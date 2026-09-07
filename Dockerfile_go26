@@ -1,0 +1,24 @@
+ARG BASE_IMAGE
+
+ARG GO_IMAGE=golang:1.26-alpine
+
+FROM ${GO_IMAGE} AS golang
+
+FROM ${BASE_IMAGE}
+
+USER root
+
+RUN apk add --no-cache \
+    build-base \
+    sqlite-dev
+
+COPY --from=golang /usr/local/go /usr/local/go
+
+ENV GOROOT=/usr/local/go
+ENV GOPATH=/home/opencode/go
+ENV PATH="/usr/local/go/bin:/home/opencode/go/bin:${PATH}"
+
+RUN mkdir -p /home/opencode/go \
+    && chown -R opencode:opencode /home/opencode/go
+
+USER opencode

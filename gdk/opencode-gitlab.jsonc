@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "lsp": {
+    "ruby-lsp": {
+      "disabled": true
+    },
+    "ruby-lsp-real": {
+      "command": ["ruby-lsp"],
+      "extensions": [".rb", ".rake", ".gemspec", ".ru"]
+    }
+  }
+}

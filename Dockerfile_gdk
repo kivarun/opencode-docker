@@ -1,0 +1,83 @@
+# ci: standalone
+# ci: watch=gdk/**
+
+FROM registry.gitlab.com/gitlab-org/gitlab-development-kit/gitlab-gdk-in-a-box:latest
+
+ARG DOCKER_HELPER_VERSION=2.1.0
+ARG DOCKER_HELPER_SHA256=6cf766e11b3558157a979d7a0c1e4892c2581683422afaa214366fa9e18c5364
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libnotify-bin \
+        ca-certificates \
+        curl \
+        tar \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && install -m 0755 \
+        /root/.opencode/bin/opencode \
+        /usr/local/bin/opencode \
+    && rm -rf /root/.opencode
+
+RUN install -d \
+        -m 0700 \
+        -o gdk \
+        -g gdk \
+        /home/gdk/.ssh \
+    && install -d \
+        -m 0755 \
+        /etc/opencode
+
+COPY gdk/opencode-gitlab.jsonc /etc/opencode/opencode-gitlab.jsonc
+COPY gdk/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+RUN chmod 0644 /etc/opencode/opencode-gitlab.jsonc \
+    && chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
+RUN set -eux; \
+    bundle="docker-helper-${DOCKER_HELPER_VERSION}-linux-amd64"; \
+    archive="/tmp/${bundle}.tar.gz"; \
+    \
+    curl -fsSL --retry 3 \
+        "https://github.com/kivarun/docker-helper/releases/download/v${DOCKER_HELPER_VERSION}/${bundle}.tar.gz" \
+        -o "${archive}"; \
+    \
+    echo "${DOCKER_HELPER_SHA256}  ${archive}" | sha256sum -c -; \
+    \
+    tar -xzf "${archive}" -C /tmp; \
+    \
+    install -m 0755 \
+        "/tmp/${bundle}/docker-helper" \
+        /usr/local/bin/docker-helper; \
+    \
+    install -d \
+        -m 0755 \
+        -o gdk \
+        -g gdk \
+        /home/gdk/.claude/skills/docker-helper; \
+    \
+    install \
+        -m 0644 \
+        -o gdk \
+        -g gdk \
+        "/tmp/${bundle}/skills/docker-helper/SKILL.md" \
+        /home/gdk/.claude/skills/docker-helper/SKILL.md; \
+    \
+    test "$(docker-helper version)" = "${DOCKER_HELPER_VERSION}"; \
+    \
+    rm -rf "${archive}" "/tmp/${bundle}"
+
+ENV HOME=/home/gdk
+ENV PATH="/home/gdk/.local/share/mise/shims:/home/gdk/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV OPENCODE_CONFIG=/etc/opencode/opencode-gitlab.jsonc
+
+WORKDIR /workspace
+
+USER gdk
+
+RUN /home/gdk/.local/bin/mise use --global ruby@3.3.11
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
