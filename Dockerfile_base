@@ -105,3 +105,4 @@ RUN set -eux; \
     rm -rf "${archive}" "/tmp/${bundle}"
 
 USER opencode
+# pr-smoke: permission verification comment
