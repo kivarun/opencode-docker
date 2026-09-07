@@ -8,158 +8,30 @@ permissions:
   contents: read
 
 jobs:
-  plan:
-    name: plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  pr-pipeline:
+    name: images pipeline (no publish)
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/ci-images.yml
     permissions:
       contents: read
-    outputs:
-      base-changed: ${{ steps.plan.outputs.base_changed }}
-      has-standalone: ${{ steps.plan.outputs.has_standalone }}
-      standalone: ${{ steps.plan.outputs.standalone }}
-      has-dependent: ${{ steps.plan.outputs.has_dependent }}
-      dependent: ${{ steps.plan.outputs.dependent }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    with:
+      event-name: pull_request
+      commit-sha: ${{ github.sha }}
+      pr-base-sha: ${{ github.event.pull_request.base.sha }}
+      default-branch: ${{ github.event.repository.default_branch }}
+      publish: false
 
-      - name: Plan affected images
-        id: plan
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: bash scripts/build-images.sh plan
-
-  base:
-    name: base
-    needs: [plan]
-    if: needs.plan.outputs.base-changed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  publish-pipeline:
+    name: images pipeline (publish)
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/ci-images.yml
     permissions:
       contents: read
       packages: write
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf '%s\n' "$GHCR_TOKEN" \
-            | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-
-      - name: Build base image
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          REGISTRY_PREFIX: ghcr.io/${{ github.repository }}
-          PUBLISH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
-          SAVE_BASE_TO: ${{ runner.temp }}/base-image.tar.gz
-        run: bash scripts/build-images.sh build base
-
-      - name: Upload base image for dependent jobs
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-base-image
-          path: ${{ runner.temp }}/base-image.tar.gz
-          retention-days: 1
-          if-no-files-found: error
-
-  standalone:
-    name: standalone ${{ matrix.image }}
-    needs: [plan]
-    if: needs.plan.outputs.has-standalone == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      matrix:
-        image: ${{ fromJSON(needs.plan.outputs.standalone) }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf '%s\n' "$GHCR_TOKEN" \
-            | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-
-      - name: Build image
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          REGISTRY_PREFIX: ghcr.io/${{ github.repository }}
-          PUBLISH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
-        run: bash scripts/build-images.sh build ${{ matrix.image }}
-
-  dependent:
-    name: dependent ${{ matrix.image }}
-    needs: [plan, base]
-    if: >-
-      always() &&
-      needs.plan.result == 'success' &&
-      (needs.base.result == 'success' || needs.base.result == 'skipped') &&
-      needs.plan.outputs.has-dependent == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      matrix:
-        image: ${{ fromJSON(needs.plan.outputs.dependent) }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Download base image artifact
-        if: >-
-          github.event_name == 'pull_request' &&
-          needs.base.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: pr-base-image
-          path: ${{ runner.temp }}
-
-      - name: Load base image from artifact
-        if: >-
-          github.event_name == 'pull_request' &&
-          needs.base.result == 'success'
-        run: docker load --input "${{ runner.temp }}/base-image.tar.gz"
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf '%s\n' "$GHCR_TOKEN" \
-            | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-
-      - name: Build image
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          REGISTRY_PREFIX: ghcr.io/${{ github.repository }}
-          PUBLISH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
-          BASE_CHANGED: ${{ needs.plan.outputs.base-changed }}
-        run: bash scripts/build-images.sh build ${{ matrix.image }}
+    with:
+      event-name: ${{ github.event_name }}
+      commit-sha: ${{ github.sha }}
+      before-sha: ${{ github.event.before }}
+      branch: ${{ github.ref_name }}
+      default-branch: ${{ github.event.repository.default_branch }}
+      publish: true
