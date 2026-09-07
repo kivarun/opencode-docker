@@ -251,6 +251,19 @@ if [[ "$MODE" == "plan" ]]; then
     else
         output base_changed false
     fi
+
+    if (( ${#selected_standalone[@]} > 0 )); then
+        output has_standalone true
+    else
+        output has_standalone false
+    fi
+
+    if (( ${#selected_dependent[@]} > 0 )); then
+        output has_dependent true
+    else
+        output has_dependent false
+    fi
+
     output standalone "$(json_array "${selected_standalone[@]}")"
     output dependent "$(json_array "${selected_dependent[@]}")"
 elif [[ "$MODE" == "build" ]]; then
