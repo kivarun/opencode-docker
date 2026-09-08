@@ -261,26 +261,37 @@ orchestrator agent-smoke --config-root /abs/config-root [--pipeline-root /abs/bu
 `agent-smoke` is driven by a declarative pipeline bundle (schema version 1).
 The bundled default pipeline (`/opt/orchestrator/pipelines/default`) is the
 production input; an external bundle can be selected with an absolute
-`--pipeline-root`. The pipeline selects the execution profile, the protected
-workspace input, the agent prompt, the result contract, and the worker
+`--pipeline-root`. Each agent state selects its execution profile, its
+workspace inputs, its agent prompt, the result contract, and its worker
 timeout — there are no `--profile`, `--task`, or `--image` flags for
-`agent-smoke`. Only the one-step execution shape is supported today: one
-agent state whose single transition with outcome `completed` leads to a
-success terminal state, `max_transitions` 1, `max_attempts` 1, exactly one
-protected declared input, and the standard agent result contract. Any other
-structurally valid pipeline is rejected before any Session is created.
-Multi-state execution, retries, and resume are not implemented
-yet. The orchestrator verifies the structured result, artifact confinement,
-the unchanged protected input, and the outcome transition before reporting
-success.
+`agent-smoke`. The supported multi-state shape today: any number of agent and
+terminal states, an agent or terminal entry state, sequential states and
+cycles bounded by `max_transitions`, `max_attempts` 1, exactly one transition
+per agent state with outcome `completed`, and the standard agent result
+contract on every state. All other structurally valid pipelines — extra
+transitions, foreign outcomes, retries — are rejected before Launcher auth and
+before any Session is created. Content-based branching, retries, resume, and
+arbitrary JSON Schemas are not implemented yet. The orchestrator verifies the
+structured result, artifact confinement, the unchanged protected inputs, and
+the outcome transition before accepting it.
+
+Each agent-state activation runs in its own child Session with its own
+bearer: the Sessions are never reused between states or between revisits of
+the same state, and each activation has its own directory
+(`activations/<activation-index>-<state-id>/attempt-1/`) with its own
+execution document and result. The activation is keyed into the result by
+`run_id`/`state_id`/`activation_index`/`attempt`, so a copied result from a
+previous activation is rejected.
 
 `agent-smoke` records one authoritative, atomically committed run state
 document per run under the orchestrator state root
-(`pipeline-runs/<run-id>/state.json`): run identity and status, the pipeline
-identity (including a digest of the resolved bundle), the protected input
-digest, the child session, the execution cursor and attempt, every committed
-transition with the result digest and artifacts, the reached terminal, a
-normalized failure reason, and an ordered event journal. It never records
+(`pipeline-runs/<run-id>/state.json`, schema version 2): run identity and
+status, the pipeline identity (including a digest of the resolved bundle),
+every protected input with its digest, the ordered activations (state id,
+attempt, profile, activation phase, child session, cleanup outcome, accepted
+result digest and artifacts, normalized activation failure), the committed
+transitions referencing their activation, the execution cursor and transition
+count, the reached terminal, and an ordered event journal. It never records
 credentials, environment values, prompt or input bodies, or the OpenCode
 configuration.
 
@@ -320,6 +331,15 @@ For `agent-smoke`, provide the configuration root (profiles, OpenCode
 configuration) and optionally a pipeline bundle root. Model/provider
 environment is forwarded only through exact profile bindings; Launcher
 credentials and admin credentials are never forwarded to workers.
+
+## Transport boundary
+
+The current local mode keeps the plain CLI over a Unix socket. A future
+container/remote (T3) integration will not inject the helper socket into
+worker containers: the orchestrator will receive a network endpoint and a
+transport trust configuration, while the agent worker will receive only the
+endpoint of its child Session together with that Session's bearer. The
+network transport itself is not implemented yet.
 
 ## GDK image
 

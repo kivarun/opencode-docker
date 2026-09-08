@@ -7,8 +7,10 @@ orchestrator, agent workers, pipeline authors, and users.
 
 It is a design sketch, not a claim that every described interface is already
 implemented. The current implementation is the tested `smoke` and
-`agent-smoke` baseline with the first trusted execution profile increment and
-the durable per-run pipeline state.
+`agent-smoke` baseline with the first trusted execution profile increment,
+the durable per-run pipeline state, and the multi-state execution
+substrate (one child Session per agent-state activation, per-activation
+result identity, run state schema version 2).
 New behavior becomes a product contract only after it is implemented, tested,
 and reflected in the canonical architecture documentation.
 
@@ -25,31 +27,43 @@ by the default declarative pipeline:
    (`--pipeline-root`; the default is the bundled
    `/opt/orchestrator/pipelines/default`).
 2. The orchestrator loads and validates the pipeline, checks that it matches
-   the supported one-step execution shape, resolves the execution profile
-   named by the agent state, and resolves the declared protected workspace
-   input (regular file, workspace confinement, digest). All of that happens
-   before Launcher authentication and before any child Session; a failure
-   exits 1 without creating anything.
+   the supported multi-state execution shape, loads and validates every
+   profile named by the pipeline's agent states, canonicalizes the
+   workspace, and resolves and hashes every `protected: true` input (regular
+   file, workspace confinement, digest). All of that happens before Launcher
+   authentication and before any child Session; a failure exits 1 without
+   creating anything.
 3. The orchestrator verifies its docker-helper Launcher credential.
-4. It creates a child Session for the workspace.
+4. For every agent-state activation the orchestrator runs one activation in
+   its own child Session: durable `activation_started`, runtime-input
+   existence checks, child Session creation with an immediate durable
+   `session_created`, an image pull (non-fatal), durable `agent_running`, the
+   `docker-helper run` bounded by that state's `timeout_seconds`, result
+   verification, durable `result_accepted`, the child Session delete, and
+   durable `session_cleanup_completed`; only then does the validated outcome
+   reach the graph engine, whose transition-commit hook records the
+   transition and cursor before the next activation. Sessions are never
+   reused between states or revisits.
 5. It starts OpenCode non-interactively in the child Session. The worker is
    launched through the official docker-helper CLI 2.1.0 (`docker-helper run`,
    spawned as an argv array); until docker-helper issue #3 is implemented,
    resolved worker environment values (including secrets and the OpenCode
    config content) are visible in that CLI process's argv — a consciously
-   accepted temporary risk. The pipeline's `timeout_seconds` bounds the run:
-   the runner sends SIGTERM at the deadline, marks the result timed out, and
-   the run fails normally.
-6. OpenCode reads the orchestrator-owned execution document (run identity,
-   state, attempt, input/result paths, allowed outcome, pipeline prompt,
-   result format) and writes a structured `result.json`.
-  7. The orchestrator verifies the result schema (exact fields), run identity,
-     artifact paths (workspace confinement, plus canonical-path and
-     dev+inode alias checks against the protected input), the unchanged
-     protected input digest, and maps the validated outcome through the
-     pipeline transition to the success terminal state. Every accepted
-     transition, the reached terminal, and the final run status are committed
-     to the durable pipeline run state under the operator state root.
+   accepted temporary risk. The agent state's `timeout_seconds` bounds the
+   run: the runner sends SIGTERM at the deadline, marks the result timed out,
+   and the run fails normally.
+6. OpenCode reads the orchestrator-owned per-activation execution document
+   (run identity, state id, activation index, attempt, input/result paths,
+   allowed outcome, pipeline prompt, result format) and writes the
+   activation's structured `result.json`.
+  7. The orchestrator verifies the result schema (exact fields), the
+     `run_id`/`state_id`/`activation_index`/`attempt` identity, artifact
+     paths (workspace confinement, plus canonical-path and dev+inode alias
+     checks against every protected input), and the unchanged protected
+     input digests. The graph engine maps the validated outcome through the
+     state's declared transition; every accepted transition, the reached
+     terminal, and the final run status are committed to the durable
+     pipeline run state under the operator state root.
  8. On cancellation, the first SIGINT/SIGTERM is recorded by the lifecycle; a
     running `docker-helper run` process receives the same signal and docker-helper
     performs a bounded synchronous best-effort cancel. The orchestrator never
@@ -89,8 +103,9 @@ files; worker environment values do appear as `docker-helper run` argv elements
 
 The current implementation does not yet provide:
 
-- pipeline graph execution beyond the supported one-step shape (multi-state
-  execution is not implemented; unsupported pipelines fail closed before any
+- pipeline graph execution beyond the supported multi-state shape
+  (content-based branching, retries, user-input states, and arbitrary JSON
+  Schemas are not implemented; unsupported pipelines fail closed before any
   Session);
 - arbitrary user-supplied JSON Schema validation (the result schema must equal
   the standard agent result contract verbatim);
@@ -98,22 +113,22 @@ The current implementation does not yet provide:
   control API, and concurrency;
 - multi-process run-state coordination: two processes writing the same run in
   the same state root are not serialized across process boundaries;
-- run-state migration (schema version 1 only, no compatibility with other
-  versions);
+- run-state migration (schema version 2 only; version 1 documents are
+  rejected as unsupported and never rewritten);
 - run listing or inspection commands;
 - an event stream;
 - a T3 integration.
 
-## Pipelines (schema version 1: loader, validator, one-step execution)
+## Pipelines (schema version 1: loader, validator, multi-state execution plan)
 
 `orchestrator/src/pipeline.ts` implements the declarative pipeline contract:
 `parsePipelineSpec(raw)` validates the structure and graph in memory,
 `loadPipeline(bundleRoot)` additionally loads the bundle from an absolute
 directory containing exactly `pipeline.yaml` (`pipeline.yml` and JSON are not
-supported) and resolves bundle files. `planOneStepExecution(pipeline)` builds
-the one-step execution plan used by `agent-smoke`; the default bundled
-pipeline is the production input for `agent-smoke`, and an external bundle is
-selected with `--pipeline-root`.
+supported) and resolves bundle files. `planMultiStateExecution(pipeline)`
+builds the fail-closed multi-state execution plan used by `agent-smoke`; the
+default bundled pipeline is the production input for `agent-smoke`, and an
+external bundle is selected with `--pipeline-root`.
 
 Schema version 1 is fixed. Every mapping accepts only its exact field set;
 unknown and missing fields fail closed:
@@ -141,9 +156,9 @@ Graph invariants checked before a resolved pipeline is returned:
 - every agent input reference names a declared input;
 - every transition has a non-empty outcome and an existing target; outcomes
   are unique within one state; every agent has at least one transition;
-- at least one terminal state exists, every state is reachable from the entry
-  state, and every agent state has a path to a terminal state; cycles are
-  allowed because the whole run is bounded by `max_transitions`;
+- at least one terminal state exists; agent states must be reachable from the
+  entry state; terminal states may sit beyond the reachable part (a cycle can
+  never leave itself, and the transition budget bounds the whole run);
 - `max_transitions`, `timeout_seconds`, and `max_attempts` are positive safe
   integers.
 
@@ -164,39 +179,50 @@ same exact-field validation. Workspace input existence and `run_id`,
 artifact-confinement, and protected-task checks are orchestrator semantics,
 not JSON Schema or loader checks.
 
-Not implemented yet for pipelines: multi-state worker execution (the pure
-graph engine core exists, but production still runs only the one-step plan),
-arbitrary JSON Schema support, retries, resume, user input, API, and
-concurrency.
+Not implemented yet for pipelines: content-based branching, arbitrary JSON
+Schema support, retries, resume, user input states, API, and concurrency.
 
-### One-step execution bridge (implemented)
+### Multi-state execution plan (implemented)
 
-`planOneStepExecution` accepts exactly one execution shape and rejects every
-other structurally valid pipeline with a clear error before Launcher
-authentication and before any child Session:
+`planMultiStateExecution` accepts exactly one execution shape and rejects
+every other structurally valid pipeline with a clear error before Launcher
+authentication, before any child Session, and before any durable state
+exists:
 
-- exactly two states; the entry state is the agent state; the second state is
-  a terminal with `result: success`;
-- the agent state has exactly one transition, its outcome is `completed`, and
-  its target is that terminal state (state and input identifiers are
-  arbitrary; nothing is hardcoded);
-- `max_transitions` is 1 and the agent `max_attempts` is 1;
-- the agent uses exactly one declared input, the pipeline declares no other
-  inputs, and that single input is `protected: true`;
-- the agent's `result_schema` equals the standard agent result contract
-  (`STANDARD_AGENT_RESULT_SCHEMA`) as a verbatim structural comparison — JSON
-  key order does not matter; no generic JSON Schema engine is involved;
-- `timeout_seconds` is within the single JS-timer bound
+- any number of agent and terminal states; the entry state may be an agent
+  state or a terminal state;
+- sequential states, revisits of the same state, and cycles are allowed; the
+  whole run is bounded by `max_transitions`;
+- every agent state has `max_attempts` 1 (no retries);
+- every agent state has exactly one transition, and its outcome is
+  `completed` (the engine resolves the target from the declaration);
+- the agent's `result_schema` equals the standard multi-state agent result
+  contract (`STANDARD_AGENT_RESULT_SCHEMA`, schema version 2) as a verbatim
+  structural comparison — JSON key order does not matter; no generic JSON
+  Schema engine is involved;
+- every `timeout_seconds` is within the single JS-timer bound
   (`MAX_RUN_TIMEOUT_SECONDS` = 2147483); larger values are rejected, never
-  clamped.
+  clamped;
+- all profiles named by the agent states load and validate before
+  authentication; unprotected inputs are allowed and may be created by
+  earlier states.
 
-Execution: the orchestrator materializes a non-secret execution document
-inside the orchestrator-owned run directory of the workspace (run id, state
-id, attempt 1, workspace-relative input/result paths, allowed outcome, the
-pipeline prompt body, and the exact result format). The OpenCode command
-receives only a short static instruction pointing at that document; prompt
-and input bodies never appear in argv, env, state, or diagnostics; the
-pipeline bundle and config root are not mounted into the worker.
+Anything else — extra transitions, foreign outcomes, retries, custom
+decision payloads — is rejected as unsupported, and unsupported graphs are
+never partially executed.
+
+Execution: the orchestrator materializes a non-secret per-activation
+execution document inside the orchestrator-owned run directory of the
+workspace
+(`activations/<activation-index>-<state-id>/attempt-1/execution.md`: run id,
+state id, activation index, attempt 1, workspace-relative input/result
+paths, allowed outcome, the pipeline prompt body, and the exact result
+format). The OpenCode command receives only a short static instruction
+pointing at that document; prompt and input bodies never appear in argv,
+env, state, or diagnostics; the pipeline bundle and config root are not
+mounted into the worker. Each activation's `result.json` lives next to its
+execution document, so a revisit never sees a previous activation's result
+as its own.
 
 ### Pure graph engine (implemented, single transition-mapping owner)
 
@@ -233,10 +259,10 @@ A terminal `result: failed` is a normal graph result, not an engine
 exception. Free text, stdout, and exit codes never participate in transition
 selection.
 
-Production `agent-smoke` runs its single agent step through this engine (it
+Production `agent-smoke` runs every step through this engine (it
 is the single owner of the outcome → transition → next-state mapping; no
-parallel hand-written mapping exists), while remaining restricted by
-`planOneStepExecution`. The orchestrator registers a transition-commit hook
+parallel hand-written mapping exists), restricted by
+`planMultiStateExecution`. The orchestrator registers a transition-commit hook
 with the engine: after the callback's outcome is validated and before the
 cursor moves, the engine calls the hook with a frozen transition step; the
 hook records the committed transition and, on terminal arrival, the terminal
@@ -246,8 +272,8 @@ durable write lands, so no transition is recorded anywhere; a
 `durability_unknown` failure means the rename already landed, so the new
 candidate revision may already be visible on disk even though the hook
 failed — the cursor never moves in either case, the next agent callback never
-runs, and the run fails with exit 1 and a single cleanup. Multi-state worker
-execution, retries, resume, and concurrency are still not implemented. The
+runs, and the run fails with exit 1 and a single cleanup. Retries, resume,
+and concurrency are still not implemented. The
 engine is not a second production path and not a generic workflow engine.
 
 The pipeline's `timeout_seconds` is enforced by the CLI runner on the
@@ -324,14 +350,25 @@ Implemented rules:
   output remains an untrusted stream that may contain whatever the worker
   chooses to print;
 - the profile comes from the pipeline's agent state (`agent-smoke` has no
-  `--profile` flag) and the workspace input path comes from the pipeline's
-  declared inputs (no `--task` flag); an external pipeline bundle is selected
+  `--profile` flag) and each state's workspace input paths come from the
+  pipeline's declared inputs (no `--task` flag); an external pipeline bundle
+  is selected
   with `--pipeline-root` (default: the bundled default pipeline). There is no
   `--image` flag, the worker image comes only from the selected profile.
   Plain `smoke` keeps `--image`.
 
 Profile-selected file projections, resource limits, and profile inheritance
 are not implemented yet.
+
+## Transport boundary (direction, not implementation)
+
+The current local mode keeps the plain docker-helper CLI over a Unix socket.
+A future container/remote (T3) integration will not inject the helper socket
+into worker containers: the orchestrator will receive a network endpoint and
+a transport trust configuration, while the agent worker will receive only the
+endpoint of its child Session together with that Session's bearer. The
+network transport itself is not implemented; this section records the
+direction only.
 
 ## Containerized orchestrator workspace projection (proven integration pattern)
 
@@ -549,10 +586,12 @@ For `agent-smoke` this is implemented as the durable pipeline run state
 (`orchestrator/src/pipeline_state.ts`, `pipeline_state_store.ts`,
 `pipeline_state_sink.ts`): exactly one JSON document per run at
 `<XDG state root>/pipeline-runs/<run-id>/state.json`, written and read only by
-the orchestrator. The document is schema-versioned (`schema_version: 1`) and
+the orchestrator. The document is schema-versioned (`schema_version: 2`) and
 validated in both directions with exact-field rules: unknown fields, missing
 fields, and any structural inconsistency fail closed when the document is
-written (pure reducer) and when it is loaded again (store loader).
+written (pure reducer) and when it is loaded again (store loader). There is
+no version migration: v1 documents are rejected as an unsupported version and
+are never rewritten.
 
 It records:
 
@@ -562,22 +601,29 @@ It records:
   execution snapshot digest (canonical-JSON SHA-256 over the resolved
   pipeline bundle content, `pipeline_digest.ts`), entry state, and transition
   budget;
-- the protected workspace input: declared id, workspace-relative path, and
+- every protected workspace input: declared id, workspace-relative path, and
   content digest;
-- the child Session identity;
-- the execution cursor (current state id, applied transition count) and the
-  recorded attempt (state id, attempt, profile, session id, attempt phase
-  `running|completed|failed`);
-- every committed transition: original transition index, `from`, `outcome`,
-  `to`, attempt, the SHA-256 digest of the verified result bytes, and the
-  committed artifact paths;
+- the ordered activations: a global monotonic activation index starting at 1,
+  the state id, attempt (always 1 today), profile, activation phase
+  (`creating_session|session_created|agent_running|result_accepted|session_cleanup_completed|failed`),
+  the child Session id (recorded after creation, when the Session was
+  created), the session cleanup outcome, the accepted result digest and
+  artifact paths, and a normalized activation failure reason when the
+  activation failed;
+- the execution cursor (current state id, applied transition count);
+- every committed transition: original transition index (per state), `from`,
+  `outcome`, `to`, the referenced activation, the SHA-256 digest of the
+  verified result bytes, and the committed artifact paths;
 - the reached terminal state id and its `success|failed` result;
 - a normalized, text-free failure reason (`run_errors.ts` maps the terminal
   cause to one stable reason; signals win over other causes);
-- an ordered event journal (`run_created`, `phase_entered`,
-  `session_created`, `attempt_started`, `transition_committed`,
+- an ordered discriminated event journal (`run_created`, `activation_started`,
+  `session_created`, `agent_running`, `result_accepted`,
+  `session_cleanup_completed`, `activation_failed`, `transition_committed`,
   `terminal_reached`, `run_succeeded`, `run_failed`, `run_cleanup_failed`)
-  with contiguous sequence numbers and timestamps.
+  with contiguous sequence numbers and timestamps; events carry the
+  `state_id`, `activation_index`, `session_id`, or transition fields where
+  they are relevant to the event.
 
 It never records credentials, environment values, prompt or input bodies, the
 OpenCode configuration, result summaries, or worker output; worker-visible
@@ -585,7 +631,12 @@ content is referenced by digests and paths only.
 
 Every mutation is a pure reducer command applied to the previous snapshot.
 The reducer enforces the run's shape: event successor rules, contiguous
-sequences, cursor/transition/attempt/terminal coherence, and terminal-status
+sequences, cursor/transition/activation coherence (contiguous activation
+indexes from 1, exactly one active activation, a new activation only after
+the previous activation's cleanup and committed transition, a transition
+referencing the accepted-and-cleaned activation whose `from` equals the
+cursor, the terminal recorded only when the cursor reaches a terminal state),
+and terminal-status
 immutability (once the run status is `success`, `failed`, or
 `cleanup_failed`, no command can overwrite it — there is no
 `success → failed` rewrite and no other post-terminal mutation).
@@ -758,8 +809,9 @@ tests complete; end-to-end UAT pending):
 
 The next increment expresses the current one-step flow through the default
 declarative pipeline and generalizes it into the orchestrator-owned state
-machine. The one-step bridge is implemented today: `agent-smoke` executes the
-default (or an explicitly selected) pipeline in its supported one-step shape
-and maps the validated outcome through the declared transition. The
-generalization to arbitrary multi-state graphs, durable state, and resume has
-not started.
+machine. The multi-state substrate is implemented today: `agent-smoke`
+executes the supported multi-state shape (sequential states, revisits, and
+cycles within the transition budget) through the graph engine, one child
+Session per activation, per-activation result identity, and run state schema
+version 2. Generalization to content-based branching, arbitrary JSON
+Schemas, retries, and resume has not started.
