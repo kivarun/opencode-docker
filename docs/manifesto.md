@@ -77,6 +77,10 @@ orchestrator or changing its source code. The project should ship a useful
 default pipeline, while accepting external pipeline bundles through the same
 validated contract.
 
+The [pipeline model](pipeline-model.md) records the target user-facing contract,
+responsibility split, validation lifecycle, and migration approach for the
+default workflow.
+
 Pipeline flexibility comes from an explicit graph and typed contracts, not from
 arbitrary shell commands, embedded JavaScript, unrestricted expressions, or
 host callbacks. A pipeline is not a plugin with ambient process authority.

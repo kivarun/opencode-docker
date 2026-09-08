@@ -48,5 +48,6 @@ Repo of Dockerfiles for OpenCode agent images (published to GHCR via CI) plus an
 ## Docs pointers
 
 - `docs/manifesto.md` — design principles (OpenCode is an execution engine, not state authority; the orchestrator owns state).
+- `docs/pipeline-model.md` — target user-facing pipeline model: responsibility boundaries, roles and profiles, declarative process/data contracts, validation, defaults, and migration of the established workflow.
 - `docs/orchestration-workflow.md` — design sketch: only `smoke`/`agent-smoke` are implemented; don't treat described future interfaces as existing.
 - agent-smoke result contract: the worker writes a structured `result.json` per activation (schema version 2 with `run_id`/`state_id`/`activation_index`/`attempt` identity, `status` `completed`, `summary`, `artifacts`); protected input digests must be unchanged; fixture in `orchestrator/fixtures/agent-smoke/`.
