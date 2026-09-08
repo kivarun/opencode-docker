@@ -19,6 +19,8 @@ import {
   type LifecycleOutcome,
   type SessionContext,
 } from "./lifecycle.ts";
+import type { ResolvedAgentState } from "./pipeline.ts";
+import { executePipelineGraph } from "./pipeline_engine.ts";
 import type { ResolvedProfile } from "./profile.ts";
 import { loadProfile } from "./profile.ts";
 import { AGENT_SMOKE_DIR, agentWorkerSpec, pullArgs, runArgs } from "./worker.ts";
@@ -268,20 +270,37 @@ export async function runAgentSmoke(
         );
         console.error(`orchestrator: run dir ${agentRunDirPath(options.workspace, ctx.runId)}`);
       },
-      withSession: (ctx) => agentRun(options, plan, profile, input, deps, ctx),
+      // The graph engine owns the outcome -> transition -> next-state mapping
+      // even for the one-step path: the agent callback reports only the
+      // validated result status, the engine resolves the declared transition,
+      // and success is possible only by reaching a success terminal state.
+      withSession: async (ctx) => {
+        const execution = await executePipelineGraph(plan.pipeline, (state) =>
+          agentRunOutcome(options, profile, input, state, deps, ctx),
+        );
+        console.error(
+          `orchestrator: graph execution terminal ${execution.terminalStateId} (${execution.terminalResult}, ${execution.transitionCount} transition(s))`,
+        );
+        if (execution.terminalResult !== "success") {
+          throw new PipelineError(
+            `pipeline execution ended at terminal ${JSON.stringify(execution.terminalStateId)} with result failed`,
+          );
+        }
+        await ctx.updateState("success");
+      },
     },
     "agent-smoke",
   );
 }
 
-async function agentRun(
+async function agentRunOutcome(
   options: AgentSmokeOptions,
-  plan: OneStepPlan,
   profile: ResolvedProfile,
   input: ResolvedWorkspaceInput,
+  state: ResolvedAgentState,
   deps: AgentSmokeDeps,
   ctx: SessionContext,
-): Promise<void> {
+): Promise<string> {
   const { runId, updateState, childEnv } = ctx;
   const resultPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/result.json`;
   const executionDocPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/execution.md`;
@@ -318,12 +337,12 @@ async function agentRun(
   ctx.checkAbort();
   const run = await deps.cli(runArgs(spec, deps.config.socketPath), childEnv, "inherit", {
     signalOnAbort: true,
-    timeoutSeconds: plan.agent.timeout_seconds,
+    timeoutSeconds: state.timeout_seconds,
   });
   if (run.timedOut === true) {
     throw new DockerHelperError(
       "cli_failure",
-      `agent container timed out after ${plan.agent.timeout_seconds} seconds`,
+      `agent container timed out after ${state.timeout_seconds} seconds`,
     );
   }
   if (run.code !== 0) {
@@ -357,24 +376,8 @@ async function agentRun(
     ino: input.ino,
   });
 
-  // Map the verified result status through the declared transition table of
-  // the agent state; success is possible only by reaching a success terminal.
-  const transition = plan.agent.transitions.find(
-    (candidate) => candidate.outcome === result.status,
-  );
-  if (transition === undefined) {
-    throw new PipelineError(
-      `agent result status ${JSON.stringify(result.status)} does not match any transition outcome of state ${JSON.stringify(plan.agent.id)}`,
-    );
-  }
-  const target = plan.pipeline.states.find((state) => state.id === transition.to);
-  if (target === undefined || target.type !== "terminal" || target.result !== "success") {
-    throw new PipelineError(
-      `transition outcome ${JSON.stringify(result.status)} of state ${JSON.stringify(plan.agent.id)} does not lead to a success terminal state`,
-    );
-  }
-
   console.error(`orchestrator: agent result verified for run ${runId}`);
-  await updateState("success");
+  // the validated outcome only; the graph engine selects the next state
+  return result.status;
 }
 

@@ -156,9 +156,10 @@ same exact-field validation. Workspace input existence and `run_id`,
 artifact-confinement, and protected-task checks are orchestrator semantics,
 not JSON Schema or loader checks.
 
-Not implemented yet for pipelines: multi-state graph execution, arbitrary
-JSON Schema support, retries, durable pipeline state, resume, user input,
-API, and concurrency.
+Not implemented yet for pipelines: multi-state worker execution (the pure
+graph engine core exists, but production still runs only the one-step plan),
+arbitrary JSON Schema support, retries, durable pipeline state, resume, user
+input, API, and concurrency.
 
 ### One-step execution bridge (implemented)
 
@@ -187,10 +188,41 @@ id, attempt 1, workspace-relative input/result paths, allowed outcome, the
 pipeline prompt body, and the exact result format). The OpenCode command
 receives only a short static instruction pointing at that document; prompt
 and input bodies never appear in argv, env, state, or diagnostics; the
-pipeline bundle and config root are not mounted into the worker. After the
-verified result, the outcome is mapped through the declared transition table
-of the agent state; success is possible only by reaching a success terminal
-state. The pipeline's `timeout_seconds` is enforced by the CLI runner on the
+pipeline bundle and config root are not mounted into the worker.
+
+### Pure graph engine (implemented, single transition-mapping owner)
+
+`orchestrator/src/pipeline_engine.ts` implements `executePipelineGraph`, a
+pure, deterministic graph execution core. It takes an already loaded
+`ResolvedPipeline`, starts strictly at `entry_state`, invokes an injected
+agent callback for agent states, and — after accepting a validated outcome —
+resolves the declared transition by outcome itself, moves to the declared
+target state, enforces `max_transitions`, and finishes at a terminal state
+with `result: success|failed`. It returns the terminal state id, the terminal
+result, the applied transition count, and an ordered transition trace
+(`from`, `outcome`, `to`, `transition_index`); it contains no timestamps or
+randomness. At the core level it supports sequential states, branching by
+outcome, and cycles bounded by `max_transitions`. It fails closed with
+`PipelineExecutionError` (stable reasons: `invalid_graph`,
+`missing_state`, `unknown_outcome`, `invalid_outcome`,
+`transition_budget_exhausted`, `transition_exceeds_max_transitions`) when the
+cursor is missing, an outcome is not declared by the current agent state, an
+agent state would run with an exhausted transition budget, an outcome is
+empty or not a string, or the resolved graph is internally inconsistent. A
+callback failure propagates unchanged: no transition is recorded and the
+cursor does not move. A terminal `result: failed` is a normal graph result,
+not an engine exception. The agent reports only an outcome and never selects
+the next state; free text, stdout, and exit codes never participate in
+transition selection.
+
+Production `agent-smoke` runs its single agent step through this engine (it
+is the single owner of the outcome → transition → next-state mapping; no
+parallel hand-written mapping exists), while remaining restricted by
+`planOneStepExecution`: multi-state worker execution, retries, durable state,
+resume, and concurrency are still not implemented. The engine is not a
+second production path and not a generic workflow engine.
+
+The pipeline's `timeout_seconds` is enforced by the CLI runner on the
 signalable worker `docker-helper run` only; the deadline sends SIGTERM, the
 result is marked timed out, and the run fails normally with a single cleanup.
 `max_attempts` is 1, so no retries are implemented.

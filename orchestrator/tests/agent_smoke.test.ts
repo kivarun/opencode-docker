@@ -1,7 +1,7 @@
 import { link, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import {
   parseAgentResult,
   verifyAgentResult,
@@ -1122,6 +1122,147 @@ test("24. input path comes from the pipeline", async () => {
     expect(envPairValue(run.args, "AGENT_SMOKE_INPUT_PATH")).toBe("/workspace/docs/input.md");
     const doc = await readFile(executionDocumentPath(dirs.workspace, outcome.runId), "utf8");
     expect(doc).toContain("- input (workspace-relative): docs/input.md");
+  });
+});
+
+test("25. the default one-step pipeline executes through the graph engine", async () => {
+  await withFixture(async (dirs) => {
+    const diagnostics: string[] = [];
+    const restoreError = spyOn(console, "error").mockImplementation((message: unknown) => {
+      diagnostics.push(String(message));
+    });
+    try {
+      const { runner } = fakeCli({ workspace: dirs.workspace });
+      const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+      expect(outcome.exitCode).toBe(0);
+      expect(outcome.status).toBe("success");
+      // the engine owns the outcome -> transition -> next-state mapping: it
+      // started at the entry state, applied the declared transition and
+      // reached the declared success terminal
+      expect(diagnostics).toContain(
+        `orchestrator: graph execution terminal completed (success, 1 transition(s))`,
+      );
+      // exactly one agent execution and exactly one applied transition
+      expect(diagnostics.filter((line) => line.includes("graph execution terminal")).length).toBe(1);
+      expect(diagnostics.filter((line) => line === "orchestrator: starting agent in child session").length).toBe(1);
+    } finally {
+      restoreError.mockRestore();
+    }
+  });
+});
+
+test("26. foreign result status does not advance the graph", async () => {
+  await withFixture(async (dirs) => {
+    const diagnostics: string[] = [];
+    const restoreError = spyOn(console, "error").mockImplementation((message: unknown) => {
+      diagnostics.push(String(message));
+    });
+    try {
+      const { calls, runner } = fakeCli({
+        workspace: dirs.workspace,
+        resultBody: (runId) =>
+          JSON.stringify({
+            schema_version: 1,
+            run_id: runId,
+            status: "unexpected",
+            summary: "claims a status the pipeline never declared",
+            artifacts: [WORK_PRODUCT_PATH],
+          }),
+      });
+      const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+      expect(outcome.exitCode).toBe(1);
+      expect(outcome.ok).toBe(false);
+      expect(outcome.status).toBe("failed");
+      // the standard agent result contract rejects the foreign status before
+      // any transition could be applied; the engine-level unknown-outcome
+      // defense itself is proven by the pure engine tests
+      expect(outcome.detail).toContain('result status is "unexpected"');
+      expect(outcome.detail).toContain('expected "completed"');
+      // no transition was applied and no terminal diagnostic was emitted
+      expect(diagnostics.some((line) => line.includes("graph execution terminal"))).toBe(false);
+      expect(deleteCallCount(calls)).toBe(1);
+      expect(createCallCount(calls)).toBe(1);
+    } finally {
+      restoreError.mockRestore();
+    }
+  });
+});
+
+test("27. worker failure creates no transition; single cleanup", async () => {
+  await withFixture(async (dirs) => {
+    const diagnostics: string[] = [];
+    const restoreError = spyOn(console, "error").mockImplementation((message: unknown) => {
+      diagnostics.push(String(message));
+    });
+    try {
+      const { calls, runner } = fakeCli({ workspace: dirs.workspace, runCode: 3 });
+      const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+      expect(outcome.exitCode).toBe(1);
+      expect(outcome.status).toBe("failed");
+      expect(outcome.detail).toContain("agent container failed (exit 3)");
+      // the callback failed, so the engine recorded no transition
+      expect(diagnostics.some((line) => line.includes("graph execution terminal"))).toBe(false);
+      expect(deleteCallCount(calls)).toBe(1);
+      expect(createCallCount(calls)).toBe(1);
+    } finally {
+      restoreError.mockRestore();
+    }
+  });
+});
+
+test("28. arbitrary valid state ids through the engine", async () => {
+  await withFixture(async (dirs) => {
+    await writeFile(
+      join(dirs.pipelineRoot, "pipeline.yaml"),
+      [
+        "schema_version: 1",
+        "entry_state: begin-step",
+        "max_transitions: 1",
+        "",
+        "inputs:",
+        "  - id: task",
+        "    path: TASK.md",
+        "    protected: true",
+        "",
+        "states:",
+        "  - id: begin-step",
+        "    type: agent",
+        "    profile: default",
+        "    prompt: prompts/execute.md",
+        "    inputs:",
+        "      - task",
+        "    result_schema: schemas/agent-result.schema.json",
+        "    timeout_seconds: 3600",
+        "    max_attempts: 1",
+        "    transitions:",
+        "      - outcome: completed",
+        "        to: finish-success",
+        "",
+        "  - id: finish-success",
+        "    type: terminal",
+        "    result: success",
+        "",
+      ].join("\n"),
+    );
+    const diagnostics: string[] = [];
+    const restoreError = spyOn(console, "error").mockImplementation((message: unknown) => {
+      diagnostics.push(String(message));
+    });
+    try {
+      const { runner } = fakeCli({ workspace: dirs.workspace });
+      const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+      expect(outcome.exitCode).toBe(0);
+      expect(outcome.status).toBe("success");
+      expect(diagnostics).toContain(
+        `orchestrator: graph execution terminal finish-success (success, 1 transition(s))`,
+      );
+    } finally {
+      restoreError.mockRestore();
+    }
   });
 });
 
