@@ -62,11 +62,13 @@ by the default declarative pipeline:
     keep the plain lifecycle semantics. `session create`, `pull`, and
     `session delete` always run to completion, and the child Session is deleted
     only in the single lifecycle cleanup path after the active step settles.
-   Signal acceptance closes in the same synchronous tail that completes the
-   authoritative final state write: a signal accepted while that write was in
-   flight rewrites a persisted `success` to `failed`, and a signal delivered
-   after the write completes can no longer change the recorded outcome or the
-   exit code.
+   Signal acceptance closes in the same synchronous tail after cleanup and
+   before the single authoritative final state write: causes are snapshotted
+   and signal acceptance closes with no await in between, then exactly one
+   `finalize` writes the already-decided terminal status. A signal delivered
+   after the cutoff — including while the final write is in flight — is late
+   and can no longer change the recorded outcome or the exit code; the
+   terminal status is never rewritten.
 9. It deletes the child Session and records the final cleanup result.
 10. Process exit status reports overall success or failure.
 
@@ -238,10 +240,15 @@ parallel hand-written mapping exists), while remaining restricted by
 with the engine: after the callback's outcome is validated and before the
 cursor moves, the engine calls the hook with a frozen transition step; the
 hook records the committed transition and, on terminal arrival, the terminal
-in the durable pipeline run state, and a hook failure propagates unchanged (no
-transition recorded, cursor unmoved). Multi-state worker execution, retries,
-resume, and concurrency are still not implemented. The engine is not a
-second production path and not a generic workflow engine.
+in the durable pipeline run state. A hook failure stops the graph immediately
+and propagates unchanged: a `not_committed` failure rejects before the
+durable write lands, so no transition is recorded anywhere; a
+`durability_unknown` failure means the rename already landed, so the new
+candidate revision may already be visible on disk even though the hook
+failed — the cursor never moves in either case, the next agent callback never
+runs, and the run fails with exit 1 and a single cleanup. Multi-state worker
+execution, retries, resume, and concurrency are still not implemented. The
+engine is not a second production path and not a generic workflow engine.
 
 The pipeline's `timeout_seconds` is enforced by the CLI runner on the
 signalable worker `docker-helper run` only; the deadline sends SIGTERM, the
@@ -578,10 +585,10 @@ content is referenced by digests and paths only.
 
 Every mutation is a pure reducer command applied to the previous snapshot.
 The reducer enforces the run's shape: event successor rules, contiguous
-sequences, cursor/transition/attempt/terminal coherence, and a single
-post-success mutation (a signal accepted while the authoritative success
-write was in flight rewrites the persisted `success` to `failed`; nothing
-else may overwrite a terminal status).
+sequences, cursor/transition/attempt/terminal coherence, and terminal-status
+immutability (once the run status is `success`, `failed`, or
+`cleanup_failed`, no command can overwrite it — there is no
+`success → failed` rewrite and no other post-terminal mutation).
 
 Write algorithm — one commit per state change, always in this order: create
 the run directory (mode 0700, symlinked directories rejected), create the
@@ -595,10 +602,25 @@ non-symlink file. The state change and the event describing it are committed
 as one authoritative operation: a committed revision either contains both or
 does not exist.
 
+Commit failures are typed. A `not_committed` failure (`PipelineStateStoreError`)
+happens at or before the rename: the temporary file is removed and the
+previous snapshot remains authoritative byte-for-byte, so the sink can still
+record a normalized failure durably at finalize. A `durability_unknown`
+failure (`PipelineStateDurabilityError`, carrying the candidate revision and
+snapshot) happens after a successful rename, when the post-rename directory
+`fsync` fails: the candidate revision is already visible at `state.json`,
+but whether the previous or the candidate revision survives a crash is not
+guaranteed. The rename is never rolled back and no automatic recovery is
+implemented: the sink adopts the visible candidate, poisons itself (no
+further commits or finalize for that run), and the run fails with exit 1
+while the Session is still cleaned up exactly once. The previous snapshot is
+never claimed to have survived in that case.
+
 Not implemented yet: resume (a fresh process cannot continue an existing
 run), multi-process coordination (concurrent writers of the same run in the
 same state root are not serialized across process boundaries), migration
-between schema versions, and run listing or inspection commands.
+between schema versions, post-rename durability recovery, and run listing or
+inspection commands.
 
 Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
