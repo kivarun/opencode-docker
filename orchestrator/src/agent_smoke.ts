@@ -2,6 +2,7 @@ import { mkdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { AgentResultError, verifyAgentResult } from "./agent_result.ts";
 import { DockerHelperError, describeError } from "./docker_helper.ts";
+import type { HelperTransport } from "./helper_api.ts";
 import {
   runWithChildSession,
   type LifecycleDeps,
@@ -9,10 +10,16 @@ import {
   type LifecycleOutcome,
   type SessionContext,
 } from "./lifecycle.ts";
-import { AGENT_SMOKE_DIR, agentWorkerSpec, pullArgs, runArgs } from "./worker.ts";
+import type { ResolvedProfile } from "./profile.ts";
+import { loadProfile } from "./profile.ts";
+import { AGENT_SMOKE_DIR, agentWorkerSpec } from "./worker.ts";
 
-export interface AgentSmokeOptions extends LifecycleOptions {
+export interface AgentSmokeOptions {
+  workspace: string;
   taskPath: string;
+  configRoot: string;
+  profileName: string;
+  launcherId?: string;
 }
 
 export type AgentSmokeDeps = LifecycleDeps;
@@ -143,11 +150,34 @@ export async function runAgentSmoke(
   options: AgentSmokeOptions,
   deps: AgentSmokeDeps,
 ): Promise<AgentSmokeOutcome> {
+  let profile: ResolvedProfile;
+  try {
+    profile = await loadProfile(options.configRoot, options.profileName, deps.baseEnv ?? {});
+  } catch (cause) {
+    const failure = cause instanceof Error ? cause : new Error(String(cause));
+    console.error(`orchestrator: agent-smoke failed: ${failure.message}`);
+    return {
+      ok: false,
+      exitCode: 1,
+      runId: "",
+      status: "failed",
+      detail: failure.message,
+    };
+  }
+  console.error(
+    `orchestrator: profile ${profile.profileName} ok (image ${profile.image}, env bindings ${Object.keys(profile.env).length})`,
+  );
   let task: ResolvedTaskFile | null = null;
+
+  const lifecycleOptions: LifecycleOptions = {
+    workspace: options.workspace,
+    workerImage: profile.image,
+    launcherId: options.launcherId,
+  };
 
   return runWithChildSession(
     deps,
-    options,
+    lifecycleOptions,
     {
       preSession: async (ctx) => {
         task = await resolveTaskFile(options.workspace, options.taskPath);
@@ -157,7 +187,7 @@ export async function runAgentSmoke(
         await mkdir(agentRunDirPath(options.workspace, ctx.runId), { recursive: true });
         console.error(`orchestrator: run dir ${agentRunDirPath(options.workspace, ctx.runId)}`);
       },
-      withSession: (ctx) => agentRun(options, deps, ctx, () => task),
+      withSession: (ctx) => agentRun(options, profile, deps, ctx, () => task),
     },
     "agent-smoke",
   );
@@ -165,6 +195,7 @@ export async function runAgentSmoke(
 
 async function agentRun(
   options: AgentSmokeOptions,
+  profile: ResolvedProfile,
   deps: AgentSmokeDeps,
   ctx: SessionContext,
   taskRef: () => ResolvedTaskFile | null,
@@ -173,33 +204,35 @@ async function agentRun(
   if (task === null) {
     throw new TaskFileError("task file was not prepared before the session");
   }
-  const { runId, updateState, childEnv } = ctx;
+  const { runId, updateState, childToken } = ctx;
+  const transport: HelperTransport | undefined = deps.transport;
+  if (transport === undefined) {
+    throw new DockerHelperError("unexpected_response", "worker transport is not configured");
+  }
   const resultPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/result.json`;
 
-  console.error(`orchestrator: pulling agent image ${options.workerImage}`);
-  const pull = await deps.cli(
-    pullArgs(options.workerImage, deps.config.socketPath),
-    childEnv,
-    "inherit",
-  );
-  if (pull.code !== 0) {
+  console.error(`orchestrator: pulling agent image ${profile.image}`);
+  try {
+    await transport.pull(profile.image, childToken);
+  } catch (cause) {
     console.error(
-      `orchestrator: warning: docker-helper pull ${options.workerImage} failed (exit ${pull.code}); continuing, the image may already be present locally`,
+      `orchestrator: warning: docker-helper pull ${profile.image} failed: ${describeError(cause)}; continuing, the image may already be present locally`,
     );
   }
 
   const spec = agentWorkerSpec({
     runId,
-    childSessionToken: ctx.childToken,
-    workerImage: options.workerImage,
+    childSessionToken: childToken,
+    workerImage: profile.image,
     taskPathInWorkspace: task.pathInWorkspace,
     resultPathInWorkspace,
-    baseEnv: deps.baseEnv ?? {},
+    profileEnv: profile.env,
+    opencodeConfigContent: profile.opencodeConfigContent,
   });
 
   console.error(`orchestrator: starting agent in child session`);
   await updateState("agent_running");
-  const run = await deps.cli(runArgs(spec, deps.config.socketPath), childEnv, "inherit");
+  const run = await transport.run(spec, childToken);
   if (run.code !== 0) {
     throw new DockerHelperError(
       "cli_failure",

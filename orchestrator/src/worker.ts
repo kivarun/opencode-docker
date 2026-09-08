@@ -1,14 +1,20 @@
+export interface WorkerMount {
+  source: string;
+  target: string;
+}
+
 export interface WorkerSpec {
   image: string;
   entrypoint?: string;
   command: string[];
   workdir: string;
-  mount: string;
+  mounts: WorkerMount[];
   containerEnv: Record<string, string>;
 }
 
 export const DEFAULT_WORKER_IMAGE = "alpine:3.22";
 export const DEFAULT_WORKSPACE_MOUNT_TARGET = "/workspace";
+export const WORKSPACE_MOUNT_SOURCE = ".";
 export const SMOKE_ENV_RUN_ID = "SMOKE_RUN_ID";
 export const SESSION_TOKEN_ENV = "DOCKER_HELPER_SESSION_TOKEN";
 
@@ -18,14 +24,7 @@ export const AGENT_SMOKE_TASK_PATH_ENV = "AGENT_SMOKE_TASK_PATH";
 export const AGENT_SMOKE_RESULT_PATH_ENV = "AGENT_SMOKE_RESULT_PATH";
 
 export const AGENT_SMOKE_ENTRYPOINT = "opencode";
-
-export const AGENT_WORKER_ENV_ALLOWLIST = [
-  "LLM_SERVER",
-  "LLM_KEY",
-  "OPENCODE_CONFIG_CONTENT",
-  "OPENCODE_ENABLE_EXA",
-  "OPENCODE_EXPERIMENTAL_LSP_TOOL",
-] as const;
+export const OPENCODE_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT";
 
 export const WORKER_SCRIPT = `
 set -eu
@@ -46,6 +45,10 @@ fi
 } > "$dir/result.json"
 `;
 
+export function workspaceMount(): WorkerMount {
+  return { source: WORKSPACE_MOUNT_SOURCE, target: DEFAULT_WORKSPACE_MOUNT_TARGET };
+}
+
 export function smokeWorkerSpec(
   runId: string,
   childSessionToken: string,
@@ -55,7 +58,7 @@ export function smokeWorkerSpec(
     image: workerImage,
     command: ["/bin/sh", "-eu", "-c", WORKER_SCRIPT],
     workdir: DEFAULT_WORKSPACE_MOUNT_TARGET,
-    mount: `.:${DEFAULT_WORKSPACE_MOUNT_TARGET}`,
+    mounts: [workspaceMount()],
     containerEnv: {
       [SMOKE_ENV_RUN_ID]: runId,
       [SESSION_TOKEN_ENV]: childSessionToken,
@@ -69,14 +72,9 @@ export function agentWorkerSpec(params: {
   workerImage: string;
   taskPathInWorkspace: string;
   resultPathInWorkspace: string;
-  baseEnv: Readonly<Record<string, string | undefined>>;
+  profileEnv: Readonly<Record<string, string>>;
+  opencodeConfigContent: string;
 }): WorkerSpec {
-  const containerEnv = agentContainerEnv(params.baseEnv, {
-    [SESSION_TOKEN_ENV]: params.childSessionToken,
-    [AGENT_SMOKE_RUN_ID_ENV]: params.runId,
-    [AGENT_SMOKE_TASK_PATH_ENV]: inWorkspace(params.taskPathInWorkspace),
-    [AGENT_SMOKE_RESULT_PATH_ENV]: inWorkspace(params.resultPathInWorkspace),
-  });
   return {
     image: params.workerImage,
     entrypoint: AGENT_SMOKE_ENTRYPOINT,
@@ -88,28 +86,20 @@ export function agentWorkerSpec(params: {
       agentInstruction(params.taskPathInWorkspace, params.resultPathInWorkspace, params.runId),
     ],
     workdir: DEFAULT_WORKSPACE_MOUNT_TARGET,
-    mount: `.:${DEFAULT_WORKSPACE_MOUNT_TARGET}`,
-    containerEnv,
+    mounts: [workspaceMount()],
+    containerEnv: {
+      ...params.profileEnv,
+      [OPENCODE_CONFIG_CONTENT_ENV]: params.opencodeConfigContent,
+      [SESSION_TOKEN_ENV]: params.childSessionToken,
+      [AGENT_SMOKE_RUN_ID_ENV]: params.runId,
+      [AGENT_SMOKE_TASK_PATH_ENV]: inWorkspace(params.taskPathInWorkspace),
+      [AGENT_SMOKE_RESULT_PATH_ENV]: inWorkspace(params.resultPathInWorkspace),
+    },
   };
 }
 
 function inWorkspace(relative: string): string {
   return `${DEFAULT_WORKSPACE_MOUNT_TARGET}/${relative}`;
-}
-
-export function agentContainerEnv(
-  baseEnv: Readonly<Record<string, string | undefined>>,
-  runEnv: Record<string, string>,
-): Record<string, string> {
-  const containerEnv: Record<string, string> = {};
-  for (const key of AGENT_WORKER_ENV_ALLOWLIST) {
-    const value = baseEnv[key];
-    if (typeof value === "string" && value !== "") {
-      containerEnv[key] = value;
-    }
-  }
-  Object.assign(containerEnv, runEnv);
-  return containerEnv;
 }
 
 export function agentInstruction(
@@ -127,36 +117,4 @@ export function agentInstruction(
     "Do not list the task file in artifacts.",
     "The result file must contain valid JSON and nothing else.",
   ].join(" ");
-}
-
-export function runArgs(
-  spec: WorkerSpec,
-  socketPath: string,
-): string[] {
-  const args = [
-    "run",
-    "--endpoint",
-    socketPath,
-    "--image",
-    spec.image,
-  ];
-  if (spec.entrypoint !== undefined) {
-    args.push("--entrypoint", spec.entrypoint);
-  }
-  args.push(
-    "--workdir",
-    spec.workdir,
-    "--mount",
-    spec.mount,
-  );
-  for (const [key, value] of Object.entries(spec.containerEnv)) {
-    args.push("--env", `${key}=${value}`);
-  }
-  args.push("--");
-  args.push(...spec.command);
-  return args;
-}
-
-export function pullArgs(image: string, socketPath: string): string[] {
-  return ["pull", "--endpoint", socketPath, image];
 }

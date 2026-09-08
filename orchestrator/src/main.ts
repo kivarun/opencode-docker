@@ -4,17 +4,11 @@ import {
   type CliRunner,
   type CliStdio,
 } from "./docker_helper.ts";
+import { HttpHelperTransport } from "./helper_api.ts";
 import { resolveHelperConfig } from "./launcher.ts";
 import { runAgentSmoke, type AgentSmokeOptions } from "./agent_smoke.ts";
 import { runSmoke, type SmokeOptions } from "./smoke.ts";
 import { DEFAULT_WORKER_IMAGE } from "./worker.ts";
-
-interface ParsedCommon {
-  workspace: string;
-  workerImage: string | null;
-  workerImageExplicit: boolean;
-  launcherId?: string;
-}
 
 interface ParsedSmokeArgs {
   kind: "smoke";
@@ -26,7 +20,8 @@ interface ParsedSmokeArgs {
 interface ParsedAgentSmokeArgs {
   kind: "agent-smoke";
   workspace: string;
-  workerImage: string;
+  configRoot: string;
+  profileName: string;
   launcherId?: string;
   taskPath?: string;
 }
@@ -56,18 +51,38 @@ function usage(): string {
     `  --image WORKER_IMAGE    worker container image (default: ${DEFAULT_WORKER_IMAGE})`,
     "",
     "agent-smoke flags:",
-    "  --image WORKER_IMAGE    OpenCode agent image (required; explicit opt-in)",
+    "  --config-root PATH      operator-controlled configuration root; must exist and be",
+    "                          visible to the orchestrator at this absolute path",
+    "  --profile NAME          execution profile to run under; loaded from",
+    "                          <config-root>/profiles/<name>.json",
     "  --task PATH             task file for the agent; must be a regular file inside the",
     "                          workspace (default: <workspace>/TASK.md); the file content is",
     "                          never embedded in command lines, environment or logs",
     "",
-    "The agent worker environment is an explicit allowlist: LLM_SERVER, LLM_KEY,",
-    "OPENCODE_CONFIG_CONTENT, OPENCODE_ENABLE_EXA, OPENCODE_EXPERIMENTAL_LSP_TOOL",
-    "(when present in the orchestrator environment), the child session bearer token",
-    "and non-secret run parameters (AGENT_SMOKE_RUN_ID, AGENT_SMOKE_TASK_PATH,",
-    "AGENT_SMOKE_RESULT_PATH). Launcher credentials, admin tokens and the orchestrator",
-    "state path are never forwarded. OPENCODE_CONFIG_CONTENT may carry the operator's",
-    "opencode.json so the agent image runs with the existing model/provider config.",
+    "The execution profile owns the trusted worker configuration: the worker image, the",
+    "OpenCode configuration file and the exact environment bindings. There is no --image",
+    "flag for agent-smoke; the image comes only from the selected profile.",
+    "",
+    "Profile schema (schema_version 1):",
+    '  {"schema_version":1,"image":"<worker image>","opencode_config":"<path relative to the',
+    '   configuration root>","env":{"DEST":{"from_env":"SOURCE_VAR","required":true|false}}}',
+    "",
+    "Profile rules:",
+    "  - unknown and missing fields are rejected; schema_version must be 1",
+    "  - the profile name is a single safe path component; the profile file and the OpenCode",
+    "    configuration must be regular files that resolve inside the configuration root",
+    "  - env bindings are exact: only declared variables reach the worker, there is no",
+    "    ambient inheritance; a missing required source variable fails before any child",
+    "    session is created; a missing optional source variable is not forwarded",
+    "  - orchestrator-owned control variables (DOCKER_HELPER_*, AGENT_SMOKE_*,",
+    "    ORCHESTRATOR_*, OPENCODE_CONFIG_CONTENT) can be neither destinations nor sources",
+    "  - profile files may reference secret environment-variable names but must never",
+    "    contain secret values; resolved values are passed to the worker through the",
+    "    docker-helper HTTP API over its unix socket and never appear in argv, logs or",
+    "    state files",
+    "",
+    "The OpenCode configuration is read by the orchestrator from the path given by",
+    "opencode_config and forwarded to the worker as OPENCODE_CONFIG_CONTENT.",
     "",
     "The launcher credential is read from",
     "  ${XDG_CONFIG_HOME:-$HOME/.config}/docker-helper/credential.token",
@@ -98,8 +113,9 @@ function parseCommand(kind: "smoke" | "agent-smoke", argv: string[]): ParsedComm
   const defaultWorkspace = process.env.SMOKE_WORKSPACE?.trim() || "/workspace";
   let workspace: string | null = null;
   let workerImage: string | null = null;
-  let workerImageExplicit = false;
   let launcherId: string | undefined;
+  let configRoot: string | null = null;
+  let profileName: string | null = null;
   let taskPath: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
@@ -112,9 +128,24 @@ function parseCommand(kind: "smoke" | "agent-smoke", argv: string[]): ParsedComm
       workspace = value;
       i = next;
     } else if (arg === "--image" || arg.startsWith("--image=")) {
+      if (kind === "agent-smoke") {
+        throw new Error(
+          "agent-smoke does not accept --image; the worker image comes only from the selected execution profile",
+        );
+      }
       const { value, next } = parseValue(argv, i, "--image");
       workerImage = value;
-      workerImageExplicit = true;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      if (!value.startsWith("/")) {
+        throw new Error("--config-root must be an absolute path");
+      }
+      configRoot = value;
+      i = next;
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      const { value, next } = parseValue(argv, i, "--profile");
+      profileName = value;
       i = next;
     } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
       const { value, next } = parseValue(argv, i, "--launcher-id");
@@ -132,30 +163,26 @@ function parseCommand(kind: "smoke" | "agent-smoke", argv: string[]): ParsedComm
     }
   }
 
-  const common: ParsedCommon = {
-    workspace: workspace ?? defaultWorkspace,
-    workerImage,
-    workerImageExplicit,
-    launcherId,
-  };
   if (kind === "smoke") {
     return {
       kind,
-      workspace: common.workspace,
-      workerImage: common.workerImage ?? DEFAULT_WORKER_IMAGE,
-      launcherId: common.launcherId,
+      workspace: workspace ?? defaultWorkspace,
+      workerImage: workerImage ?? DEFAULT_WORKER_IMAGE,
+      launcherId,
     };
   }
-  if (!common.workerImageExplicit) {
-    throw new Error(
-      "--image WORKER_IMAGE is required for agent-smoke (explicit opt-in for the OpenCode agent image)",
-    );
+  if (configRoot === null) {
+    throw new Error("--config-root ABSOLUTE_PATH is required for agent-smoke");
+  }
+  if (profileName === null) {
+    throw new Error("--profile PROFILE_NAME is required for agent-smoke");
   }
   return {
-    kind: "agent-smoke",
-    workspace: common.workspace,
-    workerImage: common.workerImage ?? DEFAULT_WORKER_IMAGE,
-    launcherId: common.launcherId,
+    kind,
+    workspace: workspace ?? defaultWorkspace,
+    configRoot,
+    profileName,
+    launcherId,
     taskPath,
   };
 }
@@ -223,8 +250,10 @@ async function main(): Promise<number> {
 
   const config = resolveHelperConfig(process.env);
   const runner = new SubprocessCliRunner();
+  const transport = new HttpHelperTransport(config.socketPath);
   const deps = {
     cli: (args: string[], env: Record<string, string>, stdio: CliStdio) => runner.run(args, env, stdio),
+    transport,
     fetchAuth: fetchAuthOverSocket,
     config,
     baseEnv: process.env,
@@ -232,6 +261,7 @@ async function main(): Promise<number> {
       for (const signal of ["SIGINT", "SIGTERM"] as const) {
         process.on(signal, () => {
           runner.killActive();
+          transport.cancelActive();
           handler(signal);
         });
       }
@@ -255,7 +285,8 @@ async function main(): Promise<number> {
 
   const options: AgentSmokeOptions = {
     workspace: parsed.workspace,
-    workerImage: parsed.workerImage,
+    configRoot: parsed.configRoot,
+    profileName: parsed.profileName,
     launcherId: parsed.launcherId,
     taskPath: parsed.taskPath ?? `${parsed.workspace.replace(/\/+$/, "")}/TASK.md`,
   };

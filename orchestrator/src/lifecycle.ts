@@ -4,6 +4,7 @@ import {
   type AuthFetcher,
   type CliRunner,
 } from "./docker_helper.ts";
+import type { HelperTransport } from "./helper_api.ts";
 import {
   createChildSession,
   deleteChildSession,
@@ -32,6 +33,7 @@ export class StatePersistError extends Error {
 
 export interface LifecycleDeps {
   cli: CliRunner;
+  transport?: HelperTransport;
   fetchAuth: AuthFetcher;
   config: HelperConfig;
   stateDirPath?: string;
@@ -56,7 +58,6 @@ export interface PreSessionContext {
 export interface SessionContext extends PreSessionContext {
   sessionId: string;
   childToken: string;
-  childEnv: Record<string, string>;
   checkAbort: () => void;
 }
 
@@ -74,26 +75,18 @@ export interface LifecycleOutcome {
   detail?: string;
 }
 
+const CLI_ENV_KEYS = ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DOCKER_HELPER_CONFIG"] as const;
+
 export function operatorEnv(
   baseEnv: Readonly<Record<string, string | undefined>>,
 ): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(baseEnv)) {
+  for (const key of CLI_ENV_KEYS) {
+    const value = baseEnv[key];
     if (typeof value === "string") {
       env[key] = value;
     }
   }
-  return env;
-}
-
-export function childSessionEnv(
-  baseEnv: Readonly<Record<string, string | undefined>>,
-  childToken: string,
-  socketPath: string,
-): Record<string, string> {
-  const env = operatorEnv(baseEnv);
-  env.DOCKER_HELPER_SESSION_TOKEN = childToken;
-  env.DOCKER_HELPER_SOCKET_PATH = socketPath;
   return env;
 }
 
@@ -223,7 +216,6 @@ export async function runWithChildSession(
         updateState,
         sessionId: child.sessionId,
         childToken: child.token,
-        childEnv: childSessionEnv(deps.baseEnv ?? {}, child.token, deps.config.socketPath),
         checkAbort: () => {
           if (signalBox.abort !== null) {
             throw signalBox.abort;
