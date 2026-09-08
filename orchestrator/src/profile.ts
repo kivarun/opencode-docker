@@ -58,7 +58,7 @@ export function validateProfileName(name: string): string {
 
 function expectObject(value: unknown, what: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new ProfileError(`${what} is not a JSON object`);
+    throw new ProfileError(`${what} is not a YAML mapping`);
   }
   return value as Record<string, unknown>;
 }
@@ -91,9 +91,9 @@ function expectExactKeys(
 export function parseProfileSpec(raw: string): ProfileSpec {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = Bun.YAML.parse(raw);
   } catch (cause) {
-    throw new ProfileError(`profile is not valid JSON: ${describeError(cause)}`);
+    throw new ProfileError(`profile is not valid YAML: ${describeError(cause)}`);
   }
   const obj = expectObject(parsed, "profile");
   expectExactKeys(obj, ["schema_version", "image", "opencode_config", "env"], "profile");
@@ -214,7 +214,7 @@ export async function loadProfile(
     );
   }
   const profileFile = await requireRegularFileInsideRoot(
-    join(rootCanonical, "profiles", `${profileName}.json`),
+    join(rootCanonical, "profiles", `${profileName}.yaml`),
     rootCanonical,
     "profile file",
   );

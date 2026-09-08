@@ -40,17 +40,25 @@ const BASE_ENV = {
   DOCKER_HELPER_STATE_PATH: "/host/orchestrator-state",
 };
 
-const PROFILE_BODY = JSON.stringify({
-  schema_version: 1,
-  image: PROFILE_IMAGE,
-  opencode_config: "opencode/default.json",
-  env: {
-    LLM_SERVER: { from_env: "LLM_SERVER", required: true },
-    LLM_KEY: { from_env: "LLM_KEY", required: true },
-    OPENCODE_ENABLE_EXA: { from_env: "OPENCODE_ENABLE_EXA", required: false },
-    OPENCODE_EXPERIMENTAL_LSP_TOOL: { from_env: "OPENCODE_EXPERIMENTAL_LSP_TOOL", required: false },
-  },
-});
+const PROFILE_BODY = [
+  "schema_version: 1",
+  `image: ${PROFILE_IMAGE}`,
+  "opencode_config: opencode/default.json",
+  "env:",
+  "  LLM_SERVER:",
+  "    from_env: LLM_SERVER",
+  "    required: true",
+  "  LLM_KEY:",
+  "    from_env: LLM_KEY",
+  "    required: true",
+  "  OPENCODE_ENABLE_EXA:",
+  "    from_env: OPENCODE_ENABLE_EXA",
+  "    required: false",
+  "  OPENCODE_EXPERIMENTAL_LSP_TOOL:",
+  "    from_env: OPENCODE_EXPERIMENTAL_LSP_TOOL",
+  "    required: false",
+  "",
+].join("\n");
 
 async function withFixture(
   fn: (dirs: {
@@ -74,10 +82,10 @@ async function withFixture(
   const credentialFile = join(configDir, "credential.token");
   await writeFile(credentialFile, `${LAUNCHER_TOKEN}\n`, { mode: 0o600 });
   await writeFile(join(workspace, "TASK.md"), TASK_BODY);
-  await writeFile(join(configRoot, "profiles", "default.json"), PROFILE_BODY);
+  await writeFile(join(configRoot, "profiles", "default.yaml"), PROFILE_BODY);
   await writeFile(join(configRoot, "opencode", "default.json"), OPENCODE_CONFIG);
   try {
-    await fn({ workspace, state, credentialFile, configRoot, profileFile: join(configRoot, "profiles", "default.json") });
+    await fn({ workspace, state, credentialFile, configRoot, profileFile: join(configRoot, "profiles", "default.yaml") });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -605,13 +613,13 @@ test("16. missing required source env: fails before any session is created", asy
 
 test("17. malformed profile: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
-    await writeFile(dirs.profileFile, "{ not json");
+    await writeFile(dirs.profileFile, "schema_version: [unclosed");
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
     const transport = new FakeAgentTransport({ workspace: dirs.workspace });
     const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
 
     expect(outcome.exitCode).toBe(1);
-    expect(outcome.detail).toContain("not valid JSON");
+    expect(outcome.detail).toContain("not valid YAML");
     expect(createCallCount(calls)).toBe(0);
   });
 });
@@ -620,14 +628,16 @@ test("18. profile with control destination: fails before any session is created"
   await withFixture(async (dirs) => {
     await writeFile(
       dirs.profileFile,
-      JSON.stringify({
-        schema_version: 1,
-        image: PROFILE_IMAGE,
-        opencode_config: "opencode/default.json",
-        env: {
-          OPENCODE_CONFIG_CONTENT: { from_env: "LLM_SERVER", required: false },
-        },
-      }),
+      [
+        "schema_version: 1",
+        `image: ${PROFILE_IMAGE}`,
+        "opencode_config: opencode/default.json",
+        "env:",
+        "  OPENCODE_CONFIG_CONTENT:",
+        "    from_env: LLM_SERVER",
+        "    required: false",
+        "",
+      ].join("\n"),
     );
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
     const transport = new FakeAgentTransport({ workspace: dirs.workspace });

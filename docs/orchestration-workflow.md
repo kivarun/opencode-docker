@@ -50,34 +50,36 @@ The current implementation does not yet provide:
 ## Execution profiles (implemented)
 
 The first increment of trusted execution profiles is implemented for
-`agent-smoke`. A profile is a small JSON document under an operator-controlled
+`agent-smoke`. A profile is a small YAML document under an operator-controlled
 configuration root:
 
 ```text
 <config-root>/
-  profiles/<profile-name>.json
+  profiles/<profile-name>.yaml
   opencode/<configuration files>
 ```
 
 The minimal schema (schema_version 1) is:
 
-```json
-{
-  "schema_version": 1,
-  "image": "ghcr.io/kivarun/opencode-docker/base:latest",
-  "opencode_config": "opencode/default.jsonc",
-  "env": {
-    "LLM_SERVER": {
-      "from_env": "LLM_SERVER",
-      "required": true
-    },
-    "LLM_KEY": {
-      "from_env": "LLM_KEY",
-      "required": true
-    }
-  }
-}
+```yaml
+schema_version: 1
+image: ghcr.io/kivarun/opencode-docker/base:latest
+opencode_config: opencode/default.jsonc
+
+env:
+  LLM_SERVER:
+    from_env: LLM_SERVER
+    required: true
+  LLM_KEY:
+    from_env: LLM_KEY
+    required: true
+  OPENCODE_ENABLE_EXA:
+    from_env: OPENCODE_ENABLE_EXA
+    required: false
 ```
+
+Only `.yaml` profile files are supported; JSON and `.yml` are not accepted as
+alternative profile formats.
 
 Implemented rules:
 
