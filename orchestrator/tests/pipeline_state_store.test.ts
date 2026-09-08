@@ -51,16 +51,17 @@ function commands(): PipelineRunCommand[] {
       runId: "store-run",
       workspace: "/work",
       identity: IDENTITY,
-      protectedInput: PROTECTED_INPUT,
-      initialPhase: "validating",
+      protectedInputs: [PROTECTED_INPUT],
     },
-    { kind: "enter_phase", phase: "creating_session" },
-    { kind: "session_created", sessionId: "dhs_child" },
-    { kind: "attempt_started", stateId: "execute", attempt: 1, profile: "default" },
+    { kind: "start_activation", stateId: "execute", profile: "default" },
+    { kind: "activation_session_created", sessionId: "dhs_child" },
+    { kind: "activation_agent_running" },
+    { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] },
+    { kind: "activation_cleanup_completed" },
     {
       kind: "transition_committed",
       step: { from: "execute", outcome: "completed", to: "completed", transition_index: 0 },
-      attempt: 1,
+      activationIndex: 1,
       resultSha256: "c".repeat(64),
       artifacts: ["out/product.txt"],
     },
@@ -293,7 +294,7 @@ describe("pipeline run state store", () => {
       expect(loaded?.revision).toBe(3);
       expect(loaded?.events.map((event) => event.kind)).toEqual([
         "run_created",
-        "phase_entered",
+        "activation_started",
         "session_created",
       ]);
     });

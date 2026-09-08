@@ -1,6 +1,7 @@
 import {
   reducePipelineRunCommand,
   PipelineStateError,
+  type FailureReason,
   type PipelineIdentityState,
   type PipelineRunCommand,
   type PipelineRunState,
@@ -14,10 +15,7 @@ import {
 } from "./pipeline_state_store.ts";
 import { classifyRunFailure } from "./run_errors.ts";
 import type { TransitionStep } from "./pipeline_engine.ts";
-import type {
-  RunFinalization,
-  RunStateSink,
-} from "./lifecycle.ts";
+import type { RunFinalization } from "./lifecycle.ts";
 
 /**
  * Production run state sink for `agent-smoke`: the only state adapter of that
@@ -44,8 +42,7 @@ export interface PipelineRunSinkParams {
   /** Canonical workspace path recorded as run identity. */
   workspace: string;
   identity: PipelineIdentityState;
-  protectedInput: ProtectedInputState;
-  attempt: { stateId: string; attempt: number; profile: string };
+  protectedInputs: readonly ProtectedInputState[];
   io?: PipelineStateIo;
   /** Injected clock (tests); defaults to the wall clock. */
   now?: () => Date;
@@ -56,7 +53,44 @@ export interface AcceptedAgentResultRecord {
   artifacts: readonly string[];
 }
 
-export class PipelineRunStateSink implements RunStateSink {
+/**
+ * Activation/session executor vocabulary. The multi-state runner drives this
+ * sink directly (never through the legacy smoke lifecycle); the reducer owns
+ * all ordering and coherence rules.
+ */
+export interface PipelineRunSink {
+  initialize(): Promise<void>;
+  /** Durable `activation_started`; returns the global activation index. */
+  startActivation(stateId: string, profile: string): Promise<number>;
+  /** Durable `session_created`, recorded immediately after Session create. */
+  activationSessionCreated(sessionId: string): Promise<void>;
+  /** Durable `agent_running`, recorded after the image pull. */
+  activationAgentRunning(): Promise<void>;
+  /** Durable `result_accepted` (digest + artifact paths, no summary). */
+  activationResultAccepted(accepted: AcceptedAgentResultRecord): Promise<void>;
+  /** Durable `session_cleanup_completed` after a successful Session delete. */
+  activationCleanupCompleted(): Promise<void>;
+  /** Durable activation failure with its normalized reason and cleanup outcome. */
+  activationFailed(
+    reason: FailureReason,
+    sessionCleanup: "completed" | "failed",
+  ): Promise<void>;
+  /** Engine transition hook: cursor, transition, and event in one commit. */
+  recordTransition(step: TransitionStep, accepted: AcceptedAgentResultRecord): Promise<void>;
+  recordTerminal(terminalStateId: string, terminalResult: "success" | "failed"): Promise<void>;
+  /** Authoritative final status write after the run-level signal cutoff. */
+  finalize(outcome: RunFinalization): Promise<void>;
+  /** Status for the lifecycle outcome (last known). */
+  currentStatus(): string;
+  /** Last committed (or, after a failed commit, last good) snapshot. */
+  get snapshot(): PipelineRunState | null;
+  /** Path of the durable state document (diagnostics and tests only). */
+  get statePath(): string;
+  /** True after a `durability_unknown` commit (poisoned sink). */
+  get poisoned(): boolean;
+}
+
+export class PipelineRunStateSink implements PipelineRunSink {
   private readonly store: PipelineStateStore;
   private readonly params: PipelineRunSinkParams;
   private current: PipelineRunState | null = null;
@@ -141,40 +175,55 @@ export class PipelineRunStateSink implements RunStateSink {
       runId: this.params.runId,
       workspace: this.params.workspace,
       identity: this.params.identity,
-      protectedInput: this.params.protectedInput,
-      initialPhase: "validating",
+      protectedInputs: this.params.protectedInputs,
     });
   }
 
-  async phase(status: string, sessionId?: string): Promise<void> {
-    switch (status) {
-      case "creating_session":
-        return await this.dispatch({ kind: "enter_phase", phase: "creating_session" });
-      case "session_created": {
-        if (typeof sessionId !== "string" || sessionId === "") {
-          throw new PipelineStateError("the pipeline run state requires the child session id with the session_created status");
-        }
-        return await this.dispatch({ kind: "session_created", sessionId });
-      }
-      case "agent_running":
-        return await this.dispatch({
-          kind: "attempt_started",
-          stateId: this.params.attempt.stateId,
-          attempt: this.params.attempt.attempt,
-          profile: this.params.attempt.profile,
-        });
-      default:
-        throw new PipelineStateError(
-          `the pipeline run state does not support the phase update ${JSON.stringify(status)}; run finalization goes through finalize()`,
-        );
+  async startActivation(stateId: string, profile: string): Promise<number> {
+    await this.dispatch({ kind: "start_activation", stateId, profile });
+    const snapshot = this.current;
+    if (snapshot === null) {
+      throw new PipelineStateError("the pipeline run state disappeared after start_activation");
     }
+    const activation = snapshot.activations[snapshot.activations.length - 1];
+    if (activation === undefined) {
+      throw new PipelineStateError("start_activation did not record an activation");
+    }
+    return activation.index;
+  }
+
+  async activationSessionCreated(sessionId: string): Promise<void> {
+    return await this.dispatch({ kind: "activation_session_created", sessionId });
+  }
+
+  async activationAgentRunning(): Promise<void> {
+    return await this.dispatch({ kind: "activation_agent_running" });
+  }
+
+  async activationResultAccepted(accepted: AcceptedAgentResultRecord): Promise<void> {
+    return await this.dispatch({
+      kind: "activation_result_accepted",
+      resultSha256: accepted.resultSha256,
+      artifacts: accepted.artifacts,
+    });
+  }
+
+  async activationCleanupCompleted(): Promise<void> {
+    return await this.dispatch({ kind: "activation_cleanup_completed" });
+  }
+
+  async activationFailed(
+    reason: FailureReason,
+    sessionCleanup: "completed" | "failed",
+  ): Promise<void> {
+    return await this.dispatch({ kind: "activation_failed", reason, sessionCleanup });
   }
 
   async finalize(outcome: RunFinalization): Promise<void> {
     if (this.current === null) {
       // The initial snapshot never committed: record the run so the failure
       // is durable too, then fail it. If the store is still broken, this
-      // propagates and the lifecycle reports the persist failure.
+      // propagates and the runner reports the persist failure.
       await this.initialize();
     }
     switch (outcome.status) {
@@ -195,10 +244,18 @@ export class PipelineRunStateSink implements RunStateSink {
     step: TransitionStep,
     accepted: AcceptedAgentResultRecord,
   ): Promise<void> {
+    const snapshot = this.current;
+    if (snapshot === null) {
+      throw new PipelineStateError("the pipeline run state does not exist");
+    }
+    const activation = snapshot.activations[snapshot.activations.length - 1];
+    if (activation === undefined) {
+      throw new PipelineStateError("committing a transition requires a recorded activation");
+    }
     return await this.dispatch({
       kind: "transition_committed",
       step,
-      attempt: this.params.attempt.attempt,
+      activationIndex: activation.index,
       resultSha256: accepted.resultSha256,
       artifacts: accepted.artifacts,
     });

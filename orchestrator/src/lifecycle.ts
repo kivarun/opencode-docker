@@ -11,7 +11,6 @@ import {
   type HelperConfig,
 } from "./launcher.ts";
 import { saveRunState, stateDir, type RunState } from "./state.ts";
-import type { TransitionStep } from "./pipeline_engine.ts";
 
 export class SignalAbort extends Error {
   readonly signal: "SIGINT" | "SIGTERM";
@@ -33,8 +32,8 @@ export class StatePersistError extends Error {
 
 /**
  * Run state sink: the lifecycle speaks only this vocabulary. `smoke` keeps
- * the legacy flat adapter (unchanged contract); `agent-smoke` plugs in the
- * durable pipeline run state sink and never writes the legacy smoke state.
+ * the legacy flat adapter (unchanged contract); the multi-state pipeline
+ * runner uses the dedicated pipeline run state sink instead.
  */
 export interface RunStateSink {
   /**
@@ -112,26 +111,86 @@ export class LegacyRunStateSink implements RunStateSink {
 }
 
 /**
- * Pipeline-specific extension used by `agent-smoke` to commit engine
- * transitions and the reached terminal state durably.
+ * Run-level cause and signal tracking shared by every run shape (`smoke`
+ * single-session and the multi-state pipeline runner): exactly one
+ * implementation of signal acceptance, failure/cleanup cause recording, and
+ * the finalization cutoff.
+ *
+ * Signals are recorded only while acceptance is open. The first terminal
+ * cause of the run wins: a recorded signal suppresses nothing by itself —
+ * the runner decides per operation whether a signal still participates.
+ * Acceptance closes synchronously at the cutoff (`freezeFinalStatus`),
+ * called after all cleanup has settled and before the single authoritative
+ * final state write. A signal delivered from the cutoff onwards — including
+ * while the final write is in flight — is late and can no longer change the
+ * recorded outcome or the exit code; the terminal status is written exactly
+ * once and never rewritten.
  */
-export interface PipelineTransitionSink extends RunStateSink {
-  recordTransition(
-    step: TransitionStep,
-    accepted: { resultSha256: string; artifacts: readonly string[] },
-  ): Promise<void>;
-  recordTerminal(terminalStateId: string, terminalResult: "success" | "failed"): Promise<void>;
-}
+export class RunCauseGate {
+  /** First non-signal failure of the run body (first-wins). */
+  readonly failure: { error: Error | null } = { error: null };
+  /** First cleanup failure of the run (first-wins, highest priority). */
+  readonly cleanup: { error: Error | null } = { error: null };
 
-export function isPipelineTransitionSink(sink: RunStateSink): sink is PipelineTransitionSink {
-  const candidate = sink as PipelineTransitionSink;
-  return (
-    typeof candidate.recordTransition === "function" &&
-    typeof candidate.recordTerminal === "function"
-  );
-}
+  private abort: SignalAbort | null = null;
+  private acceptSignals = true;
 
-export type StateSinkFactory = (runId: string, stateDirPath: string) => RunStateSink;
+  constructor(onSignal?: (handler: (signal: "SIGINT" | "SIGTERM") => void) => void) {
+    onSignal?.((signal) => {
+      if (!this.acceptSignals || this.abort !== null) {
+        return;
+      }
+      // Record the abort only. The caller (main.ts) forwards the signal to a
+      // running worker `run` CLI process; everything else (`session create`,
+      // `pull`, `session delete`) runs to completion. Cleanup happens inside
+      // the run body before the final state write — the fire-and-forget
+      // cleanup path is intentionally gone. docker-helper 2.1.0 cancels the
+      // container operation on the signal best-effort and does not confirm a
+      // terminal operation state.
+      this.abort = new SignalAbort(signal);
+    });
+  }
+
+  /** The recorded signal, if any. */
+  get recordedSignal(): SignalAbort | null {
+    return this.abort;
+  }
+
+  /** Throws the recorded abort if a signal was accepted before the cutoff. */
+  checkAbort(): void {
+    if (this.abort !== null) {
+      throw this.abort;
+    }
+  }
+
+  recordFailure(cause: unknown): void {
+    this.failure.error = cause instanceof Error ? cause : new Error(String(cause));
+  }
+
+  /** First-wins cleanup failure recording. */
+  recordCleanupFailure(cause: unknown): void {
+    if (this.cleanup.error !== null) {
+      return;
+    }
+    this.cleanup.error = cause instanceof Error ? cause : new Error(String(cause));
+  }
+
+  /**
+   * The cutoff. Cleanup has settled; compute the final status synchronously
+   * from the accepted causes, then close signal acceptance with no await
+   * between the cause snapshot and this line.
+   */
+  freezeFinalStatus(): "success" | "failed" | "cleanup_failed" {
+    const status =
+      this.cleanup.error !== null
+        ? "cleanup_failed"
+        : this.failure.error === null && this.abort === null
+          ? "success"
+          : "failed";
+    this.acceptSignals = false;
+    return status;
+  }
+}
 
 export interface LifecycleDeps {
   cli: CliRunner;
@@ -151,22 +210,16 @@ export interface LifecycleOptions {
   launcherId?: string;
 }
 
-export interface PreSessionContext {
+export interface SessionContext {
   runId: string;
-  updateState: (status: string) => Promise<void>;
-}
-
-export interface SessionContext extends PreSessionContext {
   sessionId: string;
   childToken: string;
   childEnv: Record<string, string>;
   checkAbort: () => void;
-  /** Present only when the command runs on the pipeline run state sink. */
-  transitionSink?: PipelineTransitionSink;
+  updateState: (status: string) => Promise<void>;
 }
 
 export interface LifecycleHooks {
-  preSession?: (ctx: PreSessionContext) => Promise<void>;
   withSession?: (ctx: SessionContext) => Promise<void>;
 }
 
@@ -204,39 +257,88 @@ export function operatorEnv(
   return env;
 }
 
+/** Run-level authority prelude shared by the smoke and pipeline runners. */
+export interface LifecycleAuthority {
+  auth: Awaited<ReturnType<typeof requireLauncherCredential>>;
+  baseOperatorEnv: Record<string, string>;
+}
+
+export async function lifecycleAuthority(
+  deps: LifecycleDeps,
+  options: { workspace: string; launcherId?: string },
+): Promise<LifecycleAuthority> {
+  const baseOperatorEnv = operatorEnv(deps.baseEnv ?? {});
+  const auth = await requireLauncherCredential(
+    deps.config,
+    deps.fetchAuth,
+    defaultFileExists,
+  );
+  if (
+    options.launcherId !== undefined &&
+    auth.launcher_id !== options.launcherId
+  ) {
+    throw new DockerHelperError(
+      "wrong_authority",
+      `installed credential belongs to launcher ${auth.launcher_id ?? "unknown"}, expected ${options.launcherId} (point XDG_CONFIG_HOME at the directory holding the intended credential.token)`,
+    );
+  }
+  console.error(
+    `orchestrator: launcher credential ok (launcher ${auth.launcher_id ?? "unknown"}, principal ${auth.principal ?? "unknown"})`,
+  );
+  return { auth, baseOperatorEnv };
+}
+
+/**
+ * Run-level exit-code computation shared by every run shape: a cleanup
+ * failure is exit 1, an accepted signal keeps its conventional exit code,
+ * any other failure is exit 1, success is 0.
+ */
+export function runOutcomeExitCode(
+  failure: Error | null,
+  cleanupError: Error | null,
+  signal: SignalAbort | null,
+): number {
+  if (cleanupError !== null) {
+    return 1;
+  }
+  if (signal !== null) {
+    return signalExitCode(signal.signal);
+  }
+  if (failure !== null) {
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * Runs the smoke command: one child Session, one worker run, one result
+ * verification. The legacy flat run state is kept byte-for-byte compatible.
+ */
 export async function runWithChildSession(
   deps: LifecycleDeps,
   options: LifecycleOptions,
   hooks: LifecycleHooks,
   label: string,
-  makeStateSink?: StateSinkFactory,
 ): Promise<LifecycleOutcome> {
   const runId = deps.randomId ? deps.randomId() : crypto.randomUUID();
   const nowFn = (): Date => (deps.now ? deps.now() : new Date());
   const startedAt = nowFn().toISOString();
   const stateDirPath = deps.stateDirPath ?? stateDir(deps.baseEnv ?? {});
   const workspaceExists = deps.workspaceExists ?? defaultWorkspaceExists;
-  const baseOperatorEnv = operatorEnv(deps.baseEnv ?? {});
 
-  const sink: RunStateSink = makeStateSink
-    ? makeStateSink(runId, stateDirPath)
-    : new LegacyRunStateSink(
-        stateDirPath,
-        {
-          runId,
-          workspace: options.workspace,
-          workerImage: options.workerImage,
-          startedAt,
-        },
-        nowFn,
-      );
-  const transitionSink = isPipelineTransitionSink(sink) ? sink : undefined;
+  const sink = new LegacyRunStateSink(
+    stateDirPath,
+    {
+      runId,
+      workspace: options.workspace,
+      workerImage: options.workerImage,
+      startedAt,
+    },
+    nowFn,
+  );
 
   let childSessionId: string | null = null;
-  const failureBox: { error: Error | null } = { error: null };
-  const cleanupBox: { error: Error | null } = { error: null };
-  const signalBox: { abort: SignalAbort | null } = { abort: null };
-  let acceptSignals = true;
+  const gate = new RunCauseGate(deps.onSignal);
   let cleanupPromise: Promise<void> | null = null;
 
   const cleanup = (): Promise<void> => {
@@ -246,32 +348,14 @@ export async function runWithChildSession(
           return;
         }
         try {
-          await deleteChildSession(deps.cli, deps.config, childSessionId, baseOperatorEnv);
+          await deleteChildSession(deps.cli, deps.config, childSessionId, operatorEnv(deps.baseEnv ?? {}));
         } catch (cause) {
-          cleanupBox.error = cause instanceof Error ? cause : new Error(String(cause));
+          gate.recordCleanupFailure(cause);
         }
       })();
     }
     return cleanupPromise;
   };
-
-  deps.onSignal?.((signal) => {
-    if (!acceptSignals || signalBox.abort !== null) {
-      return;
-    }
-    // Record the abort only. The caller (main.ts) forwards the signal to a
-    // running worker `run` CLI process; everything else (`session create`,
-    // `pull`, `session delete`) runs to completion. Cleanup happens solely in
-    // the lifecycle `finally`, after the active hook settles — the fire-and-
-    // forget cleanup path is intentionally gone. docker-helper 2.1.0 cancels
-    // the container operation on the signal best-effort and does not confirm
-    // a terminal operation state. Acceptance closes synchronously after
-    // cleanup and before the single authoritative final state write (see the
-    // end of the `finally` below); a signal delivered after that cutoff —
-    // including while the final write is in flight — is late and can no
-    // longer change the recorded outcome or the exit code.
-    signalBox.abort = new SignalAbort(signal);
-  });
 
   const updateState = (status: string): Promise<void> => sink.phase(status);
 
@@ -285,92 +369,47 @@ export async function runWithChildSession(
       );
     }
 
-    const auth = await requireLauncherCredential(
-      deps.config,
-      deps.fetchAuth,
-      defaultFileExists,
-    );
-    if (
-      options.launcherId !== undefined &&
-      auth.launcher_id !== options.launcherId
-    ) {
-      throw new DockerHelperError(
-        "wrong_authority",
-        `installed credential belongs to launcher ${auth.launcher_id ?? "unknown"}, expected ${options.launcherId} (point XDG_CONFIG_HOME at the directory holding the intended credential.token)`,
-      );
-    }
-    console.error(
-      `orchestrator: launcher credential ok (launcher ${auth.launcher_id ?? "unknown"}, principal ${auth.principal ?? "unknown"})`,
-    );
+    const { auth, baseOperatorEnv } = await lifecycleAuthority(deps, options);
 
     await updateState("creating_session");
 
-    if (signalBox.abort !== null) {
-      throw signalBox.abort;
-    }
-
-    if (hooks.preSession !== undefined) {
-      await hooks.preSession({ runId, updateState });
-      if (signalBox.abort !== null) {
-        throw signalBox.abort;
-      }
-    }
-
-    const child = await createChildSession(deps.cli, deps.config, options.workspace, baseOperatorEnv);
-    childSessionId = child.sessionId;
-
-    if (
-      auth.launcher_id !== undefined &&
-      child.launcherId !== undefined &&
-      child.launcherId !== auth.launcher_id
-    ) {
-      throw new DockerHelperError(
-        "unexpected_response",
-        `created session belongs to launcher ${child.launcherId}, expected ${auth.launcher_id}`,
-      );
-    }
-    console.error(`orchestrator: child session ${child.sessionId} created`);
-    await sink.phase("session_created", child.sessionId);
-
-    if (signalBox.abort !== null) {
-      throw signalBox.abort;
-    }
+    gate.checkAbort();
 
     if (hooks.withSession !== undefined) {
+      const child = await createChildSession(deps.cli, deps.config, options.workspace, baseOperatorEnv);
+      childSessionId = child.sessionId;
+
+      if (
+        auth.launcher_id !== undefined &&
+        child.launcherId !== undefined &&
+        child.launcherId !== auth.launcher_id
+      ) {
+        throw new DockerHelperError(
+          "unexpected_response",
+          `created session belongs to launcher ${child.launcherId}, expected ${auth.launcher_id}`,
+        );
+      }
+      console.error(`orchestrator: child session ${child.sessionId} created`);
+      await sink.phase("session_created", child.sessionId);
+
+      gate.checkAbort();
+
       await hooks.withSession({
         runId,
-        updateState,
         sessionId: child.sessionId,
         childToken: child.token,
         childEnv: childSessionEnv(child.token),
-        checkAbort: () => {
-          if (signalBox.abort !== null) {
-            throw signalBox.abort;
-          }
-        },
-        transitionSink,
+        checkAbort: () => gate.checkAbort(),
+        updateState,
       });
     }
   } catch (cause) {
-    failureBox.error = cause instanceof Error ? cause : new Error(String(cause));
+    gate.recordFailure(cause);
   } finally {
     await cleanup();
-    // Signal cutoff. Cleanup has settled; snapshot the accepted causes and
-    // compute the final status synchronously, then close signal acceptance
-    // with no await between the cause snapshot and this line. A signal
-    // delivered from here on — including while the single authoritative
-    // final state write is in flight — is late and can no longer change the
-    // recorded outcome or the exit code. The terminal status is written
-    // exactly once and is never rewritten afterwards.
-    const finalFailure = failureBox.error;
-    const finalSignal = signalBox.abort;
-    const finalStatus =
-      cleanupBox.error !== null
-        ? "cleanup_failed"
-        : finalFailure === null && finalSignal === null
-          ? "success"
-          : "failed";
-    acceptSignals = false;
+    const finalFailure = gate.failure.error;
+    const finalSignal = gate.recordedSignal;
+    const finalStatus = gate.freezeFinalStatus();
     try {
       await sink.finalize({
         status: finalStatus,
@@ -379,12 +418,12 @@ export async function runWithChildSession(
         sessionId: childSessionId,
       });
     } catch (cause) {
-      failureBox.error ??= cause instanceof Error ? cause : new StatePersistError();
+      gate.failure.error ??= cause instanceof Error ? cause : new StatePersistError();
     }
   }
 
-  const failure = failureBox.error;
-  const cleanupError = cleanupBox.error;
+  const failure = gate.failure.error;
+  const cleanupError = gate.cleanup.error;
   if (failure !== null && !(failure instanceof SignalAbort)) {
     console.error(`orchestrator: ${label} failed: ${failure.message}`);
   }
@@ -392,16 +431,7 @@ export async function runWithChildSession(
     console.error(`orchestrator: cleanup failed: ${cleanupError.message}`);
   }
 
-  let exitCode: number;
-  if (cleanupError !== null) {
-    exitCode = 1;
-  } else if (signalBox.abort !== null) {
-    exitCode = signalExitCode(signalBox.abort.signal);
-  } else if (failure !== null) {
-    exitCode = 1;
-  } else {
-    exitCode = 0;
-  }
+  const exitCode = runOutcomeExitCode(failure, cleanupError, gate.recordedSignal);
 
   return {
     ok: exitCode === 0,

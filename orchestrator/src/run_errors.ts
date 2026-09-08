@@ -9,7 +9,7 @@ import type { FailureReason } from "./pipeline_state.ts";
 import type { SignalAbort } from "./lifecycle.ts";
 
 /**
- * Failure types of the one-step agent run and their mapping to the
+ * Failure types of the multi-state agent run and their mapping to the
  * normalized, text-free failure reasons of the durable pipeline run state.
  */
 
@@ -26,6 +26,19 @@ export class WorkspaceInputError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "WorkspaceInputError";
+  }
+}
+
+/**
+ * A runtime input declared by an agent state is missing or invalid at
+ * activation time. Unprotected inputs may be produced by an earlier state of
+ * the same run; a missing one fails the pipeline before the consuming
+ * state's Session is created.
+ */
+export class RuntimeInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RuntimeInputError";
   }
 }
 
@@ -62,6 +75,9 @@ export function classifyRunFailure(
   }
   if (failure instanceof WorkspaceInputError) {
     return "protected_input_modified";
+  }
+  if (failure instanceof RuntimeInputError) {
+    return "runtime_input_missing";
   }
   if (failure instanceof PipelineExecutionError) {
     switch (failure.reason) {

@@ -10,6 +10,7 @@ import {
   type PipelineStateIo,
 } from "../src/pipeline_state_store.ts";
 import type { TransitionStep } from "../src/pipeline_engine.ts";
+import { DockerHelperError } from "../src/docker_helper.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
 
 const IDENTITY = {
@@ -41,8 +42,7 @@ function makeSink(io: PipelineStateIo, root: string, runId = "sink-run"): Pipeli
     runId,
     workspace: "/work",
     identity: IDENTITY,
-    protectedInput: PROTECTED_INPUT,
-    attempt: { stateId: "execute", attempt: 1, profile: "default" },
+    protectedInputs: [PROTECTED_INPUT],
     io,
     now: tick,
   });
@@ -66,25 +66,32 @@ async function committedSnapshotRevision(root: string): Promise<number> {
   return raw.revision;
 }
 
+/** Drives one activation (start, session, agent run, result) up to cleanup. */
+async function runActivationToAccepted(sink: PipelineRunStateSink, sessionId = "s1"): Promise<void> {
+  await sink.startActivation("execute", "default");
+  await sink.activationSessionCreated(sessionId);
+  await sink.activationAgentRunning();
+  await sink.activationResultAccepted({ resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] });
+}
+
 describe("pipeline run state sink", () => {
   test("a not_committed commit leaves the previous revision authoritative and writable", async () => {
     await withRoot(async (root) => {
-      const sink = makeSink(faultIo({ failCommit: 5, failStep: "sync" }), root);
+      const sink = makeSink(faultIo({ failCommit: 7, failStep: "sync" }), root);
       await sink.initialize();
-      await sink.phase("creating_session");
-      await sink.phase("session_created", "dhs_child");
-      await sink.phase("agent_running");
+      await runActivationToAccepted(sink);
+      await sink.activationCleanupCompleted();
 
       const error = await sink
-        .recordTransition(STEP, { resultSha256: "c".repeat(64), artifacts: [] })
+        .recordTransition(STEP, { resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] })
         .catch((cause: unknown) => cause);
       // typed not_committed outcome: the store wrapped it, the sink did not
       // adopt anything and is not poisoned
       expect(error).toBeInstanceOf(PipelineStateStoreError);
       expect(error).not.toBeInstanceOf(PipelineStateDurabilityError);
       expect(sink.poisoned).toBe(false);
-      expect(sink.snapshot?.revision).toBe(4);
-      expect(await committedSnapshotRevision(root)).toBe(4);
+      expect(sink.snapshot?.revision).toBe(6);
+      expect(await committedSnapshotRevision(root)).toBe(6);
       expect(await readFile(statePath(root), "utf8")).toContain('"status": "active"');
 
       // the run can still record the normalized failure durably
@@ -92,10 +99,10 @@ describe("pipeline run state sink", () => {
         status: "failed",
         failure: error as Error,
         signal: null,
-        sessionId: "dhs_child",
+        sessionId: "s1",
       });
       const finalState = JSON.parse(await readFile(statePath(root), "utf8"));
-      expect(finalState.revision).toBe(5);
+      expect(finalState.revision).toBe(7);
       expect(finalState.status).toBe("failed");
       expect(finalState.failure).toEqual({ reason: "state_persist_failed" });
     });
@@ -103,25 +110,24 @@ describe("pipeline run state sink", () => {
 
   test("a durability_unknown commit adopts the candidate and poisons the sink", async () => {
     await withRoot(async (root) => {
-      const sink = makeSink(faultIo({ failCommit: 5, failStep: "dirsync" }), root);
+      const sink = makeSink(faultIo({ failCommit: 7, failStep: "dirsync" }), root);
       await sink.initialize();
-      await sink.phase("creating_session");
-      await sink.phase("session_created", "dhs_child");
-      await sink.phase("agent_running");
+      await runActivationToAccepted(sink);
+      await sink.activationCleanupCompleted();
 
       const error = await sink
-        .recordTransition(STEP, { resultSha256: "c".repeat(64), artifacts: [] })
+        .recordTransition(STEP, { resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] })
         .catch((cause: unknown) => cause);
       expect(error).toBeInstanceOf(PipelineStateDurabilityError);
       const durability = error as PipelineStateDurabilityError;
-      expect(durability.revision).toBe(5);
+      expect(durability.revision).toBe(7);
       expect(durability.candidate.status).toBe("active");
       expect(durability.message).toContain("durability could not be confirmed");
       // the sink adopted the visible candidate, not the previous revision
       expect(sink.poisoned).toBe(true);
-      expect(sink.snapshot?.revision).toBe(5);
+      expect(sink.snapshot?.revision).toBe(7);
       expect(sink.snapshot?.cursor).toEqual({ current_state: "completed", transition_count: 1 });
-      expect(await committedSnapshotRevision(root)).toBe(5);
+      expect(await committedSnapshotRevision(root)).toBe(7);
 
       // the poisoned sink refuses every further write without touching disk
       const before = await readFile(statePath(root), "utf8");
@@ -131,13 +137,14 @@ describe("pipeline run state sink", () => {
           status: "failed",
           failure: error as Error,
           signal: null,
-          sessionId: "dhs_child",
+          sessionId: "s1",
         }),
       ).rejects.toThrow(/poisoned/);
-      await expect(sink.phase("creating_session")).rejects.toThrow(/poisoned/);
+      await expect(sink.startActivation("execute", "default")).rejects.toThrow(/poisoned/);
+      await expect(sink.activationFailed("worker_failed", "completed")).rejects.toThrow(/poisoned/);
       await expect(sink.initialize()).rejects.toThrow(/poisoned/);
       expect(await readFile(statePath(root), "utf8")).toBe(before);
-      expect(await committedSnapshotRevision(root)).toBe(5);
+      expect(await committedSnapshotRevision(root)).toBe(7);
     });
   });
 
@@ -152,7 +159,75 @@ describe("pipeline run state sink", () => {
       expect(sink.snapshot?.revision).toBe(1);
       expect(sink.snapshot?.status).toBe("active");
       expect(await committedSnapshotRevision(root)).toBe(1);
-      await expect(sink.phase("creating_session")).rejects.toThrow(/poisoned/);
+      await expect(sink.startActivation("execute", "default")).rejects.toThrow(/poisoned/);
+    });
+  });
+
+  test("the activation lifecycle records the exact ordered journal", async () => {
+    await withRoot(async (root) => {
+      const sink = makeSink(faultIo({ failCommit: 0 }), root);
+      await sink.initialize();
+      const index = await sink.startActivation("execute", "default");
+      expect(index).toBe(1);
+      await sink.activationSessionCreated("s1");
+      await sink.activationAgentRunning();
+      await sink.activationResultAccepted({ resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] });
+      await sink.activationCleanupCompleted();
+      await sink.recordTransition(STEP, { resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] });
+      await sink.recordTerminal("completed", "success");
+      await sink.finalize({ status: "success", failure: null, signal: null, sessionId: "s1" });
+
+      const state = JSON.parse(await readFile(statePath(root), "utf8"));
+      expect(state.status).toBe("success");
+      expect(state.activations).toHaveLength(1);
+      expect(state.activations[0]).toMatchObject({
+        index: 1,
+        state_id: "execute",
+        attempt: 1,
+        profile: "default",
+        phase: "session_cleanup_completed",
+        session_id: "s1",
+        session_cleanup: "completed",
+      });
+      expect(state.transitions[0]).toMatchObject({ activation_index: 1, from: "execute", to: "completed" });
+      expect(state.events.map((event: { kind: string }) => event.kind)).toEqual([
+        "run_created",
+        "activation_started",
+        "session_created",
+        "agent_running",
+        "result_accepted",
+        "session_cleanup_completed",
+        "transition_committed",
+        "terminal_reached",
+        "run_succeeded",
+      ]);
+      // no summary text anywhere in the durable document
+      expect(await readFile(statePath(root), "utf8")).not.toContain("summary");
+    });
+  });
+
+  test("an activation failure with its cleanup outcome is recorded and finalizes", async () => {
+    await withRoot(async (root) => {
+      const sink = makeSink(faultIo({ failCommit: 0 }), root);
+      await sink.initialize();
+      await sink.startActivation("execute", "default");
+      await sink.activationSessionCreated("s1");
+      await sink.activationAgentRunning();
+      await sink.activationFailed("worker_failed", "completed");
+      await sink.finalize({
+        status: "failed",
+        failure: new DockerHelperError("cli_failure", "agent container failed (exit 1)"),
+        signal: null,
+        sessionId: "s1",
+      });
+      const state = JSON.parse(await readFile(statePath(root), "utf8"));
+      expect(state.status).toBe("failed");
+      expect(state.failure).toEqual({ reason: "worker_failed" });
+      expect(state.activations[0]).toMatchObject({
+        phase: "failed",
+        failure_reason: "worker_failed",
+        session_cleanup: "completed",
+      });
     });
   });
 });

@@ -20,8 +20,12 @@ export const SESSION_TOKEN_ENV = "DOCKER_HELPER_SESSION_TOKEN";
 
 export const AGENT_SMOKE_DIR = ".pipeline-agent-smoke";
 export const AGENT_SMOKE_RUN_ID_ENV = "AGENT_SMOKE_RUN_ID";
-export const AGENT_SMOKE_INPUT_PATH_ENV = "AGENT_SMOKE_INPUT_PATH";
+export const AGENT_SMOKE_STATE_ID_ENV = "AGENT_SMOKE_STATE_ID";
+export const AGENT_SMOKE_ACTIVATION_INDEX_ENV = "AGENT_SMOKE_ACTIVATION_INDEX";
+export const AGENT_SMOKE_ATTEMPT_ENV = "AGENT_SMOKE_ATTEMPT";
 export const AGENT_SMOKE_RESULT_PATH_ENV = "AGENT_SMOKE_RESULT_PATH";
+/** Per-input env var prefix; the input id is appended verbatim. */
+export const AGENT_SMOKE_INPUT_ENV_PREFIX = "AGENT_SMOKE_INPUT_";
 
 export const AGENT_SMOKE_ENTRYPOINT = "opencode";
 export const OPENCODE_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT";
@@ -99,16 +103,38 @@ export function smokeWorkerSpec(
   };
 }
 
+export interface AgentWorkerInput {
+  id: string;
+  /** Workspace-relative path of the input. */
+  pathInWorkspace: string;
+}
+
 export function agentWorkerSpec(params: {
   runId: string;
+  stateId: string;
+  activationIndex: number;
+  attempt: number;
   childSessionToken: string;
   workerImage: string;
-  inputPathInWorkspace: string;
+  inputs: readonly AgentWorkerInput[];
   resultPathInWorkspace: string;
   executionDocPathInWorkspace: string;
   profileEnv: Readonly<Record<string, string>>;
   opencodeConfigContent: string;
 }): WorkerSpec {
+  const containerEnv: Record<string, string> = {
+    ...params.profileEnv,
+    [OPENCODE_CONFIG_CONTENT_ENV]: params.opencodeConfigContent,
+    [SESSION_TOKEN_ENV]: params.childSessionToken,
+    [AGENT_SMOKE_RUN_ID_ENV]: params.runId,
+    [AGENT_SMOKE_STATE_ID_ENV]: params.stateId,
+    [AGENT_SMOKE_ACTIVATION_INDEX_ENV]: String(params.activationIndex),
+    [AGENT_SMOKE_ATTEMPT_ENV]: String(params.attempt),
+    [AGENT_SMOKE_RESULT_PATH_ENV]: inWorkspace(params.resultPathInWorkspace),
+  };
+  for (const input of params.inputs) {
+    containerEnv[`${AGENT_SMOKE_INPUT_ENV_PREFIX}${input.id}`] = inWorkspace(input.pathInWorkspace);
+  }
   return {
     image: params.workerImage,
     entrypoint: AGENT_SMOKE_ENTRYPOINT,
@@ -121,14 +147,7 @@ export function agentWorkerSpec(params: {
     ],
     workdir: DEFAULT_WORKSPACE_MOUNT_TARGET,
     mounts: [workspaceMount()],
-    containerEnv: {
-      ...params.profileEnv,
-      [OPENCODE_CONFIG_CONTENT_ENV]: params.opencodeConfigContent,
-      [SESSION_TOKEN_ENV]: params.childSessionToken,
-      [AGENT_SMOKE_RUN_ID_ENV]: params.runId,
-      [AGENT_SMOKE_INPUT_PATH_ENV]: inWorkspace(params.inputPathInWorkspace),
-      [AGENT_SMOKE_RESULT_PATH_ENV]: inWorkspace(params.resultPathInWorkspace),
-    },
+    containerEnv,
   };
 }
 
