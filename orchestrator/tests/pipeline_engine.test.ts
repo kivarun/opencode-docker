@@ -4,6 +4,7 @@ import {
   PipelineExecutionError,
   type AgentOutcomeExecutor,
   type AgentStateView,
+  type ReadonlyJsonValue,
   type GraphExecutionResult,
   type TransitionStep,
 } from "../src/pipeline_engine.ts";
@@ -428,6 +429,174 @@ describe("defensive fail-closed against internally contradictory resolved graphs
       throw new Error("expected PipelineExecutionError");
     }
     expect(error.reason).toBe("invalid_graph");
+  });
+});
+
+describe("deeply isolated result schema in the callback view", () => {
+  function nestedSchemaPipeline(): { pipeline: ResolvedPipeline; sourceSchema: Record<string, unknown> } {
+    const sourceSchema: Record<string, unknown> = {
+      type: "object",
+      properties: {
+        status: { type: "string" },
+        detail: {
+          type: "array",
+          items: { type: "string" },
+        },
+      },
+      required: ["status", "summary"],
+    };
+    const pipeline = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "completed", to: "done" }], { resultSchema: sourceSchema }),
+      terminalState("done", "success"),
+    ]);
+    return { pipeline, sourceSchema };
+  }
+
+  test("callback cannot mutate nested schema objects (properties.status)", async () => {
+    const { pipeline, sourceSchema } = nestedSchemaPipeline();
+    let seenSchema: unknown = null;
+    const result = await run(pipeline, (state) => {
+      seenSchema = state.resultSchema;
+      const properties = (state.resultSchema as { properties: Record<string, unknown> }).properties;
+      expect(() => {
+        (properties.status as { type: string }).type = "hijacked";
+      }).toThrow(TypeError);
+      expect((sourceSchema.properties as Record<string, unknown>).status).toEqual({ type: "string" });
+      return "completed";
+    });
+    expect(result.terminalResult).toBe("success");
+    const properties = (seenSchema as unknown as { properties: Record<string, unknown> }).properties;
+    expect(properties.status).toEqual({ type: "string" });
+    expect(Object.isFrozen(properties)).toBe(true);
+    expect(Object.isFrozen(properties.status)).toBe(true);
+  });
+
+  test("callback cannot push into nested required arrays", async () => {
+    const { pipeline, sourceSchema } = nestedSchemaPipeline();
+    const result = await run(pipeline, (state) => {
+      const required = (state.resultSchema as { required: string[] }).required;
+      expect(() => {
+        required.push("rogue");
+      }).toThrow(TypeError);
+      expect(sourceSchema.required).toEqual(["status", "summary"]);
+      return "completed";
+    });
+    expect(result.terminalResult).toBe("success");
+  });
+
+  test("callback cannot mutate nested arrays (items)", async () => {
+    const { pipeline, sourceSchema } = nestedSchemaPipeline();
+    const result = await run(pipeline, (state) => {
+      const items = (state.resultSchema as {
+        properties: { detail: { items: unknown } };
+      }).properties.detail.items;
+      expect(() => {
+        (items as { type: string }).type = "number";
+      }).toThrow(TypeError);
+      const sourceItems = (sourceSchema.properties as Record<string, unknown>).detail as {
+        items: unknown;
+      };
+      expect(sourceItems.items).toEqual({ type: "string" });
+      return "completed";
+    });
+    expect(result.terminalResult).toBe("success");
+  });
+
+  test("external mutation of the source nested schema while the callback is pending does not reach the view", async () => {
+    const { pipeline, sourceSchema } = nestedSchemaPipeline();
+    const gate: { release: () => void } = { release: () => {} };
+    let viewStatus: unknown = null;
+    let viewSummary: unknown = null;
+    const pending = executePipelineGraph(pipeline, async (state) => {
+      // external mutation happens while this callback is blocked below
+      await new Promise<void>((resolve) => {
+        gate.release = resolve;
+      });
+      const properties = (state.resultSchema as { properties: Record<string, unknown> }).properties;
+      viewStatus = properties.status;
+      viewSummary = (state.resultSchema as { properties: Record<string, unknown> }).properties.summary;
+      return "completed";
+    });
+
+    // mutate the source schema deeply while the callback is blocked
+    (sourceSchema.properties as Record<string, unknown>).status = { type: "number" };
+    const summary = { type: "string" } as unknown;
+    (sourceSchema.properties as Record<string, unknown>).summary = summary;
+    gate.release();
+
+    await pending;
+    expect(viewStatus).toEqual({ type: "string" });
+    // a nested key added to the source after compilation is absent in the view
+    expect(viewSummary).toBeUndefined();
+  });
+
+  test("attempted view mutations do not change the source pipeline", async () => {
+    const { pipeline, sourceSchema } = nestedSchemaPipeline();
+    const result = await run(pipeline, (state) => {
+      expect(Object.isFrozen(state)).toBe(true);
+      expect(() => {
+        (state.resultSchema as { type: string }).type = "hijacked";
+      }).toThrow(TypeError);
+      return "completed";
+    });
+    expect(result.terminalResult).toBe("success");
+    expect(sourceSchema.type).toBe("object");
+  });
+
+  test("corrupted non-JSON schemas are rejected as invalid_graph before the callback", async () => {
+    const cases: unknown[] = [];
+    // cyclic reference
+    const cyclic: Record<string, unknown> = { type: "object" };
+    cyclic.properties = cyclic;
+    cases.push(cyclic);
+    // function value
+    cases.push({ type: "object", validate: () => true });
+    // bigint value
+    cases.push({ type: "object", max: 10n });
+    // non-finite number
+    cases.push({ type: "object", multipleOf: Number.NaN });
+    // exotic non-plain object (Date)
+    cases.push({ type: "object", pattern: new Date() });
+    // Map instance
+    cases.push({ type: "object", mapping: new Map() });
+    // undefined property value
+    cases.push({ type: "object", hole: undefined });
+    for (const schema of cases) {
+      let callbackRuns = 0;
+      const pipeline = syntheticPipeline("a", 1, [
+        agentState("a", [{ outcome: "completed", to: "done" }], {
+          resultSchema: schema as Record<string, unknown>,
+        }),
+        terminalState("done", "success"),
+      ]);
+      const promise = executePipelineGraph(pipeline, () => {
+        callbackRuns += 1;
+        return "completed";
+      });
+      const error: unknown = await promise.catch((cause) => cause);
+      if (!(error instanceof PipelineExecutionError)) {
+        throw new Error("expected PipelineExecutionError");
+      }
+      expect(error.reason).toBe("invalid_graph");
+      expect(error.message).toContain("result schema is not a JSON value");
+      expect(callbackRuns).toBe(0);
+    }
+  });
+
+  test("valid JSON schema values (array root, string root, null root) compile", async () => {
+    for (const schema of [{ type: "object" }, ["flat"], "named-schema", null]) {
+      const pipeline = syntheticPipeline("a", 1, [
+        agentState("a", [{ outcome: "completed", to: "done" }], {
+          resultSchema: schema as unknown as Record<string, unknown>,
+        }),
+        terminalState("done", "success"),
+      ]);
+      const result = await run(pipeline, (state) => {
+        expect(state.resultSchema).toEqual(schema);
+        return "completed";
+      });
+      expect(result.terminalResult).toBe("success");
+    }
   });
 });
 

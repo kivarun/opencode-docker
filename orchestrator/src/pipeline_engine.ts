@@ -47,10 +47,22 @@ export interface AgentStateView {
   readonly promptContent: string;
   readonly inputs: readonly string[];
   readonly resultSchemaPath: string;
-  readonly resultSchema: Record<string, unknown>;
+  readonly resultSchema: ReadonlyJsonValue;
   readonly timeout_seconds: number;
   readonly max_attempts: number;
 }
+
+/**
+ * Readonly JSON value type for data that crosses the engine/callback boundary
+ * (the result schema is a JSON value, not a mutable Record).
+ */
+export type ReadonlyJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly ReadonlyJsonValue[]
+  | { readonly [key: string]: ReadonlyJsonValue };
 
 export type AgentOutcomeExecutor = (
   state: AgentStateView,
@@ -93,11 +105,86 @@ function contradiction(detail: string): PipelineExecutionError {
   );
 }
 
+function notAJsonValue(stateId: string, detail: string): PipelineExecutionError {
+  return new PipelineExecutionError(
+    "invalid_graph",
+    `agent state ${JSON.stringify(stateId)} result schema is not a JSON value: ${detail}`,
+  );
+}
+
+function isPlainJsonObject(value: object): boolean {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Builds a deep, recursively frozen snapshot of a JSON value. Cycles,
+ * non-finite numbers, and any non-JSON value (functions, bigints, undefined,
+ * symbols, exotic objects) of an artificially corrupted resolved pipeline are
+ * rejected as an internal inconsistency; no accidental TypeError or
+ * DataCloneError escapes.
+ */
+function snapshotJsonValue(
+  stateId: string,
+  value: unknown,
+  onPath: Set<object>,
+): ReadonlyJsonValue {
+  if (value === null) {
+    return null;
+  }
+  const kind = typeof value;
+  if (kind === "string" || kind === "boolean") {
+    return value as string | boolean;
+  }
+  if (kind === "number") {
+    if (!Number.isFinite(value as number)) {
+      throw notAJsonValue(stateId, "non-finite number");
+    }
+    return value as number;
+  }
+  if (kind === "bigint" || kind === "function" || kind === "undefined" || kind === "symbol") {
+    throw notAJsonValue(stateId, `non-JSON value of type ${kind}`);
+  }
+  if (kind !== "object") {
+    throw notAJsonValue(stateId, `unsupported value of type ${kind}`);
+  }
+  const source = value as object;
+  if (onPath.has(source)) {
+    throw notAJsonValue(stateId, "cyclic reference");
+  }
+  if (Array.isArray(source)) {
+    onPath.add(source);
+    try {
+      const copy: ReadonlyJsonValue[] = [];
+      for (let index = 0; index < source.length; index++) {
+        copy.push(snapshotJsonValue(stateId, source[index], onPath));
+      }
+      return Object.freeze(copy);
+    } finally {
+      onPath.delete(source);
+    }
+  }
+  if (!isPlainJsonObject(source)) {
+    throw notAJsonValue(stateId, "non-JSON value (not a plain object or array)");
+  }
+  onPath.add(source);
+  try {
+    const copy: Record<string, ReadonlyJsonValue> = {};
+    for (const [key, nested] of Object.entries(source)) {
+      copy[key] = snapshotJsonValue(stateId, nested, onPath);
+    }
+    return Object.freeze(copy);
+  } finally {
+    onPath.delete(source);
+  }
+}
+
 /**
  * Builds the frozen execution view of an agent state: a fresh copy of the
- * data a step needs. It deliberately contains no transitions; freezing it is
- * an additional defense, the primary one being that the engine never reads
- * graph data from the view.
+ * data a step needs, deeply isolated from the source pipeline (the result
+ * schema is deep-cloned and recursively frozen). It deliberately contains no
+ * transitions; freezing it is an additional defense, the primary one being
+ * that the engine never reads graph data from the view.
  */
 function buildAgentStateView(state: ResolvedAgentState): AgentStateView {
   const view: AgentStateView = {
@@ -107,11 +194,7 @@ function buildAgentStateView(state: ResolvedAgentState): AgentStateView {
     promptContent: state.promptContent,
     inputs: Object.freeze(Array.isArray(state.inputs) ? [...state.inputs] : []),
     resultSchemaPath: state.resultSchemaPath,
-    resultSchema: {
-      ...(typeof state.resultSchema === "object" && state.resultSchema !== null
-        ? state.resultSchema
-        : {}),
-    },
+    resultSchema: snapshotJsonValue(state.id, state.resultSchema, new Set()),
     timeout_seconds: state.timeout_seconds,
     max_attempts: state.max_attempts,
   };

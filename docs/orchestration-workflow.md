@@ -200,10 +200,12 @@ ordered transitions with original indices) and validates it fail-closed;
 during execution it reads transitions, terminal results, and the budget only
 from that snapshot, so mutations of the source `ResolvedPipeline` —
 synchronous inside the callback or external while a callback is pending —
-cannot redirect the graph. The callback receives a separate frozen,
-transition-free execution view (state id, profile, prompt, inputs, result
-schema, timeout, attempts) and returns only a validated outcome: it can never
-select the next state. The engine starts strictly at `entry_state`, resolves
+cannot redirect the graph. The callback receives a separate frozen, deeply
+isolated, transition-free execution view (state id, profile, prompt, inputs,
+and a deep-cloned, recursively frozen JSON result schema — a corrupted
+non-JSON schema in an artificially damaged resolved pipeline is rejected as
+`invalid_graph` before the callback) and returns only a validated outcome: it
+can never select the next state. The engine starts strictly at `entry_state`, resolves
 the declared transition by outcome itself, enforces `max_transitions` with a
 single reachable contract — an agent state cursor with an exhausted budget
 fails before the callback, and reaching a terminal exactly at the boundary
