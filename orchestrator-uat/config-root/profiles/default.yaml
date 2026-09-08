@@ -1,0 +1,17 @@
+schema_version: 1
+image: ghcr.io/kivarun/opencode-docker/base:latest
+opencode_config: opencode/default.json
+
+env:
+  LLM_SERVER:
+    from_env: LLM_SERVER
+    required: true
+  LLM_KEY:
+    from_env: LLM_KEY
+    required: true
+  OPENCODE_ENABLE_EXA:
+    from_env: OPENCODE_ENABLE_EXA
+    required: false
+  OPENCODE_EXPERIMENTAL_LSP_TOOL:
+    from_env: OPENCODE_EXPERIMENTAL_LSP_TOOL
+    required: false

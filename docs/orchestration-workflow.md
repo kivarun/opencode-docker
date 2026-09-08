@@ -90,7 +90,9 @@ unknown and missing fields fail closed:
   `max_transitions: <positive safe integer>`;
 - `inputs`: list of `{id, path, protected}`; `id` is a safe unique identifier,
   `path` is a clean workspace-relative path (no absolute path, `~`, empty
-  segments, `.` or `..`), `protected` is boolean;
+  segments, `.` or `..`), and each workspace path may map to only one input
+  declaration (duplicated paths are rejected, case-sensitively, as a lexical
+  check), `protected` is boolean;
 - `states`: non-empty list of `agent` and `terminal` states;
 - agent state: `id`, `type: agent`, `profile` (validated with the execution
   profile name grammar), `prompt` and `result_schema` (bundle-relative paths),
@@ -113,12 +115,17 @@ Graph invariants checked before a resolved pipeline is returned:
 - `max_transitions`, `timeout_seconds`, and `max_attempts` are positive safe
   integers.
 
-Bundle file validation: `prompt` and `result_schema` must be clean
+Bundle file validation: `loadPipeline` requires an absolute bundle root that
+is a directory, and `pipeline.yaml` itself obeys the same fail-closed
+containment contract as the other bundle files (a symlink to a file inside the
+bundle is allowed, a symlink escape is rejected, and the file is read from the
+verified canonical path). `prompt` and `result_schema` must be clean
 bundle-relative paths that resolve (through `realpath`, symlinks inside the
 bundle allowed) to regular files inside the bundle; absolute paths, traversal,
 and symlink escapes fail closed. The prompt must be readable and non-empty;
 the result schema must be a valid JSON object. The resolved pipeline carries
-the already-read prompt content and the parsed result schema. A pipeline
+the accepted `schema_version`, the already-read prompt content, and the parsed
+result schema. A pipeline
 cannot declare images, environment, mounts, credentials, Docker options,
 shell commands, JavaScript, or host callbacks — those are rejected by the
 same exact-field validation. Workspace input existence and `run_id`,

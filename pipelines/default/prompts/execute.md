@@ -13,8 +13,13 @@ Requirements:
   over printing results only to the console.
 - Record every file you created or modified as an artifact in the structured
   result, using clean workspace-relative paths.
-- Write the structured result to the result path given for this run. Set
-  `status: "completed"` only when the task is actually done; otherwise report
-  honestly what is missing.
+- Write the structured result to the result path given for this run. Create a
+  conforming structured result with `status: "completed"` only when the task
+  is actually finished; never create or fake a successful result for
+  unfinished work.
+- If the task cannot be completed, do not write a conforming result; explain
+  what is missing in your normal output. That output is diagnostics only: it
+  does not advance the pipeline and cannot substitute for the structured
+  result.
 - Do not fabricate results, artifacts, or paths that do not exist.
 - Do not attempt to change pipeline, profile, or runtime configuration.
