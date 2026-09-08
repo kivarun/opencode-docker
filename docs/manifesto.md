@@ -56,6 +56,36 @@ table and persists the transition atomically.
 Human-readable state files may be generated as views or agent inputs, but they
 are not the authoritative state store.
 
+## Deterministic mechanism, pipeline-defined policy
+
+Deterministic orchestration does not require one hard-coded workflow.
+
+Given the same persisted run snapshot and the same validated input, the
+orchestrator must select the same transition and apply the same state effects.
+It must not infer control flow from free-form prose, hidden heuristics, timing,
+or an agent's attempt to edit orchestration state.
+
+The pipeline bundle defines the process policy: its roles, state graph,
+outcomes, decision rules, bounds, and user-intervention points. A simple
+pipeline may map a validated agent outcome directly to a transition. A richer
+pipeline may ask an agent for structured semantic facts and pass them to a
+deterministic decision state that applies declared constraints and priorities.
+
+Agents may produce facts, artifacts, warnings, and proposed changes to
+pipeline data. They cannot apply state effects, choose undeclared targets, or
+override the decision policy. The orchestrator validates their outputs and is
+the only component that commits the resulting transition.
+
+The project may ship a sophisticated default decision model without embedding
+that model into the orchestrator core. Users remain free to define different
+declarative workflows through the same versioned contract. The selected graph
+and decision policy are fixed in the run snapshot so that later bundle changes
+cannot reinterpret an execution already in progress.
+
+This flexibility stops at executable extensions. Arbitrary scripts,
+callbacks, or host-language expressions do not become orchestration authority;
+missing, invalid, contradictory, or ambiguous decisions fail closed.
+
 ## Declarative pipelines, not embedded programs
 
 A pipeline is data, not project code.
@@ -342,6 +372,8 @@ their implementation.
   orchestration;
 - OpenCode executes agent steps; it does not own pipeline state;
 - the orchestrator is the sole authority for run state and transitions;
+- orchestration is deterministic for a fixed persisted state and validated
+  input, while the state graph and decision policy remain pipeline-defined;
 - pipelines are declarative data, not executable extensions;
 - prompts guide agents but do not grant authority;
 - trusted execution profiles form the capability ceiling;
