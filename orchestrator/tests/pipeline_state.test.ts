@@ -1271,7 +1271,7 @@ describe("exact-field loader validation", () => {
       event.sequence = index + 1;
     });
     expect(() => validatePipelineRunState(dropped)).toThrow(
-      /records an accepted result digest without a result_accepted event/,
+      /records an accepted result without a result_accepted event/,
     );
     // a cleanup-completed phase whose cleanup event never happened: the
     // journal stops at result_accepted while the record claims the cleanup
@@ -1287,6 +1287,127 @@ describe("exact-field loader validation", () => {
     forged.activations[0].session_cleanup = "completed";
     expect(() => validatePipelineRunState(forged)).toThrow(
       /has phase "session_cleanup_completed" but the event journal does not confirm the stage session_cleanup_completed/,
+    );
+  });
+
+  test("a result_accepted event without the recorded result pair is rejected", () => {
+    // cleanup failure after an accepted result: the full legit state
+    const cleanupFailure = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] },
+      { kind: "activation_failed", reason: SESSION_CLEANUP_FAILURE_REASON, sessionCleanup: "failed" },
+      { kind: "run_cleanup_failed", reason: SESSION_CLEANUP_FAILURE_REASON },
+    ])!;
+    // positive round-trip: digest, artifacts, failure reason, and cleanup
+    // outcome survive together after the accepted result
+    expect(validatePipelineRunState(JSON.parse(JSON.stringify(cleanupFailure)))).toEqual(cleanupFailure);
+    expect(cleanupFailure.activations[0]?.result_sha256).toBe("c".repeat(64));
+    expect(cleanupFailure.activations[0]?.artifacts).toEqual(["out/product.txt"]);
+    expect(cleanupFailure.activations[0]?.failure_reason).toBe(SESSION_CLEANUP_FAILURE_REASON);
+    expect(cleanupFailure.activations[0]?.session_cleanup).toBe("failed");
+    // the recorded result pair is removed while the result_accepted event
+    // stays: the loader must reject the hole
+    const holed = JSON.parse(JSON.stringify(cleanupFailure));
+    delete holed.activations[0].result_sha256;
+    delete holed.activations[0].artifacts;
+    expect(() => validatePipelineRunState(holed)).toThrow(
+      /result_accepted event without the recorded accepted result/,
+    );
+  });
+
+  test("a failed activation without a failure reason is rejected", () => {
+    const failedRun = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: [] },
+      { kind: "activation_failed", reason: SESSION_CLEANUP_FAILURE_REASON, sessionCleanup: "failed" },
+      { kind: "run_cleanup_failed", reason: SESSION_CLEANUP_FAILURE_REASON },
+    ])!;
+    const stripped = JSON.parse(JSON.stringify(failedRun));
+    delete stripped.activations[0].failure_reason;
+    expect(() => validatePipelineRunState(stripped)).toThrow(
+      /has phase "failed" but records no failure reason/,
+    );
+  });
+
+  test("a failed activation without a session cleanup outcome is rejected", () => {
+    // failure before the Session existed: session_id absent,
+    // session_cleanup "completed" — the full legit state
+    const earlyFailure = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_failed", reason: "worker_failed", sessionCleanup: "completed" },
+      { kind: "run_failed", reason: "worker_failed" },
+    ])!;
+    // positive round-trip: the session-less failure stays complete
+    expect(validatePipelineRunState(JSON.parse(JSON.stringify(earlyFailure)))).toEqual(earlyFailure);
+    expect(earlyFailure.activations[0]?.session_id).toBeUndefined();
+    expect(earlyFailure.activations[0]?.session_cleanup).toBe("completed");
+    expect(earlyFailure.activations[0]?.failure_reason).toBe("worker_failed");
+    expect(earlyFailure.activations[0]?.result_sha256).toBeUndefined();
+    expect(earlyFailure.activations[0]?.artifacts).toBeUndefined();
+    const stripped = JSON.parse(JSON.stringify(earlyFailure));
+    delete stripped.activations[0].session_cleanup;
+    expect(() => validatePipelineRunState(stripped)).toThrow(
+      /has phase "failed" but records no session cleanup outcome/,
+    );
+  });
+
+  test("the accepted result pair is atomic: one field alone is rejected", () => {
+    // the failed-after-acceptance shape keeps the failure reason, so the
+    // half-pair is what the loader actually catches
+    const cleanupFailure = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: ["out/product.txt"] },
+      { kind: "activation_failed", reason: SESSION_CLEANUP_FAILURE_REASON, sessionCleanup: "failed" },
+      { kind: "run_cleanup_failed", reason: SESSION_CLEANUP_FAILURE_REASON },
+    ])!;
+    const digestOnly = JSON.parse(JSON.stringify(cleanupFailure));
+    delete digestOnly.activations[0].artifacts;
+    digestOnly.transitions = [];
+    expect(() => validatePipelineRunState(digestOnly)).toThrow(
+      /records only result_sha256; the accepted result is a pair/,
+    );
+    const artifactsOnly = JSON.parse(JSON.stringify(cleanupFailure));
+    delete artifactsOnly.activations[0].result_sha256;
+    expect(() => validatePipelineRunState(artifactsOnly)).toThrow(
+      /records only artifacts; the accepted result is a pair/,
+    );
+  });
+
+  test("the run-level mark path stays valid: a failed commit before finalize leaves a complete record", () => {
+    // the reducer's run_failed marks the last activation when the
+    // activation_failed commit did not land: the record carries the failure
+    // reason, a session cleanup outcome, and is confirmed by the run event
+    const marked = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "run_failed", reason: "control_path_invalid" },
+    ])!;
+    expect(marked.activations[0]?.phase).toBe("failed");
+    expect(marked.activations[0]?.failure_reason).toBe("control_path_invalid");
+    expect(marked.activations[0]?.session_cleanup).toBe("completed");
+    expect(validatePipelineRunState(JSON.parse(JSON.stringify(marked)))).toEqual(marked);
+    // a forged mark-path record with a mismatching cleanup outcome is
+    // rejected
+    const forged = JSON.parse(JSON.stringify(marked));
+    forged.activations[0].session_cleanup = "failed";
+    expect(() => validatePipelineRunState(forged)).toThrow(
+      /was marked failed by the run event, but records session cleanup "failed", expected "completed"/,
+    );
+    // ...as is a mismatching failure reason
+    const forgedReason = JSON.parse(JSON.stringify(marked));
+    forgedReason.activations[0].failure_reason = "worker_failed";
+    expect(() => validatePipelineRunState(forgedReason)).toThrow(
+      /was marked failed by the run event, but its failure reason does not match the run failure/,
     );
   });
 });

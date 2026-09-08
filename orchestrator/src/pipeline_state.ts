@@ -644,10 +644,13 @@ function validateEventPayloadCoherence(
   activations: ActivationState[],
   transitions: CommittedTransitionState[],
   terminal: TerminalStateState | undefined,
+  failure: FailureState | undefined,
 ): void {
   let activationPointer = 0;
   let transitionPointer = 0;
   let terminalSeen = 0;
+  let runFailedSeen = false;
+  let runCleanupFailedSeen = false;
   // per-activation stage confirmations from the event journal
   const sessionSeen = new Set<number>();
   const agentRunningSeen = new Set<number>();
@@ -741,9 +744,14 @@ function validateEventPayloadCoherence(
         break;
       }
       case "run_created":
-      case "run_succeeded":
+        break;
       case "run_failed":
+        runFailedSeen = true;
+        break;
       case "run_cleanup_failed":
+        runCleanupFailedSeen = true;
+        break;
+      case "run_succeeded":
         break;
     }
   }
@@ -806,7 +814,6 @@ function validateEventPayloadCoherence(
         forbidden.push("activation_failed");
         break;
       case "failed":
-        required.push("activation_failed");
         forbidden.push("session_cleanup_completed");
         break;
     }
@@ -840,10 +847,64 @@ function validateEventPayloadCoherence(
         );
       }
     }
-    if (activation.result_sha256 !== undefined && !resultAcceptedSeen.has(activation.index)) {
+    // the accepted result is a pair: digest and artifacts exist only together,
+    // a result_accepted event requires the pair, and the pair requires the
+    // event
+    const hasDigest = activation.result_sha256 !== undefined;
+    const hasArtifacts = activation.artifacts !== undefined;
+    if (hasDigest !== hasArtifacts) {
       throw new PipelineStateError(
-        `activation ${activation.index} records an accepted result digest without a result_accepted event`,
+        `activation ${activation.index} records ${hasDigest ? "only result_sha256" : "only artifacts"}; the accepted result is a pair and both fields must exist together`,
       );
+    }
+    if (resultAcceptedSeen.has(activation.index)) {
+      if (!hasDigest || !hasArtifacts) {
+        throw new PipelineStateError(
+          `activation ${activation.index} has a result_accepted event without the recorded accepted result (result_sha256 and artifacts)`,
+        );
+      }
+    } else if (hasDigest) {
+      throw new PipelineStateError(
+        `activation ${activation.index} records an accepted result without a result_accepted event`,
+      );
+    }
+    // a failed activation is complete: failure reason, session cleanup
+    // outcome, and a confirming event
+    if (phase === "failed") {
+      if (activation.failure_reason === undefined) {
+        throw new PipelineStateError(
+          `activation ${activation.index} has phase "failed" but records no failure reason`,
+        );
+      }
+      if (activation.session_cleanup === undefined) {
+        throw new PipelineStateError(
+          `activation ${activation.index} has phase "failed" but records no session cleanup outcome`,
+        );
+      }
+      if (!failedSeen.has(activation.index)) {
+        // The only reducer path that leaves phase "failed" without its own
+        // activation_failed event is the run-level mark: the activation_failed
+        // commit did not land (not_committed) and finalize recorded the
+        // failure with run_failed/run_cleanup_failed, which marked the last
+        // activation. Anything else is a forged record.
+        const isLast = activations[activations.length - 1] === activation;
+        if (!isLast || (!runFailedSeen && !runCleanupFailedSeen)) {
+          throw new PipelineStateError(
+            `activation ${activation.index} has phase "failed" but the event journal does not confirm the stage activation_failed`,
+          );
+        }
+        const expectedCleanup = runCleanupFailedSeen ? "failed" : "completed";
+        if (activation.session_cleanup !== expectedCleanup) {
+          throw new PipelineStateError(
+            `activation ${activation.index} was marked failed by the run event, but records session cleanup ${JSON.stringify(activation.session_cleanup)}, expected ${JSON.stringify(expectedCleanup)}`,
+          );
+        }
+        if (failure === undefined || activation.failure_reason !== failure.reason) {
+          throw new PipelineStateError(
+            `activation ${activation.index} was marked failed by the run event, but its failure reason does not match the run failure`,
+          );
+        }
+      }
     }
   }
 }
@@ -1236,8 +1297,9 @@ export function validatePipelineRunState(value: unknown): PipelineRunState {
     }
   }
 
-  // last: every event payload must name exactly the record it belongs to
-  validateEventPayloadCoherence(events, activations, transitions, terminal);
+  // last: every event payload must name exactly the record it belongs to,
+  // and every record must be represented by exactly its events
+  validateEventPayloadCoherence(events, activations, transitions, terminal, failure);
 
   if (terminal !== undefined) {
     state.terminal = terminal;
@@ -1365,10 +1427,10 @@ function markLastActivationFailed(
   // run_failed is only reachable when the executor's session cleanup settled
   // without a cleanup failure: with a recorded session the delete succeeded
   // ("completed"); a cleanup failure always takes the run_cleanup_failed
-  // path ("failed"). Without a recorded session there is no cleanup outcome.
-  if (activation.session_id !== undefined) {
-    activation.session_cleanup = cleanupOutcome;
-  }
+  // path ("failed"). Without a recorded session there is no session to clean
+  // up, so the cleanup outcome is trivially "completed" — a phase-"failed"
+  // activation always records a session cleanup outcome.
+  activation.session_cleanup = activation.session_id !== undefined ? cleanupOutcome : "completed";
 }
 
 /**
