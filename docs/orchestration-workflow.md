@@ -148,6 +148,17 @@ copies, ambient host mounts, or permission changes are involved. This pattern
 was verified against docker-helper 2.1.0 with identical device and inode
 identities across both targets.
 
+A helper-launched container cannot receive the docker-helper unix socket:
+`docker-helper run` only accepts workspace-relative mount sources, so a
+containerized orchestrator cannot reach the docker-helper API from inside a
+helper-launched container. A containerized orchestrator must therefore be
+launched directly by the operator (plain `docker run` with the docker-helper
+socket, the Launcher credential, and the dual workspace mounts), or
+docker-helper needs a future feature for trusted socket projection. This is a
+known docker-helper integration limitation, not an orchestrator defect; until
+it is addressed, the end-to-end profile-backed `agent-smoke` UAT cannot be
+executed from inside a helper-launched orchestrator container.
+
 ## Responsibility and trust boundaries
 
 | Layer | Responsibility | Trust |
