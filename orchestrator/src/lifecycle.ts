@@ -243,14 +243,19 @@ export async function runWithChildSession(
     failureBox.error = cause instanceof Error ? cause : new Error(String(cause));
   } finally {
     await cleanup();
+    // A recorded signal (arriving at any point after the last explicit abort
+    // check — e.g. during result/artifact verification or during cleanup)
+    // forbids a final success status. Cleanup failure keeps the higher
+    // priority; otherwise a signal-only run reports `failed`. No state machine
+    // is introduced for this.
+    const finalStatus =
+      cleanupBox.error !== null
+        ? "cleanup_failed"
+        : failureBox.error === null && signalBox.abort === null
+          ? "success"
+          : "failed";
     try {
-      await updateState(
-        cleanupBox.error !== null
-          ? "cleanup_failed"
-          : failureBox.error === null
-            ? "success"
-            : "failed",
-      );
+      await updateState(finalStatus);
     } catch {
       failureBox.error ??= new StatePersistError();
     }

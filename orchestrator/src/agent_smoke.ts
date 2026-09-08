@@ -232,6 +232,9 @@ async function agentRun(
 
   console.error(`orchestrator: starting agent in child session`);
   await updateState("agent_running");
+  // after a recorded signal no new worker run may start: check synchronously
+  // right before the CLI call, with no await in between
+  ctx.checkAbort();
   const run = await deps.cli(runArgs(spec, deps.config.socketPath), childEnv, "inherit", {
     signalOnAbort: true,
   });

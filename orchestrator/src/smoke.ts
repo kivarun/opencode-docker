@@ -68,6 +68,9 @@ async function smokeWorkerRun(
   const spec = smokeWorkerSpec(runId, ctx.childToken, options.workerImage);
   console.error(`orchestrator: starting worker in child session`);
   await updateState("worker_running");
+  // after a recorded signal no new worker run may start: check synchronously
+  // right before the CLI call, with no await in between
+  ctx.checkAbort();
   const run = await deps.cli(runArgs(spec, deps.config.socketPath), childEnv, "inherit", {
     signalOnAbort: true,
   });

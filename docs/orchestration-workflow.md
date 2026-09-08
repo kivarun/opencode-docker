@@ -44,10 +44,11 @@ The current orchestrator proves one complete delegated agent execution:
 10. Process exit status reports overall success or failure.
 
 OpenCode output and docker-helper CLI output are inherited by the orchestrator
-process: the CLI's stdout and stderr are mixed into one stream and the original
-stream separation is not preserved. The orchestrator's own diagnostics stay on
-stderr. Worker stdin is not interactive; the orchestrator implements no
-polling, log cursor, or operation-API parsing.
+process: docker-helper 2.1.0 delivers the container operation output already
+mixed and prints it on the CLI's stdout, while the CLI's own warnings and
+errors go to stderr; the original stream separation is not preserved. The
+orchestrator's own diagnostics stay on stderr. Worker stdin is not interactive;
+the orchestrator implements no polling, log cursor, or operation-API parsing.
 
 Worker output is raw, untrusted container output. It must be treated as a
 sensitive observation of a concrete run, never as a safe audit log and never as

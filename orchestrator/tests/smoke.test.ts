@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -66,6 +66,7 @@ interface FakeCliOptions {
   blockCreate?: boolean;
   blockPull?: boolean;
   blockRun?: boolean;
+  blockDelete?: boolean;
 }
 
 function fakeCli(options: FakeCliOptions) {
@@ -74,6 +75,11 @@ function fakeCli(options: FakeCliOptions) {
   let activeRun: { release: (code: number) => void } | null = null;
   let releaseCreate: ((result: CliResult) => void) | null = null;
   let releasePull: ((result: CliResult) => void) | null = null;
+  let releaseDelete: ((result: CliResult) => void) | null = null;
+  let notifyDeleteStart: (() => void) | null = null;
+  const deleteStarted = new Promise<void>((resolve) => {
+    notifyDeleteStart = resolve;
+  });
 
   const runner: CliRunner = async (args, env, stdio, opts) => {
     calls.push({ args: [...args], env: { ...env }, stdio, signalOnAbort: opts?.signalOnAbort === true });
@@ -157,6 +163,15 @@ function fakeCli(options: FakeCliOptions) {
     }
     if (args[0] === "session" && args[1] === "delete") {
       events.push("session:delete");
+      notifyDeleteStart?.();
+      if (options.blockDelete === true) {
+        return await new Promise<CliResult>((resolve) => {
+          releaseDelete = (r) => {
+            events.push("session:delete-done");
+            resolve(r);
+          };
+        });
+      }
       if ((options.deleteCode ?? 0) !== 0) {
         return { code: options.deleteCode ?? 1, stdout: "", stderr: "delete boom" };
       }
@@ -202,7 +217,42 @@ function fakeCli(options: FakeCliOptions) {
         release(result);
       }
     },
+    releaseDelete: (result: CliResult) => {
+      if (releaseDelete !== null) {
+        const release = releaseDelete;
+        releaseDelete = null;
+        release(result);
+      }
+    },
+    deleteStarted,
   };
+}
+
+function mkfifo(path: string): void {
+  const proc = Bun.spawnSync(["mkfifo", path]);
+  if (proc.exitCode !== 0) {
+    throw new Error(`mkfifo failed: ${new TextDecoder().decode(proc.stderr)}`);
+  }
+}
+
+/**
+ * Deterministic FIFO barrier around saveRunState: the state file itself is a
+ * named pipe, so each state write blocks at open() until this reader connects,
+ * and resolves only after the writer closes (EOF). The returned JSON tells the
+ * test exactly which state write completed.
+ */
+async function drainFifo(fifo: string): Promise<string> {
+  const fh = await open(fifo, "r");
+  const data = await fh.readFile();
+  await fh.close();
+  return data.toString("utf8");
+}
+
+/** Writer side of a FIFO barrier: rendezvous with a blocked reader, then deliver. */
+async function fifoWrite(fifo: string, body: string): Promise<void> {
+  const fh = await open(fifo, "w");
+  await fh.write(body);
+  await fh.close();
 }
 
 async function withTempDirs(
@@ -532,6 +582,163 @@ test("6c. signal during pull: pull completed -> run skipped -> Session deleted",
     expect(events).toEqual(["session:create", "session:create-done", "pull:start", "pull:done", "session:delete"]);
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
     expect(calls.find((c) => c.args[0] === "pull")?.signalOnAbort).toBe(false);
+  });
+});
+
+test("7. signal during updateState(worker_running): run never starts, status not success", async () => {
+  await withTempDirs(async (dirs) => {
+    const runId = "signal-state-run";
+    await mkdir(dirs.state, { recursive: true });
+    const stateFifo = join(dirs.state, `smoke-${runId}.json`);
+    mkfifo(stateFifo);
+
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner, killActive, deleteStarted } = fakeCli({
+      workspace: dirs.workspace,
+      writeArtifact: false,
+    });
+    const pending = runSmoke(
+      { workspace: dirs.workspace, workerImage: "alpine:3.22" },
+      makeDeps(dirs, runner, {
+        randomId: () => runId,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    // release state writes one by one; each drain proves which write completed
+    const b1 = JSON.parse(await drainFifo(stateFifo));
+    expect(b1.status).toBe("creating_session");
+    const b2 = JSON.parse(await drainFifo(stateFifo));
+    expect(b2.status).toBe("session_created");
+
+    // rendezvous with the in-flight worker_running write, record the signal
+    // while updateState is still pending, then release it
+    const reader3 = await open(stateFifo, "r");
+    signalHandler!("SIGTERM");
+    killActive("SIGTERM");
+    const b3 = JSON.parse((await reader3.readFile()).toString("utf8"));
+    await reader3.close();
+    expect(b3.status).toBe("worker_running");
+
+    // the abort check right after the state write skips the worker run; wait
+    // for the cleanup delete, then drain the final blocked state write
+    await deleteStarted;
+    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
+    const finalState = JSON.parse(await drainFifo(stateFifo));
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(143);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
+    expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
+
+    expect(finalState.status).toBe("failed");
+    expect(finalState.session_id).toBe(CHILD_SESSION_ID);
+  });
+});
+
+test("7b. signal after successful run, before artifact verification completes: cleanup ok, status not success", async () => {
+  await withTempDirs(async (dirs) => {
+    const runId = "signal-verify-run";
+    const stateFifo = join(dirs.state, `smoke-${runId}.json`);
+    mkfifo(stateFifo);
+    const artifactFifo = join(dirs.workspace, ".pipeline-smoke", runId, "result.json");
+    await mkdir(join(dirs.workspace, ".pipeline-smoke", runId), { recursive: true });
+    mkfifo(artifactFifo);
+
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner, killActive, deleteStarted } = fakeCli({
+      workspace: dirs.workspace,
+      writeArtifact: false,
+    });
+    const pending = runSmoke(
+      { workspace: dirs.workspace, workerImage: "alpine:3.22" },
+      makeDeps(dirs, runner, {
+        randomId: () => runId,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    // let the pre-run state writes through: creating_session, session_created,
+    // worker_running (the run itself does not touch the state file)
+    const b1 = JSON.parse(await drainFifo(stateFifo));
+    expect(b1.status).toBe("creating_session");
+    const b2 = JSON.parse(await drainFifo(stateFifo));
+    expect(b2.status).toBe("session_created");
+    const b3 = JSON.parse(await drainFifo(stateFifo));
+    expect(b3.status).toBe("worker_running");
+
+    // the worker run succeeded; artifact verification blocks reading the FIFO
+    const artifactBody = JSON.stringify({
+      schema_version: 1,
+      status: "success",
+      run_id: runId,
+      session_token_present: true,
+    });
+    // writer open rendezvous with the blocked verification read; the signal is
+    // recorded while verification is still in flight, then the data is delivered
+    const artifactWriter = await open(artifactFifo, "w");
+    signalHandler!("SIGTERM");
+    killActive("SIGTERM");
+    await artifactWriter.write(`${artifactBody}\n`);
+    await artifactWriter.close();
+
+    // verification completed after the signal; the hook's own final state
+    // write ("success") still goes through, then cleanup runs and the
+    // lifecycle's final state write (blocked FIFO) records the non-success
+    await drainFifo(stateFifo);
+    await deleteStarted;
+    const finalState = JSON.parse(await drainFifo(stateFifo));
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(143);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+    expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
+
+    expect(finalState.status).toBe("failed");
+  });
+});
+
+test("7c. signal during session delete: delete completes once, status not success", async () => {
+  await withTempDirs(async (dirs) => {
+    const { calls, events, runner, releaseDelete, killActive, deleteStarted } = fakeCli({
+      workspace: dirs.workspace,
+      blockDelete: true,
+    });
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const pending = runSmoke(
+      { workspace: dirs.workspace, workerImage: "alpine:3.22" },
+      makeDeps(dirs, runner, {
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+    await deleteStarted;
+
+    signalHandler!("SIGTERM");
+    killActive("SIGTERM");
+
+    releaseDelete({
+      code: 0,
+      stdout: JSON.stringify({ ok: true, id: CHILD_SESSION_ID, deleted: true }),
+      stderr: "",
+    });
+
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(143);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
+    expect(events.filter((e) => e === "session:delete").length).toBe(1);
   });
 });
 

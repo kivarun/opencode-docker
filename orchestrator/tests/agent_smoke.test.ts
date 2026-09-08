@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -99,10 +99,27 @@ function envPairValue(args: string[], name: string): string {
   return "";
 }
 
+/**
+ * Deterministic FIFO barrier around saveRunState: the state file itself is a
+ * named pipe, so each state write blocks at open() until this reader connects,
+ * and resolves only after the writer closes (EOF). The returned JSON tells the
+ * test exactly which state write completed.
+ */
+async function drainFifo(fifo: string): Promise<string> {
+  const fh = await open(fifo, "r");
+  const data = await fh.readFile();
+  await fh.close();
+  return data.toString("utf8");
+}
+
 function fakeCli(options: FakeAgentOptions & { workspace: string }) {
   const calls: RecordedCall[] = [];
   const events: string[] = [];
   let activeRun: { release: (code: number) => void } | null = null;
+  let notifyDeleteStart: (() => void) | null = null;
+  const deleteStarted = new Promise<void>((resolve) => {
+    notifyDeleteStart = resolve;
+  });
 
   const runner = async (
     args: string[],
@@ -185,6 +202,7 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
     }
     if (args[0] === "session" && args[1] === "delete") {
       events.push("session:delete");
+      notifyDeleteStart?.();
       if ((options.deleteCode ?? 0) !== 0) {
         return { code: options.deleteCode ?? 1, stdout: "", stderr: "delete boom" };
       }
@@ -201,6 +219,7 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
     calls,
     events,
     runner,
+    deleteStarted,
     killActive: (signal: "SIGINT" | "SIGTERM") => {
       if (activeRun !== null) {
         events.push(`run:signal:${signal}`);
@@ -755,6 +774,52 @@ test("20. signal during agent run: signal forwarded -> CLI exited -> Session del
     expect(calls.find((c) => c.args[0] === "run")?.signalOnAbort).toBe(true);
     expect(calls.find((c) => c.args[0] === "pull")?.signalOnAbort).toBe(false);
     expect(events[events.length - 1]).toBe("session:delete");
+  });
+});
+
+test("21. signal during updateState(agent_running): run never starts, status not success", async () => {
+  await withFixture(async (dirs) => {
+    const runId = "agent-signal-state-run";
+    await mkdir(dirs.state, { recursive: true });
+    const stateFifo = join(dirs.state, `smoke-${runId}.json`);
+    Bun.spawnSync(["mkfifo", stateFifo]);
+
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner, killActive, deleteStarted } = fakeCli({ workspace: dirs.workspace });
+    const pending = runAgentSmoke(
+      agentSmokeOptions(dirs),
+      makeDeps(dirs, runner, {
+        randomId: () => runId,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    const b1 = JSON.parse(await drainFifo(stateFifo));
+    expect(b1.status).toBe("creating_session");
+    const b2 = JSON.parse(await drainFifo(stateFifo));
+    expect(b2.status).toBe("session_created");
+
+    const reader3 = await open(stateFifo, "r");
+    signalHandler!("SIGTERM");
+    killActive("SIGTERM");
+    const b3 = JSON.parse((await reader3.readFile()).toString("utf8"));
+    await reader3.close();
+    expect(b3.status).toBe("agent_running");
+
+    await deleteStarted;
+    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
+    const finalState = JSON.parse(await drainFifo(stateFifo));
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(143);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
+    expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
+    expect(finalState.status).toBe("failed");
+    expect(finalState.session_id).toBe(CHILD_SESSION_ID);
   });
 });
 
