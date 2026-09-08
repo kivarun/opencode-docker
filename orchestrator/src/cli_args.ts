@@ -156,6 +156,9 @@ export function parseCommand(kind: "smoke" | "agent-smoke", argv: string[]): Par
       workerImage = value;
       i = next;
     } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      if (kind !== "agent-smoke") {
+        throw new Error(`unknown argument: ${arg}`);
+      }
       const { value, next } = parseValue(argv, i, "--config-root");
       if (!value.startsWith("/")) {
         throw new Error("--config-root must be an absolute path");

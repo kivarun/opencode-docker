@@ -4,7 +4,8 @@ import {
   AgentResultError,
   verifyAgentResult,
   type AgentResult,
-} from "./agent_result.ts";import { DockerHelperError, describeError } from "./docker_helper.ts";
+} from "./agent_result.ts";
+import { DockerHelperError, describeError } from "./docker_helper.ts";
 import {
   loadPipeline,
   planOneStepExecution,
@@ -57,6 +58,8 @@ export interface ResolvedWorkspaceInput {
   canonical: string;
   pathInWorkspace: string;
   sha256: string;
+  dev: number;
+  ino: number;
 }
 
 async function sha256File(path: string): Promise<string> {
@@ -126,7 +129,14 @@ export async function resolveWorkspaceInput(
       `workspace input ${inputPath} is not readable: ${describeError(cause)}`,
     );
   }
-  return { workspaceCanonical, canonical, pathInWorkspace, sha256 };
+  return {
+    workspaceCanonical,
+    canonical,
+    pathInWorkspace,
+    sha256,
+    dev: info.dev,
+    ino: info.ino,
+  };
 }
 
 async function currentInputSha256(input: ResolvedWorkspaceInput): Promise<string> {
@@ -341,12 +351,11 @@ async function agentRun(
       `agent result not readable at ${resultFile}: ${describeError(cause)}`,
     );
   }
-  const result: AgentResult = await verifyAgentResult(
-    raw,
-    runId,
-    input.workspaceCanonical,
-    input.pathInWorkspace,
-  );
+  const result: AgentResult = await verifyAgentResult(raw, runId, input.workspaceCanonical, {
+    canonical: input.canonical,
+    dev: input.dev,
+    ino: input.ino,
+  });
 
   // Map the verified result status through the declared transition table of
   // the agent state; success is possible only by reaching a success terminal.

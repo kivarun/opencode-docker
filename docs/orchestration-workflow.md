@@ -42,16 +42,23 @@ by the default declarative pipeline:
 6. OpenCode reads the orchestrator-owned execution document (run identity,
    state, attempt, input/result paths, allowed outcome, pipeline prompt,
    result format) and writes a structured `result.json`.
-7. The orchestrator verifies the result schema (exact fields), run identity,
-   artifact paths, workspace confinement, the unchanged protected input
-   digest, and maps the validated outcome through the pipeline transition to
-   the success terminal state.
-8. On cancellation, the first SIGINT/SIGTERM is recorded by the lifecycle; a
-   running `docker-helper run` process receives the same signal and docker-helper
-   performs a bounded synchronous best-effort cancel. The orchestrator never
-   confirms a terminal operation state; `session create`, `pull`, and
-   `session delete` always run to completion, and the child Session is deleted
-   only in the single lifecycle cleanup path after the active step settles.
+ 7. The orchestrator verifies the result schema (exact fields), run identity,
+    artifact paths (workspace confinement, plus canonical-path and
+    dev+inode alias checks against the protected input), the unchanged
+    protected input digest, and maps the validated outcome through the
+    pipeline transition to the success terminal state.
+ 8. On cancellation, the first SIGINT/SIGTERM is recorded by the lifecycle; a
+    running `docker-helper run` process receives the same signal and docker-helper
+    performs a bounded synchronous best-effort cancel. The orchestrator never
+    confirms a terminal operation state. First-wins applies to the active
+    signalable worker: the first terminal cause — runner `timeout` or
+    `user_signal` — is recorded once; a user signal that wins suppresses the
+    timer (`timedOut` stays false, exit 130/143), and a user signal that loses
+    to the runner timer is neither delivered nor forwarded to the lifecycle
+    (the run stays a timeout failure, exit 1); signals outside a worker run
+    keep the plain lifecycle semantics. `session create`, `pull`, and
+    `session delete` always run to completion, and the child Session is deleted
+    only in the single lifecycle cleanup path after the active step settles.
    Signal acceptance closes in the same synchronous tail that completes the
    authoritative final state write: a signal accepted while that write was in
    flight rewrites a persisted `success` to `failed`, and a signal delivered

@@ -74,6 +74,17 @@ export class AgentResultError extends Error {
   }
 }
 
+/**
+ * Identity of the protected workspace input used to reject artifacts that
+ * alias it. `canonical` catches the direct path and any symlink alias
+ * (compared after realpath); `dev`/`ino` additionally catch hardlink aliases.
+ */
+export interface ProtectedInputRef {
+  canonical: string;
+  dev: number;
+  ino: number;
+}
+
 export function parseAgentResult(
   raw: string,
   expectedRunId: string,
@@ -150,18 +161,10 @@ export async function verifyAgentResult(
   raw: string,
   expectedRunId: string,
   workspaceCanonical: string,
-  protectedInputPath?: string,
+  protectedInput?: ProtectedInputRef,
 ): Promise<AgentResult> {
   const result = parseAgentResult(raw, expectedRunId);
   for (const artifact of result.artifacts) {
-    if (
-      protectedInputPath !== undefined &&
-      (artifact === protectedInputPath || artifact.startsWith(`${protectedInputPath}/`))
-    ) {
-      throw new AgentResultError(
-        `artifact must not reference the protected input: ${JSON.stringify(artifact)}`,
-      );
-    }
     const absolute = join(workspaceCanonical, artifact);
     let info;
     try {
@@ -188,6 +191,18 @@ export async function verifyAgentResult(
       throw new AgentResultError(
         `artifact ${JSON.stringify(artifact)} resolves outside the workspace`,
       );
+    }
+    if (protectedInput !== undefined) {
+      if (canonical === protectedInput.canonical) {
+        throw new AgentResultError(
+          `artifact ${JSON.stringify(artifact)} resolves to the protected input (direct path or symlink alias)`,
+        );
+      }
+      if (info.dev === protectedInput.dev && info.ino === protectedInput.ino) {
+        throw new AgentResultError(
+          `artifact ${JSON.stringify(artifact)} is a hardlink alias of the protected input`,
+        );
+      }
     }
   }
   return result;

@@ -261,16 +261,40 @@ export function describeError(error: unknown): string {
 }
 
 export class SubprocessCliRunner {
-  private active: { proc: Bun.Subprocess<"ignore", "pipe" | "inherit", "pipe" | "inherit">; signalOnAbort: boolean } | null = null;
+  private active: {
+    proc: Bun.Subprocess<"ignore", "pipe" | "inherit", "pipe" | "inherit">;
+    signalOnAbort: boolean;
+    cause: "user_signal" | "timeout" | null;
+  } | null = null;
 
-  killActive(signal: "SIGINT" | "SIGTERM"): void {
-    if (this.active !== null && this.active.signalOnAbort) {
+  /**
+   * Delivers a user signal to the active signalable worker process.
+   *
+   * First-wins contract for one active worker run: the first terminal cause —
+   * `timeout` (runner timer) or `user_signal` (this call) — is recorded once.
+   * Returns true when the orchestrator should still record a user abort in
+   * the lifecycle (no signalable worker is active, or this signal just claimed
+   * the worker). Returns false only when a timeout already claimed the active
+   * worker: a late user signal must not reclassify that termination and must
+   * not reach the lifecycle as an abort.
+   */
+  killActive(signal: "SIGINT" | "SIGTERM"): boolean {
+    const active = this.active;
+    if (active === null || !active.signalOnAbort) {
+      return true;
+    }
+    if (active.cause === "timeout") {
+      return false;
+    }
+    if (active.cause === null) {
+      active.cause = "user_signal";
       try {
-        this.active.proc.kill(signal);
+        active.proc.kill(signal);
       } catch {
-        this.active = null;
+        // the process already exited
       }
     }
+    return true;
   }
 
   async run(
@@ -285,17 +309,28 @@ export class SubprocessCliRunner {
       stdout: stdio === "inherit" ? "inherit" : "pipe",
       stderr: stdio === "inherit" ? "inherit" : "pipe",
     });
-    this.active = { proc, signalOnAbort: opts?.signalOnAbort === true };
+    const active: NonNullable<SubprocessCliRunner["active"]> = {
+      proc,
+      signalOnAbort: opts?.signalOnAbort === true,
+      cause: null,
+    };
+    this.active = active;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     if (
-      opts?.signalOnAbort === true &&
-      typeof opts.timeoutSeconds === "number" &&
+      active.signalOnAbort &&
+      typeof opts?.timeoutSeconds === "number" &&
       Number.isSafeInteger(opts.timeoutSeconds) &&
       opts.timeoutSeconds > 0 &&
       opts.timeoutSeconds <= MAX_RUN_TIMEOUT_SECONDS
     ) {
       timer = setTimeout(() => {
+        // first-wins: a user signal that already claimed this worker run
+        // cannot be converted into a timeout classification
+        if (active.cause !== null) {
+          return;
+        }
+        active.cause = "timeout";
         timedOut = true;
         try {
           proc.kill("SIGTERM");
@@ -317,7 +352,9 @@ export class SubprocessCliRunner {
       if (timer !== null) {
         clearTimeout(timer);
       }
-      this.active = null;
+      if (this.active === active) {
+        this.active = null;
+      }
     }
   }
 }

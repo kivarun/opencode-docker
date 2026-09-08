@@ -41,10 +41,14 @@ async function main(): Promise<number> {
     onSignal: (handler: (signal: "SIGINT" | "SIGTERM") => void) => {
       for (const signal of ["SIGINT", "SIGTERM"] as const) {
         process.on(signal, () => {
-          // forward the same signal to a running worker `run` CLI process only;
-          // session create/delete and pull always run to completion
-          runner.killActive(signal);
-          handler(signal);
+          // First-wins: forward the signal to a running worker `run` CLI
+          // process (signalable only; session create/delete and pull always
+          // run to completion) and record a lifecycle abort unless a runner
+          // timeout already claimed the active worker. killActive answers
+          // whether this signal may still be classified as a user abort.
+          if (runner.killActive(signal)) {
+            handler(signal);
+          }
         });
       }
     },

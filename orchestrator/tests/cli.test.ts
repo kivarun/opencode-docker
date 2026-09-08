@@ -73,6 +73,8 @@ test("smoke keeps its own contract", () => {
   expect(() => parseCommand("smoke", ["--profile", "default"])).toThrow(/unknown argument: --profile/);
   expect(() => parseCommand("smoke", ["--task", "TASK.md"])).toThrow(/unknown argument: --task/);
   expect(() => parseCommand("smoke", ["--pipeline-root", "/p"])).toThrow(/unknown argument: --pipeline-root/);
+  expect(() => parseCommand("smoke", ["--config-root", "/c"])).toThrow(/unknown argument: --config-root/);
+  expect(() => parseCommand("smoke", ["--config-root=/c"])).toThrow(/unknown argument: --config-root=/);
 });
 
 test("--config-root is required for agent-smoke", () => {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, open, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -128,6 +128,7 @@ interface FakeAgentOptions {
   deleteCode?: number;
   createCode?: number;
   blockRun?: boolean;
+  blockPull?: boolean;
   runTimeoutExpires?: boolean;
 }
 
@@ -168,9 +169,14 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
   const calls: RecordedCall[] = [];
   const events: string[] = [];
   let activeRun: { release: (code: number) => void } | null = null;
+  let activePull: { release: () => void } | null = null;
   let notifyDeleteStart: (() => void) | null = null;
   const deleteStarted = new Promise<void>((resolve) => {
     notifyDeleteStart = resolve;
+  });
+  let notifyPullStart: (() => void) | null = null;
+  const pullStarted = new Promise<void>((resolve) => {
+    notifyPullStart = resolve;
   });
 
   const runner = async (
@@ -238,7 +244,14 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
       return { code: runCode, stdout: "", stderr: "" };
     }
     if (args[0] === "pull") {
-      events.push("pull:start", "pull:done");
+      events.push("pull:start");
+      notifyPullStart?.();
+      if (options.blockPull === true) {
+        await new Promise<void>((resolve) => {
+          activePull = { release: resolve };
+        });
+      }
+      events.push("pull:done");
       return { code: options.pullCode ?? 0, stdout: "", stderr: "" };
     }
     if (args[0] === "session" && args[1] === "create") {
@@ -282,13 +295,22 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
     events,
     runner,
     deleteStarted,
+    pullStarted,
+    releasePull: () => {
+      const pull = activePull;
+      activePull = null;
+      pull?.release();
+    },
     killActive: (signal: "SIGINT" | "SIGTERM") => {
+      // mirrors the real runner's contract answer for tests: a delivery to the
+      // active signalable worker run (pull and session ops are not signalable)
       if (activeRun !== null) {
         events.push(`run:signal:${signal}`);
         const release = activeRun.release;
         activeRun = null;
         release(signalExitCode(signal));
       }
+      return true;
     },
   };
 }
@@ -639,7 +661,7 @@ test("7b. artifact referencing the protected input: run fails, session deleted",
     const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
-    expect(outcome.detail).toContain("must not reference the protected input");
+    expect(outcome.detail).toContain("protected input");
     expect(deleteCallCount(calls)).toBe(1);
   });
 });
@@ -1030,6 +1052,41 @@ test("22. timeout only on the worker run; timeout expiry fails the run with a si
   });
 });
 
+test("22b. signal during pull: pull completes, run never starts, single cleanup", async () => {
+  await withFixture(async (dirs) => {
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, events, runner, killActive, releasePull, pullStarted } = fakeCli({
+      workspace: dirs.workspace,
+      blockPull: true,
+    });
+    const pending = runAgentSmoke(
+      agentSmokeOptions(dirs),
+      makeDeps(dirs, runner, {
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+    await pullStarted;
+
+    // pull is not signalable: the runner has nothing to deliver to, so
+    // main.ts still records the lifecycle abort; the pull runs to completion
+    expect(killActive("SIGINT")).toBe(true);
+    signalHandler!("SIGINT");
+    releasePull();
+
+    const outcome = await pending;
+    expect(outcome.exitCode).toBe(130);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
+    expect(events).toContain("pull:done");
+    expect(events).not.toContain("run:start");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+  });
+});
+
 test("23. profile comes from the pipeline's agent state", async () => {
   await withFixture(async (dirs) => {
     await writeFile(
@@ -1164,13 +1221,23 @@ test("extra: result contract", () => {
   }
 });
 
-test("extra: artifacts must not reference the protected input at verify time", async () => {
+test("extra: artifacts must not alias the protected input (direct, symlink, hardlink)", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-input-artifact-"));
   try {
     const workspace = join(root, "workspace");
     await mkdir(join(workspace, "out"), { recursive: true });
+    await mkdir(join(workspace, "other"), { recursive: true });
     await writeFile(join(workspace, "input.md"), "input body");
     await writeFile(join(workspace, "out", "artifact.txt"), "x");
+    await writeFile(join(workspace, "other", "input.md"), "separate file with a similar name");
+    await symlink(join(workspace, "input.md"), join(workspace, "out", "link.md"));
+    await link(join(workspace, "input.md"), join(workspace, "out", "hard.md"));
+    const inputInfo = await stat(join(workspace, "input.md"));
+    const protectedInput = {
+      canonical: await realpath(join(workspace, "input.md")),
+      dev: inputInfo.dev,
+      ino: inputInfo.ino,
+    };
     const result = {
       schema_version: 1,
       run_id: "r",
@@ -1179,16 +1246,25 @@ test("extra: artifacts must not reference the protected input at verify time", a
       artifacts: ["out/artifact.txt"],
     };
     await expect(
-      verifyAgentResult(JSON.stringify({ ...result, artifacts: ["input.md"] }), "r", workspace, "input.md"),
+      verifyAgentResult(JSON.stringify({ ...result, artifacts: ["input.md"] }), "r", workspace, protectedInput),
+    ).rejects.toThrow(/resolves to the protected input/);
+    await expect(
+      verifyAgentResult(JSON.stringify({ ...result, artifacts: ["out/link.md"] }), "r", workspace, protectedInput),
+    ).rejects.toThrow(/resolves to the protected input/);
+    await expect(
+      verifyAgentResult(JSON.stringify({ ...result, artifacts: ["out/hard.md"] }), "r", workspace, protectedInput),
     ).rejects.toThrow(/protected input/);
     await expect(
-      verifyAgentResult(JSON.stringify({ ...result, artifacts: ["input.md/copy.txt"] }), "r", workspace, "input.md"),
-    ).rejects.toThrow(/protected input/);
-    await expect(
-      verifyAgentResult(JSON.stringify({ ...result, artifacts: ["other/input.md"] }), "r", workspace, "input.md"),
+      verifyAgentResult(JSON.stringify({ ...result, artifacts: ["input.md/copy.txt"] }), "r", workspace, protectedInput),
     ).rejects.toThrow(/not readable/);
-    const verified = await verifyAgentResult(JSON.stringify(result), "r", workspace, "input.md");
-    expect(verified.artifacts).toEqual(["out/artifact.txt"]);
+    // a separate regular file with a similar name is not the protected input
+    const verified = await verifyAgentResult(
+      JSON.stringify({ ...result, artifacts: ["other/input.md", "out/artifact.txt"] }),
+      "r",
+      workspace,
+      protectedInput,
+    );
+    expect(verified.artifacts).toEqual(["other/input.md", "out/artifact.txt"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
