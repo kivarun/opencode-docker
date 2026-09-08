@@ -77,12 +77,12 @@ export async function runAgentSmoke(
       const resolved = await resolveWorkspaceInput(options.workspace, input.path, workspaceCanonical);
       protectedInputs.push({ ...resolved, id: input.id });
       console.error(
-        `orchestrator: protected input ${input.id} ok (${resolved.pathInWorkspace}, sha256 ${resolved.sha256})`,
+        `orchestrator: protected input ${input.id} ok (${resolved.declaredPath}, target ${resolved.pathInWorkspace}, sha256 ${resolved.sha256})`,
       );
     }
     protectedInputStates = protectedInputs.map((input) => ({
       id: input.id,
-      path: input.pathInWorkspace,
+      path: input.declaredPath,
       sha256: input.sha256,
     }));
     identity = {

@@ -59,6 +59,7 @@ export const PIPELINE_RUN_FAILURE_REASONS = [
   "worker_timeout",
   "agent_result_invalid",
   "protected_input_modified",
+  "control_path_invalid",
   "runtime_input_missing",
   "unknown_outcome",
   "invalid_outcome",
@@ -632,6 +633,105 @@ function validateEventOrder(events: PipelineRunEvent[]): void {
 }
 
 /**
+ * Every lifecycle event payload must name exactly the activation, session,
+ * transition, or terminal it belongs to. Events are replayed in order
+ * against the activation/transition/terminal records, so a mutated
+ * `state_id`, `activation_index`, `session_id`, transition payload/index, or
+ * terminal state id fails closed.
+ */
+function validateEventPayloadCoherence(
+  events: PipelineRunEvent[],
+  activations: ActivationState[],
+  transitions: CommittedTransitionState[],
+  terminal: TerminalStateState | undefined,
+): void {
+  let activationPointer = 0;
+  let transitionPointer = 0;
+  for (const event of events) {
+    switch (event.kind) {
+      case "activation_started": {
+        const expected = activations[activationPointer];
+        if (
+          expected === undefined ||
+          event.activation_index !== expected.index ||
+          event.state_id !== expected.state_id
+        ) {
+          throw new PipelineStateError(
+            `event ${event.sequence} (activation_started) names activation ${event.activation_index} (${JSON.stringify(event.state_id)}), which does not match the next activation record`,
+          );
+        }
+        activationPointer += 1;
+        break;
+      }
+      case "session_created": {
+        const current = activations[activationPointer - 1];
+        if (
+          current === undefined ||
+          event.activation_index !== current.index ||
+          event.state_id !== current.state_id
+        ) {
+          throw new PipelineStateError(
+            `event ${event.sequence} (session_created) names activation ${event.activation_index} (${JSON.stringify(event.state_id)}), which is not the activation in progress`,
+          );
+        }
+        if (current.session_id === undefined || event.session_id !== current.session_id) {
+          throw new PipelineStateError(
+            `event ${event.sequence} (session_created) names session ${JSON.stringify(event.session_id)}, which is not the session recorded by activation ${current.index}`,
+          );
+        }
+        break;
+      }
+      case "agent_running":
+      case "result_accepted":
+      case "session_cleanup_completed":
+      case "activation_failed": {
+        const current = activations[activationPointer - 1];
+        if (
+          current === undefined ||
+          event.activation_index !== current.index ||
+          event.state_id !== current.state_id
+        ) {
+          throw new PipelineStateError(
+            `event ${event.sequence} (${event.kind}) names activation ${event.activation_index} (${JSON.stringify(event.state_id)}), which is not the activation in progress`,
+          );
+        }
+        break;
+      }
+      case "transition_committed": {
+        const transition = transitions[transitionPointer];
+        if (
+          transition === undefined ||
+          event.from !== transition.from ||
+          event.outcome !== transition.outcome ||
+          event.to !== transition.to ||
+          event.transition_index !== transition.index ||
+          event.activation_index !== transition.activation_index
+        ) {
+          throw new PipelineStateError(
+            `event ${event.sequence} (transition_committed) does not match the next committed transition record`,
+          );
+        }
+        transitionPointer += 1;
+        break;
+      }
+      case "terminal_reached": {
+        if (terminal === undefined || event.state_id !== terminal.state_id) {
+          throw new PipelineStateError(
+            `event ${event.sequence} (terminal_reached) names terminal state ${JSON.stringify(event.state_id)}, which is not the reached terminal`,
+          );
+        }
+        break;
+      }
+      case "run_created":
+      case "run_succeeded":
+      case "run_failed":
+      case "run_cleanup_failed":
+        break;
+    }
+  }
+}
+
+/**
  * Exact-field, fail-closed validation of a parsed pipeline run state
  * document, including cross-field consistency (revision/sequence, cursor
  * versus transition chain, activation contiguity and session ownership,
@@ -718,6 +818,11 @@ export function validatePipelineRunState(value: unknown): PipelineRunState {
   const transitions = obj.transitions.map((transition, index) =>
     validateCommittedTransition(transition, `pipeline run state transitions[${index}]`),
   );
+  if (transitions.length > pipeline.max_transitions) {
+    throw new PipelineStateError(
+      `pipeline run state records ${transitions.length} committed transitions, more than the pipeline transition budget ${pipeline.max_transitions}`,
+    );
+  }
   const terminal = obj.terminal === undefined ? undefined : validateTerminalState(obj.terminal, "pipeline run state terminal");
   const failure = obj.failure === undefined ? undefined : validateFailureState(obj.failure, "pipeline run state failure");
   const events = validateEvents(obj.events, "pipeline run state events");
@@ -984,6 +1089,12 @@ export function validatePipelineRunState(value: unknown): PipelineRunState {
         `terminal state ${JSON.stringify(terminal.state_id)} does not match the cursor ${JSON.stringify(cursor.current_state)}`,
       );
     }
+    if (activations.length > transitions.length) {
+      const uncommitted = activations[transitions.length];
+      throw new PipelineStateError(
+        `the terminal was reached but activation ${uncommitted?.index}'s transition was never committed`,
+      );
+    }
     if (phase !== "finalizing" && phase !== "finished") {
       throw new PipelineStateError(
         `a reached terminal state requires phase "finalizing" or "finished", got ${JSON.stringify(phase)}`,
@@ -1007,6 +1118,9 @@ export function validatePipelineRunState(value: unknown): PipelineRunState {
       );
     }
   }
+
+  // last: every event payload must name exactly the record it belongs to
+  validateEventPayloadCoherence(events, activations, transitions, terminal);
 
   if (terminal !== undefined) {
     state.terminal = terminal;
@@ -1489,6 +1603,12 @@ export function reducePipelineRunCommand(
           `transition starts at ${JSON.stringify(step.from)}, but the cursor is at ${JSON.stringify(current.cursor.current_state)}`,
         );
       }
+      if (current.cursor.transition_count >= current.pipeline.max_transitions) {
+        fail(
+          current,
+          `committing transition ${current.cursor.transition_count + 1} would exceed the pipeline transition budget ${current.pipeline.max_transitions}`,
+        );
+      }
       if (step.from !== activation.state_id) {
         fail(
           current,
@@ -1548,13 +1668,21 @@ export function reducePipelineRunCommand(
         );
       }
       // every started activation must be cleaned up before the terminal is
-      // recorded: the engine only reaches the terminal after the last
-      // transition, and that transition required a cleaned activation
+      // recorded, and every cleaned activation's transition must be committed:
+      // the engine only reaches the terminal after the last transition, and
+      // that transition required a cleaned activation
       const last = current.activations[current.activations.length - 1];
       if (last !== undefined && last.phase !== "session_cleanup_completed") {
         fail(
           current,
           `recording the terminal state requires the last activation to be cleaned up, activation ${last.index} has phase ${JSON.stringify(last.phase)}`,
+        );
+      }
+      if (current.activations.length > current.transitions.length) {
+        const uncommitted = current.activations[current.transitions.length];
+        fail(
+          current,
+          `recording the terminal state requires activation ${uncommitted?.index}'s transition to be committed first`,
         );
       }
       next.terminal = { state_id: command.terminalStateId, result: command.terminalResult };

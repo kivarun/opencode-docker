@@ -43,6 +43,19 @@ export class RuntimeInputError extends Error {
 }
 
 /**
+ * An orchestrator-owned control path (the activation control tree inside the
+ * workspace) is not in the expected state: an unexpected object, a symlink,
+ * or a pre-placed leaf. The failure happens before the Session is created;
+ * nothing outside the workspace is read, created, or modified.
+ */
+export class ControlPathError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ControlPathError";
+  }
+}
+
+/**
  * Maps the terminal cause of a run to one normalized failure reason. A
  * recorded signal always wins (the lifecycle records it as the run's cause);
  * everything unrecognized is `internal_error`.
@@ -75,6 +88,9 @@ export function classifyRunFailure(
   }
   if (failure instanceof WorkspaceInputError) {
     return "protected_input_modified";
+  }
+  if (failure instanceof ControlPathError) {
+    return "control_path_invalid";
   }
   if (failure instanceof RuntimeInputError) {
     return "runtime_input_missing";

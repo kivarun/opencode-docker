@@ -1,4 +1,4 @@
-import { mkdir, realpath, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants, lstat, mkdir, open as fsOpen, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentResultError,
@@ -29,6 +29,7 @@ import type { PipelineStateIo } from "./pipeline_state_store.ts";
 import {
   AgentTimeoutError,
   classifyRunFailure,
+  ControlPathError,
   RuntimeInputError,
   WorkspaceInputError,
 } from "./run_errors.ts";
@@ -122,6 +123,8 @@ export interface ResolvedWorkspaceInput {
   workspaceCanonical: string;
   canonical: string;
   pathInWorkspace: string;
+  /** The declared input path (verbatim, never rewritten). */
+  declaredPath: string;
   sha256: string;
   dev: number;
   ino: number;
@@ -209,6 +212,7 @@ export async function resolveWorkspaceInput(
     workspaceCanonical,
     canonical: checked.canonical,
     pathInWorkspace: relative(workspaceCanonical, checked.canonical),
+    declaredPath: inputPath,
     sha256,
     dev: checked.dev,
     ino: checked.ino,
@@ -224,6 +228,267 @@ export async function canonicalWorkspacePath(
     throw new WorkspaceInputError(
       `workspace ${workspace} cannot be canonicalized: ${describeError(cause)}`,
     );
+  }
+}
+
+async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {
+  try {
+    return await lstat(path);
+  } catch (cause) {
+    if (
+      typeof cause === "object" &&
+      cause !== null &&
+      (cause as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return null;
+    }
+    throw new ControlPathError(
+      `orchestrator control path ${path} cannot be inspected: ${describeError(cause)}`,
+    );
+  }
+}
+
+async function ensureControlDir(
+  path: string,
+  description: string,
+): Promise<void> {
+  const info = await lstatOrNull(path);
+  if (info === null) {
+    try {
+      await mkdir(path, { mode: 0o700 });
+    } catch (cause) {
+      throw new ControlPathError(
+        `orchestrator control directory ${path} (${description}) could not be created: ${describeError(cause)}`,
+      );
+    }
+    return;
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new ControlPathError(
+      `orchestrator control path ${path} (${description}) exists but is ${info.isSymbolicLink() ? "a symbolic link" : "not a directory"}`,
+    );
+  }
+}
+
+/**
+ * Prepares the activation control tree for one activation, fail-closed:
+ * every parent component is an existing (or freshly created) real directory
+ * without symlinks, and both the activation leaf and the attempt leaf must
+ * be absent — an existing leaf, symlink, or unexpected object is rejected
+ * before any Session is created. The execution document is then created with
+ * O_EXCL|O_NOFOLLOW, so a pre-placed file or symlink can never be followed
+ * or overwritten.
+ */
+export async function prepareActivationControlTree(params: {
+  workspaceCanonical: string;
+  runId: string;
+  activationIndex: number;
+  stateId: string;
+  executionDocument: string;
+}): Promise<string> {
+  const { workspaceCanonical, runId, activationIndex, stateId } = params;
+  const root = join(workspaceCanonical, AGENT_SMOKE_DIR);
+  const runDir = join(root, runId);
+  const activationsDir = join(runDir, "activations");
+  const activationLeaf = join(activationsDir, `${activationIndex}-${stateId}`);
+  const attemptLeaf = join(activationLeaf, "attempt-1");
+  const docPath = join(attemptLeaf, "execution.md");
+
+  await ensureControlDir(root, `run state root of run ${runId}`);
+  await ensureControlDir(runDir, `run directory of run ${runId}`);
+  await ensureControlDir(activationsDir, `activations directory of run ${runId}`);
+
+  for (const absent of [activationLeaf, attemptLeaf]) {
+    const info = await lstatOrNull(absent);
+    if (info !== null) {
+      throw new ControlPathError(
+        `activation leaf ${absent} must not exist before the activation starts, found ${info.isSymbolicLink() ? "a symbolic link" : info.isDirectory() ? "an existing directory" : "an unexpected object"}`,
+      );
+    }
+  }
+
+  try {
+    await mkdir(activationLeaf, { mode: 0o700 });
+  } catch (cause) {
+    throw new ControlPathError(
+      `activation leaf ${activationLeaf} could not be created as a new directory: ${describeError(cause)}`,
+    );
+  }
+  try {
+    await mkdir(attemptLeaf, { mode: 0o700 });
+  } catch (cause) {
+    throw new ControlPathError(
+      `attempt leaf ${attemptLeaf} could not be created as a new directory: ${describeError(cause)}`,
+    );
+  }
+
+  let handle;
+  try {
+    handle = await fsOpen(
+      docPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (cause) {
+    throw new ControlPathError(
+      `execution document ${docPath} could not be created exclusively: ${describeError(cause)}`,
+    );
+  }
+  try {
+    await handle.write(Buffer.from(params.executionDocument, "utf8"));
+  } finally {
+    await handle.close();
+  }
+
+  // the whole control tree must still resolve inside the canonical workspace
+  const rootCanonical = await realpath(root).catch((cause: unknown) => {
+    throw new ControlPathError(
+      `orchestrator control directory ${root} cannot be canonicalized: ${describeError(cause)}`,
+    );
+  });
+  if (
+    rootCanonical !== workspaceCanonical &&
+    !rootCanonical.startsWith(`${workspaceCanonical}/`)
+  ) {
+    throw new ControlPathError(
+      `orchestrator control directory ${root} resolves outside the canonical workspace ${workspaceCanonical}`,
+    );
+  }
+  const attemptCanonical = await realpath(attemptLeaf).catch((cause: unknown) => {
+    throw new ControlPathError(
+      `activation leaf ${attemptLeaf} cannot be canonicalized: ${describeError(cause)}`,
+    );
+  });
+  if (attemptCanonical !== attemptLeaf) {
+    throw new ControlPathError(
+      `activation leaf ${attemptLeaf} does not match its canonical path ${attemptCanonical}`,
+    );
+  }
+  return attemptLeaf;
+}
+
+/**
+ * The expected result file must not exist before the worker starts: the
+ * result of this activation can only be produced by the worker run itself.
+ */
+export async function checkResultFileAbsent(resultPath: string): Promise<void> {
+  const info = await lstatOrNull(resultPath);
+  if (info !== null) {
+    throw new ControlPathError(
+      `expected result file ${resultPath} already exists before the agent run, found ${info.isSymbolicLink() ? "a symbolic link" : info.isDirectory() ? "a directory" : "an unexpected object"}`,
+    );
+  }
+}
+
+/**
+ * Reads the activation's result file fail-closed: the path itself must be a
+ * regular non-symlink file inside the exact activation leaf (realpath
+ * equality, no follow), and the bytes are read through an O_NOFOLLOW file
+ * descriptor. A missing file is a missing agent result; anything else about
+ * the control path is a control-path violation.
+ */
+export async function readResultFileNoFollow(resultPath: string): Promise<Uint8Array> {
+  const activationDir = resolve(resultPath, "..");
+  const attemptCanonical = await realpath(activationDir).catch((cause: unknown) => {
+    throw new ControlPathError(
+      `activation leaf ${activationDir} cannot be canonicalized: ${describeError(cause)}`,
+    );
+  });
+  if (attemptCanonical !== activationDir) {
+    throw new ControlPathError(
+      `activation leaf ${activationDir} does not match its canonical path ${attemptCanonical}`,
+    );
+  }
+  let info = await lstatOrNull(resultPath);
+  if (info === null) {
+    throw new AgentResultError(`agent result not readable at ${resultPath}: no such file`);
+  }
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new ControlPathError(
+      `expected result file ${resultPath} is ${info.isSymbolicLink() ? "a symbolic link" : "not a regular file"}`,
+    );
+  }
+  let handle;
+  try {
+    handle = await fsOpen(resultPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (cause) {
+    throw new ControlPathError(
+      `expected result file ${resultPath} cannot be opened without following symlinks: ${describeError(cause)}`,
+    );
+  }
+  try {
+    const opened = await handle.stat();
+    if (opened.isSymbolicLink?.() === true || !opened.isFile()) {
+      throw new ControlPathError(
+        `expected result file ${resultPath} is not a regular file`,
+      );
+    }
+    return new Uint8Array(await handle.readFile());
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Re-resolves every declared protected input path against the canonical
+ * workspace and compares the full filesystem identity — canonical target,
+ * device, inode, and content digest — against the recorded baseline. An
+ * unchanged in-workspace symlink still passes; a retargeted symlink, a
+ * replaced inode, a changed file type, a disappearance, or a content change
+ * fails as `protected_input_modified`.
+ */
+export async function verifyProtectedInputs(
+  workspaceCanonical: string,
+  baselines: readonly ResolvedProtectedInput[],
+  when: string,
+): Promise<void> {
+  for (const baseline of baselines) {
+    const declared = baseline.declaredPath;
+    const candidate = resolve(workspaceCanonical, declared);
+    let info;
+    try {
+      info = await stat(candidate);
+    } catch (cause) {
+      throw new WorkspaceInputError(
+        `protected input ${declared} disappeared ${when}: ${describeError(cause)}`,
+      );
+    }
+    if (!info.isFile()) {
+      throw new WorkspaceInputError(
+        `protected input ${declared} is no longer a regular file ${when}`,
+      );
+    }
+    let canonical: string;
+    try {
+      canonical = await realpath(candidate);
+    } catch (cause) {
+      throw new WorkspaceInputError(
+        `protected input ${declared} cannot be canonicalized ${when}: ${describeError(cause)}`,
+      );
+    }
+    if (canonical !== baseline.canonical) {
+      throw new WorkspaceInputError(
+        `protected input ${declared} now resolves to ${canonical} instead of the recorded target ${baseline.canonical} ${when}`,
+      );
+    }
+    if (info.dev !== baseline.dev || info.ino !== baseline.ino) {
+      throw new WorkspaceInputError(
+        `protected input ${declared} was replaced with a different file (device/inode ${baseline.dev}/${baseline.ino} -> ${info.dev}/${info.ino}) ${when}`,
+      );
+    }
+    let sha256: string;
+    try {
+      sha256 = await sha256File(canonical);
+    } catch (cause) {
+      throw new WorkspaceInputError(
+        `protected input ${declared} cannot be re-read ${when}: ${describeError(cause)}`,
+      );
+    }
+    if (sha256 !== baseline.sha256) {
+      throw new WorkspaceInputError(
+        `protected input ${declared} was modified ${when} (sha256 ${baseline.sha256} -> ${sha256})`,
+      );
+    }
   }
 }
 
@@ -342,9 +607,16 @@ async function runActivation(
 
   const activationIndex = await sink.startActivation(state.id, profile.profileName);
 
-  const activationDir = activationDirPath(options.workspace, runId, activationIndex, state.id);
+  // the workspace-relative control paths of this activation; the host-side
+  // control tree is built from the fixed canonical workspace below
   const resultPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/activations/${activationIndex}-${state.id}/attempt-1/result.json`;
   const executionDocPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/activations/${activationIndex}-${state.id}/attempt-1/execution.md`;
+  const resultPathHost = activationResultFilePath(
+    params.workspaceCanonical,
+    runId,
+    activationIndex,
+    state.id,
+  );
 
   const declaredInputs = state.inputs.map((inputId) => {
     const spec = params.plan.pipeline.inputs.find((input) => input.id === inputId);
@@ -360,10 +632,14 @@ async function runActivation(
   let accepted: ActivationExecution | null = null;
   let failure: Error | null = null;
   try {
-    await mkdir(activationDir, { recursive: true });
-    await writeFile(
-      activationExecutionDocPath(options.workspace, runId, activationIndex, state.id),
-      executionDocument({
+    // orchestrator-owned control paths are built from the fixed canonical
+    // workspace and prepared fail-closed before any Session exists
+    const activationDir = await prepareActivationControlTree({
+      workspaceCanonical: params.workspaceCanonical,
+      runId,
+      activationIndex,
+      stateId: state.id,
+      executionDocument: executionDocument({
         runId,
         stateId: state.id,
         activationIndex,
@@ -373,15 +649,14 @@ async function runActivation(
         allowedOutcome: "completed",
         promptContent: state.promptContent,
       }),
-      { encoding: "utf8" },
-    );
+    });
     console.error(
       `orchestrator: activation ${activationIndex} of state ${JSON.stringify(state.id)} in ${activationDir}`,
     );
 
     // every input of this state must exist before its Session is created
     for (const input of declaredInputs) {
-      const candidate = resolve(options.workspace, input.path);
+      const candidate = resolve(params.workspaceCanonical, input.path);
       let info;
       try {
         info = await stat(candidate);
@@ -405,10 +680,24 @@ async function runActivation(
         !canonical.startsWith(`${params.workspaceCanonical}/`)
       ) {
         throw new RuntimeInputError(
-          `input ${JSON.stringify(input.id)} (${input.path}) resolves outside workspace ${options.workspace}`,
+          `input ${JSON.stringify(input.id)} (${input.path}) resolves outside workspace ${params.workspaceCanonical}`,
         );
       }
     }
+
+    // the declared protected inputs are re-resolved and compared against the
+    // recorded baseline (canonical target, device, inode, digest) before the
+    // Session is created
+    await verifyProtectedInputs(
+      params.workspaceCanonical,
+      params.protectedInputs,
+      `before activation ${activationIndex}`,
+    );
+
+    // final synchronous signal check: no await between this check and the
+    // Session create call, so a signal recorded during the durable
+    // start_activation or the filesystem preparation cannot create a Session
+    gate.checkAbort();
 
     const child = await createChildSession(
       deps.cli,
@@ -452,6 +741,10 @@ async function runActivation(
 
     await sink.activationAgentRunning();
 
+    // the expected result file of this activation must not exist before the
+    // worker starts: a pre-placed file or symlink is a control-path violation
+    await checkResultFileAbsent(resultPathHost);
+
     const spec = agentWorkerSpec({
       runId,
       stateId: state.id,
@@ -484,25 +777,18 @@ async function runActivation(
       );
     }
 
-    // re-verify every protected input digest after the agent run
-    for (const input of params.protectedInputs) {
-      const current = await currentInputSha256(input);
-      if (current !== input.sha256) {
-        throw new WorkspaceInputError(
-          `protected input ${input.pathInWorkspace} was modified during the agent run (sha256 ${input.sha256} -> ${current})`,
-        );
-      }
-    }
+    // re-verify every protected input's full filesystem identity after the
+    // agent run, before the result can be accepted
+    await verifyProtectedInputs(
+      params.workspaceCanonical,
+      params.protectedInputs,
+      "after the agent run",
+    );
 
-    const resultFile = activationResultFilePath(options.workspace, runId, activationIndex, state.id);
-    let bytes: Uint8Array;
-    try {
-      bytes = await Bun.file(resultFile).bytes();
-    } catch (cause) {
-      throw new AgentResultError(
-        `agent result not readable at ${resultFile}: ${describeError(cause)}`,
-      );
-    }
+    // the result file must be a regular non-symlink file inside the exact
+    // activation leaf; the bytes are read without following symlinks
+    const resultFile = resultPathHost;
+    const bytes = await readResultFileNoFollow(resultFile);
     const resultHasher = new Bun.CryptoHasher("sha256");
     resultHasher.update(bytes);
     const resultSha256 = resultHasher.digest("hex");
@@ -570,31 +856,6 @@ async function runActivation(
     throw new PipelineError("the activation finished without an accepted result");
   }
   return accepted;
-}
-
-async function currentInputSha256(input: ResolvedProtectedInput): Promise<string> {
-  let info;
-  try {
-    info = await stat(input.canonical);
-  } catch (cause) {
-    throw new WorkspaceInputError(
-      `protected input ${input.pathInWorkspace} disappeared during the agent run: ${describeError(cause)}`,
-    );
-  }
-  if (!info.isFile()) {
-    throw new WorkspaceInputError(
-      `protected input ${input.pathInWorkspace} is no longer a regular file after the agent run`,
-    );
-  }
-  let current: string;
-  try {
-    current = await sha256File(input.canonical);
-  } catch (cause) {
-    throw new WorkspaceInputError(
-      `cannot re-read protected input ${input.canonical} after the agent run: ${describeError(cause)}`,
-    );
-  }
-  return current;
 }
 
 /**

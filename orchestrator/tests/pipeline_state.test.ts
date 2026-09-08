@@ -77,7 +77,7 @@ function happyPathCommands(): PipelineRunCommand[] {
 /** Two activations of the same state (a revisit), one transition each. */
 function revisitPathCommands(): PipelineRunCommand[] {
   return [
-    createRun(),
+    createRun({ identity: { ...IDENTITY, max_transitions: 2 } }),
     { kind: "start_activation", stateId: "execute", profile: "default" },
     { kind: "activation_session_created", sessionId: "s1" },
     { kind: "activation_agent_running" },
@@ -394,6 +394,74 @@ describe("pipeline run state reducer", () => {
       { kind: "start_activation", stateId: "execute", profile: "default" },
     ])!;
     expectCommandRejection(cleaned, { kind: "activation_session_created", sessionId: "s1" }, /already belongs to activation/);
+  });
+
+  test("the transition budget rejects the next transition and the rejected command changes nothing", () => {
+    const exhausted = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: [] },
+      { kind: "activation_cleanup_completed" },
+      // the single budgeted transition commits at the boundary
+      { kind: "transition_committed", step: { from: "execute", outcome: "completed", to: "execute", transition_index: 0 }, activationIndex: 1, resultSha256: "c".repeat(64), artifacts: [] },
+    ])!;
+    expect(exhausted.cursor).toEqual({ current_state: "execute", transition_count: 1 });
+    const before = JSON.stringify(exhausted);
+    // a second transition would exceed the budget of 1
+    const overBudget: PipelineRunCommand = {
+      kind: "transition_committed",
+      step: { from: "execute", outcome: "completed", to: "execute", transition_index: 0 },
+      activationIndex: 1,
+      resultSha256: "c".repeat(64),
+      artifacts: [],
+    };
+    expect(() => reducePipelineRunCommand(exhausted, overBudget, tick(15))).toThrow(
+      /would exceed the pipeline transition budget 1/,
+    );
+    expect(JSON.stringify(exhausted)).toBe(before);
+    // with a raised budget the same transition commits
+    const raised = runCommands([
+      createRun({ identity: { ...IDENTITY, max_transitions: 2 } }),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: [] },
+      { kind: "activation_cleanup_completed" },
+      { kind: "transition_committed", step: { from: "execute", outcome: "completed", to: "execute", transition_index: 0 }, activationIndex: 1, resultSha256: "c".repeat(64), artifacts: [] },
+    ])!;
+    const second = reducePipelineRunCommand(raised, overBudget, tick(15));
+    expect(second.cursor).toEqual({ current_state: "execute", transition_count: 2 });
+  });
+
+  test("the terminal cannot be reached directly after a cleaned activation without a committed transition", () => {
+    const cleaned = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: [] },
+      { kind: "activation_cleanup_completed" },
+    ])!;
+    expectCommandRejection(
+      cleaned,
+      { kind: "terminal_reached", terminalStateId: "completed", terminalResult: "success" },
+      /does not match the cursor "execute"/,
+    );
+  });
+
+  test("an entry-terminal run with zero activations and transitions round-trips", () => {
+    const entryTerminal = runCommands([
+      createRun({ identity: { ...IDENTITY, entry_state: "completed" } }),
+      { kind: "terminal_reached", terminalStateId: "completed", terminalResult: "success" },
+      { kind: "run_succeeded" },
+    ])!;
+    expect(entryTerminal.activations).toEqual([]);
+    expect(entryTerminal.transitions).toEqual([]);
+    expect(entryTerminal.cursor).toEqual({ current_state: "completed", transition_count: 0 });
+    expect(entryTerminal.terminal).toEqual({ state_id: "completed", result: "success" });
+    expect(validatePipelineRunState(JSON.parse(JSON.stringify(entryTerminal)))).toEqual(entryTerminal);
   });
 
   test("duplicate transitions and events are rejected", () => {
@@ -812,11 +880,19 @@ describe("exact-field loader validation", () => {
     const uncleanedReference = JSON.parse(JSON.stringify(failedRun));
     uncleanedReference.transitions[0].activation_index = 2;
     expect(() => validatePipelineRunState(uncleanedReference)).toThrow(/transitions must reference activations in order/);
-    // a reference to an existing but uncleaned activation is equally illegal
+    // an artificial second transition first trips the transition budget
     const uncleanedSecond = JSON.parse(JSON.stringify(failedRun));
     uncleanedSecond.transitions.push({ ...uncleanedSecond.transitions[0], activation_index: 2 });
     uncleanedSecond.cursor.transition_count = 2;
     expect(() => validatePipelineRunState(uncleanedSecond)).toThrow(
+      /records 2 committed transitions, more than the pipeline transition budget 1/,
+    );
+    // with a raised budget the uncleaned reference is rejected on its own
+    const uncleanedSecondWithBudget = JSON.parse(JSON.stringify(failedRun));
+    uncleanedSecondWithBudget.pipeline.max_transitions = 2;
+    uncleanedSecondWithBudget.transitions.push({ ...uncleanedSecondWithBudget.transitions[0], activation_index: 2 });
+    uncleanedSecondWithBudget.cursor.transition_count = 2;
+    expect(() => validatePipelineRunState(uncleanedSecondWithBudget)).toThrow(
       /references activation 2 whose phase "failed" is not a cleaned activation/,
     );
     const stateIdMismatch = JSON.parse(JSON.stringify(valid()));
@@ -926,6 +1002,137 @@ describe("exact-field loader validation", () => {
     ])!;
     expect(failedEntry.status).toBe("failed");
     expect(validatePipelineRunState(JSON.parse(JSON.stringify(failedEntry)))).toEqual(failedEntry);
+  });
+
+  test("an artificial document with more transitions than the budget is rejected", () => {
+    const overBudget = JSON.parse(JSON.stringify(valid()));
+    overBudget.pipeline.max_transitions = 1;
+    overBudget.transitions.push({ ...overBudget.transitions[0], from: "completed", to: "completed", activation_index: 2 });
+    overBudget.cursor.transition_count = 2;
+    expect(() => validatePipelineRunState(overBudget)).toThrow(
+      /records 2 committed transitions, more than the pipeline transition budget 1/,
+    );
+    // the budget boundary itself is proven by the reducer tests: a run with
+    // max_transitions 2 commits two transitions (see the revisit path)
+  });
+
+  test("event payloads must name exactly the activation, session, transition, or terminal they belong to", () => {
+    const mutate = (mutator: (document: Record<string, any>) => void, pattern: RegExp) => {
+      const broken = JSON.parse(JSON.stringify(valid()));
+      mutator(broken);
+      expect(() => validatePipelineRunState(broken)).toThrow(pattern);
+    };
+
+    mutate(
+      (document) => {
+        document.events[1].state_id = "elsewhere";
+      },
+      /activation_started.*does not match the next activation record/s,
+    );
+    mutate(
+      (document) => {
+        document.events[1].activation_index = 2;
+      },
+      /activation_started.*does not match the next activation record/s,
+    );
+    mutate(
+      (document) => {
+        document.events[2].session_id = "s-elsewhere";
+      },
+      /session_created.*names session "s-elsewhere", which is not the session recorded by activation 1/s,
+    );
+    mutate(
+      (document) => {
+        document.events[2].state_id = "elsewhere";
+      },
+      /session_created.*is not the activation in progress/s,
+    );
+    mutate(
+      (document) => {
+        document.events[3].activation_index = 2;
+      },
+      /agent_running.*is not the activation in progress/s,
+    );
+    mutate(
+      (document) => {
+        document.events[4].state_id = "elsewhere";
+      },
+      /result_accepted.*is not the activation in progress/s,
+    );
+    mutate(
+      (document) => {
+        document.events[5].activation_index = 2;
+      },
+      /session_cleanup_completed.*is not the activation in progress/s,
+    );
+    mutate(
+      (document) => {
+        document.events[6].transition_index = 5;
+      },
+      /transition_committed.*does not match the next committed transition record/s,
+    );
+    mutate(
+      (document) => {
+        document.events[6].to = "elsewhere";
+      },
+      /transition_committed.*does not match the next committed transition record/s,
+    );
+    mutate(
+      (document) => {
+        document.events[6].activation_index = 2;
+      },
+      /transition_committed.*does not match the next committed transition record/s,
+    );
+    mutate(
+      (document) => {
+        document.events[7].state_id = "elsewhere";
+      },
+      /terminal_reached.*names terminal state "elsewhere", which is not the reached terminal/s,
+    );
+    // the terminal record itself mutated to match the event is caught by the
+    // cursor check
+    mutate(
+      (document) => {
+        document.terminal.state_id = "elsewhere";
+      },
+      /does not match the cursor/,
+    );
+  });
+
+  test("session_cleanup_completed followed by terminal_reached without a transition is rejected", () => {
+    const cleaned = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: [] },
+      { kind: "activation_cleanup_completed" },
+    ])!;
+    expect(() =>
+      reducePipelineRunCommand(
+        cleaned,
+        { kind: "terminal_reached", terminalStateId: "completed", terminalResult: "success" },
+        tick(15),
+      ),
+    ).toThrow(/does not match the cursor "execute"/);
+    // an equivalent artificial document (cursor and terminal forged) is
+    // rejected because the cleaned activation's transition is missing
+    const forged = JSON.parse(JSON.stringify(cleaned));
+    forged.revision = 7;
+    forged.phase = "finalizing";
+    forged.events = [
+      ...forged.events.slice(0, 6),
+      { sequence: 7, kind: "terminal_reached", state_id: "completed", at: "2026-01-01T00:00:07.000Z" },
+    ];
+    // the forged document is cursor-consistent (no transitions, the entry
+    // state claims to be the terminal), so the missing transition is what is
+    // actually caught
+    forged.pipeline.entry_state = "completed";
+    forged.cursor = { current_state: "completed", transition_count: 0 };
+    forged.terminal = { state_id: "completed", result: "success" };
+    expect(() => validatePipelineRunState(forged)).toThrow(
+      /the terminal was reached but activation 1's transition was never committed/,
+    );
   });
 });
 

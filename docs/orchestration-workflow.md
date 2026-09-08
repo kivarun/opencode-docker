@@ -36,14 +36,22 @@ by the default declarative pipeline:
 3. The orchestrator verifies its docker-helper Launcher credential.
 4. For every agent-state activation the orchestrator runs one activation in
    its own child Session: durable `activation_started`, runtime-input
-   existence checks, child Session creation with an immediate durable
-   `session_created`, an image pull (non-fatal), durable `agent_running`, the
-   `docker-helper run` bounded by that state's `timeout_seconds`, result
-   verification, durable `result_accepted`, the child Session delete, and
-   durable `session_cleanup_completed`; only then does the validated outcome
-   reach the graph engine, whose transition-commit hook records the
-   transition and cursor before the next activation. Sessions are never
-   reused between states or revisits.
+   existence checks, fail-closed activation control-tree preparation
+   (parents re-validated, leaves created as new absent directories, the
+   execution document created `O_EXCL|O_NOFOLLOW`), re-resolution of every
+   declared protected input against its recorded baseline (canonical target,
+   device, inode, digest), a final synchronous signal check, child Session
+   creation with an immediate durable `session_created`, an image pull
+   (non-fatal), durable `agent_running` after verifying the expected result
+   file is still absent, the `docker-helper run` bounded by that state's
+   `timeout_seconds`, full re-verification of the protected inputs' declared
+   paths and filesystem identities, result verification (identity, schema,
+   artifact confinement, alias protection, and a symlink-free read of the
+   result file inside the exact activation leaf), durable `result_accepted`,
+   the child Session delete, and durable `session_cleanup_completed`; only
+   then does the validated outcome reach the graph engine, whose
+   transition-commit hook records the transition and cursor before the next
+   activation. Sessions are never reused between states or revisits.
 5. It starts OpenCode non-interactively in the child Session. The worker is
    launched through the official docker-helper CLI 2.1.0 (`docker-helper run`,
    spawned as an argv array); until docker-helper issue #3 is implemented,
@@ -60,7 +68,9 @@ by the default declarative pipeline:
      `run_id`/`state_id`/`activation_index`/`attempt` identity, artifact
      paths (workspace confinement, plus canonical-path and dev+inode alias
      checks against every protected input), and the unchanged protected
-     input digests. The graph engine maps the validated outcome through the
+     inputs (each declared path re-resolved fresh; canonical target,
+     device, inode, and digest compared against the recorded baseline). The
+     graph engine maps the validated outcome through the
      state's declared transition; every accepted transition, the reached
      terminal, and the final run status are committed to the durable
      pipeline run state under the operator state root.
@@ -635,11 +645,21 @@ sequences, cursor/transition/activation coherence (contiguous activation
 indexes from 1, exactly one active activation, a new activation only after
 the previous activation's cleanup and committed transition, a transition
 referencing the accepted-and-cleaned activation whose `from` equals the
-cursor, the terminal recorded only when the cursor reaches a terminal state),
-and terminal-status
+cursor, a transition that would exceed `pipeline.max_transitions` rejected,
+the terminal recorded only when the cursor reaches a terminal state, and a
+terminal never reachable after a cleaned activation whose transition was
+never committed), and terminal-status
 immutability (once the run status is `success`, `failed`, or
 `cleanup_failed`, no command can overwrite it — there is no
-`success → failed` rewrite and no other post-terminal mutation).
+`success → failed` rewrite and no other post-terminal mutation). The loader
+enforces the same coherence fail-closed: a document with more committed
+transitions than the pipeline's `max_transitions` is rejected, and every
+event payload must name exactly the activation, session, transition, or
+terminal record it belongs to (a mutated `state_id`, `activation_index`,
+`session_id`, transition field, or terminal state id fails validation);
+an entry-terminal run with zero activations and transitions stays
+representable, and a failed run after a cleaned activation whose transition
+was not committed due to a persistence error remains representable.
 
 Write algorithm — one commit per state change, always in this order: create
 the run directory (mode 0700, symlinked directories rejected), create the

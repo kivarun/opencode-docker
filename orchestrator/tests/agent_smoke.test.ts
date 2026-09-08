@@ -248,6 +248,13 @@ interface FakeAgentOptions {
   pullCode?: number;
   resultBody?: ResultBody;
   resultByState?: Record<string, ResultBody>;
+  /** Deterministic hook executed inside the fake worker of each run. */
+  prepareTrap?: (
+    workspace: string,
+    runId: string,
+    stateId: string,
+    activationIndex: number,
+  ) => Promise<void> | void;
   createArtifacts?: boolean;
   createNotesDuringFirstRun?: boolean;
   writeNotes?: boolean;
@@ -353,6 +360,9 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
       }
       if (activationIndex === 1 && options.createNotesDuringFirstRun === true) {
         await writeFile(join(options.workspace, NOTES_PATH), NOTES_BODY);
+      }
+      if (options.prepareTrap !== undefined) {
+        await options.prepareTrap(options.workspace, runId, stateId, activationIndex);
       }
       if ((options.createArtifacts ?? true) === true) {
         await mkdir(join(options.workspace, ".pipeline-agent-smoke"), { recursive: true });
@@ -1661,7 +1671,7 @@ test("27. agent modified the protected input: run fails, session deleted", async
     const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
-    expect(outcome.detail).toContain("was modified during the agent run");
+    expect(outcome.detail).toContain("was modified after the agent run");
     expect(deleteCallCount(calls)).toBe(1);
   });
 });
@@ -2843,4 +2853,310 @@ test("extra: activation directories are separate per revisit", () => {
     "/w/.pipeline-agent-smoke/run-1/activations/2-review/attempt-1",
   );
   expect(agentRunDirPath("/w", "run-1")).toBe("/w/.pipeline-agent-smoke/run-1");
+});
+
+function trapActivationLeaf(
+  workspace: string,
+  runId: string,
+  activationIndex: number,
+  stateId: string,
+): string {
+  return join(
+    workspace,
+    ".pipeline-agent-smoke",
+    runId,
+    "activations",
+    `${activationIndex}-${stateId}`,
+  );
+}
+
+test("60a. a symlink planted at the future activation leaf is rejected before the second session", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    const root = dirs.state; // outside the workspace
+    const sentinel = join(root, "sentinel-dir", "sentinel.txt");
+    await mkdir(join(root, "sentinel-dir"), { recursive: true });
+    await writeFile(sentinel, "SENTINEL\n");
+    let runIdSeen = "";
+    const { calls, runner } = fakeCli({
+      workspace: dirs.workspace,
+      prepareTrap: async (workspace, runId) => {
+        runIdSeen = runId;
+        await symlink(
+          join(root, "sentinel-dir"),
+          trapActivationLeaf(workspace, runId, 2, "second"),
+        );
+      },
+    });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+    expect(runIdSeen).not.toBe("");
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("must not exist");
+    expect(outcome.detail).toContain("a symbolic link");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    expect(await readFile(sentinel, "utf8")).toBe("SENTINEL\n");
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure.reason).toBe("control_path_invalid");
+    expect(state.transitions).toHaveLength(1);
+    expect(state.activations).toHaveLength(2);
+    expect(state.activations[1].phase).toBe("failed");
+    expect(state.activations[1].failure_reason).toBe("control_path_invalid");
+  });
+});
+
+test("60b. a planted execution.md symlink is rejected before the second session", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    const sentinel = join(dirs.state, "sentinel.md");
+    await writeFile(sentinel, "SENTINEL EXECUTION\n");
+    const { calls, runner } = fakeCli({
+      workspace: dirs.workspace,
+      prepareTrap: async (workspace, runId) => {
+        const leaf = trapActivationLeaf(workspace, runId, 2, "second");
+        await mkdir(join(leaf, "attempt-1"), { recursive: true });
+        await symlink(sentinel, join(leaf, "attempt-1", "execution.md"));
+      },
+    });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("must not exist");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    expect(await readFile(sentinel, "utf8")).toBe("SENTINEL EXECUTION\n");
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure.reason).toBe("control_path_invalid");
+    expect(state.transitions).toHaveLength(1);
+    expect(state.activations[1].failure_reason).toBe("control_path_invalid");
+  });
+});
+
+test("60c. a planted result.json symlink is rejected before the second session", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    const sentinel = join(dirs.state, "sentinel-result.json");
+    await writeFile(sentinel, '{"sentinel":true}\n');
+    const { calls, runner } = fakeCli({
+      workspace: dirs.workspace,
+      prepareTrap: async (workspace, runId) => {
+        const leaf = trapActivationLeaf(workspace, runId, 2, "second");
+        await mkdir(join(leaf, "attempt-1"), { recursive: true });
+        await symlink(sentinel, join(leaf, "attempt-1", "result.json"));
+      },
+    });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("must not exist");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    expect(await readFile(sentinel, "utf8")).toBe('{"sentinel":true}\n');
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure.reason).toBe("control_path_invalid");
+    expect(state.transitions).toHaveLength(1);
+  });
+});
+
+test("60d. a pre-created regular future activation leaf with prepared content is rejected", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    const sentinel = join(dirs.state, "sentinel-plain.md");
+    await writeFile(sentinel, "SENTINEL PLAIN\n");
+    const { calls, runner } = fakeCli({
+      workspace: dirs.workspace,
+      prepareTrap: async (workspace, runId) => {
+        const leaf = trapActivationLeaf(workspace, runId, 2, "second");
+        await mkdir(join(leaf, "attempt-1"), { recursive: true });
+        await writeFile(join(leaf, "attempt-1", "execution.md"), "PREPARED\n");
+      },
+    });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("must not exist");
+    expect(outcome.detail).toContain("an existing directory");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    expect(await readFile(sentinel, "utf8")).toBe("SENTINEL PLAIN\n");
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure.reason).toBe("control_path_invalid");
+    expect(state.transitions).toHaveLength(1);
+  });
+});
+
+test("60e. the first activation retargets a declared symlink protected input: the second session is never created", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    await mkdir(join(dirs.workspace, "notes"));
+    await writeFile(join(dirs.workspace, "notes", "a.md"), "TARGET A\n");
+    await writeFile(join(dirs.workspace, "notes", "b.md"), "TARGET B\n");
+    await rm(join(dirs.workspace, "TASK.md"));
+    await symlink(join(dirs.workspace, "notes", "a.md"), join(dirs.workspace, "TASK.md"));
+    // the first activation's worker prepares the trap while the transition
+    // commit of activation 1 is in flight, so the retargeted symlink is
+    // caught by the second activation's pre-activation identity check
+    const gate = gateIoAtRename(7);
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, createNotesDuringFirstRun: true });
+    const pending = runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: gate.io }));
+    await gate.reached;
+    await rm(join(dirs.workspace, "TASK.md"));
+    await symlink(join(dirs.workspace, "notes", "b.md"), join(dirs.workspace, "TASK.md"));
+    gate.release();
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("now resolves to");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure.reason).toBe("protected_input_modified");
+    expect(state.transitions).toHaveLength(1);
+    expect(state.activations).toHaveLength(2);
+    expect(state.activations[1].phase).toBe("failed");
+    expect(state.activations[1].failure_reason).toBe("protected_input_modified");
+    expect(state.activations[1].session_id).toBeUndefined();
+    // the durable path is the declared pipeline path
+    expect(state.protected_inputs[0].path).toBe("TASK.md");
+  });
+});
+
+test("60f. a protected regular file replaced with a new inode of identical bytes is detected", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    // the replacement lands while the transition commit of activation 1 is
+    // in flight; the second activation's pre-activation check must catch it
+    const gate = gateIoAtRename(7);
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, createNotesDuringFirstRun: true });
+    const pending = runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: gate.io }));
+    await gate.reached;
+    const body = await readFile(join(dirs.workspace, "TASK.md"), "utf8");
+    await rm(join(dirs.workspace, "TASK.md"));
+    await writeFile(join(dirs.workspace, "TASK.md"), body);
+    gate.release();
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("was replaced with a different file");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure.reason).toBe("protected_input_modified");
+    expect(state.transitions).toHaveLength(1);
+  });
+});
+
+test("60g. a replaced protected input plus a hardlink artifact does not bypass alias protection", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    const gate = gateIoAtRename(7);
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, createNotesDuringFirstRun: true });
+    const pending = runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: gate.io }));
+    await gate.reached;
+    const body = await readFile(join(dirs.workspace, "TASK.md"), "utf8");
+    await rm(join(dirs.workspace, "TASK.md"));
+    await writeFile(join(dirs.workspace, "TASK.md"), body);
+    // an artifact hardlinked to the replacement inode; the identity
+    // verification must fail before artifact checks can even run
+    await link(join(dirs.workspace, "TASK.md"), join(dirs.workspace, "stolen-artifact.txt"));
+    gate.release();
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("was replaced with a different file");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure.reason).toBe("protected_input_modified");
+    expect(state.transitions).toHaveLength(1);
+  });
+});
+
+test("60h. an unchanged internal symlink protected input passes the full identity check", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    await mkdir(join(dirs.workspace, "notes"));
+    await writeFile(join(dirs.workspace, "notes", "a.md"), "TARGET A\n");
+    await rm(join(dirs.workspace, "TASK.md"));
+    await symlink(join(dirs.workspace, "notes", "a.md"), join(dirs.workspace, "TASK.md"));
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, createNotesDuringFirstRun: true });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.status).toBe("success");
+    expect(createCallCount(calls)).toBe(2);
+    expect(deleteCallCount(calls)).toBe(2);
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("success");
+    expect(state.protected_inputs[0].path).toBe("TASK.md");
+    expect(state.protected_inputs[0].sha256).toBe(
+      new Bun.CryptoHasher("sha256").update("TARGET A\n").digest("hex"),
+    );
+  });
+});
+
+test("60i. a plain protected input content change is still detected after the run", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    const { calls, runner } = fakeCli({
+      workspace: dirs.workspace,
+      modifyTask: true,
+    });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.detail).toContain("was modified after the agent run");
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    const state = await readState(dirs, outcome.runId);
+    expect(state.failure.reason).toBe("protected_input_modified");
+  });
+});
+
+test("61. a signal recorded during the blocked second start_activation closes the window before the second session", async () => {
+  await withTwoStateFixture(async (dirs) => {
+    // commit 8 is the durable start_activation of the second activation:
+    // while its rename is in flight the signal is recorded, and after the
+    // commit is released the new pre-Session checkAbort must abort the run
+    // before any second Session is created
+    const gate = gateIoAtRename(8);
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, createNotesDuringFirstRun: true });
+    const pending = runAgentSmoke(
+      agentSmokeOptions(dirs),
+      makeDeps(dirs, runner, {
+        pipelineStateIo: gate.io,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    await gate.reached;
+    signalHandler!("SIGINT");
+    gate.release();
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(130);
+    expect(outcome.ok).toBe(false);
+    // the first Session was created and deleted exactly once, the second was
+    // never created
+    expect(createCallCount(calls)).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+    const state = await readState(dirs, outcome.runId);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toEqual({ reason: "signal_sigint" });
+    expect(state.transitions).toHaveLength(1);
+    expect(state.transitions[0].to).toBe("second");
+    expect(state.activations).toHaveLength(2);
+    expect(state.activations[1].phase).toBe("failed");
+    expect(state.activations[1].failure_reason).toBe("signal_sigint");
+    expect(state.activations[1].session_id).toBeUndefined();
+    expect(state.activations[1].session_cleanup).toBe("completed");
+    expect(state.events.map((e: any) => e.kind).slice(-4)).toEqual([
+      "transition_committed",
+      "activation_started",
+      "activation_failed",
+      "run_failed",
+    ]);
+  });
 });
