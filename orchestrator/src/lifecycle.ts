@@ -1,11 +1,9 @@
 import { stat } from "node:fs/promises";
 import {
   DockerHelperError,
-  describeError,
   type AuthFetcher,
   type CliRunner,
 } from "./docker_helper.ts";
-import type { HelperTransport } from "./helper_api.ts";
 import {
   createChildSession,
   deleteChildSession,
@@ -34,7 +32,6 @@ export class StatePersistError extends Error {
 
 export interface LifecycleDeps {
   cli: CliRunner;
-  transport?: HelperTransport;
   fetchAuth: AuthFetcher;
   config: HelperConfig;
   stateDirPath?: string;
@@ -59,6 +56,7 @@ export interface PreSessionContext {
 export interface SessionContext extends PreSessionContext {
   sessionId: string;
   childToken: string;
+  childEnv: Record<string, string>;
   checkAbort: () => void;
 }
 
@@ -74,6 +72,16 @@ export interface LifecycleOutcome {
   sessionId?: string;
   status: string;
   detail?: string;
+}
+
+/**
+ * Environment for docker-helper `pull`/`run` CLI calls: the child Session
+ * bearer only. The bearer authorizes the CLI call and is repeated through
+ * `--env` so the worker receives its Session capability. No ambient or
+ * operator environment is inherited.
+ */
+export function childSessionEnv(childToken: string): Record<string, string> {
+  return { DOCKER_HELPER_SESSION_TOKEN: childToken };
 }
 
 const CLI_ENV_KEYS = ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DOCKER_HELPER_CONFIG"] as const;
@@ -129,21 +137,14 @@ export async function runWithChildSession(
     if (signalBox.abort !== null) {
       return;
     }
+    // Record the abort only. The caller (main.ts) forwards the signal to a
+    // running worker `run` CLI process; everything else (`session create`,
+    // `pull`, `session delete`) runs to completion. Cleanup happens solely in
+    // the lifecycle `finally`, after the active hook settles — the fire-and-
+    // forget cleanup path is intentionally gone. docker-helper 2.1.0 cancels
+    // the container operation on the signal best-effort and does not confirm
+    // a terminal operation state.
     signalBox.abort = new SignalAbort(signal);
-    // Abort sequence: confirm the worker operation reached a terminal state
-    // after cancellation (or record that its state is unknown) BEFORE the child
-    // Session may be deleted, so the in-flight cancellation never races the
-    // Session cleanup that would invalidate the child bearer.
-    void (async () => {
-      try {
-        await deps.transport?.cancelActive();
-      } catch (cause) {
-        console.error(
-          `orchestrator: worker cancellation did not confirm a terminal state: ${describeError(cause)}`,
-        );
-      }
-      await cleanup();
-    })();
   });
 
   const state: RunState = {
@@ -230,6 +231,7 @@ export async function runWithChildSession(
         updateState,
         sessionId: child.sessionId,
         childToken: child.token,
+        childEnv: childSessionEnv(child.token),
         checkAbort: () => {
           if (signalBox.abort !== null) {
             throw signalBox.abort;

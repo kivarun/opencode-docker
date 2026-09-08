@@ -6,10 +6,20 @@ export interface CliResult {
 
 export type CliStdio = "capture" | "inherit";
 
+export interface CliRunOptions {
+  /**
+   * Forward a received SIGINT/SIGTERM to this CLI process. Only worker `run`
+   * calls are signalable: `session create/delete` and `pull` always run to
+   * completion.
+   */
+  signalOnAbort?: boolean;
+}
+
 export type CliRunner = (
   args: string[],
   env: Record<string, string>,
   stdio: CliStdio,
+  opts?: CliRunOptions,
 ) => Promise<CliResult>;
 
 export interface AuthInfo {
@@ -230,4 +240,45 @@ export function describeError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+export class SubprocessCliRunner {
+  private active: { proc: Bun.Subprocess<"ignore", "pipe" | "inherit", "pipe" | "inherit">; signalOnAbort: boolean } | null = null;
+
+  killActive(signal: "SIGINT" | "SIGTERM"): void {
+    if (this.active !== null && this.active.signalOnAbort) {
+      try {
+        this.active.proc.kill(signal);
+      } catch {
+        this.active = null;
+      }
+    }
+  }
+
+  async run(
+    args: string[],
+    env: Record<string, string>,
+    stdio: CliStdio,
+    opts?: CliRunOptions,
+  ): Promise<CliResult> {
+    const proc = Bun.spawn(["docker-helper", ...args], {
+      env,
+      stdin: "ignore",
+      stdout: stdio === "inherit" ? "inherit" : "pipe",
+      stderr: stdio === "inherit" ? "inherit" : "pipe",
+    });
+    this.active = { proc, signalOnAbort: opts?.signalOnAbort === true };
+    try {
+      if (stdio === "inherit") {
+        return { code: await proc.exited };
+      }
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout as ReadableStream).text(),
+        new Response(proc.stderr as ReadableStream).text(),
+      ]);
+      return { code: await proc.exited, stdout, stderr };
+    } finally {
+      this.active = null;
+    }
+  }
 }

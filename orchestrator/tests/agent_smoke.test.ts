@@ -7,21 +7,27 @@ import {
   verifyAgentResult,
   type AgentResult,
 } from "../src/agent_result.ts";
-import { agentInstruction, agentWorkerSpec, type WorkerSpec } from "../src/worker.ts";
-import type { HelperTransport, RunOutcome } from "../src/helper_api.ts";
+import { agentInstruction, agentWorkerSpec, pullArgs, runArgs } from "../src/worker.ts";
 import { runAgentSmoke, agentRunDirPath, agentResultFilePath, type AgentSmokeDeps } from "../src/agent_smoke.ts";
-import type { CliRunner } from "../src/docker_helper.ts";
+import { childSessionEnv, signalExitCode, type LifecycleDeps } from "../src/lifecycle.ts";
+import type { CliResult, CliRunner } from "../src/docker_helper.ts";
 
 const LAUNCHER_TOKEN = "dhc_" + "a".repeat(64);
 const CHILD_TOKEN = "dht_" + "b".repeat(64);
 const CHILD_SESSION_ID = "dhs_child";
 const LAUNCHER_ID = "dhl_launcher";
+const SOCKET = "/run/docker-helper/test.sock";
 const TASK_MARKER = "SECRET-TASK-MARKER-42";
 const TASK_BODY = `# Task ${TASK_MARKER}\n\nCreate the work product.\n`;
 const WORK_PRODUCT_PATH = ".pipeline-agent-smoke/work-product.txt";
 const WORK_PRODUCT_BODY = "opencode-agent-smoke-ok\n";
 const CANARY = "CANARY_AMBIENT_VAR";
 const CANARY_VALUE = "must-never-reach-the-worker";
+const COMPLEX_LLM_SERVER = "https://llm.example/v1? a=b \"c\"";
+
+const LAUNCHER_SECRET = "dhc_launcher_secret_value";
+const ADMIN_SECRET = "dha_admin_secret_value";
+const STATE_PATH = "/host/orchestrator-state";
 
 const PROFILE_IMAGE = "gitreg.example/opencode-docker/base:latest";
 const OPENCODE_CONFIG = '{"$schema":"https://opencode.ai/config.json","model":"test/model"}';
@@ -29,15 +35,17 @@ const OPENCODE_CONFIG = '{"$schema":"https://opencode.ai/config.json","model":"t
 const BASE_ENV = {
   HOME: "/home/opencode",
   XDG_CONFIG_HOME: "/uat-cred",
-  LLM_SERVER: "https://llm.example/v1",
+  XDG_STATE_HOME: "/xdg-state",
+  XDG_RUNTIME_DIR: "/run/user/1000",
+  LLM_SERVER: COMPLEX_LLM_SERVER,
   LLM_KEY: "sk-test-key",
   OPENCODE_ENABLE_EXA: "1",
   OPENCODE_EXPERIMENTAL_LSP_TOOL: "true",
   [CANARY]: CANARY_VALUE,
   DOCKER_HELPER_SESSION_TOKEN: "dht_launcher_session_token",
-  DOCKER_HELPER_CREDENTIAL_TOKEN: LAUNCHER_TOKEN,
-  DOCKER_HELPER_ADMIN_TOKEN: "dha_admin_secret",
-  DOCKER_HELPER_STATE_PATH: "/host/orchestrator-state",
+  DOCKER_HELPER_CREDENTIAL_TOKEN: LAUNCHER_SECRET,
+  DOCKER_HELPER_ADMIN_TOKEN: ADMIN_SECRET,
+  DOCKER_HELPER_STATE_PATH: STATE_PATH,
 };
 
 const PROFILE_BODY = [
@@ -59,6 +67,150 @@ const PROFILE_BODY = [
   "    required: false",
   "",
 ].join("\n");
+
+interface FakeAgentOptions {
+  runCode?: number;
+  pullCode?: number;
+  resultBody?: string | ((runId: string) => string);
+  createArtifacts?: boolean;
+  modifyTask?: boolean;
+  writeResult?: boolean;
+  deleteCode?: number;
+  createCode?: number;
+  blockRun?: boolean;
+}
+
+interface RecordedCall {
+  args: string[];
+  env: Record<string, string>;
+  stdio: string;
+  signalOnAbort: boolean;
+}
+
+function envPairValue(args: string[], name: string): string {
+  for (let i = 1; i < args.length; i++) {
+    if (args[i - 1] === "--env") {
+      const pair = args[i] ?? "";
+      if (pair.startsWith(`${name}=`)) {
+        return pair.slice(name.length + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function fakeCli(options: FakeAgentOptions & { workspace: string }) {
+  const calls: RecordedCall[] = [];
+  const events: string[] = [];
+  let activeRun: { release: (code: number) => void } | null = null;
+
+  const runner = async (
+    args: string[],
+    env: Record<string, string>,
+    stdio: string,
+    opts?: { signalOnAbort?: boolean },
+  ): Promise<CliResult> => {
+    calls.push({ args: [...args], env: { ...env }, stdio, signalOnAbort: opts?.signalOnAbort === true });
+    if (args[0] === "run") {
+      events.push("run:start");
+      if (options.blockRun === true) {
+        return await new Promise<CliResult>((resolve) => {
+          activeRun = {
+            release: (code: number) => {
+              events.push(`run:exited:${code}`);
+              resolve({ code, stdout: "", stderr: "" });
+            },
+          };
+        });
+      }
+      const runCode = options.runCode ?? 0;
+      events.push(`run:exited:${runCode}`);
+      const envPairs = args.filter((a, i) => args[i - 1] === "--env");
+      const runId = envPairs.find((p) => p.startsWith("AGENT_SMOKE_RUN_ID="))?.slice("AGENT_SMOKE_RUN_ID=".length) ?? "";
+      if ((options.modifyTask ?? false) === true) {
+        const taskPair = envPairs.find((p) => p.startsWith("AGENT_SMOKE_TASK_PATH=")) ?? "";
+        const taskContainerPath = taskPair.slice("AGENT_SMOKE_TASK_PATH=".length);
+        const taskHost = join(options.workspace, taskContainerPath.replace(/^\/workspace\//, ""));
+        await writeFile(taskHost, `${await readFile(taskHost, "utf8")}TAMPERED\n`);
+      }
+      if ((options.createArtifacts ?? true) === true) {
+        await mkdir(join(options.workspace, ".pipeline-agent-smoke"), { recursive: true });
+        await writeFile(join(options.workspace, WORK_PRODUCT_PATH), WORK_PRODUCT_BODY);
+      }
+      if ((options.writeResult ?? true) === true && runCode === 0) {
+        const artifacts =
+          (options.createArtifacts ?? true) === true ? [WORK_PRODUCT_PATH] : [];
+        const bodyOrFactory =
+          options.resultBody === undefined
+            ? JSON.stringify({
+                schema_version: 1,
+                run_id: runId,
+                status: "completed",
+                summary: "created the work product",
+                artifacts,
+              })
+            : options.resultBody;
+        const body = typeof bodyOrFactory === "function" ? bodyOrFactory(runId) : bodyOrFactory;
+        if (body !== "") {
+          await mkdir(agentRunDirPath(options.workspace, runId), { recursive: true });
+          await writeFile(agentResultFilePath(options.workspace, runId), `${body}\n`);
+        }
+      }
+      return { code: runCode, stdout: "", stderr: "" };
+    }
+    if (args[0] === "pull") {
+      events.push("pull:start", "pull:done");
+      return { code: options.pullCode ?? 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "session" && args[1] === "create") {
+      events.push("session:create", "session:create-done");
+      if ((options.createCode ?? 0) !== 0) {
+        return { code: options.createCode ?? 1, stdout: "", stderr: "create boom" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          session: {
+            id: CHILD_SESSION_ID,
+            workspace: options.workspace,
+            created_at: "t",
+            expires_at: "t",
+            launcher_id: LAUNCHER_ID,
+          },
+          token: CHILD_TOKEN,
+        }),
+        stderr: "",
+      };
+    }
+    if (args[0] === "session" && args[1] === "delete") {
+      events.push("session:delete");
+      if ((options.deleteCode ?? 0) !== 0) {
+        return { code: options.deleteCode ?? 1, stdout: "", stderr: "delete boom" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ ok: true, id: CHILD_SESSION_ID, deleted: true }),
+        stderr: "",
+      };
+    }
+    return { code: 1, stdout: "", stderr: `unexpected cli call: ${args[0]}` };
+  };
+
+  return {
+    calls,
+    events,
+    runner,
+    killActive: (signal: "SIGINT" | "SIGTERM") => {
+      if (activeRun !== null) {
+        events.push(`run:signal:${signal}`);
+        const release = activeRun.release;
+        activeRun = null;
+        release(signalExitCode(signal));
+      }
+    },
+  };
+}
 
 async function withFixture(
   fn: (dirs: {
@@ -85,153 +237,30 @@ async function withFixture(
   await writeFile(join(configRoot, "profiles", "default.yaml"), PROFILE_BODY);
   await writeFile(join(configRoot, "opencode", "default.json"), OPENCODE_CONFIG);
   try {
-    await fn({ workspace, state, credentialFile, configRoot, profileFile: join(configRoot, "profiles", "default.yaml") });
+    await fn({
+      workspace,
+      state,
+      credentialFile,
+      configRoot,
+      profileFile: join(configRoot, "profiles", "default.yaml"),
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 }
 
-interface FakeAgentOptions {
-  runCode?: number;
-  pullFails?: boolean;
-  writeResult?: boolean;
-  resultBody?: string | ((runId: string) => string);
-  createArtifacts?: boolean;
-  modifyTask?: boolean;
-  deleteCode?: number;
-  createCode?: number;
-}
-
-interface RecordedCliCall {
-  args: string[];
-  env: Record<string, string>;
-  stdio: string;
-}
-
-interface RecordedTransportCall {
-  kind: "pull" | "run" | "cancel";
-  image?: string;
-  spec?: WorkerSpec;
-  bearer?: string;
-}
-
-class FakeAgentTransport implements HelperTransport {
-  readonly calls: RecordedTransportCall[] = [];
-
-  constructor(
-    private readonly options: FakeAgentOptions & { workspace: string },
-  ) {}
-
-  async pull(image: string, bearer: string): Promise<void> {
-    this.calls.push({ kind: "pull", image, bearer });
-    if (this.options.pullFails === true) {
-      throw new Error("pull boom");
-    }
-  }
-
-  async run(spec: WorkerSpec, bearer: string): Promise<RunOutcome> {
-    this.calls.push({ kind: "run", spec, bearer });
-    const env = spec.containerEnv;
-    const runId = env["AGENT_SMOKE_RUN_ID"] ?? "";
-    if ((this.options.modifyTask ?? false) === true) {
-      const taskContainer = env["AGENT_SMOKE_TASK_PATH"] ?? "";
-      const taskHost = this.containerToHost(taskContainer);
-      await writeFile(taskHost, `${await readFile(taskHost, "utf8")}TAMPERED\n`);
-    }
-    if ((this.options.createArtifacts ?? true) === true) {
-      const workProduct = join(this.options.workspace, WORK_PRODUCT_PATH);
-      await mkdir(join(this.options.workspace, ".pipeline-agent-smoke"), { recursive: true });
-      await writeFile(workProduct, WORK_PRODUCT_BODY);
-    }
-    if ((this.options.writeResult ?? true) === true) {
-      const artifacts =
-        (this.options.createArtifacts ?? true) === true ? [WORK_PRODUCT_PATH] : [];
-      const bodyOrFactory =
-        this.options.resultBody === undefined
-          ? JSON.stringify({
-              schema_version: 1,
-              run_id: runId,
-              status: "completed",
-              summary: "created the work product",
-              artifacts,
-            } satisfies AgentResult)
-          : this.options.resultBody;
-      const body = typeof bodyOrFactory === "function" ? bodyOrFactory(runId) : bodyOrFactory;
-      if (body !== "") {
-        await mkdir(agentRunDirPath(this.options.workspace, runId), { recursive: true });
-        await writeFile(agentResultFilePath(this.options.workspace, runId), `${body}\n`);
-      }
-    }
-    return { code: this.options.runCode ?? 0, operationId: "op_fake" };
-  }
-
-  cancelActive(): Promise<void> {
-    this.calls.push({ kind: "cancel" });
-    return Promise.resolve();
-  }
-
-  private containerToHost(containerPath: string): string {
-    const prefix = "/workspace/";
-    if (!containerPath.startsWith(prefix)) {
-      throw new Error(`unexpected container path: ${containerPath}`);
-    }
-    return join(this.options.workspace, containerPath.slice(prefix.length));
-  }
-}
-
-function fakeCli(options: FakeAgentOptions & { workspace: string }) {
-  const calls: RecordedCliCall[] = [];
-  const runner: CliRunner = async (args, env, stdio) => {
-    calls.push({ args: [...args], env: { ...env }, stdio });
-    if (args[0] === "session" && args[1] === "create") {
-      if ((options.createCode ?? 0) !== 0) {
-        return { code: options.createCode ?? 1, stdout: "", stderr: "create boom" };
-      }
-      return {
-        code: 0,
-        stdout: JSON.stringify({
-          ok: true,
-          session: {
-            id: CHILD_SESSION_ID,
-            workspace: options.workspace,
-            created_at: "t",
-            expires_at: "t",
-            launcher_id: LAUNCHER_ID,
-          },
-          token: CHILD_TOKEN,
-        }),
-        stderr: "",
-      };
-    }
-    if (args[0] === "session" && args[1] === "delete") {
-      if ((options.deleteCode ?? 0) !== 0) {
-        return { code: options.deleteCode ?? 1, stdout: "", stderr: "delete boom" };
-      }
-      return {
-        code: 0,
-        stdout: JSON.stringify({ ok: true, id: CHILD_SESSION_ID, deleted: true }),
-        stderr: "",
-      };
-    }
-    return { code: 1, stdout: "", stderr: `unexpected cli call: ${args[0]}` };
-  };
-  return { calls, runner };
-}
-
 function makeDeps(
   dirs: { workspace: string; state: string; credentialFile: string },
   runner: CliRunner,
-  transport: HelperTransport,
-  overrides: Partial<AgentSmokeDeps> = {},
+  overrides: Partial<LifecycleDeps> = {},
 ): AgentSmokeDeps {
   return {
     cli: runner,
-    transport,
     fetchAuth: async () => ({
       status: 200,
       body: { authority: "launcher", principal: "michael", launcher_id: LAUNCHER_ID },
     }),
-    config: { socketPath: "/run/docker-helper/test.sock", credentialFile: dirs.credentialFile },
+    config: { socketPath: SOCKET, credentialFile: dirs.credentialFile },
     stateDirPath: dirs.state,
     baseEnv: BASE_ENV,
     ...overrides,
@@ -247,38 +276,79 @@ function agentSmokeOptions(dirs: { workspace: string; configRoot: string }) {
   };
 }
 
-function deleteCallCount(calls: RecordedCliCall[]): number {
+function deleteCallCount(calls: RecordedCall[]): number {
   return calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length;
 }
 
-function createCallCount(calls: RecordedCliCall[]): number {
+function createCallCount(calls: RecordedCall[]): number {
   return calls.filter((c) => c.args[0] === "session" && c.args[1] === "create").length;
+}
+
+function runCall(calls: RecordedCall[]): RecordedCall {
+  const call = calls.find((c) => c.args[0] === "run");
+  if (call === undefined) {
+    throw new Error("no run call recorded");
+  }
+  return call;
+}
+
+function runEnvPairs(args: string[]): string[] {
+  return args.filter((a, i) => args[i - 1] === "--env");
 }
 
 test("1. success: agent runs via profile, result + artifacts verified, session cleaned up, exit 0", async () => {
   await withFixture(async (dirs) => {
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(0);
     expect(outcome.ok).toBe(true);
     expect(outcome.sessionId).toBe(CHILD_SESSION_ID);
     expect(outcome.status).toBe("success");
 
-    const createCall = calls.find((c) => c.args[0] === "session" && c.args[1] === "create")!;
-    expect(createCall.env.XDG_CONFIG_HOME).toBe("/uat-cred");
+    const create = calls.find((c) => c.args[0] === "session" && c.args[1] === "create")!;
+    expect(create.env.XDG_CONFIG_HOME).toBe("/uat-cred");
+    expect(create.env.DOCKER_HELPER_SESSION_TOKEN).toBeUndefined();
 
-    const runCall = transport.calls.find((c) => c.kind === "run")!;
-    const env = runCall.spec?.containerEnv ?? {};
-    expect(env.AGENT_SMOKE_RUN_ID).toBe(outcome.runId);
-    expect(env.AGENT_SMOKE_TASK_PATH).toBe("/workspace/TASK.md");
-    expect(env.AGENT_SMOKE_RESULT_PATH).toBe(
-      `/workspace/.pipeline-agent-smoke/${outcome.runId}/result.json`,
-    );
-    expect(runCall.spec?.image).toBe(PROFILE_IMAGE);
-    expect(runCall.spec?.entrypoint).toBe("opencode");
-    expect(runCall.spec?.mounts).toEqual([{ source: ".", target: "/workspace" }]);
+    const run = calls.find((c) => c.args[0] === "run")!;
+    expect(run.env).toEqual(childSessionEnv(CHILD_TOKEN));
+    expect(run.signalOnAbort).toBe(true);
+    expect(run.stdio).toBe("inherit");
+    expect(run.args[0]).toBe("run");
+    expect(run.args[1]).toBe("--endpoint");
+    expect(run.args[2]).toBe(SOCKET);
+    expect(run.args[3]).toBe("--image");
+    expect(run.args[4]).toBe(PROFILE_IMAGE);
+    expect(run.args[5]).toBe("--entrypoint");
+    expect(run.args[6]).toBe("opencode");
+    expect(run.args[7]).toBe("--workdir");
+    expect(run.args[8]).toBe("/workspace");
+    expect(run.args[9]).toBe("--mount");
+    expect(run.args[10]).toBe(".:/workspace");
+    const envPairs = run.args.filter((a, i) => run.args[i - 1] === "--env");
+    expect(envPairs).toEqual([
+      `AGENT_SMOKE_RESULT_PATH=/workspace/.pipeline-agent-smoke/${outcome.runId}/result.json`,
+      `AGENT_SMOKE_RUN_ID=${outcome.runId}`,
+      "AGENT_SMOKE_TASK_PATH=/workspace/TASK.md",
+      `DOCKER_HELPER_SESSION_TOKEN=${CHILD_TOKEN}`,
+      "LLM_KEY=sk-test-key",
+      `LLM_SERVER=${COMPLEX_LLM_SERVER}`,
+      `OPENCODE_CONFIG_CONTENT=${OPENCODE_CONFIG}`,
+      "OPENCODE_ENABLE_EXA=1",
+      "OPENCODE_EXPERIMENTAL_LSP_TOOL=true",
+    ]);
+    const separator = run.args.indexOf("--");
+    expect(run.args.slice(separator + 1)).toEqual([
+      "run",
+      "--format",
+      "json",
+      "--auto",
+      agentInstruction("TASK.md", `.pipeline-agent-smoke/${outcome.runId}/result.json`, outcome.runId),
+    ]);
+    expect(run.args.indexOf("--")).toBeGreaterThan(run.args.lastIndexOf("--env"));
+
+    expect(calls.find((c) => c.args[0] === "pull")?.args).toEqual(pullArgs(PROFILE_IMAGE, SOCKET));
+    expect(calls.find((c) => c.args[0] === "pull")?.env).toEqual(childSessionEnv(CHILD_TOKEN));
 
     expect(deleteCallCount(calls)).toBe(1);
 
@@ -303,9 +373,8 @@ test("1. success: agent runs via profile, result + artifacts verified, session c
 
 test("2. agent nonzero exit: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace, runCode: 3 });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, runCode: 3 });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.ok).toBe(false);
@@ -316,9 +385,8 @@ test("2. agent nonzero exit: run fails, session deleted", async () => {
 
 test("3. missing result.json: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace, writeResult: false });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, writeResult: false });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("agent result not readable");
@@ -328,9 +396,8 @@ test("3. missing result.json: run fails, session deleted", async () => {
 
 test("4. invalid JSON result: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace, resultBody: "{ not json" });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, resultBody: "{ not json" });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("not valid JSON");
@@ -340,8 +407,7 @@ test("4. invalid JSON result: run fails, session deleted", async () => {
 
 test("5a. wrong schema_version: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({
+    const { calls, runner } = fakeCli({
       workspace: dirs.workspace,
       resultBody: JSON.stringify({
         schema_version: 2,
@@ -351,7 +417,7 @@ test("5a. wrong schema_version: run fails, session deleted", async () => {
         artifacts: [],
       }),
     });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("schema_version");
@@ -361,8 +427,7 @@ test("5a. wrong schema_version: run fails, session deleted", async () => {
 
 test("5b. run_id mismatch: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({
+    const { calls, runner } = fakeCli({
       workspace: dirs.workspace,
       resultBody: JSON.stringify({
         schema_version: 1,
@@ -372,7 +437,7 @@ test("5b. run_id mismatch: run fails, session deleted", async () => {
         artifacts: [],
       }),
     });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("does not match this run");
@@ -382,8 +447,7 @@ test("5b. run_id mismatch: run fails, session deleted", async () => {
 
 test("6. listed artifact missing on disk: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({
+    const { calls, runner } = fakeCli({
       workspace: dirs.workspace,
       createArtifacts: false,
       resultBody: (runId) =>
@@ -395,7 +459,7 @@ test("6. listed artifact missing on disk: run fails, session deleted", async () 
           artifacts: [WORK_PRODUCT_PATH],
         }),
     });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("is not readable");
@@ -405,8 +469,7 @@ test("6. listed artifact missing on disk: run fails, session deleted", async () 
 
 test("7. artifact escaping the workspace: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({
+    const { calls, runner } = fakeCli({
       workspace: dirs.workspace,
       resultBody: (runId) =>
         JSON.stringify({
@@ -417,7 +480,7 @@ test("7. artifact escaping the workspace: run fails, session deleted", async () 
           artifacts: ["../../escaped.txt"],
         }),
     });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("not a clean workspace-relative");
@@ -427,9 +490,8 @@ test("7. artifact escaping the workspace: run fails, session deleted", async () 
 
 test("8. agent modified TASK.md: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace, modifyTask: true });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, modifyTask: true });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("task file was modified during the agent run");
@@ -437,93 +499,83 @@ test("8. agent modified TASK.md: run fails, session deleted", async () => {
   });
 });
 
-test("9. pull failure is non-fatal when the image is local; post-session failures still clean up", async () => {
+test("9. pull failure is non-fatal when the image may be local", async () => {
   await withFixture(async (dirs) => {
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace, pullFails: true });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace, pullCode: 1 });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(0);
     expect(outcome.status).toBe("success");
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
     expect(deleteCallCount(calls)).toBe(1);
   });
 });
 
-test("10. worker environment is the exact profile projection; credentials and ambient env never forwarded", async () => {
+test("10. exact env projection; control and ambient material never reaches worker env; task body never in argv", async () => {
   await withFixture(async (dirs) => {
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
     expect(outcome.exitCode).toBe(0);
 
-    const runCall = transport.calls.find((c) => c.kind === "run")!;
-    const env = runCall.spec?.containerEnv ?? {};
-    expect(Object.keys(env).sort()).toEqual([
-      "AGENT_SMOKE_RESULT_PATH",
-      "AGENT_SMOKE_RUN_ID",
-      "AGENT_SMOKE_TASK_PATH",
-      "DOCKER_HELPER_SESSION_TOKEN",
-      "LLM_KEY",
-      "LLM_SERVER",
-      "OPENCODE_CONFIG_CONTENT",
-      "OPENCODE_ENABLE_EXA",
-      "OPENCODE_EXPERIMENTAL_LSP_TOOL",
-    ]);
-    expect(env.DOCKER_HELPER_SESSION_TOKEN).toBe(CHILD_TOKEN);
-    expect(env.LLM_SERVER).toBe(BASE_ENV.LLM_SERVER);
-    expect(env.OPENCODE_CONFIG_CONTENT).toBe(OPENCODE_CONFIG);
-    expect(env[CANARY]).toBeUndefined();
+    const run = calls.find((c) => c.args[0] === "run")!;
+    expect(run.env).toEqual(childSessionEnv(CHILD_TOKEN));
+    const runArgsText = JSON.stringify(run.args);
+    for (const forbidden of [LAUNCHER_SECRET, ADMIN_SECRET, STATE_PATH, CANARY_VALUE, TASK_MARKER, TASK_BODY.trim()]) {
+      expect(runArgsText.includes(forbidden)).toBe(false);
+    }
+    // known temporary exception until docker-helper#3: resolved profile env and
+    // the OpenCode config content travel as --env argv elements
+    expect(run.args).toContain(`--env`);
+    expect(run.args).toContain(`LLM_KEY=sk-test-key`);
+    expect(run.args).toContain(`OPENCODE_CONFIG_CONTENT=${OPENCODE_CONFIG}`);
 
-    const runBearer = runCall.bearer;
-    expect(runBearer).toBe(CHILD_TOKEN);
-
-    const serializedCalls = JSON.stringify(calls);
-    for (const secret of [
-      LAUNCHER_TOKEN,
-      "sk-test-key",
-      BASE_ENV.DOCKER_HELPER_ADMIN_TOKEN,
-      BASE_ENV.DOCKER_HELPER_STATE_PATH,
-      BASE_ENV.DOCKER_HELPER_SESSION_TOKEN,
-      CANARY_VALUE,
-      TASK_MARKER,
-      OPENCODE_CONFIG,
-    ]) {
-      expect(serializedCalls.includes(secret)).toBe(false);
+    const create = calls.find((c) => c.args[0] === "session" && c.args[1] === "create")!;
+    const createText = JSON.stringify(create);
+    for (const secret of [CHILD_TOKEN, LAUNCHER_SECRET, "sk-test-key", ADMIN_SECRET, OPENCODE_CONFIG, CANARY_VALUE, COMPLEX_LLM_SERVER]) {
+      expect(createText.includes(secret)).toBe(false);
+    }
+    expect(deleteCallCount(calls)).toBe(1);
+    for (const call of calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete")) {
+      expect(JSON.stringify(call)).not.toContain(CHILD_TOKEN);
     }
 
-    for (const call of calls) {
-      if (call.args[0] === "session") {
-        expect(call.env.DOCKER_HELPER_SESSION_TOKEN).not.toBe(CHILD_TOKEN);
-      }
-    }
-
-    const taskPath = join(dirs.workspace, "TASK.md");
-    const taskContent = await readFile(taskPath, "utf8");
+    const taskContent = await readFile(join(dirs.workspace, "TASK.md"), "utf8");
     expect(taskContent).toContain(TASK_MARKER);
   });
 });
 
-test("10b. transport is the only secret path: no cli call carries profile env values", async () => {
+test("10b. no launcher/admin/state/canary/task markers in run args or env", async () => {
   await withFixture(async (dirs) => {
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
     expect(outcome.exitCode).toBe(0);
 
     for (const call of calls) {
-      const argsText = JSON.stringify(call.args);
-      expect(argsText).not.toContain("sk-test-key");
-      expect(argsText).not.toContain("LLM_KEY=");
-      expect(argsText).not.toContain("OPENCODE_CONFIG_CONTENT=");
+      const text = JSON.stringify(call);
+      if (call.args[0] === "session") {
+        expect(text).not.toContain(LAUNCHER_SECRET);
+        expect(text).not.toContain(ADMIN_SECRET);
+        expect(text).not.toContain(STATE_PATH);
+        expect(text).not.toContain(CANARY_VALUE);
+        expect(text).not.toContain("sk-test-key");
+        expect(text).not.toContain(OPENCODE_CONFIG);
+      }
     }
+    const create = calls.find((c) => c.args[0] === "session" && c.args[1] === "create")!;
+    expect(Object.keys(create.env).sort()).toEqual(
+      ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"].filter((k) => create.env[k] !== undefined).sort(),
+    );
+    const del = calls.find((c) => c.args[0] === "session" && c.args[1] === "delete")!;
+    expect(Object.keys(del.env).sort()).toEqual(
+      ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"].filter((k) => del.env[k] !== undefined).sort(),
+    );
   });
 });
 
 test("11. cleanup failure: overall result can never be success", async () => {
   await withFixture(async (dirs) => {
     const { calls, runner } = fakeCli({ workspace: dirs.workspace, deleteCode: 1 });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.ok).toBe(false);
@@ -536,8 +588,7 @@ test("12. missing TASK.md fails before any session is created", async () => {
   await withFixture(async (dirs) => {
     await rm(join(dirs.workspace, "TASK.md"));
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("is not accessible");
@@ -551,10 +602,9 @@ test("13. TASK.md outside the workspace is rejected", async () => {
     const outside = join(dirs.workspace, "..", "outside-task.md");
     await writeFile(outside, "task");
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
     const outcome = await runAgentSmoke(
       { ...agentSmokeOptions(dirs), taskPath: outside },
-      makeDeps(dirs, runner, transport),
+      makeDeps(dirs, runner),
     );
 
     expect(outcome.exitCode).toBe(1);
@@ -568,8 +618,7 @@ test("14. TASK.md that is a directory is rejected", async () => {
     await rm(join(dirs.workspace, "TASK.md"));
     await mkdir(join(dirs.workspace, "TASK.md"));
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("not a regular file");
@@ -580,35 +629,33 @@ test("14. TASK.md that is a directory is rejected", async () => {
 test("15. unknown profile: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
     const outcome = await runAgentSmoke(
       { ...agentSmokeOptions(dirs), profileName: "missing" },
-      makeDeps(dirs, runner, transport),
+      makeDeps(dirs, runner),
     );
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("profile");
     expect(createCallCount(calls)).toBe(0);
-    expect(transport.calls.some((c) => c.kind === "run")).toBe(false);
+    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
   });
 });
 
 test("16. missing required source env: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const env = { ...BASE_ENV };
-    delete (env as Record<string, string | undefined>).LLM_KEY;
+    const env = { ...BASE_ENV } as Record<string, string | undefined>;
+    delete env.LLM_KEY;
     const outcome = await runAgentSmoke(
       agentSmokeOptions(dirs),
-      makeDeps(dirs, runner, transport, { baseEnv: env }),
+      makeDeps(dirs, runner, { baseEnv: env }),
     );
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("profile requires environment variable LLM_KEY");
     expect(outcome.detail).not.toContain("sk-test-key");
     expect(createCallCount(calls)).toBe(0);
-    expect(transport.calls.some((c) => c.kind === "run")).toBe(false);
+    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
   });
 });
 
@@ -616,8 +663,7 @@ test("17. malformed profile: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
     await writeFile(dirs.profileFile, "schema_version: [unclosed");
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("not valid YAML");
@@ -641,8 +687,7 @@ test("18. profile with control destination: fails before any session is created"
       ].join("\n"),
     );
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("orchestrator-owned control or operator-path variable");
@@ -653,12 +698,11 @@ test("18. profile with control destination: fails before any session is created"
 test("19. profile symlink escape: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
     await rm(dirs.profileFile);
-    const outside = join(dirs.configRoot, "..", "outside-profile.json");
+    const outside = join(dirs.configRoot, "..", "outside-profile.yaml");
     await writeFile(outside, PROFILE_BODY);
     await symlink(outside, dirs.profileFile);
     const { calls, runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("resolves outside the configuration root");
@@ -666,13 +710,51 @@ test("19. profile symlink escape: fails before any session is created", async ()
   });
 });
 
-test("20. --image style second path cannot exist: worker image comes from the profile only", async () => {
+test("20. signal during agent run: signal forwarded -> CLI exited -> Session deleted", async () => {
   await withFixture(async (dirs) => {
-    const { runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeAgentTransport({ workspace: dirs.workspace });
-    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
-    const runCall = transport.calls.find((c) => c.kind === "run")!;
-    expect(runCall.spec?.image).toBe(PROFILE_IMAGE);
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, events, runner, killActive } = fakeCli({
+      workspace: dirs.workspace,
+      blockRun: true,
+    });
+    const pending = runAgentSmoke(
+      agentSmokeOptions(dirs),
+      makeDeps(dirs, runner, {
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+    await Bun.sleep(10);
+    expect(events).toEqual([
+      "session:create",
+      "session:create-done",
+      "pull:start",
+      "pull:done",
+      "run:start",
+    ]);
+
+    killActive("SIGTERM");
+    signalHandler!("SIGTERM");
+    await Bun.sleep(10);
+
+    const outcome = await pending;
+    expect(outcome.exitCode).toBe(143);
+    expect(outcome.ok).toBe(false);
+
+    expect(events).toEqual([
+      "session:create",
+      "session:create-done",
+      "pull:start",
+      "pull:done",
+      "run:start",
+      "run:signal:SIGTERM",
+      "run:exited:143",
+      "session:delete",
+    ]);
+    expect(calls.find((c) => c.args[0] === "run")?.signalOnAbort).toBe(true);
+    expect(calls.find((c) => c.args[0] === "pull")?.signalOnAbort).toBe(false);
+    expect(events[events.length - 1]).toBe("session:delete");
   });
 });
 
@@ -684,8 +766,8 @@ test("extra: agent worker spec argv, entrypoint and env", () => {
     taskPathInWorkspace: "docs/TASK.md",
     resultPathInWorkspace: ".pipeline-agent-smoke/run-x/result.json",
     profileEnv: {
-      LLM_SERVER: BASE_ENV.LLM_SERVER,
-      LLM_KEY: BASE_ENV.LLM_KEY,
+      LLM_SERVER: COMPLEX_LLM_SERVER,
+      LLM_KEY: "sk-test-key",
       OPENCODE_ENABLE_EXA: "1",
       OPENCODE_EXPERIMENTAL_LSP_TOOL: "true",
     },
@@ -699,16 +781,33 @@ test("extra: agent worker spec argv, entrypoint and env", () => {
   expect(spec.command[spec.command.length - 2]).toBe("--auto");
   expect(spec.command[spec.command.length - 3]).toBe("json");
   expect(spec.command[spec.command.length - 4]).toBe("--format");
-  expect(spec.mounts).toEqual([{ source: ".", target: "/workspace" }]);
-  expect(spec.containerEnv.DOCKER_HELPER_SESSION_TOKEN).toBe(CHILD_TOKEN);
-  expect(spec.containerEnv.LLM_KEY).toBe(BASE_ENV.LLM_KEY);
-  expect(spec.containerEnv.AGENT_SMOKE_TASK_PATH).toBe("/workspace/docs/TASK.md");
-  expect(spec.containerEnv.AGENT_SMOKE_RESULT_PATH).toBe(
-    "/workspace/.pipeline-agent-smoke/run-x/result.json",
-  );
-  expect(Object.keys(spec.containerEnv)).not.toContain("DOCKER_HELPER_CREDENTIAL_TOKEN");
-  expect(Object.keys(spec.containerEnv)).not.toContain("DOCKER_HELPER_ADMIN_TOKEN");
-  expect(Object.keys(spec.containerEnv)).not.toContain("DOCKER_HELPER_STATE_PATH");
+  const args = runArgs(spec, SOCKET);
+  expect(args.slice(0, 9)).toEqual([
+    "run",
+    "--endpoint",
+    SOCKET,
+    "--image",
+    "base:latest",
+    "--entrypoint",
+    "opencode",
+    "--workdir",
+    "/workspace",
+  ]);
+  const envPairs = args.filter((a, i) => args[i - 1] === "--env");
+  expect(envPairs).toEqual([
+    `AGENT_SMOKE_RESULT_PATH=/workspace/.pipeline-agent-smoke/run-x/result.json`,
+    "AGENT_SMOKE_RUN_ID=run-x",
+    "AGENT_SMOKE_TASK_PATH=/workspace/docs/TASK.md",
+    `DOCKER_HELPER_SESSION_TOKEN=${CHILD_TOKEN}`,
+    "LLM_KEY=sk-test-key",
+    `LLM_SERVER=${COMPLEX_LLM_SERVER}`,
+    `OPENCODE_CONFIG_CONTENT=${OPENCODE_CONFIG}`,
+    "OPENCODE_ENABLE_EXA=1",
+    "OPENCODE_EXPERIMENTAL_LSP_TOOL=true",
+  ]);
+  const separatorIndex = args.indexOf("--");
+  expect(args.slice(separatorIndex + 1)).toEqual(spec.command);
+  expect(pullArgs("base:latest", SOCKET)).toEqual(["pull", "--endpoint", SOCKET, "base:latest"]);
 });
 
 test("extra: instruction never embeds the task body", () => {
@@ -728,7 +827,7 @@ test("extra: result contract", () => {
   };
   expect(parseAgentResult(JSON.stringify(ok), "r")).toEqual(ok);
 
-  const invalid: [string, RegExp][] = [
+  const invalid: Array<[string, RegExp]> = [
     ["not json", /not valid JSON/],
     ["[]", /not a JSON object/],
     [JSON.stringify({ schema_version: 2, run_id: "r", status: "completed", summary: "s", artifacts: [] }), /schema_version/],

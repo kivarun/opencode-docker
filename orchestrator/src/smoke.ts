@@ -1,7 +1,6 @@
 import { verifyArtifact } from "./artifact.ts";
 import {
   DockerHelperError,
-  type CliRunner,
 } from "./docker_helper.ts";
 import {
   runWithChildSession,
@@ -10,7 +9,7 @@ import {
   type LifecycleOutcome,
   type SessionContext,
 } from "./lifecycle.ts";
-import { smokeWorkerSpec } from "./worker.ts";
+import { pullArgs, runArgs, smokeWorkerSpec } from "./worker.ts";
 
 export type SmokeOptions = LifecycleOptions;
 
@@ -49,18 +48,29 @@ async function smokeWorkerRun(
   deps: SmokeDeps,
   ctx: SessionContext,
 ): Promise<void> {
-  const { runId, updateState, childToken } = ctx;
-  if (deps.transport === undefined) {
-    throw new DockerHelperError("unexpected_response", "worker transport is not configured");
-  }
+  const { runId, updateState, childEnv } = ctx;
 
   console.error(`orchestrator: pulling worker image ${options.workerImage}`);
-  await deps.transport.pull(options.workerImage, childToken);
+  const pull = await deps.cli(
+    pullArgs(options.workerImage, deps.config.socketPath),
+    childEnv,
+    "inherit",
+  );
+  if (pull.code !== 0) {
+    throw new DockerHelperError(
+      "cli_failure",
+      `docker-helper pull ${options.workerImage} failed (exit ${pull.code})`,
+    );
+  }
 
-  const spec = smokeWorkerSpec(runId, childToken, options.workerImage);
+  ctx.checkAbort();
+
+  const spec = smokeWorkerSpec(runId, ctx.childToken, options.workerImage);
   console.error(`orchestrator: starting worker in child session`);
   await updateState("worker_running");
-  const run = await deps.transport.run(spec, childToken);
+  const run = await deps.cli(runArgs(spec, deps.config.socketPath), childEnv, "inherit", {
+    signalOnAbort: true,
+  });
   if (run.code !== 0) {
     throw new DockerHelperError(
       "cli_failure",

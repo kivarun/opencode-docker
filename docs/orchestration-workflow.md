@@ -25,31 +25,37 @@ The current orchestrator proves one complete delegated agent execution:
    child Session.
 4. It creates a child Session for the workspace.
 5. It starts OpenCode non-interactively in the child Session. The worker is
-   launched through the docker-helper HTTP API over its unix socket, so
-   environment values never appear in process arguments.
+   launched through the official docker-helper CLI 2.1.0 (`docker-helper run`,
+   spawned as an argv array); until docker-helper issue #3 is implemented,
+   resolved worker environment values (including secrets and the OpenCode
+   config content) are visible in that CLI process's argv — a consciously
+   accepted temporary risk.
 6. OpenCode reads the task by workspace path and writes a structured
    `result.json`.
 7. The orchestrator verifies the result schema, run identity, artifact paths,
    workspace confinement, and the unchanged task digest.
-8. On cancellation, the worker operation is cancelled through docker-helper and
-   the orchestrator confirms the operation reached a terminal state before the
-   child Session is deleted, so the in-flight cancellation never races the
-   cleanup that would invalidate the child bearer.
+8. On cancellation, the first SIGINT/SIGTERM is recorded by the lifecycle; a
+   running `docker-helper run` process receives the same signal and docker-helper
+   performs a bounded synchronous best-effort cancel. The orchestrator never
+   confirms a terminal operation state; `session create`, `pull`, and
+   `session delete` always run to completion, and the child Session is deleted
+   only in the single lifecycle cleanup path after the active step settles.
 9. It deletes the child Session and records the final cleanup result.
 10. Process exit status reports overall success or failure.
 
-OpenCode JSON events and docker-helper operation logs reach the orchestrator
-terminal by polling the docker-helper operation log endpoint over its unix
-socket. The operation log is a single mixed stdout/stderr stream: the original
+OpenCode output and docker-helper CLI output are inherited by the orchestrator
+process: the CLI's stdout and stderr are mixed into one stream and the original
 stream separation is not preserved. The orchestrator's own diagnostics stay on
-stderr. Worker stdin is not interactive.
+stderr. Worker stdin is not interactive; the orchestrator implements no
+polling, log cursor, or operation-API parsing.
 
 Worker output is raw, untrusted container output. It must be treated as a
 sensitive observation of a concrete run, never as a safe audit log and never as
 authoritative state: the worker sees everything it was given and may print task
-content, file fragments, or secret values it holds. The orchestrator itself
-never places secret values into process arguments, its own structured
-diagnostics, or state files.
+content, file fragments, or secret values it holds. Secret values and the task
+body never appear in the orchestrator's own structured diagnostics or state
+files; worker environment values do appear as `docker-helper run` argv elements
+(see step 5).
 
 The current implementation does not yet provide:
 
@@ -120,11 +126,14 @@ Implemented rules:
 - the orchestrator reads the OpenCode configuration and forwards it to the
   worker as `OPENCODE_CONFIG_CONTENT`;
 - profile files may reference secret environment-variable names but must never
-  contain secret values; resolved values reach the worker only through the
-  docker-helper HTTP API over its unix socket (bearer header plus environment
-  map). The orchestrator does not place these values into process arguments,
-  its own diagnostics, or state files; raw worker output remains an untrusted
-  stream that may contain whatever the worker chooses to print;
+  contain secret values; resolved values reach the worker only as separate
+  `--env KEY=VALUE` arguments of the `docker-helper run` CLI call. Until
+  docker-helper issue #3 is implemented these values are visible in that CLI
+  process's argv (a consciously accepted temporary risk); they never appear in
+  the orchestrator's own diagnostics or state files, and the task body is never
+  placed into argv or env (the task travels by workspace path only). Raw worker
+  output remains an untrusted stream that may contain whatever the worker
+  chooses to print;
 - `agent-smoke` takes `--config-root` and `--profile`; there is no `--image`
   flag, the worker image comes only from the selected profile. Plain `smoke`
   keeps `--image`.

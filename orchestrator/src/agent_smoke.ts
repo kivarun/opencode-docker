@@ -2,7 +2,6 @@ import { mkdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { AgentResultError, verifyAgentResult } from "./agent_result.ts";
 import { DockerHelperError, describeError } from "./docker_helper.ts";
-import type { HelperTransport } from "./helper_api.ts";
 import {
   runWithChildSession,
   type LifecycleDeps,
@@ -12,7 +11,7 @@ import {
 } from "./lifecycle.ts";
 import type { ResolvedProfile } from "./profile.ts";
 import { loadProfile } from "./profile.ts";
-import { AGENT_SMOKE_DIR, agentWorkerSpec } from "./worker.ts";
+import { AGENT_SMOKE_DIR, agentWorkerSpec, pullArgs, runArgs } from "./worker.ts";
 
 export interface AgentSmokeOptions {
   workspace: string;
@@ -204,25 +203,26 @@ async function agentRun(
   if (task === null) {
     throw new TaskFileError("task file was not prepared before the session");
   }
-  const { runId, updateState, childToken } = ctx;
-  const transport: HelperTransport | undefined = deps.transport;
-  if (transport === undefined) {
-    throw new DockerHelperError("unexpected_response", "worker transport is not configured");
-  }
+  const { runId, updateState, childEnv } = ctx;
   const resultPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/result.json`;
 
   console.error(`orchestrator: pulling agent image ${profile.image}`);
-  try {
-    await transport.pull(profile.image, childToken);
-  } catch (cause) {
+  const pull = await deps.cli(
+    pullArgs(profile.image, deps.config.socketPath),
+    childEnv,
+    "inherit",
+  );
+  if (pull.code !== 0) {
     console.error(
-      `orchestrator: warning: docker-helper pull ${profile.image} failed: ${describeError(cause)}; continuing, the image may already be present locally`,
+      `orchestrator: warning: docker-helper pull ${profile.image} failed (exit ${pull.code}); continuing, the image may already be present locally`,
     );
   }
 
+  ctx.checkAbort();
+
   const spec = agentWorkerSpec({
     runId,
-    childSessionToken: childToken,
+    childSessionToken: ctx.childToken,
     workerImage: profile.image,
     taskPathInWorkspace: task.pathInWorkspace,
     resultPathInWorkspace,
@@ -232,7 +232,9 @@ async function agentRun(
 
   console.error(`orchestrator: starting agent in child session`);
   await updateState("agent_running");
-  const run = await transport.run(spec, childToken);
+  const run = await deps.cli(runArgs(spec, deps.config.socketPath), childEnv, "inherit", {
+    signalOnAbort: true,
+  });
   if (run.code !== 0) {
     throw new DockerHelperError(
       "cli_failure",

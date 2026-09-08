@@ -49,6 +49,39 @@ export function workspaceMount(): WorkerMount {
   return { source: WORKSPACE_MOUNT_SOURCE, target: DEFAULT_WORKSPACE_MOUNT_TARGET };
 }
 
+export function pullArgs(image: string, socketPath: string): string[] {
+  return ["pull", "--endpoint", socketPath, image];
+}
+
+export function runArgs(
+  spec: WorkerSpec,
+  socketPath: string,
+): string[] {
+  const args = [
+    "run",
+    "--endpoint",
+    socketPath,
+    "--image",
+    spec.image,
+  ];
+  if (spec.entrypoint !== undefined) {
+    args.push("--entrypoint", spec.entrypoint);
+  }
+  args.push(
+    "--workdir",
+    spec.workdir,
+  );
+  for (const mount of spec.mounts) {
+    args.push("--mount", `${mount.source}:${mount.target}`);
+  }
+  for (const key of Object.keys(spec.containerEnv).sort()) {
+    args.push("--env", `${key}=${spec.containerEnv[key]}`);
+  }
+  args.push("--");
+  args.push(...spec.command);
+  return args;
+}
+
 export function smokeWorkerSpec(
   runId: string,
   childSessionToken: string,

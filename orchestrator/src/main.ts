@@ -1,13 +1,13 @@
 import {
   fetchAuthOverSocket,
-  type CliResult,
-  type CliRunner,
+  type CliRunOptions,
   type CliStdio,
+  SubprocessCliRunner,
 } from "./docker_helper.ts";
-import { HttpHelperTransport } from "./helper_api.ts";
 import { resolveHelperConfig } from "./launcher.ts";
 import { runAgentSmoke, type AgentSmokeOptions } from "./agent_smoke.ts";
 import { runSmoke, type SmokeOptions } from "./smoke.ts";
+import type { LifecycleDeps } from "./lifecycle.ts";
 import { DEFAULT_WORKER_IMAGE } from "./worker.ts";
 
 interface ParsedSmokeArgs {
@@ -80,11 +80,14 @@ function usage(): string {
     "    ambient inheritance; a missing required source variable fails before any child",
     "    session is created; a missing optional source variable is not forwarded",
     "  - orchestrator-owned control variables (DOCKER_HELPER_*, AGENT_SMOKE_*,",
-    "    ORCHESTRATOR_*, OPENCODE_CONFIG_CONTENT) can be neither destinations nor sources",
+    "    ORCHESTRATOR_*, OPENCODE_CONFIG_CONTENT) and operator path variables (HOME,",
+    "    XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_RUNTIME_DIR) can be neither destinations",
+    "    nor sources",
     "  - profile files may reference secret environment-variable names but must never",
-    "    contain secret values; resolved values are passed to the worker through the",
-    "    docker-helper HTTP API over its unix socket and never appear in argv, logs or",
-    "    state files",
+    "    contain secret values; resolved values are passed to the worker as",
+    "    `--env KEY=VALUE` arguments of the docker-helper run CLI call; until",
+    "    docker-helper issue #3 is implemented they appear in that process's argv;",
+    "    they never appear in state files or the orchestrator's own diagnostics",
     "",
     "The OpenCode configuration is read by the orchestrator from the path given by",
     "opencode_config and forwarded to the worker as OPENCODE_CONFIG_CONTENT.",
@@ -192,46 +195,6 @@ function parseCommand(kind: "smoke" | "agent-smoke", argv: string[]): ParsedComm
   };
 }
 
-class SubprocessCliRunner {
-  private active: { kill: (signal: "SIGTERM") => void } | null = null;
-
-  killActive(): void {
-    if (this.active !== null) {
-      try {
-        this.active.kill("SIGTERM");
-      } catch {
-        this.active = null;
-      }
-    }
-  }
-
-  async run(
-    args: string[],
-    env: Record<string, string>,
-    stdio: CliStdio,
-  ): Promise<CliResult> {
-    const proc = Bun.spawn(["docker-helper", ...args], {
-      env,
-      stdin: "ignore",
-      stdout: stdio === "inherit" ? "inherit" : "pipe",
-      stderr: stdio === "inherit" ? "inherit" : "pipe",
-    });
-    this.active = proc;
-    try {
-      if (stdio === "inherit") {
-        return { code: await proc.exited };
-      }
-      const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout as ReadableStream).text(),
-        new Response(proc.stderr as ReadableStream).text(),
-      ]);
-      return { code: await proc.exited, stdout, stderr };
-    } finally {
-      this.active = null;
-    }
-  }
-}
-
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const command = argv[0];
@@ -255,17 +218,18 @@ async function main(): Promise<number> {
 
   const config = resolveHelperConfig(process.env);
   const runner = new SubprocessCliRunner();
-  const transport = new HttpHelperTransport(config.socketPath);
-  const deps = {
-    cli: (args: string[], env: Record<string, string>, stdio: CliStdio) => runner.run(args, env, stdio),
-    transport,
+  const deps: LifecycleDeps = {
+    cli: (args: string[], env: Record<string, string>, stdio: CliStdio, opts?: CliRunOptions) =>
+      runner.run(args, env, stdio, opts),
     fetchAuth: fetchAuthOverSocket,
     config,
     baseEnv: process.env,
     onSignal: (handler: (signal: "SIGINT" | "SIGTERM") => void) => {
       for (const signal of ["SIGINT", "SIGTERM"] as const) {
         process.on(signal, () => {
-          runner.killActive();
+          // forward the same signal to a running worker `run` CLI process only;
+          // session create/delete and pull always run to completion
+          runner.killActive(signal);
           handler(signal);
         });
       }
