@@ -269,10 +269,20 @@ agent state whose single transition with outcome `completed` leads to a
 success terminal state, `max_transitions` 1, `max_attempts` 1, exactly one
 protected declared input, and the standard agent result contract. Any other
 structurally valid pipeline is rejected before any Session is created.
-Multi-state execution, retries, durable state, and resume are not implemented
+Multi-state execution, retries, and resume are not implemented
 yet. The orchestrator verifies the structured result, artifact confinement,
 the unchanged protected input, and the outcome transition before reporting
 success.
+
+`agent-smoke` records one authoritative, atomically committed run state
+document per run under the orchestrator state root
+(`pipeline-runs/<run-id>/state.json`): run identity and status, the pipeline
+identity (including a digest of the resolved bundle), the protected input
+digest, the child session, the execution cursor and attempt, every committed
+transition with the result digest and artifacts, the reached terminal, a
+normalized failure reason, and an ordered event journal. It never records
+credentials, environment values, prompt or input bodies, or the OpenCode
+configuration.
 
 ### Orchestrator runtime requirements
 

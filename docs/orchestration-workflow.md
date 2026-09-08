@@ -7,7 +7,8 @@ orchestrator, agent workers, pipeline authors, and users.
 
 It is a design sketch, not a claim that every described interface is already
 implemented. The current implementation is the tested `smoke` and
-`agent-smoke` baseline with the first trusted execution profile increment.
+`agent-smoke` baseline with the first trusted execution profile increment and
+the durable per-run pipeline state.
 New behavior becomes a product contract only after it is implemented, tested,
 and reflected in the canonical architecture documentation.
 
@@ -42,11 +43,13 @@ by the default declarative pipeline:
 6. OpenCode reads the orchestrator-owned execution document (run identity,
    state, attempt, input/result paths, allowed outcome, pipeline prompt,
    result format) and writes a structured `result.json`.
- 7. The orchestrator verifies the result schema (exact fields), run identity,
-    artifact paths (workspace confinement, plus canonical-path and
-    dev+inode alias checks against the protected input), the unchanged
-    protected input digest, and maps the validated outcome through the
-    pipeline transition to the success terminal state.
+  7. The orchestrator verifies the result schema (exact fields), run identity,
+     artifact paths (workspace confinement, plus canonical-path and
+     dev+inode alias checks against the protected input), the unchanged
+     protected input digest, and maps the validated outcome through the
+     pipeline transition to the success terminal state. Every accepted
+     transition, the reached terminal, and the final run status are committed
+     to the durable pipeline run state under the operator state root.
  8. On cancellation, the first SIGINT/SIGTERM is recorded by the lifecycle; a
     running `docker-helper run` process receives the same signal and docker-helper
     performs a bounded synchronous best-effort cancel. The orchestrator never
@@ -89,9 +92,12 @@ The current implementation does not yet provide:
   Session);
 - arbitrary user-supplied JSON Schema validation (the result schema must equal
   the standard agent result contract verbatim);
-- retries (`max_attempts` must be 1 today), durable pipeline state, resume,
-  user input, a local control API, and concurrency;
-- a multi-step durable state machine;
+- retries (`max_attempts` must be 1 today), resume, user input, a local
+  control API, and concurrency;
+- multi-process run-state coordination: two processes writing the same run in
+  the same state root are not serialized across process boundaries;
+- run-state migration (schema version 1 only, no compatibility with other
+  versions);
 - run listing or inspection commands;
 - an event stream;
 - a T3 integration.
@@ -158,8 +164,8 @@ not JSON Schema or loader checks.
 
 Not implemented yet for pipelines: multi-state worker execution (the pure
 graph engine core exists, but production still runs only the one-step plan),
-arbitrary JSON Schema support, retries, durable pipeline state, resume, user
-input, API, and concurrency.
+arbitrary JSON Schema support, retries, resume, user input, API, and
+concurrency.
 
 ### One-step execution bridge (implemented)
 
@@ -228,7 +234,12 @@ selection.
 Production `agent-smoke` runs its single agent step through this engine (it
 is the single owner of the outcome → transition → next-state mapping; no
 parallel hand-written mapping exists), while remaining restricted by
-`planOneStepExecution`: multi-state worker execution, retries, durable state,
+`planOneStepExecution`. The orchestrator registers a transition-commit hook
+with the engine: after the callback's outcome is validated and before the
+cursor moves, the engine calls the hook with a frozen transition step; the
+hook records the committed transition and, on terminal arrival, the terminal
+in the durable pipeline run state, and a hook failure propagates unchanged (no
+transition recorded, cursor unmoved). Multi-state worker execution, retries,
 resume, and concurrency are still not implemented. The engine is not a
 second production path and not a generic workflow engine.
 
@@ -527,24 +538,71 @@ concepts rather than hard-coded engine roles.
 The orchestrator's private state is the sole source of truth for pipeline
 progress.
 
-It records at least:
+For `agent-smoke` this is implemented as the durable pipeline run state
+(`orchestrator/src/pipeline_state.ts`, `pipeline_state_store.ts`,
+`pipeline_state_sink.ts`): exactly one JSON document per run at
+`<XDG state root>/pipeline-runs/<run-id>/state.json`, written and read only by
+the orchestrator. The document is schema-versioned (`schema_version: 1`) and
+validated in both directions with exact-field rules: unknown fields, missing
+fields, and any structural inconsistency fail closed when the document is
+written (pure reducer) and when it is loaded again (store loader).
 
-- run identity and lifecycle status;
-- the bound pipeline identity;
-- current state and attempt;
-- accepted results and transitions;
-- active or last child Session identity;
-- timestamps;
-- blocked or waiting-for-input status;
-- cleanup failures.
+It records:
+
+- run identity, lifecycle status (`active|success|failed|cleanup_failed`),
+  lifecycle phase, and the workspace path;
+- the bound pipeline identity: pipeline schema version, bundle root, the
+  execution snapshot digest (canonical-JSON SHA-256 over the resolved
+  pipeline bundle content, `pipeline_digest.ts`), entry state, and transition
+  budget;
+- the protected workspace input: declared id, workspace-relative path, and
+  content digest;
+- the child Session identity;
+- the execution cursor (current state id, applied transition count) and the
+  recorded attempt (state id, attempt, profile, session id, attempt phase
+  `running|completed|failed`);
+- every committed transition: original transition index, `from`, `outcome`,
+  `to`, attempt, the SHA-256 digest of the verified result bytes, and the
+  committed artifact paths;
+- the reached terminal state id and its `success|failed` result;
+- a normalized, text-free failure reason (`run_errors.ts` maps the terminal
+  cause to one stable reason; signals win over other causes);
+- an ordered event journal (`run_created`, `phase_entered`,
+  `session_created`, `attempt_started`, `transition_committed`,
+  `terminal_reached`, `run_succeeded`, `run_failed`, `run_cleanup_failed`)
+  with contiguous sequence numbers and timestamps.
+
+It never records credentials, environment values, prompt or input bodies, the
+OpenCode configuration, result summaries, or worker output; worker-visible
+content is referenced by digests and paths only.
+
+Every mutation is a pure reducer command applied to the previous snapshot.
+The reducer enforces the run's shape: event successor rules, contiguous
+sequences, cursor/transition/attempt/terminal coherence, and a single
+post-success mutation (a signal accepted while the authoritative success
+write was in flight rewrites the persisted `success` to `failed`; nothing
+else may overwrite a terminal status).
+
+Write algorithm — one commit per state change, always in this order: create
+the run directory (mode 0700, symlinked directories rejected), create the
+temporary file with `O_EXCL` (mode 0600), write and `fsync` the file, rename
+it atomically over `state.json`, `fsync` the directory, and unlink the
+temporary file when any step before the rename failed. Before every commit
+the on-disk revision must equal the revision the new snapshot was derived
+from, and the new revision must be exactly one higher; the first write
+refuses to overwrite an existing state. A loaded state must be a regular,
+non-symlink file. The state change and the event describing it are committed
+as one authoritative operation: a committed revision either contains both or
+does not exist.
+
+Not implemented yet: resume (a fresh process cannot continue an existing
+run), multi-process coordination (concurrent writers of the same run in the
+same state root are not serialized across process boundaries), migration
+between schema versions, and run listing or inspection commands.
 
 Files such as `STATE.md` may be generated for compatibility or human
-inspection, but an agent cannot advance the run by modifying them.
-
-State transition and the event describing that transition must be committed as
-one authoritative operation. The persistence mechanism may initially be an
-atomic file format or SQLite; that choice remains open until concurrency,
-query, and recovery requirements are fixed.
+inspection in the future, but an agent cannot advance the run by modifying
+them.
 
 ## User intervention
 
