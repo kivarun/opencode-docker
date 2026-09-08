@@ -255,11 +255,24 @@ Two commands currently exist:
 
 ```text
 orchestrator smoke
-orchestrator agent-smoke
+orchestrator agent-smoke --config-root /abs/config-root [--pipeline-root /abs/bundle]
 ```
 
-`agent-smoke` additionally runs an OpenCode worker against a task file and
-verifies its result contract.
+`agent-smoke` is driven by a declarative pipeline bundle (schema version 1).
+The bundled default pipeline (`/opt/orchestrator/pipelines/default`) is the
+production input; an external bundle can be selected with an absolute
+`--pipeline-root`. The pipeline selects the execution profile, the protected
+workspace input, the agent prompt, the result contract, and the worker
+timeout — there are no `--profile`, `--task`, or `--image` flags for
+`agent-smoke`. Only the one-step execution shape is supported today: one
+agent state whose single transition with outcome `completed` leads to a
+success terminal state, `max_transitions` 1, `max_attempts` 1, exactly one
+protected declared input, and the standard agent result contract. Any other
+structurally valid pipeline is rejected before any Session is created.
+Multi-state execution, retries, durable state, and resume are not implemented
+yet. The orchestrator verifies the structured result, artifact confinement,
+the unchanged protected input, and the outcome transition before reporting
+success.
 
 ### Orchestrator runtime requirements
 
@@ -293,9 +306,10 @@ docker run --rm -it \
     smoke --workspace "$workspace"
 ```
 
-For `agent-smoke`, pass an explicit worker image. Model/provider environment is
-forwarded by an allowlist; Launcher credentials and admin credentials are not
-forwarded to workers.
+For `agent-smoke`, provide the configuration root (profiles, OpenCode
+configuration) and optionally a pipeline bundle root. Model/provider
+environment is forwarded only through exact profile bindings; Launcher
+credentials and admin credentials are never forwarded to workers.
 
 ## GDK image
 

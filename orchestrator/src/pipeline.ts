@@ -1,6 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { describeError } from "./docker_helper.ts";
+import { describeError, MAX_RUN_TIMEOUT_SECONDS } from "./docker_helper.ts";
+import { matchesStandardAgentResultSchema } from "./agent_result.ts";
 import { validateProfileName } from "./profile.ts";
 
 export const PIPELINE_SCHEMA_VERSION = 1;
@@ -584,5 +585,127 @@ export async function loadPipeline(bundleRoot: string): Promise<ResolvedPipeline
     max_transitions: spec.max_transitions,
     inputs: spec.inputs,
     states,
+  };
+}
+
+export const ONE_STEP_ATTEMPT = 1;
+export const ONE_STEP_OUTCOME = "completed";
+
+export interface OneStepPlan {
+  pipeline: ResolvedPipeline;
+  agent: ResolvedAgentState;
+  terminal: ResolvedTerminalState;
+  input: PipelineInputSpec;
+  outcome: string;
+  attempt: number;
+}
+
+/**
+ * Builds the one-step execution plan this increment supports. Any other
+ * structurally valid pipeline is rejected with a clear message before any
+ * Launcher authentication or child Session creation; multi-state graphs are
+ * never partially executed.
+ */
+export function planOneStepExecution(pipeline: ResolvedPipeline): OneStepPlan {
+  const unsupported = (reason: string): PipelineError =>
+    new PipelineError(
+      `pipeline is not supported by the current one-step execution: ${reason}`,
+    );
+
+  if (pipeline.states.length !== 2) {
+    throw unsupported(
+      `exactly two states are supported, got ${pipeline.states.length}`,
+    );
+  }
+  const entryState = pipeline.states.find((state) => state.id === pipeline.entry_state);
+  if (entryState === undefined) {
+    throw unsupported(`entry state ${JSON.stringify(pipeline.entry_state)} does not exist`);
+  }
+  if (entryState.type !== "agent") {
+    throw unsupported(
+      `the entry state must be an agent state, got ${entryState.type}`,
+    );
+  }
+  const terminalState = pipeline.states.find((state) => state.id !== entryState.id);
+  if (terminalState === undefined || terminalState.type !== "terminal") {
+    throw unsupported("the second state must be a terminal state");
+  }
+  const transitions = entryState.transitions;
+  if (transitions.length !== 1) {
+    throw unsupported(
+      `the agent state must have exactly one transition, got ${transitions.length}`,
+    );
+  }
+  const transition = transitions[0];
+  if (transition === undefined) {
+    throw unsupported("the agent state has no transition");
+  }
+  if (transition.outcome !== ONE_STEP_OUTCOME) {
+    throw unsupported(
+      `the single transition outcome must be ${JSON.stringify(ONE_STEP_OUTCOME)}, got ${JSON.stringify(transition.outcome)}`,
+    );
+  }
+  if (transition.to !== terminalState.id) {
+    throw unsupported(
+      `the transition target ${JSON.stringify(transition.to)} is not the terminal state ${JSON.stringify(terminalState.id)}`,
+    );
+  }
+  if (terminalState.result !== "success") {
+    throw unsupported(
+      `the terminal state must have result success, got ${JSON.stringify(terminalState.result)}`,
+    );
+  }
+  if (pipeline.max_transitions !== 1) {
+    throw unsupported(
+      `max_transitions must be 1 for the one-step execution, got ${pipeline.max_transitions}`,
+    );
+  }
+  if (entryState.max_attempts !== ONE_STEP_ATTEMPT) {
+    throw unsupported(
+      `the agent state max_attempts must be 1 for the one-step execution, got ${entryState.max_attempts}`,
+    );
+  }
+  if (entryState.timeout_seconds > MAX_RUN_TIMEOUT_SECONDS) {
+    throw unsupported(
+      `the agent state timeout_seconds ${entryState.timeout_seconds} exceeds the maximum representable single-timer bound ${MAX_RUN_TIMEOUT_SECONDS}`,
+    );
+  }
+  if (entryState.inputs.length !== 1) {
+    throw unsupported(
+      `the agent state must use exactly one input, got ${entryState.inputs.length}`,
+    );
+  }
+  const inputId = entryState.inputs[0];
+  if (inputId === undefined) {
+    throw unsupported("the agent state has no input reference");
+  }
+  if (pipeline.inputs.length !== 1) {
+    throw unsupported(
+      `the pipeline must declare exactly one input (the one used by the agent state), got ${pipeline.inputs.length}`,
+    );
+  }
+  const input = pipeline.inputs[0];
+  if (input === undefined || input.id !== inputId) {
+    throw unsupported(
+      `the pipeline input ${JSON.stringify(input?.id ?? null)} does not match the input ${JSON.stringify(inputId)} used by the agent state`,
+    );
+  }
+  if (!input.protected) {
+    throw unsupported(
+      `the single input ${JSON.stringify(inputId)} must be protected`,
+    );
+  }
+  if (!matchesStandardAgentResultSchema(entryState.resultSchema)) {
+    throw unsupported(
+      `the result schema of state ${JSON.stringify(entryState.id)} does not match the supported standard agent result contract`,
+    );
+  }
+  return {
+    pipeline,
+    agent: entryState,
+    terminal: terminalState,
+    input,
+    outcome: transition.outcome,
+    attempt: ONE_STEP_ATTEMPT,
   };
 }

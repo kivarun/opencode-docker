@@ -8,7 +8,12 @@ import {
   PipelineError,
   loadPipeline,
   parsePipelineSpec,
+  planOneStepExecution,
+  type OneStepPlan,
+  type ResolvedPipeline,
 } from "../src/pipeline.ts";
+import { STANDARD_AGENT_RESULT_SCHEMA } from "../src/agent_result.ts";
+import { MAX_RUN_TIMEOUT_SECONDS } from "../src/docker_helper.ts";
 
 const DEFAULT_BUNDLE = join(import.meta.dir, "..", "..", "pipelines", "default");
 
@@ -504,3 +509,168 @@ function bundleFiles(pipelineText: string): Record<string, string> {
     "schemas/agent-result.schema.json": JSON.stringify({ type: "object" }),
   };
 }
+
+function syntheticPipeline(overrides: Partial<ResolvedPipeline> = {}, agentOverrides: Record<string, unknown> = {}): ResolvedPipeline {
+  const agent: ResolvedPipeline["states"][number] = {
+    id: "step",
+    type: "agent",
+    profile: "default",
+    promptPath: "/bundle/prompts/step.md",
+    promptContent: "Perform the step.",
+    inputs: ["src"],
+    resultSchemaPath: "/bundle/schemas/result.json",
+    resultSchema: JSON.parse(JSON.stringify(STANDARD_AGENT_RESULT_SCHEMA)),
+    timeout_seconds: 3600,
+    max_attempts: 1,
+    transitions: [{ outcome: "completed", to: "done" }],
+    ...agentOverrides,
+  };
+  return {
+    schema_version: 1,
+    bundleRoot: "/bundle",
+    entry_state: "step",
+    max_transitions: 1,
+    inputs: [{ id: "src", path: "IN.md", protected: true }],
+    states: [agent, { id: "done", type: "terminal", result: "success" }],
+    ...overrides,
+  };
+}
+
+test("26. one-step plan accepts the synthetic standard shape and exposes plan fields", () => {
+  const pipeline = syntheticPipeline();
+  const plan: OneStepPlan = planOneStepExecution(pipeline);
+  expect(plan.agent.id).toBe("step");
+  expect(plan.terminal.id).toBe("done");
+  expect(plan.terminal.result).toBe("success");
+  expect(plan.input.id).toBe("src");
+  expect(plan.input.path).toBe("IN.md");
+  expect(plan.outcome).toBe("completed");
+  expect(plan.attempt).toBe(1);
+});
+
+test("27. one-step plan does not hardcode default bundle identifiers", () => {
+  const pipeline = syntheticPipeline({}, {
+    id: "implement-feature",
+    inputs: ["spec"],
+    transitions: [{ outcome: "completed", to: "finish-ok" }],
+  });
+  pipeline.entry_state = "implement-feature";
+  pipeline.inputs = [{ id: "spec", path: "SPEC/notes.md", protected: true }];
+  pipeline.states = [
+    pipeline.states[0]!,
+    { id: "finish-ok", type: "terminal", result: "success" },
+  ];
+  const plan = planOneStepExecution(pipeline);
+  expect(plan.agent.id).toBe("implement-feature");
+  expect(plan.terminal.id).toBe("finish-ok");
+  expect(plan.input.path).toBe("SPEC/notes.md");
+});
+
+test("28. unsupported multi-state graphs are rejected", () => {
+  const threeStates = syntheticPipeline({}, {
+    transitions: [{ outcome: "completed", to: "done" }],
+  });
+  threeStates.states = [
+    threeStates.states[0]!,
+    { id: "review", type: "agent", profile: "default", promptPath: "/b/p.md", promptContent: "x", inputs: [], resultSchemaPath: "/b/s.json", resultSchema: {}, timeout_seconds: 1, max_attempts: 1, transitions: [{ outcome: "completed", to: "done" }] },
+    { id: "done", type: "terminal", result: "success" },
+  ];
+  expect(() => planOneStepExecution(threeStates)).toThrow(/exactly two states/);
+
+  const terminalEntry = syntheticPipeline();
+  terminalEntry.entry_state = "done";
+  expect(() => planOneStepExecution(terminalEntry)).toThrow(/entry state must be an agent state/);
+});
+
+test("29. extra transition, wrong outcome, and failed terminal are rejected", () => {
+  const extraTransition = syntheticPipeline({}, {
+    transitions: [
+      { outcome: "completed", to: "done" },
+      { outcome: "blocked", to: "done" },
+    ],
+  });
+  expect(() => planOneStepExecution(extraTransition)).toThrow(/exactly one transition, got 2/);
+
+  const wrongOutcome = syntheticPipeline({}, {
+    transitions: [{ outcome: "finished", to: "done" }],
+  });
+  expect(() => planOneStepExecution(wrongOutcome)).toThrow(/outcome must be "completed"/);
+
+  const failedTerminal = syntheticPipeline();
+  failedTerminal.states = [
+    failedTerminal.states[0]!,
+    { id: "done", type: "terminal", result: "failed" },
+  ];
+  expect(() => planOneStepExecution(failedTerminal)).toThrow(/result success, got "failed"/);
+
+  const targetCycle = syntheticPipeline({}, {
+    transitions: [{ outcome: "completed", to: "step" }],
+  });
+  expect(() => planOneStepExecution(targetCycle)).toThrow(/is not the terminal state/);
+});
+
+test("30. max_transitions != 1 and max_attempts != 1 are rejected", () => {
+  const moreTransitions = syntheticPipeline({ max_transitions: 2 });
+  expect(() => planOneStepExecution(moreTransitions)).toThrow(/max_transitions must be 1 for the one-step execution, got 2/);
+
+  const retryable = syntheticPipeline({}, { max_attempts: 3 });
+  expect(() => planOneStepExecution(retryable)).toThrow(/max_attempts must be 1 for the one-step execution, got 3/);
+});
+
+test("31. unused extra input and unprotected input are rejected", () => {
+  const unusedInput = syntheticPipeline({
+    inputs: [
+      { id: "src", path: "IN.md", protected: true },
+      { id: "extra", path: "EXTRA.md", protected: false },
+    ],
+  });
+  expect(() => planOneStepExecution(unusedInput)).toThrow(/must declare exactly one input/);
+
+  const unprotected = syntheticPipeline({
+    inputs: [{ id: "src", path: "IN.md", protected: false }],
+  });
+  expect(() => planOneStepExecution(unprotected)).toThrow(/must be protected/);
+});
+
+test("32. incompatible result schemas are rejected", () => {
+  const mutated = JSON.parse(JSON.stringify(STANDARD_AGENT_RESULT_SCHEMA));
+  (mutated as Record<string, unknown>).additionalProperties = true;
+  const permissive = syntheticPipeline({}, { resultSchema: mutated });
+  expect(() => planOneStepExecution(permissive)).toThrow(/standard agent result contract/);
+
+  const noConst = JSON.parse(JSON.stringify(STANDARD_AGENT_RESULT_SCHEMA));
+  const status = (noConst as Record<string, unknown>).properties as Record<string, unknown>;
+  status.status = { type: "string" };
+  const loosenedStatus = syntheticPipeline({}, { resultSchema: noConst });
+  expect(() => planOneStepExecution(loosenedStatus)).toThrow(/standard agent result contract/);
+
+  const reordered = JSON.parse(JSON.stringify(STANDARD_AGENT_RESULT_SCHEMA));
+  const reorderedProps = (reordered as Record<string, unknown>).properties as Record<string, unknown>;
+  reorderedProps.summary = { pattern: "\\S", minLength: 1, type: "string" };
+  expect(planOneStepExecution(syntheticPipeline({}, { resultSchema: reordered }))).toBeDefined();
+});
+
+test("33. timeout beyond the single-timer bound is rejected", () => {
+  expect(MAX_RUN_TIMEOUT_SECONDS).toBe(2147483);
+  const tooLong = syntheticPipeline({}, { timeout_seconds: MAX_RUN_TIMEOUT_SECONDS + 1 });
+  expect(() => planOneStepExecution(tooLong)).toThrow(/exceeds the maximum representable single-timer bound/);
+  const atBound = syntheticPipeline({}, { timeout_seconds: MAX_RUN_TIMEOUT_SECONDS });
+  expect(planOneStepExecution(atBound).agent.timeout_seconds).toBe(MAX_RUN_TIMEOUT_SECONDS);
+});
+
+test.skipIf(!hasDefaultBundle)(
+  "34. the real default bundle forms a one-step plan",
+  async () => {
+  const resolved = await loadPipeline(DEFAULT_BUNDLE);
+  const plan = planOneStepExecution(resolved);
+  expect(plan.agent.id).toBe("execute");
+  expect(plan.terminal.id).toBe("completed");
+  expect(plan.terminal.result).toBe("success");
+  expect(plan.input.id).toBe("task");
+  expect(plan.input.path).toBe("TASK.md");
+  expect(plan.input.protected).toBe(true);
+  expect(plan.outcome).toBe("completed");
+  expect(plan.attempt).toBe(1);
+  expect(plan.agent.timeout_seconds).toBe(3600);
+  expect(plan.agent.promptContent).toContain("implementation agent");
+});

@@ -2,9 +2,22 @@ export interface CliResult {
   code: number;
   stdout?: string;
   stderr?: string;
+  /**
+   * True only when the runner's own timeout expired and terminated the CLI
+   * process. Never set for a user-signal abort (that keeps its own exit-code
+   * semantics in the lifecycle).
+   */
+  timedOut?: boolean;
 }
 
 export type CliStdio = "capture" | "inherit";
+
+/**
+ * Largest timeout safely representable by a single JS timer: the timer delay
+ * in milliseconds must stay below 2^31, so the seconds bound is
+ * floor((2^31 - 1) / 1000). Values above it are rejected, never clamped.
+ */
+export const MAX_RUN_TIMEOUT_SECONDS = 2147483;
 
 export interface CliRunOptions {
   /**
@@ -13,6 +26,11 @@ export interface CliRunOptions {
    * completion.
    */
   signalOnAbort?: boolean;
+  /**
+   * Fail the CLI call after this many seconds by sending the process SIGTERM.
+   * Only honored together with `signalOnAbort` (worker `run` calls only).
+   */
+  timeoutSeconds?: number;
 }
 
 export type CliRunner = (
@@ -268,16 +286,37 @@ export class SubprocessCliRunner {
       stderr: stdio === "inherit" ? "inherit" : "pipe",
     });
     this.active = { proc, signalOnAbort: opts?.signalOnAbort === true };
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (
+      opts?.signalOnAbort === true &&
+      typeof opts.timeoutSeconds === "number" &&
+      Number.isSafeInteger(opts.timeoutSeconds) &&
+      opts.timeoutSeconds > 0 &&
+      opts.timeoutSeconds <= MAX_RUN_TIMEOUT_SECONDS
+    ) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          proc.kill("SIGTERM");
+        } catch {
+          // the process already exited
+        }
+      }, opts.timeoutSeconds * 1000);
+    }
     try {
       if (stdio === "inherit") {
-        return { code: await proc.exited };
+        return { code: await proc.exited, timedOut };
       }
       const [stdout, stderr] = await Promise.all([
         new Response(proc.stdout as ReadableStream).text(),
         new Response(proc.stderr as ReadableStream).text(),
       ]);
-      return { code: await proc.exited, stdout, stderr };
+      return { code: await proc.exited, stdout, stderr, timedOut };
     } finally {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
       this.active = null;
     }
   }

@@ -1,9 +1,63 @@
 import { stat, realpath } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { describeError } from "./docker_helper.ts";
 
 export const AGENT_RESULT_SCHEMA_VERSION = 1;
 export const AGENT_RESULT_STATUS_COMPLETED = "completed";
+
+/**
+ * The canonical standard result contract. The one-step pipeline execution
+ * supports exactly this schema: a loaded pipeline `result_schema` must equal
+ * this object structurally (JSON key order does not matter). This is a
+ * verbatim contract comparison, not a JSON Schema engine.
+ */
+export const STANDARD_AGENT_RESULT_SCHEMA: Record<string, unknown> = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  title: "Agent result",
+  type: "object",
+  additionalProperties: false,
+  required: ["schema_version", "run_id", "status", "summary", "artifacts"],
+  properties: {
+    schema_version: { const: 1 },
+    run_id: { type: "string", minLength: 1 },
+    status: { const: "completed" },
+    summary: { type: "string", minLength: 1, pattern: "\\S" },
+    artifacts: { type: "array", items: { type: "string" } },
+  },
+};
+
+const RESULT_FIELDS = new Set(["schema_version", "run_id", "status", "summary", "artifacts"]);
+
+export function jsonEquals(a: unknown, b: unknown): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, i) => jsonEquals(item, b[i]));
+  }
+  if (
+    typeof a === "object" &&
+    typeof b === "object" &&
+    a !== null &&
+    b !== null &&
+    !Array.isArray(a) &&
+    !Array.isArray(b)
+  ) {
+    const aObj = a as Record<string, unknown>;
+    const bObj = b as Record<string, unknown>;
+    const aKeys = Object.keys(aObj);
+    const bKeys = Object.keys(bObj);
+    if (aKeys.length !== bKeys.length) {
+      return false;
+    }
+    return aKeys.every((key) => key in bObj && jsonEquals(aObj[key], bObj[key]));
+  }
+  return false;
+}
+
+export function matchesStandardAgentResultSchema(schema: unknown): boolean {
+  return jsonEquals(schema, STANDARD_AGENT_RESULT_SCHEMA);
+}
 
 export interface AgentResult {
   schema_version: number;
@@ -34,6 +88,11 @@ export function parseAgentResult(
     throw new AgentResultError("result is not a JSON object");
   }
   const obj = parsed as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (!RESULT_FIELDS.has(key)) {
+      throw new AgentResultError(`result has unknown field ${JSON.stringify(key)}`);
+    }
+  }
   if (obj.schema_version !== AGENT_RESULT_SCHEMA_VERSION) {
     throw new AgentResultError(
       `result has schema_version ${JSON.stringify(obj.schema_version)}, expected ${AGENT_RESULT_SCHEMA_VERSION}`,
@@ -84,11 +143,6 @@ function validateArtifactPath(entry: unknown): string {
       `artifact path is not a clean workspace-relative path: ${JSON.stringify(entry)}`,
     );
   }
-  if (basename(entry) === "TASK.md" || parts.some((part) => part === "TASK.md")) {
-    throw new AgentResultError(
-      `artifact must not reference the task file: ${JSON.stringify(entry)}`,
-    );
-  }
   return entry;
 }
 
@@ -96,9 +150,18 @@ export async function verifyAgentResult(
   raw: string,
   expectedRunId: string,
   workspaceCanonical: string,
+  protectedInputPath?: string,
 ): Promise<AgentResult> {
   const result = parseAgentResult(raw, expectedRunId);
   for (const artifact of result.artifacts) {
+    if (
+      protectedInputPath !== undefined &&
+      (artifact === protectedInputPath || artifact.startsWith(`${protectedInputPath}/`))
+    ) {
+      throw new AgentResultError(
+        `artifact must not reference the protected input: ${JSON.stringify(artifact)}`,
+      );
+    }
     const absolute = join(workspaceCanonical, artifact);
     let info;
     try {

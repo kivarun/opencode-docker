@@ -20,7 +20,7 @@ export const SESSION_TOKEN_ENV = "DOCKER_HELPER_SESSION_TOKEN";
 
 export const AGENT_SMOKE_DIR = ".pipeline-agent-smoke";
 export const AGENT_SMOKE_RUN_ID_ENV = "AGENT_SMOKE_RUN_ID";
-export const AGENT_SMOKE_TASK_PATH_ENV = "AGENT_SMOKE_TASK_PATH";
+export const AGENT_SMOKE_INPUT_PATH_ENV = "AGENT_SMOKE_INPUT_PATH";
 export const AGENT_SMOKE_RESULT_PATH_ENV = "AGENT_SMOKE_RESULT_PATH";
 
 export const AGENT_SMOKE_ENTRYPOINT = "opencode";
@@ -103,8 +103,9 @@ export function agentWorkerSpec(params: {
   runId: string;
   childSessionToken: string;
   workerImage: string;
-  taskPathInWorkspace: string;
+  inputPathInWorkspace: string;
   resultPathInWorkspace: string;
+  executionDocPathInWorkspace: string;
   profileEnv: Readonly<Record<string, string>>;
   opencodeConfigContent: string;
 }): WorkerSpec {
@@ -116,7 +117,7 @@ export function agentWorkerSpec(params: {
       "--format",
       "json",
       "--auto",
-      agentInstruction(params.taskPathInWorkspace, params.resultPathInWorkspace, params.runId),
+      agentInstruction(params.executionDocPathInWorkspace),
     ],
     workdir: DEFAULT_WORKSPACE_MOUNT_TARGET,
     mounts: [workspaceMount()],
@@ -125,7 +126,7 @@ export function agentWorkerSpec(params: {
       [OPENCODE_CONFIG_CONTENT_ENV]: params.opencodeConfigContent,
       [SESSION_TOKEN_ENV]: params.childSessionToken,
       [AGENT_SMOKE_RUN_ID_ENV]: params.runId,
-      [AGENT_SMOKE_TASK_PATH_ENV]: inWorkspace(params.taskPathInWorkspace),
+      [AGENT_SMOKE_INPUT_PATH_ENV]: inWorkspace(params.inputPathInWorkspace),
       [AGENT_SMOKE_RESULT_PATH_ENV]: inWorkspace(params.resultPathInWorkspace),
     },
   };
@@ -135,19 +136,18 @@ function inWorkspace(relative: string): string {
   return `${DEFAULT_WORKSPACE_MOUNT_TARGET}/${relative}`;
 }
 
-export function agentInstruction(
-  taskPathInWorkspace: string,
-  resultPathInWorkspace: string,
-  runId: string,
-): string {
+/**
+ * Static instruction handed to OpenCode: it carries only the workspace path of
+ * the orchestrator-owned execution document. The pipeline prompt body and the
+ * input body never appear in argv or env; OpenCode reads them from the
+ * workspace.
+ */
+export function agentInstruction(executionDocPathInWorkspace: string): string {
+  const docPath = inWorkspace(executionDocPathInWorkspace);
   return [
-    `Read the task file at "${inWorkspace(taskPathInWorkspace)}" and perform only the work it describes.`,
-    `Do not modify or delete the task file, and do not modify any other existing file unless the task explicitly requires it.`,
-    `When the task is done, write the result file to "${inWorkspace(resultPathInWorkspace)}".`,
-    "The result file must contain a single JSON object with exactly this shape:",
-    `{"schema_version":1,"run_id":"${runId}","status":"completed","summary":"<one sentence describing the work performed>","artifacts":["<workspace-relative paths of files the task created>"]}`,
-    "Use workspace-relative paths in artifacts, never absolute paths and never paths outside the workspace.",
-    "Do not list the task file in artifacts.",
-    "The result file must contain valid JSON and nothing else.",
+    `Read the execution document at "${docPath}" and follow it exactly.`,
+    "It defines the agent instruction, the input file to use, and the required result format.",
+    "Do not modify or delete the execution document or the input file it references.",
+    "Write the result file only to the result path given in the execution document.",
   ].join(" ");
 }

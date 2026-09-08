@@ -16,24 +16,36 @@ The stable project boundary and design principles are defined in
 
 ## Current baseline
 
-The current orchestrator proves one complete delegated agent execution:
+The current orchestrator proves one complete delegated agent execution driven
+by the default declarative pipeline:
 
-1. The user starts `orchestrator agent-smoke` with an explicit workspace,
-   operator configuration root, named execution profile, and task file.
-2. The orchestrator loads and verifies its docker-helper Launcher credential.
-3. It loads and validates the selected execution profile before creating any
-   child Session.
+1. The user starts `orchestrator agent-smoke` with a workspace, an operator
+   configuration root, and optionally an explicit pipeline bundle root
+   (`--pipeline-root`; the default is the bundled
+   `/opt/orchestrator/pipelines/default`).
+2. The orchestrator loads and validates the pipeline, checks that it matches
+   the supported one-step execution shape, resolves the execution profile
+   named by the agent state, and resolves the declared protected workspace
+   input (regular file, workspace confinement, digest). All of that happens
+   before Launcher authentication and before any child Session; a failure
+   exits 1 without creating anything.
+3. The orchestrator verifies its docker-helper Launcher credential.
 4. It creates a child Session for the workspace.
 5. It starts OpenCode non-interactively in the child Session. The worker is
    launched through the official docker-helper CLI 2.1.0 (`docker-helper run`,
    spawned as an argv array); until docker-helper issue #3 is implemented,
    resolved worker environment values (including secrets and the OpenCode
    config content) are visible in that CLI process's argv — a consciously
-   accepted temporary risk.
-6. OpenCode reads the task by workspace path and writes a structured
-   `result.json`.
-7. The orchestrator verifies the result schema, run identity, artifact paths,
-   workspace confinement, and the unchanged task digest.
+   accepted temporary risk. The pipeline's `timeout_seconds` bounds the run:
+   the runner sends SIGTERM at the deadline, marks the result timed out, and
+   the run fails normally.
+6. OpenCode reads the orchestrator-owned execution document (run identity,
+   state, attempt, input/result paths, allowed outcome, pipeline prompt,
+   result format) and writes a structured `result.json`.
+7. The orchestrator verifies the result schema (exact fields), run identity,
+   artifact paths, workspace confinement, the unchanged protected input
+   digest, and maps the validated outcome through the pipeline transition to
+   the success terminal state.
 8. On cancellation, the first SIGINT/SIGTERM is recorded by the lifecycle; a
    running `docker-helper run` process receives the same signal and docker-helper
    performs a bounded synchronous best-effort cancel. The orchestrator never
@@ -65,23 +77,28 @@ files; worker environment values do appear as `docker-helper run` argv elements
 
 The current implementation does not yet provide:
 
-- pipeline graph execution (the schema version 1 loader and validator are
-  implemented; the graph is not executed);
-- durable pipeline state, retry/timeout enforcement, resume, user input,
-  a local control API, and concurrency;
+- pipeline graph execution beyond the supported one-step shape (multi-state
+  execution is not implemented; unsupported pipelines fail closed before any
+  Session);
+- arbitrary user-supplied JSON Schema validation (the result schema must equal
+  the standard agent result contract verbatim);
+- retries (`max_attempts` must be 1 today), durable pipeline state, resume,
+  user input, a local control API, and concurrency;
 - a multi-step durable state machine;
 - run listing or inspection commands;
 - an event stream;
 - a T3 integration.
 
-## Pipelines (schema version 1: loader and validator implemented)
+## Pipelines (schema version 1: loader, validator, one-step execution)
 
 `orchestrator/src/pipeline.ts` implements the declarative pipeline contract:
 `parsePipelineSpec(raw)` validates the structure and graph in memory,
 `loadPipeline(bundleRoot)` additionally loads the bundle from an absolute
 directory containing exactly `pipeline.yaml` (`pipeline.yml` and JSON are not
-supported) and resolves bundle files. `agent-smoke` does not use this module
-yet; there is no pipeline execution and no CLI command yet.
+supported) and resolves bundle files. `planOneStepExecution(pipeline)` builds
+the one-step execution plan used by `agent-smoke`; the default bundled
+pipeline is the production input for `agent-smoke`, and an external bundle is
+selected with `--pipeline-root`.
 
 Schema version 1 is fixed. Every mapping accepts only its exact field set;
 unknown and missing fields fail closed:
@@ -132,8 +149,44 @@ same exact-field validation. Workspace input existence and `run_id`,
 artifact-confinement, and protected-task checks are orchestrator semantics,
 not JSON Schema or loader checks.
 
-Not implemented yet for pipelines: graph execution, durable pipeline state,
-retry/timeout enforcement, resume, user input, API, and concurrency.
+Not implemented yet for pipelines: multi-state graph execution, arbitrary
+JSON Schema support, retries, durable pipeline state, resume, user input,
+API, and concurrency.
+
+### One-step execution bridge (implemented)
+
+`planOneStepExecution` accepts exactly one execution shape and rejects every
+other structurally valid pipeline with a clear error before Launcher
+authentication and before any child Session:
+
+- exactly two states; the entry state is the agent state; the second state is
+  a terminal with `result: success`;
+- the agent state has exactly one transition, its outcome is `completed`, and
+  its target is that terminal state (state and input identifiers are
+  arbitrary; nothing is hardcoded);
+- `max_transitions` is 1 and the agent `max_attempts` is 1;
+- the agent uses exactly one declared input, the pipeline declares no other
+  inputs, and that single input is `protected: true`;
+- the agent's `result_schema` equals the standard agent result contract
+  (`STANDARD_AGENT_RESULT_SCHEMA`) as a verbatim structural comparison — JSON
+  key order does not matter; no generic JSON Schema engine is involved;
+- `timeout_seconds` is within the single JS-timer bound
+  (`MAX_RUN_TIMEOUT_SECONDS` = 2147483); larger values are rejected, never
+  clamped.
+
+Execution: the orchestrator materializes a non-secret execution document
+inside the orchestrator-owned run directory of the workspace (run id, state
+id, attempt 1, workspace-relative input/result paths, allowed outcome, the
+pipeline prompt body, and the exact result format). The OpenCode command
+receives only a short static instruction pointing at that document; prompt
+and input bodies never appear in argv, env, state, or diagnostics; the
+pipeline bundle and config root are not mounted into the worker. After the
+verified result, the outcome is mapped through the declared transition table
+of the agent state; success is possible only by reaching a success terminal
+state. The pipeline's `timeout_seconds` is enforced by the CLI runner on the
+signalable worker `docker-helper run` only; the deadline sends SIGTERM, the
+result is marked timed out, and the run fails normally with a single cleanup.
+`max_attempts` is 1, so no retries are implemented.
 
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
@@ -203,9 +256,12 @@ Implemented rules:
   placed into argv or env (the task travels by workspace path only). Raw worker
   output remains an untrusted stream that may contain whatever the worker
   chooses to print;
-- `agent-smoke` takes `--config-root` and `--profile`; there is no `--image`
-  flag, the worker image comes only from the selected profile. Plain `smoke`
-  keeps `--image`.
+- the profile comes from the pipeline's agent state (`agent-smoke` has no
+  `--profile` flag) and the workspace input path comes from the pipeline's
+  declared inputs (no `--task` flag); an external pipeline bundle is selected
+  with `--pipeline-root` (default: the bundled default pipeline). There is no
+  `--image` flag, the worker image comes only from the selected profile.
+  Plain `smoke` keeps `--image`.
 
 Profile-selected file projections, resource limits, and profile inheritance
 are not implemented yet.
@@ -573,4 +629,8 @@ tests complete; end-to-end UAT pending):
 
 The next increment expresses the current one-step flow through the default
 declarative pipeline and generalizes it into the orchestrator-owned state
-machine. That work has not started.
+machine. The one-step bridge is implemented today: `agent-smoke` executes the
+default (or an explicitly selected) pipeline in its supported one-step shape
+and maps the validated outcome through the declared transition. The
+generalization to arbitrary multi-state graphs, durable state, and resume has
+not started.
