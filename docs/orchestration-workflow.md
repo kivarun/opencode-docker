@@ -31,12 +31,25 @@ The current orchestrator proves one complete delegated agent execution:
    `result.json`.
 7. The orchestrator verifies the result schema, run identity, artifact paths,
    workspace confinement, and the unchanged task digest.
-8. It deletes the child Session and records the final cleanup result.
-9. Process exit status reports overall success or failure.
+8. On cancellation, the worker operation is cancelled through docker-helper and
+   the orchestrator confirms the operation reached a terminal state before the
+   child Session is deleted, so the in-flight cancellation never races the
+   cleanup that would invalidate the child bearer.
+9. It deletes the child Session and records the final cleanup result.
+10. Process exit status reports overall success or failure.
 
-OpenCode JSON events and docker-helper diagnostics currently flow directly to
-the orchestrator terminal through inherited stdout and stderr. Worker stdin is
-not interactive.
+OpenCode JSON events and docker-helper operation logs reach the orchestrator
+terminal by polling the docker-helper operation log endpoint over its unix
+socket. The operation log is a single mixed stdout/stderr stream: the original
+stream separation is not preserved. The orchestrator's own diagnostics stay on
+stderr. Worker stdin is not interactive.
+
+Worker output is raw, untrusted container output. It must be treated as a
+sensitive observation of a concrete run, never as a safe audit log and never as
+authoritative state: the worker sees everything it was given and may print task
+content, file fragments, or secret values it holds. The orchestrator itself
+never places secret values into process arguments, its own structured
+diagnostics, or state files.
 
 The current implementation does not yet provide:
 
@@ -47,10 +60,15 @@ The current implementation does not yet provide:
 - a local control API or event stream;
 - a T3 integration.
 
-## Execution profiles (implemented)
+## Execution profiles (implementation complete, end-to-end UAT pending)
 
 The first increment of trusted execution profiles is implemented for
-`agent-smoke`. A profile is a small YAML document under an operator-controlled
+`agent-smoke` and covered by deterministic tests. The end-to-end
+profile-backed `agent-smoke` UAT (real launcher credential, real docker-helper,
+real OpenCode/LLM run accepted through the profile path) has not been executed
+yet; until that run succeeds, the profile increment is not a proven baseline.
+
+A profile is a small YAML document under an operator-controlled
 configuration root:
 
 ```text
@@ -95,14 +113,18 @@ Implemented rules:
   created; a missing optional source variable is not forwarded; an empty
   required source value is treated as missing;
 - orchestrator-owned control variables (`DOCKER_HELPER_*`, `AGENT_SMOKE_*`,
-  `ORCHESTRATOR_*`, `OPENCODE_CONFIG_CONTENT`) can be neither destinations nor
-  sources;
+  `ORCHESTRATOR_*`, `OPENCODE_CONFIG_CONTENT`) and operator environment path
+  variables (`HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`)
+  can be neither destinations nor sources; these variables remain available to
+  the orchestrator itself and to its minimal CLI environment;
 - the orchestrator reads the OpenCode configuration and forwards it to the
   worker as `OPENCODE_CONFIG_CONTENT`;
 - profile files may reference secret environment-variable names but must never
   contain secret values; resolved values reach the worker only through the
-  docker-helper HTTP API over its unix socket and never appear in process
-  arguments, logs, or state files;
+  docker-helper HTTP API over its unix socket (bearer header plus environment
+  map). The orchestrator does not place these values into process arguments,
+  its own diagnostics, or state files; raw worker output remains an untrusted
+  stream that may contain whatever the worker chooses to print;
 - `agent-smoke` takes `--config-root` and `--profile`; there is no `--image`
   flag, the worker image comes only from the selected profile. Plain `smoke`
   keeps `--image`.
@@ -450,7 +472,8 @@ Regardless of the selected pipeline or profile:
 The design should be introduced through the existing working smoke path rather
 than as a parallel implementation.
 
-The first increment is execution profiles (implemented):
+The first increment is execution profiles (implementation and deterministic
+tests complete; end-to-end UAT pending):
 
 1. Define the smallest profile schema required by the current agent smoke.
 2. Load one named profile from an operator-controlled configuration root.

@@ -266,7 +266,6 @@ async function main(): Promise<number> {
       for (const signal of ["SIGINT", "SIGTERM"] as const) {
         process.on(signal, () => {
           runner.killActive();
-          transport.cancelActive();
           handler(signal);
         });
       }

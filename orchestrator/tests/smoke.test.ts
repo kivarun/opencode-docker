@@ -26,6 +26,7 @@ interface FakeCliOptions {
   createStdout?: string;
   createCode?: number;
   deleteCode?: number;
+  sharedEvents?: string[];
 }
 
 interface FakeTransportOptions {
@@ -35,6 +36,7 @@ interface FakeTransportOptions {
   writeArtifact?: boolean;
   artifactBody?: string;
   blockRun?: boolean;
+  sharedEvents?: string[];
 }
 
 interface RecordedTransportCall {
@@ -85,8 +87,10 @@ class FakeTransport implements HelperTransport {
     return { code: this.options.runCode ?? 0, operationId: "op_fake" };
   }
 
-  cancelActive(): void {
+  cancelActive(): Promise<void> {
     this.calls.push({ kind: "cancel" });
+    this.options.sharedEvents?.push("transport:cancel");
+    return Promise.resolve();
   }
 
   fireRunExit(code: number): void {
@@ -125,6 +129,7 @@ function fakeCli(options: FakeCliOptions) {
       };
     }
     if (args[0] === "session" && args[1] === "delete") {
+      options.sharedEvents?.push("cli:session-delete");
       if ((options.deleteCode ?? 0) !== 0) {
         return { code: options.deleteCode ?? 1, stdout: "", stderr: "delete boom" };
       }
@@ -328,8 +333,14 @@ test("5. launcher credential never reaches the worker; child token does", async 
 test("6. signal after session creation triggers cleanup; SIGTERM exits 143", async () => {
   await withTempDirs(async (dirs) => {
     let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
-    const { runner } = fakeCli({ workspace: dirs.workspace });
-    const transport = new FakeTransport({ workspace: dirs.workspace, writeArtifact: false, blockRun: true });
+    const sharedEvents: string[] = [];
+    const { runner } = fakeCli({ workspace: dirs.workspace, sharedEvents });
+    const transport = new FakeTransport({
+      workspace: dirs.workspace,
+      writeArtifact: false,
+      blockRun: true,
+      sharedEvents,
+    });
     const pending = runSmoke(
       { workspace: dirs.workspace, workerImage: "alpine:3.22" },
       makeDeps(dirs, runner, transport, {
@@ -352,6 +363,9 @@ test("6. signal after session creation triggers cleanup; SIGTERM exits 143", asy
     expect(outcome.exitCode).toBe(143);
     expect(outcome.ok).toBe(false);
     expect(outcome.status).not.toBe("success");
+    // the lifecycle signal chain confirms worker cancellation before deleting
+    // the child Session (transport cancellation proof lives in helper_api.test.ts)
+    expect(sharedEvents).toEqual(["transport:cancel", "cli:session-delete"]);
   });
 });
 

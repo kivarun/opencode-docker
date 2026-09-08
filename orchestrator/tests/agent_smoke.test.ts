@@ -165,8 +165,9 @@ class FakeAgentTransport implements HelperTransport {
     return { code: this.options.runCode ?? 0, operationId: "op_fake" };
   }
 
-  cancelActive(): void {
+  cancelActive(): Promise<void> {
     this.calls.push({ kind: "cancel" });
+    return Promise.resolve();
   }
 
   private containerToHost(containerPath: string): string {
@@ -644,7 +645,7 @@ test("18. profile with control destination: fails before any session is created"
     const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, transport));
 
     expect(outcome.exitCode).toBe(1);
-    expect(outcome.detail).toContain("orchestrator-owned control variable");
+    expect(outcome.detail).toContain("orchestrator-owned control or operator-path variable");
     expect(createCallCount(calls)).toBe(0);
   });
 });

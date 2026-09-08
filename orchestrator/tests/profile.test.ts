@@ -224,6 +224,10 @@ test("profile: control variables cannot be destinations or sources", () => {
     "DOCKER_HELPER_STATE_PATH",
     "AGENT_SMOKE_RUN_ID",
     "ORCHESTRATOR_FUTURE",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
   ]) {
     expect(isControlEnvName(name)).toBe(true);
     expect(() =>
@@ -232,7 +236,7 @@ test("profile: control variables cannot be destinations or sources", () => {
     from_env: LLM_SERVER
     required: false`),
       ),
-    ).toThrow(/orchestrator-owned control variable/);
+    ).toThrow(/orchestrator-owned control or operator-path variable/);
     expect(() =>
       parseProfileSpec(
         profileYaml("img:1", "a", `  LLM_SERVER:
@@ -240,6 +244,24 @@ test("profile: control variables cannot be destinations or sources", () => {
     required: false`),
       ),
     ).toThrow(/cannot be used as a source/);
+  }
+});
+
+test("profile: operator path variables stay usable by the orchestrator but not as bindings", () => {
+  // the orchestrator's own minimal CLI env still resolves these names
+  const env = {
+    HOME: "/home/opencode",
+    XDG_CONFIG_HOME: "/uat-cred",
+    XDG_STATE_HOME: "/xdg-state",
+    XDG_RUNTIME_DIR: "/run/user/1000",
+  };
+  const resolved = resolveEnvBindings(
+    { LLM_KEY: { from_env: "LLM_KEY", required: true } },
+    { ...env, LLM_KEY: "sk-supersecret-value-42" },
+  );
+  expect(resolved).toEqual({ LLM_KEY: "sk-supersecret-value-42" });
+  for (const name of Object.keys(env)) {
+    expect(isControlEnvName(name)).toBe(true);
   }
 });
 

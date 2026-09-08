@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import {
   DockerHelperError,
+  describeError,
   type AuthFetcher,
   type CliRunner,
 } from "./docker_helper.ts";
@@ -129,7 +130,20 @@ export async function runWithChildSession(
       return;
     }
     signalBox.abort = new SignalAbort(signal);
-    void cleanup();
+    // Abort sequence: confirm the worker operation reached a terminal state
+    // after cancellation (or record that its state is unknown) BEFORE the child
+    // Session may be deleted, so the in-flight cancellation never races the
+    // Session cleanup that would invalidate the child bearer.
+    void (async () => {
+      try {
+        await deps.transport?.cancelActive();
+      } catch (cause) {
+        console.error(
+          `orchestrator: worker cancellation did not confirm a terminal state: ${describeError(cause)}`,
+        );
+      }
+      await cleanup();
+    })();
   });
 
   const state: RunState = {

@@ -36,7 +36,13 @@ const ENV_NAME_MAX_LENGTH = 256;
 const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 const CONTROL_ENV_PREFIXES = ["DOCKER_HELPER_", "AGENT_SMOKE_", "ORCHESTRATOR_"] as const;
-const CONTROL_ENV_NAMES = ["OPENCODE_CONFIG_CONTENT"] as const;
+const CONTROL_ENV_NAMES = [
+  "OPENCODE_CONFIG_CONTENT",
+  "HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_STATE_HOME",
+  "XDG_RUNTIME_DIR",
+] as const;
 
 export function isControlEnvName(name: string): boolean {
   return (
@@ -119,7 +125,7 @@ export function parseProfileSpec(raw: string): ProfileSpec {
     }
     if (isControlEnvName(destination)) {
       throw new ProfileError(
-        `profile env destination ${JSON.stringify(destination)} is an orchestrator-owned control variable and cannot be set by a profile`,
+        `profile env destination ${JSON.stringify(destination)} is an orchestrator-owned control or operator-path variable and cannot be set by a profile`,
       );
     }
     const binding = expectObject(rawBinding, `profile env binding ${JSON.stringify(destination)}`);
@@ -132,7 +138,7 @@ export function parseProfileSpec(raw: string): ProfileSpec {
     }
     if (isControlEnvName(fromEnv)) {
       throw new ProfileError(
-        `profile env binding ${JSON.stringify(destination)} source ${JSON.stringify(fromEnv)} is an orchestrator-owned control variable and cannot be used as a source`,
+        `profile env binding ${JSON.stringify(destination)} source ${JSON.stringify(fromEnv)} is an orchestrator-owned control or operator-path variable and cannot be used as a source`,
       );
     }
     if (typeof binding.required !== "boolean") {
