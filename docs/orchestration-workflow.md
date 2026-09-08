@@ -7,9 +7,9 @@ orchestrator, agent workers, pipeline authors, and users.
 
 It is a design sketch, not a claim that every described interface is already
 implemented. The current implementation is the tested `smoke` and
-`agent-smoke` baseline. New behavior becomes a product contract only after it
-is implemented, tested, and reflected in the canonical architecture
-documentation.
+`agent-smoke` baseline with the first trusted execution profile increment.
+New behavior becomes a product contract only after it is implemented, tested,
+and reflected in the canonical architecture documentation.
 
 The stable project boundary and design principles are defined in
 [manifesto.md](manifesto.md).
@@ -19,16 +19,20 @@ The stable project boundary and design principles are defined in
 The current orchestrator proves one complete delegated agent execution:
 
 1. The user starts `orchestrator agent-smoke` with an explicit workspace,
-   worker image, and task file.
+   operator configuration root, named execution profile, and task file.
 2. The orchestrator loads and verifies its docker-helper Launcher credential.
-3. It creates a child Session for the workspace.
-4. It starts OpenCode non-interactively in the child Session.
-5. OpenCode reads the task by workspace path and writes a structured
+3. It loads and validates the selected execution profile before creating any
+   child Session.
+4. It creates a child Session for the workspace.
+5. It starts OpenCode non-interactively in the child Session. The worker is
+   launched through the docker-helper HTTP API over its unix socket, so
+   environment values never appear in process arguments.
+6. OpenCode reads the task by workspace path and writes a structured
    `result.json`.
-6. The orchestrator verifies the result schema, run identity, artifact paths,
+7. The orchestrator verifies the result schema, run identity, artifact paths,
    workspace confinement, and the unchanged task digest.
-7. It deletes the child Session and records the final cleanup result.
-8. Process exit status reports overall success or failure.
+8. It deletes the child Session and records the final cleanup result.
+9. Process exit status reports overall success or failure.
 
 OpenCode JSON events and docker-helper diagnostics currently flow directly to
 the orchestrator terminal through inherited stdout and stderr. Worker stdin is
@@ -37,12 +41,88 @@ not interactive.
 The current implementation does not yet provide:
 
 - general declarative pipelines;
-- named execution profiles;
 - a multi-step durable state machine;
 - user input and resume;
 - run listing or inspection commands;
 - a local control API or event stream;
 - a T3 integration.
+
+## Execution profiles (implemented)
+
+The first increment of trusted execution profiles is implemented for
+`agent-smoke`. A profile is a small JSON document under an operator-controlled
+configuration root:
+
+```text
+<config-root>/
+  profiles/<profile-name>.json
+  opencode/<configuration files>
+```
+
+The minimal schema (schema_version 1) is:
+
+```json
+{
+  "schema_version": 1,
+  "image": "ghcr.io/kivarun/opencode-docker/base:latest",
+  "opencode_config": "opencode/default.jsonc",
+  "env": {
+    "LLM_SERVER": {
+      "from_env": "LLM_SERVER",
+      "required": true
+    },
+    "LLM_KEY": {
+      "from_env": "LLM_KEY",
+      "required": true
+    }
+  }
+}
+```
+
+Implemented rules:
+
+- the profile name comes from the CLI and is a single safe path component;
+- the profile file and the referenced OpenCode configuration must be regular
+  files that resolve inside the configuration root; traversal and symlink
+  escape are rejected;
+- unknown and missing fields are rejected; `schema_version` must be 1;
+- `env` bindings are exact: destination and source must be valid environment
+  variable names, only `from_env` and `required` are accepted, there is no
+  ambient inheritance and no wildcard forwarding;
+- a missing required source variable fails before any child Session is
+  created; a missing optional source variable is not forwarded; an empty
+  required source value is treated as missing;
+- orchestrator-owned control variables (`DOCKER_HELPER_*`, `AGENT_SMOKE_*`,
+  `ORCHESTRATOR_*`, `OPENCODE_CONFIG_CONTENT`) can be neither destinations nor
+  sources;
+- the orchestrator reads the OpenCode configuration and forwards it to the
+  worker as `OPENCODE_CONFIG_CONTENT`;
+- profile files may reference secret environment-variable names but must never
+  contain secret values; resolved values reach the worker only through the
+  docker-helper HTTP API over its unix socket and never appear in process
+  arguments, logs, or state files;
+- `agent-smoke` takes `--config-root` and `--profile`; there is no `--image`
+  flag, the worker image comes only from the selected profile. Plain `smoke`
+  keeps `--image`.
+
+Profile-selected file projections, resource limits, and profile inheritance
+are not implemented yet.
+
+## Containerized orchestrator workspace projection (proven integration pattern)
+
+A containerized orchestrator is launched with the Session workspace mounted
+twice through relative `source: "."` mounts:
+
+- the canonical host workspace path (the path passed to
+  `docker-helper session create`; docker-helper validates it on its own host
+  view), and
+- `/workspace` as an ergonomic local path.
+
+Both mount targets map the same live Session workspace; writes through one
+target are immediately visible through the other. No symlinks, workspace
+copies, ambient host mounts, or permission changes are involved. This pattern
+was verified against docker-helper 2.1.0 with identical device and inode
+identities across both targets.
 
 ## Responsibility and trust boundaries
 
@@ -91,6 +171,7 @@ environment bindings referenced from that OpenCode configuration.
 Optional projected files must use sources relative to the configured root and
 fixed container targets. The orchestrator canonicalizes the source, rejects
 symlink escape, and projects only the files declared by the selected profile.
+File projection is not implemented yet.
 
 A secret required by a worker must be considered visible to that worker.
 Security therefore depends on purpose-specific credentials, narrow scope, and
@@ -367,7 +448,7 @@ Regardless of the selected pipeline or profile:
 The design should be introduced through the existing working smoke path rather
 than as a parallel implementation.
 
-The first increment is execution profiles:
+The first increment is execution profiles (implemented):
 
 1. Define the smallest profile schema required by the current agent smoke.
 2. Load one named profile from an operator-controlled configuration root.
@@ -376,6 +457,6 @@ The first increment is execution profiles:
 5. Run the existing real agent smoke without changing its lifecycle and result
    guarantees.
 
-Only after that increment is verified should the current one-step flow be
-expressed through the default declarative pipeline and generalized into the
-orchestrator-owned state machine.
+The next increment expresses the current one-step flow through the default
+declarative pipeline and generalizes it into the orchestrator-owned state
+machine. That work has not started.
