@@ -1,4 +1,5 @@
 # ci: watch=orchestrator/**
+# ci: watch=pipelines/**
 
 ARG BASE_IMAGE
 ARG BUN_VERSION=1.3.14
@@ -28,6 +29,10 @@ RUN test "$(bun --version)" = "${BUN_VERSION}" \
 COPY --chown=opencode:opencode \
     ./orchestrator/ \
     /opt/orchestrator/
+
+COPY --chown=opencode:opencode \
+    ./pipelines/ \
+    /opt/orchestrator/pipelines/
 
 USER opencode
 

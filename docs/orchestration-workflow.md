@@ -65,12 +65,68 @@ files; worker environment values do appear as `docker-helper run` argv elements
 
 The current implementation does not yet provide:
 
-- general declarative pipelines;
+- pipeline graph execution (the schema version 1 loader and validator are
+  implemented; the graph is not executed);
+- durable pipeline state, retry/timeout enforcement, resume, user input,
+  a local control API, and concurrency;
 - a multi-step durable state machine;
-- user input and resume;
 - run listing or inspection commands;
-- a local control API or event stream;
+- an event stream;
 - a T3 integration.
+
+## Pipelines (schema version 1: loader and validator implemented)
+
+`orchestrator/src/pipeline.ts` implements the declarative pipeline contract:
+`parsePipelineSpec(raw)` validates the structure and graph in memory,
+`loadPipeline(bundleRoot)` additionally loads the bundle from an absolute
+directory containing exactly `pipeline.yaml` (`pipeline.yml` and JSON are not
+supported) and resolves bundle files. `agent-smoke` does not use this module
+yet; there is no pipeline execution and no CLI command yet.
+
+Schema version 1 is fixed. Every mapping accepts only its exact field set;
+unknown and missing fields fail closed:
+
+- `schema_version: 1`, `entry_state: <state id>`,
+  `max_transitions: <positive safe integer>`;
+- `inputs`: list of `{id, path, protected}`; `id` is a safe unique identifier,
+  `path` is a clean workspace-relative path (no absolute path, `~`, empty
+  segments, `.` or `..`), `protected` is boolean;
+- `states`: non-empty list of `agent` and `terminal` states;
+- agent state: `id`, `type: agent`, `profile` (validated with the execution
+  profile name grammar), `prompt` and `result_schema` (bundle-relative paths),
+  `inputs` (declared input ids, no duplicates), `timeout_seconds`,
+  `max_attempts` (positive safe integers), and a non-empty `transitions` list
+  of `{outcome, to}`;
+- terminal state: only `id`, `type: terminal`, `result: success|failed`;
+- states, inputs, and transitions are lists (not mappings) so uniqueness never
+  depends on YAML last-wins behavior.
+
+Graph invariants checked before a resolved pipeline is returned:
+
+- the entry state exists; input and state identifiers are unique and safe;
+- every agent input reference names a declared input;
+- every transition has a non-empty outcome and an existing target; outcomes
+  are unique within one state; every agent has at least one transition;
+- at least one terminal state exists, every state is reachable from the entry
+  state, and every agent state has a path to a terminal state; cycles are
+  allowed because the whole run is bounded by `max_transitions`;
+- `max_transitions`, `timeout_seconds`, and `max_attempts` are positive safe
+  integers.
+
+Bundle file validation: `prompt` and `result_schema` must be clean
+bundle-relative paths that resolve (through `realpath`, symlinks inside the
+bundle allowed) to regular files inside the bundle; absolute paths, traversal,
+and symlink escapes fail closed. The prompt must be readable and non-empty;
+the result schema must be a valid JSON object. The resolved pipeline carries
+the already-read prompt content and the parsed result schema. A pipeline
+cannot declare images, environment, mounts, credentials, Docker options,
+shell commands, JavaScript, or host callbacks — those are rejected by the
+same exact-field validation. Workspace input existence and `run_id`,
+artifact-confinement, and protected-task checks are orchestrator semantics,
+not JSON Schema or loader checks.
+
+Not implemented yet for pipelines: graph execution, durable pipeline state,
+retry/timeout enforcement, resume, user input, API, and concurrency.
 
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
