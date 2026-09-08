@@ -1134,6 +1134,161 @@ describe("exact-field loader validation", () => {
       /the terminal was reached but activation 1's transition was never committed/,
     );
   });
+
+  test("a phantom failed activation without activation_started is rejected", () => {
+    const failedRun = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_failed", reason: "worker_failed", sessionCleanup: "completed" },
+      { kind: "run_failed", reason: "worker_failed" },
+    ])!;
+    expect(failedRun.activations).toHaveLength(1);
+    const phantom = JSON.parse(JSON.stringify(failedRun));
+    phantom.activations.push({
+      index: 2,
+      state_id: "execute",
+      attempt: 1,
+      profile: "default",
+      phase: "failed",
+      failure_reason: "worker_failed",
+      session_cleanup: "completed",
+    });
+    expect(() => validatePipelineRunState(phantom)).toThrow(
+      /activation record 2 \("execute"\) is not represented by any activation_started event/,
+    );
+  });
+
+  test("an added transition record with an adjusted cursor but no transition event is rejected", () => {
+    const cleaned = runCommands(happyPathCommands())!;
+    expect(cleaned.transitions).toHaveLength(1);
+    const phantom = JSON.parse(JSON.stringify(cleaned));
+    // a second cleaned activation and a second transition, cursor adjusted,
+    // but the event journal is untouched: both records stay unconsumed
+    phantom.pipeline.max_transitions = 2;
+    phantom.activations.push({
+      index: 2,
+      state_id: "completed",
+      attempt: 1,
+      profile: "default",
+      phase: "session_cleanup_completed",
+      session_id: "s2",
+      session_cleanup: "completed",
+      result_sha256: cleaned.activations[0]!.result_sha256,
+      artifacts: [],
+    });
+    phantom.transitions.push({
+      index: 0,
+      from: "completed",
+      outcome: "completed",
+      to: "completed",
+      activation_index: 2,
+      result_sha256: cleaned.activations[0]!.result_sha256,
+      artifacts: [],
+    });
+    phantom.cursor = { current_state: "completed", transition_count: 2 };
+    expect(() => validatePipelineRunState(phantom)).toThrow(
+      /transition record 2 \(completed -> completed\) is not represented by any transition_committed event/,
+    );
+    // a phantom cleaned activation without any transition or terminal is
+    // caught as well
+    const phantomActivation = JSON.parse(JSON.stringify(cleaned));
+    phantomActivation.activations.push({
+      index: 2,
+      state_id: "execute",
+      attempt: 1,
+      profile: "default",
+      phase: "session_cleanup_completed",
+      session_id: "s2",
+      session_cleanup: "completed",
+      result_sha256: cleaned.activations[0]!.result_sha256,
+      artifacts: [],
+    });
+    // strip the terminal: the forged activation hides in an active run
+    phantomActivation.terminal = undefined;
+    phantomActivation.events = phantomActivation.events.filter(
+      (event: any) => event.kind !== "terminal_reached" && event.kind !== "run_succeeded",
+    );
+    phantomActivation.revision = phantomActivation.events.length;
+    phantomActivation.events.forEach((event: any, index: number) => {
+      event.sequence = index + 1;
+    });
+    phantomActivation.phase = "running";
+    phantomActivation.status = "active";
+    expect(() => validatePipelineRunState(phantomActivation)).toThrow(
+      /activation record 2 \("execute"\) is not represented by any activation_started event/,
+    );
+  });
+
+  test("an injected terminal record on a run that failed before the terminal is rejected", () => {
+    const failedEarly = runCommands([
+      createRun({ identity: { ...IDENTITY, entry_state: "execute" } }),
+      { kind: "run_failed", reason: "worker_failed" },
+    ])!;
+    expect(failedEarly.terminal).toBeUndefined();
+    expect(failedEarly.activations).toHaveLength(0);
+    const injected = JSON.parse(JSON.stringify(failedEarly));
+    injected.terminal = { state_id: "execute", result: "failed" };
+    expect(() => validatePipelineRunState(injected)).toThrow(
+      /terminal record "execute" is not represented by exactly one terminal_reached event/,
+    );
+    // the same document without the injected terminal record stays valid
+    expect(validatePipelineRunState(JSON.parse(JSON.stringify(failedEarly)))).toEqual(failedEarly);
+  });
+
+  test("an activation with a recorded session but no session_created event is rejected", () => {
+    // a session-less failed activation (failed before the session existed);
+    // the forged document claims a session the journal never recorded
+    const failedRun = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_failed", reason: "worker_failed", sessionCleanup: "completed" },
+      { kind: "run_failed", reason: "worker_failed" },
+    ])!;
+    const injected = JSON.parse(JSON.stringify(failedRun));
+    injected.activations[0].session_id = "s-forged";
+    expect(() => validatePipelineRunState(injected)).toThrow(
+      /activation 1 records session "s-forged" without a corresponding session_created event/,
+    );
+  });
+
+  test("recorded stages must be confirmed by the event journal in both directions", () => {
+    // an accepted digest whose result_accepted event was dropped
+    const digestWithoutEvent = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: [] },
+      { kind: "activation_failed", reason: "worker_failed", sessionCleanup: "completed" },
+      { kind: "run_failed", reason: "worker_failed" },
+    ])!;
+    const dropped = JSON.parse(JSON.stringify(digestWithoutEvent));
+    dropped.events = dropped.events.filter((event: any) => event.kind !== "result_accepted");
+    dropped.revision = dropped.events.length;
+    dropped.events.forEach((event: any, index: number) => {
+      event.sequence = index + 1;
+    });
+    expect(() => validatePipelineRunState(dropped)).toThrow(
+      /records an accepted result digest without a result_accepted event/,
+    );
+    // a cleanup-completed phase whose cleanup event never happened: the
+    // journal stops at result_accepted while the record claims the cleanup
+    const truncated = runCommands([
+      createRun(),
+      { kind: "start_activation", stateId: "execute", profile: "default" },
+      { kind: "activation_session_created", sessionId: "s1" },
+      { kind: "activation_agent_running" },
+      { kind: "activation_result_accepted", resultSha256: "c".repeat(64), artifacts: [] },
+    ])!;
+    const forged = JSON.parse(JSON.stringify(truncated));
+    forged.activations[0].phase = "session_cleanup_completed";
+    forged.activations[0].session_cleanup = "completed";
+    expect(() => validatePipelineRunState(forged)).toThrow(
+      /has phase "session_cleanup_completed" but the event journal does not confirm the stage session_cleanup_completed/,
+    );
+  });
 });
 
 describe("pipeline execution digest", () => {

@@ -1,4 +1,4 @@
-import { link, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, spyOn, test } from "bun:test";
@@ -2855,6 +2855,33 @@ test("extra: activation directories are separate per revisit", () => {
   expect(agentRunDirPath("/w", "run-1")).toBe("/w/.pipeline-agent-smoke/run-1");
 });
 
+/**
+ * Replaces a file with a new inode carrying identical bytes,
+ * deterministically: the replacement is created while the original still
+ * exists, `stat` confirms a different device/inode pair, and only then is
+ * the replacement renamed over the original path.
+ */
+async function replaceWithNewInode(filePath: string): Promise<void> {
+  const body = await readFile(filePath, "utf8");
+  const directory = filePath.slice(0, filePath.lastIndexOf("/")) || ".";
+  const original = await stat(filePath);
+  let replacementPath = "";
+  for (let attempt = 0; ; attempt++) {
+    replacementPath = join(directory, `.replacement-${attempt}.tmp`);
+    await writeFile(replacementPath, body);
+    const candidate = await stat(replacementPath);
+    if (candidate.dev !== original.dev || candidate.ino !== original.ino) {
+      break;
+    }
+    await rm(replacementPath);
+  }
+  const candidate = await stat(replacementPath);
+  if (candidate.dev === original.dev && candidate.ino === original.ino) {
+    throw new Error("the replacement file reused the original inode");
+  }
+  await rename(replacementPath, filePath);
+}
+
 function trapActivationLeaf(
   workspace: string,
   runId: string,
@@ -3030,9 +3057,9 @@ test("60f. a protected regular file replaced with a new inode of identical bytes
     const { calls, runner } = fakeCli({ workspace: dirs.workspace, createNotesDuringFirstRun: true });
     const pending = runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: gate.io }));
     await gate.reached;
-    const body = await readFile(join(dirs.workspace, "TASK.md"), "utf8");
-    await rm(join(dirs.workspace, "TASK.md"));
-    await writeFile(join(dirs.workspace, "TASK.md"), body);
+    // deterministic same-bytes replacement on a new inode (rm+write can
+    // reuse the same inode on some filesystems)
+    await replaceWithNewInode(join(dirs.workspace, "TASK.md"));
     gate.release();
     const outcome = await pending;
 
@@ -3047,29 +3074,55 @@ test("60f. a protected regular file replaced with a new inode of identical bytes
   });
 });
 
-test("60g. a replaced protected input plus a hardlink artifact does not bypass alias protection", async () => {
+test("60g. a replaced protected input plus a declared hardlink artifact does not bypass alias protection", async () => {
   await withTwoStateFixture(async (dirs) => {
-    const gate = gateIoAtRename(7);
-    const { calls, runner } = fakeCli({ workspace: dirs.workspace, createNotesDuringFirstRun: true });
-    const pending = runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: gate.io }));
-    await gate.reached;
-    const body = await readFile(join(dirs.workspace, "TASK.md"), "utf8");
-    await rm(join(dirs.workspace, "TASK.md"));
-    await writeFile(join(dirs.workspace, "TASK.md"), body);
-    // an artifact hardlinked to the replacement inode; the identity
-    // verification must fail before artifact checks can even run
-    await link(join(dirs.workspace, "TASK.md"), join(dirs.workspace, "stolen-artifact.txt"));
-    gate.release();
-    const outcome = await pending;
+    // the attack runs inside the second worker run: the protected input is
+    // replaced with a new inode of identical bytes, the new inode is
+    // hardlinked into the workspace, and the activation's result actually
+    // declares the stolen artifact — the post-run identity verification must
+    // reject the run before any artifact processing
+    const { calls, runner } = fakeCli({
+      workspace: dirs.workspace,
+      createNotesDuringFirstRun: true,
+      prepareTrap: async (workspace, _runId, _stateId, activationIndex) => {
+        if (activationIndex !== 2) {
+          return;
+        }
+        await replaceWithNewInode(join(workspace, "TASK.md"));
+        await link(join(workspace, "TASK.md"), join(workspace, "stolen-artifact.txt"));
+      },
+      resultByState: {
+        second: (identity) =>
+          JSON.stringify({
+            schema_version: 2,
+            run_id: identity.runId,
+            state_id: identity.stateId,
+            activation_index: identity.activationIndex,
+            attempt: 1,
+            status: "completed",
+            summary: SUMMARY_TEXT,
+            artifacts: ["stolen-artifact.txt"],
+          }),
+      },
+    });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("was replaced with a different file");
-    expect(createCallCount(calls)).toBe(1);
-    expect(deleteCallCount(calls)).toBe(1);
+    // both sessions were created and cleaned up exactly once; the second
+    // activation's result was never accepted
+    expect(createCallCount(calls)).toBe(2);
+    expect(deleteCallCount(calls)).toBe(2);
     const state = await readState(dirs, outcome.runId);
     expect(state.status).toBe("failed");
     expect(state.failure.reason).toBe("protected_input_modified");
     expect(state.transitions).toHaveLength(1);
+    expect(state.activations).toHaveLength(2);
+    expect(state.activations[1].phase).toBe("failed");
+    expect(state.activations[1].failure_reason).toBe("protected_input_modified");
+    expect(state.activations[1].result_sha256).toBeUndefined();
+    expect(state.activations[1].artifacts).toBeUndefined();
+    expect(state.activations[1].session_id).toBe("dhs_child_2");
   });
 });
 

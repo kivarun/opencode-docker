@@ -647,6 +647,13 @@ function validateEventPayloadCoherence(
 ): void {
   let activationPointer = 0;
   let transitionPointer = 0;
+  let terminalSeen = 0;
+  // per-activation stage confirmations from the event journal
+  const sessionSeen = new Set<number>();
+  const agentRunningSeen = new Set<number>();
+  const resultAcceptedSeen = new Set<number>();
+  const cleanupCompletedSeen = new Set<number>();
+  const failedSeen = new Set<number>();
   for (const event of events) {
     switch (event.kind) {
       case "activation_started": {
@@ -679,6 +686,7 @@ function validateEventPayloadCoherence(
             `event ${event.sequence} (session_created) names session ${JSON.stringify(event.session_id)}, which is not the session recorded by activation ${current.index}`,
           );
         }
+        sessionSeen.add(current.index);
         break;
       }
       case "agent_running":
@@ -694,6 +702,15 @@ function validateEventPayloadCoherence(
           throw new PipelineStateError(
             `event ${event.sequence} (${event.kind}) names activation ${event.activation_index} (${JSON.stringify(event.state_id)}), which is not the activation in progress`,
           );
+        }
+        if (event.kind === "agent_running") {
+          agentRunningSeen.add(current.index);
+        } else if (event.kind === "result_accepted") {
+          resultAcceptedSeen.add(current.index);
+        } else if (event.kind === "session_cleanup_completed") {
+          cleanupCompletedSeen.add(current.index);
+        } else {
+          failedSeen.add(current.index);
         }
         break;
       }
@@ -720,6 +737,7 @@ function validateEventPayloadCoherence(
             `event ${event.sequence} (terminal_reached) names terminal state ${JSON.stringify(event.state_id)}, which is not the reached terminal`,
           );
         }
+        terminalSeen += 1;
         break;
       }
       case "run_created":
@@ -727,6 +745,105 @@ function validateEventPayloadCoherence(
       case "run_failed":
       case "run_cleanup_failed":
         break;
+    }
+  }
+
+  // bidirectional coherence: every record must be represented by exactly the
+  // events that consumed it — no phantom activations, transitions, or
+  // terminal records may hide behind a plausible-looking journal
+  if (transitionPointer !== transitions.length) {
+    const transition = transitions[transitionPointer]!;
+    throw new PipelineStateError(
+      `transition record ${transitionPointer + 1} (${transition.from} -> ${transition.to}) is not represented by any transition_committed event`,
+    );
+  }
+  if (activationPointer !== activations.length) {
+    const activation = activations[activationPointer]!;
+    throw new PipelineStateError(
+      `activation record ${activation.index} (${JSON.stringify(activation.state_id)}) is not represented by any activation_started event`,
+    );
+  }
+  if (terminal === undefined) {
+    if (terminalSeen !== 0) {
+      throw new PipelineStateError(
+        "the event journal records terminal_reached without a terminal record",
+      );
+    }
+  } else if (terminalSeen !== 1) {
+    throw new PipelineStateError(
+      `terminal record ${JSON.stringify(terminal.state_id)} is not represented by exactly one terminal_reached event`,
+    );
+  }
+
+  // every recorded activation stage must be confirmed by the event journal
+  for (const activation of activations) {
+    if (activation.session_id !== undefined && !sessionSeen.has(activation.index)) {
+      throw new PipelineStateError(
+        `activation ${activation.index} records session ${JSON.stringify(activation.session_id)} without a corresponding session_created event`,
+      );
+    }
+    const phase = activation.phase;
+    const required: string[] = [];
+    const forbidden: string[] = [];
+    switch (phase) {
+      case "creating_session":
+        forbidden.push("session_created", "agent_running", "result_accepted", "session_cleanup_completed", "activation_failed");
+        break;
+      case "session_created":
+        required.push("session_created");
+        forbidden.push("agent_running", "result_accepted", "session_cleanup_completed", "activation_failed");
+        break;
+      case "agent_running":
+        required.push("session_created", "agent_running");
+        forbidden.push("result_accepted", "session_cleanup_completed", "activation_failed");
+        break;
+      case "result_accepted":
+        required.push("session_created", "agent_running", "result_accepted");
+        forbidden.push("session_cleanup_completed", "activation_failed");
+        break;
+      case "session_cleanup_completed":
+        required.push("session_created", "agent_running", "result_accepted", "session_cleanup_completed");
+        forbidden.push("activation_failed");
+        break;
+      case "failed":
+        required.push("activation_failed");
+        forbidden.push("session_cleanup_completed");
+        break;
+    }
+    const stageSeen = (stage: string): boolean => {
+      switch (stage) {
+        case "session_created":
+          return sessionSeen.has(activation.index);
+        case "agent_running":
+          return agentRunningSeen.has(activation.index);
+        case "result_accepted":
+          return resultAcceptedSeen.has(activation.index);
+        case "session_cleanup_completed":
+          return cleanupCompletedSeen.has(activation.index);
+        case "activation_failed":
+          return failedSeen.has(activation.index);
+        default:
+          return false;
+      }
+    };
+    for (const stage of required) {
+      if (!stageSeen(stage)) {
+        throw new PipelineStateError(
+          `activation ${activation.index} has phase ${JSON.stringify(phase)} but the event journal does not confirm the stage ${stage}`,
+        );
+      }
+    }
+    for (const stage of forbidden) {
+      if (stageSeen(stage)) {
+        throw new PipelineStateError(
+          `activation ${activation.index} has phase ${JSON.stringify(phase)} but the event journal records the later stage ${stage}`,
+        );
+      }
+    }
+    if (activation.result_sha256 !== undefined && !resultAcceptedSeen.has(activation.index)) {
+      throw new PipelineStateError(
+        `activation ${activation.index} records an accepted result digest without a result_accepted event`,
+      );
     }
   }
 }
