@@ -19,7 +19,7 @@ import {
   type LifecycleOutcome,
   type SessionContext,
 } from "./lifecycle.ts";
-import type { ResolvedAgentState } from "./pipeline.ts";
+import type { AgentStateView } from "./pipeline_engine.ts";
 import { executePipelineGraph } from "./pipeline_engine.ts";
 import type { ResolvedProfile } from "./profile.ts";
 import { loadProfile } from "./profile.ts";
@@ -297,7 +297,7 @@ async function agentRunOutcome(
   options: AgentSmokeOptions,
   profile: ResolvedProfile,
   input: ResolvedWorkspaceInput,
-  state: ResolvedAgentState,
+  state: AgentStateView,
   deps: AgentSmokeDeps,
   ctx: SessionContext,
 ): Promise<string> {

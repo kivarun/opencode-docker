@@ -3,6 +3,7 @@ import {
   executePipelineGraph,
   PipelineExecutionError,
   type AgentOutcomeExecutor,
+  type AgentStateView,
   type GraphExecutionResult,
   type TransitionStep,
 } from "../src/pipeline_engine.ts";
@@ -63,7 +64,7 @@ function scriptExecutor(
   script: Record<string, string>,
 ): AgentOutcomeExecutor & { seen: string[] } {
   const seen: string[] = [];
-  const executor = (state: ResolvedAgentState): string => {
+  const executor = (state: AgentStateView): string => {
     seen.push(state.id);
     const outcome = script[state.id];
     if (outcome === undefined) {
@@ -439,4 +440,213 @@ test("engine results are deterministic: same inputs, same result", async () => {
   const first = await run(build(), scriptExecutor({ a: "completed" }));
   const second = await run(build(), scriptExecutor({ a: "completed" }));
   expect(second).toEqual(first);
+});
+
+describe("mutation resistance: the engine owns the compiled graph", () => {
+  test("callback mutation of the original pipeline cannot redirect the graph", async () => {
+    const pipeline = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "completed", to: "declared" }]),
+      terminalState("declared", "success"),
+    ]);
+    const result = await run(pipeline, (state) => {
+      // mutate the source graph data from inside the callback
+      const agent = pipeline.states[0];
+      if (agent !== undefined && agent.type === "agent") {
+        agent.transitions[0] = { outcome: "completed", to: "rogue" };
+      }
+      const terminal = pipeline.states[1];
+      if (terminal !== undefined && terminal.type === "terminal") {
+        terminal.result = "failed";
+      }
+      expect(state.id).toBe("a");
+      return "completed";
+    });
+    expect(result).toEqual({
+      terminalStateId: "declared",
+      terminalResult: "success",
+      transitionCount: 1,
+      trace: [{ from: "a", outcome: "completed", to: "declared", transition_index: 0 }],
+    });
+  });
+
+  test("callback mutation of max_transitions does not change the budget", async () => {
+    const pipeline = syntheticPipeline("a1", 2, [
+      agentState("a1", [{ outcome: "next", to: "a2" }]),
+      agentState("a2", [{ outcome: "next", to: "end" }]),
+      terminalState("end", "success"),
+    ]);
+    const result = await run(pipeline, (state) => {
+      pipeline.max_transitions = 0;
+      expect(state.id).toMatch(/a[12]/);
+      return "next";
+    });
+    // the compiled budget is 2; the terminal is still reached at the boundary
+    expect(result.terminalStateId).toBe("end");
+    expect(result.terminalResult).toBe("success");
+    expect(result.transitionCount).toBe(2);
+  });
+
+  test("external mutation while an async callback is pending stays bound to the snapshot", async () => {
+    const pipeline = syntheticPipeline("a", 1, [
+      agentState("a", [
+        { outcome: "completed", to: "declared" },
+        { outcome: "halt", to: "halt-terminal" },
+      ]),
+      terminalState("declared", "success"),
+      terminalState("halt-terminal", "failed"),
+    ]);
+    const gate: { release: () => void } = { release: () => {} };
+    let callbackRuns = 0;
+    const pending = executePipelineGraph(pipeline, async (state) => {
+      callbackRuns += 1;
+      expect(state.id).toBe("a");
+      await new Promise<void>((resolve) => {
+        gate.release = resolve;
+      });
+      return "completed";
+    });
+
+    // while the callback promise is pending, external code mutates every
+    // piece of graph data the engine is supposed to own
+    const agent = pipeline.states[0];
+    if (agent === undefined || agent.type !== "agent") {
+      throw new Error("expected the agent state");
+    }
+    agent.transitions.reverse();
+    agent.transitions[0] = { outcome: "completed", to: "rogue" };
+    const declared = pipeline.states[1];
+    if (declared === undefined || declared.type !== "terminal") {
+      throw new Error("expected the declared terminal");
+    }
+    declared.result = "failed";
+    pipeline.max_transitions = 0;
+    gate.release();
+
+    const result = await pending;
+    expect(callbackRuns).toBe(1);
+    expect(result).toEqual({
+      terminalStateId: "declared",
+      terminalResult: "success",
+      transitionCount: 1,
+      trace: [{ from: "a", outcome: "completed", to: "declared", transition_index: 0 }],
+    });
+  });
+
+  test("the callback view is frozen, transition-free, and isolated from the source", async () => {
+    const pipeline = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "completed", to: "done" }]),
+      terminalState("done", "success"),
+    ]);
+    const result = await run(pipeline, (state) => {
+      expect("transitions" in state).toBe(false);
+      expect(state.id).toBe("a");
+      expect(state.inputs).toEqual(["task"]);
+      // frozen: view mutations cannot even happen
+      expect(() => {
+        (state as { id: string }).id = "hijacked";
+      }).toThrow();
+      expect(() => {
+        (state.inputs as string[]).push("extra");
+      }).toThrow();
+      // source mutation cannot reach the view either
+      const agent = pipeline.states[0];
+      if (agent !== undefined && agent.type === "agent") {
+        agent.promptContent = "tampered";
+        agent.inputs.push("sneaky");
+      }
+      expect(state.promptContent).toBe("prompt for a");
+      expect(state.inputs).toEqual(["task"]);
+      return "completed";
+    });
+    expect(result.terminalResult).toBe("success");
+  });
+});
+
+describe("defensive compile-time bounds (invalid_graph before any callback)", () => {
+  test("invalid max_transitions values are rejected", async () => {
+    const cases: unknown[] = [0, -3, 1.5, NaN, Infinity, 2 ** 53];
+    for (const maxTransitions of cases) {
+      let callbackRuns = 0;
+      const pipeline = syntheticPipeline("a", 1, [
+        agentState("a", [{ outcome: "completed", to: "done" }]),
+        terminalState("done", "success"),
+      ]);
+      pipeline.max_transitions = maxTransitions as number;
+      const promise = executePipelineGraph(pipeline, () => {
+        callbackRuns += 1;
+        return "completed";
+      });
+      const error: unknown = await promise.catch((cause) => cause);
+      if (!(error instanceof PipelineExecutionError)) {
+        throw new Error(`expected PipelineExecutionError for ${String(maxTransitions)}`);
+      }
+      expect(error.reason).toBe("invalid_graph");
+      expect(error.message).toContain("max_transitions");
+      expect(callbackRuns).toBe(0);
+    }
+  });
+
+  test("invalid runtime state shapes are rejected, not a random TypeError", async () => {
+    // unsupported state type
+    const wrongType = syntheticPipeline("x", 1, [
+      { id: "x", type: "banana" } as unknown as ResolvedState,
+      terminalState("done", "success"),
+    ]);
+    // garbage terminal result
+    const wrongResult = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "completed", to: "done" }]),
+      { id: "done", type: "terminal", result: "weird" } as unknown as ResolvedState,
+    ]);
+    // transitions not an array
+    const wrongTransitions = syntheticPipeline("a", 1, [
+      {
+        ...agentState("a", []),
+        transitions: "nope" as unknown as [{ outcome: string; to: string }],
+      },
+      terminalState("done", "success"),
+    ]);
+    // empty outcome
+    const emptyOutcome = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "", to: "done" } as { outcome: string; to: string }]),
+      terminalState("done", "success"),
+    ]);
+    // non-string state id
+    const wrongId = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "completed", to: "done" }]),
+      terminalState("done", "success"),
+    ]);
+    (wrongId.states[1] as unknown as { id: unknown }).id = 42;
+    const pipelines = [wrongType, wrongResult, wrongTransitions, emptyOutcome, wrongId];
+    for (const pipeline of pipelines) {
+      let callbackRuns = 0;
+      const promise = executePipelineGraph(pipeline, () => {
+        callbackRuns += 1;
+        return "completed";
+      });
+      const error: unknown = await promise.catch((cause) => cause);
+      if (!(error instanceof PipelineExecutionError)) {
+        throw new Error("expected PipelineExecutionError");
+      }
+      expect(error.reason).toBe("invalid_graph");
+      expect(callbackRuns).toBe(0);
+    }
+  });
+
+  test("non-string transition target is rejected", async () => {
+    const pipeline = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "completed", to: 42 } as unknown as { outcome: string; to: string }]),
+      terminalState("done", "success"),
+    ]);
+    let callbackRuns = 0;
+    const promise = executePipelineGraph(pipeline, () => {
+      callbackRuns += 1;
+      return "completed";
+    });
+    const error: unknown = await promise.catch((cause) => cause);
+    if (!(error instanceof PipelineExecutionError)) {
+      throw new Error("expected PipelineExecutionError");
+    }
+    expect(error.reason).toBe("invalid_graph");
+    expect(callbackRuns).toBe(0);
+  });
 });

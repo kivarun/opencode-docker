@@ -193,27 +193,35 @@ pipeline bundle and config root are not mounted into the worker.
 ### Pure graph engine (implemented, single transition-mapping owner)
 
 `orchestrator/src/pipeline_engine.ts` implements `executePipelineGraph`, a
-pure, deterministic graph execution core. It takes an already loaded
-`ResolvedPipeline`, starts strictly at `entry_state`, invokes an injected
-agent callback for agent states, and — after accepting a validated outcome —
-resolves the declared transition by outcome itself, moves to the declared
-target state, enforces `max_transitions`, and finishes at a terminal state
-with `result: success|failed`. It returns the terminal state id, the terminal
-result, the applied transition count, and an ordered transition trace
-(`from`, `outcome`, `to`, `transition_index`); it contains no timestamps or
-randomness. At the core level it supports sequential states, branching by
-outcome, and cycles bounded by `max_transitions`. It fails closed with
-`PipelineExecutionError` (stable reasons: `invalid_graph`,
-`missing_state`, `unknown_outcome`, `invalid_outcome`,
-`transition_budget_exhausted`, `transition_exceeds_max_transitions`) when the
-cursor is missing, an outcome is not declared by the current agent state, an
-agent state would run with an exhausted transition budget, an outcome is
-empty or not a string, or the resolved graph is internally inconsistent. A
-callback failure propagates unchanged: no transition is recorded and the
-cursor does not move. A terminal `result: failed` is a normal graph result,
-not an engine exception. The agent reports only an outcome and never selects
-the next state; free text, stdout, and exit codes never participate in
-transition selection.
+pure, deterministic graph execution core. Before the first callback it
+compiles an immutable, engine-owned snapshot of exactly the graph data it
+needs (`entry_state`, `max_transitions`, state ids/types, terminal results,
+ordered transitions with original indices) and validates it fail-closed;
+during execution it reads transitions, terminal results, and the budget only
+from that snapshot, so mutations of the source `ResolvedPipeline` —
+synchronous inside the callback or external while a callback is pending —
+cannot redirect the graph. The callback receives a separate frozen,
+transition-free execution view (state id, profile, prompt, inputs, result
+schema, timeout, attempts) and returns only a validated outcome: it can never
+select the next state. The engine starts strictly at `entry_state`, resolves
+the declared transition by outcome itself, enforces `max_transitions` with a
+single reachable contract — an agent state cursor with an exhausted budget
+fails before the callback, and reaching a terminal exactly at the boundary
+succeeds — and finishes at a terminal state with `result: success|failed`. It
+returns the terminal state id, the terminal result, the applied transition
+count, and an ordered transition trace (`from`, `outcome`, `to`,
+`transition_index`); it contains no timestamps or randomness. At the core
+level it supports sequential states, branching by outcome, and cycles bounded
+by `max_transitions`. It fails closed with `PipelineExecutionError` (stable
+reasons: `invalid_graph`, `missing_state`, `unknown_outcome`,
+`invalid_outcome`, `transition_budget_exhausted`) when the cursor is missing,
+an outcome is not declared by the current agent state, an agent state would
+run with an exhausted transition budget, an outcome is empty or not a string,
+or the resolved graph is internally inconsistent. A callback failure
+propagates unchanged: no transition is recorded and the cursor does not move.
+A terminal `result: failed` is a normal graph result, not an engine
+exception. Free text, stdout, and exit codes never participate in transition
+selection.
 
 Production `agent-smoke` runs its single agent step through this engine (it
 is the single owner of the outcome → transition → next-state mapping; no
