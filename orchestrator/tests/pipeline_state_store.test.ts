@@ -12,6 +12,7 @@ import {
 } from "../src/pipeline_state.ts";
 import {
   defaultPipelineStateIo,
+  PipelineStateDurabilityError,
   PipelineStateStore,
   PipelineStateStoreError,
   pipelineRunStatePath,
@@ -210,20 +211,60 @@ describe("pipeline run state store", () => {
     }
   });
 
-  test("a failure after the rename (directory fsync) reports the commit as failed but leaves the complete new snapshot", async () => {
+  test("a post-rename failure (directory fsync) reports durability_unknown with the candidate snapshot", async () => {
     const states = buildStates();
     await withStore("store-run", async ({ root, store, statePath }) => {
       await store.create(states[0]!);
       const failing = new PipelineStateStore(root, "store-run", faultIo({ failCommit: 1, failStep: "dirsync" }));
-      await expect(failing.commit(states[1]!, 1)).rejects.toThrow(/injected pipeline state failure/);
+      const error = await failing.commit(states[1]!, 1).catch((cause: unknown) => cause);
+      // typed durability_unknown outcome: rename succeeded, durability unknown
+      expect(error).toBeInstanceOf(PipelineStateDurabilityError);
+      const durability = error as PipelineStateDurabilityError;
+      expect(durability.message).toContain("durability could not be confirmed");
+      expect(durability.message).not.toContain("remains authoritative");
+      expect(durability.revision).toBe(states[1]!.revision);
+      expect(durability.candidate).toEqual(states[1]!);
       // the rename already happened: the loader sees the complete new
       // snapshot, never a partial one
       expect(parsePipelineRunState(await readFile(statePath, "utf8"))).toEqual(states[1]!);
       const runDir = join(root, "pipeline-runs", "store-run");
       expect(await listDir(runDir)).toEqual(["state.json"]);
-      // the real store continues from the on-disk revision
+      // the real store continues from the on-disk revision (the poison policy
+      // lives in the sink, not in the store)
       await store.commit(states[2]!, 2);
       expect((await store.load())?.revision).toBe(3);
+    });
+  });
+
+  test("a post-rename failure of the first create reports durability_unknown with the candidate", async () => {
+    const states = buildStates();
+    await withStore("store-run", async ({ root, statePath }) => {
+      const failing = new PipelineStateStore(root, "store-run", faultIo({ failCommit: 1, failStep: "dirsync" }));
+      const error = await failing.create(states[0]!).catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(PipelineStateDurabilityError);
+      const durability = error as PipelineStateDurabilityError;
+      expect(durability.revision).toBe(1);
+      expect(durability.candidate).toEqual(states[0]!);
+      // the first snapshot is visible on disk nonetheless
+      expect(parsePipelineRunState(await readFile(statePath, "utf8"))).toEqual(states[0]!);
+    });
+  });
+
+  test("a pre-rename fsync failure reports not_committed and leaves the previous snapshot intact", async () => {
+    const states = buildStates();
+    await withStore("store-run", async ({ root, store, statePath }) => {
+      await store.create(states[0]!);
+      const before = await readFile(statePath, "utf8");
+      const failing = new PipelineStateStore(root, "store-run", faultIo({ failCommit: 1, failStep: "sync" }));
+      const error = await failing.commit(states[1]!, 1).catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(PipelineStateStoreError);
+      expect(error).not.toBeInstanceOf(PipelineStateDurabilityError);
+      expect((error as Error).message).toContain("cannot commit pipeline run state");
+      // the previous snapshot is byte-for-byte intact and authoritative
+      expect(await readFile(statePath, "utf8")).toBe(before);
+      expect((await store.load())?.revision).toBe(1);
+      // no residue in the run directory
+      expect(await listDir(join(root, "pipeline-runs", "store-run"))).toEqual(["state.json"]);
     });
   });
 

@@ -7,7 +7,9 @@ import {
   type ProtectedInputState,
 } from "./pipeline_state.ts";
 import {
+  PipelineStateDurabilityError,
   PipelineStateStore,
+  PipelineStateStoreError,
   type PipelineStateIo,
 } from "./pipeline_state_store.ts";
 import { classifyRunFailure } from "./run_errors.ts";
@@ -24,6 +26,16 @@ import type {
  * commits each new snapshot. It never records credentials, environment
  * values, prompt/input bodies, OpenCode configuration, raw worker output, or
  * result summaries.
+ *
+ * Commit outcome handling:
+ *
+ * - `not_committed` (`PipelineStateStoreError`): the snapshot on disk is
+ *   unchanged; the sink stays on the previous revision, which remains
+ *   authoritative and can still record the normalized failure at finalize.
+ * - `durability_unknown` (`PipelineStateDurabilityError`): the candidate
+ *   revision is already visible on disk; the sink adopts it as the visible
+ *   state, poisons itself, and refuses every further commit and finalize for
+ *   this run. The error propagates and fails the run.
  */
 
 export interface PipelineRunSinkParams {
@@ -49,6 +61,7 @@ export class PipelineRunStateSink implements RunStateSink {
   private readonly params: PipelineRunSinkParams;
   private current: PipelineRunState | null = null;
   private chain: Promise<unknown> = Promise.resolve();
+  private isPoisoned = false;
 
   constructor(params: PipelineRunSinkParams) {
     this.params = params;
@@ -65,6 +78,14 @@ export class PipelineRunStateSink implements RunStateSink {
     return this.current;
   }
 
+  /**
+   * True after a `durability_unknown` commit: the sink adopted the visible
+   * candidate snapshot and refuses every further write for this run.
+   */
+  get poisoned(): boolean {
+    return this.isPoisoned;
+  }
+
   currentStatus(): string {
     return this.current?.status ?? "failed";
   }
@@ -78,17 +99,40 @@ export class PipelineRunStateSink implements RunStateSink {
   }
 
   private async dispatchNow(command: PipelineRunCommand): Promise<void> {
-    const now = this.params.now ? this.params.now() : new Date();
+    if (this.isPoisoned) {
+      throw new PipelineStateStoreError(
+        "the pipeline run state is poisoned by a durability-unknown commit; no further writes are accepted for this run",
+      );
+    }
+    const now = this.clock();
     const next = reducePipelineRunCommand(this.current, command, now);
-    if (this.current === null) {
-      await this.store.create(next);
-    } else {
-      await this.store.commit(next, this.current.revision);
+    try {
+      if (this.current === null) {
+        await this.store.create(next);
+      } else {
+        await this.store.commit(next, this.current.revision);
+      }
+    } catch (cause) {
+      if (cause instanceof PipelineStateDurabilityError) {
+        // `durability_unknown`: the rename succeeded, so the candidate
+        // revision is already visible at the state path. Adopt it as the
+        // visible state, poison the sink (no further commits or finalize for
+        // this run), and propagate: the run fails with exit 1, the Session is
+        // still cleaned up exactly once, and neither the previous snapshot is
+        // claimed to have survived nor the rename rolled back.
+        this.current = cause.candidate;
+        this.isPoisoned = true;
+      }
+      throw cause;
     }
     // The committed snapshot becomes the in-memory state only after the
     // durable write succeeded; a failed commit leaves the previous snapshot
     // authoritative.
     this.current = next;
+  }
+
+  private clock(): Date {
+    return this.params.now ? this.params.now() : new Date();
   }
 
   async initialize(): Promise<void> {

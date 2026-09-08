@@ -26,6 +26,18 @@ import {
  * the previous or the new complete snapshot, never a partial one. Residual
  * temporary files are not run state and are ignored by the loader.
  *
+ * Commit failures are reported as one of two typed outcomes:
+ *
+ * - `PipelineStateStoreError` (`not_committed`): the rename did not happen;
+ *   the previous committed snapshot is guaranteed to remain the authoritative
+ *   one, byte-for-byte.
+ * - `PipelineStateDurabilityError` (`durability_unknown`): the rename
+ *   succeeded, but the post-rename durability confirmation (`openDir`,
+ *   directory `fsync`, or close) failed. The candidate revision is already
+ *   visible at the state path, yet whether the previous or the candidate
+ *   revision survives a crash is not guaranteed. The rename is never rolled
+ *   back and no automatic recovery is implemented.
+ *
  * The first write refuses to clobber an existing run. Later commits verify
  * the on-disk revision against the expected revision. Commits of one run are
  * serialized inside the process. Multi-process locking is intentionally out
@@ -36,6 +48,26 @@ export class PipelineStateStoreError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PipelineStateStoreError";
+  }
+}
+
+/**
+ * `durability_unknown` commit outcome: the atomic rename over the previous
+ * snapshot succeeded, but the post-rename directory fsync that would make it
+ * durable failed. The candidate snapshot is already visible at the state
+ * path; whether it survives a crash is unknown. Carries the exact candidate
+ * revision and snapshot so the caller can adopt the visible state instead of
+ * pretending the previous snapshot still survived.
+ */
+export class PipelineStateDurabilityError extends PipelineStateStoreError {
+  readonly revision: number;
+  readonly candidate: PipelineRunState;
+
+  constructor(revision: number, candidate: PipelineRunState, message: string) {
+    super(message);
+    this.name = "PipelineStateDurabilityError";
+    this.revision = revision;
+    this.candidate = candidate;
   }
 }
 
@@ -308,12 +340,22 @@ export class PipelineStateStore {
         await dirHandle.close();
       }
     } catch (cause) {
-      if (!renamed) {
-        try {
-          await this.io.unlinkIfExists(tempPath);
-        } catch {
-          // best effort: the previous snapshot is intact either way
-        }
+      if (renamed) {
+        // `durability_unknown`: the rename already happened, so the candidate
+        // revision is visible at the state path, but its durability could not
+        // be confirmed. Never roll the rename back, never claim the previous
+        // snapshot survived, and report the candidate so the caller can adopt
+        // the visible state.
+        throw new PipelineStateDurabilityError(
+          state.revision,
+          state,
+          `pipeline run state ${file} was renamed to revision ${state.revision}, but its durability could not be confirmed: ${describeError(cause)}`,
+        );
+      }
+      try {
+        await this.io.unlinkIfExists(tempPath);
+      } catch {
+        // best effort: the previous snapshot is intact either way
       }
       throw cause instanceof PipelineStateStoreError
         ? cause

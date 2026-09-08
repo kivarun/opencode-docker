@@ -80,9 +80,15 @@ export interface TransitionStep {
  * validated outcome against its immutable graph snapshot. The hook receives
  * the exact immutable TransitionStep and must persist it before the engine
  * allows the next state callback. A rejecting or throwing hook stops the
- * graph: the transition never appears in the trace, the cursor does not move,
- * and the error propagates unchanged. The hook can never choose the target
- * state and is never given the graph's transitions.
+ * graph immediately: the transition never appears in the trace and the cursor
+ * does not move. Two commit outcomes are possible. A `not_committed` failure
+ * rejects before the durable write lands: the transition is not recorded
+ * anywhere. A `durability_unknown` failure means the rename already landed:
+ * the new candidate revision may already be visible on disk even though the
+ * hook failed — execution stops immediately either way, the next agent
+ * callback never runs, and the caller owns the durability-unknown handling.
+ * The hook can never choose the target state and is never given the graph's
+ * transitions.
  */
 export type TransitionCommitHook = (step: TransitionStep) => void | Promise<void>;
 
