@@ -115,6 +115,7 @@ export async function runWithChildSession(
   const failureBox: { error: Error | null } = { error: null };
   const cleanupBox: { error: Error | null } = { error: null };
   const signalBox: { abort: SignalAbort | null } = { abort: null };
+  let acceptSignals = true;
   let cleanupPromise: Promise<void> | null = null;
 
   const cleanup = (): Promise<void> => {
@@ -134,7 +135,7 @@ export async function runWithChildSession(
   };
 
   deps.onSignal?.((signal) => {
-    if (signalBox.abort !== null) {
+    if (!acceptSignals || signalBox.abort !== null) {
       return;
     }
     // Record the abort only. The caller (main.ts) forwards the signal to a
@@ -143,7 +144,9 @@ export async function runWithChildSession(
     // the lifecycle `finally`, after the active hook settles — the fire-and-
     // forget cleanup path is intentionally gone. docker-helper 2.1.0 cancels
     // the container operation on the signal best-effort and does not confirm
-    // a terminal operation state.
+    // a terminal operation state. Acceptance closes once the authoritative
+    // final state write has completed (see the end of the `finally` below);
+    // a signal delivered after that point can no longer change the outcome.
     signalBox.abort = new SignalAbort(signal);
   });
 
@@ -256,9 +259,20 @@ export async function runWithChildSession(
           : "failed";
     try {
       await updateState(finalStatus);
+      // A signal accepted while the final write was in flight invalidates a
+      // persisted success: rewrite the authoritative final status and wait for
+      // that write before the outcome is considered final.
+      if (finalStatus === "success" && signalBox.abort !== null) {
+        await updateState("failed");
+      }
     } catch {
       failureBox.error ??= new StatePersistError();
     }
+    // Linearization point: the authoritative final state write has completed
+    // and the last signalBox check above ran synchronously (no await in
+    // between). Close signal acceptance; a signal delivered from here on can
+    // no longer change the recorded outcome or the exit code.
+    acceptSignals = false;
   }
 
   const failure = failureBox.error;

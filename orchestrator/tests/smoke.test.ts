@@ -742,6 +742,107 @@ test("7c. signal during session delete: delete completes once, status not succes
   });
 });
 
+test("8. signal during the final success state write: rewritten to failed, exit 143", async () => {
+  await withTempDirs(async (dirs) => {
+    const runId = "signal-final-write-run";
+    await mkdir(dirs.state, { recursive: true });
+    const stateFifo = join(dirs.state, `smoke-${runId}.json`);
+    mkfifo(stateFifo);
+
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner, killActive, deleteStarted } = fakeCli({ workspace: dirs.workspace });
+    const pending = runSmoke(
+      { workspace: dirs.workspace, workerImage: "alpine:3.22" },
+      makeDeps(dirs, runner, {
+        randomId: () => runId,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    // hook-side state writes in strict order
+    const b1 = JSON.parse(await drainFifo(stateFifo));
+    expect(b1.status).toBe("creating_session");
+    const b2 = JSON.parse(await drainFifo(stateFifo));
+    expect(b2.status).toBe("session_created");
+    const b3 = JSON.parse(await drainFifo(stateFifo));
+    expect(b3.status).toBe("worker_running");
+    const b4 = JSON.parse(await drainFifo(stateFifo));
+    expect(b4.status).toBe("success");
+
+    // cleanup runs before the lifecycle's final write
+    await deleteStarted;
+
+    // the lifecycle's authoritative final "success" write is blocked on the
+    // FIFO; record the signal while the write is in flight, then release it
+    const reader5 = await open(stateFifo, "r");
+    signalHandler!("SIGTERM");
+    killActive("SIGTERM");
+    const b5 = JSON.parse((await reader5.readFile()).toString("utf8"));
+    await reader5.close();
+    expect(b5.status).toBe("success");
+
+    // the lifecycle notices the signal accepted during the write and rewrites
+    // the final status; the rewritten state must also complete
+    const finalState = JSON.parse(await drainFifo(stateFifo));
+    expect(finalState.status).toBe("failed");
+
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(143);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+    expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
+  });
+});
+
+test("8b. cutoff: signal after the authoritative final write does not change the result", async () => {
+  await withTempDirs(async (dirs) => {
+    const runId = "cutoff-final-write-run";
+    await mkdir(dirs.state, { recursive: true });
+    const stateFifo = join(dirs.state, `smoke-${runId}.json`);
+    mkfifo(stateFifo);
+
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner, deleteStarted } = fakeCli({ workspace: dirs.workspace });
+    const pending = runSmoke(
+      { workspace: dirs.workspace, workerImage: "alpine:3.22" },
+      makeDeps(dirs, runner, {
+        randomId: () => runId,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    await drainFifo(stateFifo);
+    await drainFifo(stateFifo);
+    await drainFifo(stateFifo);
+    const b4 = JSON.parse(await drainFifo(stateFifo));
+    expect(b4.status).toBe("success");
+
+    await deleteStarted;
+    // the authoritative final "success" write completes with no signal accepted
+    const b5 = JSON.parse(await drainFifo(stateFifo));
+    expect(b5.status).toBe("success");
+
+    // the outcome resolves only after the lifecycle closed signal acceptance in
+    // the same synchronous tail as the final write, so this late signal is a
+    // no-op by the linearization contract
+    const outcome = await pending;
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.ok).toBe(true);
+    expect(outcome.status).toBe("success");
+
+    signalHandler!("SIGTERM");
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.status).toBe("success");
+    expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
+  });
+});
+
 test("extra: endpoint unreachable fails before any session is created", async () => {
   await withTempDirs(async (dirs) => {
     const { runner } = fakeCli({ workspace: dirs.workspace });

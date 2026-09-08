@@ -40,6 +40,11 @@ The current orchestrator proves one complete delegated agent execution:
    confirms a terminal operation state; `session create`, `pull`, and
    `session delete` always run to completion, and the child Session is deleted
    only in the single lifecycle cleanup path after the active step settles.
+   Signal acceptance closes in the same synchronous tail that completes the
+   authoritative final state write: a signal accepted while that write was in
+   flight rewrites a persisted `success` to `failed`, and a signal delivered
+   after the write completes can no longer change the recorded outcome or the
+   exit code.
 9. It deletes the child Session and records the final cleanup result.
 10. Process exit status reports overall success or failure.
 
