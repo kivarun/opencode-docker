@@ -18,12 +18,28 @@ import {
   type LifecycleOptions,
   type LifecycleOutcome,
   type SessionContext,
+  type StateSinkFactory,
 } from "./lifecycle.ts";
-import type { AgentStateView } from "./pipeline_engine.ts";
-import { executePipelineGraph } from "./pipeline_engine.ts";
+import {
+  pipelineExecutionDigest,
+} from "./pipeline_digest.ts";
+import {
+  executePipelineGraph,
+  type AgentStateView,
+} from "./pipeline_engine.ts";
+import {
+  PipelineRunStateSink,
+  type AcceptedAgentResultRecord,
+  type PipelineRunSinkParams,
+} from "./pipeline_state_sink.ts";
+import type { PipelineIdentityState, ProtectedInputState } from "./pipeline_state.ts";
+import type { PipelineStateIo } from "./pipeline_state_store.ts";
+import { AgentTimeoutError, WorkspaceInputError } from "./run_errors.ts";
 import type { ResolvedProfile } from "./profile.ts";
 import { loadProfile } from "./profile.ts";
 import { AGENT_SMOKE_DIR, agentWorkerSpec, pullArgs, runArgs } from "./worker.ts";
+
+export { AgentTimeoutError, WorkspaceInputError } from "./run_errors.ts";
 
 export interface AgentSmokeOptions {
   workspace: string;
@@ -32,7 +48,10 @@ export interface AgentSmokeOptions {
   launcherId?: string;
 }
 
-export type AgentSmokeDeps = LifecycleDeps;
+export type AgentSmokeDeps = LifecycleDeps & {
+  /** IO seam for the durable pipeline run state (tests). */
+  pipelineStateIo?: PipelineStateIo;
+};
 
 export type AgentSmokeOutcome = LifecycleOutcome;
 
@@ -46,13 +65,6 @@ export function agentResultFilePath(workspace: string, runId: string): string {
 
 export function executionDocumentPath(workspace: string, runId: string): string {
   return `${agentRunDirPath(workspace, runId)}/execution.md`;
-}
-
-export class WorkspaceInputError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "WorkspaceInputError";
-  }
 }
 
 export interface ResolvedWorkspaceInput {
@@ -217,6 +229,8 @@ export async function runAgentSmoke(
   let plan: OneStepPlan;
   let profile: ResolvedProfile;
   let input: ResolvedWorkspaceInput;
+  let identity: PipelineIdentityState;
+  let protectedInput: ProtectedInputState;
   try {
     const pipeline = await loadPipeline(options.pipelineRoot);
     plan = planOneStepExecution(pipeline);
@@ -231,6 +245,18 @@ export async function runAgentSmoke(
     console.error(
       `orchestrator: protected input ok (${input.pathInWorkspace}, sha256 ${input.sha256})`,
     );
+    identity = {
+      schema_version: pipeline.schema_version,
+      bundle_root: pipeline.bundleRoot,
+      execution_snapshot_sha256: pipelineExecutionDigest(pipeline),
+      entry_state: pipeline.entry_state,
+      max_transitions: pipeline.max_transitions,
+    };
+    protectedInput = {
+      id: plan.input.id,
+      path: input.pathInWorkspace,
+      sha256: input.sha256,
+    };
   } catch (cause) {
     const failure = cause instanceof Error ? cause : new Error(String(cause));
     console.error(`orchestrator: agent-smoke failed: ${failure.message}`);
@@ -248,6 +274,24 @@ export async function runAgentSmoke(
     workerImage: profile.image,
     launcherId: options.launcherId,
   };
+
+  // `agent-smoke` runs exclusively on the durable pipeline run state sink:
+  // no legacy smoke state file is written for this command.
+  const makeStateSink: StateSinkFactory = (runId, stateDirPath) =>
+    new PipelineRunStateSink({
+      stateDirPath,
+      runId,
+      workspace: input.workspaceCanonical,
+      identity,
+      protectedInput,
+      attempt: {
+        stateId: plan.agent.id,
+        attempt: plan.attempt,
+        profile: profile.profileName,
+      },
+      io: deps.pipelineStateIo,
+      now: deps.now,
+    });
 
   return runWithChildSession(
     deps,
@@ -274,10 +318,33 @@ export async function runAgentSmoke(
       // even for the one-step path: the agent callback reports only the
       // validated result status, the engine resolves the declared transition,
       // and success is possible only by reaching a success terminal state.
+      // Every resolved transition is durably committed (cursor, transition,
+      // and event in one snapshot) before the engine moves on.
       withSession: async (ctx) => {
-        const execution = await executePipelineGraph(plan.pipeline, (state) =>
-          agentRunOutcome(options, profile, input, state, deps, ctx),
+        const sink = requireTransitionSink(ctx);
+        let accepted: AcceptedAgentResultRecord | null = null;
+        const execution = await executePipelineGraph(
+          plan.pipeline,
+          async (state) => {
+            const acceptedResult = await agentRunOutcome(options, profile, input, state, deps, ctx);
+            accepted = {
+              resultSha256: acceptedResult.resultSha256,
+              artifacts: acceptedResult.artifacts,
+            };
+            return acceptedResult.outcome;
+          },
+          {
+            onTransitionCommit: (step) => {
+              if (accepted === null) {
+                throw new PipelineError(
+                  "no accepted agent result is available for the committed transition",
+                );
+              }
+              return sink.recordTransition(step, accepted);
+            },
+          },
         );
+        await sink.recordTerminal(execution.terminalStateId, execution.terminalResult);
         console.error(
           `orchestrator: graph execution terminal ${execution.terminalStateId} (${execution.terminalResult}, ${execution.transitionCount} transition(s))`,
         );
@@ -286,11 +353,18 @@ export async function runAgentSmoke(
             `pipeline execution ended at terminal ${JSON.stringify(execution.terminalStateId)} with result failed`,
           );
         }
-        await ctx.updateState("success");
       },
     },
     "agent-smoke",
+    makeStateSink,
   );
+}
+
+function requireTransitionSink(ctx: SessionContext) {
+  if (ctx.transitionSink === undefined) {
+    throw new PipelineError("agent-smoke requires the pipeline run state sink");
+  }
+  return ctx.transitionSink;
 }
 
 async function agentRunOutcome(
@@ -300,7 +374,7 @@ async function agentRunOutcome(
   state: AgentStateView,
   deps: AgentSmokeDeps,
   ctx: SessionContext,
-): Promise<string> {
+): Promise<{ outcome: string; resultSha256: string; artifacts: readonly string[] }> {
   const { runId, updateState, childEnv } = ctx;
   const resultPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/result.json`;
   const executionDocPathInWorkspace = `${AGENT_SMOKE_DIR}/${runId}/execution.md`;
@@ -340,10 +414,7 @@ async function agentRunOutcome(
     timeoutSeconds: state.timeout_seconds,
   });
   if (run.timedOut === true) {
-    throw new DockerHelperError(
-      "cli_failure",
-      `agent container timed out after ${state.timeout_seconds} seconds`,
-    );
+    throw new AgentTimeoutError(state.timeout_seconds);
   }
   if (run.code !== 0) {
     throw new DockerHelperError(
@@ -362,14 +433,18 @@ async function agentRunOutcome(
   }
 
   const resultFile = agentResultFilePath(options.workspace, runId);
-  let raw: string;
+  let bytes: Uint8Array;
   try {
-    raw = await Bun.file(resultFile).text();
+    bytes = await Bun.file(resultFile).bytes();
   } catch (cause) {
     throw new AgentResultError(
       `agent result not readable at ${resultFile}: ${describeError(cause)}`,
     );
   }
+  const resultHasher = new Bun.CryptoHasher("sha256");
+  resultHasher.update(bytes);
+  const resultSha256 = resultHasher.digest("hex");
+  const raw = new TextDecoder().decode(bytes);
   const result: AgentResult = await verifyAgentResult(raw, runId, input.workspaceCanonical, {
     canonical: input.canonical,
     dev: input.dev,
@@ -378,6 +453,5 @@ async function agentRunOutcome(
 
   console.error(`orchestrator: agent result verified for run ${runId}`);
   // the validated outcome only; the graph engine selects the next state
-  return result.status;
+  return { ...result, outcome: result.status, resultSha256 };
 }
-

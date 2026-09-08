@@ -1,4 +1,4 @@
-import { link, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, spyOn, test } from "bun:test";
@@ -17,7 +17,12 @@ import {
   type AgentSmokeDeps,
 } from "../src/agent_smoke.ts";
 import { childSessionEnv, signalExitCode, type LifecycleDeps } from "../src/lifecycle.ts";
+import { loadPipeline } from "../src/pipeline.ts";
+import { pipelineExecutionDigest } from "../src/pipeline_digest.ts";
+import { pipelineRunStatePath } from "../src/pipeline_state_store.ts";
 import type { CliResult, CliRunner } from "../src/docker_helper.ts";
+import { gateIoAtRename, faultIo } from "./state_io_test_helpers.ts";
+import { PipelineStateStoreError } from "../src/pipeline_state_store.ts";
 
 const LAUNCHER_TOKEN = "dhc_" + "a".repeat(64);
 const CHILD_TOKEN = "dht_" + "b".repeat(64);
@@ -150,19 +155,6 @@ function envPairValue(args: string[], name: string): string {
     }
   }
   return "";
-}
-
-/**
- * Deterministic FIFO barrier around saveRunState: the state file itself is a
- * named pipe, so each state write blocks at open() until this reader connects,
- * and resolves only after the writer closes (EOF). The returned JSON tells the
- * test exactly which state write completed.
- */
-async function drainFifo(fifo: string): Promise<string> {
-  const fh = await open(fifo, "r");
-  const data = await fh.readFile();
-  await fh.close();
-  return data.toString("utf8");
 }
 
 function fakeCli(options: FakeAgentOptions & { workspace: string }) {
@@ -363,7 +355,7 @@ async function withFixture(
 function makeDeps(
   dirs: { workspace: string; state: string; credentialFile: string },
   runner: CliRunner,
-  overrides: Partial<LifecycleDeps> = {},
+  overrides: Partial<AgentSmokeDeps> = {},
 ): AgentSmokeDeps {
   return {
     cli: runner,
@@ -407,6 +399,16 @@ function agentSmokeOptions(dirs: { workspace: string; configRoot: string; pipeli
 
 function deleteCallCount(calls: RecordedCall[]): number {
   return calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length;
+}
+
+async function waitFor(desc: string, check: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for ${desc}`);
+    }
+    await Bun.sleep(5);
+  }
 }
 
 function createCallCount(calls: RecordedCall[]): number {
@@ -489,17 +491,83 @@ test("1. success: pipeline-driven agent run, result + artifacts verified, sessio
 
     expect(deleteCallCount(calls)).toBe(1);
 
-    const stateFiles = await readdir(dirs.state);
-    const state = JSON.parse(await readFile(join(dirs.state, stateFiles[0] ?? ""), "utf8"));
-    expect(state.status).toBe("success");
-    expect(state.session_id).toBe(CHILD_SESSION_ID);
-    expect(state.worker_image).toBe(PROFILE_IMAGE);
-    expect(JSON.stringify(state)).not.toContain(CHILD_TOKEN);
-    expect(JSON.stringify(state)).not.toContain(LAUNCHER_TOKEN);
-    expect(JSON.stringify(state)).not.toContain("sk-test-key");
-    expect(JSON.stringify(state)).not.toContain(OPENCODE_CONFIG);
-    expect(JSON.stringify(state)).not.toContain(PROMPT_MARKER);
-    expect(JSON.stringify(state)).not.toContain(INPUT_MARKER);
+    // the durable pipeline run state: one authoritative document under the state root
+    const statePath = pipelineRunStatePath(dirs.state, outcome.runId);
+    const stateBytes = await readFile(statePath);
+    const stateText = stateBytes.toString("utf8");
+    const state = JSON.parse(stateText);
+    const resolvedPipeline = await loadPipeline(dirs.pipelineRoot);
+    const resultPath = agentResultFilePath(dirs.workspace, outcome.runId);
+    const resultSha = new Bun.CryptoHasher("sha256").update(await readFile(resultPath)).digest("hex");
+    const inputSha = new Bun.CryptoHasher("sha256")
+      .update(await readFile(join(dirs.workspace, "TASK.md")))
+      .digest("hex");
+    expect(state).toEqual({
+      schema_version: 1,
+      revision: 7,
+      run_id: outcome.runId,
+      status: "success",
+      phase: "finished",
+      started_at: expect.any(String),
+      updated_at: expect.any(String),
+      workspace: dirs.workspace,
+      pipeline: {
+        schema_version: 1,
+        bundle_root: dirs.pipelineRoot,
+        execution_snapshot_sha256: pipelineExecutionDigest(resolvedPipeline),
+        entry_state: "execute",
+        max_transitions: 1,
+      },
+      protected_input: { id: "task", path: "TASK.md", sha256: inputSha },
+      session_id: CHILD_SESSION_ID,
+      cursor: { current_state: "completed", transition_count: 1 },
+      attempt: {
+        state_id: "execute",
+        attempt: 1,
+        profile: "default",
+        session_id: CHILD_SESSION_ID,
+        phase: "completed",
+      },
+      transitions: [
+        {
+          index: 0,
+          from: "execute",
+          outcome: "completed",
+          to: "completed",
+          attempt: 1,
+          result_sha256: resultSha,
+          artifacts: [WORK_PRODUCT_PATH],
+        },
+      ],
+      terminal: { state_id: "completed", result: "success" },
+      events: [
+        { sequence: 1, kind: "run_created", at: expect.any(String) },
+        { sequence: 2, kind: "phase_entered", at: expect.any(String) },
+        { sequence: 3, kind: "session_created", at: expect.any(String) },
+        { sequence: 4, kind: "attempt_started", at: expect.any(String) },
+        { sequence: 5, kind: "transition_committed", at: expect.any(String) },
+        { sequence: 6, kind: "terminal_reached", at: expect.any(String) },
+        { sequence: 7, kind: "run_succeeded", at: expect.any(String) },
+      ],
+    });
+    expect((await stat(join(dirs.state, "pipeline-runs"))).mode & 0o777).toBe(0o700);
+    expect((await stat(join(dirs.state, "pipeline-runs", outcome.runId))).mode & 0o777).toBe(0o700);
+    expect((await stat(statePath)).mode & 0o777).toBe(0o600);
+    expect(await readdir(dirs.state)).toEqual(["pipeline-runs"]);
+    for (const secret of [
+      CHILD_TOKEN,
+      LAUNCHER_TOKEN,
+      "sk-test-key",
+      OPENCODE_CONFIG,
+      PROMPT_MARKER,
+      INPUT_MARKER,
+      PROMPT_BODY,
+      INPUT_BODY,
+      WORK_PRODUCT_BODY,
+      "created the work product",
+    ]) {
+      expect(stateText).not.toContain(secret);
+    }
 
     const workProduct = await readFile(join(dirs.workspace, WORK_PRODUCT_PATH), "utf8");
     expect(workProduct).toBe(WORK_PRODUCT_BODY);
@@ -945,7 +1013,7 @@ test("20. signal during agent run: signal forwarded -> CLI exited -> Session del
         },
       }),
     );
-    await Bun.sleep(10);
+    await waitFor("run:start", () => events.includes("run:start"));
     expect(events).toEqual([
       "session:create",
       "session:create-done",
@@ -956,7 +1024,7 @@ test("20. signal during agent run: signal forwarded -> CLI exited -> Session del
 
     killActive("SIGTERM");
     signalHandler!("SIGTERM");
-    await Bun.sleep(10);
+    await waitFor("run exit + cleanup", () => events.includes("session:delete"));
 
     const outcome = await pending;
     expect(outcome.exitCode).toBe(143);
@@ -978,49 +1046,275 @@ test("20. signal during agent run: signal forwarded -> CLI exited -> Session del
   });
 });
 
-test("21. signal during updateState(agent_running): run never starts, status not success", async () => {
+test("21. signal during the attempt_started commit: run never starts, run fails durably", async () => {
   await withFixture(async (dirs) => {
-    const runId = "agent-signal-state-run";
-    await mkdir(dirs.state, { recursive: true });
-    const stateFifo = join(dirs.state, `smoke-${runId}.json`);
-    Bun.spawnSync(["mkfifo", stateFifo]);
-
+    const gate = gateIoAtRename(4);
     let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
-    const { calls, runner, killActive, deleteStarted } = fakeCli({ workspace: dirs.workspace });
+    const { calls, runner, killActive } = fakeCli({ workspace: dirs.workspace });
     const pending = runAgentSmoke(
       agentSmokeOptions(dirs),
       makeDeps(dirs, runner, {
-        randomId: () => runId,
+        pipelineStateIo: gate.io,
         onSignal: (handler) => {
           signalHandler = handler;
         },
       }),
     );
 
-    const b1 = JSON.parse(await drainFifo(stateFifo));
-    expect(b1.status).toBe("creating_session");
-    const b2 = JSON.parse(await drainFifo(stateFifo));
-    expect(b2.status).toBe("session_created");
-
-    const reader3 = await open(stateFifo, "r");
+    // the attempt_started commit is in flight (blocked at its rename)
+    await gate.reached;
     signalHandler!("SIGTERM");
     killActive("SIGTERM");
-    const b3 = JSON.parse((await reader3.readFile()).toString("utf8"));
-    await reader3.close();
-    expect(b3.status).toBe("agent_running");
-
-    await deleteStarted;
-    expect(calls.some((c) => c.args[0] === "run")).toBe(false);
-    const finalState = JSON.parse(await drainFifo(stateFifo));
+    // the in-flight commit is not cancelled: it completes, then the recorded
+    // abort fails the run before the worker starts
+    gate.release();
     const outcome = await pending;
 
     expect(outcome.exitCode).toBe(143);
     expect(outcome.ok).toBe(false);
     expect(outcome.status).toBe("failed");
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
-    expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
-    expect(finalState.status).toBe("failed");
-    expect(finalState.session_id).toBe(CHILD_SESSION_ID);
+    expect(deleteCallCount(calls)).toBe(1);
+
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state).toEqual({
+      schema_version: 1,
+      revision: 5,
+      run_id: outcome.runId,
+      status: "failed",
+      phase: "finished",
+      started_at: expect.any(String),
+      updated_at: expect.any(String),
+      workspace: dirs.workspace,
+      pipeline: {
+        schema_version: 1,
+        bundle_root: dirs.pipelineRoot,
+        execution_snapshot_sha256: pipelineExecutionDigest(await loadPipeline(dirs.pipelineRoot)),
+        entry_state: "execute",
+        max_transitions: 1,
+      },
+      protected_input: { id: "task", path: "TASK.md", sha256: expect.any(String) },
+      session_id: CHILD_SESSION_ID,
+      cursor: { current_state: "execute", transition_count: 0 },
+      attempt: {
+        state_id: "execute",
+        attempt: 1,
+        profile: "default",
+        session_id: CHILD_SESSION_ID,
+        phase: "failed",
+      },
+      transitions: [],
+      failure: { reason: "signal_sigterm" },
+      events: [
+        { sequence: 1, kind: "run_created", at: expect.any(String) },
+        { sequence: 2, kind: "phase_entered", at: expect.any(String) },
+        { sequence: 3, kind: "session_created", at: expect.any(String) },
+        { sequence: 4, kind: "attempt_started", at: expect.any(String) },
+        { sequence: 5, kind: "run_failed", at: expect.any(String) },
+      ],
+    });
+  });
+});
+
+test("21b. transition commit failure: run fails, no transition recorded, failure is durable", async () => {
+  await withFixture(async (dirs) => {
+    const io = faultIo({
+      failCommit: 5,
+      error: new PipelineStateStoreError("injected store failure at the transition commit"),
+    });
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: io }));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.ok).toBe(false);
+    // the worker ran exactly once, the session was deleted exactly once
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state.revision).toBe(5);
+    expect(state.status).toBe("failed");
+    expect(state.phase).toBe("finished");
+    expect(state.failure).toEqual({ reason: "state_persist_failed" });
+    expect(state.cursor).toEqual({ current_state: "execute", transition_count: 0 });
+    expect(state.transitions).toEqual([]);
+    expect(state.terminal).toBeUndefined();
+    expect(state.attempt.phase).toBe("failed");
+    expect(state.events.map((event: { kind: string }) => event.kind)).toEqual([
+      "run_created",
+      "phase_entered",
+      "session_created",
+      "attempt_started",
+      "run_failed",
+    ]);
+  });
+});
+
+test("21c. final commit failure: the complete active snapshot stays on disk, run is not ok", async () => {
+  await withFixture(async (dirs) => {
+    const io = faultIo({
+      failCommit: 7,
+      error: new PipelineStateStoreError("injected store failure at the final commit"),
+    });
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: io }));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.ok).toBe(false);
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+
+    // the last good snapshot is the revision-6 terminal_reached state
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state.revision).toBe(6);
+    expect(state.status).toBe("active");
+    expect(state.phase).toBe("finalizing");
+    expect(state.failure).toBeUndefined();
+    expect(state.terminal).toEqual({ state_id: "completed", result: "success" });
+    expect(state.cursor).toEqual({ current_state: "completed", transition_count: 1 });
+    expect(state.events.map((event: { kind: string }) => event.kind)).toEqual([
+      "run_created",
+      "phase_entered",
+      "session_created",
+      "attempt_started",
+      "transition_committed",
+      "terminal_reached",
+    ]);
+  });
+});
+
+test("21d. cutoff: signal after the final write completed does not change the result", async () => {
+  await withFixture(async (dirs) => {
+    const gate = gateIoAtRename(7);
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
+    const pending = runAgentSmoke(
+      agentSmokeOptions(dirs),
+      makeDeps(dirs, runner, {
+        pipelineStateIo: gate.io,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    await gate.reached;
+    gate.release();
+    const outcome = await pending;
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.ok).toBe(true);
+    expect(outcome.status).toBe("success");
+    expect(deleteCallCount(calls)).toBe(1);
+
+    // the outcome resolved only after the lifecycle closed signal acceptance in
+    // the same synchronous tail as the final write, so this late signal is a
+    // no-op by the linearization contract
+    signalHandler!("SIGTERM");
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.status).toBe("success");
+
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state.revision).toBe(7);
+    expect(state.status).toBe("success");
+    expect(state.failure).toBeUndefined();
+    expect(state.events[state.events.length - 1].kind).toBe("run_succeeded");
+  });
+});
+
+test("21e. signal during the final success write: success is rewritten to failed, exit 130", async () => {
+  await withFixture(async (dirs) => {
+    const gate = gateIoAtRename(7);
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
+    const pending = runAgentSmoke(
+      agentSmokeOptions(dirs),
+      makeDeps(dirs, runner, {
+        pipelineStateIo: gate.io,
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    await gate.reached;
+    signalHandler!("SIGINT");
+    gate.release();
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(130);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(deleteCallCount(calls)).toBe(1);
+
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state.revision).toBe(8);
+    expect(state.status).toBe("failed");
+    expect(state.phase).toBe("finished");
+    expect(state.failure).toEqual({ reason: "signal_sigint" });
+    // the success event is still in the journal; the run_failed event follows it
+    expect(state.events.map((event: { kind: string }) => event.kind)).toEqual([
+      "run_created",
+      "phase_entered",
+      "session_created",
+      "attempt_started",
+      "transition_committed",
+      "terminal_reached",
+      "run_succeeded",
+      "run_failed",
+    ]);
+  });
+});
+
+test("21f. worker argv, mounts, env and execution document never contain the state root", async () => {
+  await withFixture(async (dirs) => {
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+    expect(outcome.ok).toBe(true);
+
+    for (const call of calls) {
+      for (const arg of call.args) {
+        expect(arg.includes(dirs.state)).toBe(false);
+      }
+      for (const [key, value] of Object.entries(call.env)) {
+        expect(`${key}=${value}`).not.toContain(dirs.state);
+      }
+    }
+    const doc = await readFile(executionDocumentPath(dirs.workspace, outcome.runId), "utf8");
+    expect(doc).not.toContain(dirs.state);
+  });
+});
+
+test("21g. two runs against the same bundle record the same execution snapshot digest", async () => {
+  await withFixture(async (dirs) => {
+    const { runner } = fakeCli({ workspace: dirs.workspace });
+    const first = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+    const second = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner));
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(first.runId).not.toBe(second.runId);
+
+    const readState = async (runId: string) =>
+      JSON.parse((await readFile(pipelineRunStatePath(dirs.state, runId))).toString("utf8"));
+    const firstState = await readState(first.runId);
+    const secondState = await readState(second.runId);
+    const digest = pipelineExecutionDigest(await loadPipeline(dirs.pipelineRoot));
+
+    expect(firstState.pipeline.execution_snapshot_sha256).toBe(digest);
+    expect(secondState.pipeline.execution_snapshot_sha256).toBe(digest);
+    // run identity is otherwise independent: different run ids, same bundle
+    expect(firstState.pipeline.bundle_root).toBe(dirs.pipelineRoot);
+    expect(secondState.pipeline.bundle_root).toBe(dirs.pipelineRoot);
+    expect(firstState.protected_input.sha256).toBe(secondState.protected_input.sha256);
   });
 });
 

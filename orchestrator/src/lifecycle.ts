@@ -10,7 +10,8 @@ import {
   requireLauncherCredential,
   type HelperConfig,
 } from "./launcher.ts";
-import { stateDir, saveRunState, type RunState } from "./state.ts";
+import { saveRunState, stateDir, type RunState } from "./state.ts";
+import type { TransitionStep } from "./pipeline_engine.ts";
 
 export class SignalAbort extends Error {
   readonly signal: "SIGINT" | "SIGTERM";
@@ -29,6 +30,108 @@ export class StatePersistError extends Error {
     super("cannot persist run state");
   }
 }
+
+/**
+ * Run state sink: the lifecycle speaks only this vocabulary. `smoke` keeps
+ * the legacy flat adapter (unchanged contract); `agent-smoke` plugs in the
+ * durable pipeline run state sink and never writes the legacy smoke state.
+ */
+export interface RunStateSink {
+  /**
+   * Called once at run start. The legacy adapter intentionally does nothing:
+   * its first disk write remains the first phase update. The pipeline sink
+   * creates the durable run record here.
+   */
+  initialize(): Promise<void>;
+  /** Progress updates while the run is active. */
+  phase(status: string, sessionId?: string): Promise<void>;
+  /** Authoritative final status write after cleanup. */
+  finalize(outcome: RunFinalization): Promise<void>;
+  /** Status for the lifecycle outcome (last known). */
+  currentStatus(): string;
+}
+
+export interface RunFinalization {
+  status: "success" | "failed" | "cleanup_failed";
+  failure: Error | null;
+  signal: SignalAbort | null;
+  sessionId: string | null;
+}
+
+/**
+ * Legacy flat run state for `smoke`, byte-for-byte compatible with the
+ * previous in-lifecycle implementation.
+ */
+export class LegacyRunStateSink implements RunStateSink {
+  private readonly state: RunState;
+  private sessionId: string | null = null;
+
+  constructor(
+    private readonly stateDirPath: string,
+    params: { runId: string; workspace: string; workerImage: string; startedAt: string },
+    private readonly now: () => Date,
+  ) {
+    this.state = {
+      schema_version: 1,
+      run_id: params.runId,
+      workspace: params.workspace,
+      worker_image: params.workerImage,
+      started_at: params.startedAt,
+      updated_at: params.startedAt,
+      status: "starting",
+    };
+  }
+
+  async initialize(): Promise<void> {
+    // no initial write: the legacy contract persists the run state starting
+    // with the first phase update
+  }
+
+  async phase(status: string, sessionId?: string): Promise<void> {
+    if (sessionId !== undefined) {
+      this.sessionId = sessionId;
+    }
+    this.state.status = status;
+    this.state.updated_at = this.now().toISOString();
+    if (this.sessionId !== null) {
+      this.state.session_id = this.sessionId;
+    }
+    await saveRunState(this.stateDirPath, this.state);
+  }
+
+  async finalize(outcome: RunFinalization): Promise<void> {
+    if (outcome.sessionId !== null) {
+      this.sessionId = outcome.sessionId;
+    }
+    await this.phase(outcome.status);
+  }
+
+  currentStatus(): string {
+    return this.state.status;
+  }
+}
+
+/**
+ * Pipeline-specific extension used by `agent-smoke` to commit engine
+ * transitions and the reached terminal state durably.
+ */
+export interface PipelineTransitionSink extends RunStateSink {
+  recordTransition(
+    step: TransitionStep,
+    accepted: { resultSha256: string; artifacts: readonly string[] },
+  ): Promise<void>;
+  recordTerminal(terminalStateId: string, terminalResult: "success" | "failed"): Promise<void>;
+}
+
+export function isPipelineTransitionSink(sink: RunStateSink): sink is PipelineTransitionSink {
+  const candidate = sink as PipelineTransitionSink;
+  return (
+    typeof candidate.recordTransition === "function" &&
+    typeof candidate.recordTerminal === "function"
+  );
+}
+
+export type StateSinkFactory = (runId: string, stateDirPath: string) => RunStateSink;
 
 export interface LifecycleDeps {
   cli: CliRunner;
@@ -58,6 +161,8 @@ export interface SessionContext extends PreSessionContext {
   childToken: string;
   childEnv: Record<string, string>;
   checkAbort: () => void;
+  /** Present only when the command runs on the pipeline run state sink. */
+  transitionSink?: PipelineTransitionSink;
 }
 
 export interface LifecycleHooks {
@@ -104,12 +209,28 @@ export async function runWithChildSession(
   options: LifecycleOptions,
   hooks: LifecycleHooks,
   label: string,
+  makeStateSink?: StateSinkFactory,
 ): Promise<LifecycleOutcome> {
   const runId = deps.randomId ? deps.randomId() : crypto.randomUUID();
-  const startedAt = (deps.now ? deps.now() : new Date()).toISOString();
+  const nowFn = (): Date => (deps.now ? deps.now() : new Date());
+  const startedAt = nowFn().toISOString();
   const stateDirPath = deps.stateDirPath ?? stateDir(deps.baseEnv ?? {});
   const workspaceExists = deps.workspaceExists ?? defaultWorkspaceExists;
   const baseOperatorEnv = operatorEnv(deps.baseEnv ?? {});
+
+  const sink: RunStateSink = makeStateSink
+    ? makeStateSink(runId, stateDirPath)
+    : new LegacyRunStateSink(
+        stateDirPath,
+        {
+          runId,
+          workspace: options.workspace,
+          workerImage: options.workerImage,
+          startedAt,
+        },
+        nowFn,
+      );
+  const transitionSink = isPipelineTransitionSink(sink) ? sink : undefined;
 
   let childSessionId: string | null = null;
   const failureBox: { error: Error | null } = { error: null };
@@ -150,26 +271,11 @@ export async function runWithChildSession(
     signalBox.abort = new SignalAbort(signal);
   });
 
-  const state: RunState = {
-    schema_version: 1,
-    run_id: runId,
-    workspace: options.workspace,
-    worker_image: options.workerImage,
-    started_at: startedAt,
-    updated_at: startedAt,
-    status: "starting",
-  };
-
-  const updateState = async (status: string): Promise<void> => {
-    state.status = status;
-    state.updated_at = (deps.now ? deps.now() : new Date()).toISOString();
-    if (childSessionId !== null) {
-      state.session_id = childSessionId;
-    }
-    await saveRunState(stateDirPath, state);
-  };
+  const updateState = (status: string): Promise<void> => sink.phase(status);
 
   try {
+    await sink.initialize();
+
     if (!(await workspaceExists(options.workspace))) {
       throw new Error(
         `workspace ${options.workspace} is not accessible to the orchestrator; ` +
@@ -222,7 +328,7 @@ export async function runWithChildSession(
       );
     }
     console.error(`orchestrator: child session ${child.sessionId} created`);
-    await updateState("session_created");
+    await sink.phase("session_created", child.sessionId);
 
     if (signalBox.abort !== null) {
       throw signalBox.abort;
@@ -240,6 +346,7 @@ export async function runWithChildSession(
             throw signalBox.abort;
           }
         },
+        transitionSink,
       });
     }
   } catch (cause) {
@@ -258,12 +365,22 @@ export async function runWithChildSession(
           ? "success"
           : "failed";
     try {
-      await updateState(finalStatus);
+      await sink.finalize({
+        status: finalStatus,
+        failure: failureBox.error,
+        signal: signalBox.abort,
+        sessionId: childSessionId,
+      });
       // A signal accepted while the final write was in flight invalidates a
       // persisted success: rewrite the authoritative final status and wait for
       // that write before the outcome is considered final.
       if (finalStatus === "success" && signalBox.abort !== null) {
-        await updateState("failed");
+        await sink.finalize({
+          status: "failed",
+          failure: failureBox.error,
+          signal: signalBox.abort,
+          sessionId: childSessionId,
+        });
       }
     } catch {
       failureBox.error ??= new StatePersistError();
@@ -300,7 +417,7 @@ export async function runWithChildSession(
     exitCode,
     runId,
     sessionId: childSessionId ?? undefined,
-    status: state.status,
+    status: sink.currentStatus(),
     detail: failure?.message,
   };
 }
