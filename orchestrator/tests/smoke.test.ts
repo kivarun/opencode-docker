@@ -742,7 +742,7 @@ test("7c. signal during session delete: delete completes once, status not succes
   });
 });
 
-test("8. signal during the final success state write: rewritten to failed, exit 143", async () => {
+test("8. signal during the final success state write is late: persisted success, exit 0", async () => {
   await withTempDirs(async (dirs) => {
     const runId = "signal-final-write-run";
     await mkdir(dirs.state, { recursive: true });
@@ -774,8 +774,10 @@ test("8. signal during the final success state write: rewritten to failed, exit 
     // cleanup runs before the lifecycle's final write
     await deleteStarted;
 
-    // the lifecycle's authoritative final "success" write is blocked on the
-    // FIFO; record the signal while the write is in flight, then release it
+    // the lifecycle's single authoritative final "success" write is blocked on
+    // the FIFO; the signal cutoff already happened before the write started,
+    // so the signal recorded while the write is in flight is late and changes
+    // nothing: the success snapshot is written exactly once and is final
     const reader5 = await open(stateFifo, "r");
     signalHandler!("SIGTERM");
     killActive("SIGTERM");
@@ -783,18 +785,16 @@ test("8. signal during the final success state write: rewritten to failed, exit 
     await reader5.close();
     expect(b5.status).toBe("success");
 
-    // the lifecycle notices the signal accepted during the write and rewrites
-    // the final status; the rewritten state must also complete
-    const finalState = JSON.parse(await drainFifo(stateFifo));
-    expect(finalState.status).toBe("failed");
-
     const outcome = await pending;
 
-    expect(outcome.exitCode).toBe(143);
-    expect(outcome.ok).toBe(false);
-    expect(outcome.status).toBe("failed");
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.ok).toBe(true);
+    expect(outcome.status).toBe("success");
     expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
     expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
+    // no rewrite: the outcome resolved immediately after the single final
+    // write; a rewrite attempt would block forever on the FIFO and the run
+    // could never have resolved with exit 0
   });
 });
 

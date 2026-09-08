@@ -265,9 +265,11 @@ export async function runWithChildSession(
     // the lifecycle `finally`, after the active hook settles — the fire-and-
     // forget cleanup path is intentionally gone. docker-helper 2.1.0 cancels
     // the container operation on the signal best-effort and does not confirm
-    // a terminal operation state. Acceptance closes once the authoritative
-    // final state write has completed (see the end of the `finally` below);
-    // a signal delivered after that point can no longer change the outcome.
+    // a terminal operation state. Acceptance closes synchronously after
+    // cleanup and before the single authoritative final state write (see the
+    // end of the `finally` below); a signal delivered after that cutoff —
+    // including while the final write is in flight — is late and can no
+    // longer change the recorded outcome or the exit code.
     signalBox.abort = new SignalAbort(signal);
   });
 
@@ -353,43 +355,32 @@ export async function runWithChildSession(
     failureBox.error = cause instanceof Error ? cause : new Error(String(cause));
   } finally {
     await cleanup();
-    // A recorded signal (arriving at any point after the last explicit abort
-    // check — e.g. during result/artifact verification or during cleanup)
-    // forbids a final success status. Cleanup failure keeps the higher
-    // priority; otherwise a signal-only run reports `failed`. No state machine
-    // is introduced for this.
+    // Signal cutoff. Cleanup has settled; snapshot the accepted causes and
+    // compute the final status synchronously, then close signal acceptance
+    // with no await between the cause snapshot and this line. A signal
+    // delivered from here on — including while the single authoritative
+    // final state write is in flight — is late and can no longer change the
+    // recorded outcome or the exit code. The terminal status is written
+    // exactly once and is never rewritten afterwards.
+    const finalFailure = failureBox.error;
+    const finalSignal = signalBox.abort;
     const finalStatus =
       cleanupBox.error !== null
         ? "cleanup_failed"
-        : failureBox.error === null && signalBox.abort === null
+        : finalFailure === null && finalSignal === null
           ? "success"
           : "failed";
+    acceptSignals = false;
     try {
       await sink.finalize({
         status: finalStatus,
-        failure: failureBox.error,
-        signal: signalBox.abort,
+        failure: finalFailure,
+        signal: finalSignal,
         sessionId: childSessionId,
       });
-      // A signal accepted while the final write was in flight invalidates a
-      // persisted success: rewrite the authoritative final status and wait for
-      // that write before the outcome is considered final.
-      if (finalStatus === "success" && signalBox.abort !== null) {
-        await sink.finalize({
-          status: "failed",
-          failure: failureBox.error,
-          signal: signalBox.abort,
-          sessionId: childSessionId,
-        });
-      }
-    } catch {
-      failureBox.error ??= new StatePersistError();
+    } catch (cause) {
+      failureBox.error ??= cause instanceof Error ? cause : new StatePersistError();
     }
-    // Linearization point: the authoritative final state write has completed
-    // and the last signalBox check above ran synchronously (no await in
-    // between). Close signal acceptance; a signal delivered from here on can
-    // no longer change the recorded outcome or the exit code.
-    acceptSignals = false;
   }
 
   const failure = failureBox.error;

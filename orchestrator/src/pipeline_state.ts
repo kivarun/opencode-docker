@@ -59,11 +59,6 @@ export const PIPELINE_RUN_FAILURE_REASONS = [
 ] as const;
 export type FailureReason = (typeof PIPELINE_RUN_FAILURE_REASONS)[number];
 
-export const SIGNAL_FAILURE_REASONS: readonly FailureReason[] = [
-  "signal_sigint",
-  "signal_sigterm",
-];
-
 export const SESSION_CLEANUP_FAILURE_REASON: FailureReason = "session_cleanup_failed";
 
 export const PIPELINE_RUN_EVENT_KINDS = [
@@ -415,7 +410,7 @@ const EVENT_SUCCESSORS: Record<PipelineRunEventKind, readonly PipelineRunEventKi
   attempt_started: ["transition_committed", "run_failed", "run_cleanup_failed"],
   transition_committed: ["transition_committed", "terminal_reached", "run_failed", "run_cleanup_failed"],
   terminal_reached: ["run_succeeded", "run_failed", "run_cleanup_failed"],
-  run_succeeded: ["run_failed"],
+  run_succeeded: [],
   run_failed: [],
   run_cleanup_failed: [],
 };
@@ -1004,14 +999,8 @@ export function reducePipelineRunCommand(
       if (!PIPELINE_RUN_FAILURE_REASONS.includes(command.reason)) {
         throw new PipelineStateError(`run_failed requires a normalized failure reason, got ${JSON.stringify(command.reason)}`);
       }
-      if (current.status === "success") {
-        // The only legal post-success mutation: a signal accepted while the
-        // authoritative success write was in flight rewrites it to failed.
-        if (!SIGNAL_FAILURE_REASONS.includes(command.reason)) {
-          fail(current, "a persisted success may only be rewritten to failed by a signal reason");
-        }
-      } else if (current.status !== "active") {
-        fail(current, `failure cannot overwrite status ${JSON.stringify(current.status)}`);
+      if (current.status !== "active") {
+        fail(current, `failure cannot overwrite status ${JSON.stringify(current.status)}; the terminal run status is immutable`);
       }
       if (current.phase === "finished" && current.status === "active") {
         fail(current, "an active run in the finished phase cannot fail");

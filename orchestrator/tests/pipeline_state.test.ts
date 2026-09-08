@@ -363,7 +363,7 @@ describe("pipeline run state reducer", () => {
     expect(reducePipelineRunCommand(terminal, { kind: "run_succeeded" }, tick(9)).status).toBe("success");
   });
 
-  test("success is only legal after a success terminal, and a late signal can rewrite it", () => {
+  test("the terminal run status is immutable: success is final and cannot be rewritten", () => {
     const succeeded = runCommands(happyPathCommands())!;
     expectCommandRejection(
       succeeded,
@@ -373,24 +373,32 @@ describe("pipeline run state reducer", () => {
     expectCommandRejection(
       succeeded,
       { kind: "run_failed", reason: "worker_failed" },
-      /only be rewritten to failed by a signal reason/,
+      /cannot overwrite status "success"/,
     );
-    const rewritten = reducePipelineRunCommand(succeeded, { kind: "run_failed", reason: "signal_sigterm" }, tick(9));
-    expect(rewritten.status).toBe("failed");
-    expect(rewritten.phase).toBe("finished");
-    expect(rewritten.failure).toEqual({ reason: "signal_sigterm" });
-    expect(rewritten.events.map((event) => event.kind)).toEqual([
-      "run_created",
-      "phase_entered",
-      "session_created",
-      "attempt_started",
-      "transition_committed",
-      "terminal_reached",
-      "run_succeeded",
-      "run_failed",
-    ]);
-    // and the rewrite is final
-    expectCommandRejection(rewritten, { kind: "run_failed", reason: "signal_sigterm" }, /cannot overwrite status/);
+    expectCommandRejection(
+      succeeded,
+      { kind: "run_failed", reason: "signal_sigterm" },
+      /cannot overwrite status "success"/,
+    );
+    expectCommandRejection(succeeded, { kind: "run_succeeded" }, /requires an active run/);
+    expectCommandRejection(
+      succeeded,
+      { kind: "run_cleanup_failed", reason: "session_cleanup_failed" },
+      /cannot overwrite status "success"/,
+    );
+    expectCommandRejection(
+      succeeded,
+      { kind: "enter_phase", phase: "finished" },
+      /phase changes require an active run/,
+    );
+    // a failed run status is equally immutable
+    const failed = runCommands([createRun(), { kind: "run_failed", reason: "worker_failed" }])!;
+    expectCommandRejection(
+      failed,
+      { kind: "run_failed", reason: "signal_sigterm" },
+      /cannot overwrite status "failed"/,
+    );
+    expectCommandRejection(failed, { kind: "run_succeeded" }, /requires an active run/);
     // a failed terminal can never become success
     const failedTerminal = runCommands([
       createRun(),
@@ -589,6 +597,13 @@ describe("exact-field loader validation", () => {
     doubleEnd.events.push({ sequence: 8, kind: "run_succeeded", at: doubleEnd.updated_at });
     doubleEnd.revision = 8;
     expect(() => validatePipelineRunState(doubleEnd)).toThrow(/may not follow/);
+    // the removed run_succeeded -> run_failed successor stays illegal on load
+    const rewriteJournal = JSON.parse(JSON.stringify(valid()));
+    rewriteJournal.events.push({ sequence: 8, kind: "run_failed", at: rewriteJournal.updated_at });
+    rewriteJournal.revision = 8;
+    rewriteJournal.status = "failed";
+    rewriteJournal.failure = { reason: "signal_sigterm" };
+    expect(() => validatePipelineRunState(rewriteJournal)).toThrow(/may not follow/);
   });
 
   test("status, phase, terminal, attempt, and failure coherence is enforced", () => {

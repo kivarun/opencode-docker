@@ -134,6 +134,7 @@ interface FakeAgentOptions {
   createCode?: number;
   blockRun?: boolean;
   blockPull?: boolean;
+  blockDelete?: boolean;
   runTimeoutExpires?: boolean;
 }
 
@@ -162,6 +163,7 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
   const events: string[] = [];
   let activeRun: { release: (code: number) => void } | null = null;
   let activePull: { release: () => void } | null = null;
+  let activeDelete: { release: () => void } | null = null;
   let notifyDeleteStart: (() => void) | null = null;
   const deleteStarted = new Promise<void>((resolve) => {
     notifyDeleteStart = resolve;
@@ -270,6 +272,11 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
     if (args[0] === "session" && args[1] === "delete") {
       events.push("session:delete");
       notifyDeleteStart?.();
+      if (options.blockDelete === true) {
+        await new Promise<void>((resolve) => {
+          activeDelete = { release: resolve };
+        });
+      }
       if ((options.deleteCode ?? 0) !== 0) {
         return { code: options.deleteCode ?? 1, stdout: "", stderr: "delete boom" };
       }
@@ -288,6 +295,11 @@ function fakeCli(options: FakeAgentOptions & { workspace: string }) {
     runner,
     deleteStarted,
     pullStarted,
+    releaseDelete: () => {
+      const del = activeDelete;
+      activeDelete = null;
+      del?.release();
+    },
     releasePull: () => {
       const pull = activePull;
       activePull = null;
@@ -1212,8 +1224,8 @@ test("21d. cutoff: signal after the final write completed does not change the re
     expect(outcome.status).toBe("success");
     expect(deleteCallCount(calls)).toBe(1);
 
-    // the outcome resolved only after the lifecycle closed signal acceptance in
-    // the same synchronous tail as the final write, so this late signal is a
+    // the outcome resolved only after the lifecycle closed signal acceptance
+    // synchronously before the single final write, so this late signal is a
     // no-op by the linearization contract
     signalHandler!("SIGTERM");
     expect(outcome.exitCode).toBe(0);
@@ -1229,7 +1241,7 @@ test("21d. cutoff: signal after the final write completed does not change the re
   });
 });
 
-test("21e. signal during the final success write: success is rewritten to failed, exit 130", async () => {
+test("21e. signal while the blocked terminal write is in flight is late: persisted success, exit 0", async () => {
   await withFixture(async (dirs) => {
     const gate = gateIoAtRename(7);
     let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
@@ -1244,24 +1256,26 @@ test("21e. signal during the final success write: success is rewritten to failed
       }),
     );
 
+    // the single terminal write is blocked at its rename; the signal cutoff
+    // already happened before the write started, so the signal recorded while
+    // the write is in flight is late and changes nothing
     await gate.reached;
     signalHandler!("SIGINT");
     gate.release();
     const outcome = await pending;
 
-    expect(outcome.exitCode).toBe(130);
-    expect(outcome.ok).toBe(false);
-    expect(outcome.status).toBe("failed");
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.ok).toBe(true);
+    expect(outcome.status).toBe("success");
     expect(deleteCallCount(calls)).toBe(1);
 
     const state = JSON.parse(
       (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
     );
-    expect(state.revision).toBe(8);
-    expect(state.status).toBe("failed");
+    expect(state.revision).toBe(7);
+    expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
-    expect(state.failure).toEqual({ reason: "signal_sigint" });
-    // the success event is still in the journal; the run_failed event follows it
+    expect(state.failure).toBeUndefined();
     expect(state.events.map((event: { kind: string }) => event.kind)).toEqual([
       "run_created",
       "phase_entered",
@@ -1270,7 +1284,6 @@ test("21e. signal during the final success write: success is rewritten to failed
       "transition_committed",
       "terminal_reached",
       "run_succeeded",
-      "run_failed",
     ]);
   });
 });
@@ -1315,6 +1328,106 @@ test("21g. two runs against the same bundle record the same execution snapshot d
     expect(firstState.pipeline.bundle_root).toBe(dirs.pipelineRoot);
     expect(secondState.pipeline.bundle_root).toBe(dirs.pipelineRoot);
     expect(firstState.protected_input.sha256).toBe(secondState.protected_input.sha256);
+  });
+});
+
+test("21h. transition durability failure: exit 1, one cleanup, candidate stays on disk, no further callback", async () => {
+  await withFixture(async (dirs) => {
+    const io = faultIo({ failCommit: 5, failStep: "dirsync" });
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: io }));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("durability could not be confirmed");
+    // the worker ran exactly once and the Session was cleaned up exactly once
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+    expect(deleteCallCount(calls)).toBe(1);
+
+    // the candidate revision is visible on disk; the run is not reported ok
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state.revision).toBe(5);
+    expect(state.status).toBe("active");
+    expect(state.cursor).toEqual({ current_state: "completed", transition_count: 1 });
+    expect(state.transitions).toHaveLength(1);
+    expect(state.terminal).toBeUndefined();
+
+    // the previous snapshot is not claimed to have survived, the rename is
+    // not rolled back, and no further agent callback runs (one run call only)
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+  });
+});
+
+test("21i. terminal durability failure: exit 1, not reported as a confirmed success", async () => {
+  await withFixture(async (dirs) => {
+    const io = faultIo({ failCommit: 7, failStep: "dirsync" });
+    const { calls, runner } = fakeCli({ workspace: dirs.workspace });
+    const outcome = await runAgentSmoke(agentSmokeOptions(dirs), makeDeps(dirs, runner, { pipelineStateIo: io }));
+
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("durability could not be confirmed");
+    expect(deleteCallCount(calls)).toBe(1);
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+
+    // the candidate success snapshot is visible on disk, but the process
+    // verdict is a failure: the durability of that revision is unknown
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state.revision).toBe(7);
+    expect(state.status).toBe("success");
+    expect(state.phase).toBe("finished");
+    expect(state.events[state.events.length - 1].kind).toBe("run_succeeded");
+  });
+});
+
+test("21j. signal during cleanup, directly before the cutoff: persisted failed, exit 130", async () => {
+  await withFixture(async (dirs) => {
+    let signalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+    const { calls, runner, releaseDelete, deleteStarted } = fakeCli({
+      workspace: dirs.workspace,
+      blockDelete: true,
+    });
+    const pending = runAgentSmoke(
+      agentSmokeOptions(dirs),
+      makeDeps(dirs, runner, {
+        onSignal: (handler) => {
+          signalHandler = handler;
+        },
+      }),
+    );
+
+    // the run succeeded and cleanup is blocked; the signal is recorded while
+    // cleanup is in flight, directly before the cutoff
+    await deleteStarted;
+    signalHandler!("SIGINT");
+    releaseDelete();
+    const outcome = await pending;
+
+    expect(outcome.exitCode).toBe(130);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe("failed");
+    expect(deleteCallCount(calls)).toBe(1);
+    expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
+
+    const state = JSON.parse(
+      (await readFile(pipelineRunStatePath(dirs.state, outcome.runId))).toString("utf8"),
+    );
+    expect(state.revision).toBe(7);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toEqual({ reason: "signal_sigint" });
+    expect(state.events.map((event: { kind: string }) => event.kind)).toEqual([
+      "run_created",
+      "phase_entered",
+      "session_created",
+      "attempt_started",
+      "transition_committed",
+      "terminal_reached",
+      "run_failed",
+    ]);
   });
 });
 
