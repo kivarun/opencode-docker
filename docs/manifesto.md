@@ -53,6 +53,10 @@ an arbitrary next state.
 The orchestrator maps a validated outcome through the declarative transition
 table and persists the transition atomically.
 
+It also detects violations of the pipeline contract and controls admission to
+recovery. A worker cannot decide that an invalid state is safe enough to
+continue.
+
 Human-readable state files may be generated as views or agent inputs, but they
 are not the authoritative state store.
 
@@ -85,6 +89,38 @@ cannot reinterpret an execution already in progress.
 This flexibility stops at executable extensions. Arbitrary scripts,
 callbacks, or host-language expressions do not become orchestration authority;
 missing, invalid, contradictory, or ambiguous decisions fail closed.
+
+## Pipeline faults become explicit recovery paths
+
+A failed task step and a broken pipeline execution are different conditions.
+An invalid or incoherent state, an impossible transition, a missing control
+artifact, or evidence of partial execution is a pipeline fault. An exhausted
+iteration or retry bound is a separate control condition. Neither may be
+disguised as an agent outcome.
+
+The orchestrator validates the pipeline state before admitting work and before
+committing every transition. When an invariant fails, normal execution stops.
+The last authoritative durable snapshot and the available evidence are
+preserved; the orchestrator does not silently repair state, guess the intended
+transition, or continue from a partially understood position.
+
+Recovery is an explicit, pipeline-defined path rather than an implicit retry.
+A recovery policy may permit a bounded retry, rework of the current stage,
+revision of the stage contract or future plan, return to a declared earlier
+stage, a blocked wait for user input, or terminal failure. Returning to an
+earlier stage changes control flow; it does not pretend that workspace effects
+have automatically been reversed.
+
+In the default pipeline, an architect may classify the problem and report
+structured recovery facts. The declared decision model applies its hard
+constraints and priority rules, and the orchestrator alone commits the chosen
+state effects. The architect cannot rewrite durable state or bypass the
+recovery policy.
+
+Recovery remains part of the pipeline contract, not a workflow hard-coded into
+the engine. Another pipeline may declare different recovery roles and paths,
+or no automated recovery at all. If no declared action safely matches the
+observed condition, the run remains blocked for the user.
 
 ## Declarative pipelines, not embedded programs
 
