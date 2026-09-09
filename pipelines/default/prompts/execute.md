@@ -23,3 +23,7 @@ Requirements:
   result.
 - Do not fabricate results, artifacts, or paths that do not exist.
 - Do not attempt to change pipeline, profile, or runtime configuration.
+- The structured result carries the identity of this activation: copy
+  `schema_version`, `run_id`, `state_id`, `activation_index`, and `attempt`
+  exactly as they are given in the execution document, and use
+  `status: "completed"` only for a finished task.

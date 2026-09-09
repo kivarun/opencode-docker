@@ -1,0 +1,332 @@
+{
+  "format_version": 1,
+  "resolutions": [
+    {
+      "id": "P01",
+      "status": "accepted",
+      "scope": "default_pipeline_policy",
+      "title": "Escalate unresolved work at the stage iteration limit to the user",
+      "origin": "User policy decision, 2026-09-09",
+      "addresses": {
+        "specification_note": "G01",
+        "legacy_scenarios": [
+          "D14",
+          "D15"
+        ]
+      },
+      "rationale": [
+        "The same observable condition can be caused by an undersized limit, an ineffective coder model, hallucinating reviewer models, or a combination of these causes.",
+        "The deterministic decision model cannot identify the cause from iteration exhaustion alone.",
+        "A user must inspect the evidence and explicitly change the future execution policy."
+      ],
+      "trigger": {
+        "legacy_decision": null,
+        "iteration_limit_reached": true,
+        "can_close_normally": false,
+        "has_major_issue": true,
+        "requires_task_change": false,
+        "needs_pipeline_plan_change": false
+      },
+      "result": {
+        "state_kind": "wait",
+        "reason": "stage_iteration_limit_exhausted",
+        "authority": "user",
+        "normal_agent_activation_allowed": false
+      },
+      "user_view": [
+        "current stage id, index, iteration count, and configured limit",
+        "unmet acceptance criteria and accepted outstanding review/security findings",
+        "role, execution-profile, and model-profile references used by each stage iteration",
+        "validated artifacts and transition history relevant to the stage",
+        "normalized failures and cleanup results"
+      ],
+      "secret_exclusions": [
+        "provider tokens and credential values",
+        "Launcher or child Session credentials",
+        "raw environment values",
+        "unbounded raw worker output"
+      ],
+      "accepted_user_intents": [
+        {
+          "type": "continue_stage",
+          "requirements": [
+            "additional_iterations is a positive bounded integer",
+            "the protected TASK revision and digest are unchanged",
+            "optional model-profile replacements satisfy the trusted-profile requirements below",
+            "the grant applies to the current stage and future activations only",
+            "past iteration, activation, and transition history remains immutable",
+            "attempt and activation identities are never reused",
+            "the next agent state is coder"
+          ],
+          "note": "A user-visible budget reset is represented as a new grant or budget epoch, not by rewriting the old iteration counter."
+        },
+        {
+          "type": "revise_task",
+          "requirements": [
+            "the user explicitly declares the change and supplies the expected previous TASK digest",
+            "the current protected TASK file has a different valid digest",
+            "the old TASK revision, run history, and all activation identities remain immutable",
+            "optional model-profile replacements satisfy the trusted-profile requirements below",
+            "the next agent state is architect",
+            "PLAN and STAGE remain unchanged until an accepted architect result updates them",
+            "after the architect produces and the orchestrator accepts the revised PLAN and STAGE, the execution cycle starts at coder",
+            "the revised plan/stage generation receives a fresh stage budget from the pipeline policy"
+          ]
+        }
+      ],
+      "model_profile_replacement_requirements": [
+        "model-profile replacement is an optional part of continue_stage or revise_task and cannot release the wait by itself",
+        "at least one role binding changes",
+        "each value is a reference to an existing trusted model profile",
+        "the referenced profiles remain within operator and Launcher capability ceilings",
+        "the change applies only to future activations",
+        "endpoint, model, and credential values are resolved from the trusted profile and are not embedded in the response"
+      ],
+      "resume_invariants": [
+        "the wait record and user response are durably recorded before execution resumes",
+        "continue_stage requires a positive budget grant and an unchanged TASK digest",
+        "revise_task requires an explicit TASK revision and routes through architect",
+        "the orchestrator validates the TASK transition, new budget, and all profile references before creating a Session",
+        "the resumed execution snapshot records the accepted TASK revision, budget, and profile bindings",
+        "no agent or prompt may apply this user-authority transition"
+      ],
+      "resume_routes": {
+        "continue_stage": [
+          "coder"
+        ],
+        "revise_task": [
+          "architect",
+          "coder_after_accepted_plan_and_stage_update"
+        ]
+      },
+      "legacy_equivalence": "continue_stage is the controlled replacement for the user's old STATE.md edit; revise_task is the controlled replacement for an explicit TASK.md edit followed by architect-owned PLAN/STAGE changes. Durable orchestrator state is never edited by the user."
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "P01-S01",
+      "title": "A one-iteration limit with unfinished work waits for the user",
+      "given": {
+        "stage_iteration": 1,
+        "max_stage_iterations": 1,
+        "acceptance_criteria_satisfied": false,
+        "has_major_issue": true,
+        "requires_task_change": false,
+        "needs_pipeline_plan_change": false,
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "reason": "stage_iteration_limit_exhausted",
+        "authority": "user",
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S02",
+      "title": "An ineffective coder after all allowed iterations waits for the user",
+      "given": {
+        "limit_exhausted": true,
+        "cause_hypothesis": "coder_model_quality",
+        "blocking_review_findings_remain": true,
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "cause_recorded_as_fact": false,
+        "evidence_exposed": true,
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S03",
+      "title": "Possibly hallucinated reviewer findings still require user judgment",
+      "given": {
+        "limit_exhausted": true,
+        "cause_hypothesis": "reviewer_model_quality",
+        "architect_reports_major_issue": true,
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "cause_recorded_as_fact": false,
+        "review_findings_exposed": true,
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S04",
+      "title": "Mixed coder and reviewer quality cannot be classified deterministically",
+      "given": {
+        "limit_exhausted": true,
+        "cause_hypothesis": "multiple_models_or_limit",
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "selected_cause": null,
+        "authority": "user"
+      }
+    },
+    {
+      "id": "P01-S05",
+      "title": "Granting more iterations preserves all previous history",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "continue_stage",
+          "additional_iterations": 2
+        },
+        "task_digest_changed": false
+      },
+      "expected": {
+        "response_accepted": true,
+        "additional_future_iterations": 2,
+        "previous_iteration_records_unchanged": true,
+        "identities_reused": false,
+        "next_agent_state": "coder"
+      }
+    },
+    {
+      "id": "P01-S06",
+      "title": "Changing model profiles affects future activations only",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "continue_stage",
+          "additional_iterations": 2,
+          "model_profile_bindings": {
+            "coder": "coder_stronger",
+            "reviewer": "reviewer_alternative"
+          }
+        },
+        "task_digest_changed": false,
+        "profiles_exist_and_are_allowed": true
+      },
+      "expected": {
+        "response_accepted": true,
+        "past_activation_profiles_unchanged": true,
+        "future_bindings_updated": true,
+        "credential_values_in_response": false,
+        "next_agent_state": "coder"
+      }
+    },
+    {
+      "id": "P01-S07",
+      "title": "Changing only model profiles cannot release an exhausted budget",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "continue_stage",
+          "model_profile_bindings": {
+            "coder": "coder_stronger"
+          }
+        }
+      },
+      "expected": {
+        "response_accepted": false,
+        "state_kind": "wait",
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S08",
+      "title": "Raw provider settings and tokens are not accepted as wait-response data",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "continue_stage",
+          "additional_iterations": 2,
+          "model_profile_bindings": {
+            "coder": {
+              "endpoint": "https://provider.example/v1",
+              "model": "model-name",
+              "token": "secret-value"
+            }
+          }
+        }
+      },
+      "expected": {
+        "response_accepted": false,
+        "state_kind": "wait",
+        "credential_values_persisted": false,
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S09",
+      "title": "An explicit TASK revision routes through architect before coder",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "recorded_task_sha256": "old-task-digest",
+        "current_task_sha256": "new-task-digest",
+        "user_intent": {
+          "type": "revise_task",
+          "expected_previous_task_sha256": "old-task-digest"
+        }
+      },
+      "expected": {
+        "response_accepted": true,
+        "task_revision_incremented": true,
+        "old_task_revision_unchanged": true,
+        "next_agent_state": "architect",
+        "plan_and_stage_changed_by_user": false
+      }
+    },
+    {
+      "id": "P01-S10",
+      "title": "Accepted architect changes after a TASK revision start the coder cycle",
+      "given": {
+        "user_intent": "revise_task",
+        "current_agent_state": "architect",
+        "architect_result": {
+          "plan_update_valid": true,
+          "stage_update_valid": true
+        }
+      },
+      "expected": {
+        "plan_and_stage_owner": "architect",
+        "updates_applied_by": "orchestrator",
+        "fresh_stage_budget_from_pipeline_policy": true,
+        "next_agent_state": "coder"
+      }
+    },
+    {
+      "id": "P01-S11",
+      "title": "A changed TASK cannot use the state-only continuation route",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "recorded_task_sha256": "old-task-digest",
+        "current_task_sha256": "new-task-digest",
+        "user_intent": {
+          "type": "continue_stage",
+          "additional_iterations": 2
+        }
+      },
+      "expected": {
+        "response_accepted": false,
+        "required_intent": "revise_task",
+        "state_kind": "wait",
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S12",
+      "title": "Declaring a TASK revision without changing TASK cannot release the wait",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "recorded_task_sha256": "same-task-digest",
+        "current_task_sha256": "same-task-digest",
+        "user_intent": {
+          "type": "revise_task",
+          "expected_previous_task_sha256": "same-task-digest"
+        }
+      },
+      "expected": {
+        "response_accepted": false,
+        "state_kind": "wait",
+        "new_agent_session_created": false
+      }
+    }
+  ]
+}

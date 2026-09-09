@@ -1,0 +1,564 @@
+{
+  "format_version": 1,
+  "status": "extracted_not_a_runtime_schema",
+  "input_fields": [
+    {
+      "name": "requires_task_change",
+      "origin": "semantic",
+      "meaning": "Resolving the issue requires a TASK.md change.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            693,
+            695
+          ]
+        }
+      ]
+    },
+    {
+      "name": "iteration_limit_reached",
+      "origin": "derived",
+      "meaning": "STAGE_ITERATION >= MAX_STAGE_ITERATIONS; equality and above are both true.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            699,
+            701
+          ]
+        }
+      ]
+    },
+    {
+      "name": "issues_exist",
+      "origin": "derived_from_classified_findings",
+      "meaning": "At least one accepted issue exists.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            705,
+            707
+          ]
+        }
+      ]
+    },
+    {
+      "name": "has_major_issue",
+      "origin": "derived_from_classified_findings",
+      "meaning": "At least one accepted non-minor issue exists.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            711,
+            713
+          ]
+        }
+      ]
+    },
+    {
+      "name": "has_only_minor_issues",
+      "origin": "derived",
+      "meaning": "has_only_minor_issues == (issues_exist and not has_major_issue)",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            717,
+            721
+          ]
+        }
+      ]
+    },
+    {
+      "name": "needs_stage_contract_change",
+      "origin": "semantic",
+      "meaning": "The issue can be resolved by changing STAGE.md without changing pipeline structure or execution path.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            725,
+            728
+          ]
+        }
+      ]
+    },
+    {
+      "name": "needs_pipeline_plan_change",
+      "origin": "semantic",
+      "meaning": "The current execution path cannot resolve the issue; change PLAN.md and/or stage sequence, including possible rollback.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            732,
+            739
+          ]
+        }
+      ]
+    },
+    {
+      "name": "stage_cannot_continue_without_external_input",
+      "origin": "semantic",
+      "meaning": "External input is required to continue or complete; excludes a TASK.md change.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            743,
+            746
+          ]
+        }
+      ]
+    },
+    {
+      "name": "no_blocking_issues",
+      "origin": "derived",
+      "meaning": "no_blocking_issues == (not has_major_issue and not stage_cannot_continue_without_external_input and not requires_task_change)",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            750,
+            755
+          ]
+        }
+      ]
+    },
+    {
+      "name": "can_close_normally",
+      "origin": "derived",
+      "meaning": "can_close_normally == (acceptance_criteria_satisfied and not issues_exist)",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            759,
+            763
+          ]
+        }
+      ]
+    },
+    {
+      "name": "acceptance_criteria_satisfied",
+      "origin": "semantic_fact",
+      "meaning": "An explicit oracle fact needed to check the definitions; this is not an additional legacy decision flag.",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            759,
+            773
+          ]
+        }
+      ]
+    }
+  ],
+  "decision_preconditions": {
+    "NEXT_AGENT": "architect",
+    "CODER_STATUS": "done",
+    "REVIEWER_STATUS": "done",
+    "SEC_REVIEWER_STATUS": "done",
+    "STAGE_STATUS": "in_progress"
+  },
+  "decision_required_files": [
+    "TASK.md",
+    "PLAN.md",
+    "STAGE.md",
+    "STATE.md",
+    "REVIEW.md",
+    "SECURITY_REVIEW.md"
+  ],
+  "precondition_sources": [
+    {
+      "source": "architect",
+      "lines": [
+        488,
+        518
+      ]
+    }
+  ],
+  "consistency_relations": [
+    {
+      "id": "FC1",
+      "meaning": "has_only_minor_issues == (issues_exist and not has_major_issue)",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            705,
+            721
+          ]
+        }
+      ]
+    },
+    {
+      "id": "FC2",
+      "meaning": "no_blocking_issues == (not has_major_issue and not stage_cannot_continue_without_external_input and not requires_task_change)",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            750,
+            755
+          ]
+        }
+      ]
+    },
+    {
+      "id": "FC3",
+      "meaning": "can_close_normally == (acceptance_criteria_satisfied and not issues_exist)",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            759,
+            763
+          ]
+        }
+      ]
+    },
+    {
+      "id": "FC4",
+      "meaning": "has_major_issue implies issues_exist",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            705,
+            713
+          ]
+        }
+      ],
+      "basis": "definition: a non-minor issue is an issue"
+    },
+    {
+      "id": "FC5",
+      "meaning": "not acceptance_criteria_satisfied implies has_major_issue",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            767,
+            773
+          ]
+        }
+      ]
+    },
+    {
+      "id": "FC6",
+      "meaning": "stage_cannot_continue_without_external_input implies not requires_task_change",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            743,
+            746
+          ]
+        }
+      ]
+    }
+  ],
+  "hard_constraints": [
+    {
+      "id": "HC1",
+      "when": {
+        "requires_task_change": true
+      },
+      "only": [
+        "architectural_proposal"
+      ],
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            784,
+            795
+          ]
+        }
+      ]
+    },
+    {
+      "id": "HC2",
+      "when": {
+        "iteration_limit_reached": true
+      },
+      "forbid": [
+        "rework_same_stage",
+        "rework_change_stage_contract"
+      ],
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            799,
+            819
+          ]
+        }
+      ]
+    },
+    {
+      "id": "HC3",
+      "when": {
+        "has_major_issue": true
+      },
+      "forbid": [
+        "close_stage_ignore_minor"
+      ],
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            823,
+            833
+          ]
+        }
+      ]
+    },
+    {
+      "id": "HC4",
+      "when": {
+        "stage_cannot_continue_without_external_input": true,
+        "requires_task_change": false,
+        "needs_pipeline_plan_change": false,
+        "needs_stage_contract_change": false
+      },
+      "only": [
+        "architectural_warning"
+      ],
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            837,
+            849
+          ]
+        }
+      ]
+    },
+    {
+      "id": "HC5",
+      "when": {
+        "requires_task_change": false,
+        "needs_pipeline_plan_change": true
+      },
+      "forbid": [
+        "rework_same_stage",
+        "rework_change_stage_contract"
+      ],
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            853,
+            865
+          ]
+        }
+      ]
+    }
+  ],
+  "rules_in_priority_order": [
+    {
+      "id": "F",
+      "decision": "close_stage",
+      "when": {
+        "can_close_normally": true
+      },
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            970,
+            978
+          ]
+        }
+      ]
+    },
+    {
+      "id": "E",
+      "decision": "close_stage_ignore_minor",
+      "when": {
+        "iteration_limit_reached": true,
+        "requires_task_change": false,
+        "has_only_minor_issues": true,
+        "can_close_normally": false
+      },
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            955,
+            966
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "decision": "rework_same_stage",
+      "when": {
+        "requires_task_change": false,
+        "stage_cannot_continue_without_external_input": false,
+        "can_close_normally": false,
+        "needs_pipeline_plan_change": false,
+        "needs_stage_contract_change": false,
+        "iteration_limit_reached": false
+      },
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            907,
+            920
+          ]
+        }
+      ]
+    },
+    {
+      "id": "C",
+      "decision": "rework_change_stage_contract",
+      "when": {
+        "requires_task_change": false,
+        "stage_cannot_continue_without_external_input": false,
+        "has_major_issue": true,
+        "needs_pipeline_plan_change": false,
+        "needs_stage_contract_change": true,
+        "iteration_limit_reached": false
+      },
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            924,
+            937
+          ]
+        }
+      ]
+    },
+    {
+      "id": "D",
+      "decision": "rework_change_pipeline_plan",
+      "when": {
+        "requires_task_change": false,
+        "has_major_issue": true,
+        "needs_pipeline_plan_change": true
+      },
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            941,
+            951
+          ]
+        }
+      ]
+    },
+    {
+      "id": "A",
+      "decision": "architectural_proposal",
+      "when": {
+        "requires_task_change": true
+      },
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            895,
+            903
+          ]
+        }
+      ]
+    },
+    {
+      "id": "HC4",
+      "decision": "architectural_warning",
+      "when": {
+        "stage_cannot_continue_without_external_input": true,
+        "requires_task_change": false,
+        "needs_pipeline_plan_change": false,
+        "needs_stage_contract_change": false
+      },
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            837,
+            849
+          ]
+        }
+      ],
+      "note": "The only explicit positive warning condition is Constraint 4. No general fallback is inferred."
+    }
+  ],
+  "priority_source": [
+    {
+      "source": "architect",
+      "lines": [
+        869,
+        887
+      ]
+    }
+  ],
+  "evaluation": "Validate facts; intersect the sets allowed by all active hard constraints; select the first matching rule whose decision is allowed.",
+  "unmatched": {
+    "extraction_status": "uncovered",
+    "selected_decision": null,
+    "gap": "G01",
+    "automatic_warning": false
+  },
+  "unused_in_selection": [
+    "no_blocking_issues"
+  ],
+  "stage_status_effects": {
+    "close_stage": "completed",
+    "close_stage_ignore_minor": "completed",
+    "architectural_proposal": "blocked",
+    "architectural_warning": "blocked"
+  },
+  "rework_status_effect": "not completed; no exact status assignment is stated for the decision step",
+  "effect_sources": [
+    {
+      "source": "architect",
+      "lines": [
+        613,
+        665
+      ]
+    },
+    {
+      "source": "architect",
+      "lines": [
+        558,
+        578
+      ]
+    }
+  ],
+  "decision_only_state_writes": [
+    "ARCHITECT_DECISION",
+    "STAGE_STATUS"
+  ],
+  "decision_scope_sources": [
+    {
+      "source": "architect",
+      "lines": [
+        558,
+        578
+      ]
+    },
+    {
+      "source": "architect",
+      "lines": [
+        982,
+        1012
+      ]
+    }
+  ],
+  "notes": [
+    "RECOVERY_MODE updates for a blocked decision conflict with the two-field decision write limit; G03 keeps that open.",
+    "Semantic classifications are supplied by fixtures, never guessed by this oracle. Missing classification criteria remain G10.",
+    "The six consistency relations are necessary source constraints, not proof that every admitted flag vector can occur in a real task.",
+    "No implicit constraints such as needs_pipeline_plan_change implies has_major_issue, or no_blocking_issues as a closing guard, are added."
+  ]
+}

@@ -6,6 +6,7 @@ import {
   type AgentStateView,
   type ReadonlyJsonValue,
   type GraphExecutionResult,
+  type TransitionCommitHook,
   type TransitionStep,
 } from "../src/pipeline_engine.ts";
 import type {
@@ -79,8 +80,9 @@ function scriptExecutor(
 async function run(
   pipeline: ResolvedPipeline,
   executor: AgentOutcomeExecutor,
+  onTransitionCommit?: TransitionCommitHook,
 ): Promise<GraphExecutionResult> {
-  return await executePipelineGraph(pipeline, executor);
+  return await executePipelineGraph(pipeline, executor, onTransitionCommit ? { onTransitionCommit } : {});
 }
 
 test("one agent -> success terminal", async () => {
@@ -597,6 +599,212 @@ describe("deeply isolated result schema in the callback view", () => {
       });
       expect(result.terminalResult).toBe("success");
     }
+  });
+
+  test("hostile JSON keys (__proto__, constructor, prototype) survive as own enumerable properties", async () => {
+    // The exact shape a JSON.parse'd schema file produces: every key is a
+    // plain own data property, including "__proto__". The source is built
+    // from a raw JSON string on purpose — an object literal with a
+    // "__proto__:" key would trigger the prototype setter and never create
+    // the own property (that is precisely the bug class being guarded).
+    const sourceSchema: Record<string, unknown> = JSON.parse(`{
+      "type": "object",
+      "__proto__": { "hijacked": true },
+      "constructor": { "const": "safe" },
+      "prototype": { "const": "safe" },
+      "properties": { "status": { "type": "string" } }
+    }`);
+    // sanity: JSON.parse really produced them as own keys
+    expect(Object.keys(sourceSchema).sort()).toEqual(
+      ["__proto__", "constructor", "properties", "prototype", "type"],
+    );
+    expect((sourceSchema as { properties: { status: unknown } }).properties.status).toEqual({ type: "string" });
+
+    const pipeline = syntheticPipeline("a", 1, [
+      agentState("a", [{ outcome: "completed", to: "done" }], {
+        resultSchema: sourceSchema,
+      }),
+      terminalState("done", "success"),
+    ]);
+    const result = await run(pipeline, (state) => {
+      const schema = state.resultSchema as Record<string, unknown>;
+      // every JSON key is an own enumerable property of the frozen view
+      expect(Object.keys(schema).sort()).toEqual(
+        ["__proto__", "constructor", "properties", "prototype", "type"],
+      );
+      expect(Object.getOwnPropertyDescriptor(schema, "__proto__")).toEqual({
+        value: { hijacked: true },
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
+      expect(schema.constructor).toEqual({ const: "safe" } as unknown as Function);
+      expect(schema.prototype).toEqual({ const: "safe" });
+      expect(schema.__proto__).toEqual({ hijacked: true });
+      // the view copy must not inherit from Object.prototype at all
+      expect(Object.getPrototypeOf(schema)).toBe(null);
+      expect(Object.getPrototypeOf(schema.properties as object)).toBe(null);
+      // deep freeze
+      expect(Object.isFrozen(schema)).toBe(true);
+      expect(Object.isFrozen(schema.properties as object)).toBe(true);
+      // source isolation: the source is unchanged and untriggered
+      expect((sourceSchema as { properties: { status: unknown } }).properties.status).toEqual({ type: "string" });
+      expect(() => {
+        (schema as { type: string }).type = "hijacked";
+      }).toThrow(TypeError);
+      // the prototype machinery itself is untouched
+      expect(({} as { constructor: unknown }).constructor).toBe(Object);
+      expect(({} as { hasOwnProperty: unknown }).hasOwnProperty).toBe(
+        Object.prototype.hasOwnProperty,
+      );
+      const probe: Record<string, unknown> = {};
+      expect(Object.getPrototypeOf(probe)).toBe(Object.prototype);
+      expect(Object.keys(probe)).toEqual([]);
+      return "completed";
+    });
+    expect(result.terminalResult).toBe("success");
+    // the source schema keeps its own keys, and Object.prototype is clean
+    expect(Object.keys(sourceSchema).sort()).toEqual(
+      ["__proto__", "constructor", "properties", "prototype", "type"],
+    );
+    expect(Object.keys(Object.prototype).length).toBe(0);
+    expect(Object.getOwnPropertyNames(Object.prototype)).toEqual(
+      Object.getOwnPropertyNames(Object.prototype).filter((name) => name !== "hijacked"),
+    );
+  });
+});
+
+describe("trusted transition-commit hook", () => {
+  const twoStepPipeline = () =>
+    syntheticPipeline("first", 2, [
+      agentState("first", [{ outcome: "ok", to: "second" }]),
+      agentState("second", [{ outcome: "done", to: "end" }]),
+      terminalState("end", "success"),
+    ]);
+
+  test("the hook receives the exact engine-produced immutable transition", async () => {
+    const steps: TransitionStep[] = [];
+    const result = await run(
+      syntheticPipeline("a", 1, [
+        agentState("a", [{ outcome: "completed", to: "declared" }]),
+        terminalState("declared", "success"),
+      ]),
+      scriptExecutor({ a: "completed" }),
+      (step) => {
+        expect(Object.isFrozen(step)).toBe(true);
+        steps.push(step);
+      },
+    );
+    expect(steps).toEqual([
+      { from: "a", outcome: "completed", to: "declared", transition_index: 0 },
+    ]);
+    expect(result.trace).toEqual(steps);
+    expect(result.terminalStateId).toBe("declared");
+  });
+
+  test("the second agent callback does not start before the hook completes", async () => {
+    let releaseHook: (() => void) | null = null;
+    const hookGate = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
+    const events: string[] = [];
+    const pending = executePipelineGraph(
+      twoStepPipeline(),
+      (state) => {
+        events.push(`callback:${state.id}`);
+        return state.id === "first" ? "ok" : "done";
+      },
+      {
+        onTransitionCommit: async (step) => {
+          events.push(`hook:${step.from}->${step.to}`);
+          await hookGate;
+          events.push(`hook-done:${step.from}->${step.to}`);
+        },
+      },
+    );
+    // let the microtasks settle: the first callback ran, the hook is pending
+    await Bun.sleep(5);
+    expect(events).toEqual(["callback:first", "hook:first->second"]);
+    releaseHook!();
+    const result = await pending;
+    expect(events).toEqual([
+      "callback:first",
+      "hook:first->second",
+      "hook-done:first->second",
+      "callback:second",
+      "hook:second->end",
+      "hook-done:second->end",
+    ]);
+    expect(result.transitionCount).toBe(2);
+  });
+
+  test("a rejecting hook stops the graph and propagates unchanged", async () => {
+    const hookFailure = new Error("durable transition commit failed");
+    let callbackRuns = 0;
+    const promise = executePipelineGraph(
+      twoStepPipeline(),
+      (state) => {
+        callbackRuns += 1;
+        return state.id === "first" ? "ok" : "done";
+      },
+      {
+        onTransitionCommit: (step) => {
+          if (step.from === "first") {
+            return Promise.reject(hookFailure);
+          }
+          throw new Error("the second callback must never run");
+        },
+      },
+    );
+    const error: unknown = await promise.catch((cause) => cause);
+    expect(error).toBe(hookFailure);
+    expect(callbackRuns).toBe(1);
+  });
+
+  test("a throwing hook stops the graph; the transition is not recorded", async () => {
+    const hookFailure = new Error("store exploded");
+    let callbackRuns = 0;
+    const promise = executePipelineGraph(
+      syntheticPipeline("a", 1, [
+        agentState("a", [{ outcome: "completed", to: "done" }]),
+        terminalState("done", "success"),
+      ]),
+      (state) => {
+        callbackRuns += 1;
+        expect(state.id).toBe("a");
+        return "completed";
+      },
+      {
+        onTransitionCommit: () => {
+          throw hookFailure;
+        },
+      },
+    );
+    const error: unknown = await promise.catch((cause) => cause);
+    expect(error).toBe(hookFailure);
+    expect(error).not.toBeInstanceOf(PipelineExecutionError);
+    expect(callbackRuns).toBe(1);
+    // no result and no trace is observable: the graph never finished
+  });
+
+  test("the hook cannot select the target state or mutate the recorded step", async () => {
+    const steps: TransitionStep[] = [];
+    const result = await run(
+      syntheticPipeline("a", 1, [
+        agentState("a", [{ outcome: "completed", to: "declared" }]),
+        terminalState("declared", "success"),
+        terminalState("rogue", "success"),
+      ]),
+      scriptExecutor({ a: "completed" }),
+      (step) => {
+        // any attempt to redirect the graph from the hook has no effect: the
+        // step is a frozen plain value and the engine owns the mapping
+        steps.push({ ...step, to: "rogue" });
+      },
+    );
+    expect(result.terminalStateId).toBe("declared");
+    expect(result.trace[0]?.to).toBe("declared");
+    expect(steps[0]?.to).toBe("rogue"); // the hook's own copy changed, nothing else
   });
 });
 

@@ -75,6 +75,27 @@ export interface TransitionStep {
   transition_index: number;
 }
 
+/**
+ * Trusted transition-commit hook, invoked by the engine after it resolved a
+ * validated outcome against its immutable graph snapshot. The hook receives
+ * the exact immutable TransitionStep and must persist it before the engine
+ * allows the next state callback. A rejecting or throwing hook stops the
+ * graph immediately: the transition never appears in the trace and the cursor
+ * does not move. Two commit outcomes are possible. A `not_committed` failure
+ * rejects before the durable write lands: the transition is not recorded
+ * anywhere. A `durability_unknown` failure means the rename already landed:
+ * the new candidate revision may already be visible on disk even though the
+ * hook failed — execution stops immediately either way, the next agent
+ * callback never runs, and the caller owns the durability-unknown handling.
+ * The hook can never choose the target state and is never given the graph's
+ * transitions.
+ */
+export type TransitionCommitHook = (step: TransitionStep) => void | Promise<void>;
+
+export interface GraphExecutionOptions {
+  readonly onTransitionCommit?: TransitionCommitHook;
+}
+
 export interface GraphExecutionResult {
   terminalStateId: string;
   terminalResult: "success" | "failed";
@@ -169,9 +190,18 @@ function snapshotJsonValue(
   }
   onPath.add(source);
   try {
-    const copy: Record<string, ReadonlyJsonValue> = {};
+    // A null-prototype copy keeps hostile keys such as "__proto__" as plain
+    // own enumerable data properties: assignment through a `{}` literal would
+    // hit the Object.prototype `__proto__` setter instead of creating the
+    // field, silently dropping the key and polluting prototypes.
+    const copy: Record<string, ReadonlyJsonValue> = Object.create(null) as Record<string, ReadonlyJsonValue>;
     for (const [key, nested] of Object.entries(source)) {
-      copy[key] = snapshotJsonValue(stateId, nested, onPath);
+      Object.defineProperty(copy, key, {
+        value: snapshotJsonValue(stateId, nested, onPath),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
     return Object.freeze(copy);
   } finally {
@@ -337,16 +367,22 @@ function findTransition(
  * the injected `executeAgent` callback is invoked with the frozen execution
  * view compiled before the run and must return a validated outcome string;
  * the engine resolves the declared transition by outcome from its own
- * snapshot and moves to the declared target state. A terminal state ends the
- * execution. Callback failures propagate unchanged: no transition is recorded
- * and the cursor does not move. A terminal `result: "failed"` is a normal
- * graph result, not an engine error.
+ * snapshot and moves to the declared target state. When `options`
+ * `.onTransitionCommit` is set, the engine hands the hook the exact immutable
+ * TransitionStep and waits for it to complete before recording the
+ * transition and starting the next state callback; a hook failure stops the
+ * graph with no transition recorded. A terminal state ends the execution.
+ * Callback failures propagate unchanged: no transition is recorded and the
+ * cursor does not move. A terminal `result: "failed"` is a normal graph
+ * result, not an engine error.
  */
 export async function executePipelineGraph(
   pipeline: ResolvedPipeline,
   executeAgent: AgentOutcomeExecutor,
+  options: GraphExecutionOptions = {},
 ): Promise<GraphExecutionResult> {
   const graph = compileGraph(pipeline);
+  const onTransitionCommit = options.onTransitionCommit;
 
   const trace: TransitionStep[] = [];
   let cursor: string = graph.entryState;
@@ -388,14 +424,19 @@ export async function executePipelineGraph(
         `agent result outcome ${JSON.stringify(outcome)} does not match any transition outcome of state ${JSON.stringify(current.id)}`,
       );
     }
-    const target = match.to;
-    trace.push({
+    // The step is built and frozen by the engine from its own snapshot: the
+    // callback selected only the outcome, never the target.
+    const step: TransitionStep = Object.freeze({
       from: current.id,
       outcome,
-      to: target,
+      to: match.to,
       transition_index: match.index,
     });
+    if (onTransitionCommit !== undefined) {
+      await onTransitionCommit(step);
+    }
+    trace.push(step);
     transitionCount += 1;
-    cursor = target;
+    cursor = step.to;
   }
 }
