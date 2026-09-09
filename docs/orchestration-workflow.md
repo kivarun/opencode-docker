@@ -454,6 +454,39 @@ before auth/session. The decision evaluator, durable state, lifecycle, signal
 handling, helper transport, and the default bundle are untouched; wiring
 v2 execution into `agent-smoke` is a later increment.
 
+### v2 run-input snapshots and host-side activation data layout (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_runtime.ts` materializes the v2 data plane on
+the host, without Sessions or containers. `snapshotRunInputs` binds every
+declared pipeline input exactly once to an absolute host path whose real
+object kind must match the declared `file`/`directory`/`json` type (`json`
+must parse; the loaded schema snapshot is used, never re-read), then copies
+each input into the orchestrator-owned snapshot
+`<runRoot>/data/inputs/<input-id>` — files byte-for-byte, directories in
+deterministic sorted order with only real directories and regular files
+allowed — and records a deterministic SHA-256 digest over type, relative
+paths, and content only. After the snapshot, user source paths are no longer
+read: the returned frozen metadata is the run's only data source. Sources are
+never mounted directly to agents. `prepareActivationData` then builds a fresh
+`<runRoot>/activations/<index>-<state>/data/` tree per activation with
+`inputs/` (declaration-order copies from the run-owned snapshot or from the
+runner-owned accepted-output list, where the last accepted entry for a
+`state`/`output` pair wins), `outputs/` (pre-created directories for
+`directory` outputs; `file`/`json` outputs absent until the worker creates
+them) and a fresh `project/` scratch directory, and returns exact mount
+descriptors: project → `/workspace` RW, inputs → `/pipeline/inputs` RO,
+outputs → `/pipeline/outputs` RW, plus `reject_undeclared_outputs: true`
+(validation after a worker run is not implemented yet). Everything is
+fail-closed: bindings and accepted outputs are validated before any mutation,
+the activation leaf must be absent, symlink traps on run-owned paths are
+rejected, directories are 0700 and files 0600 (worker-UID compatibility is an
+explicit limitation of the next increment), failed operations remove exactly
+the objects they created, and existing snapshots are never overwritten.
+Honest boundaries: no defense against a trusted host process mutating a
+source during the read, and no crash-recovery contract. The production
+runner, durable state, decision evaluator, and lifecycle are untouched;
+Session creation, mounts, and worker launch are a later increment.
+
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
 The first increment of trusted execution profiles is implemented for

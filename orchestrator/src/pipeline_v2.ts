@@ -239,7 +239,11 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-function parsePortType(value: unknown, what: string): PortType {
+/**
+ * Parse a declared port type. Exported for the v2 runtime data-plane module;
+ * the compiler and the runtime share the same fixed port type vocabulary.
+ */
+export function parsePortType(value: unknown, what: string): PortType {
   if (value !== "file" && value !== "directory" && value !== "json") {
     throw new PipelineError(
       `${what} must be one of "file", "directory" or "json", got ${JSON.stringify(value)}`,
@@ -628,7 +632,7 @@ async function loadJsonSchema(
  * Module-private provenance registry of resolved v2 snapshots.
  *
  * `loadPipelineV2` registers the exact deep-frozen snapshot object it is
- * about to return; `planActivationLayout` accepts only registered objects.
+ * about to return; every v2 runtime API accepts only registered objects.
  * Membership is keyed by object identity, so hand-built objects, casts,
  * shallow or deep clones (e.g. `structuredClone`), Proxies and corrupted
  * copies are all unregistered. The registry is never exported, never
@@ -636,10 +640,24 @@ async function loadJsonSchema(
  */
 const resolvedV2SnapshotProvenance = new WeakSet<object>();
 
-/** Stable rejection message for any argument without loader provenance. */
-const UNTRUSTED_RESOLVED_PIPELINE_MESSAGE =
-  "planActivationLayout requires the deep-frozen snapshot object returned by loadPipelineV2; " +
-  "hand-built objects, casts, clones and Proxies are rejected before any content is read";
+/**
+ * Provenance gate shared by every v2 runtime API: the argument must be the
+ * exact deep-frozen snapshot object a previous successful `loadPipelineV2`
+ * call returned. `what` names the calling API in the stable rejection
+ * message. There is no second validation pass behind this gate —
+ * structural correctness is owned once by the compiler.
+ */
+export function requireResolvedPipelineV2Provenance(
+  pipeline: ResolvedPipelineV2,
+  what: string,
+): void {
+  if (!resolvedV2SnapshotProvenance.has(pipeline)) {
+    throw new PipelineError(
+      `${what} requires the deep-frozen snapshot object returned by loadPipelineV2; ` +
+        "hand-built objects, casts, clones and Proxies are rejected before any content is read",
+    );
+  }
+}
 
 /**
  * Load a v2 pipeline bundle: the same fail-closed bundle containment as v1
@@ -648,7 +666,7 @@ const UNTRUSTED_RESOLVED_PIPELINE_MESSAGE =
  * result is an engine-owned deep-frozen snapshot; mutations of the parsed
  * source objects cannot change it. The exact snapshot object is registered
  * in the module-private provenance registry immediately before the
- * successful return, so the planner can later distinguish it from any
+ * successful return, so runtime APIs can later distinguish it from any
  * hand-built, cloned or corrupted lookalike.
  */
 export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipelineV2> {
@@ -914,9 +932,7 @@ export function planActivationLayout(
   pipeline: ResolvedPipelineV2,
   stateId: string,
 ): ActivationLayoutPlan {
-  if (!resolvedV2SnapshotProvenance.has(pipeline)) {
-    throw new PipelineError(UNTRUSTED_RESOLVED_PIPELINE_MESSAGE);
-  }
+  requireResolvedPipelineV2Provenance(pipeline, "planActivationLayout");
   validateSafeId(stateId, "activation layout state id");
   let state: ResolvedV2State | undefined;
   for (const candidate of pipeline.states) {
