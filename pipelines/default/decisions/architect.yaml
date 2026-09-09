@@ -1,0 +1,221 @@
+schema_version: 1
+facts:
+- id: requires_task_change
+- id: iteration_limit_reached
+- id: issues_exist
+- id: has_major_issue
+- id: has_only_minor_issues
+- id: needs_stage_contract_change
+- id: needs_pipeline_plan_change
+- id: stage_cannot_continue_without_external_input
+- id: no_blocking_issues
+- id: can_close_normally
+- id: acceptance_criteria_satisfied
+decisions:
+- id: close_stage
+- id: close_stage_ignore_minor
+- id: rework_same_stage
+- id: rework_change_stage_contract
+- id: rework_change_pipeline_plan
+- id: architectural_proposal
+- id: architectural_warning
+relations:
+- id: FC1
+  assert:
+    any:
+    - all:
+      - fact: has_only_minor_issues
+        equals: true
+      - fact: issues_exist
+        equals: true
+      - fact: has_major_issue
+        equals: false
+    - all:
+      - fact: has_only_minor_issues
+        equals: false
+      - any:
+        - fact: issues_exist
+          equals: false
+        - fact: has_major_issue
+          equals: true
+- id: FC2
+  assert:
+    any:
+    - all:
+      - fact: no_blocking_issues
+        equals: true
+      - fact: has_major_issue
+        equals: false
+      - fact: stage_cannot_continue_without_external_input
+        equals: false
+      - fact: requires_task_change
+        equals: false
+    - all:
+      - fact: no_blocking_issues
+        equals: false
+      - any:
+        - fact: has_major_issue
+          equals: true
+        - fact: stage_cannot_continue_without_external_input
+          equals: true
+        - fact: requires_task_change
+          equals: true
+- id: FC3
+  assert:
+    any:
+    - all:
+      - fact: can_close_normally
+        equals: true
+      - fact: acceptance_criteria_satisfied
+        equals: true
+      - fact: issues_exist
+        equals: false
+    - all:
+      - fact: can_close_normally
+        equals: false
+      - any:
+        - fact: acceptance_criteria_satisfied
+          equals: false
+        - fact: issues_exist
+          equals: true
+- id: FC4
+  assert:
+    any:
+    - fact: has_major_issue
+      equals: false
+    - fact: issues_exist
+      equals: true
+- id: FC5
+  assert:
+    any:
+    - fact: acceptance_criteria_satisfied
+      equals: true
+    - fact: has_major_issue
+      equals: true
+- id: FC6
+  assert:
+    any:
+    - fact: stage_cannot_continue_without_external_input
+      equals: false
+    - fact: requires_task_change
+      equals: false
+constraints:
+- id: HC1
+  when:
+    fact: requires_task_change
+    equals: true
+  only:
+  - architectural_proposal
+- id: HC2
+  when:
+    fact: iteration_limit_reached
+    equals: true
+  forbid:
+  - rework_same_stage
+  - rework_change_stage_contract
+- id: HC3
+  when:
+    fact: has_major_issue
+    equals: true
+  forbid:
+  - close_stage_ignore_minor
+- id: HC4
+  when:
+    all:
+    - fact: stage_cannot_continue_without_external_input
+      equals: true
+    - fact: requires_task_change
+      equals: false
+    - fact: needs_pipeline_plan_change
+      equals: false
+    - fact: needs_stage_contract_change
+      equals: false
+  only:
+  - architectural_warning
+- id: HC5
+  when:
+    all:
+    - fact: requires_task_change
+      equals: false
+    - fact: needs_pipeline_plan_change
+      equals: true
+  forbid:
+  - rework_same_stage
+  - rework_change_stage_contract
+rules:
+- id: F
+  when:
+    fact: can_close_normally
+    equals: true
+  decision: close_stage
+- id: E
+  when:
+    all:
+    - fact: iteration_limit_reached
+      equals: true
+    - fact: requires_task_change
+      equals: false
+    - fact: has_only_minor_issues
+      equals: true
+    - fact: can_close_normally
+      equals: false
+  decision: close_stage_ignore_minor
+- id: B
+  when:
+    all:
+    - fact: requires_task_change
+      equals: false
+    - fact: stage_cannot_continue_without_external_input
+      equals: false
+    - fact: can_close_normally
+      equals: false
+    - fact: needs_pipeline_plan_change
+      equals: false
+    - fact: needs_stage_contract_change
+      equals: false
+    - fact: iteration_limit_reached
+      equals: false
+  decision: rework_same_stage
+- id: C
+  when:
+    all:
+    - fact: requires_task_change
+      equals: false
+    - fact: stage_cannot_continue_without_external_input
+      equals: false
+    - fact: has_major_issue
+      equals: true
+    - fact: needs_pipeline_plan_change
+      equals: false
+    - fact: needs_stage_contract_change
+      equals: true
+    - fact: iteration_limit_reached
+      equals: false
+  decision: rework_change_stage_contract
+- id: D
+  when:
+    all:
+    - fact: requires_task_change
+      equals: false
+    - fact: has_major_issue
+      equals: true
+    - fact: needs_pipeline_plan_change
+      equals: true
+  decision: rework_change_pipeline_plan
+- id: A
+  when:
+    fact: requires_task_change
+    equals: true
+  decision: architectural_proposal
+- id: HC4
+  when:
+    all:
+    - fact: stage_cannot_continue_without_external_input
+      equals: true
+    - fact: requires_task_change
+      equals: false
+    - fact: needs_pipeline_plan_change
+      equals: false
+    - fact: needs_stage_contract_change
+      equals: false
+  decision: architectural_warning

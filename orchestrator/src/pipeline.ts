@@ -3,6 +3,11 @@ import { isAbsolute, join } from "node:path";
 import { describeError, MAX_RUN_TIMEOUT_SECONDS } from "./docker_helper.ts";
 import { matchesStandardAgentResultSchema } from "./agent_result.ts";
 import { validateProfileName } from "./profile.ts";
+import {
+  readBundleFile,
+  requireBundleFileInsideRoot,
+  validateBundleRelativePath,
+} from "./bundle_file.ts";
 
 export const PIPELINE_SCHEMA_VERSION = 1;
 
@@ -151,24 +156,6 @@ function validateWorkspaceRelativePath(value: string, what: string): string {
   return value;
 }
 
-/**
- * Bundle file references (prompt, result_schema) must be clean relative paths;
- * containment inside the bundle is verified by realpath at load time.
- */
-function validateBundleRelativePath(value: string, what: string): string {
-  if (isAbsolute(value) || value.startsWith("~")) {
-    throw new PipelineError(`${what} must be a bundle-relative path, got ${JSON.stringify(value)}`);
-  }
-  for (const segment of value.split("/")) {
-    if (segment === "" || segment === "." || segment === ".." || segment === "~") {
-      throw new PipelineError(
-        `${what} must be a clean bundle-relative path without empty, ".", ".." or "~" segments, got ${JSON.stringify(value)}`,
-      );
-    }
-  }
-  return value;
-}
-
 function validateSafeId(value: unknown, what: string): string {
   const id = expectNonEmptyString(value, what);
   if (!SAFE_ID_PATTERN.test(id) || id.includes("..")) {
@@ -236,11 +223,13 @@ function parseAgentState(obj: Record<string, unknown>): AgentStateSpec {
     prompt: validateBundleRelativePath(
       expectNonEmptyString(obj.prompt, `${stateWhat} prompt`),
       `${stateWhat} prompt`,
+      PipelineError,
     ),
     inputs,
     result_schema: validateBundleRelativePath(
       expectNonEmptyString(obj.result_schema, `${stateWhat} result_schema`),
       `${stateWhat} result_schema`,
+      PipelineError,
     ),
     timeout_seconds: expectPositiveSafeInteger(obj.timeout_seconds, `${stateWhat} timeout_seconds`),
     max_attempts: expectPositiveSafeInteger(obj.max_attempts, `${stateWhat} max_attempts`),
@@ -414,40 +403,6 @@ export function parsePipelineSpec(raw: string): PipelineSpec {
   return spec;
 }
 
-async function requireBundleFileInsideRoot(
-  path: string,
-  rootCanonical: string,
-  what: string,
-): Promise<string> {
-  let info;
-  try {
-    info = await stat(path);
-  } catch (cause) {
-    throw new PipelineError(`${what} ${path} is not accessible: ${describeError(cause)}`);
-  }
-  if (!info.isFile()) {
-    throw new PipelineError(`${what} ${path} is not a regular file`);
-  }
-  let canonical: string;
-  try {
-    canonical = await realpath(path);
-  } catch (cause) {
-    throw new PipelineError(`${what} ${path} cannot be canonicalized: ${describeError(cause)}`);
-  }
-  if (canonical !== rootCanonical && !canonical.startsWith(`${rootCanonical}/`)) {
-    throw new PipelineError(`${what} ${path} resolves outside the pipeline bundle`);
-  }
-  return canonical;
-}
-
-async function readBundleFile(path: string, what: string): Promise<string> {
-  try {
-    return await Bun.file(path).text();
-  } catch (cause) {
-    throw new PipelineError(`${what} ${path} is not readable: ${describeError(cause)}`);
-  }
-}
-
 async function resolveAgentBundleFiles(
   state: AgentStateSpec,
   rootCanonical: string,
@@ -456,10 +411,13 @@ async function resolveAgentBundleFiles(
     join(rootCanonical, state.prompt),
     rootCanonical,
     `agent state ${JSON.stringify(state.id)} prompt`,
+    PipelineError,
+    "pipeline bundle",
   );
   const promptContent = await readBundleFile(
     promptPath,
     `agent state ${JSON.stringify(state.id)} prompt`,
+    PipelineError,
   );
   if (promptContent.trim() === "") {
     throw new PipelineError(
@@ -470,10 +428,13 @@ async function resolveAgentBundleFiles(
     join(rootCanonical, state.result_schema),
     rootCanonical,
     `agent state ${JSON.stringify(state.id)} result_schema`,
+    PipelineError,
+    "pipeline bundle",
   );
   const resultSchemaRaw = await readBundleFile(
     resultSchemaPath,
     `agent state ${JSON.stringify(state.id)} result_schema`,
+    PipelineError,
   );
   let resultSchema: unknown;
   try {
@@ -531,8 +492,10 @@ export async function loadPipeline(bundleRoot: string): Promise<ResolvedPipeline
     join(rootCanonical, "pipeline.yaml"),
     rootCanonical,
     "pipeline file",
+    PipelineError,
+    "pipeline bundle",
   );
-  const spec = parsePipelineSpec(await readBundleFile(pipelinePath, "pipeline file"));
+  const spec = parsePipelineSpec(await readBundleFile(pipelinePath, "pipeline file", PipelineError));
 
   const states: ResolvedState[] = [];
   for (const state of spec.states) {

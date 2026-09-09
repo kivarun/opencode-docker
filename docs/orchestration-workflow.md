@@ -291,6 +291,79 @@ signalable worker `docker-helper run` only; the deadline sends SIGTERM, the
 result is marked timed out, and the run fails normally with a single cleanup.
 `max_attempts` is 1, so no retries are implemented.
 
+### Pure decision-table substrate (implemented, not yet used by the production runner)
+
+`orchestrator/src/decision.ts` implements a pure, declarative decision-table
+substrate (schema version 1): `orchestrator/src/bundle_file.ts` holds the
+shared bundle-file containment helpers extracted from `pipeline.ts`
+(unchanged pipeline behavior, same messages), and
+`pipelines/default/decisions/architect.yaml` is the runtime decision model
+mechanically transferred from the oracle
+(`docs/pipeline-oracle/decision-table.json` +
+`decision-vectors.json`). **The production pipeline runner does not use any
+of this yet** — `pipeline.yaml`, `pipeline_engine.ts`, `pipeline_runner.ts`,
+`agent-smoke`, and the durable state schema are untouched; the substrate is
+not a production path, not a runner hook, and not referenced by the CLI.
+
+A decision model is a YAML document with exact-field validation at every
+level: `schema_version` (exactly 1), `facts` (non-empty list of unique safe
+ids), `decisions` (non-empty list of unique safe ids), `relations` (unique
+`id` + `assert`), `constraints` (unique `id` + `when` + exactly one of
+`only`/`forbid` over declared decisions), `rules` (unique `id` + `when` +
+one declared `decision`). Expressions are a closed boolean DSL with exactly
+one node form each: `{fact: <id>, equals: true|false}`, `{all: [...]}`,
+`{any: [...]}`, `{not: <expression>}` — no JavaScript, shell, callbacks,
+executable strings, environment/filesystem access, arbitrary JSON
+comparisons, or computed field names. Static limits (64 facts/decisions/
+relations/constraints/rules, expression depth 16, 512 nodes per expression,
+4096 nodes per document, 128-character ids) reject oversized documents at
+compile time. The loader takes an absolute bundle root plus a clean
+bundle-relative path (`*.yaml` only), enforces realpath containment with the
+shared helpers (internal symlinks allowed, symlink escapes and lexical
+traversal rejected, regular files only), and compiles into a deep-frozen,
+engine-owned snapshot; evaluation reads only the snapshot, so later
+mutations of the parsed source object cannot change results, and repeated
+evaluation of the same input is structurally identical.
+
+`evaluateDecision` is deterministic: validate the fact assignment (missing,
+extra, or non-boolean facts and non-mapping inputs throw
+`DecisionModelError` — they never become `uncovered`); check every
+consistency relation in declaration order and fail with
+`inconsistent_facts` plus all violated relation ids in declaration order;
+narrow the allowed set (initially every declared decision) with each active
+hard constraint in declaration order (`only` intersects, `forbid` removes)
+recording `active_constraint_ids` in declaration order; then select the
+first rule whose `when` is true and whose decision is still allowed — a
+matched but forbidden rule never terminates the search. If no rule applies,
+the outcome is `uncovered` — a normal computed result, not an exception,
+warning, or fallback. Outcomes are an exact discriminated union:
+`selected` (decision, rule_id, active_constraint_ids), `uncovered`
+(active_constraint_ids), `inconsistent_facts` (violated_relation_ids).
+
+The compiled default decision document holds exactly the oracle content that
+is meaningful at runtime: the 11 boolean facts with their exact names, the
+6 consistency relations FC1–FC6, the 5 hard constraints HC1–HC5, the 7 rules
+in the original priority order, and the 7 exact decision ids, with no
+automatic fallback. Source line references, explanatory text, stage effects,
+state writes, recovery semantics, and the P01 user policy are deliberately
+not part of the runtime document; P01 remains the next policy layer above
+the base evaluator. `orchestrator/tests/decision.test.ts` proves equivalence
+against the unchanged oracle: it enumerates all 2048 boolean assignments in
+`bit_order` and asserts 1952 → `inconsistent_facts` (violations matching an
+independent transcription), 82 → `selected` with the exact frozen expected
+decisions and rule ids (checked against both the frozen vectors and an
+independent table transcription), 14 → `uncovered` that never turn into a
+warning or another decision, plus the exact per-decision distribution
+(close_stage 14, close_stage_ignore_minor 7, rework_same_stage 3,
+rework_change_stage_contract 2, rework_change_pipeline_plan 16,
+architectural_proposal 32, architectural_warning 8, uncovered 14). Generic
+unit tests cover arbitrary non-legacy fact/decision ids, priority order,
+skipped forbidden rules, `only`/`forbid` intersection, declaration-order id
+lists, fail-closed fact/reference/duplicate/field/expression errors, all
+static limits, loader containment (internal symlink accepted, symlink
+escape and lexical traversal rejected), snapshot immutability under source
+mutation, and repeated-evaluation determinism.
+
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
 The first increment of trusted execution profiles is implemented for
