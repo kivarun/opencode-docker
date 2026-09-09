@@ -377,9 +377,18 @@ output ports. Port sources have exactly one form
 (`{pipeline_input: ID}` or `{state_output: {state, output}}`); port types
 are `file`, `directory`, or `json` (json ports require a bundle-relative
 JSON schema file loaded through the same realpath containment; parsed as a
-JSON object, no generic JSON Schema validation); agent input types are
-derived from their sources (never declared); run outputs must declare the
-type their source provides; exact-field validation applies at every level;
+JSON object, no generic JSON Schema validation). Pipeline inputs and agent
+outputs are the only places that declare a type or schema: agent input
+types are derived from their sources, a run output is exactly
+`{id, required, source}` with type and JSON schema fully derived from the
+source (declaring `type`/`schema` on a run output is rejected), and a
+stricter output contract is a separate transforming state, not a
+re-interpretation of the same value. The JSON contract travels by data
+flow: a run-level json input keeps its resolved `schemaPath/schema`; an
+agent input port sourced from it (directly or through `state_output`)
+receives the derived type and the immutable schema snapshot value; schema
+paths stay with the declaring sites and never enter a layout plan.
+Exact-field validation applies at every level;
 ids are safe and unique per collection; references to pipeline inputs,
 states, and state outputs must exist; self-references and cycles between
 state outputs compile (value availability is a runtime question). Runtime
@@ -395,39 +404,49 @@ list).
 
 `loadPipelineV2` returns an engine-owned deep-frozen snapshot;
 `planActivationLayout(pipeline, stateId)` is a pure deterministic planner
-producing an immutable plan: ordered input ports (`source`, `type`, fixed
-target `/pipeline/inputs/<id>`, `read_only: true`), ordered output ports
-(`type`, optional parsed schema snapshot, fixed target
-`/pipeline/outputs/<id>`, `read_only: false`), project mount `/workspace`
-RW, `reject_undeclared_outputs: true` — and only logical/structural data,
-never bearers, credentials, env values, or host paths. Mutations of the
-source YAML object or of the returned view cannot change a built plan.
+producing an immutable plan: ordered input ports (`source`, `type`,
+optional deep-frozen schema snapshot without `schemaPath`, fixed target
+`/pipeline/inputs/<id>`, `read_only: true`), ordered output ports (`type`,
+optional parsed schema snapshot, fixed target `/pipeline/outputs/<id>`,
+`read_only: false`), project mount `/workspace` RW,
+`reject_undeclared_outputs: true` — and only logical/structural data,
+never bearers, credentials, env values, host paths, or schema paths.
+Mutations of the source YAML object or of the returned view cannot change
+a built plan. The planner is fail-closed against forged or corrupted
+input: it re-validates the resolved object (exact port shapes, safe and
+unique ids, known port types, intact source unions, recursively
+plain-JSON schema snapshots) before any target path is built, never
+trusting a TypeScript cast or a past loader pass.
 
 Session capability contracts are fixed next to the planner, unwired:
-Execution Session (scope run root; orchestrator-only bearer, used only to
-launch workers), Tool Session (scope project only; bearer handed to the
-worker, which receives a projected helper socket; nested containers cannot
-reach pipeline inputs/outputs through helper), and worker mounts (project
-`/workspace` RW, prepared activation inputs `/pipeline/inputs` RO,
-activation outputs `/pipeline/outputs` RW). The Execution Session bearer is
-never passed to a worker in any form and no wide-Tool-Session workaround
-exists; the docker-helper#8 allowed-roots RO/RW refinement is not required
-by this increment.
+Execution Session (`type: "execution"`, scope run root; orchestrator-only
+bearer, used only to launch workers, never passed to a worker in any
+form), Tool Session (`type: "tool"`, scope project only; bearer handed to
+the worker; nested containers cannot reach pipeline inputs/outputs through
+helper), and worker mounts (project `/workspace` RW, prepared activation
+inputs `/pipeline/inputs` RO, activation outputs `/pipeline/outputs` RW).
+The helper socket projection is not a session capability: it lives in the
+separate immutable Worker Launch contract (`WORKER_LAUNCH_CONTRACT`)
+because it happens once, at worker launch through the Execution Session —
+the socket is transport, the Tool Session bearer is the worker's
+authority. No wide-Tool-Session workaround exists; the docker-helper#8
+allowed-roots RO/RW refinement is not required by this increment.
 
 The production boundary stays sharp: `agent-smoke` and the current runner
 execute v1 without any behavior change (v1 representation is unchanged;
 `pipeline.ts` shares exact-field validators and `checkGraphShape` with v2),
-v2 loads and compiles only through the pure v2 APIs, and a genuine v2
-document (schema_version 2 with the top-level `outputs` key) is rejected by
-the production loader with exactly `pipeline schema version 2 is not
-executable yet` before Launcher auth and before any Session; a v1-shaped
-version-2 document keeps the previous "schema_version 2, expected 1"
-error. `orchestrator/tests/pipeline_v2.test.ts` covers v1 regression,
+v2 loads and compiles only through the pure v2 APIs, and any YAML document
+with `schema_version: 2` is rejected by the production loader with exactly
+`pipeline schema version 2 is not executable yet` before Launcher auth and
+before any Session — no "genuine v2" shape sniffing.
+`orchestrator/tests/pipeline_v2.test.ts` covers v1 regression,
 compilation, exact-field/union validation, duplicate/unknown references,
-type propagation, schema containment, frozen snapshots, planner
-determinism/fixed targets/flags, absence of secrets and host paths in
-plans, capability separation, and the production rejection before
-auth/session. The decision evaluator, durable state, lifecycle, signal
+schema propagation through `state_output`, schema containment, frozen
+snapshots, planner determinism/fixed targets/flags, absence of secrets,
+host paths, and schema paths in plans, planner fail-closed regressions
+(forged port ids, corrupted resolved objects, invalid schema snapshots),
+socket-transport/Tool-authority separation, and the production rejection
+before auth/session. The decision evaluator, durable state, lifecycle, signal
 handling, helper transport, and the default bundle are untouched; wiring
 v2 execution into `agent-smoke` is a later increment.
 

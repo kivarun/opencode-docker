@@ -148,7 +148,7 @@ test("3. unknown and missing fields are rejected at every level", () => {
 
 test("4. unsupported schema versions are rejected", () => {
   expect(() => parsePipelineSpec(pipelineYaml().replace("schema_version: 1", "schema_version: 2"))).toThrow(
-    /schema_version 2, expected 1/,
+    "pipeline schema version 2 is not executable yet",
   );
   expect(() => parsePipelineSpec(pipelineYaml().replace("schema_version: 1", "schema_version: 0"))).toThrow(
     /schema_version 0, expected 1/,

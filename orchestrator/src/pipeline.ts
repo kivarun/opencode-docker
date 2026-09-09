@@ -374,12 +374,10 @@ export function parsePipelineSpec(raw: string): PipelineSpec {
     throw new PipelineError(`pipeline is not valid YAML: ${describeError(cause)}`);
   }
   const obj = expectObject(parsed, "pipeline");
-  // A document that declares schema version 2 and carries the v2-only
-  // top-level `outputs` contract is a genuine v2 pipeline: the production
-  // path rejects it explicitly before anything else happens. A version-2
-  // document without the v2 shape falls through to the v1 validation below
-  // and is rejected as an unsupported version, as before.
-  if (obj.schema_version === PIPELINE_SCHEMA_VERSION_V2 && "outputs" in obj) {
+  // Any document with schema_version 2 is a v2 pipeline; the production path
+  // cannot execute v2 yet, so it is rejected explicitly and uniformly before
+  // anything else happens. No shape sniffing decides "genuine v2".
+  if (obj.schema_version === PIPELINE_SCHEMA_VERSION_V2) {
     throw new PipelineError("pipeline schema version 2 is not executable yet");
   }
   expectExactKeys(
