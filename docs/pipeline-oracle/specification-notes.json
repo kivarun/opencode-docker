@@ -25,7 +25,7 @@
         }
       ],
       "evidence": "Warning has an explicit positive condition only in HC4. Allowed at the iteration limit does not mean applicable. Fourteen of the 96 vectors satisfying the stated consistency relations match no decision.",
-      "oracle_boundary": "Expected legacy decision remains null with status uncovered. Do not rewrite the extracted table. P01 adds a default-pipeline wait for the user when unfinished major work reaches the limit without requiring TASK or plan changes; other uncovered combinations remain open.",
+      "oracle_boundary": "Expected legacy decision remains null with status uncovered. Do not rewrite the extracted table. P01 adds a default-pipeline wait for the user when unfinished major work reaches the limit without requiring TASK or plan changes. Continuing the unchanged TASK grants a new budget and resumes at coder; an explicit TASK revision routes through architect-owned PLAN/STAGE updates and then coder. Other uncovered combinations remain open.",
       "resolution_refs": [
         "P01"
       ]

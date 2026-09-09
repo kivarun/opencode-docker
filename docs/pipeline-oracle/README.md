@@ -137,14 +137,21 @@ the pipeline plan do not need changes, enters a `wait` state with reason
 and waits for an explicit user decision. It does not guess whether the limit,
 coder model, reviewer models, or several of them caused the failure.
 
-The user may grant additional stage iterations, replace role-to-model-profile
-bindings for future activations, or do both atomically. A visible "reset" creates
-a new budget grant; it never erases old iteration records or reuses activation
-identities. Model changes name trusted profiles. Provider endpoints, model names,
-and credential values remain operator-controlled profile data rather than user
-response fields. P01 leaves one policy choice open: whether the default pipeline
-restarts the full stage at coder, restarts its review cycle, or exposes both as
-separate intents.
+The wait exposes two deterministic user intents. `continue_stage` grants a
+positive number of additional iterations while the protected TASK revision stays
+unchanged; the next state is coder. It may also replace trusted model-profile
+bindings for future activations. `revise_task` declares an explicit TASK revision;
+the next state is architect. PLAN and STAGE remain architect-owned: the user does
+not edit them, and the orchestrator starts coder only after it has accepted the
+architect's updated PLAN and STAGE with a fresh stage budget.
+
+A model-profile change alone cannot release an exhausted budget. A visible
+"reset" creates a new budget grant or epoch; it never erases old iteration records
+or reuses activation identities. Model changes name trusted profiles. Provider
+endpoints, model names, and credential values remain operator-controlled profile
+data rather than user response fields. These typed intents replace the legacy
+ability to edit STATE.md and TASK.md directly; the user never edits durable
+orchestrator state.
 
 ## State transition contracts
 
@@ -228,7 +235,7 @@ interpretation.
 | Input/actor/state validation | V01–V06, V12–V18, V24; R01–R24 | Orchestrator admission and context validation |
 | Output completeness and ownership | V07–V11, V19 | Result acceptance and orchestrator context changes |
 | Role cycle | T03–T05, S01–S02 | Default graph and role prompts |
-| Decision facts, constraints, priority/scope | D01–D31, T06–T07; P01-S01–P01-S08 | Structured facts plus deterministic policy and explicit user wait |
+| Decision facts, constraints, priority/scope | D01–D31, T06–T07; P01-S01–P01-S12 | Structured facts plus deterministic policy and explicit user wait |
 | Dynamic stages and rework | T01–T02, T08–T15, S03 | Default context and declared actions |
 | User proposal/warning and task ownership | T16–T18, V22–V23, S04 | Artifacts, waits, user inputs and protected task |
 | Reports and classification boundary | V20–V23, D24–D31 | Role prompts and result/artifact schemas |

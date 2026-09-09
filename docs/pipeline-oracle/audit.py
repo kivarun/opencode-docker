@@ -246,8 +246,8 @@ def main():
     policy_cases = policy['scenarios']
     require(len(resolutions) == 1 and resolutions[0]['id'] == 'P01', 'Expected policy resolution P01')
     require(len({r['id'] for r in resolutions}) == len(resolutions), 'Repeated policy resolution')
-    require(len(policy_cases) == 8 and len({c['id'] for c in policy_cases}) == 8,
-            'Expected eight distinct P01 scenarios')
+    require(len(policy_cases) == 12 and len({c['id'] for c in policy_cases}) == 12,
+            'Expected twelve distinct P01 scenarios')
     require(documents['specification-notes.json']['user_policy_resolutions'] == ['P01'],
             'Specification note does not reference P01')
     g01 = next(note for note in notes if note['id'] == 'G01')
@@ -272,6 +272,19 @@ def main():
         'authority': 'user',
         'normal_agent_activation_allowed': False,
     }, 'P01 result contract changed')
+    require(p01['resume_routes'] == {
+        'continue_stage': ['coder'],
+        'revise_task': ['architect', 'coder_after_accepted_plan_and_stage_update'],
+    }, 'P01 deterministic resume routes changed')
+    intents = {intent['type']: intent for intent in p01['accepted_user_intents']}
+    require(set(intents) == {'continue_stage', 'revise_task'},
+            'P01 must expose exactly the state-only and TASK-revision intents')
+    require(any('next agent state is coder' in requirement
+                for requirement in intents['continue_stage']['requirements']),
+            'State-only continuation must resume at coder')
+    require(any('next agent state is architect' in requirement
+                for requirement in intents['revise_task']['requirements']),
+            'TASK revision must resume at architect')
     policy_case_map = {case['id']: case for case in policy_cases}
     for scenario_id in ['P01-S01', 'P01-S02', 'P01-S03', 'P01-S04']:
         require(policy_case_map[scenario_id]['expected']['state_kind'] == 'wait',
@@ -280,13 +293,31 @@ def main():
             'Budget grant must preserve history')
     require(policy_case_map['P01-S05']['expected']['identities_reused'] is False,
             'Budget grant must not reuse identities')
+    require(policy_case_map['P01-S05']['expected']['next_agent_state'] == 'coder',
+            'State-only continuation must start at coder')
     require(policy_case_map['P01-S06']['expected']['credential_values_in_response'] is False,
             'Profile replacement must not carry credentials')
+    require(policy_case_map['P01-S06']['expected']['next_agent_state'] == 'coder' and
+            policy_case_map['P01-S06']['expected']['future_bindings_updated'] is True,
+            'Profile replacement with a budget grant must affect future coder execution')
     require(policy_case_map['P01-S07']['expected']['response_accepted'] is False,
             'Empty budget grant must not resume')
     require(policy_case_map['P01-S08']['expected']['response_accepted'] is False and
             policy_case_map['P01-S08']['expected']['credential_values_persisted'] is False,
             'Raw provider credentials must be rejected')
+    require(policy_case_map['P01-S09']['expected']['response_accepted'] is True and
+            policy_case_map['P01-S09']['expected']['next_agent_state'] == 'architect' and
+            policy_case_map['P01-S09']['expected']['plan_and_stage_changed_by_user'] is False,
+            'TASK revision must route to architect without user-owned PLAN/STAGE edits')
+    require(policy_case_map['P01-S10']['expected']['plan_and_stage_owner'] == 'architect' and
+            policy_case_map['P01-S10']['expected']['updates_applied_by'] == 'orchestrator' and
+            policy_case_map['P01-S10']['expected']['next_agent_state'] == 'coder',
+            'Accepted architect PLAN/STAGE updates must route to coder')
+    require(policy_case_map['P01-S11']['expected']['response_accepted'] is False and
+            policy_case_map['P01-S11']['expected']['required_intent'] == 'revise_task',
+            'Changed TASK must not use state-only continuation')
+    require(policy_case_map['P01-S12']['expected']['response_accepted'] is False,
+            'Unchanged TASK must not use the TASK-revision intent')
 
     print('Source copies: 2/2 SHA-256, byte counts and line counts match')
     print(f'Source references: {reference_count} within archived source bounds')
@@ -295,7 +326,7 @@ def main():
     print('Selected distribution: ' + json.dumps({d: counts[d] for d in priority}))
     print(f'Named cases: {len(cases)} structurally checked; {named_decisions} decision expectations independently checked')
     print('Transition coverage: 16/16; notes: 9 open, 1 partially resolved, 2 source precedence')
-    print('User policy P01: 2 legacy gaps mapped to wait; 8 policy scenarios checked')
+    print('User policy P01: 2 legacy gaps mapped to wait; 12 policy scenarios checked')
     print('No production execution, LLM run, transition simulator, or end-to-end parity claim')
 
 
