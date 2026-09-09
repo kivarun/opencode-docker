@@ -1,0 +1,794 @@
+{
+  "format_version": 1,
+  "status": "partial_legacy_effect_contracts",
+  "guards": "Conjunctive conditions; enum-value arrays mean one of the listed alternatives, and required_inputs lists require every item. Descriptive conditions document source semantics, not an executable expression language. Procedure guards do not override global admission/recovery rules.",
+  "effect_policy": "Only stated effects and necessary validity-derived values are asserted; omission never asserts unchanged. Open notes are not implementation defaults.",
+  "transitions": [
+    {
+      "id": "TR01",
+      "title": "Initialize pipeline",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            306,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1161,
+            1196
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            752,
+            872
+          ]
+        }
+      ],
+      "guard": {
+        "state_exists": false,
+        "TASK.md": true,
+        "prior_pipeline_artifacts": false
+      },
+      "effects": {
+        "must_create": [
+          "PLAN.md",
+          "STAGE.md",
+          "STATE.md"
+        ],
+        "set": {
+          "CURRENT_STAGE_INDEX": 1,
+          "STAGE_ITERATION": 1,
+          "STAGE_STATUS": "in_progress",
+          "ARCHITECT_STATUS": "done",
+          "NEXT_AGENT": "coder",
+          "ARCHITECT_DECISION": "none"
+        },
+        "derive": {
+          "STAGE_SEQUENCE": "stage sequence from PLAN.md",
+          "CURRENT_STAGE": "first stage",
+          "TOTAL_STAGES": "length(STAGE_SEQUENCE)"
+        },
+        "required_but_unassigned": [
+          "MAX_STAGE_ITERATIONS",
+          "CODER_STATUS",
+          "REVIEWER_STATUS",
+          "SEC_REVIEWER_STATUS",
+          "RECOVERY_MODE"
+        ]
+      },
+      "spec_notes": [
+        "G05",
+        "G09"
+      ]
+    },
+    {
+      "id": "TR02",
+      "title": "coder step",
+      "scope": "agent_step",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            610,
+            644
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            540,
+            607
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        }
+      ],
+      "guard": {
+        "NEXT_AGENT": "coder",
+        "RECOVERY_MODE": false,
+        "agent_visible_state_valid": true,
+        "required_inputs": [
+          "STAGE.md",
+          "STATE.md"
+        ],
+        "required_outputs_produced": true
+      },
+      "effects": {
+        "set": {
+          "CODER_STATUS": "done",
+          "NEXT_AGENT": "reviewer"
+        },
+        "must_produce": [
+          "stage implementation artifacts",
+          "STATE.md"
+        ],
+        "role_scope_only": true
+      },
+      "spec_notes": []
+    },
+    {
+      "id": "TR03",
+      "title": "reviewer step",
+      "scope": "agent_step",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            648,
+            681
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            540,
+            607
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        }
+      ],
+      "guard": {
+        "NEXT_AGENT": "reviewer",
+        "RECOVERY_MODE": false,
+        "agent_visible_state_valid": true,
+        "required_inputs": [
+          "STAGE.md",
+          "STATE.md",
+          "stage implementation artifacts"
+        ],
+        "required_outputs_produced": true
+      },
+      "effects": {
+        "set": {
+          "REVIEWER_STATUS": "done",
+          "NEXT_AGENT": "sec_reviewer"
+        },
+        "must_produce": [
+          "REVIEW.md",
+          "STATE.md"
+        ],
+        "role_scope_only": true
+      },
+      "spec_notes": []
+    },
+    {
+      "id": "TR04",
+      "title": "sec_reviewer step",
+      "scope": "agent_step",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            685,
+            719
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            540,
+            607
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        }
+      ],
+      "guard": {
+        "NEXT_AGENT": "sec_reviewer",
+        "RECOVERY_MODE": false,
+        "agent_visible_state_valid": true,
+        "required_inputs": [
+          "PLAN.md",
+          "STAGE.md",
+          "STATE.md",
+          "stage implementation artifacts"
+        ],
+        "required_outputs_produced": true
+      },
+      "effects": {
+        "set": {
+          "SEC_REVIEWER_STATUS": "done",
+          "NEXT_AGENT": "architect"
+        },
+        "must_produce": [
+          "SECURITY_REVIEW.md",
+          "STATE.md"
+        ],
+        "role_scope_only": true
+      },
+      "spec_notes": []
+    },
+    {
+      "id": "TR05",
+      "title": "Select decision without executing it",
+      "scope": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            488,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            613,
+            665
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            982,
+            1012
+          ]
+        }
+      ],
+      "guard": {
+        "state_valid": true,
+        "iteration_complete": true,
+        "required_inputs": [
+          "TASK.md",
+          "PLAN.md",
+          "STAGE.md",
+          "STATE.md",
+          "REVIEW.md",
+          "SECURITY_REVIEW.md"
+        ]
+      },
+      "effects": {
+        "decision_table": "decision-table.json",
+        "state_writes_only": [
+          "ARCHITECT_DECISION",
+          "STAGE_STATUS"
+        ],
+        "must_not_change": [
+          "STAGE_SEQUENCE",
+          "CURRENT_STAGE",
+          "CURRENT_STAGE_INDEX",
+          "STAGE_ITERATION"
+        ],
+        "close_file_effect": "TR13"
+      },
+      "spec_notes": [
+        "G01",
+        "G03",
+        "G11"
+      ]
+    },
+    {
+      "id": "TR06",
+      "title": "Start same-stage rework",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1200,
+            1214
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1070,
+            1078
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": "rework_same_stage"
+      },
+      "effects": {
+        "set": {
+          "STAGE_STATUS": "in_progress",
+          "CODER_STATUS": "pending",
+          "REVIEWER_STATUS": "pending",
+          "SEC_REVIEWER_STATUS": "pending",
+          "ARCHITECT_STATUS": "done",
+          "NEXT_AGENT": "coder"
+        },
+        "increment": {
+          "STAGE_ITERATION": 1
+        },
+        "state_unchanged": [
+          "STAGE_SEQUENCE",
+          "CURRENT_STAGE",
+          "CURRENT_STAGE_INDEX"
+        ],
+        "files_unchanged": [
+          "PLAN.md",
+          "STAGE.md"
+        ]
+      },
+      "spec_notes": [
+        "G04"
+      ]
+    },
+    {
+      "id": "TR07",
+      "title": "Start changed-stage rework",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1218,
+            1233
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1082,
+            1091
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            471,
+            474
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": "rework_change_stage_contract",
+        "STAGE.md": true
+      },
+      "effects": {
+        "set": {
+          "STAGE_STATUS": "in_progress",
+          "CODER_STATUS": "pending",
+          "REVIEWER_STATUS": "pending",
+          "SEC_REVIEWER_STATUS": "pending",
+          "ARCHITECT_STATUS": "done",
+          "NEXT_AGENT": "coder"
+        },
+        "increment": {
+          "STAGE_ITERATION": 1
+        },
+        "state_unchanged": [
+          "STAGE_SEQUENCE",
+          "CURRENT_STAGE",
+          "CURRENT_STAGE_INDEX"
+        ],
+        "must_update_at_least_one": [
+          "STAGE.md",
+          "PLAN.md"
+        ]
+      },
+      "spec_notes": [
+        "G04",
+        "G06"
+      ]
+    },
+    {
+      "id": "TR08",
+      "title": "Apply pipeline plan change, including earlier target",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            732,
+            739
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1095,
+            1105
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": "rework_change_pipeline_plan"
+      },
+      "effects": {
+        "set": {
+          "STAGE_STATUS": "in_progress",
+          "CODER_STATUS": "pending",
+          "REVIEWER_STATUS": "pending",
+          "SEC_REVIEWER_STATUS": "pending",
+          "ARCHITECT_STATUS": "done",
+          "NEXT_AGENT": "coder",
+          "STAGE_ITERATION": 1
+        },
+        "must_update": [
+          "PLAN.md"
+        ],
+        "may_change": [
+          "STAGE_SEQUENCE",
+          "CURRENT_STAGE",
+          "CURRENT_STAGE_INDEX"
+        ],
+        "derive": {
+          "CURRENT_STAGE_INDEX": "1-based position of CURRENT_STAGE",
+          "TOTAL_STAGES": "length(STAGE_SEQUENCE)"
+        },
+        "must_satisfy": [
+          "CURRENT_STAGE belongs to STAGE_SEQUENCE",
+          "CURRENT_STAGE matches STAGE.md"
+        ],
+        "implementation_rollback": "unspecified"
+      },
+      "spec_notes": [
+        "G04",
+        "G07",
+        "G12"
+      ]
+    },
+    {
+      "id": "TR09",
+      "title": "Open next stage",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            395,
+            409
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1237,
+            1251
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": [
+          "close_stage",
+          "close_stage_ignore_minor"
+        ],
+        "STAGE_STATUS": "completed",
+        "next_stage_exists": true
+      },
+      "effects": {
+        "set": {
+          "STAGE_ITERATION": 1,
+          "CODER_STATUS": "pending",
+          "REVIEWER_STATUS": "pending",
+          "SEC_REVIEWER_STATUS": "pending",
+          "ARCHITECT_STATUS": "done",
+          "NEXT_AGENT": "coder"
+        },
+        "increment": {
+          "CURRENT_STAGE_INDEX": 1
+        },
+        "derive": {
+          "CURRENT_STAGE": "next stage in existing sequence"
+        },
+        "must_update": [
+          "STAGE.md"
+        ],
+        "unspecified": [
+          "new STAGE_STATUS",
+          "consumption of ARCHITECT_DECISION"
+        ]
+      },
+      "spec_notes": [
+        "G04",
+        "G07"
+      ]
+    },
+    {
+      "id": "TR10",
+      "title": "Complete final stage",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            395,
+            409
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1256,
+            1263
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": [
+          "close_stage",
+          "close_stage_ignore_minor"
+        ],
+        "STAGE_STATUS": "completed",
+        "next_stage_exists": false
+      },
+      "effects": {
+        "set": {
+          "ARCHITECT_STATUS": "done",
+          "NEXT_AGENT": "user"
+        },
+        "must_not_open_next_stage": true,
+        "run_exit_code": "not a legacy concept"
+      },
+      "spec_notes": []
+    },
+    {
+      "id": "TR11",
+      "title": "Keep pipeline blocked",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            413,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1267,
+            1275
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            174,
+            199
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": [
+          "architectural_warning",
+          "architectural_proposal with changes not applied"
+        ]
+      },
+      "effects": {
+        "set": {
+          "STAGE_STATUS": "blocked",
+          "NEXT_AGENT": "user"
+        },
+        "global_obligation": {
+          "RECOVERY_MODE": true
+        },
+        "pipeline_must_not_advance": true
+      },
+      "spec_notes": [
+        "G03",
+        "G08"
+      ]
+    },
+    {
+      "id": "TR12",
+      "title": "Apply user proposal changes",
+      "scope": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            420,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1279,
+            1292
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": "architectural_proposal",
+        "proposed_TASK_changes_applied": true
+      },
+      "effects": {
+        "set": {
+          "STAGE_STATUS": "in_progress",
+          "CODER_STATUS": "pending",
+          "REVIEWER_STATUS": "pending",
+          "SEC_REVIEWER_STATUS": "pending",
+          "ARCHITECT_STATUS": "done",
+          "NEXT_AGENT": "coder"
+        },
+        "may_update": [
+          "PLAN.md",
+          "STAGE.md"
+        ],
+        "not_assigned": [
+          "STAGE_ITERATION",
+          "RECOVERY_MODE",
+          "ARCHITECT_DECISION"
+        ],
+        "actor_changing_TASK": "external, not architect"
+      },
+      "spec_notes": [
+        "G03",
+        "G04"
+      ]
+    },
+    {
+      "id": "TR13",
+      "title": "Archive completed stage contract",
+      "scope": "file_effect",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            558,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1315,
+            1325
+          ]
+        }
+      ],
+      "guard": {
+        "ARCHITECT_DECISION": [
+          "close_stage",
+          "close_stage_ignore_minor"
+        ]
+      },
+      "effects": {
+        "rename": {
+          "from": "STAGE.md",
+          "to": "<archive>/<CURRENT_STAGE_INDEX>_<CURRENT_STAGE>.md"
+        },
+        "copy_instead_of_rename": false,
+        "collision_behavior": "unspecified"
+      },
+      "spec_notes": [
+        "G07"
+      ]
+    },
+    {
+      "id": "TR14",
+      "title": "Enter recovery and stop",
+      "scope": "recovery_entry",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            306,
+            350
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            501,
+            518
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "guard": {
+        "architect_validation_failed": true
+      },
+      "effects": {
+        "set": {
+          "RECOVERY_MODE": true,
+          "NEXT_AGENT": "architect"
+        },
+        "stop_immediately": true,
+        "further_actions": false,
+        "other_state_repair": "unspecified"
+      },
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "TR15",
+      "title": "Hold recovery validation gate",
+      "scope": "recovery_gate",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            174,
+            191
+          ]
+        }
+      ],
+      "guard": {
+        "RECOVERY_MODE": true
+      },
+      "effects": {
+        "non_architect_steps": false,
+        "architect_allowed_actions": [
+          "validate current state"
+        ],
+        "pipeline_must_not_advance": true
+      },
+      "spec_notes": []
+    },
+    {
+      "id": "TR16",
+      "title": "Exit after recovery has already completed",
+      "scope": "recovery_exit",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            188,
+            199
+          ]
+        }
+      ],
+      "guard": {
+        "RECOVERY_MODE": true,
+        "state_valid": true,
+        "STAGE_STATUS_not": "blocked",
+        "recovery_completed": true
+      },
+      "effects": {
+        "set": {
+          "STAGE_STATUS": "in_progress",
+          "RECOVERY_MODE": false
+        },
+        "derive": {
+          "NEXT_AGENT": "according to transition rules"
+        },
+        "must_validate": "full state",
+        "recovery_completed_producer": "unspecified"
+      },
+      "spec_notes": [
+        "G02",
+        "G03"
+      ]
+    }
+  ]
+}

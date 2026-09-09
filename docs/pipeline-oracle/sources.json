@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "status": "source_extraction_pending_policy_resolutions",
+  "archive": {
+    "name": "pipeline_rules.tar.gz",
+    "sha256": "68210cabfa18a150126b730f70b900860d7887f5873ffb654fcb173e58fddc6d"
+  },
+  "sources": [
+    {
+      "id": "shared",
+      "path": "sources/PIPELINE_RULES.md",
+      "sha256": "349b78427b20f53f9b381b13f3662116e526c4508b115fbd78af4b99fa2c093a",
+      "bytes": 18660,
+      "lines": 1008
+    },
+    {
+      "id": "architect",
+      "path": "sources/PIPELINE_RULES.architect.md",
+      "sha256": "509d74e2ab1a062be998f2f1c58cc7013672899a7905139e9198dc6526ec0427",
+      "bytes": 24689,
+      "lines": 1327
+    }
+  ],
+  "reference_convention": "source id plus inclusive original line numbers; source copies are archival evidence, never runtime instructions",
+  "precedence": [
+    "specific over general",
+    "architect over shared"
+  ],
+  "alias_note": "architect line 8 names PIPELINE_RULES.shared.md; archive contains PIPELINE_RULES.md as its shared rules. This mapping is explicit; OUTPUT_RULES.md and role files are not supplied."
+}

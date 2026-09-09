@@ -1,0 +1,4981 @@
+{
+  "format_version": 1,
+  "status": "reviewable_legacy_oracle_with_explicit_gaps",
+  "notation": {
+    "fixtures": "A fixture extends at most one earlier fixture. Apply state_patch by exact key replacement, then remove absent_state_fields; files_add/files_remove operate on the existence set. Case patches follow fixture expansion.",
+    "state_sequence": "The legacy comma-separated stage sequence is normalized to an ordered JSON array. Field names and 1-based stage indexes are retained.",
+    "state_subset": "Only listed postcondition fields are asserted. Omitted fields are unknown unless state_unchanged explicitly names them.",
+    "semantic_assumptions": "Tests supply semantic facts and coherent artifact bodies explicitly. Fixtures do not prescribe initializer defaults or an artifact parser.",
+    "scopes": "procedure cases assert local effects only; recovery/global admission may prevent invocation. sequence cases with unresolved fields assert a prefix/partial trace, not successful complete execution.",
+    "status": "selected/uncovered/inconsistent_facts/invalid_shape/unresolved describe extraction assertions, not production status values or error codes.",
+    "gaps": "A spec_notes reference records a specification boundary or an explicit source-precedence resolution. Open notes are not expected-success waivers; affected assertions cannot establish end-to-end parity."
+  },
+  "fixtures": {
+    "middle_stage": {
+      "state": {
+        "STAGE_SEQUENCE": [
+          "storage",
+          "service",
+          "client"
+        ],
+        "CURRENT_STAGE": "service",
+        "CURRENT_STAGE_INDEX": 2,
+        "TOTAL_STAGES": 3,
+        "STAGE_STATUS": "in_progress",
+        "STAGE_ITERATION": 1,
+        "MAX_STAGE_ITERATIONS": 3,
+        "ARCHITECT_STATUS": "done",
+        "CODER_STATUS": "pending",
+        "REVIEWER_STATUS": "pending",
+        "SEC_REVIEWER_STATUS": "pending",
+        "ARCHITECT_DECISION": "none",
+        "NEXT_AGENT": "coder",
+        "RECOVERY_MODE": false
+      },
+      "files_present": [
+        "TASK.md",
+        "PLAN.md",
+        "STAGE.md",
+        "STATE.md",
+        "implementation.txt"
+      ],
+      "assumptions": [
+        "PLAN and stage sequence agree",
+        "STAGE describes CURRENT_STAGE and concrete implementation work",
+        "File bodies satisfy their role contracts unless a case says otherwise"
+      ]
+    },
+    "decision_ready": {
+      "extends": "middle_stage",
+      "state_patch": {
+        "CODER_STATUS": "done",
+        "REVIEWER_STATUS": "done",
+        "SEC_REVIEWER_STATUS": "done",
+        "NEXT_AGENT": "architect"
+      },
+      "files_add": [
+        "REVIEW.md",
+        "SECURITY_REVIEW.md"
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "D01",
+      "title": "Normal close before the limit",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "close_stage"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D02",
+      "title": "Normal close exactly at the limit",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "close_stage"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D03",
+      "title": "Limit flag uses >=, not only equality",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 4,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "close_stage"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D04",
+      "title": "Minor findings are reworked before the limit",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "rework_same_stage"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D05",
+      "title": "Only minor findings may close at the limit",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "close_stage_ignore_minor"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D06",
+      "title": "Major issue can be fixed in the same contract",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "rework_same_stage"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D07",
+      "title": "Major issue requires a stage contract change",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "rework_change_stage_contract"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D08",
+      "title": "Plan change dominates stage rework",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": true,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "rework_change_pipeline_plan"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D09",
+      "title": "Plan change remains allowed at the iteration limit",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": true,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "rework_change_pipeline_plan"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D10",
+      "title": "TASK change dominates the other correction choices",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": true,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": true,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "architectural_proposal"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D11",
+      "title": "External input with no task/plan/contract change",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "architectural_warning"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D12",
+      "title": "The same external block at the limit",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "architectural_warning"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D13",
+      "title": "HC4 suppresses minor close while external input is required",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "architectural_warning"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D14",
+      "title": "Major issue at limit with no task/plan change has no rule",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "uncovered",
+        "decision": null
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G01"
+      ]
+    },
+    {
+      "id": "D15",
+      "title": "Contract rework cannot be selected at the limit",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "uncovered",
+        "decision": null
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G01"
+      ]
+    },
+    {
+      "id": "D16",
+      "title": "Minor-only contract change before limit has no rule",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "uncovered",
+        "decision": null
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G01"
+      ]
+    },
+    {
+      "id": "D17",
+      "title": "Minor-only plan change before limit has no rule",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": true,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "uncovered",
+        "decision": null
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G01"
+      ]
+    },
+    {
+      "id": "D18",
+      "title": "External input plus contract change has no applicable correction",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "uncovered",
+        "decision": null
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G01"
+      ]
+    },
+    {
+      "id": "D19",
+      "title": "Literal Rule E closes with an external block when HC4 is disabled",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "close_stage_ignore_minor"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G11"
+      ]
+    },
+    {
+      "id": "D20",
+      "title": "Literal Rule E closes despite a plan-change flag",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": true,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 3,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "close_stage_ignore_minor"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G11"
+      ]
+    },
+    {
+      "id": "D21",
+      "title": "Literal Rule F has no no_blocking_issues guard",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": true,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "close_stage"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G11"
+      ]
+    },
+    {
+      "id": "D22",
+      "title": "HC1 filters normal-close applicability before priority",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": true,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "architectural_proposal"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": [
+        "G11"
+      ]
+    },
+    {
+      "id": "D23",
+      "title": "Major plan change remains applicable with external input",
+      "kind": "decision",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            978
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": true,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "counters": {
+          "STAGE_ITERATION": 1,
+          "MAX_STAGE_ITERATIONS": 3
+        }
+      },
+      "event": {
+        "type": "select_decision"
+      },
+      "expected": {
+        "status": "selected",
+        "decision": "rework_change_pipeline_plan"
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D24",
+      "title": "Minor flag cannot be true with no issues",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            773
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": true,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "inconsistent_facts",
+        "required_violations": [
+          "FC1"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D25",
+      "title": "no_blocking_issues must equal its definition",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            773
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "inconsistent_facts",
+        "required_violations": [
+          "FC2"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D26",
+      "title": "Close flag must equal acceptance and no issues",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            773
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "inconsistent_facts",
+        "required_violations": [
+          "FC3"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D27",
+      "title": "A major issue is also an issue",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            773
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "inconsistent_facts",
+        "required_violations": [
+          "FC4"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D28",
+      "title": "Failed acceptance criteria imply a major issue",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            773
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "inconsistent_facts",
+        "required_violations": [
+          "FC5"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D29",
+      "title": "External-input flag excludes a TASK change",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            773
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": true,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": true,
+          "no_blocking_issues": false,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "inconsistent_facts",
+        "required_violations": [
+          "FC6"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D30",
+      "title": "Every decision flag must be supplied",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            689
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "invalid_shape",
+        "missing": [
+          "needs_pipeline_plan_change"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "D31",
+      "title": "A string is not a boolean flag",
+      "kind": "decision_input",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            701
+          ]
+        }
+      ],
+      "given": {
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": "true",
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "validate_decision_facts"
+      },
+      "expected": {
+        "status": "invalid_shape",
+        "non_boolean": [
+          "iteration_limit_reached"
+        ]
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "T01",
+      "title": "Fresh initialization has a partial but explicit effect contract",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            306,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1161,
+            1196
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            752,
+            872
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md"
+        ],
+        "proposed_plan": {
+          "parts": [
+            "storage",
+            "service",
+            "client"
+          ],
+          "stages": [
+            "storage",
+            "service",
+            "client"
+          ]
+        }
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR01"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_SEQUENCE": [
+              "storage",
+              "service",
+              "client"
+            ],
+            "CURRENT_STAGE": "storage",
+            "CURRENT_STAGE_INDEX": 1,
+            "TOTAL_STAGES": 3,
+            "STAGE_ITERATION": 1,
+            "STAGE_STATUS": "in_progress",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder",
+            "ARCHITECT_DECISION": "none"
+          },
+          "must_create": [
+            "PLAN.md",
+            "STAGE.md",
+            "STATE.md"
+          ]
+        },
+        "unassigned_fields": [
+          "MAX_STAGE_ITERATIONS",
+          "CODER_STATUS",
+          "REVIEWER_STATUS",
+          "SEC_REVIEWER_STATUS",
+          "RECOVERY_MODE"
+        ]
+      },
+      "transition_refs": [
+        "TR01"
+      ],
+      "spec_notes": [
+        "G05"
+      ]
+    },
+    {
+      "id": "T02",
+      "title": "Number of solution stages follows the plan, not role count",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1161,
+            1196
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            730,
+            748
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md"
+        ],
+        "proposed_plan": {
+          "parts": [
+            "parser",
+            "model",
+            "store",
+            "service",
+            "cli"
+          ],
+          "stages": [
+            "parser",
+            "model",
+            "store",
+            "service",
+            "cli"
+          ]
+        }
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR01"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "TOTAL_STAGES": 5,
+            "CURRENT_STAGE": "parser",
+            "CURRENT_STAGE_INDEX": 1
+          },
+          "must_create": [
+            "PLAN.md",
+            "STAGE.md",
+            "STATE.md"
+          ]
+        }
+      },
+      "transition_refs": [
+        "TR01"
+      ],
+      "spec_notes": [
+        "G05"
+      ]
+    },
+    {
+      "id": "T03",
+      "title": "Coder hands off to reviewer",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            610,
+            644
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            540,
+            607
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {}
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR02"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "CODER_STATUS": "done",
+            "NEXT_AGENT": "reviewer"
+          },
+          "must_produce": [
+            "implementation.txt",
+            "STATE.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR02"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "T04",
+      "title": "Reviewer hands off even when review conclusion is fail",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            648,
+            681
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            540,
+            607
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "CODER_STATUS": "done",
+          "NEXT_AGENT": "reviewer"
+        },
+        "review_conclusion": "fail"
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR03"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "REVIEWER_STATUS": "done",
+            "NEXT_AGENT": "sec_reviewer"
+          },
+          "must_produce": [
+            "REVIEW.md",
+            "STATE.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR03"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "T05",
+      "title": "Security reviewer hands off even when unsafe to proceed",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            685,
+            719
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            540,
+            607
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "CODER_STATUS": "done",
+          "REVIEWER_STATUS": "done",
+          "NEXT_AGENT": "sec_reviewer"
+        },
+        "security_conclusion": "unsafe to proceed"
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR04"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "SEC_REVIEWER_STATUS": "done",
+            "NEXT_AGENT": "architect"
+          },
+          "must_produce": [
+            "SECURITY_REVIEW.md",
+            "STATE.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR04"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "T06",
+      "title": "Close decision does not open the next stage",
+      "kind": "decision_effect",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            488,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            982,
+            1012
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1315,
+            1325
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "architect_decision"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "ARCHITECT_DECISION": "close_stage",
+            "STAGE_STATUS": "completed"
+          },
+          "state_unchanged": [
+            "CURRENT_STAGE",
+            "CURRENT_STAGE_INDEX",
+            "STAGE_SEQUENCE",
+            "STAGE_ITERATION",
+            "NEXT_AGENT"
+          ],
+          "rename": {
+            "from": "STAGE.md",
+            "to": "<archive>/2_service.md"
+          },
+          "must_not_create": [
+            "next-stage STAGE.md"
+          ]
+        }
+      },
+      "transition_refs": [
+        "TR05",
+        "TR13"
+      ],
+      "spec_notes": [
+        "G07"
+      ]
+    },
+    {
+      "id": "T07",
+      "title": "A rework decision does not itself increment iteration",
+      "kind": "decision_effect",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            488,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            613,
+            665
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            982,
+            997
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        }
+      },
+      "event": {
+        "type": "architect_decision"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "ARCHITECT_DECISION": "rework_same_stage"
+          },
+          "state_not": {
+            "STAGE_STATUS": "completed"
+          },
+          "state_unchanged": [
+            "CURRENT_STAGE",
+            "CURRENT_STAGE_INDEX",
+            "STAGE_SEQUENCE",
+            "STAGE_ITERATION"
+          ],
+          "files_unchanged": [
+            "PLAN.md",
+            "STAGE.md"
+          ]
+        }
+      },
+      "transition_refs": [
+        "TR05"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "T08",
+      "title": "Same-stage rework resets workers and increases only stage iteration",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1200,
+            1214
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1070,
+            1078
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "rework_same_stage",
+          "NEXT_AGENT": "architect",
+          "CODER_STATUS": "done",
+          "REVIEWER_STATUS": "done",
+          "SEC_REVIEWER_STATUS": "done"
+        }
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR06"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "in_progress",
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder",
+            "STAGE_ITERATION": 2
+          },
+          "state_unchanged": [
+            "CURRENT_STAGE",
+            "CURRENT_STAGE_INDEX",
+            "STAGE_SEQUENCE"
+          ],
+          "files_unchanged": [
+            "PLAN.md",
+            "STAGE.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR06"
+      ],
+      "spec_notes": [
+        "G04"
+      ]
+    },
+    {
+      "id": "T09",
+      "title": "Changed-stage rework modifies the contract and keeps stage identity",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1218,
+            1233
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1082,
+            1091
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            471,
+            474
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "rework_change_stage_contract",
+          "NEXT_AGENT": "architect"
+        },
+        "changed_files": [
+          "STAGE.md"
+        ]
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR07"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "in_progress",
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder",
+            "STAGE_ITERATION": 2
+          },
+          "state_unchanged": [
+            "CURRENT_STAGE",
+            "CURRENT_STAGE_INDEX",
+            "STAGE_SEQUENCE"
+          ],
+          "must_update": [
+            "STAGE.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR07"
+      ],
+      "spec_notes": [
+        "G04"
+      ]
+    },
+    {
+      "id": "T10",
+      "title": "PLAN-only changed-stage rework exposes definition/procedure precedence",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1218,
+            1233
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1082,
+            1091
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            471,
+            474
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "rework_change_stage_contract",
+          "NEXT_AGENT": "architect"
+        },
+        "changed_files": [
+          "PLAN.md"
+        ]
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR07"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "in_progress",
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder",
+            "STAGE_ITERATION": 2
+          },
+          "satisfies_specific_procedure": true,
+          "satisfies_general_definition": false
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR07"
+      ],
+      "spec_notes": [
+        "G06"
+      ]
+    },
+    {
+      "id": "T11",
+      "title": "Plan change can return from service to earlier storage",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            732,
+            739
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1095,
+            1105
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "rework_change_pipeline_plan",
+          "NEXT_AGENT": "architect",
+          "STAGE_ITERATION": 3
+        },
+        "proposed_sequence": [
+          "storage",
+          "service",
+          "client"
+        ],
+        "proposed_current_stage": "storage"
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR08"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "in_progress",
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder",
+            "STAGE_ITERATION": 1,
+            "CURRENT_STAGE": "storage",
+            "CURRENT_STAGE_INDEX": 1,
+            "TOTAL_STAGES": 3
+          },
+          "must_update": [
+            "PLAN.md"
+          ],
+          "automatic_workspace_rollback": "not specified"
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR08"
+      ],
+      "spec_notes": [
+        "G04",
+        "G07",
+        "G12"
+      ]
+    },
+    {
+      "id": "T12",
+      "title": "Plan change can insert a new stage and recompute total/index",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            732,
+            739
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1095,
+            1105
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "rework_change_pipeline_plan",
+          "NEXT_AGENT": "architect"
+        },
+        "proposed_sequence": [
+          "storage",
+          "cache",
+          "service",
+          "client"
+        ],
+        "proposed_current_stage": "cache"
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR08"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "in_progress",
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder",
+            "STAGE_ITERATION": 1,
+            "STAGE_SEQUENCE": [
+              "storage",
+              "cache",
+              "service",
+              "client"
+            ],
+            "CURRENT_STAGE": "cache",
+            "CURRENT_STAGE_INDEX": 2,
+            "TOTAL_STAGES": 4
+          },
+          "must_update": [
+            "PLAN.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR08"
+      ],
+      "spec_notes": [
+        "G04",
+        "G07",
+        "G12"
+      ]
+    },
+    {
+      "id": "T13",
+      "title": "Plan change can remove a future stage",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            732,
+            739
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1095,
+            1105
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "rework_change_pipeline_plan",
+          "NEXT_AGENT": "architect"
+        },
+        "proposed_sequence": [
+          "storage",
+          "service"
+        ],
+        "proposed_current_stage": "service"
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR08"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "in_progress",
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder",
+            "STAGE_ITERATION": 1,
+            "STAGE_SEQUENCE": [
+              "storage",
+              "service"
+            ],
+            "CURRENT_STAGE": "service",
+            "CURRENT_STAGE_INDEX": 2,
+            "TOTAL_STAGES": 2
+          },
+          "must_update": [
+            "PLAN.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR08"
+      ],
+      "spec_notes": [
+        "G04",
+        "G12"
+      ]
+    },
+    {
+      "id": "T14",
+      "title": "Opening the next stage has an unresolved status assignment",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            395,
+            409
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1237,
+            1251
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "close_stage",
+          "STAGE_STATUS": "completed",
+          "NEXT_AGENT": "architect"
+        }
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR09"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "CURRENT_STAGE": "client",
+            "CURRENT_STAGE_INDEX": 3,
+            "STAGE_ITERATION": 1,
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder"
+          },
+          "must_update": [
+            "STAGE.md"
+          ],
+          "unspecified": [
+            "STAGE_STATUS",
+            "ARCHITECT_DECISION consumption"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR09"
+      ],
+      "spec_notes": [
+        "G04",
+        "G07"
+      ]
+    },
+    {
+      "id": "T15",
+      "title": "Last stage returns control to the user without opening another stage",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            395,
+            409
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1256,
+            1263
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "close_stage",
+          "STAGE_STATUS": "completed",
+          "NEXT_AGENT": "architect",
+          "CURRENT_STAGE": "client",
+          "CURRENT_STAGE_INDEX": 3
+        }
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR10"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "user"
+          },
+          "must_not_create": [
+            "next-stage STAGE.md"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR10"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "T16",
+      "title": "Unapplied proposal stays blocked",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            413,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1267,
+            1275
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            174,
+            199
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "architectural_proposal",
+          "STAGE_STATUS": "blocked",
+          "NEXT_AGENT": "architect"
+        },
+        "files_add": [
+          "ARCHITECTURE_PROPOSAL.md"
+        ],
+        "proposal_applied": false
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR11"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "blocked",
+            "NEXT_AGENT": "user"
+          },
+          "global_obligation": {
+            "RECOVERY_MODE": true
+          },
+          "pipeline_advance": false
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR11"
+      ],
+      "spec_notes": [
+        "G03",
+        "G08"
+      ]
+    },
+    {
+      "id": "T17",
+      "title": "Warning stays blocked",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            413,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1267,
+            1275
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            174,
+            199
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "architectural_warning",
+          "STAGE_STATUS": "blocked",
+          "NEXT_AGENT": "architect"
+        }
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR11"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "blocked",
+            "NEXT_AGENT": "user"
+          },
+          "global_obligation": {
+            "RECOVERY_MODE": true
+          },
+          "pipeline_advance": false
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR11"
+      ],
+      "spec_notes": [
+        "G03",
+        "G08"
+      ]
+    },
+    {
+      "id": "T18",
+      "title": "Applied user proposal has effects but no fully defined recovery admission",
+      "kind": "procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            420,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1279,
+            1292
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "ARCHITECT_DECISION": "architectural_proposal",
+          "STAGE_STATUS": "blocked",
+          "RECOVERY_MODE": true,
+          "NEXT_AGENT": "user",
+          "STAGE_ITERATION": 3
+        },
+        "files_add": [
+          "ARCHITECTURE_PROPOSAL.md"
+        ],
+        "proposal_applied": true,
+        "TASK_changed_by": "user"
+      },
+      "event": {
+        "type": "apply_procedure",
+        "procedure": "TR12"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "STAGE_STATUS": "in_progress",
+            "CODER_STATUS": "pending",
+            "REVIEWER_STATUS": "pending",
+            "SEC_REVIEWER_STATUS": "pending",
+            "ARCHITECT_STATUS": "done",
+            "NEXT_AGENT": "coder"
+          },
+          "unspecified": [
+            "recovery/user-to-architect admission",
+            "STAGE_ITERATION after proposal",
+            "ARCHITECT_DECISION consumption"
+          ]
+        },
+        "assertion_scope": "local procedure effects; global admission must be checked separately"
+      },
+      "transition_refs": [
+        "TR12"
+      ],
+      "spec_notes": [
+        "G03",
+        "G04"
+      ]
+    },
+    {
+      "id": "V01",
+      "title": "Non-architect admission rejects wrong actor or invalid visible values",
+      "kind": "admission",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            103,
+            125
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            559,
+            580
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "NEXT_AGENT": "reviewer"
+        }
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "coder"
+      },
+      "expected": {
+        "assert": {
+          "stop_immediately": true,
+          "must_not_modify_any_files": true,
+          "further_actions": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V02",
+      "title": "Non-architect admission rejects wrong actor or invalid visible values",
+      "kind": "admission",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            103,
+            125
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            559,
+            580
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "NEXT_AGENT": "reviewer",
+          "REVIEWER_STATUS": "unknown"
+        }
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "reviewer"
+      },
+      "expected": {
+        "assert": {
+          "stop_immediately": true,
+          "must_not_modify_any_files": true,
+          "further_actions": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V03",
+      "title": "Missing required input stops coder",
+      "kind": "admission",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            454,
+            477
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            559,
+            580
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "NEXT_AGENT": "coder"
+        },
+        "files_remove": [
+          "STAGE.md"
+        ]
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "coder"
+      },
+      "expected": {
+        "assert": {
+          "stop_immediately": true,
+          "must_not_modify_any_files": true,
+          "further_actions": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V04",
+      "title": "Missing required input stops reviewer",
+      "kind": "admission",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            454,
+            477
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            559,
+            580
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "NEXT_AGENT": "reviewer"
+        },
+        "files_remove": [
+          "STAGE.md"
+        ]
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "reviewer"
+      },
+      "expected": {
+        "assert": {
+          "stop_immediately": true,
+          "must_not_modify_any_files": true,
+          "further_actions": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V05",
+      "title": "Missing required input stops sec_reviewer",
+      "kind": "admission",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            454,
+            477
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            559,
+            580
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "NEXT_AGENT": "sec_reviewer"
+        },
+        "files_remove": [
+          "PLAN.md"
+        ]
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "sec_reviewer"
+      },
+      "expected": {
+        "assert": {
+          "stop_immediately": true,
+          "must_not_modify_any_files": true,
+          "further_actions": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V06",
+      "title": "Missing optional reviews do not block coder",
+      "kind": "admission",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            481,
+            492
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            610,
+            644
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "files_remove": [
+          "REVIEW.md",
+          "SECURITY_REVIEW.md"
+        ]
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "coder"
+      },
+      "expected": {
+        "assert": {
+          "input_admission": true
+        }
+      },
+      "transition_refs": [
+        "TR02"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "V07",
+      "title": "A missing required output makes the step invalid",
+      "kind": "output_validation",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            66,
+            78
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            454,
+            477
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "NEXT_AGENT": "reviewer"
+        }
+      },
+      "event": {
+        "type": "finish_agent_step",
+        "role": "reviewer",
+        "outputs": [
+          "STATE.md"
+        ]
+      },
+      "expected": {
+        "assert": {
+          "step_valid": false
+        },
+        "workspace_rollback": "not specified"
+      },
+      "transition_refs": [
+        "TR03"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "V08",
+      "title": "Prose without STATE.md cannot update legacy state",
+      "kind": "output_validation",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            889,
+            905
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage"
+      },
+      "event": {
+        "type": "finish_agent_step",
+        "outputs": [
+          "implementation.txt"
+        ],
+        "prose": "NEXT_AGENT=reviewer"
+      },
+      "expected": {
+        "assert": {
+          "state_updated": false
+        }
+      },
+      "transition_refs": [
+        "TR02"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "V09",
+      "title": "A role writing another role status violates ownership",
+      "kind": "output_validation",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            774,
+            788
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage"
+      },
+      "event": {
+        "type": "finish_agent_step",
+        "role": "coder",
+        "state_writes": {
+          "REVIEWER_STATUS": "done"
+        }
+      },
+      "expected": {
+        "assert": {
+          "step_valid": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V10",
+      "title": "Architect cannot modify pipeline rule files",
+      "kind": "output_validation",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            19,
+            31
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready"
+      },
+      "event": {
+        "type": "finish_agent_step",
+        "role": "architect",
+        "changed_files": [
+          "PIPELINE_RULES.architect.md"
+        ]
+      },
+      "expected": {
+        "assert": {
+          "step_valid": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V11",
+      "title": "Architect execution step cannot produce implementation or reviews",
+      "kind": "output_validation",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            432,
+            449
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready"
+      },
+      "event": {
+        "type": "finish_agent_step",
+        "role": "architect",
+        "outputs": [
+          "STATE.md",
+          "implementation.txt",
+          "REVIEW.md"
+        ]
+      },
+      "expected": {
+        "assert": {
+          "step_valid": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V12",
+      "title": "Stage names cannot encode agent execution order",
+      "kind": "state_validation",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            224,
+            233
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            730,
+            748
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "STAGE_SEQUENCE": [
+            "coder",
+            "reviewer",
+            "sec_reviewer"
+          ]
+        }
+      },
+      "event": {
+        "type": "validate_full_state"
+      },
+      "expected": {
+        "assert": {
+          "state_valid": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V13",
+      "title": "Stage index and total must match the sequence",
+      "kind": "state_validation",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            105,
+            128
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "CURRENT_STAGE_INDEX": 1,
+          "TOTAL_STAGES": 4
+        }
+      },
+      "event": {
+        "type": "validate_full_state"
+      },
+      "expected": {
+        "assert": {
+          "state_valid": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V14",
+      "title": "A replan target outside the proposed sequence is invalid",
+      "kind": "state_validation",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            76,
+            89
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "CURRENT_STAGE": "missing"
+        }
+      },
+      "event": {
+        "type": "validate_full_state"
+      },
+      "expected": {
+        "assert": {
+          "state_valid": false
+        }
+      },
+      "transition_refs": [
+        "TR08"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "V15",
+      "title": "Planning-only first stage is invalid",
+      "kind": "initialization_validation",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            182,
+            198
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1179,
+            1196
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md"
+        ],
+        "proposed_stage": {
+          "implementation_required": false,
+          "outputs": [
+            "design.md"
+          ]
+        }
+      },
+      "event": {
+        "type": "initialize_pipeline"
+      },
+      "expected": {
+        "assert": {
+          "initialization_valid": false
+        }
+      },
+      "transition_refs": [
+        "TR01"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "V16",
+      "title": "Multiple architecture parts cannot collapse into a single stage",
+      "kind": "initialization_validation",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1184,
+            1196
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "parts": [
+          "storage",
+          "service"
+        ],
+        "stages": [
+          "all_work"
+        ]
+      },
+      "event": {
+        "type": "initialize_pipeline"
+      },
+      "expected": {
+        "assert": {
+          "initialization_valid": false
+        }
+      },
+      "transition_refs": [
+        "TR01"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "V17",
+      "title": "Grouped parts with several stages expose cardinality precedence",
+      "kind": "initialization_validation",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            730,
+            748
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1184,
+            1196
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "parts": [
+          "storage",
+          "cache",
+          "service"
+        ],
+        "stages": [
+          "storage",
+          "service"
+        ],
+        "stage_parts": {
+          "storage": [
+            "storage",
+            "cache"
+          ],
+          "service": [
+            "service"
+          ]
+        }
+      },
+      "event": {
+        "type": "initialize_pipeline"
+      },
+      "expected": {
+        "assert": {
+          "satisfies_specific_procedure": true,
+          "satisfies_shared_exact_cardinality": false
+        }
+      },
+      "transition_refs": [
+        "TR01"
+      ],
+      "spec_notes": [
+        "G09"
+      ]
+    },
+    {
+      "id": "V18",
+      "title": "No default value for the iteration limit is supplied",
+      "kind": "state_validation",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            824,
+            829
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "MAX_STAGE_ITERATIONS": 1
+        }
+      },
+      "event": {
+        "type": "validate_full_state"
+      },
+      "expected": {
+        "assert": {
+          "state_valid": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": [
+        "G05"
+      ]
+    },
+    {
+      "id": "V19",
+      "title": "Decision cannot both close and open the next stage",
+      "kind": "output_validation",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            558,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            982,
+            1012
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready"
+      },
+      "event": {
+        "type": "architect_decision",
+        "state_writes": {
+          "ARCHITECT_DECISION": "close_stage",
+          "STAGE_STATUS": "completed",
+          "CURRENT_STAGE": "client"
+        }
+      },
+      "expected": {
+        "assert": {
+          "step_valid": false
+        }
+      },
+      "transition_refs": [
+        "TR05",
+        "TR09"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "V20",
+      "title": "Review contains all requirements/findings and no severity classification",
+      "kind": "artifact_contract",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            913,
+            967
+          ]
+        }
+      ],
+      "given": {
+        "role": "reviewer"
+      },
+      "event": {
+        "type": "validate_review_contract"
+      },
+      "expected": {
+        "assert": {
+          "required_sections": [
+            "Scope",
+            "Checked items",
+            "Findings",
+            "Violations",
+            "Conclusion"
+          ],
+          "item_statuses": [
+            "implemented",
+            "not implemented",
+            "unclear"
+          ],
+          "conclusions": [
+            "pass",
+            "fail"
+          ],
+          "all_stage_requirements_checked": true,
+          "all_mismatches_listed": true,
+          "severity_classification_allowed": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V21",
+      "title": "Security report retains every finding without severity classification",
+      "kind": "artifact_contract",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            970,
+            1006
+          ]
+        }
+      ],
+      "given": {
+        "role": "sec_reviewer"
+      },
+      "event": {
+        "type": "validate_security_review_contract"
+      },
+      "expected": {
+        "assert": {
+          "required_sections": [
+            "Scope",
+            "Findings",
+            "Conclusion"
+          ],
+          "conclusions": [
+            "safe",
+            "unsafe to proceed"
+          ],
+          "all_risks_listed": true,
+          "severity_classification_allowed": false,
+          "PLAN_is_security_context": true
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": []
+    },
+    {
+      "id": "V22",
+      "title": "Proposal describes a TASK change; architect does not apply it",
+      "kind": "artifact_contract",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            240,
+            270
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            420,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            432,
+            449
+          ]
+        }
+      ],
+      "given": {
+        "role": "architect"
+      },
+      "event": {
+        "type": "validate_proposal_contract"
+      },
+      "expected": {
+        "assert": {
+          "required_sections": [
+            "Scope",
+            "Problem",
+            "Proposed change",
+            "Rationale"
+          ],
+          "proposed_change_target": "TASK.md",
+          "TASK_mutation_by_architect_allowed": false
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": [
+        "G08"
+      ]
+    },
+    {
+      "id": "V23",
+      "title": "Warning requires TASK-oriented evidence in the supplied format",
+      "kind": "artifact_contract",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            203,
+            236
+          ]
+        }
+      ],
+      "given": {
+        "role": "architect"
+      },
+      "event": {
+        "type": "validate_warning_contract"
+      },
+      "expected": {
+        "assert": {
+          "required_sections": [
+            "Scope",
+            "Violations",
+            "Impact",
+            "Recommendation"
+          ],
+          "comparison_target": "TASK.md"
+        }
+      },
+      "transition_refs": [],
+      "spec_notes": [
+        "G08"
+      ]
+    },
+    {
+      "id": "V24",
+      "title": "Missing TASK stops architect before initialization",
+      "kind": "admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            294,
+            310
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            454,
+            474
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            559,
+            580
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": []
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "architect"
+      },
+      "expected": {
+        "assert": {
+          "stop_immediately": true,
+          "must_not_modify_any_files": true,
+          "initialization_allowed": false
+        }
+      },
+      "transition_refs": [
+        "TR01"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "R01",
+      "title": "Missing state with prior PLAN.md is recovery, not fresh initialization",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            312,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md",
+          "PLAN.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R02",
+      "title": "Missing state with prior STAGE.md is recovery, not fresh initialization",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            312,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md",
+          "STAGE.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R03",
+      "title": "Missing state with prior REVIEW.md is recovery, not fresh initialization",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            312,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md",
+          "REVIEW.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R04",
+      "title": "Missing state with prior SECURITY_REVIEW.md is recovery, not fresh initialization",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            312,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md",
+          "SECURITY_REVIEW.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R05",
+      "title": "Missing state with prior ARCHITECTURE_PROPOSAL.md is recovery, not fresh initialization",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            312,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md",
+          "ARCHITECTURE_PROPOSAL.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R06",
+      "title": "Missing state with prior ARCHITECTURE_WARNING.md is recovery, not fresh initialization",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            312,
+            327
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "state": null,
+        "files_present": [
+          "TASK.md",
+          "ARCHITECTURE_WARNING.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R07",
+      "title": "Malformed full state enters recovery",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            329,
+            338
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "TOTAL_STAGES": 0
+        }
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R08",
+      "title": "Unexpected architect activation enters recovery",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            329,
+            338
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage"
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R09",
+      "title": "Missing PLAN for existing state enters recovery",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            340,
+            342
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "files_remove": [
+          "PLAN.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R10",
+      "title": "Changed-contract action requires STAGE.md",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            344,
+            346
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "ARCHITECT_DECISION": "rework_change_stage_contract"
+        },
+        "files_remove": [
+          "STAGE.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R11",
+      "title": "Proposal action with no proposal file enters recovery",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            348,
+            350
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "ARCHITECT_DECISION": "architectural_proposal"
+        }
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R12",
+      "title": "Decision requires completed CODER_STATUS",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            501,
+            518
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "CODER_STATUS": "pending"
+        }
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R13",
+      "title": "Decision requires completed REVIEWER_STATUS",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            501,
+            518
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "REVIEWER_STATUS": "pending"
+        }
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R14",
+      "title": "Decision requires completed SEC_REVIEWER_STATUS",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            501,
+            518
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "SEC_REVIEWER_STATUS": "pending"
+        }
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R15",
+      "title": "Decision requires in-progress stage",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            501,
+            518
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "STAGE_STATUS": "pending"
+        }
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R16",
+      "title": "Decision requires both reviews to be present",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            490,
+            518
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "files_remove": [
+          "SECURITY_REVIEW.md"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R17",
+      "title": "No ordinary worker may act while recovery is active",
+      "kind": "recovery_gate",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            183,
+            186
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "RECOVERY_MODE": true
+        }
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "coder"
+      },
+      "expected": {
+        "assert": {
+          "agent_step_allowed": false,
+          "pipeline_advance": false
+        }
+      },
+      "transition_refs": [
+        "TR15"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "R18",
+      "title": "Architect may validate, but cannot repair or advance under the recovery gate",
+      "kind": "recovery_gate",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            183,
+            186
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "RECOVERY_MODE": true
+        }
+      },
+      "event": {
+        "type": "start_agent_step",
+        "role": "architect"
+      },
+      "expected": {
+        "assert": {
+          "allowed_actions": [
+            "validate current state"
+          ],
+          "pipeline_advance": false
+        }
+      },
+      "transition_refs": [
+        "TR15"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R19",
+      "title": "Valid but blocked state cannot leave recovery",
+      "kind": "recovery_gate",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            188,
+            199
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "RECOVERY_MODE": true,
+          "STAGE_STATUS": "blocked",
+          "ARCHITECT_DECISION": "architectural_warning"
+        }
+      },
+      "event": {
+        "type": "exit_recovery"
+      },
+      "expected": {
+        "assert": {
+          "clear_recovery_allowed": false
+        }
+      },
+      "transition_refs": [
+        "TR16"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "R20",
+      "title": "Invalid nonblocked state cannot leave recovery",
+      "kind": "recovery_gate",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            188,
+            199
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "RECOVERY_MODE": true,
+          "CURRENT_STAGE_INDEX": 0
+        }
+      },
+      "event": {
+        "type": "exit_recovery"
+      },
+      "expected": {
+        "assert": {
+          "clear_recovery_allowed": false
+        }
+      },
+      "transition_refs": [
+        "TR16"
+      ],
+      "spec_notes": []
+    },
+    {
+      "id": "R21",
+      "title": "Recovery exit effects are conditional on recovery already being completed",
+      "kind": "recovery_exit",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            188,
+            199
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "RECOVERY_MODE": true
+        },
+        "state_valid": true,
+        "recovery_completed": true
+      },
+      "event": {
+        "type": "exit_recovery"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": false,
+            "STAGE_STATUS": "in_progress"
+          },
+          "full_state_revalidation_required": true
+        },
+        "unspecified": [
+          "producer of recovery_completed",
+          "NEXT_AGENT selection for an ambiguous control position"
+        ]
+      },
+      "transition_refs": [
+        "TR16"
+      ],
+      "spec_notes": [
+        "G02",
+        "G03"
+      ]
+    },
+    {
+      "id": "R22",
+      "title": "A corrupt state does not authorize rerunning the last worker",
+      "kind": "recovery_gate",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            183,
+            199
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "state_patch": {
+          "RECOVERY_MODE": true,
+          "TOTAL_STAGES": 0
+        },
+        "implementation_may_have_changed": true
+      },
+      "event": {
+        "type": "automatic_retry_request"
+      },
+      "expected": {
+        "assert": {
+          "ordinary_execution_allowed": false
+        },
+        "repair_and_replay_contract": "not supplied"
+      },
+      "transition_refs": [
+        "TR14",
+        "TR15"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "R23",
+      "title": "Archive collision after rollback has no specified resolution",
+      "kind": "file_effect",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1315,
+            1325
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            732,
+            739
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "files_add": [
+          "<archive>/2_service.md"
+        ]
+      },
+      "event": {
+        "type": "archive_closed_stage"
+      },
+      "expected": {
+        "status": "unresolved",
+        "unspecified": [
+          "overwrite existing archive",
+          "keep several revisions",
+          "reject collision"
+        ]
+      },
+      "transition_refs": [
+        "TR13"
+      ],
+      "spec_notes": [
+        "G07"
+      ]
+    },
+    {
+      "id": "R24",
+      "title": "Missing architect decision field enters recovery",
+      "kind": "recovery_admission",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            329,
+            338
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "absent_state_fields": [
+          "ARCHITECT_DECISION"
+        ]
+      },
+      "event": {
+        "type": "architect_input_validation"
+      },
+      "expected": {
+        "assert": {
+          "state_subset": {
+            "RECOVERY_MODE": true,
+            "NEXT_AGENT": "architect"
+          },
+          "stop_immediately": true,
+          "further_actions": false
+        },
+        "full_repaired_state": "unspecified"
+      },
+      "transition_refs": [
+        "TR14"
+      ],
+      "spec_notes": [
+        "G02"
+      ]
+    },
+    {
+      "id": "S01",
+      "title": "Successful iteration fixes a decision before a separate stage-open action",
+      "kind": "sequence",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            610,
+            719
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            488,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1237,
+            1251
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "decision_flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": false,
+          "has_major_issue": false,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": true,
+          "can_close_normally": true,
+          "acceptance_criteria_satisfied": true
+        }
+      },
+      "event": {
+        "type": "ordered_steps",
+        "steps": [
+          "TR02",
+          "TR03",
+          "TR04",
+          "TR05",
+          "TR09"
+        ]
+      },
+      "expected": {
+        "assert": {
+          "NEXT_AGENT_trace_through_decision": [
+            "coder",
+            "reviewer",
+            "sec_reviewer",
+            "architect",
+            "architect"
+          ],
+          "decision": "close_stage",
+          "stage_index_at_decision": 2,
+          "stage_index_after_open": 3,
+          "archive_before_next_stage": true
+        },
+        "full_trace_status": "partial_due_to_open_stage_gap"
+      },
+      "transition_refs": [
+        "TR02",
+        "TR03",
+        "TR04",
+        "TR05",
+        "TR09",
+        "TR13"
+      ],
+      "spec_notes": [
+        "G04",
+        "G07"
+      ]
+    },
+    {
+      "id": "S02",
+      "title": "A failed review still reaches security review and architect decision",
+      "kind": "sequence",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            648,
+            719
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            488,
+            528
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "middle_stage",
+        "review_conclusion": "fail",
+        "security_conclusion": "unsafe to proceed",
+        "decision_flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        }
+      },
+      "event": {
+        "type": "ordered_steps",
+        "steps": [
+          "TR02",
+          "TR03",
+          "TR04",
+          "TR05",
+          "TR06"
+        ]
+      },
+      "expected": {
+        "assert": {
+          "role_order": [
+            "coder",
+            "reviewer",
+            "sec_reviewer",
+            "architect"
+          ],
+          "decision": "rework_same_stage",
+          "iteration_at_decision": 1,
+          "iteration_after_rework": 2,
+          "stage_after_rework": "service"
+        }
+      },
+      "transition_refs": [
+        "TR02",
+        "TR03",
+        "TR04",
+        "TR05",
+        "TR06"
+      ],
+      "spec_notes": [
+        "G04"
+      ]
+    },
+    {
+      "id": "S03",
+      "title": "Plan rework can return an already advanced project to an earlier solution stage",
+      "kind": "sequence",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            732,
+            739
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            799,
+            819
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "state_patch": {
+          "CURRENT_STAGE": "client",
+          "CURRENT_STAGE_INDEX": 3,
+          "STAGE_ITERATION": 3
+        },
+        "decision_flags": {
+          "requires_task_change": false,
+          "iteration_limit_reached": true,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": true,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        },
+        "proposed_sequence": [
+          "storage",
+          "service",
+          "client"
+        ],
+        "proposed_current_stage": "storage"
+      },
+      "event": {
+        "type": "ordered_steps",
+        "steps": [
+          "TR05",
+          "TR08"
+        ]
+      },
+      "expected": {
+        "assert": {
+          "decision": "rework_change_pipeline_plan",
+          "stage_at_decision": "client",
+          "stage_after_plan_change": "storage",
+          "stage_index_after_plan_change": 1,
+          "iteration_after_plan_change": 1,
+          "NEXT_AGENT_after_plan_change": "coder"
+        },
+        "workspace_restoration": "unspecified"
+      },
+      "transition_refs": [
+        "TR05",
+        "TR08"
+      ],
+      "spec_notes": [
+        "G04",
+        "G07",
+        "G12"
+      ]
+    },
+    {
+      "id": "S04",
+      "title": "User proposal waits before a separate application step",
+      "kind": "sequence",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            413,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            174,
+            199
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1279,
+            1292
+          ]
+        }
+      ],
+      "given": {
+        "fixture": "decision_ready",
+        "decision_flags": {
+          "requires_task_change": true,
+          "iteration_limit_reached": false,
+          "issues_exist": true,
+          "has_major_issue": true,
+          "has_only_minor_issues": false,
+          "needs_stage_contract_change": false,
+          "needs_pipeline_plan_change": false,
+          "stage_cannot_continue_without_external_input": false,
+          "no_blocking_issues": false,
+          "can_close_normally": false,
+          "acceptance_criteria_satisfied": false
+        }
+      },
+      "event": {
+        "type": "intended_steps",
+        "steps": [
+          "TR05",
+          "TR11",
+          "user applies proposal",
+          "TR12"
+        ]
+      },
+      "expected": {
+        "assert": {
+          "decision": "architectural_proposal",
+          "status_after_decision": "blocked",
+          "TASK_changed_by": "user"
+        },
+        "full_trace_status": "unresolved_recovery_and_admission_order"
+      },
+      "transition_refs": [
+        "TR05",
+        "TR11",
+        "TR12"
+      ],
+      "spec_notes": [
+        "G03",
+        "G08"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,431 @@
+{
+  "format_version": 1,
+  "user_policy_resolutions": [],
+  "notes": [
+    {
+      "id": "G01",
+      "status": "open",
+      "title": "No total decision coverage",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            784,
+            887
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            891,
+            978
+          ]
+        }
+      ],
+      "evidence": "Warning has an explicit positive condition only in HC4. Allowed at the iteration limit does not mean applicable. Fourteen of the 96 vectors satisfying the stated consistency relations match no decision.",
+      "oracle_boundary": "Expected decision is null with status uncovered. Do not insert a catch-all warning or silently relax the limit."
+    },
+    {
+      "id": "G02",
+      "status": "open",
+      "title": "Recovery detection and exit do not define a repair procedure",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            143,
+            152
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            174,
+            199
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            306,
+            350
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1149,
+            1158
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            431,
+            441
+          ]
+        }
+      ],
+      "evidence": "Recovery admits validation only; invalid state entry stops immediately. Clearing recovery requires valid and nonblocked state, but no actor, trusted reconstruction source, repair transaction, or admissible field changes are specified. Entry may occur even when STATE.md is missing.",
+      "oracle_boundary": "Test detection, stop, and necessary exit conditions. No automatic repair, replay, retry, or recovery-complete event is inferred. Application rework is not permission to repair an invalid state."
+    },
+    {
+      "id": "G03",
+      "status": "open",
+      "title": "Blocked decisions and recovery gates overlap",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            174,
+            199
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            420,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            558,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            646,
+            653
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1267,
+            1292
+          ]
+        }
+      ],
+      "evidence": "A blocked stage requires RECOVERY_MODE=true, but a decision may write only decision/status. A proposal-applied path advances to coder, while active recovery allows validation only and clearing requires an already nonblocked stage. Returning NEXT_AGENT from user to architect is not specified.",
+      "oracle_boundary": "Keep blocked decision effects, wait effects, and proposal-application effects as separate procedure assertions. Do not invent their admission order or bypass recovery."
+    },
+    {
+      "id": "G04",
+      "status": "open",
+      "title": "Open-stage status and control-action consumption are unspecified",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            367,
+            428
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            508,
+            514
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1237,
+            1251
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1200,
+            1233
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "evidence": "Open next stage resets role statuses and iteration but does not assign STAGE_STATUS=in_progress or consume ARCHITECT_DECISION. Rework and proposal/plan application also leave a previous decision with no explicit consumption marker; routing architect step versus architect decision step is not encoded.",
+      "oracle_boundary": "Assert the stated per-procedure effects; mark next-stage status and dispatch/consumption as unresolved instead of introducing defaults or repeated execution."
+    },
+    {
+      "id": "G05",
+      "status": "open",
+      "title": "Initialization leaves required values without defaults",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            752,
+            872
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            105,
+            139
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1161,
+            1196
+          ]
+        }
+      ],
+      "evidence": "Initialization lists seven assignments but the state has fourteen required fields. Index 1 and total length follow from validity; MAX_STAGE_ITERATIONS has only integer >1, and initial worker statuses/RECOVERY_MODE are not assigned.",
+      "oracle_boundary": "Record derived index/total and the limit domain, but do not choose the limit or worker/recovery defaults. A test fixture with these fields is an input, not evidence of initializer behavior."
+    },
+    {
+      "id": "G06",
+      "status": "resolved_by_source_precedence",
+      "title": "Changed-stage procedure permits PLAN-only change while the definition requires STAGE",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            1082,
+            1091
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1218,
+            1233
+          ]
+        }
+      ],
+      "evidence": "The definition requires STAGE.md to change; the specific procedure requires at least STAGE.md or PLAN.md. Specific-over-general gives the procedure precedence, but the text describes two observable contracts.",
+      "oracle_boundary": "Record the precedence-derived PLAN-only case explicitly, pending parity confirmation. Cases modifying STAGE.md satisfy both texts.",
+      "resolution_source": {
+        "source": "architect",
+        "lines": [
+          5,
+          17
+        ]
+      },
+      "resolution": "Apply the specific architect procedure; retain the superseded wording as evidence. This is a source-derived precedence resolution, not new policy."
+    },
+    {
+      "id": "G07",
+      "status": "open",
+      "title": "Archive move removes a file still used by current-stage validity; rollback can collide",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            76,
+            89
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1315,
+            1325
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            558,
+            578
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "evidence": "Closing renames STAGE.md to an index/name path, while current-stage validity says CURRENT_STAGE must match STAGE.md. No post-close missing-file exception, archive collision policy on revisit, or rollback contract restoration is given.",
+      "oracle_boundary": "Assert rename/path and separate close/open steps. Missing-file interpretation, repeated archive replacement, and contract restoration remain unresolved. No workspace rollback is inferred."
+    },
+    {
+      "id": "G08",
+      "status": "open",
+      "title": "Proposal and warning artifact obligations differ across sections",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            203,
+            288
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            344,
+            350
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            535,
+            554
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            743,
+            746
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            837,
+            849
+          ]
+        }
+      ],
+      "evidence": "Decision output makes warning/proposal optional, but the next proposal action requires the proposal file. Warning content requires TASK violations even for external-input blockers; introductory prose calls a proposal a plan change while its body requires a TASK change.",
+      "oracle_boundary": "Preserve exact artifact formats and the missing-proposal recovery check. Do not auto-generate a proposal, infer a TASK violation for every warning, or change MAY to MUST silently."
+    },
+    {
+      "id": "G09",
+      "status": "resolved_by_source_precedence",
+      "title": "Architectural-part to stage cardinality has two formulations",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            730,
+            748
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1161,
+            1196
+          ]
+        }
+      ],
+      "evidence": "Shared rules require exactly one stage per part with matching names. Specific initialization permits a stage to cover one or more parts, covers all parts, and forbids a single stage for multiple parts.",
+      "oracle_boundary": "Keep the one-to-one example and dynamic stage count as definite. Grouped-parts examples expose the precedence issue; no global one-stage-per-role model is introduced.",
+      "resolution_source": {
+        "source": "architect",
+        "lines": [
+          5,
+          17
+        ]
+      },
+      "resolution": "Apply the specific architect procedure; retain the superseded wording as evidence. This is a source-derived precedence resolution, not new policy."
+    },
+    {
+      "id": "G10",
+      "status": "open",
+      "title": "Semantic flags are not fully specified by the supplied files",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            683,
+            773
+          ]
+        },
+        {
+          "source": "shared",
+          "lines": [
+            913,
+            1006
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            5,
+            28
+          ]
+        }
+      ],
+      "evidence": "Architect classifies severity, but no general minor/major criterion is supplied. The archive lacks the referenced OUTPUT_RULES.md and role files; shared.md is a filename alias. Review conclusion alone cannot yield all decision flags.",
+      "oracle_boundary": "Use explicit semantic facts in the oracle and keep prompts/criteria traceable. Do not infer severity from prose, exit codes, or a pass/fail label."
+    },
+    {
+      "id": "G11",
+      "status": "open",
+      "title": "Literal guards admit surprising close decisions",
+      "sources": [
+        {
+          "source": "architect",
+          "lines": [
+            743,
+            763
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            837,
+            865
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            955,
+            978
+          ]
+        }
+      ],
+      "evidence": "no_blocking_issues is computed but unused. HC4 is disabled when contract/plan change is true; Rule E does not itself exclude external input or a plan change. Some admitted vectors therefore select close even with those flags set.",
+      "oracle_boundary": "Preserve the literal table result as evidence, mark witness scenarios unresolved for migration, and do not assert all 96 vectors are semantically realizable or approved policy."
+    },
+    {
+      "id": "G12",
+      "status": "open",
+      "title": "Execution budgets and physical rollback are not legacy contracts",
+      "sources": [
+        {
+          "source": "shared",
+          "lines": [
+            264,
+            278
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            699,
+            701
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            799,
+            819
+          ]
+        },
+        {
+          "source": "architect",
+          "lines": [
+            1296,
+            1311
+          ]
+        }
+      ],
+      "evidence": "Stage rework is bounded, but plan change resets iteration to 1 and remains allowed at the bound. No whole-run transition budget, archive cleanup/invalidation scheme, transaction, or reversal of implementation changes is specified.",
+      "oracle_boundary": "Preserve plan-change and backward-target effects. Treat whole-run bounds and durable recovery as explicit new orchestrator contracts, never as recovered legacy behavior."
+    }
+  ]
+}

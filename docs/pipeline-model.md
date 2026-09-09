@@ -266,6 +266,11 @@ migration must not silently invent behavior. The old rules already contain at
 least one such uncovered decision combination, so an explicit decision table
 is required before declaring parity.
 
+The [legacy pipeline oracle](pipeline-oracle/README.md) preserves the original
+source pair, the extracted decision table and state effects, and formal
+scenarios for this migration. It marks uncovered and ambiguous behavior
+explicitly; its extraction audit is not a production parity test.
+
 The dynamic solution-stage plan remains pipeline context generated from the
 user task. It is not expanded into hard-coded engine states. The stable control
 graph may therefore move among architect, implementation, review, security
