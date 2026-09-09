@@ -10,6 +10,44 @@ import { describeError } from "./docker_helper.ts";
 export type BundleFileErrorClass = new (message: string) => Error;
 
 /**
+ * Canonicalize an absolute bundle root that must be a real directory.
+ * Symlinked roots are allowed (they resolve through realpath); missing
+ * roots, files, and inaccessible roots are rejected fail-closed. The
+ * returned path is the verified canonical directory.
+ */
+export async function requireCanonicalDirectoryRoot(
+  bundleRoot: string,
+  what: string,
+  errorClass: BundleFileErrorClass,
+): Promise<string> {
+  if (!isAbsolute(bundleRoot)) {
+    throw new errorClass(
+      `${what} must be an absolute path, got ${JSON.stringify(bundleRoot)}`,
+    );
+  }
+  let rootCanonical: string;
+  try {
+    rootCanonical = await realpath(bundleRoot);
+  } catch (cause) {
+    throw new errorClass(
+      `${what} ${bundleRoot} cannot be canonicalized: ${describeError(cause)}`,
+    );
+  }
+  let rootInfo;
+  try {
+    rootInfo = await stat(rootCanonical);
+  } catch (cause) {
+    throw new errorClass(
+      `${what} ${rootCanonical} is not accessible: ${describeError(cause)}`,
+    );
+  }
+  if (!rootInfo.isDirectory()) {
+    throw new errorClass(`${what} ${rootCanonical} is not a directory`);
+  }
+  return rootCanonical;
+}
+
+/**
  * Bundle-relative references must be clean: no absolute paths, no home
  * expansion, no empty segments, no `.` or `..` traversal segments; realpath
  * containment inside the bundle is verified separately at load time.

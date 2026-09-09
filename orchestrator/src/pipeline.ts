@@ -1,4 +1,3 @@
-import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { describeError, MAX_RUN_TIMEOUT_SECONDS } from "./docker_helper.ts";
 import { matchesStandardAgentResultSchema } from "./agent_result.ts";
@@ -6,15 +5,94 @@ import { validateProfileName } from "./profile.ts";
 import {
   readBundleFile,
   requireBundleFileInsideRoot,
+  requireCanonicalDirectoryRoot,
   validateBundleRelativePath,
 } from "./bundle_file.ts";
 
 export const PIPELINE_SCHEMA_VERSION = 1;
 
+/**
+ * Schema version 2 (declarative data ports) is loadable through the pure
+ * `pipeline_v2.ts` APIs but is not executable by the production path yet.
+ */
+export const PIPELINE_SCHEMA_VERSION_V2 = 2;
+
 export class PipelineError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PipelineError";
+  }
+}
+
+/**
+ * Shared exact-field spec validators used by both pipeline schema versions.
+ * They throw PipelineError and are exported for the v2 compiler; their
+ * behavior is identical for v1 documents.
+ */
+
+export function expectObject(value: unknown, what: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new PipelineError(`${what} is not a YAML mapping`);
+  }
+  return value as Record<string, unknown>;
+}
+
+export function expectArray(value: unknown, what: string): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new PipelineError(`${what} must be a list, not a mapping or scalar`);
+  }
+  return value;
+}
+
+export function expectNonEmptyString(value: unknown, what: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new PipelineError(`${what} must be a non-empty string`);
+  }
+  return value;
+}
+
+export function expectExactKeys(
+  obj: Record<string, unknown>,
+  keys: readonly string[],
+  what: string,
+): void {
+  const expected = new Set(keys);
+  for (const key of Object.keys(obj)) {
+    if (!expected.has(key)) {
+      throw new PipelineError(`${what} has unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of keys) {
+    if (!(key in obj)) {
+      throw new PipelineError(`${what} is missing required field ${JSON.stringify(key)}`);
+    }
+  }
+}
+
+export function expectPositiveSafeInteger(value: unknown, what: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new PipelineError(
+      `${what} must be a positive safe integer, got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
+const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+export function validateSafeId(value: unknown, what: string): string {
+  const id = expectNonEmptyString(value, what);
+  if (!SAFE_ID_PATTERN.test(id) || id.includes("..")) {
+    throw new PipelineError(`${what} ${JSON.stringify(id)} is not a safe identifier`);
+  }
+  return id;
+}
+
+export function validateProfileReference(name: string): string {
+  try {
+    return validateProfileName(name);
+  } catch (cause) {
+    throw new PipelineError(cause instanceof Error ? cause.message : String(cause));
   }
 }
 
@@ -88,56 +166,6 @@ export interface ResolvedPipeline {
   states: ResolvedState[];
 }
 
-const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
-
-function expectObject(value: unknown, what: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new PipelineError(`${what} is not a YAML mapping`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function expectArray(value: unknown, what: string): unknown[] {
-  if (!Array.isArray(value)) {
-    throw new PipelineError(`${what} must be a list, not a mapping or scalar`);
-  }
-  return value;
-}
-
-function expectNonEmptyString(value: unknown, what: string): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new PipelineError(`${what} must be a non-empty string`);
-  }
-  return value;
-}
-
-function expectExactKeys(
-  obj: Record<string, unknown>,
-  keys: readonly string[],
-  what: string,
-): void {
-  const expected = new Set(keys);
-  for (const key of Object.keys(obj)) {
-    if (!expected.has(key)) {
-      throw new PipelineError(`${what} has unknown field ${JSON.stringify(key)}`);
-    }
-  }
-  for (const key of keys) {
-    if (!(key in obj)) {
-      throw new PipelineError(`${what} is missing required field ${JSON.stringify(key)}`);
-    }
-  }
-}
-
-function expectPositiveSafeInteger(value: unknown, what: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
-    throw new PipelineError(
-      `${what} must be a positive safe integer, got ${JSON.stringify(value)}`,
-    );
-  }
-  return value;
-}
-
 /**
  * Workspace-relative input paths must be clean: no absolute paths, no home
  * expansion, no empty segments, no `.` or `..` traversal segments.
@@ -156,23 +184,7 @@ function validateWorkspaceRelativePath(value: string, what: string): string {
   return value;
 }
 
-function validateSafeId(value: unknown, what: string): string {
-  const id = expectNonEmptyString(value, what);
-  if (!SAFE_ID_PATTERN.test(id) || id.includes("..")) {
-    throw new PipelineError(`${what} ${JSON.stringify(id)} is not a safe identifier`);
-  }
-  return id;
-}
-
-function validateProfileReference(name: string): string {
-  try {
-    return validateProfileName(name);
-  } catch (cause) {
-    throw new PipelineError(cause instanceof Error ? cause.message : String(cause));
-  }
-}
-
-function parseTransition(raw: unknown, stateId: string, index: number): PipelineTransitionSpec {
+export function parseTransition(raw: unknown, stateId: string, index: number): PipelineTransitionSpec {
   const obj = expectObject(raw, `transition ${index} of state ${JSON.stringify(stateId)}`);
   expectExactKeys(obj, ["outcome", "to"], `transition ${index} of state ${JSON.stringify(stateId)}`);
   return {
@@ -237,7 +249,7 @@ function parseAgentState(obj: Record<string, unknown>): AgentStateSpec {
   };
 }
 
-function parseTerminalState(obj: Record<string, unknown>): TerminalStateSpec {
+export function parseTerminalState(obj: Record<string, unknown>): TerminalStateSpec {
   const id = validateSafeId(obj.id, "terminal state id");
   const what = `terminal state ${JSON.stringify(id)}`;
   expectExactKeys(obj, ["id", "type", "result"], what);
@@ -260,31 +272,35 @@ function parseState(raw: unknown, index: number): PipelineStateSpec {
   return type === "agent" ? parseAgentState(obj) : parseTerminalState(obj);
 }
 
-function checkGraph(spec: PipelineSpec): void {
-  const terminalIds = spec.states
+/**
+ * Shared graph-shape validation for both pipeline schema versions: terminal
+ * existence, declared entry state, unique per-state outcomes, declared
+ * transition targets, and agent reachability from the entry state. Port and
+ * input reference checks are version-specific and live with their parsers.
+ */
+export interface GraphShapeState {
+  id: string;
+  type: "agent" | "terminal";
+  transitions: readonly { outcome: string; to: string }[];
+}
+
+export function checkGraphShape(entryState: string, states: readonly GraphShapeState[]): void {
+  const terminalIds = states
     .filter((state) => state.type === "terminal")
     .map((state) => state.id);
   if (terminalIds.length === 0) {
     throw new PipelineError("pipeline must declare at least one terminal state");
   }
-  const stateIds = new Set(spec.states.map((state) => state.id));
-  if (!stateIds.has(spec.entry_state)) {
+  const stateIds = new Set(states.map((state) => state.id));
+  if (!stateIds.has(entryState)) {
     throw new PipelineError(
-      `entry_state ${JSON.stringify(spec.entry_state)} does not name a declared state`,
+      `entry_state ${JSON.stringify(entryState)} does not name a declared state`,
     );
   }
-  const inputIds = new Set(spec.inputs.map((input) => input.id));
   const declaredOutcomeTargets = new Map<string, string[]>();
-  for (const state of spec.states) {
+  for (const state of states) {
     if (state.type !== "agent") {
       continue;
-    }
-    for (const inputId of state.inputs) {
-      if (!inputIds.has(inputId)) {
-        throw new PipelineError(
-          `agent state ${JSON.stringify(state.id)} references undeclared input ${JSON.stringify(inputId)}`,
-        );
-      }
     }
     const outcomes = new Set<string>();
     const targets: string[] = [];
@@ -305,11 +321,11 @@ function checkGraph(spec: PipelineSpec): void {
     declaredOutcomeTargets.set(state.id, targets);
   }
 
-  // reachability from entry_state. Agent states must be reachable from the
-  // entry; terminal states may sit beyond the reachable part (a cycle can
-  // never leave itself, and the transition budget bounds the whole run).
-  const reachable = new Set<string>([spec.entry_state]);
-  const queue: string[] = [spec.entry_state];
+  // reachability from the entry state. Agent states must be reachable from
+  // the entry; terminal states may sit beyond the reachable part (a cycle
+  // can never leave itself, and the transition budget bounds the whole run).
+  const reachable = new Set<string>([entryState]);
+  const queue: string[] = [entryState];
   while (queue.length > 0) {
     const current = queue.pop() ?? "";
     for (const next of declaredOutcomeTargets.get(current) ?? []) {
@@ -319,9 +335,33 @@ function checkGraph(spec: PipelineSpec): void {
       }
     }
   }
-  for (const state of spec.states) {
+  for (const state of states) {
     if (state.type === "agent" && !reachable.has(state.id)) {
       throw new PipelineError(`agent state ${JSON.stringify(state.id)} is not reachable from entry_state`);
+    }
+  }
+}
+
+function checkGraph(spec: PipelineSpec): void {
+  checkGraphShape(
+    spec.entry_state,
+    spec.states.map((state): GraphShapeState => ({
+      id: state.id,
+      type: state.type,
+      transitions: state.type === "agent" ? state.transitions : [],
+    })),
+  );
+  const inputIds = new Set(spec.inputs.map((input) => input.id));
+  for (const state of spec.states) {
+    if (state.type !== "agent") {
+      continue;
+    }
+    for (const inputId of state.inputs) {
+      if (!inputIds.has(inputId)) {
+        throw new PipelineError(
+          `agent state ${JSON.stringify(state.id)} references undeclared input ${JSON.stringify(inputId)}`,
+        );
+      }
     }
   }
 }
@@ -334,6 +374,14 @@ export function parsePipelineSpec(raw: string): PipelineSpec {
     throw new PipelineError(`pipeline is not valid YAML: ${describeError(cause)}`);
   }
   const obj = expectObject(parsed, "pipeline");
+  // A document that declares schema version 2 and carries the v2-only
+  // top-level `outputs` contract is a genuine v2 pipeline: the production
+  // path rejects it explicitly before anything else happens. A version-2
+  // document without the v2 shape falls through to the v1 validation below
+  // and is rejected as an unsupported version, as before.
+  if (obj.schema_version === PIPELINE_SCHEMA_VERSION_V2 && "outputs" in obj) {
+    throw new PipelineError("pipeline schema version 2 is not executable yet");
+  }
   expectExactKeys(
     obj,
     ["schema_version", "entry_state", "max_transitions", "inputs", "states"],
@@ -458,32 +506,11 @@ async function resolveAgentBundleFiles(
 }
 
 export async function loadPipeline(bundleRoot: string): Promise<ResolvedPipeline> {
-  if (!isAbsolute(bundleRoot)) {
-    throw new PipelineError(
-      `pipeline bundle root must be an absolute path, got ${JSON.stringify(bundleRoot)}`,
-    );
-  }
-  let rootCanonical: string;
-  try {
-    rootCanonical = await realpath(bundleRoot);
-  } catch (cause) {
-    throw new PipelineError(
-      `pipeline bundle root ${bundleRoot} cannot be canonicalized: ${describeError(cause)}`,
-    );
-  }
-  let rootInfo;
-  try {
-    rootInfo = await stat(rootCanonical);
-  } catch (cause) {
-    throw new PipelineError(
-      `pipeline bundle root ${bundleRoot} is not accessible: ${describeError(cause)}`,
-    );
-  }
-  if (!rootInfo.isDirectory()) {
-    throw new PipelineError(
-      `pipeline bundle root ${bundleRoot} is not a directory`,
-    );
-  }
+  const rootCanonical = await requireCanonicalDirectoryRoot(
+    bundleRoot,
+    "pipeline bundle root",
+    PipelineError,
+  );
   // pipeline.yaml obeys the same fail-closed containment contract as the other
   // bundle files: a symlink to a file inside the bundle is allowed, a symlink
   // escape outside the bundle is rejected. The file is read from the verified

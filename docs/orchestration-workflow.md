@@ -364,6 +364,73 @@ static limits, loader containment (internal symlink accepted, symlink
 escape and lexical traversal rejected), snapshot immutability under source
 mutation, and repeated-evaluation determinism.
 
+### Pipeline schema v2 data ports and activation layout planner (implemented, not yet used by the production runner)
+
+`orchestrator/src/pipeline_v2.ts` implements the `schema_version: 2`
+compile branch as pure substrate. v2 replaces workspace paths with named
+ports: run-level `inputs` are logical run inputs whose host paths are bound
+later by the CLI/API (never in the document); run-level `outputs` are the
+data handed back to the user after completion (`required: true` outputs
+fail the run if absent at the terminal; optional outputs may be absent —
+both are compile-declared); each agent state declares local input and
+output ports. Port sources have exactly one form
+(`{pipeline_input: ID}` or `{state_output: {state, output}}`); port types
+are `file`, `directory`, or `json` (json ports require a bundle-relative
+JSON schema file loaded through the same realpath containment; parsed as a
+JSON object, no generic JSON Schema validation); agent input types are
+derived from their sources (never declared); run outputs must declare the
+type their source provides; exact-field validation applies at every level;
+ids are safe and unique per collection; references to pipeline inputs,
+states, and state outputs must exist; self-references and cycles between
+state outputs compile (value availability is a runtime question). Runtime
+semantics fixed in the module doc for later increments: a `state_output`
+value is the last successfully accepted output of the named state from an
+earlier activation; without one the run fails closed (no fallback); a
+missing `required: true` run output fails the run at the terminal while an
+optional output may be absent. There are no user port paths, no mount
+targets, and `image`/`env`/`mounts`/`command`/docker/helper/session options
+remain forbidden; the activation completion envelope is orchestrator-owned
+and work products are the declared outputs only (no free-form artifact
+list).
+
+`loadPipelineV2` returns an engine-owned deep-frozen snapshot;
+`planActivationLayout(pipeline, stateId)` is a pure deterministic planner
+producing an immutable plan: ordered input ports (`source`, `type`, fixed
+target `/pipeline/inputs/<id>`, `read_only: true`), ordered output ports
+(`type`, optional parsed schema snapshot, fixed target
+`/pipeline/outputs/<id>`, `read_only: false`), project mount `/workspace`
+RW, `reject_undeclared_outputs: true` — and only logical/structural data,
+never bearers, credentials, env values, or host paths. Mutations of the
+source YAML object or of the returned view cannot change a built plan.
+
+Session capability contracts are fixed next to the planner, unwired:
+Execution Session (scope run root; orchestrator-only bearer, used only to
+launch workers), Tool Session (scope project only; bearer handed to the
+worker, which receives a projected helper socket; nested containers cannot
+reach pipeline inputs/outputs through helper), and worker mounts (project
+`/workspace` RW, prepared activation inputs `/pipeline/inputs` RO,
+activation outputs `/pipeline/outputs` RW). The Execution Session bearer is
+never passed to a worker in any form and no wide-Tool-Session workaround
+exists; the docker-helper#8 allowed-roots RO/RW refinement is not required
+by this increment.
+
+The production boundary stays sharp: `agent-smoke` and the current runner
+execute v1 without any behavior change (v1 representation is unchanged;
+`pipeline.ts` shares exact-field validators and `checkGraphShape` with v2),
+v2 loads and compiles only through the pure v2 APIs, and a genuine v2
+document (schema_version 2 with the top-level `outputs` key) is rejected by
+the production loader with exactly `pipeline schema version 2 is not
+executable yet` before Launcher auth and before any Session; a v1-shaped
+version-2 document keeps the previous "schema_version 2, expected 1"
+error. `orchestrator/tests/pipeline_v2.test.ts` covers v1 regression,
+compilation, exact-field/union validation, duplicate/unknown references,
+type propagation, schema containment, frozen snapshots, planner
+determinism/fixed targets/flags, absence of secrets and host paths in
+plans, capability separation, and the production rejection before
+auth/session. The decision evaluator, durable state, lifecycle, signal
+handling, helper transport, and the default bundle are untouched; wiring
+v2 execution into `agent-smoke` is a later increment.
+
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
 The first increment of trusted execution profiles is implemented for
