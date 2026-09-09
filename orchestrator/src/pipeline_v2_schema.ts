@@ -33,6 +33,18 @@ import { describeError } from "./docker_helper.ts";
  * Stable diagnostics: validation errors are rendered as
  * `<instance path>: <message>` in Ajv's fixed order; values of user data
  * (and enum candidates) never appear.
+ *
+ * Synchronous-only contract: pipeline v2 supports only synchronous JSON
+ * Schema validators. A schema that carries `$async: true` (at the top level
+ * or in any referenced subschema) either fails Ajv compilation outright
+ * (`async schema in sync schema`) or compiles to a validator with `$async`
+ * set; such a validator returns a `Promise` instead of a boolean, so
+ * `compilePipelineJsonSchema` rejects it before it is ever registered.
+ * `validatePipelineJson` re-checks `$async` defensively before calling, and
+ * success is only the literal boolean `true` — a `false` is an ordinary
+ * validation failure, and a `Promise`, thenable, or any other result can
+ * never pass as success. Async validators are never invoked from this
+ * module, so no unhandled rejection can be created here.
  */
 
 /**
@@ -56,7 +68,15 @@ function freshAjv(): Ajv2020 {
   });
 }
 
-const compiledValidators = new WeakMap<Record<string, unknown>, ValidateFunction>();
+const compiledValidators = new WeakMap<Record<string, unknown>, CompiledValidator>();
+
+/**
+ * A compiled Ajv validator as stored in the registry. Ajv's `ValidateFunction`
+ * type does not model the `$async` marker that the compiled async function
+ * carries at runtime, so it is declared here explicitly and checked before
+ * every use.
+ */
+type CompiledValidator = ValidateFunction & { $async?: unknown };
 
 function formatError(error: ErrorObject): string {
   const path = error.instancePath === "" ? "(root)" : error.instancePath;
@@ -76,7 +96,7 @@ export function compilePipelineJsonSchema(
   if (compiledValidators.has(schema)) {
     return;
   }
-  let validator: ValidateFunction;
+  let validator: CompiledValidator;
   try {
     validator = freshAjv().compile(schema);
   } catch (cause) {
@@ -84,7 +104,25 @@ export function compilePipelineJsonSchema(
       `${what} cannot be compiled as JSON Schema Draft 2020-12: ${describeError(cause)}`,
     );
   }
+  if (validator.$async === true) {
+    throw new PipelineError(
+      `${what} compiles to an asynchronous JSON Schema validator; ` +
+        "pipeline v2 supports synchronous validators only",
+    );
+  }
   compiledValidators.set(schema, validator);
+}
+
+/**
+ * The single decision point for whether a synchronous validator result
+ * counts as success: only the literal boolean `true` is success. `false` is
+ * an ordinary validation failure, and a `Promise`, thenable, or any other
+ * result (an async validator slipping through) can never pass as success.
+ * Exported because this exact contract is part of the sync-only guarantee
+ * and is unit-tested directly.
+ */
+export function isSyncValidatorSuccess(result: unknown): boolean {
+  return result === true;
 }
 
 /**
@@ -105,11 +143,18 @@ export function validatePipelineJson(
         "hand-built or uncompiled schemas are rejected",
     );
   }
-  if (validator(parsed)) {
-    return;
+  // Defensive sync-only gate: an async validator returning a Promise must
+  // never be invoked here, so no unhandled rejection can be created.
+  if (validator.$async === true) {
+    throw new PipelineError(
+      `${what} cannot be validated with an asynchronous JSON Schema validator; ` +
+        "pipeline v2 supports synchronous validators only",
+    );
   }
-  const details = (validator.errors ?? []).map(formatError).join("; ");
-  throw new PipelineError(
-    `${what} does not conform to its JSON schema: ${details}`,
-  );
+  if (!isSyncValidatorSuccess(validator(parsed))) {
+    const details = (validator.errors ?? []).map(formatError).join("; ");
+    throw new PipelineError(
+      `${what} does not conform to its JSON schema: ${details}`,
+    );
+  }
 }

@@ -39,7 +39,13 @@ USER opencode
 WORKDIR /opt/orchestrator
 
 # Install the pinned runtime dependencies from the committed lockfile.
-# The build fails closed on a package.json/bun.lock mismatch.
-RUN bun install --frozen-lockfile --production
+# The build fails closed on a package.json/bun.lock mismatch. The same step
+# fail-closed checks that the pinned Ajv Draft 2020-12 dialect imports and
+# compiles/validates a synchronous schema (offline: local module files
+# only). The check runs from a file because `bun -e` can swallow errors
+# after Ajv's `new Function` compilation.
+RUN bun install --frozen-lockfile --production \
+    && printf 'const Ajv=require("ajv/dist/2020").default;\nconst validate=new Ajv({allErrors:true,logger:false,strict:true,strictRequired:false,coerceTypes:false,useDefaults:false,removeAdditional:false}).compile({type:"object",required:["ok"],properties:{ok:{type:"boolean"}}});\nif(validate({ok:true})!==true||validate({})!==false){throw new Error("ajv 2020-12 sync validation failed");}\nconsole.log("ajv 2020-12 sync check ok");\n' > /tmp/ajv-check.cjs \
+    && bun /tmp/ajv-check.cjs
 
 ENTRYPOINT ["bun", "/opt/orchestrator/src/main.ts"]

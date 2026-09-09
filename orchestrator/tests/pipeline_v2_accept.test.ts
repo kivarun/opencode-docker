@@ -12,7 +12,11 @@ import {
   prepareActivationData,
   snapshotRunInputs,
 } from "../src/pipeline_v2_runtime.ts";
-import { validatePipelineJson } from "../src/pipeline_v2_schema.ts";
+import {
+  compilePipelineJsonSchema,
+  isSyncValidatorSuccess,
+  validatePipelineJson,
+} from "../src/pipeline_v2_schema.ts";
 
 const FACTS_SCHEMA = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -406,11 +410,36 @@ test("5. invalid JSON and schema-violating JSON are rejected with value-free dia
     const { pipeline, prep } = await prepareCoder(dirs);
     await writeCoderOutputs(prep);
 
-    await writeFile(join(prep.outputs_root, "facts"), "{ not json SECRET");
+    // malformed JSON is rejected with one stable, content-free diagnostic:
+    // the exact message never carries the parser message, the offending
+    // token, a position, or any fragment of the input, so none of the
+    // secret canaries below can leak through it
+    const factsWhat = 'output port "facts" of agent state "coder" activation 1';
+    const factsTarget = join(prep.outputs_root, "facts");
+    const notValidJson = `${factsWhat} ${factsTarget} is not valid JSON`;
+
+    // unexpected identifier (bare token)
+    await writeFile(factsTarget, '{"revision": 2, "actor": BARE_CANARY_IDENTIFIER}');
     await expectReject(
       () => acceptActivationOutputs(pipeline, prep),
-      /output port "facts" of agent state "coder" activation 1 .* is not valid JSON/,
-      "SECRET",
+      notValidJson,
+      "BARE_CANARY_IDENTIFIER",
+    );
+
+    // unterminated string whose canary sits right before the failure
+    await writeFile(factsTarget, '{"revision": 2, "actor": "UNTERMINATED_CANARY_STRING}');
+    await expectReject(
+      () => acceptActivationOutputs(pipeline, prep),
+      notValidJson,
+      "UNTERMINATED_CANARY_STRING",
+    );
+
+    // error after an otherwise valid secret string value
+    await writeFile(factsTarget, '{"revision": 2, "actor": "AFTER_SECRET_CANARY",}');
+    await expectReject(
+      () => acceptActivationOutputs(pipeline, prep),
+      notValidJson,
+      "AFTER_SECRET_CANARY",
     );
 
     // wrong types are not coerced: a string revision stays invalid
@@ -733,6 +762,27 @@ test("10. schema compile failures reject loadPipelineV2", async () => {
       { type: "nonsense" },
       /pipeline input "brief" schema cannot be compiled as JSON Schema Draft 2020-12/,
     ],
+    [
+      // a top-level $async schema compiles to a Promise-returning validator
+      // and is rejected fail-closed before it is ever registered
+      {
+        type: "object",
+        properties: { ok: { type: "boolean" } },
+        required: ["ok"],
+        $async: true,
+      },
+      /pipeline input "brief" schema compiles to an asynchronous JSON Schema validator; pipeline v2 supports synchronous validators only/,
+    ],
+    [
+      // an $async subschema behind an internal $ref fails Ajv compilation
+      // outright and rejects the load the same way
+      {
+        type: "object",
+        properties: { x: { $ref: "#/$defs/asyncThing" } },
+        $defs: { asyncThing: { type: "string", $async: true } },
+      },
+      /pipeline input "brief" schema cannot be compiled as JSON Schema Draft 2020-12/,
+    ],
   ];
   for (const [schema, pattern] of broken) {
     await withAccept(async (dirs) => {
@@ -753,6 +803,18 @@ test("11. json run inputs are validated by the same compiled schema mechanism", 
     );
     await expect(lstat(join(runRoot, "data"))).rejects.toThrow();
 
+    // a malformed json run input is rejected with the same stable,
+    // content-free diagnostic: no canary, parser token or input fragment
+    const malformedRoot = await makeRunRoot(dirs.root);
+    const briefPath = join(dirs.root, "userdata", "brief.json");
+    await writeFile(briefPath, '{"revision": 2, "actor": "RUN_INPUT_CANARY",}');
+    await expectReject(
+      () => snapshotRunInputs(pipeline, ALL_BINDINGS(dirs.root), malformedRoot),
+      `pipeline input "brief" bound file ${briefPath} is not valid JSON`,
+      "RUN_INPUT_CANARY",
+    );
+    await expect(lstat(join(malformedRoot, "data"))).rejects.toThrow();
+
     // a conforming run input snapshots normally
     const okRoot = await makeRunRoot(dirs.root, { revision: 1, actor: "y" });
     const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(dirs.root), okRoot);
@@ -768,5 +830,55 @@ test("12. the v1 path and the production v2 rejection are unchanged", async () =
     const pipeline = await loadPipelineV2(dirs.bundle);
     expect(pipeline.schema_version).toBe(2);
     expect(pipeline.states.map((state) => state.id)).toEqual(["coder", "architect", "done"]);
+  });
+});
+
+test("13. only literal true is sync validation success; async validators are rejected and unregistered", async () => {
+  await withAccept(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const coderState = pipeline.states.find(
+      (state) => state.type === "agent" && state.id === "coder",
+    );
+    if (coderState === undefined || coderState.type !== "agent") {
+      throw new Error("expected coder agent state");
+    }
+    const port = coderState.outputs.find((entry) => entry.id === "facts");
+    if (port === undefined || port.schema === undefined) {
+      throw new Error("expected facts schema snapshot");
+    }
+
+    // the sync-success contract: only the literal boolean true passes, and
+    // a Promise, thenable, or any other result is never success
+    expect(isSyncValidatorSuccess(true)).toBe(true);
+    expect(isSyncValidatorSuccess(false)).toBe(false);
+    expect(isSyncValidatorSuccess(Promise.resolve(true))).toBe(false);
+    expect(isSyncValidatorSuccess({ then: () => {} })).toBe(false);
+    expect(isSyncValidatorSuccess(1)).toBe(false);
+    expect(isSyncValidatorSuccess("true")).toBe(false);
+    expect(isSyncValidatorSuccess(null)).toBe(false);
+    expect(isSyncValidatorSuccess(undefined)).toBe(false);
+
+    // a top-level $async schema is rejected at compile time and registers
+    // nothing, so validation with that same schema object fails closed and
+    // no Promise-returning validator can ever be invoked
+    const asyncSchema = Object.freeze({
+      type: "object",
+      properties: { ok: { type: "boolean" } },
+      required: ["ok"],
+      $async: true,
+    });
+    expect(() => compilePipelineJsonSchema(asyncSchema, "probe")).toThrow(
+      "probe compiles to an asynchronous JSON Schema validator; pipeline v2 supports synchronous validators only",
+    );
+    await expectReject(
+      () => validatePipelineJson(asyncSchema, { ok: true }, "probe"),
+      "probe requires the JSON schema snapshot compiled by loadPipelineV2; hand-built or uncompiled schemas are rejected",
+    );
+
+    // the defensively rejected async validator still compiles through Ajv,
+    // so the same failure repeats identically on a second attempt
+    expect(() => compilePipelineJsonSchema(asyncSchema, "probe")).toThrow(
+      "probe compiles to an asynchronous JSON Schema validator; pipeline v2 supports synchronous validators only",
+    );
   });
 });

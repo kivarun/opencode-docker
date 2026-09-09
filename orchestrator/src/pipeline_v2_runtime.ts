@@ -689,8 +689,10 @@ async function readPortValueForDigest(
     if (type === "json" && parseJson) {
       try {
         parsedJson = JSON.parse(content.toString("utf8"));
-      } catch (cause) {
-        throw new PipelineError(`${what} ${path} is not valid JSON: ${describeError(cause)}`);
+      } catch {
+        // Stable, content-free diagnostic: the parser message can echo the
+        // offending token or an input fragment, so it is never included.
+        throw new PipelineError(`${what} ${path} is not valid JSON`);
       }
     }
     return { digest: hasher.digest("hex"), ...(parsedJson !== undefined ? { parsedJson } : {}) };
@@ -897,9 +899,12 @@ export async function snapshotRunInputs(
         let parsedJson: unknown;
         try {
           parsedJson = JSON.parse(content.toString("utf8"));
-        } catch (cause) {
+        } catch {
+          // Stable, content-free diagnostic: the parser message can echo
+          // the offending token or an input fragment, so it is never
+          // included.
           throw new PipelineError(
-            `${what} bound file ${binding.path} is not valid JSON: ${describeError(cause)}`,
+            `${what} bound file ${binding.path} is not valid JSON`,
           );
         }
         // The same compiled Draft 2020-12 mechanism that validates JSON

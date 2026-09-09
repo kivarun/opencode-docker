@@ -378,7 +378,9 @@ output ports. Port sources have exactly one form
 are `file`, `directory`, or `json` (json ports require a bundle-relative
 JSON schema file loaded through the same realpath containment, parsed as a
 JSON object, and compiled as JSON Schema Draft 2020-12 at load time — a
-schema that cannot compile rejects the load). Pipeline inputs and agent
+schema that cannot compile, or one that compiles to an asynchronous
+validator, rejects the load; pipeline v2 supports synchronous validators
+only). Pipeline inputs and agent
 outputs are the only places that declare a type or schema: agent input
 types are derived from their sources, a run output is exactly
 `{id, required, source}` with type and JSON schema fully derived from the
@@ -536,7 +538,10 @@ declared type whose canonical path stays inside the outputs root (`file`
 read through `O_NOFOLLOW`; `json` valid and schema-conforming; `directory`
 containing only real directories and regular files), and never records
 paths, types, schemas, summaries, timestamps, or output content.
-Diagnostics never contain file contents or JSON values. A changed accepted
+Diagnostics never contain file contents or JSON values: malformed JSON in
+a user data value is reported as the stable, content-free message
+`<what> <path> is not valid JSON` — the parser message, offending token,
+position, or input fragment never enter it. A changed accepted
 output is detected by digest recomputation of the whole accepted history
 (including old, non-winning records) before the next activation leaf is
 created. Accepted records remain runner-owned input; agent envelopes,
