@@ -38,6 +38,13 @@ import {
  * filesystem work — no Sessions, no containers, no helper calls, no
  * bearers, no env, no Docker options.
  *
+ * Run layout: `<runRoot>/project` is the shared project directory of the
+ * whole run. It must exist as a real non-symlink directory before
+ * `snapshotRunInputs` is called; the runtime never creates, clears or
+ * copies it (preparing the initial project content is the caller's
+ * responsibility), and every activation mounts exactly this one directory
+ * at `/workspace` read-write, so changes persist across activations.
+ *
  * Run-input bindings + snapshot (`snapshotRunInputs`): every declared
  * pipeline input is bound exactly once to an absolute host path whose real
  * object kind must match the declared `file`/`directory`/`json` type (a
@@ -48,24 +55,34 @@ import {
  * file/json byte-for-byte, directories recursively in deterministic
  * (relative-path code-unit sorted) order, only real directories and
  * regular files inside a directory (symlinks, FIFOs, sockets, devices are
- * rejected fail-closed). A project directory is never snapshotted — v2 has
- * no project run input. After the snapshot succeeds, the returned runtime
+ * rejected fail-closed). After the snapshot succeeds, the returned runtime
  * metadata is the only data source of the run: user source paths are no
- * longer read by this module.
+ * longer read by this module. The frozen snapshot object is registered in
+ * a module-private `WeakMap` together with the exact trusted pipeline and
+ * the canonical run/project roots; `prepareActivationData` accepts only
+ * that exact object (same identity, same pipeline) — hand-built objects,
+ * casts, clones, Proxies and snapshots of another pipeline are rejected
+ * before any field is read.
  *
  * Activation data layout (`prepareActivationData`): a fresh
  * `<runRoot>/activations/<activation-index>-<state-id>/data/` tree with
  * `inputs/` (copied per declared input port, strictly in declaration
- * order), `outputs/` (empty real directory pre-created for `directory`
+ * order) and `outputs/` (empty real directory pre-created for `directory`
  * output ports; `file`/`json` output paths deliberately absent until a
- * worker run) and `project/` (a fresh empty per-activation scratch
- * directory backed at `/workspace`). Pipeline inputs are taken only from
- * the run-owned snapshot; state outputs only from the explicitly passed
- * runner-owned accepted-output list, where the last entry for a
- * `state`/`output` pair wins. Forward references, missing outputs and
- * first-visit self-references fail before any downstream use. The accepted
- * list is validated fail-closed: declared state/output/type match, real
- * object kind, and containment inside the same canonical run root.
+ * worker run). There is no per-activation project directory. Pipeline
+ * inputs are taken only from the run-owned snapshot; state outputs only
+ * from the explicitly passed runner-owned accepted records
+ * `{state, output, activation_index}` — the type is derived from the
+ * declared output port, the object path is the fixed orchestrator-derived
+ * `<runRoot>/activations/<index>-<state>/data/outputs/<output>`, and the
+ * record with the highest activation index wins for a `state`/`output`
+ * pair (list order is irrelevant). Future or current activation indexes,
+ * duplicate records, one index spanning several states, missing/forward
+ * references and first-visit self-references fail before any downstream
+ * use. The activation index is globally unique within the run: before the
+ * leaf is created, any existing `activations/` entry with the same
+ * `<index>-` prefix (any state, any object kind, never followed) rejects
+ * the request.
  *
  * Ownership and modes: every directory is created 0700 and every copied
  * file 0600 by the orchestrator user. Worker-UID compatibility of the
@@ -75,7 +92,8 @@ import {
  * Failure behavior: all validation happens before any mutation; every
  * created object is tracked and removed again when the operation fails, so
  * a partial snapshot never becomes authoritative and existing snapshots
- * (any pre-existing object at a target path) are never overwritten.
+ * (any pre-existing object at a target path) are never overwritten. The
+ * project root is never created, modified or removed by this module.
  * File snapshots are published atomically through `link()` (EEXIST-safe);
  * directory snapshots are built in a temporary directory inside
  * `data/inputs` and published with one `rename()`.
@@ -93,6 +111,36 @@ import {
  * paths are rejected, and nothing outside `runRoot` is ever created,
  * written or removed.
  */
+
+/**
+ * Module-private provenance registry of run input snapshots.
+ *
+ * `snapshotRunInputs` registers the exact frozen snapshot object it returns,
+ * together with the trusted pipeline object it was created for and the
+ * canonical run/project roots. `prepareActivationData` accepts only a
+ * registered object whose recorded pipeline is the identical
+ * `ResolvedPipelineV2` object it was handed. The registry is keyed by
+ * object identity: hand-built objects, casts, shallow or deep clones
+ * (e.g. `structuredClone`), Proxies and snapshots created for another
+ * pipeline object are all unregistered or mismatched and rejected before
+ * any snapshot field is read. There is no second structural validation
+ * pass behind this gate, and a future resume loader could mint its own
+ * trusted runtime state through the same registration path.
+ */
+interface RunInputSnapshotProvenance {
+  readonly pipeline: ResolvedPipelineV2;
+  readonly runRootCanonical: string;
+  readonly projectRootCanonical: string;
+}
+
+const runInputSnapshotProvenance = new WeakMap<object, RunInputSnapshotProvenance>();
+
+/** Stable rejection message for any snapshot argument without provenance. */
+const UNTRUSTED_RUN_INPUT_SNAPSHOT_MESSAGE =
+  "activation data preparation requires the frozen run input snapshot object " +
+  "returned by a successful snapshotRunInputs call for the same trusted pipeline; " +
+  "hand-built objects, casts, clones, snapshots of another pipeline and Proxies " +
+  "are rejected before any field is read";
 
 export interface RunInputBinding {
   readonly id: string;
@@ -114,20 +162,31 @@ export interface RunInputSnapshotEntry {
 export interface RunInputsSnapshot {
   readonly run_root: string;
   readonly inputs_root: string;
+  /**
+   * Canonical shared project directory of the whole run. It must exist
+   * before the snapshot is created; the runtime never creates, clears or
+   * copies it, and every activation mounts exactly this directory at
+   * `/workspace` read-write.
+   */
+  readonly project_root: string;
   readonly inputs: readonly RunInputSnapshotEntry[];
 }
 
 /**
- * One previously accepted state output as handed over by the runner: an
- * orchestrator-owned fixed path of an earlier activation's output object.
- * The list is trusted but validated; entries must be ordered so the last
- * entry for a `state`/`output` pair is the last successfully accepted one.
+ * One previously accepted state output as handed over by the runner: a
+ * logical reference only. The accepted object always lives at the fixed
+ * orchestrator-derived path
+ * `<runRoot>/activations/<activation_index>-<state>/data/outputs/<output>`;
+ * no user paths and no types are accepted — the type is derived from the
+ * declared output port and the path is computed by the runtime. The list is
+ * trusted input of the runner (agent envelopes, stdout and worker files can
+ * never create records); the last accepted output of a state/output pair is
+ * the record with the highest activation index, independent of list order.
  */
 export interface AcceptedStateOutput {
   readonly state: string;
   readonly output: string;
-  readonly type: PortType;
-  readonly path: string;
+  readonly activation_index: number;
 }
 
 export interface PreparedActivationInputPort {
@@ -416,17 +475,38 @@ function hashTag(hasher: Bun.CryptoHasher, tag: string): void {
 }
 
 /**
- * Digest stream for one input snapshot: the fixed domain tag, the declared
- * port type, then either the length-framed file content or, for
- * directories, every entry in sorted order (kind, length-framed relative
- * path, length-framed content for files). Only types, relative paths and
- * content participate — never host absolute paths, inodes or timestamps.
+ * Digest stream for one input snapshot. It opens with the fixed domain tag
+ * and the declared port type. For `file`/`json` the length-framed content
+ * follows. For directories every entry appears in sorted relative-path
+ * order as: entry kind tag (`directory\0` or `file\0`), the length-framed
+ * UTF-8 relative path, and — for regular files — the length-framed content.
+ * Empty directories contribute their kind tag and path only, so names,
+ * entry kinds, and empty directories all change the digest. Absolute
+ * paths, inodes, permissions and timestamps never participate.
  */
 function inputDigestHasher(type: PortType): Bun.CryptoHasher {
   const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(Buffer.from("pipeline-v2-input\0", "utf8"));
-  hasher.update(Buffer.from(`${type}\0`, "utf8"));
+  hashTag(hasher, "pipeline-v2-input\0");
+  hashTag(hasher, `${type}\0`);
   return hasher;
+}
+
+function hashRelativePath(hasher: Bun.CryptoHasher, relativePath: string): void {
+  hashBytes(hasher, Buffer.from(relativePath, "utf8"));
+}
+
+/** Hash one directory entry: kind tag, length-framed relative path, and —
+ * for regular files — the length-framed content. */
+function hashDirectoryEntry(
+  hasher: Bun.CryptoHasher,
+  entry: ScannedTreeEntry,
+  content: Buffer | undefined,
+): void {
+  hashTag(hasher, `${entry.kind}\0`);
+  hashRelativePath(hasher, entry.relativePath);
+  if (entry.kind === "file" && content !== undefined) {
+    hashBytes(hasher, content);
+  }
 }
 
 /**
@@ -594,6 +674,13 @@ export async function snapshotRunInputs(
 
   const runRootCanonical = await requireCanonicalRunRoot(runRoot, "run root");
 
+  // The shared project directory of the whole run must already exist as a
+  // real non-symlink directory; the runtime never creates, clears or copies
+  // it, and it is mounted at /workspace by every activation.
+  const projectRootPath = join(runRootCanonical, "project");
+  await requireRealDirectory(projectRootPath, "run project root");
+  const projectRootCanonical = await realpath(projectRootPath);
+
   // Validate every bound object (real kind, json parseability, clean tree,
   // outside the run root) and cache contents/plans before any mutation.
   interface PreparedBinding extends RunInputBinding {
@@ -711,6 +798,7 @@ export async function snapshotRunInputs(
         for (const entry of tree) {
           const target = join(tmpDir, entry.relativePath);
           if (entry.kind === "directory") {
+            hashDirectoryEntry(hasher, entry, undefined);
             await createRealDirectoryExclusive(
               target,
               `${what} directory entry ${JSON.stringify(entry.relativePath)}`,
@@ -721,7 +809,7 @@ export async function snapshotRunInputs(
             entry.absolutePath,
             `${what} file entry ${JSON.stringify(entry.relativePath)}`,
           );
-          hashBytes(hasher, content);
+          hashDirectoryEntry(hasher, entry, content);
           await writeRegularFileExclusive(
             target,
             content,
@@ -768,21 +856,50 @@ export async function snapshotRunInputs(
       });
     }
 
-    return deepFreeze({
+    const snapshot = deepFreeze({
       run_root: runRootCanonical,
       inputs_root: inputsRoot,
+      project_root: projectRootCanonical,
       inputs: entries,
     });
+    // Register provenance only after the full snapshot succeeded; the
+    // exact frozen object is the key, so hand-built objects, casts,
+    // clones and Proxies can never acquire provenance.
+    runInputSnapshotProvenance.set(snapshot, {
+      pipeline,
+      runRootCanonical,
+      projectRootCanonical,
+    });
+    return snapshot;
   } catch (cause) {
     await cleanupCreated();
     throw cause;
   }
 }
 
+interface ParsedAcceptedOutput {
+  readonly state: string;
+  readonly output: string;
+  readonly activationIndex: number;
+  /** Derived from the declared output port; never taken from the record. */
+  readonly type: PortType;
+}
+
+/**
+ * Parse and validate the runner-owned accepted records `{state, output,
+ * activation_index}`: exact fields, safe ids, positive safe index below the
+ * current activation index, a declared agent state, and a declared output
+ * port (whose declared type becomes the derived record type). Cross-record
+ * invariants: no duplicate records for one activation, and one activation
+ * index can never belong to two different states. List order is irrelevant
+ * — the resolved value for a `state`/`output` pair is the record with the
+ * highest activation index.
+ */
 function parseAcceptedStateOutputs(
   acceptedOutputs: readonly unknown[],
   pipeline: ResolvedPipelineV2,
-): AcceptedStateOutput[] {
+  currentActivationIndex: number,
+): ParsedAcceptedOutput[] {
   const agentStates = new Map<string, Map<string, PortType>>();
   for (const state of pipeline.states) {
     if (state.type !== "agent") {
@@ -793,16 +910,19 @@ function parseAcceptedStateOutputs(
       new Map(state.outputs.map((port) => [port.id, port.type])),
     );
   }
-  return acceptedOutputs.map((raw, index) => {
+  const parsed: ParsedAcceptedOutput[] = acceptedOutputs.map((raw, index) => {
     const what = `accepted state output ${index}`;
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
       throw new PipelineError(`${what} is not an object`);
     }
     const entry = raw as Record<string, unknown>;
-    expectExactKeys(entry, ["state", "output", "type", "path"], what);
+    expectExactKeys(entry, ["state", "output", "activation_index"], what);
     const state = validateSafeId(entry.state, `${what} state id`);
     const output = validateSafeId(entry.output, `${what} output port id`);
-    const type = parsePortType(entry.type, `${what} type`);
+    const activationIndex = expectPositiveSafeInteger(
+      entry.activation_index,
+      `${what} activation index`,
+    );
     const declaredOutputs = agentStates.get(state);
     if (declaredOutputs === undefined) {
       throw new PipelineError(
@@ -815,66 +935,104 @@ function parseAcceptedStateOutputs(
         `${what} references output ${JSON.stringify(output)} which is not declared by state ${JSON.stringify(state)}`,
       );
     }
-    if (declaredType !== type) {
+    if (activationIndex >= currentActivationIndex) {
       throw new PipelineError(
-        `${what} declares type ${JSON.stringify(type)} but state ${JSON.stringify(state)} declares output port ${JSON.stringify(output)} as ${JSON.stringify(declaredType)}`,
+        `${what} records activation index ${activationIndex} which is not below the current activation index ${currentActivationIndex}`,
       );
     }
-    const path = expectNonEmptyString(entry.path, `${what} path`);
-    if (!isAbsolute(path)) {
-      throw new PipelineError(`${what} path must be an absolute path, got ${JSON.stringify(path)}`);
-    }
-    return { state, output, type, path };
+    return { state, output, activationIndex, type: declaredType };
   });
+
+  const seenRecords = new Set<string>();
+  const activationStates = new Map<number, string>();
+  for (const record of parsed) {
+    const recordKey = `${record.activationIndex}\u0000${record.state}\u0000${record.output}`;
+    if (seenRecords.has(recordKey)) {
+      throw new PipelineError(
+        `accepted state output for ${JSON.stringify(record.state)}.${JSON.stringify(record.output)} at activation index ${record.activationIndex} is listed more than once`,
+      );
+    }
+    seenRecords.add(recordKey);
+    const declaredState = activationStates.get(record.activationIndex);
+    if (declaredState === undefined) {
+      activationStates.set(record.activationIndex, record.state);
+    } else if (declaredState !== record.state) {
+      throw new PipelineError(
+        `activation index ${record.activationIndex} cannot belong to both state ${JSON.stringify(declaredState)} and state ${JSON.stringify(record.state)}`,
+      );
+    }
+  }
+  return parsed;
 }
 
 interface ResolvedAcceptedOutput {
-  readonly entry: AcceptedStateOutput;
+  readonly type: PortType;
   readonly canonicalPath: string;
 }
 
 /**
- * Validate the runner-owned accepted-output list against the pipeline and
- * the canonical run root: declared agent state, declared output port,
- * matching type, existing real object of the right kind (never a symlink),
- * and containment inside the canonical run root. The last entry for a
- * `state`/`output` pair wins when several activations accepted it.
+ * Resolve the accepted records to their fixed orchestrator-derived paths.
+ * For each `state`/`output` pair the record with the highest activation
+ * index wins (permutation of the record list changes nothing). The object
+ * must exist at the exact fixed path
+ * `<runRoot>/activations/<index>-<state>/data/outputs/<output>`; every
+ * required parent component and the final object must be real
+ * non-symlink objects of the kind matching the declared output port type,
+ * and the canonical resolution must stay inside the canonical run root.
  */
 async function resolveAcceptedOutputs(
-  acceptedOutputs: readonly AcceptedStateOutput[],
+  acceptedOutputs: readonly ParsedAcceptedOutput[],
   runRootCanonical: string,
 ): Promise<Map<string, ResolvedAcceptedOutput>> {
+  const best = new Map<string, ParsedAcceptedOutput>();
+  for (const record of acceptedOutputs) {
+    const key = `${record.state}\u0000${record.output}`;
+    const existing = best.get(key);
+    if (existing === undefined || record.activationIndex > existing.activationIndex) {
+      best.set(key, record);
+    }
+  }
+
+  const activationsRoot = join(runRootCanonical, "activations");
   const resolved = new Map<string, ResolvedAcceptedOutput>();
-  for (const entry of acceptedOutputs) {
-    const what = `accepted state output ${JSON.stringify(entry.state)}.${JSON.stringify(entry.output)}`;
-    const info = await lstatOrNull(entry.path);
+  for (const [ref, record] of best) {
+    const what = `accepted state output for ${JSON.stringify(record.state)}.${JSON.stringify(record.output)} at activation index ${record.activationIndex}`;
+    const leafPath = join(activationsRoot, `${record.activationIndex}-${record.state}`);
+    await requireRealDirectory(activationsRoot, "activations root");
+    await requireRealDirectory(leafPath, `${what} activation leaf`);
+    await requireRealDirectory(join(leafPath, "data"), `${what} activation data root`);
+    await requireRealDirectory(join(leafPath, "data", "outputs"), `${what} activation outputs root`);
+    const fixedPath = join(leafPath, "data", "outputs", record.output);
+    const info = await lstatOrNull(fixedPath);
     if (info === null) {
-      throw new PipelineError(`${what} accepted output ${entry.path} does not exist`);
+      throw new PipelineError(`${what} fixed output path ${fixedPath} does not exist`);
     }
     if (info.isSymbolicLink()) {
-      throw new PipelineError(`${what} accepted output ${entry.path} is a symbolic link`);
+      throw new PipelineError(`${what} fixed output path ${fixedPath} is a symbolic link`);
     }
-    if (entry.type === "directory") {
+    if (record.type === "directory") {
       if (!info.isDirectory()) {
-        throw new PipelineError(`${what} accepted output ${entry.path} is not a real directory`);
+        throw new PipelineError(
+          `${what} fixed output ${fixedPath} is not a real directory, found ${describeEntry(info)}`,
+        );
       }
     } else if (!info.isFile()) {
       throw new PipelineError(
-        `${what} accepted output ${entry.path} is not a regular file`,
+        `${what} fixed output ${fixedPath} is not a regular file, found ${describeEntry(info)}`,
       );
     }
     let canonical: string;
     try {
-      canonical = await realpath(entry.path);
+      canonical = await realpath(fixedPath);
     } catch (cause) {
-      throw fail(`${what} accepted output ${entry.path} cannot be canonicalized`, cause);
+      throw fail(`${what} fixed output ${fixedPath} cannot be canonicalized`, cause);
     }
     if (!isInsideRoot(runRootCanonical, canonical)) {
       throw new PipelineError(
-        `${what} accepted output resolves outside the canonical run root ${runRootCanonical}`,
+        `${what} fixed output resolves outside the canonical run root ${runRootCanonical}`,
       );
     }
-    resolved.set(`${entry.state}\u0000${entry.output}`, { entry, canonicalPath: canonical });
+    resolved.set(ref, { type: record.type, canonicalPath: canonical });
   }
   return resolved;
 }
@@ -894,94 +1052,17 @@ function findAgentState(
 }
 
 /**
- * Validate the run-input snapshot coherence with the trusted pipeline: the
- * snapshot must cover exactly the declared pipeline inputs with matching
- * declared types. Returns the snapshot entries by input id.
- */
-function requireRunInputsCoherence(
-  pipeline: ResolvedPipelineV2,
-  runInputs: unknown,
-): { runRootCanonical: string; byId: Map<string, RunInputSnapshotEntry> } {
-  if (typeof runInputs !== "object" || runInputs === null || Array.isArray(runInputs)) {
-    throw new PipelineError("run input snapshot is not an object");
-  }
-  const snapshot = runInputs as Record<string, unknown>;
-  expectExactKeys(snapshot, ["run_root", "inputs_root", "inputs"], "run input snapshot");
-  const runRootCanonical = expectNonEmptyString(snapshot.run_root, "run input snapshot run root");
-  const inputsRoot = expectNonEmptyString(snapshot.inputs_root, "run input snapshot inputs root");
-  if (!isAbsolute(runRootCanonical)) {
-    throw new PipelineError("run input snapshot run root must be an absolute path");
-  }
-  if (!isAbsolute(inputsRoot) || !isInsideRoot(runRootCanonical, inputsRoot)) {
-    throw new PipelineError(
-      `run input snapshot inputs root ${inputsRoot} is not inside the canonical run root ${runRootCanonical}`,
-    );
-  }
-  if (!Array.isArray(snapshot.inputs)) {
-    throw new PipelineError("run input snapshot inputs must be a list");
-  }
-  const declaredById = new Map(pipeline.inputs.map((input) => [input.id, input]));
-  const byId = new Map<string, RunInputSnapshotEntry>();
-  for (const raw of snapshot.inputs) {
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-      throw new PipelineError("run input snapshot entry is not an object");
-    }
-    const entry = raw as Record<string, unknown>;
-    expectExactKeys(
-      entry,
-      ["id", "type", "protected", "snapshot_path", "digest"],
-      "run input snapshot entry",
-    );
-    const id = validateSafeId(entry.id, "run input snapshot entry id");
-    const type = parsePortType(entry.type, `run input snapshot entry ${JSON.stringify(id)} type`);
-    if (typeof entry.protected !== "boolean") {
-      throw new PipelineError(
-        `run input snapshot entry ${JSON.stringify(id)} protected must be a boolean`,
-      );
-    }
-    const snapshotPath = expectNonEmptyString(
-      entry.snapshot_path,
-      "run input snapshot entry snapshot path",
-    );
-    if (!isAbsolute(snapshotPath) || !isInsideRoot(runRootCanonical, snapshotPath)) {
-      throw new PipelineError(
-        `run input snapshot entry ${JSON.stringify(id)} snapshot path ${snapshotPath} is not inside the canonical run root ${runRootCanonical}`,
-      );
-    }
-    expectNonEmptyString(entry.digest, "run input snapshot entry digest");
-    const declared = declaredById.get(id);
-    if (declared === undefined) {
-      throw new PipelineError(
-        `run input snapshot entry ${JSON.stringify(id)} does not match a declared pipeline input`,
-      );
-    }
-    if (declared.type !== type) {
-      throw new PipelineError(
-        `run input snapshot entry ${JSON.stringify(id)} declares type ${JSON.stringify(type)} but the pipeline declares ${JSON.stringify(declared.type)}`,
-      );
-    }
-    byId.set(id, entry as unknown as RunInputSnapshotEntry);
-  }
-  for (const input of pipeline.inputs) {
-    if (!byId.has(input.id)) {
-      throw new PipelineError(
-        `run input snapshot is missing pipeline input ${JSON.stringify(input.id)}`,
-      );
-    }
-  }
-  return { runRootCanonical, byId };
-}
-
-/**
  * Prepare the host-side data layout for one activation of an agent state:
  * a fresh `<runRoot>/activations/<activation-index>-<state-id>/data/` tree
  * with per-port `inputs/` (copied in declaration order from the run-owned
- * snapshot or the accepted-output list), per-port `outputs/` (empty real
+ * snapshot or the accepted records) and per-port `outputs/` (empty real
  * directories for `directory` outputs; `file`/`json` outputs absent until a
- * worker run creates them) and a fresh empty `project/` scratch directory.
- * Every directory is created 0700, every copied file 0600; the activation
- * leaf must be absent beforehand, and the whole leaf tree is removed again
- * when the preparation fails.
+ * worker run creates them). The shared run project directory is mounted at
+ * `/workspace`; there is no per-activation project directory. Every
+ * directory is created 0700, every copied file 0600; the activation index
+ * must be globally unused, the leaf must be absent beforehand, and the
+ * whole leaf tree is removed again when the preparation fails. The project
+ * root is never created, modified or removed here.
  */
 export async function prepareActivationData(
   pipeline: ResolvedPipelineV2,
@@ -991,6 +1072,13 @@ export async function prepareActivationData(
   activationIndex: number,
 ): Promise<PreparedActivationData> {
   requireResolvedPipelineV2Provenance(pipeline, "activation data preparation");
+  const provenance = runInputSnapshotProvenance.get(runInputs);
+  if (provenance === undefined || provenance.pipeline !== pipeline) {
+    throw new PipelineError(UNTRUSTED_RUN_INPUT_SNAPSHOT_MESSAGE);
+  }
+  const runRootCanonical = provenance.runRootCanonical;
+  const projectRoot = provenance.projectRootCanonical;
+
   expectPositiveSafeInteger(activationIndex, "activation index");
   const safeStateId = validateSafeId(stateId, "activation state id");
   const state = findAgentState(pipeline, safeStateId);
@@ -1006,14 +1094,34 @@ export async function prepareActivationData(
   }
   const agentState = state;
 
-  const { runRootCanonical, byId: snapshotById } = requireRunInputsCoherence(pipeline, runInputs);
   await requireRealDirectory(runRootCanonical, "run root");
+  await requireRealDirectory(projectRoot, "run project root");
 
-  const parsedAccepted = parseAcceptedStateOutputs(acceptedOutputs, pipeline);
+  const parsedAccepted = parseAcceptedStateOutputs(acceptedOutputs, pipeline, activationIndex);
   const acceptedByRef = await resolveAcceptedOutputs(parsedAccepted, runRootCanonical);
 
   const activationsRoot = join(runRootCanonical, "activations");
   await ensureRealDirectory(activationsRoot, "activations root");
+
+  // The activation index is globally unique within the run: any existing
+  // entry with the same `<index>-` prefix (any state, any object kind,
+  // symlinks never followed) rejects the request before the leaf is made.
+  const indexPrefix = `${activationIndex}-`;
+  let dirents;
+  try {
+    dirents = await readdir(activationsRoot, { withFileTypes: true });
+  } catch (cause) {
+    throw fail(`activations root ${activationsRoot} could not be listed`, cause);
+  }
+  const sortedNames = dirents.map((dirent) => dirent.name).sort();
+  for (const name of sortedNames) {
+    if (name.startsWith(indexPrefix)) {
+      throw new PipelineError(
+        `activation index ${activationIndex} is already in use at ${join(activationsRoot, name)}`,
+      );
+    }
+  }
+
   const activationRoot = join(activationsRoot, `${activationIndex}-${safeStateId}`);
   await requireAbsent(activationRoot, "activation leaf");
 
@@ -1030,8 +1138,6 @@ export async function prepareActivationData(
     await ensureRealDirectory(inputsRoot, "activation inputs root");
     const outputsRoot = join(dataRoot, "outputs");
     await ensureRealDirectory(outputsRoot, "activation outputs root");
-    const projectRoot = join(dataRoot, "project");
-    await ensureRealDirectory(projectRoot, "activation project root");
 
     const preparedInputs: PreparedActivationInputPort[] = [];
     for (const port of agentState.inputs) {
@@ -1039,7 +1145,13 @@ export async function prepareActivationData(
       const target = join(inputsRoot, port.id);
       let sourcePath: string;
       if ("pipeline_input" in port.source) {
-        const entry = snapshotById.get(port.source.pipeline_input);
+        let entry: RunInputSnapshotEntry | undefined;
+        for (const candidate of runInputs.inputs) {
+          if (candidate.id === port.source.pipeline_input) {
+            entry = candidate;
+            break;
+          }
+        }
         if (entry === undefined) {
           throw new PipelineError(
             `${what} references pipeline input ${JSON.stringify(port.source.pipeline_input)} which has no run input snapshot entry`,
@@ -1055,9 +1167,9 @@ export async function prepareActivationData(
             `${what} references state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)} which has no accepted output yet (missing, forward or first-visit self reference)`,
           );
         }
-        if (accepted.entry.type !== port.type) {
+        if (accepted.type !== port.type) {
           throw new PipelineError(
-            `${what} expects type ${JSON.stringify(port.type)} but the accepted state output has type ${JSON.stringify(accepted.entry.type)}`,
+            `${what} expects type ${JSON.stringify(port.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
           );
         }
         sourcePath = accepted.canonicalPath;
@@ -1106,7 +1218,7 @@ export async function prepareActivationData(
   } catch (cause) {
     // The leaf was created exclusively by this call; remove exactly this
     // tree and nothing else. Run-level infrastructure (data, activations
-    // root) persists.
+    // root) and the shared project directory persist.
     await removeTrackedPath(activationRoot, runRootCanonical);
     throw cause;
   }

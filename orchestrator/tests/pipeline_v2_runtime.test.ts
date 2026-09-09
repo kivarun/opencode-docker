@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
@@ -18,7 +18,6 @@ import {
 import {
   prepareActivationData,
   snapshotRunInputs,
-  type RunInputsSnapshot,
 } from "../src/pipeline_v2_runtime.ts";
 import { runAgentSmoke, type AgentSmokeDeps } from "../src/agent_smoke.ts";
 import { STANDARD_AGENT_RESULT_SCHEMA } from "../src/agent_result.ts";
@@ -195,6 +194,10 @@ async function writeSources(root: string): Promise<string> {
 async function makeRunRoot(root: string): Promise<string> {
   const runRoot = join(root, "run");
   await mkdir(runRoot, { recursive: true });
+  // the shared project directory of the whole run is created by the caller
+  // (with closed permissions); the runtime never creates or copies it
+  await mkdir(join(runRoot, "project"), { mode: 0o700 });
+  await writeFile(join(runRoot, "project", "README.md"), "project seed\n");
   return runRoot;
 }
 
@@ -216,15 +219,6 @@ async function withRuntime(
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-}
-
-async function snapshotAll(
-  bundle: string,
-  sources: string,
-  runRoot: string,
-): Promise<RunInputsSnapshot> {
-  const pipeline = await loadPipelineV2(bundle);
-  return snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
 }
 
 async function expectReject(
@@ -483,6 +477,89 @@ test("5. the digest depends only on type, relative paths and content", async () 
     const emptyB = await emptyBindings(await makeRunRoot(join(dirs.root, "run-f")));
     expect(emptyA.inputs[1]?.digest).toBe(emptyB.inputs[1]?.digest);
     expect(emptyA.inputs[1]?.digest).toMatch(/^[0-9a-f]{64}$/);
+
+    // the same file under a different name digests differently
+    const renamed = join(dirs.root, "renamed-tree");
+    await mkdir(renamed, { recursive: true });
+    await writeFile(join(renamed, "z.txt"), "A");
+    const renameA = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: renamed },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-g")));
+    await rm(join(renamed, "z.txt"), { force: true });
+    await writeFile(join(renamed, "y.txt"), "A");
+    const renameB = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: renamed },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-h")));
+    expect(renameA.inputs[1]?.digest).not.toBe(renameB.inputs[1]?.digest);
+
+    // adding or removing an empty directory changes the digest
+    await rm(join(renamed, "y.txt"), { force: true });
+    await writeFile(join(renamed, "same.txt"), "A");
+    const base = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: renamed },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-i")));
+    await mkdir(join(renamed, "empty-sub"), { recursive: true });
+    const withEmpty = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: renamed },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-j")));
+    await rm(join(renamed, "empty-sub"), { recursive: true, force: true });
+    const withoutEmpty = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: renamed },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-k")));
+    expect(withEmpty.inputs[1]?.digest).not.toBe(base.inputs[1]?.digest);
+    expect(withoutEmpty.inputs[1]?.digest).toBe(base.inputs[1]?.digest);
+
+    // a directory entry and a file entry are never the same representation
+    const dirEntry = join(dirs.root, "dir-entry");
+    await mkdir(join(dirEntry, "x"), { recursive: true });
+    const fileEntry = join(dirs.root, "file-entry");
+    await mkdir(fileEntry, { recursive: true });
+    await writeFile(join(fileEntry, "x"), "");
+    const dirEntrySnap = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: dirEntry },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-l")));
+    const fileEntrySnap = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: fileEntry },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-m")));
+    expect(dirEntrySnap.inputs[1]?.digest).not.toBe(fileEntrySnap.inputs[1]?.digest);
+
+    // file creation order does not influence the digest
+    const orderOne = join(dirs.root, "order-one");
+    await mkdir(orderOne, { recursive: true });
+    await writeFile(join(orderOne, "a.txt"), "A");
+    await writeFile(join(orderOne, "b.txt"), "B");
+    await mkdir(join(orderOne, "sub"), { recursive: true });
+    await writeFile(join(orderOne, "sub", "c.txt"), "C");
+    const orderTwo = join(dirs.root, "order-two");
+    await mkdir(join(orderTwo, "sub"), { recursive: true });
+    await writeFile(join(orderTwo, "sub", "c.txt"), "C");
+    await writeFile(join(orderTwo, "b.txt"), "B");
+    await writeFile(join(orderTwo, "a.txt"), "A");
+    const orderOneSnap = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: orderOne },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-n")));
+    const orderTwoSnap = await snapshotRunInputs(pipeline, [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: orderTwo },
+      { id: "config", path: join(sources, "config.json") },
+    ], await makeRunRoot(join(dirs.root, "run-o")));
+    expect(orderOneSnap.inputs[1]?.digest).toBe(orderTwoSnap.inputs[1]?.digest);
   });
 });
 
@@ -543,13 +620,14 @@ test("7. symlink and special-file entries inside directory inputs are rejected",
 test("8. pipeline inputs are materialized into a fresh activation data tree", async () => {
   await withRuntime(async (dirs, sources) => {
     const runRoot = await makeRunRoot(dirs.root);
+    const pipeline = await loadPipelineV2(dirs.bundle);
     const snap = await snapshotRunInputs(
-      await loadPipelineV2(dirs.bundle),
+      pipeline,
       ALL_BINDINGS(sources),
       runRoot,
     );
     const prep = await prepareActivationData(
-      await loadPipelineV2(dirs.bundle),
+      pipeline,
       snap,
       [],
       "coder",
@@ -561,6 +639,11 @@ test("8. pipeline inputs are materialized into a fresh activation data tree", as
     expect(prep.activation_index).toBe(1);
     expect(prep.activation_root).toBe(join(prep.run_root, "activations", "1-coder"));
     expect(prep.reject_undeclared_outputs).toBe(true);
+    expect(snap.project_root).toBe(join(prep.run_root, "project"));
+    expect(prep.project_root).toBe(snap.project_root);
+    expect(prep.mounts[0]?.source).toBe(prep.project_root);
+    // there is no per-activation project directory
+    await expect(lstat(join(prep.data_root, "project"))).rejects.toThrow();
 
     expect(prep.input_ports.map((port) => port.id)).toEqual(["task", "specs", "config"]);
     expect(prep.input_ports.map((port) => port.type)).toEqual(["file", "directory", "json"]);
@@ -604,13 +687,8 @@ test("9. accepted state outputs are handed over into the next activation", async
     await writeFile(join(coderPrep.outputs_root, "scratch", "nested", "deep.txt"), "DEEP");
 
     const architectPrep = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", type: "file", path: join(coderPrep.outputs_root, "patch") },
-      {
-        state: "coder",
-        output: "scratch",
-        type: "directory",
-        path: join(coderPrep.outputs_root, "scratch"),
-      },
+      { state: "coder", output: "patch", activation_index: 1 },
+      { state: "coder", output: "scratch", activation_index: 1 },
     ], "architect", 2);
 
     expect(architectPrep.state_id).toBe("architect");
@@ -625,7 +703,7 @@ test("9. accepted state outputs are handed over into the next activation", async
   });
 });
 
-test("10. the last accepted activation wins for the same state output", async () => {
+test("10. the highest activation index wins, independent of list order", async () => {
   await withRuntime(async (dirs, sources) => {
     const runRoot = await makeRunRoot(dirs.root);
     const pipeline = await loadPipelineV2(dirs.bundle);
@@ -635,57 +713,42 @@ test("10. the last accepted activation wins for the same state output", async ()
     const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
     await writeFile(join(first.outputs_root, "patch"), "PATCH-1");
     await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
-    const scratchEntry = (prep: { outputs_root: string }) => ({
-      state: "coder",
-      output: "scratch",
-      type: "directory",
-      path: join(prep.outputs_root, "scratch"),
-    });
 
-    const latest = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", type: "file", path: join(first.outputs_root, "patch") },
-      { state: "coder", output: "patch", type: "file", path: join(second.outputs_root, "patch") },
-      scratchEntry(first),
+    const one = await prepareActivationData(pipeline, snap, [
+      { state: "coder", output: "patch", activation_index: 1 },
+      { state: "coder", output: "patch", activation_index: 2 },
+      { state: "coder", output: "scratch", activation_index: 1 },
     ], "architect", 3);
-    expect(await readFile(join(latest.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
+    expect(await readFile(join(one.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
 
-    const earliest = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", type: "file", path: join(first.outputs_root, "patch") },
-      { state: "coder", output: "patch", type: "file", path: join(second.outputs_root, "patch") },
-      { state: "coder", output: "patch", type: "file", path: join(first.outputs_root, "patch") },
-      scratchEntry(first),
+    // permuting the records cannot change the accepted output
+    const two = await prepareActivationData(pipeline, snap, [
+      { state: "coder", output: "scratch", activation_index: 1 },
+      { state: "coder", output: "patch", activation_index: 2 },
+      { state: "coder", output: "patch", activation_index: 1 },
     ], "architect", 4);
-    expect(await readFile(join(earliest.inputs_root, "patch"), "utf8")).toBe("PATCH-1");
+    expect(await readFile(join(two.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
   });
 });
 
-test("11. missing, forward and first-visit self state outputs are rejected", async () => {
+test("11. missing, future and first-visit self state outputs are rejected", async () => {
   await withRuntime(async (dirs, sources) => {
     const runRoot = await makeRunRoot(dirs.root);
     const pipeline = await loadPipelineV2(dirs.bundle);
     const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
 
-    // missing: no accepted outputs at all
+    // missing: no accepted records at all
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [], "architect", 1);
     }, /input port "patch" of agent state "architect" references state output "coder"\."patch" which has no accepted output yet/);
     await expect(lstat(join(runRoot, "activations", "1-architect"))).rejects.toThrow();
 
-    // forward: a later state's output is accepted while an earlier one is not
+    // a specific reference stays missing while another reference is present
     const coderPrep = await prepareActivationData(pipeline, snap, [], "coder", 1);
     await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH-1");
-    const fabricatedReport = join(runRoot, "fabricated", "report");
-    await mkdir(join(runRoot, "fabricated"), { recursive: true });
-    await writeFile(fabricatedReport, "REPORT");
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "architect", output: "report", type: "file", path: fabricatedReport },
-        {
-          state: "coder",
-          output: "scratch",
-          type: "directory",
-          path: join(coderPrep.outputs_root, "scratch"),
-        },
+        { state: "coder", output: "scratch", activation_index: 1 },
       ], "architect", 2);
     }, /input port "patch" of agent state "architect" references state output "coder"\."patch" which has no accepted output yet/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
@@ -701,29 +764,21 @@ test("11. missing, forward and first-visit self state outputs are rejected", asy
     await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH-1");
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", type: "file", path: join(coderPrep.outputs_root, "patch") },
-        {
-          state: "coder",
-          output: "scratch",
-          type: "directory",
-          path: join(coderPrep.outputs_root, "scratch"),
-        },
+        { state: "coder", output: "patch", activation_index: 1 },
+        { state: "coder", output: "scratch", activation_index: 1 },
       ], "architect", 2);
     }, /input port "facts" of agent state "architect" references state output "architect"\."facts" which has no accepted output yet/);
+    await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
 
-    // a revisit resolves the self-reference from the accepted list
-    const factsPath = join(runRoot, "fabricated", "facts");
-    await mkdir(join(runRoot, "fabricated"), { recursive: true });
-    await writeFile(factsPath, JSON.stringify({ revision: 7 }));
+    // a revisit resolves the self-reference from the fixed location of an
+    // earlier architect activation whose worker produced the output
+    const factsLeaf = join(runRoot, "activations", "2-architect", "data", "outputs");
+    await mkdir(factsLeaf, { recursive: true });
+    await writeFile(join(factsLeaf, "facts"), JSON.stringify({ revision: 7 }));
     const revisit = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", type: "file", path: join(coderPrep.outputs_root, "patch") },
-      {
-        state: "coder",
-        output: "scratch",
-        type: "directory",
-        path: join(coderPrep.outputs_root, "scratch"),
-      },
-      { state: "architect", output: "facts", type: "json", path: factsPath },
+      { state: "coder", output: "patch", activation_index: 1 },
+      { state: "coder", output: "scratch", activation_index: 1 },
+      { state: "architect", output: "facts", activation_index: 2 },
     ], "architect", 3);
     expect(await readFile(join(revisit.inputs_root, "facts"), "utf8")).toBe(
       JSON.stringify({ revision: 7 }),
@@ -731,100 +786,166 @@ test("11. missing, forward and first-visit self state outputs are rejected", asy
   }, SELFREF_YAML);
 });
 
-test("12. the accepted-output list is validated: declaration, type, kind, existence", async () => {
+test("12. accepted records are validated: shape, declaration, index, fixed location", async () => {
   await withRuntime(async (dirs, sources) => {
     const runRoot = await makeRunRoot(dirs.root);
     const pipeline = await loadPipelineV2(dirs.bundle);
     const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
-    const coderPrep = await prepareActivationData(pipeline, snap, [], "coder", 1);
-    await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH");
-    const patchPath = join(coderPrep.outputs_root, "patch");
+    await prepareActivationData(pipeline, snap, [], "coder", 1);
+
+    const coderOutputs = join(runRoot, "activations", "1-coder", "data", "outputs");
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "nowhere", output: "patch", type: "file", path: patchPath },
+        { state: "nowhere", output: "patch", activation_index: 1 },
       ], "architect", 2);
     }, /accepted state output 0 references state "nowhere" which is not a declared agent state/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "done", output: "patch", type: "file", path: patchPath },
+        { state: "done", output: "patch", activation_index: 1 },
       ], "architect", 2);
     }, /accepted state output 0 references state "done" which is not a declared agent state/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "nope", type: "file", path: patchPath },
+        { state: "coder", output: "nope", activation_index: 1 },
       ], "architect", 2);
     }, /references output "nope" which is not declared by state "coder"/);
 
+    // no user paths and no types are accepted at all
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", type: "directory", path: patchPath },
+        { state: "coder", output: "patch", activation_index: 1, path: coderOutputs + "/patch" },
       ], "architect", 2);
-    }, /accepted state output 0 declares type "directory" but state "coder" declares output port "patch" as "file"/);
+    }, /accepted state output 0 has unknown field "path"/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", type: "file", path: join(coderPrep.outputs_root, "scratch") },
+        { state: "coder", output: "patch", activation_index: 1, type: "file" },
       ], "architect", 2);
-    }, /accepted output .* is not a regular file/);
+    }, /accepted state output 0 has unknown field "type"/);
+
+    // future and current activation indexes are rejected
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 2 },
+      ], "architect", 2);
+    }, /records activation index 2 which is not below the current activation index 2/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", type: "file", path: join(coderPrep.outputs_root, "missing") },
+        { state: "coder", output: "patch", activation_index: 4 },
       ], "architect", 2);
-    }, /accepted output .* does not exist/);
+    }, /records activation index 4 which is not below the current activation index 2/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", type: "file", path: "relative/patch" },
+        { state: "coder", output: "patch", activation_index: 0 },
       ], "architect", 2);
-    }, /path must be an absolute path/);
+    }, /activation index must be a positive safe integer/);
+
+    // duplicate records are rejected
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 1 },
+        { state: "coder", output: "patch", activation_index: 1 },
+      ], "architect", 2);
+    }, /is listed more than once/);
+
+    // one activation index cannot belong to two different states
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 1 },
+        { state: "architect", output: "report", activation_index: 1 },
+      ], "architect", 2);
+    }, /activation index 1 cannot belong to both state "coder" and state "architect"/);
+
+    // the fixed location must exist: missing activation leaf (the index is
+    // below the current one, but no leaf for that index and state exists)
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "architect", output: "report", activation_index: 2 },
+      ], "architect", 3);
+    }, /activation leaf .*2-architect does not exist/);
+
+    // the fixed location must exist: missing output object
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 1 },
+      ], "architect", 2);
+    }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
+
+    // the fixed location must hold a real object of the declared kind
+    await mkdir(join(coderOutputs, "patch"), { recursive: true });
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 1 },
+      ], "architect", 2);
+    }, /fixed output .*1-coder\/data\/outputs\/patch is not a regular file/);
+    await rm(join(coderOutputs, "patch"), { recursive: true, force: true });
+
+    // a symlink at the fixed location is rejected
+    await symlink(join(dirs.root, "outside.txt"), join(coderOutputs, "patch"));
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 1 },
+      ], "architect", 2);
+    }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
   });
 });
 
-test("13. activation leaf and path reuse are rejected fail-closed", async () => {
+test("13. activation indexes are globally unique and paths are never reused", async () => {
   await withRuntime(async (dirs, sources) => {
     const runRoot = await makeRunRoot(dirs.root);
     const pipeline = await loadPipelineV2(dirs.bundle);
     const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
 
     await prepareActivationData(pipeline, snap, [], "coder", 1);
+
+    // exact repeat
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [], "coder", 1);
-    }, /activation leaf .* already exists, found an existing directory/);
+    }, /activation index 1 is already in use at .*1-coder/);
 
-    // the same index is allowed for a different state with its own leaf
-    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "patch"), "PATCH");
-    const architectSameIndex = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", type: "file", path: join(runRoot, "activations", "1-coder", "data", "outputs", "patch") },
-      {
-        state: "coder",
-        output: "scratch",
-        type: "directory",
-        path: join(runRoot, "activations", "1-coder", "data", "outputs", "scratch"),
-      },
-    ], "architect", 1);
-    expect(architectSameIndex.activation_root).toBe(join(runRoot, "activations", "1-architect"));
+    // the same index with a different state fails identically
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [], "architect", 1);
+    }, /activation index 1 is already in use at .*1-coder/);
+
+    // a fresh index prepares normally
+    const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+    expect(second.activation_root).toBe(join(runRoot, "activations", "2-coder"));
 
     for (const kind of ["file", "dir", "symlink"] as const) {
       const runRootX = await makeRunRoot(join(dirs.root, `r-leaf-${kind}`));
       const snapX = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRootX);
+      // pre-placed entries under the requested index prefix are rejected
+      // no matter their state id or object kind
       const leaf = join(runRootX, "activations", "1-coder");
+      const other = join(runRootX, "activations", "1-architect");
       if (kind === "dir") {
-        await mkdir(leaf, { recursive: true });
+        await mkdir(other, { recursive: true });
       } else {
         await mkdir(join(runRootX, "activations"), { recursive: true });
         if (kind === "file") {
-          await writeFile(leaf, "not a directory");
+          await writeFile(other, "not a directory");
         } else {
-          await symlink(dirs.root, leaf);
+          await symlink(dirs.root, other);
         }
       }
       await expectReject(async () => {
         await prepareActivationData(pipeline, snapX, [], "coder", 1);
-      }, /activation leaf .* already exists/);
+      }, /activation index 1 is already in use at .*1-architect/);
+      await expect(lstat(leaf)).rejects.toThrow();
+      // the pre-placed object was not modified
+      if (kind === "dir") {
+        expect((await lstat(other)).isDirectory()).toBe(true);
+      } else if (kind === "file") {
+        expect(await readFile(other, "utf8")).toBe("not a directory");
+      } else {
+        expect((await lstat(other)).isSymbolicLink()).toBe(true);
+      }
     }
   });
 });
@@ -870,30 +991,38 @@ test("14. symlink traps on run-owned paths are rejected and preserved", async ()
   });
 });
 
-test("15. escape through the accepted-output list is rejected before anything is created", async () => {
+test("15. records resolve only the fixed location; arbitrary paths never satisfy them", async () => {
   await withRuntime(async (dirs, sources) => {
     const runRoot = await makeRunRoot(dirs.root);
     const pipeline = await loadPipelineV2(dirs.bundle);
     const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
     await prepareActivationData(pipeline, snap, [], "coder", 1);
 
-    const outside = join(dirs.root, "outside-report.txt");
-    await writeFile(outside, "ESCAPED");
+    // a valid file at an arbitrary contained path cannot satisfy a record:
+    // only the fixed orchestrator-derived location is resolved
+    const arbitrary = join(runRoot, "arbitrary", "patch");
+    await mkdir(join(runRoot, "arbitrary"), { recursive: true });
+    await writeFile(arbitrary, "PATCH");
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", type: "file", path: outside },
+        { state: "coder", output: "patch", activation_index: 1 },
       ], "architect", 2);
-    }, /accepted output .*?resolves outside the canonical run root/);
+    }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
-    expect(await readFile(outside, "utf8")).toBe("ESCAPED");
+    expect(await readFile(arbitrary, "utf8")).toBe("PATCH");
 
+    // a symlink planted at the fixed location is rejected regardless of
+    // where it points
+    const outside = join(dirs.root, "outside.txt");
+    await writeFile(outside, "ESCAPED");
     const escapeLink = join(runRoot, "activations", "1-coder", "data", "outputs", "patch");
     await symlink(outside, escapeLink);
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", type: "file", path: escapeLink },
+        { state: "coder", output: "patch", activation_index: 1 },
       ], "architect", 3);
-    }, /accepted output .* is a symbolic link/);
+    }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
+    expect(await readFile(outside, "utf8")).toBe("ESCAPED");
   });
 });
 
@@ -937,6 +1066,7 @@ test("17. digests and serialized artifacts carry no source host paths", async ()
     const serialized = JSON.stringify(snap);
     expect(serialized).not.toContain(sources);
     expect(serialized).toContain(snap.run_root);
+    expect(snap.project_root).toBe(join(snap.run_root, "project"));
     for (const entry of snap.inputs) {
       expect(entry.digest).toMatch(/^[0-9a-f]{64}$/);
     }
@@ -975,6 +1105,27 @@ test("18. run root validation and rejected activation requests", async () => {
     await expectReject(async () => {
       await snapshotRunInputs(pipeline, bindings, linkRoot);
     }, /run root .* exists but is a symbolic link/);
+
+    // the shared project directory must pre-exist as a real directory
+    const noProject = await makeRunRoot(join(dirs.root, "r-no-project"));
+    await rm(join(noProject, "project"), { recursive: true, force: true });
+    await expectReject(async () => {
+      await snapshotRunInputs(pipeline, bindings, noProject);
+    }, /run project root .* does not exist/);
+
+    const linkProject = await makeRunRoot(join(dirs.root, "r-link-project"));
+    await rm(join(linkProject, "project"), { recursive: true, force: true });
+    await symlink(dirs.root, join(linkProject, "project"));
+    await expectReject(async () => {
+      await snapshotRunInputs(pipeline, bindings, linkProject);
+    }, /run project root .* exists but is a symbolic link/);
+
+    const fileProject = await makeRunRoot(join(dirs.root, "r-file-project"));
+    await rm(join(fileProject, "project"), { recursive: true, force: true });
+    await writeFile(join(fileProject, "project"), "not a directory");
+    await expectReject(async () => {
+      await snapshotRunInputs(pipeline, bindings, fileProject);
+    }, /run project root .* exists but is an existing regular file/);
 
     const runRoot = await makeRunRoot(dirs.root);
     const snap = await snapshotRunInputs(pipeline, bindings, runRoot);
@@ -1028,20 +1179,24 @@ test("19. failed operations clean up exactly what they created", async () => {
 
     // a mid-copy activation failure removes exactly its own leaf tree
     await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "patch"), "PATCH");
-    const scratch = join(runRoot, "fabricated", "scratch");
-    await mkdir(scratch, { recursive: true });
+    const scratch = join(runRoot, "activations", "1-coder", "data", "outputs", "scratch");
     await writeFile(join(scratch, "readable.txt"), "OK");
     await writeFile(join(scratch, "unreadable.txt"), "SECRET");
     await chmod(join(scratch, "unreadable.txt"), 0o000);
+
+    // the scratch handoff is missing first, then fails mid-copy once the
+    // record is present; both attempts remove exactly their own leaf tree
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        {
-          state: "coder",
-          output: "patch",
-          type: "file",
-          path: join(runRoot, "activations", "1-coder", "data", "outputs", "patch"),
-        },
-        { state: "coder", output: "scratch", type: "directory", path: scratch },
+        { state: "coder", output: "patch", activation_index: 1 },
+      ], "architect", 3);
+    }, /input port "scratch" of agent state "architect" references state output "coder"\."scratch" which has no accepted output yet/);
+    await expect(lstat(join(runRoot, "activations", "3-architect"))).rejects.toThrow();
+
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 1 },
+        { state: "coder", output: "scratch", activation_index: 1 },
       ], "architect", 3);
     }, /input port "scratch" of agent state "architect" file entry "unreadable\.txt" .* is not readable as a regular file/);
     await chmod(join(scratch, "unreadable.txt"), 0o600);
@@ -1054,24 +1209,70 @@ test("19. failed operations clean up exactly what they created", async () => {
   });
 });
 
-test("20. runtime APIs honor the loadPipelineV2 provenance boundary", async () => {
+test("20. runtime APIs honor the loadPipelineV2 and snapshotRunInputs provenance boundaries", async () => {
   await withRuntime(async (dirs, sources) => {
     const runRoot = await makeRunRoot(dirs.root);
     const pipeline = await loadPipelineV2(dirs.bundle);
     const bindings = ALL_BINDINGS(sources);
     const snap = await snapshotRunInputs(pipeline, bindings, runRoot);
 
-    const clone = structuredClone(pipeline);
+    // pipeline provenance
     await expectReject(async () => {
-      await snapshotRunInputs(clone as never, bindings, await makeRunRoot(join(dirs.root, "r-clone")));
+      await snapshotRunInputs(structuredClone(pipeline) as never, bindings, await makeRunRoot(join(dirs.root, "r-clone")));
     }, /run input binding requires the deep-frozen snapshot object returned by loadPipelineV2/);
     await expectReject(async () => {
       await prepareActivationData({} as never, snap, [], "coder", 1);
     }, /activation data preparation requires the deep-frozen snapshot object returned by loadPipelineV2/);
-    await expectReject(async () => {
-      await prepareActivationData(structuredClone(pipeline) as never, snap, [], "coder", 1);
-    }, /activation data preparation requires the deep-frozen snapshot object returned by loadPipelineV2/);
 
+    // snapshot provenance: clones and forged objects are rejected before
+    // any field is read
+    const forgedMessage = /activation data preparation requires the frozen run input snapshot object returned by a successful snapshotRunInputs call for the same trusted pipeline/;
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, structuredClone(snap), [], "coder", 1);
+    }, forgedMessage);
+
+    const forgedFields = structuredClone(snap) as unknown as {
+      run_root: string;
+      inputs_root: string;
+      project_root: string;
+      inputs: Record<string, unknown>[];
+    };
+    forgedFields.inputs.forEach((entry) => {
+      entry.snapshot_path = join(runRoot, "evil");
+      entry.digest = "0".repeat(64);
+      entry.protected = true;
+    });
+    forgedFields.inputs.push({ ...forgedFields.inputs[0] });
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, forgedFields as never, [], "coder", 1);
+    }, forgedMessage);
+
+    // a snapshot created for a different pipeline object is rejected
+    const otherPipeline = await loadPipelineV2(dirs.bundle);
+    await expectReject(async () => {
+      await prepareActivationData(otherPipeline, snap, [], "coder", 1);
+    }, forgedMessage);
+
+    // getters and Proxy traps are never invoked
+    let getterInvoked = 0;
+    const spySnapshot = new Proxy(snap, {
+      get(target, property, receiver) {
+        getterInvoked += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, spySnapshot as never, [], "coder", 1);
+    }, forgedMessage);
+    expect(getterInvoked).toBe(0);
+
+    // every forged attempt was rejected before any filesystem mutation
+    await expect(lstat(join(runRoot, "activations", "1-coder"))).rejects.toThrow();
+    expect((await readdir(join(runRoot))).filter((name) => name !== "project" && name !== "data").length).toBe(0);
+
+    // the genuine snapshot and pipeline keep working
+    const prep = await prepareActivationData(pipeline, snap, [], "coder", 1);
+    expect(prep.state_id).toBe("coder");
     await snapshotRunInputs(pipeline, bindings, await makeRunRoot(join(dirs.root, "r-again")));
     expect(planActivationLayout(pipeline, "coder").state_id).toBe("coder");
   });
@@ -1160,4 +1361,35 @@ test("23. the v2 compile path is unchanged (JSON Schema validation untouched)", 
   }
   expect(architect.inputs.map((port) => port.type)).toEqual(["file", "directory", "file"]);
   expect(architect.outputs.map((port) => port.type)).toEqual(["file", "json"]);
+});
+
+test("24. the shared project root persists across activations", async () => {
+  await withRuntime(async (dirs, sources) => {
+    const runRoot = await makeRunRoot(dirs.root);
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
+
+    const first = await prepareActivationData(pipeline, snap, [], "coder", 1);
+    const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+    expect(first.project_root).toBe(second.project_root);
+    expect(first.mounts[0]?.source).toBe(second.mounts[0]?.source);
+    expect(first.mounts[0]?.target).toBe("/workspace");
+    expect(first.mounts[0]?.read_only).toBe(false);
+    expect(second.mounts[0]?.read_only).toBe(false);
+
+    // a change to the shared project is visible to later activations
+    // through the same mount source; the runtime copied nothing
+    await writeFile(join(second.project_root, "notes.txt"), "second activation\n");
+    expect(await readFile(join(first.project_root, "notes.txt"), "utf8")).toBe("second activation\n");
+    expect((await readdir(first.data_root)).sort()).toEqual(["inputs", "outputs"]);
+    expect((await readdir(second.data_root)).sort()).toEqual(["inputs", "outputs"]);
+
+    // a failed preparation removes its leaf only; the project stays intact
+    await expectReject(async () => {
+      await prepareActivationData(pipeline, snap, [], "architect", 3);
+    }, /state output "coder"\."patch" which has no accepted output yet/);
+    await expect(lstat(join(runRoot, "activations", "3-architect"))).rejects.toThrow();
+    expect(await readFile(join(runRoot, "project", "notes.txt"), "utf8")).toBe("second activation\n");
+    expect((await lstat(join(runRoot, "project"))).isDirectory()).toBe(true);
+  });
 });

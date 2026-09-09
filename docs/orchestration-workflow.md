@@ -457,7 +457,13 @@ v2 execution into `agent-smoke` is a later increment.
 ### v2 run-input snapshots and host-side activation data layout (pure substrate, not wired)
 
 `orchestrator/src/pipeline_v2_runtime.ts` materializes the v2 data plane on
-the host, without Sessions or containers. `snapshotRunInputs` binds every
+the host, without Sessions or containers. Run layout: `<runRoot>/project` is
+the shared project directory of the whole run. It must exist as a real
+non-symlink directory before `snapshotRunInputs` is called; the runtime never
+creates, clears, or copies it (preparing the initial project content is the
+caller's responsibility), and every activation mounts exactly this one
+directory at `/workspace` read-write, so changes persist across activations —
+there is no per-activation project directory. `snapshotRunInputs` binds every
 declared pipeline input exactly once to an absolute host path whose real
 object kind must match the declared `file`/`directory`/`json` type (`json`
 must parse; the loaded schema snapshot is used, never re-read), then copies
@@ -465,27 +471,44 @@ each input into the orchestrator-owned snapshot
 `<runRoot>/data/inputs/<input-id>` — files byte-for-byte, directories in
 deterministic sorted order with only real directories and regular files
 allowed — and records a deterministic SHA-256 digest over type, relative
-paths, and content only. After the snapshot, user source paths are no longer
-read: the returned frozen metadata is the run's only data source. Sources are
-never mounted directly to agents. `prepareActivationData` then builds a fresh
+paths, and content only (directory entries contribute their kind tag,
+length-framed relative path, and length-framed content, so names, entry
+kinds, and empty directories all change the digest). After the snapshot, user
+source paths are no longer read: the returned frozen metadata (canonical run
+root, inputs root, canonical shared project root, per-input paths and
+digests) is the run's only data source. The frozen snapshot object is
+registered in a module-private `WeakMap` together with the exact trusted
+pipeline and the canonical run/project roots; `prepareActivationData` accepts
+only that exact object for the same pipeline object (hand-built objects,
+casts, clones, Proxies, and snapshots of another pipeline are rejected before
+any field is read). Sources are never mounted directly to agents.
+`prepareActivationData` then builds a fresh
 `<runRoot>/activations/<index>-<state>/data/` tree per activation with
 `inputs/` (declaration-order copies from the run-owned snapshot or from the
-runner-owned accepted-output list, where the last accepted entry for a
-`state`/`output` pair wins), `outputs/` (pre-created directories for
-`directory` outputs; `file`/`json` outputs absent until the worker creates
-them) and a fresh `project/` scratch directory, and returns exact mount
-descriptors: project → `/workspace` RW, inputs → `/pipeline/inputs` RO,
-outputs → `/pipeline/outputs` RW, plus `reject_undeclared_outputs: true`
+runner-owned accepted records `{state, output, activation_index}` — no user
+paths and no types are accepted: the type derives from the declared output
+port and the object must exist at the fixed orchestrator-derived path
+`<runRoot>/activations/<index>-<state>/data/outputs/<output>`, with the
+highest activation index winning per `state`/`output` pair independent of
+list order), and `outputs/` (pre-created directories for `directory` outputs;
+`file`/`json` outputs absent until the worker creates them). The activation
+index is globally unique within the run: any existing `activations/` entry
+with the same `<index>-` prefix rejects the request before the leaf is
+created. Activation data carries no project directory. Returns exact mount
+descriptors: shared project → `/workspace` RW, inputs → `/pipeline/inputs`
+RO, outputs → `/pipeline/outputs` RW, plus `reject_undeclared_outputs: true`
 (validation after a worker run is not implemented yet). Everything is
-fail-closed: bindings and accepted outputs are validated before any mutation,
-the activation leaf must be absent, symlink traps on run-owned paths are
-rejected, directories are 0700 and files 0600 (worker-UID compatibility is an
-explicit limitation of the next increment), failed operations remove exactly
-the objects they created, and existing snapshots are never overwritten.
-Honest boundaries: no defense against a trusted host process mutating a
-source during the read, and no crash-recovery contract. The production
-runner, durable state, decision evaluator, and lifecycle are untouched;
-Session creation, mounts, and worker launch are a later increment.
+fail-closed: bindings and accepted records are validated before any mutation,
+the activation index must be globally unused, the activation leaf must be
+absent, symlink traps on run-owned paths are rejected, directories are 0700
+and files 0600 (worker-UID compatibility is an explicit limitation of the
+next increment), failed operations remove exactly the objects they created,
+existing snapshots are never overwritten, and the shared project root is
+never created, modified, or removed by the runtime. Honest boundaries: no
+defense against a trusted host process mutating a source during the read, and
+no crash-recovery contract. The production runner, durable state, decision
+evaluator, and lifecycle are untouched; Session creation, mounts, and worker
+launch are a later increment.
 
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
