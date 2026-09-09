@@ -886,20 +886,25 @@ interface ParsedAcceptedOutput {
 }
 
 /**
- * Parse and validate the runner-owned accepted records `{state, output,
- * activation_index}`: exact fields, safe ids, positive safe index below the
- * current activation index, a declared agent state, and a declared output
- * port (whose declared type becomes the derived record type). Cross-record
+ * Phase 1 of accepted-history validation. Parse and validate the
+ * runner-owned accepted records `{state, output, activation_index}`: the
+ * argument must be a list (never a stray `TypeError`), every record has
+ * exact fields, safe ids, a positive safe index below the current
+ * activation index, a declared agent state, and a declared output port
+ * (whose declared type becomes the derived record type). Cross-record
  * invariants: no duplicate records for one activation, and one activation
- * index can never belong to two different states. List order is irrelevant
- * — the resolved value for a `state`/`output` pair is the record with the
- * highest activation index.
+ * index can never belong to two different states. List order is
+ * irrelevant — selection happens only after every record has been fully
+ * resolved (see `resolveAcceptedOutputs`).
  */
 function parseAcceptedStateOutputs(
   acceptedOutputs: readonly unknown[],
   pipeline: ResolvedPipelineV2,
   currentActivationIndex: number,
 ): ParsedAcceptedOutput[] {
+  if (!Array.isArray(acceptedOutputs)) {
+    throw new PipelineError("accepted state outputs must be a list");
+  }
   const agentStates = new Map<string, Map<string, PortType>>();
   for (const state of pipeline.states) {
     if (state.type !== "agent") {
@@ -968,37 +973,39 @@ function parseAcceptedStateOutputs(
 interface ResolvedAcceptedOutput {
   readonly type: PortType;
   readonly canonicalPath: string;
+  readonly activationIndex: number;
 }
 
 /**
- * Resolve the accepted records to their fixed orchestrator-derived paths.
- * For each `state`/`output` pair the record with the highest activation
- * index wins (permutation of the record list changes nothing). The object
- * must exist at the exact fixed path
- * `<runRoot>/activations/<index>-<state>/data/outputs/<output>`; every
- * required parent component and the final object must be real
- * non-symlink objects of the kind matching the declared output port type,
- * and the canonical resolution must stay inside the canonical run root.
+ * Phases 2 and 3 of accepted-history validation. Phase 2 resolves EVERY
+ * record to its fixed orchestrator-derived path: the accepted history is a
+ * single runner-owned journal and must be internally coherent as a whole,
+ * so a newer correct record never excuses an older phantom or corrupted
+ * one. Each record's activation leaf, `data` and `outputs` parents and the
+ * final object must be real non-symlink objects (the final one of the kind
+ * matching the declared output port type), and the canonical resolution
+ * must stay inside the canonical run root. Phase 3 — only after every
+ * record resolved — selects the record with the highest activation index
+ * for each `state`/`output` pair (permutation of the record list changes
+ * nothing).
  */
 async function resolveAcceptedOutputs(
   acceptedOutputs: readonly ParsedAcceptedOutput[],
   runRootCanonical: string,
 ): Promise<Map<string, ResolvedAcceptedOutput>> {
-  const best = new Map<string, ParsedAcceptedOutput>();
-  for (const record of acceptedOutputs) {
-    const key = `${record.state}\u0000${record.output}`;
-    const existing = best.get(key);
-    if (existing === undefined || record.activationIndex > existing.activationIndex) {
-      best.set(key, record);
-    }
-  }
-
   const activationsRoot = join(runRootCanonical, "activations");
-  const resolved = new Map<string, ResolvedAcceptedOutput>();
-  for (const [ref, record] of best) {
+  interface FullyResolvedRecord {
+    readonly record: ParsedAcceptedOutput;
+    readonly type: PortType;
+    readonly canonicalPath: string;
+  }
+  const fullyResolved: FullyResolvedRecord[] = [];
+  if (acceptedOutputs.length > 0) {
+    await requireRealDirectory(activationsRoot, "activations root");
+  }
+  for (const record of acceptedOutputs) {
     const what = `accepted state output for ${JSON.stringify(record.state)}.${JSON.stringify(record.output)} at activation index ${record.activationIndex}`;
     const leafPath = join(activationsRoot, `${record.activationIndex}-${record.state}`);
-    await requireRealDirectory(activationsRoot, "activations root");
     await requireRealDirectory(leafPath, `${what} activation leaf`);
     await requireRealDirectory(join(leafPath, "data"), `${what} activation data root`);
     await requireRealDirectory(join(leafPath, "data", "outputs"), `${what} activation outputs root`);
@@ -1032,7 +1039,20 @@ async function resolveAcceptedOutputs(
         `${what} fixed output resolves outside the canonical run root ${runRootCanonical}`,
       );
     }
-    resolved.set(ref, { type: record.type, canonicalPath: canonical });
+    fullyResolved.push({ record, type: record.type, canonicalPath: canonical });
+  }
+
+  const resolved = new Map<string, ResolvedAcceptedOutput>();
+  for (const resolvedRecord of fullyResolved) {
+    const key = `${resolvedRecord.record.state}\u0000${resolvedRecord.record.output}`;
+    const existing = resolved.get(key);
+    if (existing === undefined || resolvedRecord.record.activationIndex > existing.activationIndex) {
+      resolved.set(key, {
+        type: resolvedRecord.type,
+        canonicalPath: resolvedRecord.canonicalPath,
+        activationIndex: resolvedRecord.record.activationIndex,
+      });
+    }
   }
   return resolved;
 }

@@ -1393,3 +1393,138 @@ test("24. the shared project root persists across activations", async () => {
     expect((await lstat(join(runRoot, "project"))).isDirectory()).toBe(true);
   });
 });
+
+test("25. the whole accepted history is validated before the latest record is selected", async () => {
+  await withRuntime(async (dirs, sources) => {
+    const setup = async (name: string) => {
+      const runRoot = await makeRunRoot(join(dirs.root, name));
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
+      return { runRoot, pipeline, snap };
+    };
+    const architectLeaf = (runRoot: string, index: number) =>
+      join(runRoot, "activations", `${index}-architect`);
+
+    // a phantom index 1 is rejected even though index 2 of the same pair
+    // is correct
+    {
+      const { runRoot, pipeline, snap } = await setup("r-phantom");
+      const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+      await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      await expectReject(async () => {
+        await prepareActivationData(pipeline, snap, [
+          { state: "coder", output: "patch", activation_index: 1 },
+          { state: "coder", output: "patch", activation_index: 2 },
+        ], "architect", 3);
+      }, /accepted state output for "coder"\."patch" at activation index 1 activation leaf .*1-coder does not exist/);
+      await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
+      expect(await readFile(join(second.outputs_root, "patch"), "utf8")).toBe("PATCH-2");
+    }
+
+    // a missing output at index 1 is rejected even though index 2 exists
+    {
+      const { runRoot, pipeline, snap } = await setup("r-missing-output");
+      await prepareActivationData(pipeline, snap, [], "coder", 1);
+      const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+      await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      await expectReject(async () => {
+        await prepareActivationData(pipeline, snap, [
+          { state: "coder", output: "patch", activation_index: 1 },
+          { state: "coder", output: "patch", activation_index: 2 },
+        ], "architect", 3);
+      }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
+      await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
+    }
+
+    // a symlink output at index 1 is rejected even though index 2 is
+    // correct; the external sentinel is untouched
+    {
+      const { runRoot, pipeline, snap } = await setup("r-symlink");
+      const first = await prepareActivationData(pipeline, snap, [], "coder", 1);
+      const sentinel = join(dirs.root, "r-symlink-sentinel.txt");
+      await writeFile(sentinel, "SENTINEL");
+      await symlink(sentinel, join(first.outputs_root, "patch"));
+      const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+      await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      await expectReject(async () => {
+        await prepareActivationData(pipeline, snap, [
+          { state: "coder", output: "patch", activation_index: 1 },
+          { state: "coder", output: "patch", activation_index: 2 },
+        ], "architect", 3);
+      }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
+      await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
+      expect(await readFile(sentinel, "utf8")).toBe("SENTINEL");
+      expect(await readFile(join(second.outputs_root, "patch"), "utf8")).toBe("PATCH-2");
+    }
+
+    // a wrong filesystem kind at index 1 is rejected even though index 2
+    // is a correct regular file
+    {
+      const { runRoot, pipeline, snap } = await setup("r-kind");
+      const first = await prepareActivationData(pipeline, snap, [], "coder", 1);
+      await mkdir(join(first.outputs_root, "patch"));
+      const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+      await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      await expectReject(async () => {
+        await prepareActivationData(pipeline, snap, [
+          { state: "coder", output: "patch", activation_index: 1 },
+          { state: "coder", output: "patch", activation_index: 2 },
+        ], "architect", 3);
+      }, /fixed output .*1-coder\/data\/outputs\/patch is not a regular file/);
+      await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
+    }
+
+    // a substituted parent of an early record corrupts the whole history
+    {
+      const { runRoot, pipeline, snap } = await setup("r-parent");
+      const first = await prepareActivationData(pipeline, snap, [], "coder", 1);
+      await writeFile(join(first.outputs_root, "patch"), "PATCH-1");
+      const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+      await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      await rm(join(first.activation_root, "data"), { recursive: true, force: true });
+      await symlink(join(dirs.root, "outside-data"), join(first.activation_root, "data"));
+      await expectReject(async () => {
+        await prepareActivationData(pipeline, snap, [
+          { state: "coder", output: "patch", activation_index: 1 },
+          { state: "coder", output: "patch", activation_index: 2 },
+        ], "architect", 3);
+      }, /activation data root .*1-coder\/data exists but is a symbolic link/);
+      await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
+      expect(await readFile(join(second.outputs_root, "patch"), "utf8")).toBe("PATCH-2");
+    }
+
+    // two correct records resolve in any list order; the highest index wins
+    {
+      const { runRoot, pipeline, snap } = await setup("r-correct");
+      const first = await prepareActivationData(pipeline, snap, [], "coder", 1);
+      await writeFile(join(first.outputs_root, "patch"), "PATCH-1");
+      const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
+      await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      const scratchRecord = { state: "coder", output: "scratch", activation_index: 1 };
+      const ascending = await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 1 },
+        { state: "coder", output: "patch", activation_index: 2 },
+        scratchRecord,
+      ], "architect", 3);
+      expect(await readFile(join(ascending.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
+      const descending = await prepareActivationData(pipeline, snap, [
+        { state: "coder", output: "patch", activation_index: 2 },
+        { state: "coder", output: "patch", activation_index: 1 },
+        scratchRecord,
+      ], "architect", 4);
+      expect(await readFile(join(descending.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
+    }
+
+    // a non-list acceptedOutputs argument fails with a stable
+    // PipelineError, never a stray TypeError from .map()
+    {
+      const { runRoot, pipeline, snap } = await setup("r-nonlist");
+      for (const bad of [null, { state: "coder" }, "patch"] as unknown[]) {
+        await expectReject(async () => {
+          await prepareActivationData(pipeline, snap, bad as never, "coder", 1);
+        }, /accepted state outputs must be a list/);
+      }
+      await expect(lstat(architectLeaf(runRoot, 1))).rejects.toThrow();
+    }
+  });
+});
