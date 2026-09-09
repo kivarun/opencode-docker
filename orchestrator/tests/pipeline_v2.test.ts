@@ -358,7 +358,9 @@ test("3. loadPipelineV2 resolves bundle files with schema snapshots and is deepl
       throw new Error("expected facts_digest schema snapshot");
     }
     expect(digest.schema).toEqual(FACTS_SCHEMA);
-    expect(digest.schemaPath?.endsWith("schemas/facts.schema.json")).toBe(true);
+    // the schema VALUE is inherited from the declaring site; the run output
+    // itself never carries the schema path
+    expect("schemaPath" in digest).toBe(false);
     expect(digest.required).toBe(false);
     expect(digest.type).toBe("json");
     expect(digest.source).toEqual({ state_output: { state: "architect", output: "facts" } });
@@ -868,56 +870,27 @@ test("19. the plan is deeply frozen and rejects mutation attempts", async () => 
   });
 });
 
-test("20. mutating a hand-built pipeline object cannot change an already-built plan", () => {
-  const resolved = {
-    schema_version: 2 as const,
-    bundleRoot: "/tmp/hand-built",
-    entry_state: "coder",
-    max_transitions: 20,
-    inputs: [{ id: "task", type: "file" as const, protected: true }],
-    outputs: [],
-    states: [
-      {
-        id: "coder",
-        type: "agent" as const,
-        profile: "coder",
-        promptPath: "/tmp/hand-built/prompts/coder.md",
-        promptContent: "p",
-        inputs: [
-          {
-            id: "task",
-            source: { pipeline_input: "task" },
-            type: "file" as const,
-          },
-        ],
-        outputs: [
-          {
-            id: "facts",
-            type: "json" as const,
-            schema: { type: "object", marker: "original" },
-          },
-        ],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [{ outcome: "completed", to: "done" }],
-      },
-      { id: "done", type: "terminal" as const, result: "success" as const },
-    ],
-  };
-  const plan = planActivationLayout(resolved as unknown as ResolvedPipelineV2, "coder");
-  const factsPort = plan.output_ports.find((port) => port.id === "facts");
-  expect(factsPort?.schema).toEqual({ type: "object", marker: "original" });
-
-  const mutated = resolved as unknown as {
-    states: { outputs: { schema: Record<string, unknown> }[]; inputs: { source: unknown }[] }[];
-  };
-  mutated.states[0]!.outputs[0]!.schema.marker = "changed";
-  mutated.states[0]!.inputs[0]!.source = { pipeline_input: "other" };
-  expect(factsPort?.schema).toEqual({ type: "object", marker: "original" });
-  expect(plan.input_ports[0]?.source).toEqual({ pipeline_input: "task" });
+test("20. a hand-built object with a correct-looking structure is rejected by provenance", async () => {
+  await withBundle(async (dirs) => {
+    await writeV2Bundle(dirs);
+    const real = await loadPipelineV2(dirs.bundle);
+    // structurally identical, byte-for-byte plausible hand-built object
+    const forged = JSON.parse(JSON.stringify(real)) as unknown;
+    expect(() =>
+      planActivationLayout(forged as unknown as ResolvedPipelineV2, "architect"),
+    ).toThrow(
+      /requires the deep-frozen snapshot object returned by loadPipelineV2/,
+    );
+    // regardless of the requested state id being safe and present
+    expect(() =>
+      planActivationLayout(forged as unknown as ResolvedPipelineV2, "coder"),
+    ).toThrow(
+      /requires the deep-frozen snapshot object returned by loadPipelineV2/,
+    );
+  });
 });
 
-test("21. planActivationLayout rejects unknown and terminal states", async () => {
+test("21. planActivationLayout rejects unknown and terminal states on a trusted snapshot", async () => {
   await withBundle(async (dirs) => {
     await writeV2Bundle(dirs);
     const resolved = await loadPipelineV2(dirs.bundle);
@@ -926,6 +899,11 @@ test("21. planActivationLayout rejects unknown and terminal states", async () =>
     );
     expect(() => planActivationLayout(resolved, "completed")).toThrow(
       /state "completed" is not an agent state/,
+    );
+    // stateId remains a plain planner input: safe ids are enforced on the
+    // trusted snapshot itself
+    expect(() => planActivationLayout(resolved, "../evil")).toThrow(
+      /activation layout state id "\.\.\/evil" is not a safe identifier/,
     );
   });
 });
@@ -1058,7 +1036,7 @@ test("26. compilePipelineV2Spec works on plain objects (no YAML needed)", () => 
   expect(spec.states[0]).toEqual({ id: "done", type: "terminal", result: "success" });
 });
 
-test("27. the planner rejects forged port ids before building target paths", () => {
+test("27. forged objects are rejected by provenance before any target path is built", () => {
   const forged = {
     schema_version: 2,
     bundleRoot: "/tmp/forged",
@@ -1084,268 +1062,301 @@ test("27. the planner rejects forged port ids before building target paths", () 
   } as unknown as ResolvedPipelineV2;
   try {
     planActivationLayout(forged, "coder");
-    throw new Error("expected the planner to reject a forged port id");
+    throw new Error("expected the planner to reject a forged object");
   } catch (cause) {
-    expect((cause as Error).message).toMatch(/is not a safe identifier/);
-    expect((cause as Error).message).not.toContain("/pipeline/inputs/../evil");
+    // the stable provenance rejection, before the unsafe port id (or any
+    // other field) is ever analyzed
+    expect(cause instanceof PipelineError).toBe(true);
+    expect((cause as Error).message).toBe(
+      "planActivationLayout requires the deep-frozen snapshot object returned by loadPipelineV2; " +
+        "hand-built objects, casts, clones and Proxies are rejected before any content is read",
+    );
+    expect((cause as Error).message).not.toContain("/pipeline/inputs/");
   }
 });
 
-test("28. the planner is fail-closed against corrupted resolved objects", () => {
-  const baseStates = (): unknown[] => [
-    {
-      id: "coder",
-      type: "agent",
-      profile: "coder",
-      promptPath: "/tmp/x/prompts/coder.md",
-      promptContent: "p",
-      inputs: [{ id: "task", source: { pipeline_input: "task" }, type: "file" }],
-      outputs: [],
-      timeout_seconds: 60,
-      max_attempts: 1,
-      transitions: [{ outcome: "completed", to: "done" }],
-    },
-    { id: "done", type: "terminal", result: "success" },
-  ];
-  const basePipeline = (states: unknown): ResolvedPipelineV2 =>
+test("28. forged and corrupted objects are rejected before any content analysis", () => {
+  const UNTRUSTED_MESSAGE =
+    "planActivationLayout requires the deep-frozen snapshot object returned by loadPipelineV2; " +
+    "hand-built objects, casts, clones and Proxies are rejected before any content is read";
+  const provenanceError = (pipeline: unknown, stateId: string): void => {
+    expect(() =>
+      planActivationLayout(pipeline as unknown as ResolvedPipelineV2, stateId),
+    ).toThrow(UNTRUSTED_MESSAGE);
+  };
+  const forgedStates = (states: unknown[]): ResolvedPipelineV2 =>
     ({
       schema_version: 2,
       bundleRoot: "/tmp/x",
       entry_state: "coder",
       max_transitions: 20,
-      inputs: [{ id: "task", type: "file", protected: true }],
+      inputs: [],
       outputs: [],
       states,
     }) as unknown as ResolvedPipelineV2;
+  const coderState = (inputs: unknown): unknown => ({
+    id: "coder",
+    type: "agent",
+    profile: "coder",
+    promptPath: "/tmp/x/prompts/coder.md",
+    promptContent: "p",
+    inputs,
+    outputs: [],
+    timeout_seconds: 60,
+    max_attempts: 1,
+    transitions: [{ outcome: "completed", to: "done" }],
+  });
 
   // not a v2 resolved pipeline at all
-  expect(() => planActivationLayout({} as unknown as ResolvedPipelineV2, "coder")).toThrow(
-    /resolved pipeline has schema_version undefined, expected 2/,
+  provenanceError({}, "coder");
+  provenanceError(null, "coder");
+  provenanceError([], "coder");
+
+  // corrupted content that would previously fail content validation is now
+  // rejected earlier, by provenance alone
+  provenanceError(forgedStates([null]), "coder");
+  provenanceError(
+    forgedStates([
+      coderState([{ id: "t", source: { pipeline_input: "task" }, type: "text" }]),
+    ]),
+    "coder",
   );
-  expect(() => planActivationLayout(null as unknown as ResolvedPipelineV2, "coder")).toThrow(
-    /resolved pipeline is not a YAML mapping/,
+  // corrupt source union plus a source/type/schema mismatch: never analyzed
+  // as a trusted graph — the rejection names nothing about the port
+  provenanceError(
+    forgedStates([
+      coderState([
+        {
+          id: "t",
+          source: { pipeline_input: "task", state_output: { state: "coder", output: "o" } },
+          type: "file",
+          schema: { type: "object" },
+        },
+      ]),
+    ]),
+    "coder",
+  );
+  // duplicate state ids via a cast: rejected immediately, no duplicate check
+  provenanceError(
+    forgedStates([coderState([]), coderState([])]),
+    "coder",
   );
 
-  // unsafe requested state id
-  expect(() =>
-    planActivationLayout(
-      { schema_version: 2, bundleRoot: "/x", entry_state: "coder", max_transitions: 1, inputs: [], outputs: [], states: [] } as unknown as ResolvedPipelineV2,
-      "../evil",
-    ),
-  ).toThrow(/activation layout state id "\.\.\/evil" is not a safe identifier/);
+  // a forged cyclic schema must produce the stable PipelineError, never a
+  // RangeError from traversing the cycle
+  const cyclicSchema: Record<string, unknown> = { type: "object" };
+  cyclicSchema.properties = { self: cyclicSchema };
+  const cyclicForged = forgedStates([
+    coderState([
+      { id: "t", source: { pipeline_input: "task" }, type: "json", schema: cyclicSchema },
+    ]),
+  ]);
+  try {
+    planActivationLayout(cyclicForged, "coder");
+    throw new Error("expected the planner to reject a forged cyclic schema");
+  } catch (cause) {
+    expect(cause instanceof PipelineError).toBe(true);
+    expect((cause as Error).message).toBe(UNTRUSTED_MESSAGE);
+    expect(cause instanceof RangeError).toBe(false);
+  }
 
-  // corrupted states array element
-  expect(() =>
-    planActivationLayout(
-      { schema_version: 2, bundleRoot: "/x", entry_state: "coder", max_transitions: 20, inputs: [], outputs: [], states: [null] } as unknown as ResolvedPipelineV2,
-      "coder",
-    ),
-  ).toThrow(/resolved pipeline state is not a YAML mapping/);
-
-  // non-agent state
-  expect(() =>
-    planActivationLayout(
-      {
-        schema_version: 2,
-        bundleRoot: "/x",
-        entry_state: "done",
-        max_transitions: 20,
-        inputs: [],
-        outputs: [],
-        states: [{ id: "done", type: "terminal", result: "success" }],
-      } as unknown as ResolvedPipelineV2,
-      "done",
-    ),
-  ).toThrow(/state "done" is not an agent state/);
-
-  const plannerError = (states: unknown, message: RegExp): void => {
-    expect(() => planActivationLayout(basePipelineWithStates(states), "coder")).toThrow(
-      message,
-    );
+  // getters in a forged object are never invoked: provenance is checked by
+  // identity before any field of the object is read
+  let getterCalls = 0;
+  const getterForged = {
+    get schema_version() {
+      getterCalls += 1;
+      return 2;
+    },
+    get bundleRoot() {
+      getterCalls += 1;
+      return "/tmp/x";
+    },
+    get entry_state() {
+      getterCalls += 1;
+      return "coder";
+    },
+    get max_transitions() {
+      getterCalls += 1;
+      return 20;
+    },
+    get inputs() {
+      getterCalls += 1;
+      return [];
+    },
+    get outputs() {
+      getterCalls += 1;
+      return [];
+    },
+    get states() {
+      getterCalls += 1;
+      return [coderState([])];
+    },
   };
-  const basePipelineWithStates = (states: unknown): ResolvedPipelineV2 =>
-    ({
-      schema_version: 2,
-      bundleRoot: "/tmp/x",
-      entry_state: "coder",
-      max_transitions: 20,
-      inputs: [{ id: "task", type: "file", protected: true }],
-      outputs: [],
-      states,
-    }) as unknown as ResolvedPipelineV2;
+  provenanceError(getterForged, "coder");
+  expect(getterCalls).toBe(0);
+});
 
-  // corrupted port object
-  plannerError([null], /state "coder" inputs|is not a YAML mapping/);
-  // unknown port type
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "p",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [{ id: "t", source: { pipeline_input: "task" }, type: "text" }],
-        outputs: [],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /input port 0 of agent state "coder" type must be one of/,
-  );
-  // duplicate port ids
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "coder",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [
-          { id: "t", source: { pipeline_input: "task" }, type: "file" },
-          { id: "t", source: { pipeline_input: "task" }, type: "file" },
-        ],
-        outputs: [],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /declares input port "t" more than once/,
-  );
-  // corrupt source union: both forms
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "coder",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [
-          {
-            id: "t",
-            source: { pipeline_input: "task", state_output: { state: "coder", output: "o" } },
-            type: "file",
-          },
-        ],
-        outputs: [],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /must declare exactly one of "pipeline_input" or "state_output"/,
-  );
-  // corrupt source union: neither form
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "coder",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [{ id: "t", source: {}, type: "file" }],
-        outputs: [],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /must declare exactly one of "pipeline_input" or "state_output"/,
-  );
-  // json port without a valid JSON schema snapshot
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "coder",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [{ id: "t", source: { pipeline_input: "task" }, type: "json" }],
-        outputs: [],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /json port without a valid JSON schema snapshot/,
-  );
-  // json port with a non-JSON snapshot value (function smuggled in)
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "coder",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [
-          {
-            id: "t",
-            source: { pipeline_input: "task" },
-            type: "json",
-            schema: { bad: () => "x" },
-          },
-        ],
-        outputs: [],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /json port without a valid JSON schema snapshot/,
-  );
-  // unexpected extra field on a port
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "coder",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [
-          {
-            id: "t",
-            source: { pipeline_input: "task" },
-            type: "file",
-            target: "/host/leak",
-          },
-        ],
-        outputs: [],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /input port 0 of agent state "coder" has unknown field "target"/,
-  );
-  // duplicate output port ids
-  plannerError(
-    [
-      {
-        id: "coder",
-        type: "agent",
-        profile: "coder",
-        promptPath: "/x",
-        promptContent: "p",
-        inputs: [],
-        outputs: [
-          { id: "a", type: "file" },
-          { id: "a", type: "file" },
-        ],
-        timeout_seconds: 60,
-        max_attempts: 1,
-        transitions: [],
-      },
-    ],
-    /declares output port "a" more than once/,
-  );
+test("29. clones, casts and Proxies of a real snapshot are rejected", async () => {
+  await withBundle(async (dirs) => {
+    await writeV2Bundle(dirs);
+    const resolved = await loadPipelineV2(dirs.bundle);
+    const UNTRUSTED_MESSAGE =
+      "planActivationLayout requires the deep-frozen snapshot object returned by loadPipelineV2; " +
+      "hand-built objects, casts, clones and Proxies are rejected before any content is read";
 
-  expect(basePipelineWithStates).toBeDefined();
+    // deep clone with fresh object identities
+    const clone = structuredClone(resolved);
+    expect(clone).toEqual(resolved);
+    expect(() => planActivationLayout(clone, "architect")).toThrow(UNTRUSTED_MESSAGE);
+
+    // shallow spread clone
+    const shallow = { ...resolved };
+    expect(() => planActivationLayout(shallow as ResolvedPipelineV2, "architect")).toThrow(
+      UNTRUSTED_MESSAGE,
+    );
+
+    // prototype-derived object wrapping the real data
+    const derived = Object.create(resolved);
+    expect(() => planActivationLayout(derived as ResolvedPipelineV2, "architect")).toThrow(
+      UNTRUSTED_MESSAGE,
+    );
+
+    // a Proxy forwarding to the exact same snapshot is a different identity
+    const proxied = new Proxy(resolved, {});
+    expect(proxied.entry_state).toBe("coder");
+    expect(() => planActivationLayout(proxied, "architect")).toThrow(UNTRUSTED_MESSAGE);
+
+    // the original branded snapshot still plans deterministically
+    const first = planActivationLayout(resolved, "architect");
+    const second = planActivationLayout(resolved, "architect");
+    const third = planActivationLayout(resolved, "coder");
+    expect(second).not.toBe(first);
+    expect(second).toEqual(first);
+    expect(third.input_ports.map((port) => port.id)).toEqual(["task", "notes", "config"]);
+  });
+});
+
+const NULLISH_SCHEMA: Record<string, unknown> = {
+  type: ["string", "null"],
+  default: null,
+  const: null,
+  enum: [null, "value"],
+  properties: {
+    maybe: { type: ["string", "null"], default: null },
+    nested: {
+      type: "object",
+      properties: { deep: { const: null } },
+      required: ["deep"],
+    },
+  },
+};
+
+test("30. JSON schemas with null values load, deep-freeze and reach the layout", async () => {
+  await withBundle(async (dirs) => {
+    await writeV2Bundle(dirs);
+    // both declared schemas become null-bearing schemas
+    await writeFile(
+      join(dirs.bundle, "schemas", "facts.schema.json"),
+      JSON.stringify(NULLISH_SCHEMA),
+    );
+    await writeFile(
+      join(dirs.bundle, "schemas", "config.schema.json"),
+      JSON.stringify(NULLISH_SCHEMA),
+    );
+
+    const resolved = await loadPipelineV2(dirs.bundle);
+
+    // declaring sites: the json run input and the agent output port
+    const configInput = resolved.inputs.find((entry) => entry.id === "config");
+    if (configInput?.schema === undefined) {
+      throw new Error("expected config input schema snapshot");
+    }
+    expect(configInput.schema).toEqual(NULLISH_SCHEMA);
+
+    const architect = resolved.states[1];
+    if (architect?.type !== "agent") {
+      throw new Error("expected agent state");
+    }
+    const factsPort = architect.outputs.find((port) => port.id === "facts");
+    if (factsPort?.schema === undefined) {
+      throw new Error("expected facts output schema snapshot");
+    }
+    expect(factsPort.schema).toEqual(NULLISH_SCHEMA);
+
+    // derived nodes inherit the immutable value through the data flow
+    const digest = resolved.outputs.find((output) => output.id === "facts_digest");
+    if (digest?.schema === undefined) {
+      throw new Error("expected facts_digest schema snapshot");
+    }
+    expect(digest.schema).toEqual(NULLISH_SCHEMA);
+    expect("schemaPath" in digest).toBe(false);
+    const coderState = resolved.states[0];
+    if (coderState?.type !== "agent") {
+      throw new Error("expected coder agent state");
+    }
+    const configPort = coderState.inputs.find((port) => port.id === "config");
+    if (configPort?.schema === undefined) {
+      throw new Error("expected config input port schema snapshot");
+    }
+    expect(configPort.schema).toEqual(NULLISH_SCHEMA);
+    const factsInput = architect.inputs.find((port) => port.id === "facts");
+    if (factsInput?.schema === undefined) {
+      throw new Error("expected architect facts input schema snapshot");
+    }
+    expect(factsInput.schema).toEqual(NULLISH_SCHEMA);
+
+    // deep-freeze holds for null-bearing structures
+    expect(Object.isFrozen(configInput.schema)).toBe(true);
+    const schema = configInput.schema as { enum: unknown[]; properties: Record<string, unknown> };
+    expect(Object.isFrozen(schema.enum)).toBe(true);
+    expect(Object.isFrozen(schema.properties)).toBe(true);
+    const nested = schema.properties.nested as { properties: Record<string, unknown> };
+    expect(Object.isFrozen(nested.properties)).toBe(true);
+
+    // the snapshots reach the immutable layout plans
+    const coderPlan = planActivationLayout(resolved, "coder");
+    expect(coderPlan.input_ports.find((port) => port.id === "config")?.schema).toEqual(
+      NULLISH_SCHEMA,
+    );
+    const architectPlan = planActivationLayout(resolved, "architect");
+    expect(architectPlan.input_ports.find((port) => port.id === "facts")?.schema).toEqual(
+      NULLISH_SCHEMA,
+    );
+    expect(architectPlan.output_ports.find((port) => port.id === "facts")?.schema).toEqual(
+      NULLISH_SCHEMA,
+    );
+  });
+});
+
+test("31. derived run outputs and serialized plans carry no schema paths or provenance metadata", async () => {
+  await withBundle(async (dirs) => {
+    await writeV2Bundle(dirs);
+    const resolved = await loadPipelineV2(dirs.bundle);
+
+    for (const output of resolved.outputs) {
+      const keys = Object.keys(output).sort();
+      const expected = output.schema === undefined
+        ? ["id", "required", "source", "type"]
+        : ["id", "required", "schema", "source", "type"];
+      expect(keys).toEqual(expected);
+      expect(keys).not.toContain("schemaPath");
+    }
+
+    const plan = planActivationLayout(resolved, "architect");
+    const serialized = JSON.stringify(plan);
+    expect(serialized).not.toContain("schemaPath");
+    expect(serialized).not.toContain("provenance");
+    expect(serialized).not.toContain(resolved.bundleRoot);
+    for (const port of plan.input_ports) {
+      expect(Object.keys(port)).not.toContain("schemaPath");
+    }
+    for (const port of plan.output_ports) {
+      expect(Object.keys(port)).not.toContain("schemaPath");
+    }
+
+    const serializedOutputs = JSON.stringify(resolved.outputs);
+    expect(serializedOutputs).not.toContain("schemaPath");
+    expect(serializedOutputs).not.toContain("provenance");
+  });
 });

@@ -170,12 +170,17 @@ export interface ResolvedV2RunInput {
   readonly schema?: Readonly<Record<string, unknown>>;
 }
 
+/**
+ * Run-level output as resolved: identity, requiredness, source, and the
+ * contract derived from the source at compile time. The JSON schema is
+ * inherited by value from the declaring site; the declaring site keeps the
+ * schema path, derived nodes never do.
+ */
 export interface ResolvedV2RunOutput {
   readonly id: string;
   readonly type: PortType;
   readonly required: boolean;
   readonly source: PipelinePortSource;
-  readonly schemaPath?: string;
   readonly schema?: Readonly<Record<string, unknown>>;
 }
 
@@ -620,11 +625,31 @@ async function loadJsonSchema(
 }
 
 /**
+ * Module-private provenance registry of resolved v2 snapshots.
+ *
+ * `loadPipelineV2` registers the exact deep-frozen snapshot object it is
+ * about to return; `planActivationLayout` accepts only registered objects.
+ * Membership is keyed by object identity, so hand-built objects, casts,
+ * shallow or deep clones (e.g. `structuredClone`), Proxies and corrupted
+ * copies are all unregistered. The registry is never exported, never
+ * serialized, and no provenance marker is embedded in the snapshot itself.
+ */
+const resolvedV2SnapshotProvenance = new WeakSet<object>();
+
+/** Stable rejection message for any argument without loader provenance. */
+const UNTRUSTED_RESOLVED_PIPELINE_MESSAGE =
+  "planActivationLayout requires the deep-frozen snapshot object returned by loadPipelineV2; " +
+  "hand-built objects, casts, clones and Proxies are rejected before any content is read";
+
+/**
  * Load a v2 pipeline bundle: the same fail-closed bundle containment as v1
  * (real directory root, pipeline.yaml inside the root, symlink rules), then
  * prompt and JSON schema files loaded through the same containment. The
  * result is an engine-owned deep-frozen snapshot; mutations of the parsed
- * source objects cannot change it.
+ * source objects cannot change it. The exact snapshot object is registered
+ * in the module-private provenance registry immediately before the
+ * successful return, so the planner can later distinguish it from any
+ * hand-built, cloned or corrupted lookalike.
  */
 export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipelineV2> {
   const rootCanonical = await requireCanonicalDirectoryRoot(
@@ -642,7 +667,8 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
   const spec = parsePipelineV2Spec(await readBundleFile(pipelinePath, "pipeline file", PipelineError));
 
   // Phase 1: run inputs. json inputs load their declared schema file here;
-  // the resolved input is the only place that keeps the schema path.
+  // the resolved input keeps the schema path at the declaring site (agent
+  // output ports keep theirs below).
   const inputs: ResolvedV2RunInput[] = [];
   for (const entry of spec.inputs) {
     if (entry.schema === undefined) {
@@ -737,8 +763,8 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
   // Phase 3: contract derivation by data flow. Run outputs and agent input
   // ports take type and JSON schema snapshot from the resolved source (the
   // declaring run input or agent output). Schema paths stay with the
-  // declaring sites; derived ports and run outputs carry only the immutable
-  // snapshot value.
+  // declaring sites (resolved run inputs and agent output ports); derived
+  // nodes carry only the immutable snapshot value, never a path.
   const runInputById = new Map(inputs.map((entry) => [entry.id, entry]));
   const agentOutputByRef = new Map<string, ResolvedV2AgentOutputPort>();
   for (const state of states) {
@@ -752,7 +778,7 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
   const contractForSource = (
     source: PipelinePortSource,
     what: string,
-  ): { type: PortType; schemaPath?: string; schema?: Readonly<Record<string, unknown>> } => {
+  ): { type: PortType; schema?: Readonly<Record<string, unknown>> } => {
     if ("pipeline_input" in source) {
       const declared = runInputById.get(source.pipeline_input);
       if (declared === undefined) {
@@ -760,7 +786,7 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
           `${what} references undeclared pipeline input ${JSON.stringify(source.pipeline_input)}`,
         );
       }
-      return { type: declared.type, schemaPath: declared.schemaPath, schema: declared.schema };
+      return { type: declared.type, schema: declared.schema };
     }
     const declared = agentOutputByRef.get(
       `${source.state_output.state}\u0000${source.state_output.output}`,
@@ -770,7 +796,7 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
         `${what} references undeclared output ${JSON.stringify(source.state_output.output)} of state ${JSON.stringify(source.state_output.state)}`,
       );
     }
-    return { type: declared.type, schemaPath: declared.schemaPath, schema: declared.schema };
+    return { type: declared.type, schema: declared.schema };
   };
 
   const outputs: ResolvedV2RunOutput[] = spec.outputs.map((output) => {
@@ -780,7 +806,6 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
       type: derived.type,
       required: output.required,
       source: output.source,
-      ...(derived.schemaPath !== undefined ? { schemaPath: derived.schemaPath } : {}),
       ...(derived.schema !== undefined ? { schema: derived.schema } : {}),
     });
   });
@@ -818,7 +843,7 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
     });
   });
 
-  return deepFreeze({
+  const snapshot: ResolvedPipelineV2 = deepFreeze({
     schema_version: 2,
     bundleRoot: rootCanonical,
     entry_state: spec.entry_state,
@@ -827,6 +852,8 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
     outputs: Object.freeze(outputs),
     states: Object.freeze(resolvedStates),
   });
+  resolvedV2SnapshotProvenance.add(snapshot);
+  return snapshot;
 }
 
 
@@ -865,218 +892,69 @@ export interface ActivationLayoutPlan {
 }
 
 /**
- * Recursive JSON-ness check for schema snapshots a plan is about to carry.
- * Anything a forged or corrupted object could hide (functions, undefined,
- * non-finite numbers, exotic prototypes) is rejected fail-closed before the
- * snapshot is embedded in the immutable plan.
- */
-function isPlainJsonValue(value: unknown): boolean {
-  if (value === null) {
-    return false;
-  }
-  const kind = typeof value;
-  if (kind === "string" || kind === "boolean") {
-    return true;
-  }
-  if (kind === "number") {
-    return Number.isFinite(value);
-  }
-  if (kind !== "object") {
-    return false;
-  }
-  if (Array.isArray(value)) {
-    return (value as unknown[]).every(isPlainJsonValue);
-  }
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) {
-    return false;
-  }
-  return Object.values(value as Record<string, unknown>).every(isPlainJsonValue);
-}
-
-function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const proto = Object.getPrototypeOf(value);
-  return (proto === Object.prototype || proto === null) && isPlainJsonValue(value);
-}
-
-function assertLayoutPortShape(
-  raw: unknown,
-  what: string,
-  kind: "input" | "output",
-): { readonly id: string; readonly type: PortType; readonly schema?: Readonly<Record<string, unknown>> } {
-  const port = expectObject(raw, what);
-  const keys = Object.keys(port);
-  // A resolved output port may carry the declaring site's schemaPath; the
-  // plan never emits it. Input ports never carry schemaPath.
-  const allowed = new Set<string>(
-    kind === "input" ? ["id", "source", "type", "schema"] : ["id", "type", "schema", "schemaPath"],
-  );
-  for (const key of keys) {
-    if (!allowed.has(key)) {
-      throw new PipelineError(`${what} has unknown field ${JSON.stringify(key)}`);
-    }
-  }
-  const required =
-    kind === "input" ? ["id", "source", "type"] as const : ["id", "type"] as const;
-  for (const key of required) {
-    if (!(key in port)) {
-      throw new PipelineError(`${what} is missing required field ${JSON.stringify(key)}`);
-    }
-  }
-  const id = validateSafeId(port.id, `${what} id`);
-  const type = parsePortType(port.type, `${what} type`);
-  if (type !== "json") {
-    if ("schema" in port) {
-      throw new PipelineError(
-        `${what} must not carry a schema snapshot for type ${JSON.stringify(type)}`,
-      );
-    }
-    if ("schemaPath" in port) {
-      throw new PipelineError(
-        `${what} must not carry a schema path for type ${JSON.stringify(type)}`,
-      );
-    }
-    return { id, type };
-  }
-  if (!("schema" in port) || !isPlainJsonObject(port.schema)) {
-    throw new PipelineError(
-      `${what} is a json port without a valid JSON schema snapshot`,
-    );
-  }
-  return { id, type, schema: port.schema };
-}
-
-function assertLayoutPortSource(raw: unknown, what: string): PipelinePortSource {
-  const source = expectObject(raw, `${what} source`);
-  const keys = Object.keys(source);
-  const allowed = new Set(["pipeline_input", "state_output"]);
-  for (const key of keys) {
-    if (!allowed.has(key)) {
-      throw new PipelineError(`${what} source has unknown field ${JSON.stringify(key)}`);
-    }
-  }
-  const hasPipelineInput = keys.includes("pipeline_input");
-  const hasStateOutput = keys.includes("state_output");
-  if (hasPipelineInput === hasStateOutput) {
-    throw new PipelineError(
-      `${what} source must declare exactly one of "pipeline_input" or "state_output"`,
-    );
-  }
-  if (hasPipelineInput) {
-    if (typeof source.pipeline_input !== "string") {
-      throw new PipelineError(
-        `${what} source pipeline_input id must be a non-empty string`,
-      );
-    }
-    validateSafeId(source.pipeline_input, `${what} source pipeline_input id`);
-    return source as unknown as PipelinePortSource;
-  }
-  const stateOutput = expectObject(source.state_output, `${what} source state_output`);
-  expectExactKeys(stateOutput, ["state", "output"], `${what} source state_output`);
-  validateSafeId(stateOutput.state, `${what} source state_output state id`);
-  validateSafeId(stateOutput.output, `${what} source state_output output id`);
-  return source as unknown as PipelinePortSource;
-}
-
-/**
  * Build the immutable activation layout plan for one agent state of a
  * compiled v2 pipeline. Pure and deterministic: declaration order is
  * preserved, targets are fixed container paths, and every structured value
- * is cloned and frozen so later mutations of the pipeline object (or of the
- * returned view) cannot change the plan. The plan carries only logical and
- * structural data — no bearers, credentials, env values, host paths, or
- * schema paths.
+ * is taken from the deep-frozen loader snapshot, so later mutations of the
+ * pipeline object (or of the returned view) cannot change the plan. The
+ * plan carries only logical and structural data — no bearers, credentials,
+ * env values, host paths, or schema paths.
  *
- * The plan is built fail-closed: the resolved pipeline object is re-validated
- * here (exact port shapes, safe and unique ids, known port types, intact
- * source unions, valid JSON schema snapshots) before any target path is
- * built. A forged or corrupted pipeline object is rejected even when it
- * would satisfy the TypeScript type.
+ * Provenance is checked before any field of the pipeline object is read:
+ * the argument must be the exact snapshot object a previous successful
+ * `loadPipelineV2` call returned (membership in the module-private
+ * registry). There is no second validation pass — structural correctness
+ * is owned once by the compiler — so a hand-built, cloned, cast, proxied
+ * or corrupted object is rejected with a stable PipelineError instead of
+ * being analyzed as a trusted graph. `stateId` remains a plain planner
+ * input: it must be a safe id and must name an agent state of the trusted
+ * snapshot.
  */
 export function planActivationLayout(
   pipeline: ResolvedPipelineV2,
   stateId: string,
 ): ActivationLayoutPlan {
-  const pipelineObj = expectObject(pipeline, "resolved pipeline");
-  if (pipelineObj.schema_version !== PIPELINE_SCHEMA_VERSION_V2) {
-    throw new PipelineError(
-      `resolved pipeline has schema_version ${JSON.stringify(pipelineObj.schema_version)}, expected ${PIPELINE_SCHEMA_VERSION_V2}`,
-    );
+  if (!resolvedV2SnapshotProvenance.has(pipeline)) {
+    throw new PipelineError(UNTRUSTED_RESOLVED_PIPELINE_MESSAGE);
   }
-  const statesRaw = expectArray(pipelineObj.states, "resolved pipeline states");
   validateSafeId(stateId, "activation layout state id");
-  let stateObj: Record<string, unknown> | undefined;
-  for (const rawState of statesRaw) {
-    const entry = expectObject(rawState, "resolved pipeline state");
-    if (entry.id === stateId) {
-      stateObj = entry;
+  let state: ResolvedV2State | undefined;
+  for (const candidate of pipeline.states) {
+    if (candidate.id === stateId) {
+      state = candidate;
       break;
     }
   }
-  if (stateObj === undefined) {
+  if (state === undefined) {
     throw new PipelineError(`state ${JSON.stringify(stateId)} is not declared by the pipeline`);
   }
-  if (stateObj.type !== "agent") {
+  if (state.type !== "agent") {
     throw new PipelineError(
       `state ${JSON.stringify(stateId)} is not an agent state; activation layouts exist for agent states only`,
     );
   }
+  const agentState: ResolvedV2AgentState = state;
 
-  const inputPortsRaw = expectArray(
-    stateObj.inputs,
-    `agent state ${JSON.stringify(stateId)} inputs`,
-  );
-  const outputPortsRaw = expectArray(
-    stateObj.outputs,
-    `agent state ${JSON.stringify(stateId)} outputs`,
-  );
-
-  const seenInputIds = new Set<string>();
-  const inputPorts: ActivationInputPortPlan[] = inputPortsRaw.map((raw, index) => {
-    const what = `input port ${index} of agent state ${JSON.stringify(stateId)}`;
-    const port = assertLayoutPortShape(raw, what, "input");
-    if (seenInputIds.has(port.id)) {
-      throw new PipelineError(
-        `agent state ${JSON.stringify(stateId)} declares input port ${JSON.stringify(port.id)} more than once`,
-      );
-    }
-    seenInputIds.add(port.id);
-    const source = assertLayoutPortSource((raw as Record<string, unknown>).source, what);
-    return deepFreeze({
+  const inputPorts: ActivationInputPortPlan[] = agentState.inputs.map((port) =>
+    deepFreeze({
       id: port.id,
-      source: structuredClone(source) as PipelinePortSource,
+      source: port.source,
       type: port.type,
-      ...(port.schema !== undefined
-        ? { schema: structuredClone(port.schema) as Record<string, unknown> }
-        : {}),
+      ...(port.schema !== undefined ? { schema: port.schema } : {}),
       target: `${ACTIVATION_INPUTS_ROOT}/${port.id}`,
       read_only: true,
-    });
-  });
+    }),
+  );
 
-  const seenOutputIds = new Set<string>();
-  const outputPorts: ActivationOutputPortPlan[] = outputPortsRaw.map((raw, index) => {
-    const what = `output port ${index} of agent state ${JSON.stringify(stateId)}`;
-    const port = assertLayoutPortShape(raw, what, "output");
-    if (seenOutputIds.has(port.id)) {
-      throw new PipelineError(
-        `agent state ${JSON.stringify(stateId)} declares output port ${JSON.stringify(port.id)} more than once`,
-      );
-    }
-    seenOutputIds.add(port.id);
-    return deepFreeze({
+  const outputPorts: ActivationOutputPortPlan[] = agentState.outputs.map((port) =>
+    deepFreeze({
       id: port.id,
       type: port.type,
-      ...(port.schema !== undefined
-        ? { schema: structuredClone(port.schema) as Record<string, unknown> }
-        : {}),
+      ...(port.schema !== undefined ? { schema: port.schema } : {}),
       target: `${ACTIVATION_OUTPUTS_ROOT}/${port.id}`,
       read_only: false,
-    });
-  });
+    }),
+  );
 
   return deepFreeze({
     state_id: stateId,

@@ -412,11 +412,15 @@ optional parsed schema snapshot, fixed target `/pipeline/outputs/<id>`,
 `reject_undeclared_outputs: true` — and only logical/structural data,
 never bearers, credentials, env values, host paths, or schema paths.
 Mutations of the source YAML object or of the returned view cannot change
-a built plan. The planner is fail-closed against forged or corrupted
-input: it re-validates the resolved object (exact port shapes, safe and
-unique ids, known port types, intact source unions, recursively
-plain-JSON schema snapshots) before any target path is built, never
-trusting a TypeScript cast or a past loader pass.
+a built plan. Provenance is fail-closed before any target path is built:
+`planActivationLayout` first checks membership in a module-private
+`WeakSet` registry that only the fully resolved, deep-frozen snapshot
+returned by `loadPipelineV2` is registered in; hand-built objects, casts,
+shallow/deep clones (`structuredClone`), Proxies and corrupted objects are
+rejected with a stable `PipelineError` before any field is read (getters
+never run), and there is no second validation pass — structural
+correctness is owned once by the compiler. `stateId` remains a plain
+planner input (safe id + agent state of the trusted snapshot).
 
 Session capability contracts are fixed next to the planner, unwired:
 Execution Session (`type: "execution"`, scope run root; orchestrator-only
@@ -444,8 +448,8 @@ compilation, exact-field/union validation, duplicate/unknown references,
 schema propagation through `state_output`, schema containment, frozen
 snapshots, planner determinism/fixed targets/flags, absence of secrets,
 host paths, and schema paths in plans, planner fail-closed regressions
-(forged port ids, corrupted resolved objects, invalid schema snapshots),
-socket-transport/Tool-authority separation, and the production rejection
+(forged port ids, hand-built/cloned/proxied objects, getters never
+invoked, cyclic schemas, duplicate state casts), socket-transport/Tool-authority separation, and the production rejection
 before auth/session. The decision evaluator, durable state, lifecycle, signal
 handling, helper transport, and the default bundle are untouched; wiring
 v2 execution into `agent-smoke` is a later increment.
