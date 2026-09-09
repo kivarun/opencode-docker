@@ -1238,7 +1238,10 @@ test("29. clones, casts and Proxies of a real snapshot are rejected", async () =
 });
 
 const NULLISH_SCHEMA: Record<string, unknown> = {
-  type: ["string", "null"],
+  // A Draft 2020-12 schema that Ajv compiles; null values inside the
+  // schema document (default, const, enum, nested) must survive load,
+  // deep-freeze and derivation unchanged.
+  type: "object",
   default: null,
   const: null,
   enum: [null, "value"],

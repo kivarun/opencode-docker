@@ -22,6 +22,7 @@ import {
   validateBundleRelativePath,
 } from "./bundle_file.ts";
 import { describeError } from "./docker_helper.ts";
+import { compilePipelineJsonSchema } from "./pipeline_v2_schema.ts";
 
 /**
  * Pipeline schema version 2: declarative data ports.
@@ -625,7 +626,12 @@ async function loadJsonSchema(
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new PipelineError(`${what} ${schemaPath} is not a JSON object`);
   }
-  return { path: schemaPath, schema: parsed as Record<string, unknown> };
+  const schema = deepFreeze(parsed as Record<string, unknown>);
+  // Fail-closed schema compile at trusted load time: an unusable Draft
+  // 2020-12 schema rejects the pipeline load before the resolved snapshot
+  // is registered anywhere.
+  compilePipelineJsonSchema(schema, what);
+  return { path: schemaPath, schema };
 }
 
 /**

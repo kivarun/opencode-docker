@@ -1,0 +1,3 @@
+# Dependency install is performed inside the orchestrator image from the
+# committed package.json + bun.lock; never copy a host node_modules.
+orchestrator/node_modules

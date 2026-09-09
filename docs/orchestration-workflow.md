@@ -376,8 +376,9 @@ both are compile-declared); each agent state declares local input and
 output ports. Port sources have exactly one form
 (`{pipeline_input: ID}` or `{state_output: {state, output}}`); port types
 are `file`, `directory`, or `json` (json ports require a bundle-relative
-JSON schema file loaded through the same realpath containment; parsed as a
-JSON object, no generic JSON Schema validation). Pipeline inputs and agent
+JSON schema file loaded through the same realpath containment, parsed as a
+JSON object, and compiled as JSON Schema Draft 2020-12 at load time — a
+schema that cannot compile rejects the load). Pipeline inputs and agent
 outputs are the only places that declare a type or schema: agent input
 types are derived from their sources, a run output is exactly
 `{id, required, source}` with type and JSON schema fully derived from the
@@ -449,10 +450,11 @@ schema propagation through `state_output`, schema containment, frozen
 snapshots, planner determinism/fixed targets/flags, absence of secrets,
 host paths, and schema paths in plans, planner fail-closed regressions
 (forged port ids, hand-built/cloned/proxied objects, getters never
-invoked, cyclic schemas, duplicate state casts), socket-transport/Tool-authority separation, and the production rejection
-before auth/session. The decision evaluator, durable state, lifecycle, signal
-handling, helper transport, and the default bundle are untouched; wiring
-v2 execution into `agent-smoke` is a later increment.
+invoked, cyclic schemas, duplicate state casts), load-time JSON Schema
+compilation (a schema that cannot compile rejects the load), and the
+production rejection before auth/session. The decision evaluator, durable
+state, lifecycle, signal handling, helper transport, and the default bundle
+are untouched; wiring v2 execution into `agent-smoke` is a later increment.
 
 ### v2 run-input snapshots and host-side activation data layout (pure substrate, not wired)
 
@@ -485,30 +487,62 @@ any field is read). Sources are never mounted directly to agents.
 `prepareActivationData` then builds a fresh
 `<runRoot>/activations/<index>-<state>/data/` tree per activation with
 `inputs/` (declaration-order copies from the run-owned snapshot or from the
-runner-owned accepted records `{state, output, activation_index}` — no user
-paths and no types are accepted: the type derives from the declared output
-port and the object must exist at the fixed orchestrator-derived path
-`<runRoot>/activations/<index>-<state>/data/outputs/<output>`, with the
-highest activation index winning per `state`/`output` pair independent of
-list order), and `outputs/` (pre-created directories for `directory` outputs;
-`file`/`json` outputs absent until the worker creates them). The activation
-index is globally unique within the run: any existing `activations/` entry
-with the same `<index>-` prefix rejects the request before the leaf is
-created. Activation data carries no project directory. Returns exact mount
-descriptors: shared project → `/workspace` RW, inputs → `/pipeline/inputs`
-RO, outputs → `/pipeline/outputs` RW, plus `reject_undeclared_outputs: true`
-(validation after a worker run is not implemented yet). Everything is
-fail-closed: bindings and accepted records are validated before any mutation,
-the activation index must be globally unused, the activation leaf must be
-absent, symlink traps on run-owned paths are rejected, directories are 0700
-and files 0600 (worker-UID compatibility is an explicit limitation of the
-next increment), failed operations remove exactly the objects they created,
-existing snapshots are never overwritten, and the shared project root is
-never created, modified, or removed by the runtime. Honest boundaries: no
-defense against a trusted host process mutating a source during the read, and
-no crash-recovery contract. The production runner, durable state, decision
-evaluator, and lifecycle are untouched; Session creation, mounts, and worker
-launch are a later increment.
+runner-owned accepted records `{state, output, activation_index, digest}` —
+no user paths and no types are accepted: the type derives from the declared
+output port and the object must exist at the fixed orchestrator-derived path
+`<runRoot>/activations/<index>-<state>/data/outputs/<output>`; before
+anything is prepared the whole accepted history is validated — every record,
+including old and non-winning ones, is resolved to its fixed location and
+its digest recomputed and compared, and only then is the winner per
+`state`/`output` pair selected by highest activation index, so an accepted
+output that changed after acceptance fails the next activation before its
+leaf is created), and `outputs/` (pre-created directories for `directory`
+outputs; `file`/`json` outputs absent until the worker creates them). The
+activation index is globally unique within the run: any existing
+`activations/` entry with the same `<index>-` prefix rejects the request
+before the leaf is created. Activation data carries no project directory.
+Returns exact mount descriptors: shared project → `/workspace` RW, inputs →
+`/pipeline/inputs` RO, outputs → `/pipeline/outputs` RW. The prepared layout
+is registered in a module-private `WeakMap` (pipeline + canonical run root)
+after success, so only the exact frozen object can be handed to acceptance.
+Everything is fail-closed: bindings and accepted records are validated
+before any mutation, the activation index must be globally unused, the
+activation leaf must be absent, symlink traps on run-owned paths are
+rejected, directories are 0700 and files 0600 (worker-UID compatibility is
+an explicit limitation of the next increment), failed operations remove
+exactly the objects they created, existing snapshots are never overwritten,
+and the shared project root is never created, modified, or removed by the
+runtime. Honest boundaries: no defense against a trusted host process
+mutating a source during the read, and no crash-recovery contract.
+
+Output acceptance (`acceptActivationOutputs`) validates the finished
+`outputs/` tree of one prepared activation and releases trusted accepted
+records — one deep-frozen `{state, output, activation_index, digest}` per
+declared output, in declaration order, with a lowercase SHA-256 digest over
+the separate `pipeline-v2-output` domain and the declared type (the same
+unambiguous framing as input digests: length-framed bytes for file/json;
+kind tag, length-framed relative path, and length-framed file content in
+code-unit sorted order for directories — names, entry kinds, and empty
+directories participate; host paths, inodes, permissions, and timestamps
+never do). Acceptance accepts only the exact prepared object for the same
+pipeline (provenance `WeakMap`; hand-built, cloned, proxied, and
+other-pipeline objects rejected before any field is read), creates, fixes,
+renames and deletes nothing, re-examines the tree fresh (the worker held the
+outputs root read-write), requires exactly one top-level entry per declared
+output port (a missing declared output fails, any undeclared entry fails —
+`reject_undeclared_outputs: true` is an enforced invariant since this
+increment), requires each output to be a real non-symlink object of its
+declared type whose canonical path stays inside the outputs root (`file`
+read through `O_NOFOLLOW`; `json` valid and schema-conforming; `directory`
+containing only real directories and regular files), and never records
+paths, types, schemas, summaries, timestamps, or output content.
+Diagnostics never contain file contents or JSON values. A changed accepted
+output is detected by digest recomputation of the whole accepted history
+(including old, non-winning records) before the next activation leaf is
+created. Accepted records remain runner-owned input; agent envelopes,
+stdout, and worker files can never create one. Not implemented: Session
+creation, mounts, worker launch, and terminal/run-output collection are
+later increments.
 
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 

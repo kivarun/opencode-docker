@@ -1,2 +1,6 @@
 # Local session scratch used for UAT runs and container test copies.
 orchestrator-uat/
+
+# Dependency install for the orchestrator; package.json + bun.lock are the
+# source of truth and are committed.
+orchestrator/node_modules/

@@ -16,6 +16,8 @@ import {
   planActivationLayout,
 } from "../src/pipeline_v2.ts";
 import {
+  acceptActivationOutputs,
+  acceptedOutputDigest,
   prepareActivationData,
   snapshotRunInputs,
 } from "../src/pipeline_v2_runtime.ts";
@@ -248,6 +250,26 @@ async function makeFifo(path: string): Promise<void> {
   });
 }
 
+/**
+ * A hand-minted accepted record for cases whose rejection happens during
+ * parsing or fixed-location resolution, before any digest is verified.
+ * Real records come from `acceptActivationOutputs`; the digest here is a
+ * plausible-looking but never-verified placeholder.
+ */
+const FAKE_DIGEST = "a".repeat(64);
+
+const rec = (
+  state: string,
+  output: string,
+  activationIndex: number,
+  digest: string = FAKE_DIGEST,
+): { state: string; output: string; activation_index: number; digest: string } => ({
+  state,
+  output,
+  activation_index: activationIndex,
+  digest,
+});
+
 test("1. the exact binding set is enforced before any filesystem mutation", async () => {
   await withRuntime(async (dirs, sources) => {
     const pipeline = await loadPipelineV2(dirs.bundle);
@@ -390,11 +412,20 @@ test("3. invalid JSON is rejected before mutation; valid JSON is copied byte-for
     }, /pipeline input "config" bound file .* is not valid JSON/);
     await expect(lstat(join(runRoot, "data"))).rejects.toThrow();
 
+    // a JSON value that parses but violates the declared schema is also
+    // rejected before any mutation (same validation mechanism as outputs)
     const scalar = "null";
     await writeFile(join(sources, "config.json"), scalar);
+    await expectReject(async () => {
+      await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
+    }, /pipeline input "config" bound file .* does not conform to its JSON schema/);
+    await expect(lstat(join(runRoot, "data"))).rejects.toThrow();
+
+    const valid = '{"ok":true,"deep":{"nested":null}}';
+    await writeFile(join(sources, "config.json"), valid);
     const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
     const config = snap.inputs.find((entry) => entry.id === "config");
-    expect(await readFile(config?.snapshot_path ?? "", "utf8")).toBe(scalar);
+    expect(await readFile(config?.snapshot_path ?? "", "utf8")).toBe(valid);
     const task = snap.inputs.find((entry) => entry.id === "task");
     expect(await readFile(task?.snapshot_path ?? "", "utf8")).toBe(TASK_JSON);
   });
@@ -685,11 +716,9 @@ test("9. accepted state outputs are handed over into the next activation", async
     await writeFile(join(coderPrep.outputs_root, "scratch", "work.txt"), "WORK");
     await mkdir(join(coderPrep.outputs_root, "scratch", "nested"), { recursive: true });
     await writeFile(join(coderPrep.outputs_root, "scratch", "nested", "deep.txt"), "DEEP");
+    const coderRecords = await acceptActivationOutputs(pipeline, coderPrep);
 
-    const architectPrep = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", activation_index: 1 },
-      { state: "coder", output: "scratch", activation_index: 1 },
-    ], "architect", 2);
+    const architectPrep = await prepareActivationData(pipeline, snap, coderRecords, "architect", 2);
 
     expect(architectPrep.state_id).toBe("architect");
     expect(architectPrep.activation_root).toBe(join(runRoot, "activations", "2-architect"));
@@ -713,19 +742,22 @@ test("10. the highest activation index wins, independent of list order", async (
     const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
     await writeFile(join(first.outputs_root, "patch"), "PATCH-1");
     await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+    const firstRecords = await acceptActivationOutputs(pipeline, first);
+    const secondRecords = await acceptActivationOutputs(pipeline, second);
+    expect(firstRecords.map((record) => [record.state, record.output, record.activation_index]))
+      .toEqual([["coder", "patch", 1], ["coder", "scratch", 1]]);
 
     const one = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", activation_index: 1 },
-      { state: "coder", output: "patch", activation_index: 2 },
-      { state: "coder", output: "scratch", activation_index: 1 },
+      ...secondRecords.filter((record) => record.output === "patch"),
+      ...firstRecords,
     ], "architect", 3);
     expect(await readFile(join(one.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
 
     // permuting the records cannot change the accepted output
     const two = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "scratch", activation_index: 1 },
-      { state: "coder", output: "patch", activation_index: 2 },
-      { state: "coder", output: "patch", activation_index: 1 },
+      ...firstRecords.filter((record) => record.output === "scratch"),
+      ...secondRecords.filter((record) => record.output === "patch"),
+      ...firstRecords.filter((record) => record.output === "patch"),
     ], "architect", 4);
     expect(await readFile(join(two.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
   });
@@ -743,14 +775,16 @@ test("11. missing, future and first-visit self state outputs are rejected", asyn
     }, /input port "patch" of agent state "architect" references state output "coder"\."patch" which has no accepted output yet/);
     await expect(lstat(join(runRoot, "activations", "1-architect"))).rejects.toThrow();
 
-    // a specific reference stays missing while another reference is present
+    // a specific reference stays missing while another reference is present:
+    // the accepted records list a patch record but no scratch record
     const coderPrep = await prepareActivationData(pipeline, snap, [], "coder", 1);
     await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH-1");
+    const coderRecords = await acceptActivationOutputs(pipeline, coderPrep);
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "scratch", activation_index: 1 },
+        ...coderRecords.filter((record) => record.output === "patch"),
       ], "architect", 2);
-    }, /input port "patch" of agent state "architect" references state output "coder"\."patch" which has no accepted output yet/);
+    }, /input port "scratch" of agent state "architect" references state output "coder"\."scratch" which has no accepted output yet/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
   });
 
@@ -762,11 +796,9 @@ test("11. missing, future and first-visit self state outputs are rejected", asyn
     // first visit of a self-referencing input port fails
     const coderPrep = await prepareActivationData(pipeline, snap, [], "coder", 1);
     await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH-1");
+    const coderRecords = await acceptActivationOutputs(pipeline, coderPrep);
     await expectReject(async () => {
-      await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
-        { state: "coder", output: "scratch", activation_index: 1 },
-      ], "architect", 2);
+      await prepareActivationData(pipeline, snap, coderRecords, "architect", 2);
     }, /input port "facts" of agent state "architect" references state output "architect"\."facts" which has no accepted output yet/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
 
@@ -775,10 +807,14 @@ test("11. missing, future and first-visit self state outputs are rejected", asyn
     const factsLeaf = join(runRoot, "activations", "2-architect", "data", "outputs");
     await mkdir(factsLeaf, { recursive: true });
     await writeFile(join(factsLeaf, "facts"), JSON.stringify({ revision: 7 }));
+    const factsDigest = await acceptedOutputDigest(
+      "json",
+      join(factsLeaf, "facts"),
+      "planted architect facts output",
+    );
     const revisit = await prepareActivationData(pipeline, snap, [
-      { state: "coder", output: "patch", activation_index: 1 },
-      { state: "coder", output: "scratch", activation_index: 1 },
-      { state: "architect", output: "facts", activation_index: 2 },
+      ...coderRecords,
+      { state: "architect", output: "facts", activation_index: 2, digest: factsDigest },
     ], "architect", 3);
     expect(await readFile(join(revisit.inputs_root, "facts"), "utf8")).toBe(
       JSON.stringify({ revision: 7 }),
@@ -797,67 +833,67 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "nowhere", output: "patch", activation_index: 1 },
+        rec("nowhere", "patch", 1),
       ], "architect", 2);
     }, /accepted state output 0 references state "nowhere" which is not a declared agent state/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "done", output: "patch", activation_index: 1 },
+        rec("done", "patch", 1),
       ], "architect", 2);
     }, /accepted state output 0 references state "done" which is not a declared agent state/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "nope", activation_index: 1 },
+        rec("coder", "nope", 1),
       ], "architect", 2);
     }, /references output "nope" which is not declared by state "coder"/);
 
     // no user paths and no types are accepted at all
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1, path: coderOutputs + "/patch" },
+        { ...rec("coder", "patch", 1), path: coderOutputs + "/patch" },
       ], "architect", 2);
     }, /accepted state output 0 has unknown field "path"/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1, type: "file" },
+        { ...rec("coder", "patch", 1), type: "file" },
       ], "architect", 2);
     }, /accepted state output 0 has unknown field "type"/);
 
     // future and current activation indexes are rejected
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 2 },
+        rec("coder", "patch", 2),
       ], "architect", 2);
     }, /records activation index 2 which is not below the current activation index 2/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 4 },
+        rec("coder", "patch", 4),
       ], "architect", 2);
     }, /records activation index 4 which is not below the current activation index 2/);
 
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 0 },
+        rec("coder", "patch", 0),
       ], "architect", 2);
     }, /activation index must be a positive safe integer/);
 
     // duplicate records are rejected
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
-        { state: "coder", output: "patch", activation_index: 1 },
+        rec("coder", "patch", 1),
+        rec("coder", "patch", 1),
       ], "architect", 2);
     }, /is listed more than once/);
 
     // one activation index cannot belong to two different states
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
-        { state: "architect", output: "report", activation_index: 1 },
+        rec("coder", "patch", 1),
+        rec("architect", "report", 1),
       ], "architect", 2);
     }, /activation index 1 cannot belong to both state "coder" and state "architect"/);
 
@@ -865,14 +901,14 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
     // below the current one, but no leaf for that index and state exists)
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "architect", output: "report", activation_index: 2 },
+        rec("architect", "report", 2),
       ], "architect", 3);
     }, /activation leaf .*2-architect does not exist/);
 
     // the fixed location must exist: missing output object
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
+        rec("coder", "patch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
 
@@ -880,7 +916,7 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
     await mkdir(join(coderOutputs, "patch"), { recursive: true });
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
+        rec("coder", "patch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch is not a regular file/);
     await rm(join(coderOutputs, "patch"), { recursive: true, force: true });
@@ -889,7 +925,7 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
     await symlink(join(dirs.root, "outside.txt"), join(coderOutputs, "patch"));
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
+        rec("coder", "patch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
   });
@@ -1005,7 +1041,7 @@ test("15. records resolve only the fixed location; arbitrary paths never satisfy
     await writeFile(arbitrary, "PATCH");
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
+        rec("coder", "patch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
@@ -1019,7 +1055,7 @@ test("15. records resolve only the fixed location; arbitrary paths never satisfy
     await symlink(outside, escapeLink);
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
+        rec("coder", "patch", 1),
       ], "architect", 3);
     }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
     expect(await readFile(outside, "utf8")).toBe("ESCAPED");
@@ -1169,36 +1205,37 @@ test("19. failed operations clean up exactly what they created", async () => {
     const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
     expect(snap.inputs.length).toBe(3);
 
-    await prepareActivationData(pipeline, snap, [], "coder", 1);
-
     // a missing accepted output creates nothing at all
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [], "architect", 2);
     }, /state output "coder"\."patch" which has no accepted output yet/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
 
-    // a mid-copy activation failure removes exactly its own leaf tree
-    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "patch"), "PATCH");
-    const scratch = join(runRoot, "activations", "1-coder", "data", "outputs", "scratch");
+    // a mid-copy activation failure removes exactly its own leaf tree: the
+    // coder outputs are accepted while readable, then the unreadable file
+    // breaks the accepted history's digest verification before the next
+    // leaf is created
+    const coderPrep = await prepareActivationData(pipeline, snap, [], "coder", 1);
+    await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH");
+    const scratch = join(coderPrep.outputs_root, "scratch");
     await writeFile(join(scratch, "readable.txt"), "OK");
     await writeFile(join(scratch, "unreadable.txt"), "SECRET");
+    const coderRecords = await acceptActivationOutputs(pipeline, coderPrep);
     await chmod(join(scratch, "unreadable.txt"), 0o000);
 
-    // the scratch handoff is missing first, then fails mid-copy once the
-    // record is present; both attempts remove exactly their own leaf tree
+    // the scratch handoff is missing first, then fails during digest
+    // verification once the record is present; both attempts remove
+    // exactly their own leaf tree
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
+        ...coderRecords.filter((record) => record.output === "patch"),
       ], "architect", 3);
     }, /input port "scratch" of agent state "architect" references state output "coder"\."scratch" which has no accepted output yet/);
     await expect(lstat(join(runRoot, "activations", "3-architect"))).rejects.toThrow();
 
     await expectReject(async () => {
-      await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
-        { state: "coder", output: "scratch", activation_index: 1 },
-      ], "architect", 3);
-    }, /input port "scratch" of agent state "architect" file entry "unreadable\.txt" .* is not readable as a regular file/);
+      await prepareActivationData(pipeline, snap, coderRecords, "architect", 3);
+    }, /accepted state output for "coder"\."scratch" at activation index 1 file entry "unreadable\.txt" .* is not readable as a regular file/);
     await chmod(join(scratch, "unreadable.txt"), 0o600);
     await expect(lstat(join(runRoot, "activations", "3-architect"))).rejects.toThrow();
 
@@ -1406,15 +1443,16 @@ test("25. the whole accepted history is validated before the latest record is se
       join(runRoot, "activations", `${index}-architect`);
 
     // a phantom index 1 is rejected even though index 2 of the same pair
-    // is correct
+    // is correct; the index-2 records are minted by real acceptance
     {
       const { runRoot, pipeline, snap } = await setup("r-phantom");
       const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
       await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      const secondRecords = await acceptActivationOutputs(pipeline, second);
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
-          { state: "coder", output: "patch", activation_index: 1 },
-          { state: "coder", output: "patch", activation_index: 2 },
+          rec("coder", "patch", 1),
+          ...secondRecords.filter((record) => record.output === "patch"),
         ], "architect", 3);
       }, /accepted state output for "coder"\."patch" at activation index 1 activation leaf .*1-coder does not exist/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1427,10 +1465,11 @@ test("25. the whole accepted history is validated before the latest record is se
       await prepareActivationData(pipeline, snap, [], "coder", 1);
       const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
       await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      const secondRecords = await acceptActivationOutputs(pipeline, second);
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
-          { state: "coder", output: "patch", activation_index: 1 },
-          { state: "coder", output: "patch", activation_index: 2 },
+          rec("coder", "patch", 1),
+          ...secondRecords.filter((record) => record.output === "patch"),
         ], "architect", 3);
       }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1446,10 +1485,11 @@ test("25. the whole accepted history is validated before the latest record is se
       await symlink(sentinel, join(first.outputs_root, "patch"));
       const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
       await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      const secondRecords = await acceptActivationOutputs(pipeline, second);
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
-          { state: "coder", output: "patch", activation_index: 1 },
-          { state: "coder", output: "patch", activation_index: 2 },
+          rec("coder", "patch", 1),
+          ...secondRecords.filter((record) => record.output === "patch"),
         ], "architect", 3);
       }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1465,10 +1505,11 @@ test("25. the whole accepted history is validated before the latest record is se
       await mkdir(join(first.outputs_root, "patch"));
       const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
       await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      const secondRecords = await acceptActivationOutputs(pipeline, second);
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
-          { state: "coder", output: "patch", activation_index: 1 },
-          { state: "coder", output: "patch", activation_index: 2 },
+          rec("coder", "patch", 1),
+          ...secondRecords.filter((record) => record.output === "patch"),
         ], "architect", 3);
       }, /fixed output .*1-coder\/data\/outputs\/patch is not a regular file/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1479,14 +1520,16 @@ test("25. the whole accepted history is validated before the latest record is se
       const { runRoot, pipeline, snap } = await setup("r-parent");
       const first = await prepareActivationData(pipeline, snap, [], "coder", 1);
       await writeFile(join(first.outputs_root, "patch"), "PATCH-1");
+      const firstRecords = await acceptActivationOutputs(pipeline, first);
       const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
       await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
+      const secondRecords = await acceptActivationOutputs(pipeline, second);
       await rm(join(first.activation_root, "data"), { recursive: true, force: true });
       await symlink(join(dirs.root, "outside-data"), join(first.activation_root, "data"));
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
-          { state: "coder", output: "patch", activation_index: 1 },
-          { state: "coder", output: "patch", activation_index: 2 },
+          ...firstRecords.filter((record) => record.output === "patch"),
+          ...secondRecords.filter((record) => record.output === "patch"),
         ], "architect", 3);
       }, /activation data root .*1-coder\/data exists but is a symbolic link/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1500,17 +1543,18 @@ test("25. the whole accepted history is validated before the latest record is se
       await writeFile(join(first.outputs_root, "patch"), "PATCH-1");
       const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
       await writeFile(join(second.outputs_root, "patch"), "PATCH-2");
-      const scratchRecord = { state: "coder", output: "scratch", activation_index: 1 };
+      const firstRecords = await acceptActivationOutputs(pipeline, first);
+      const secondRecords = await acceptActivationOutputs(pipeline, second);
       const ascending = await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 1 },
-        { state: "coder", output: "patch", activation_index: 2 },
-        scratchRecord,
+        ...firstRecords.filter((record) => record.output === "patch"),
+        ...secondRecords.filter((record) => record.output === "patch"),
+        ...firstRecords.filter((record) => record.output === "scratch"),
       ], "architect", 3);
       expect(await readFile(join(ascending.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
       const descending = await prepareActivationData(pipeline, snap, [
-        { state: "coder", output: "patch", activation_index: 2 },
-        { state: "coder", output: "patch", activation_index: 1 },
-        scratchRecord,
+        ...secondRecords.filter((record) => record.output === "patch"),
+        ...firstRecords.filter((record) => record.output === "patch"),
+        ...firstRecords.filter((record) => record.output === "scratch"),
       ], "architect", 4);
       expect(await readFile(join(descending.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
     }

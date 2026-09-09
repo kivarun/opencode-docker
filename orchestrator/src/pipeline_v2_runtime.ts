@@ -29,8 +29,10 @@ import {
   type PipelinePortSource,
   type PortType,
   type ResolvedPipelineV2,
+  type ResolvedV2AgentOutputPort,
   type ResolvedV2State,
 } from "./pipeline_v2.ts";
+import { validatePipelineJson } from "./pipeline_v2_schema.ts";
 
 /**
  * Pipeline schema v2 data plane: host-side runtime substrate for run-input
@@ -89,6 +91,49 @@ import {
  * output tree is an explicit limitation left to the next runtime
  * increment — no 0777 workaround is used.
  *
+ * Output acceptance (`acceptActivationOutputs`): after a worker run, the
+ * finished `outputs/` tree of one prepared activation is validated and
+ * converted into trusted accepted-output records. The function accepts only
+ * the exact `PreparedActivationData` object a successful
+ * `prepareActivationData` call returned for the same `ResolvedPipelineV2`
+ * object (registered in a module-private `WeakMap` at preparation time;
+ * hand-built objects, casts, clones, activations of another pipeline and
+ * Proxies are rejected before any field is read). It creates, fixes,
+ * renames and deletes nothing — it only reads. The outputs root must
+ * contain exactly one top-level entry per declared output port of the
+ * state: a missing declared output fails, any undeclared top-level entry
+ * fails, and no duplicate/alias/fallback semantics exist — names, paths and
+ * types come only from the compiled pipeline and the prepared layout, and
+ * the agent never reports them. `file` outputs must be existing regular
+ * files with a non-symlink final component, read through `O_NOFOLLOW`;
+ * `json` outputs must additionally be valid JSON conforming to the
+ * declared, loader-compiled JSON Schema; `directory` outputs must be real
+ * non-symlink directories whose recursion allows only real directories and
+ * regular files (symlinks, FIFOs, sockets and devices fail). All parents
+ * and canonical paths must stay inside the canonical run root and the exact
+ * activation outputs location. Every accepted record carries a lowercase
+ * SHA-256 digest over a separate `pipeline-v2-output` domain and the
+ * declared type, with the same unambiguous framing as input digests
+ * (length-framed bytes for file/json; kind tag, length-framed UTF-8
+ * relative path, and length-framed file content in code-unit sorted order
+ * for directories — names, entry kinds and empty directories participate;
+ * host paths, inodes, permissions and timestamps never do). Records are
+ * returned deep-frozen, one per declared output, in declaration order.
+ * Acceptance re-checks the tree fresh (the worker held the outputs root
+ * read-write), so a tree that was replaced, escaped, or filled with
+ * symlinks after preparation is rejected.
+ *
+ * Accepted-history binding: `prepareActivationData` requires the exact
+ * record form `{state, output, activation_index, digest}` and re-verifies
+ * the whole history before anything is prepared — every record (including
+ * old, non-winning ones) is resolved to its fixed location and its digest
+ * recomputed and compared, and only then is the winning record per
+ * `state`/`output` pair selected. An accepted output that changed after
+ * acceptance — content, entry name, empty directory, kind, or JSON bytes —
+ * fails the next activation before its leaf is created. The records remain
+ * trusted runner-owned input: agent envelopes, stdout and worker files can
+ * never create one.
+ *
  * Failure behavior: all validation happens before any mutation; every
  * created object is tracked and removed again when the operation fails, so
  * a partial snapshot never becomes authoritative and existing snapshots
@@ -142,6 +187,34 @@ const UNTRUSTED_RUN_INPUT_SNAPSHOT_MESSAGE =
   "hand-built objects, casts, clones, snapshots of another pipeline and Proxies " +
   "are rejected before any field is read";
 
+/**
+ * Module-private provenance registry of prepared activation layouts.
+ *
+ * `prepareActivationData` registers the exact deep-frozen prepared object
+ * it returns, together with the trusted pipeline object it was prepared for
+ * and the canonical run root. `acceptActivationOutputs` accepts only a
+ * registered object whose recorded pipeline is the identical
+ * `ResolvedPipelineV2` object it was handed. The registry is keyed by
+ * object identity: hand-built objects, casts, shallow or deep clones,
+ * Proxies and prepared activations of another pipeline are all unregistered
+ * or mismatched and rejected before any field is read. There is no second
+ * structural validation pass behind this gate, and a future resume loader
+ * could mint trusted runtime state through the same registration path.
+ */
+interface PreparedActivationProvenance {
+  readonly pipeline: ResolvedPipelineV2;
+  readonly runRootCanonical: string;
+}
+
+const preparedActivationProvenance = new WeakMap<object, PreparedActivationProvenance>();
+
+/** Stable rejection message for any prepared activation without provenance. */
+const UNTRUSTED_PREPARED_ACTIVATION_MESSAGE =
+  "output acceptance requires the frozen prepared activation data object " +
+  "returned by a successful prepareActivationData call for the same trusted pipeline; " +
+  "hand-built objects, casts, clones, activations of another pipeline and Proxies " +
+  "are rejected before any field is read";
+
 export interface RunInputBinding {
   readonly id: string;
   readonly path: string;
@@ -174,19 +247,24 @@ export interface RunInputsSnapshot {
 
 /**
  * One previously accepted state output as handed over by the runner: a
- * logical reference only. The accepted object always lives at the fixed
- * orchestrator-derived path
+ * logical reference plus the content digest captured at acceptance time.
+ * The accepted object always lives at the fixed orchestrator-derived path
  * `<runRoot>/activations/<activation_index>-<state>/data/outputs/<output>`;
  * no user paths and no types are accepted — the type is derived from the
- * declared output port and the path is computed by the runtime. The list is
- * trusted input of the runner (agent envelopes, stdout and worker files can
- * never create records); the last accepted output of a state/output pair is
- * the record with the highest activation index, independent of list order.
+ * declared output port and the path is computed by the runtime. The digest
+ * is the lowercase SHA-256 over the `pipeline-v2-output` domain recorded by
+ * `acceptActivationOutputs` when the output was accepted; before a new
+ * activation is prepared, every record's digest is recomputed from the
+ * fixed location and must still match. The list is trusted input of the
+ * runner (agent envelopes, stdout and worker files can never create
+ * records); the last accepted output of a state/output pair is the record
+ * with the highest activation index, independent of list order.
  */
 export interface AcceptedStateOutput {
   readonly state: string;
   readonly output: string;
   readonly activation_index: number;
+  readonly digest: string;
 }
 
 export interface PreparedActivationInputPort {
@@ -221,8 +299,9 @@ export interface PreparedActivationData {
   readonly output_ports: readonly PreparedActivationOutputPort[];
   readonly mounts: readonly PreparedActivationMount[];
   /**
-   * Kept from the compiled plan: undeclared-output validation after a
-   * worker run is not implemented in this increment.
+   * Kept from the compiled plan and enforced by `acceptActivationOutputs`
+   * since the output-acceptance increment: the top-level entries of the
+   * finished outputs tree must be exactly the declared output ports.
    */
   readonly reject_undeclared_outputs: true;
 }
@@ -475,20 +554,29 @@ function hashTag(hasher: Bun.CryptoHasher, tag: string): void {
 }
 
 /**
- * Digest stream for one input snapshot. It opens with the fixed domain tag
- * and the declared port type. For `file`/`json` the length-framed content
- * follows. For directories every entry appears in sorted relative-path
- * order as: entry kind tag (`directory\0` or `file\0`), the length-framed
- * UTF-8 relative path, and — for regular files — the length-framed content.
- * Empty directories contribute their kind tag and path only, so names,
- * entry kinds, and empty directories all change the digest. Absolute
- * paths, inodes, permissions and timestamps never participate.
+ * Digest hasher for one typed port value with a fixed domain tag. It opens
+ * with the domain tag and the declared port type. For `file`/`json` the
+ * length-framed content follows. For directories every entry appears in
+ * sorted relative-path order as: entry kind tag (`directory\0` or
+ * `file\0`), the length-framed UTF-8 relative path, and — for regular
+ * files — the length-framed content. Empty directories contribute their
+ * kind tag and path only, so names, entry kinds, and empty directories all
+ * change the digest. Absolute paths, inodes, permissions and timestamps
+ * never participate.
  */
-function inputDigestHasher(type: PortType): Bun.CryptoHasher {
+function portValueDigestHasher(domain: string, type: PortType): Bun.CryptoHasher {
   const hasher = new Bun.CryptoHasher("sha256");
-  hashTag(hasher, "pipeline-v2-input\0");
+  hashTag(hasher, domain);
   hashTag(hasher, `${type}\0`);
   return hasher;
+}
+
+function inputDigestHasher(type: PortType): Bun.CryptoHasher {
+  return portValueDigestHasher("pipeline-v2-input\0", type);
+}
+
+function outputDigestHasher(type: PortType): Bun.CryptoHasher {
+  return portValueDigestHasher("pipeline-v2-output\0", type);
 }
 
 function hashRelativePath(hasher: Bun.CryptoHasher, relativePath: string): void {
@@ -567,6 +655,77 @@ async function copyTypedValue(
     hashBytes(hasher, content);
   }
   await writeRegularFileExclusive(targetPath, content, what);
+}
+
+interface ReadPortValue {
+  /** Deterministic digest over the `pipeline-v2-output` domain. */
+  readonly digest: string;
+  /** Parsed JSON value; present exactly when requested and reading json. */
+  readonly parsedJson?: unknown;
+}
+
+/**
+ * Read one typed port value and compute its output-domain digest. For
+ * `file`/`json` the content is read once through `O_NOFOLLOW` and hashed
+ * length-framed; for `json` the same bytes are parsed (only when requested)
+ * so callers can validate the parsed value against a compiled schema — the
+ * digest always covers the raw bytes. For `directory` the tree is scanned
+ * fail-closed (only real directories and regular files) and hashed with
+ * the unambiguous directory framing. This function performs no containment
+ * or kind checks of its own beyond what reading/scanning requires; callers
+ * establish type and containment first. It never writes anything.
+ */
+async function readPortValueForDigest(
+  type: PortType,
+  path: string,
+  what: string,
+  parseJson: boolean,
+): Promise<ReadPortValue> {
+  const hasher = outputDigestHasher(type);
+  if (type !== "directory") {
+    const content = await readRegularFileBytes(path, what);
+    hashBytes(hasher, content);
+    let parsedJson: unknown;
+    if (type === "json" && parseJson) {
+      try {
+        parsedJson = JSON.parse(content.toString("utf8"));
+      } catch (cause) {
+        throw new PipelineError(`${what} ${path} is not valid JSON: ${describeError(cause)}`);
+      }
+    }
+    return { digest: hasher.digest("hex"), ...(parsedJson !== undefined ? { parsedJson } : {}) };
+  }
+  const tree = await scanDirectoryTree(path, what);
+  for (const entry of tree) {
+    if (entry.kind === "directory") {
+      hashDirectoryEntry(hasher, entry, undefined);
+      continue;
+    }
+    const content = await readRegularFileBytes(
+      entry.absolutePath,
+      `${what} file entry ${JSON.stringify(entry.relativePath)}`,
+    );
+    hashDirectoryEntry(hasher, entry, content);
+  }
+  return { digest: hasher.digest("hex") };
+}
+
+/**
+ * Compute the accepted-output digest of one typed value at `path` with the
+ * same framing `acceptActivationOutputs` and accepted-history verification
+ * use. `type` must be a declared port type. No containment is checked and
+ * nothing is written; the path must already be established as a real
+ * non-symlink object of the declared kind by the caller. Exposed so tests
+ * (and a future resume loader) bind exactly the digest form recorded at
+ * acceptance time.
+ */
+export async function acceptedOutputDigest(
+  type: PortType,
+  path: string,
+  what: string,
+): Promise<string> {
+  const portType = parsePortType(type, "accepted output digest type");
+  return (await readPortValueForDigest(portType, path, what, false)).digest;
 }
 
 let tmpCounter = 0;
@@ -735,12 +894,19 @@ export async function snapshotRunInputs(
     } else {
       const content = await readRegularFileBytes(binding.path, what);
       if (input.type === "json") {
+        let parsedJson: unknown;
         try {
-          JSON.parse(content.toString("utf8"));
+          parsedJson = JSON.parse(content.toString("utf8"));
         } catch (cause) {
           throw new PipelineError(
             `${what} bound file ${binding.path} is not valid JSON: ${describeError(cause)}`,
           );
+        }
+        // The same compiled Draft 2020-12 mechanism that validates JSON
+        // agent outputs validates declared json run inputs here, before any
+        // snapshot is created. Diagnostics never contain parsed values.
+        if (input.schema !== undefined) {
+          validatePipelineJson(input.schema, parsedJson, `${what} bound file ${binding.path}`);
         }
       }
       prepared.push({ ...binding, content });
@@ -881,21 +1047,25 @@ interface ParsedAcceptedOutput {
   readonly state: string;
   readonly output: string;
   readonly activationIndex: number;
+  readonly digest: string;
   /** Derived from the declared output port; never taken from the record. */
   readonly type: PortType;
 }
 
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+
 /**
  * Phase 1 of accepted-history validation. Parse and validate the
- * runner-owned accepted records `{state, output, activation_index}`: the
- * argument must be a list (never a stray `TypeError`), every record has
+ * runner-owned accepted records `{state, output, activation_index, digest}`:
+ * the argument must be a list (never a stray `TypeError`), every record has
  * exact fields, safe ids, a positive safe index below the current
- * activation index, a declared agent state, and a declared output port
- * (whose declared type becomes the derived record type). Cross-record
- * invariants: no duplicate records for one activation, and one activation
- * index can never belong to two different states. List order is
- * irrelevant — selection happens only after every record has been fully
- * resolved (see `resolveAcceptedOutputs`).
+ * activation index, a lowercase SHA-256 hex digest, a declared agent state,
+ * and a declared output port (whose declared type becomes the derived
+ * record type). Cross-record invariants: no duplicate records for one
+ * activation, and one activation index can never belong to two different
+ * states. List order is irrelevant — selection happens only after every
+ * record has been fully resolved and digest-verified (see
+ * `resolveAllAcceptedOutputs` and `verifyAcceptedOutputDigests`).
  */
 function parseAcceptedStateOutputs(
   acceptedOutputs: readonly unknown[],
@@ -921,13 +1091,19 @@ function parseAcceptedStateOutputs(
       throw new PipelineError(`${what} is not an object`);
     }
     const entry = raw as Record<string, unknown>;
-    expectExactKeys(entry, ["state", "output", "activation_index"], what);
+    expectExactKeys(entry, ["state", "output", "activation_index", "digest"], what);
     const state = validateSafeId(entry.state, `${what} state id`);
     const output = validateSafeId(entry.output, `${what} output port id`);
     const activationIndex = expectPositiveSafeInteger(
       entry.activation_index,
       `${what} activation index`,
     );
+    const digest = expectNonEmptyString(entry.digest, `${what} digest`);
+    if (!SHA256_HEX_PATTERN.test(digest)) {
+      throw new PipelineError(
+        `${what} digest ${JSON.stringify(digest)} is not a lowercase SHA-256 hex digest`,
+      );
+    }
     const declaredOutputs = agentStates.get(state);
     if (declaredOutputs === undefined) {
       throw new PipelineError(
@@ -945,7 +1121,7 @@ function parseAcceptedStateOutputs(
         `${what} records activation index ${activationIndex} which is not below the current activation index ${currentActivationIndex}`,
       );
     }
-    return { state, output, activationIndex, type: declaredType };
+    return { state, output, activationIndex, digest, type: declaredType };
   });
 
   const seenRecords = new Set<string>();
@@ -970,35 +1146,27 @@ function parseAcceptedStateOutputs(
   return parsed;
 }
 
-interface ResolvedAcceptedOutput {
+interface FullyResolvedRecord {
+  readonly record: ParsedAcceptedOutput;
   readonly type: PortType;
   readonly canonicalPath: string;
-  readonly activationIndex: number;
 }
 
 /**
- * Phases 2 and 3 of accepted-history validation. Phase 2 resolves EVERY
- * record to its fixed orchestrator-derived path: the accepted history is a
- * single runner-owned journal and must be internally coherent as a whole,
- * so a newer correct record never excuses an older phantom or corrupted
- * one. Each record's activation leaf, `data` and `outputs` parents and the
- * final object must be real non-symlink objects (the final one of the kind
+ * Phase 2 of accepted-history validation. EVERY record is resolved to its
+ * fixed orchestrator-derived path: the accepted history is a single
+ * runner-owned journal and must be internally coherent as a whole, so a
+ * newer correct record never excuses an older phantom or corrupted one.
+ * Each record's activation leaf, `data` and `outputs` parents and the final
+ * object must be real non-symlink objects (the final one of the kind
  * matching the declared output port type), and the canonical resolution
- * must stay inside the canonical run root. Phase 3 — only after every
- * record resolved — selects the record with the highest activation index
- * for each `state`/`output` pair (permutation of the record list changes
- * nothing).
+ * must stay inside the canonical run root.
  */
-async function resolveAcceptedOutputs(
+async function resolveAllAcceptedOutputs(
   acceptedOutputs: readonly ParsedAcceptedOutput[],
   runRootCanonical: string,
-): Promise<Map<string, ResolvedAcceptedOutput>> {
+): Promise<FullyResolvedRecord[]> {
   const activationsRoot = join(runRootCanonical, "activations");
-  interface FullyResolvedRecord {
-    readonly record: ParsedAcceptedOutput;
-    readonly type: PortType;
-    readonly canonicalPath: string;
-  }
   const fullyResolved: FullyResolvedRecord[] = [];
   if (acceptedOutputs.length > 0) {
     await requireRealDirectory(activationsRoot, "activations root");
@@ -1041,7 +1209,51 @@ async function resolveAcceptedOutputs(
     }
     fullyResolved.push({ record, type: record.type, canonicalPath: canonical });
   }
+  return fullyResolved;
+}
 
+/**
+ * Phase 3 of accepted-history validation. Every record — including old,
+ * non-winning ones — has its digest recomputed from the fixed location with
+ * the exact `pipeline-v2-output` framing used at acceptance time; any
+ * mismatch (changed content, entry name, empty directory, kind, or JSON
+ * bytes) fails the whole preparation before the winning records are
+ * selected and before any activation leaf is created.
+ */
+async function verifyAcceptedOutputDigests(
+  fullyResolved: readonly FullyResolvedRecord[],
+): Promise<void> {
+  for (const resolvedRecord of fullyResolved) {
+    const what = `accepted state output for ${JSON.stringify(resolvedRecord.record.state)}.${JSON.stringify(resolvedRecord.record.output)} at activation index ${resolvedRecord.record.activationIndex}`;
+    const recomputed = (await readPortValueForDigest(
+      resolvedRecord.type,
+      resolvedRecord.canonicalPath,
+      what,
+      false,
+    )).digest;
+    if (recomputed !== resolvedRecord.record.digest) {
+      throw new PipelineError(
+        `${what} digest mismatch: recorded ${resolvedRecord.record.digest}, recomputed ${recomputed}`,
+      );
+    }
+  }
+}
+
+interface ResolvedAcceptedOutput {
+  readonly type: PortType;
+  readonly canonicalPath: string;
+  readonly activationIndex: number;
+}
+
+/**
+ * Phase 4 of accepted-history validation — only after every record has
+ * been fully resolved and digest-verified — selects the record with the
+ * highest activation index for each `state`/`output` pair (permutation of
+ * the record list changes nothing).
+ */
+function selectWinningAcceptedOutputs(
+  fullyResolved: readonly FullyResolvedRecord[],
+): Map<string, ResolvedAcceptedOutput> {
   const resolved = new Map<string, ResolvedAcceptedOutput>();
   for (const resolvedRecord of fullyResolved) {
     const key = `${resolvedRecord.record.state}\u0000${resolvedRecord.record.output}`;
@@ -1083,6 +1295,17 @@ function findAgentState(
  * must be globally unused, the leaf must be absent beforehand, and the
  * whole leaf tree is removed again when the preparation fails. The project
  * root is never created, modified or removed here.
+ *
+ * The accepted records must be exact-field
+ * `{state, output, activation_index, digest}` objects. Before anything is
+ * prepared, the whole accepted history is validated: every record is
+ * resolved to its fixed orchestrator-derived location and its digest is
+ * recomputed and compared (including old, non-winning records); only after
+ * the whole history checks out is the winning record per `state`/`output`
+ * pair selected by highest activation index. The returned object is
+ * deep-frozen and registered in the module-private prepared-activation
+ * provenance registry; only that exact object can later be passed to
+ * `acceptActivationOutputs` for the same pipeline object.
  */
 export async function prepareActivationData(
   pipeline: ResolvedPipelineV2,
@@ -1118,7 +1341,9 @@ export async function prepareActivationData(
   await requireRealDirectory(projectRoot, "run project root");
 
   const parsedAccepted = parseAcceptedStateOutputs(acceptedOutputs, pipeline, activationIndex);
-  const acceptedByRef = await resolveAcceptedOutputs(parsedAccepted, runRootCanonical);
+  const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
+  await verifyAcceptedOutputDigests(fullyResolved);
+  const acceptedByRef = selectWinningAcceptedOutputs(fullyResolved);
 
   const activationsRoot = join(runRootCanonical, "activations");
   await ensureRealDirectory(activationsRoot, "activations root");
@@ -1221,7 +1446,7 @@ export async function prepareActivationData(
       { source: outputsRoot, target: ACTIVATION_OUTPUTS_ROOT, read_only: false },
     ];
 
-    return deepFreeze({
+    const prepared: PreparedActivationData = deepFreeze({
       run_root: runRootCanonical,
       state_id: agentState.id,
       activation_index: activationIndex,
@@ -1235,6 +1460,11 @@ export async function prepareActivationData(
       mounts,
       reject_undeclared_outputs: true as const,
     });
+    // Register provenance only after the full preparation succeeded; the
+    // exact frozen object is the key, so hand-built objects, casts, clones
+    // and Proxies can never acquire provenance.
+    preparedActivationProvenance.set(prepared, { pipeline, runRootCanonical });
+    return prepared;
   } catch (cause) {
     // The leaf was created exclusively by this call; remove exactly this
     // tree and nothing else. Run-level infrastructure (data, activations
@@ -1242,4 +1472,149 @@ export async function prepareActivationData(
     await removeTrackedPath(activationRoot, runRootCanonical);
     throw cause;
   }
+}
+
+/**
+ * Accept the finished worker outputs of one prepared activation: validate
+ * the completed `outputs/` tree and release trusted accepted-output
+ * records. The function creates, fixes, renames and deletes nothing — it
+ * only reads already-written output objects.
+ *
+ * The argument must be the exact `PreparedActivationData` object a
+ * successful `prepareActivationData` call returned for the same
+ * `ResolvedPipelineV2` object; anything else is rejected before any field
+ * is read. All checks re-examine the filesystem fresh (the worker held the
+ * outputs root read-write): the outputs root must still be a real
+ * non-symlink directory resolving exactly to itself inside the canonical
+ * run root, its top-level entries must be exactly the declared output ports
+ * (a missing declared output fails, any undeclared entry fails, and there
+ * are no duplicate, alias or fallback semantics), and each output must be a
+ * real non-symlink object of its declared type whose canonical path stays
+ * inside the outputs root. `file` outputs are read through `O_NOFOLLOW`;
+ * `json` outputs must be valid JSON conforming to the loader-compiled
+ * schema (no coercion, no defaults, nothing removed, value never modified);
+ * `directory` outputs allow only real directories and regular files
+ * recursively. Diagnostics never contain file contents or JSON values.
+ *
+ * Returns one deep-frozen record per declared output, in declaration
+ * order: `{state, output, activation_index, digest}` with the lowercase
+ * SHA-256 digest over the `pipeline-v2-output` domain and the declared
+ * type. No path, type, schema, summary, timestamp, or output content is
+ * recorded.
+ */
+export async function acceptActivationOutputs(
+  pipeline: ResolvedPipelineV2,
+  activation: PreparedActivationData,
+): Promise<readonly AcceptedStateOutput[]> {
+  requireResolvedPipelineV2Provenance(pipeline, "output acceptance");
+  const provenance = preparedActivationProvenance.get(activation);
+  if (provenance === undefined || provenance.pipeline !== pipeline) {
+    throw new PipelineError(UNTRUSTED_PREPARED_ACTIVATION_MESSAGE);
+  }
+  const runRootCanonical = provenance.runRootCanonical;
+
+  const state = findAgentState(pipeline, activation.state_id);
+  if (state === undefined || state.type !== "agent") {
+    throw new PipelineError(
+      `prepared activation names state ${JSON.stringify(activation.state_id)} which is not a declared agent state of the trusted pipeline`,
+    );
+  }
+  const agentState = state;
+
+  await requireRealDirectory(runRootCanonical, "run root");
+  await requireRealDirectory(activation.outputs_root, "activation outputs root");
+  let outputsRootCanonical: string;
+  try {
+    outputsRootCanonical = await realpath(activation.outputs_root);
+  } catch (cause) {
+    throw fail(
+      `activation outputs root ${activation.outputs_root} cannot be canonicalized`,
+      cause,
+    );
+  }
+  if (outputsRootCanonical !== activation.outputs_root) {
+    throw new PipelineError(
+      `activation outputs root ${activation.outputs_root} does not resolve exactly to itself; it was replaced or escaped`,
+    );
+  }
+  if (!isInsideRoot(runRootCanonical, outputsRootCanonical)) {
+    throw new PipelineError(
+      `activation outputs root resolves outside the canonical run root ${runRootCanonical}`,
+    );
+  }
+
+  let dirents;
+  try {
+    dirents = await readdir(activation.outputs_root, { withFileTypes: true });
+  } catch (cause) {
+    throw fail(`activation outputs root ${activation.outputs_root} could not be listed`, cause);
+  }
+  const declaredPorts = new Map<string, ResolvedV2AgentOutputPort>(
+    agentState.outputs.map((port) => [port.id, port]),
+  );
+  const found = new Set<string>();
+  for (const dirent of dirents) {
+    if (!declaredPorts.has(dirent.name)) {
+      throw new PipelineError(
+        `activation outputs root ${activation.outputs_root} contains undeclared entry ${JSON.stringify(dirent.name)}`,
+      );
+    }
+    found.add(dirent.name);
+  }
+  for (const port of agentState.outputs) {
+    if (!found.has(port.id)) {
+      throw new PipelineError(
+        `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)} activation ${activation.activation_index} is missing from the activation outputs root ${activation.outputs_root}`,
+      );
+    }
+  }
+
+  const records: AcceptedStateOutput[] = [];
+  for (const port of agentState.outputs) {
+    const what = `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)} activation ${activation.activation_index}`;
+    const target = join(activation.outputs_root, port.id);
+    const info = await lstatOrNull(target);
+    if (info === null) {
+      throw new PipelineError(`${what} output ${target} does not exist`);
+    }
+    if (info.isSymbolicLink()) {
+      throw new PipelineError(`${what} output ${target} is a symbolic link`);
+    }
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = await realpath(target);
+    } catch (cause) {
+      throw fail(`${what} output ${target} cannot be canonicalized`, cause);
+    }
+    if (!isInsideRoot(outputsRootCanonical, canonicalTarget)) {
+      throw new PipelineError(
+        `${what} output resolves outside the activation outputs root ${outputsRootCanonical}`,
+      );
+    }
+    if (port.type === "directory") {
+      if (!info.isDirectory()) {
+        throw new PipelineError(
+          `${what} declares type "directory" but the output is ${describeEntry(info)}`,
+        );
+      }
+    } else if (!info.isFile()) {
+      throw new PipelineError(
+        `${what} declares type ${JSON.stringify(port.type)} but the output is ${describeEntry(info)}`,
+      );
+    }
+    const read = await readPortValueForDigest(port.type, target, what, true);
+    if (port.type === "json") {
+      if (port.schema === undefined) {
+        throw new PipelineError(`${what} has no compiled JSON schema`);
+      }
+      validatePipelineJson(port.schema, read.parsedJson, what);
+    }
+    records.push({
+      state: agentState.id,
+      output: port.id,
+      activation_index: activation.activation_index,
+      digest: read.digest,
+    });
+  }
+  return deepFreeze(records);
 }

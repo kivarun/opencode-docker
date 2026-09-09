@@ -36,4 +36,10 @@ COPY --chown=opencode:opencode \
 
 USER opencode
 
+WORKDIR /opt/orchestrator
+
+# Install the pinned runtime dependencies from the committed lockfile.
+# The build fails closed on a package.json/bun.lock mismatch.
+RUN bun install --frozen-lockfile --production
+
 ENTRYPOINT ["bun", "/opt/orchestrator/src/main.ts"]
