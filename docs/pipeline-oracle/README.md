@@ -21,6 +21,7 @@ extensions to the graph engine.
 | [state-transitions.json](state-transitions.json) | 16 state/procedure contracts with explicit effects and unknowns |
 | [scenarios.json](scenarios.json) | 101 named decision, transition, validation, recovery, artifact and sequence scenarios |
 | [specification-notes.json](specification-notes.json) | Ten open boundaries and two source-precedence resolutions |
+| [policy-resolutions.json](policy-resolutions.json) | Explicit post-extraction decisions for the future default pipeline |
 | [audit.py](audit.py) | Offline provenance, decision-transcription and corpus consistency audit |
 
 References use the source id and inclusive original line numbers. Source copies
@@ -129,6 +130,22 @@ necessary. Rework is forbidden, close is inapplicable, and no warning matches.
 Expected decision is `null`. `uncovered` is an extraction classification, not a
 new production state or an agent outcome.
 
+User policy resolution P01 covers this specific family of cases in the future
+default pipeline. Unfinished major work at the iteration limit, when TASK and
+the pipeline plan do not need changes, enters a `wait` state with reason
+`stage_iteration_limit_exhausted`. The orchestrator exposes the bounded evidence
+and waits for an explicit user decision. It does not guess whether the limit,
+coder model, reviewer models, or several of them caused the failure.
+
+The user may grant additional stage iterations, replace role-to-model-profile
+bindings for future activations, or do both atomically. A visible "reset" creates
+a new budget grant; it never erases old iteration records or reuses activation
+identities. Model changes name trusted profiles. Provider endpoints, model names,
+and credential values remain operator-controlled profile data rather than user
+response fields. P01 leaves one policy choice open: whether the default pipeline
+restarts the full stage at coder, restarts its review cycle, or exposes both as
+separate intents.
+
 ## State transition contracts
 
 Transition contracts use TR01–TR16; named scenarios use D/T/V/R/S prefixes.
@@ -186,7 +203,7 @@ Evidence and source ranges are recorded in `specification-notes.json`:
 
 | Note | Status | Boundary |
 | --- | --- | --- |
-| G01 | Open | No total decision coverage or fallback warning |
+| G01 | Partially resolved by P01 | Exhausted unfinished major work waits for the user; other uncovered combinations remain |
 | G02 | Open | Recovery repair procedure/authority undefined |
 | G03 | Open | Blocked decisions, recovery writes and proposal/user admission overlap |
 | G04 | Open | New-stage status and control-decision consumption/routing incomplete |
@@ -199,8 +216,10 @@ Evidence and source ranges are recorded in `specification-notes.json`:
 | G11 | Open | Questionable literal closing cases; feasibility not established |
 | G12 | Open | No global budget, physical rollback or durable recovery contract |
 
-G06/G09 follow the existing precedence rule. The open notes do not authorize an
-implementer to choose a convenient interpretation.
+G06/G09 follow the existing precedence rule. P01 is an explicit new default
+policy recorded without altering the extracted legacy table or vectors. The
+remaining open notes do not authorize an implementer to choose a convenient
+interpretation.
 
 ## Preservation map
 
@@ -209,7 +228,7 @@ implementer to choose a convenient interpretation.
 | Input/actor/state validation | V01–V06, V12–V18, V24; R01–R24 | Orchestrator admission and context validation |
 | Output completeness and ownership | V07–V11, V19 | Result acceptance and orchestrator context changes |
 | Role cycle | T03–T05, S01–S02 | Default graph and role prompts |
-| Decision facts, constraints, priority/scope | D01–D31, T06–T07 | Structured facts plus deterministic policy |
+| Decision facts, constraints, priority/scope | D01–D31, T06–T07; P01-S01–P01-S08 | Structured facts plus deterministic policy and explicit user wait |
 | Dynamic stages and rework | T01–T02, T08–T15, S03 | Default context and declared actions |
 | User proposal/warning and task ownership | T16–T18, V22–V23, S04 | Artifacts, waits, user inputs and protected task |
 | Reports and classification boundary | V20–V23, D24–D31 | Role prompts and result/artifact schemas |
@@ -236,7 +255,8 @@ range bounds, fixture/reference integrity and coverage of the 16 transitions.
 For decisions, it compares the table with an independent direct transcription
 and frozen vectors across the finite input space. The 23 named valid decision
 cases have explicitly chosen expectations; malformed/inconsistent witnesses
-are checked separately.
+are checked separately. It also checks that P01 points to still-uncovered legacy
+cases and preserves the accepted user-wait invariants.
 
 It neither imports production code nor runs Docker/LLMs, arbitrary expressions
 or a state-machine simulator. The other named cases are formal assertions for

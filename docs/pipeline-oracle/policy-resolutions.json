@@ -1,0 +1,233 @@
+{
+  "format_version": 1,
+  "resolutions": [
+    {
+      "id": "P01",
+      "status": "accepted",
+      "scope": "default_pipeline_policy",
+      "title": "Escalate unresolved work at the stage iteration limit to the user",
+      "origin": "User policy decision, 2026-09-09",
+      "addresses": {
+        "specification_note": "G01",
+        "legacy_scenarios": [
+          "D14",
+          "D15"
+        ]
+      },
+      "rationale": [
+        "The same observable condition can be caused by an undersized limit, an ineffective coder model, hallucinating reviewer models, or a combination of these causes.",
+        "The deterministic decision model cannot identify the cause from iteration exhaustion alone.",
+        "A user must inspect the evidence and explicitly change the future execution policy."
+      ],
+      "trigger": {
+        "legacy_decision": null,
+        "iteration_limit_reached": true,
+        "can_close_normally": false,
+        "has_major_issue": true,
+        "requires_task_change": false,
+        "needs_pipeline_plan_change": false
+      },
+      "result": {
+        "state_kind": "wait",
+        "reason": "stage_iteration_limit_exhausted",
+        "authority": "user",
+        "normal_agent_activation_allowed": false
+      },
+      "user_view": [
+        "current stage id, index, iteration count, and configured limit",
+        "unmet acceptance criteria and accepted outstanding review/security findings",
+        "role, execution-profile, and model-profile references used by each stage iteration",
+        "validated artifacts and transition history relevant to the stage",
+        "normalized failures and cleanup results"
+      ],
+      "secret_exclusions": [
+        "provider tokens and credential values",
+        "Launcher or child Session credentials",
+        "raw environment values",
+        "unbounded raw worker output"
+      ],
+      "accepted_user_intents": [
+        {
+          "type": "grant_additional_stage_iterations",
+          "requirements": [
+            "the grant is a positive bounded integer",
+            "the grant applies to the current stage and future activations only",
+            "past iteration, activation, and transition history remains immutable",
+            "attempt and activation identities are never reused"
+          ],
+          "note": "A user-visible budget reset is represented as a new grant or budget epoch, not by rewriting the old iteration counter."
+        },
+        {
+          "type": "replace_role_model_profiles",
+          "requirements": [
+            "at least one role binding changes",
+            "each value is a reference to an existing trusted model profile",
+            "the referenced profiles remain within operator and Launcher capability ceilings",
+            "the change applies only to future activations",
+            "endpoint, model, and credential values are resolved from the trusted profile and are not embedded in the response"
+          ]
+        },
+        {
+          "type": "grant_iterations_and_replace_role_model_profiles",
+          "requirements": [
+            "all requirements of both component intents apply atomically"
+          ]
+        }
+      ],
+      "resume_invariants": [
+        "the wait record and user response are durably recorded before execution resumes",
+        "the response must make at least one declared future-policy change",
+        "the orchestrator validates the new budget and all profile references before creating a Session",
+        "the resumed execution snapshot records the accepted budget and profile bindings",
+        "no agent or prompt may apply this user-authority transition"
+      ],
+      "remaining_boundary": "The default pipeline still needs an explicit choice of resume targets: restart the full stage at coder, restart only its review cycle, or offer both as separate user intents. P01 does not choose among them."
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "P01-S01",
+      "title": "A one-iteration limit with unfinished work waits for the user",
+      "given": {
+        "stage_iteration": 1,
+        "max_stage_iterations": 1,
+        "acceptance_criteria_satisfied": false,
+        "has_major_issue": true,
+        "requires_task_change": false,
+        "needs_pipeline_plan_change": false,
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "reason": "stage_iteration_limit_exhausted",
+        "authority": "user",
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S02",
+      "title": "An ineffective coder after all allowed iterations waits for the user",
+      "given": {
+        "limit_exhausted": true,
+        "cause_hypothesis": "coder_model_quality",
+        "blocking_review_findings_remain": true,
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "cause_recorded_as_fact": false,
+        "evidence_exposed": true,
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S03",
+      "title": "Possibly hallucinated reviewer findings still require user judgment",
+      "given": {
+        "limit_exhausted": true,
+        "cause_hypothesis": "reviewer_model_quality",
+        "architect_reports_major_issue": true,
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "cause_recorded_as_fact": false,
+        "review_findings_exposed": true,
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S04",
+      "title": "Mixed coder and reviewer quality cannot be classified deterministically",
+      "given": {
+        "limit_exhausted": true,
+        "cause_hypothesis": "multiple_models_or_limit",
+        "legacy_decision": null
+      },
+      "expected": {
+        "state_kind": "wait",
+        "selected_cause": null,
+        "authority": "user"
+      }
+    },
+    {
+      "id": "P01-S05",
+      "title": "Granting more iterations preserves all previous history",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "grant_additional_stage_iterations",
+          "additional_iterations": 2
+        }
+      },
+      "expected": {
+        "response_accepted": true,
+        "additional_future_iterations": 2,
+        "previous_iteration_records_unchanged": true,
+        "identities_reused": false,
+        "resume_target": "pending_default_pipeline_resolution"
+      }
+    },
+    {
+      "id": "P01-S06",
+      "title": "Changing model profiles affects future activations only",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "replace_role_model_profiles",
+          "bindings": {
+            "coder": "coder_stronger",
+            "reviewer": "reviewer_alternative"
+          }
+        },
+        "profiles_exist_and_are_allowed": true
+      },
+      "expected": {
+        "response_accepted": true,
+        "past_activation_profiles_unchanged": true,
+        "future_bindings_updated": true,
+        "credential_values_in_response": false,
+        "resume_target": "pending_default_pipeline_resolution"
+      }
+    },
+    {
+      "id": "P01-S07",
+      "title": "An empty continue response cannot release the wait",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "grant_additional_stage_iterations",
+          "additional_iterations": 0
+        }
+      },
+      "expected": {
+        "response_accepted": false,
+        "state_kind": "wait",
+        "new_agent_session_created": false
+      }
+    },
+    {
+      "id": "P01-S08",
+      "title": "Raw provider settings and tokens are not accepted as wait-response data",
+      "given": {
+        "wait_reason": "stage_iteration_limit_exhausted",
+        "user_intent": {
+          "type": "replace_role_model_profiles",
+          "bindings": {
+            "coder": {
+              "endpoint": "https://provider.example/v1",
+              "model": "model-name",
+              "token": "secret-value"
+            }
+          }
+        }
+      },
+      "expected": {
+        "response_accepted": false,
+        "state_kind": "wait",
+        "credential_values_persisted": false,
+        "new_agent_session_created": false
+      }
+    }
+  ]
+}

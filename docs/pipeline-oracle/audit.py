@@ -130,6 +130,7 @@ def main():
     scenarios = documents['scenarios.json']
     transitions = documents['state-transitions.json']['transitions']
     notes = documents['specification-notes.json']['notes']
+    policy = documents['policy-resolutions.json']
 
     source_map = {}
     for source in sources['sources']:
@@ -241,13 +242,60 @@ def main():
     for transition in transitions:
         require(set(transition['spec_notes']) <= note_ids, 'Unknown transition note')
 
+    resolutions = policy['resolutions']
+    policy_cases = policy['scenarios']
+    require(len(resolutions) == 1 and resolutions[0]['id'] == 'P01', 'Expected policy resolution P01')
+    require(len({r['id'] for r in resolutions}) == len(resolutions), 'Repeated policy resolution')
+    require(len(policy_cases) == 8 and len({c['id'] for c in policy_cases}) == 8,
+            'Expected eight distinct P01 scenarios')
+    require(documents['specification-notes.json']['user_policy_resolutions'] == ['P01'],
+            'Specification note does not reference P01')
+    g01 = next(note for note in notes if note['id'] == 'G01')
+    require(g01['status'] == 'partially_resolved_by_user_policy' and g01['resolution_refs'] == ['P01'],
+            'G01 must remain a partial, explicit resolution')
+    p01 = resolutions[0]
+    require(p01['addresses']['specification_note'] == 'G01', 'P01 must address G01')
+    case_map = {case['id']: case for case in cases}
+    for legacy_id in p01['addresses']['legacy_scenarios']:
+        legacy = case_map[legacy_id]
+        require(legacy['expected'] == {'status': 'uncovered', 'decision': None},
+                f'P01 rewrote legacy expectation {legacy_id}')
+        require(source_decision(legacy['given']['flags']) is None, f'{legacy_id} is not uncovered')
+        for key, value in p01['trigger'].items():
+            if key == 'legacy_decision':
+                require(value is None, 'P01 legacy decision must be null')
+            else:
+                require(legacy['given']['flags'][key] is value, f'P01 does not match {legacy_id}: {key}')
+    require(p01['result'] == {
+        'state_kind': 'wait',
+        'reason': 'stage_iteration_limit_exhausted',
+        'authority': 'user',
+        'normal_agent_activation_allowed': False,
+    }, 'P01 result contract changed')
+    policy_case_map = {case['id']: case for case in policy_cases}
+    for scenario_id in ['P01-S01', 'P01-S02', 'P01-S03', 'P01-S04']:
+        require(policy_case_map[scenario_id]['expected']['state_kind'] == 'wait',
+                f'{scenario_id} must wait')
+    require(policy_case_map['P01-S05']['expected']['previous_iteration_records_unchanged'] is True,
+            'Budget grant must preserve history')
+    require(policy_case_map['P01-S05']['expected']['identities_reused'] is False,
+            'Budget grant must not reuse identities')
+    require(policy_case_map['P01-S06']['expected']['credential_values_in_response'] is False,
+            'Profile replacement must not carry credentials')
+    require(policy_case_map['P01-S07']['expected']['response_accepted'] is False,
+            'Empty budget grant must not resume')
+    require(policy_case_map['P01-S08']['expected']['response_accepted'] is False and
+            policy_case_map['P01-S08']['expected']['credential_values_persisted'] is False,
+            'Raw provider credentials must be rejected')
+
     print('Source copies: 2/2 SHA-256, byte counts and line counts match')
     print(f'Source references: {reference_count} within archived source bounds')
     print('Decision enumeration: 2048 assignments; 1952 violate extracted relations')
     print('Admitted vectors: 96; selected 82; uncovered 14 (preserved, no fallback)')
     print('Selected distribution: ' + json.dumps({d: counts[d] for d in priority}))
     print(f'Named cases: {len(cases)} structurally checked; {named_decisions} decision expectations independently checked')
-    print('Transition coverage: 16/16; notes: 10 open, 2 resolved by source precedence')
+    print('Transition coverage: 16/16; notes: 9 open, 1 partially resolved, 2 source precedence')
+    print('User policy P01: 2 legacy gaps mapped to wait; 8 policy scenarios checked')
     print('No production execution, LLM run, transition simulator, or end-to-end parity claim')
 
 
