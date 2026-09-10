@@ -1170,6 +1170,34 @@ Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
 them.
 
+### Pipeline v2 run state (schema version 3, unwired substrate)
+
+`orchestrator/src/pipeline_v2_state.ts` already defines the durable run state
+for pipeline schema v2 as a pure substrate (schema version 3, with the nested
+pipeline identity carrying `schema_version: 2`): logical run inputs (id,
+port type, protected flag, snapshot digest), a shared contiguous execution
+index covering both agent and decision executions (agent executions reuse it
+as their activation index; a decision occupies an index without an
+activation directory), per-execution phase records with their session and
+cleanup outcomes, committed transitions that bind exactly one settled
+execution, the terminal, published run outputs (present/absent variants
+with digests only), and a normalized failure reason. The pure reducer
+applies 17 commands and enforces the same shape as the v1 state (execution
+only at the cursor, one in-flight execution, a new execution only after the
+previous transition commit, session-id uniqueness, transition only after
+agent cleanup or a matching evaluated decision outcome, the transition
+budget, one terminal at the cursor, publication exactly once after the
+terminal, `run_succeeded` requiring published outputs, a published failed
+terminal finalizing as `run_failed` with `terminal_failed`, cleanup failures
+finalizing only as `cleanup_failed`, and an immutable final status); the
+loader re-derives the same invariants from those records in both
+directions. There is no `events[]` by design: `executions`, `transitions`,
+`terminal`, and `run_outputs` are the single authoritative journal, so a
+later audit/observation layer must never duplicate them as a second source
+of truth. The schema v2 document stays the production state of pipeline v1;
+no v1/v2 migration exists, and production v2 execution, store/sink
+integration, and resume are still not implemented.
+
 ## User intervention
 
 User intervention is an explicit state transition, not an interactive agent
