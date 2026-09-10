@@ -144,7 +144,7 @@ function playSuccessRun(driver: Driver): void {
     result: {
       status: "selected",
       outcome: "approved",
-      decision: "approve",
+      decision: "approved",
       rule_id: "R1",
       active_constraint_ids: ["HC1"],
     },
@@ -201,6 +201,30 @@ function expectInvalid(
     message = (cause as Error).message;
   }
   expect(message).toContain(messagePart);
+}
+
+/** The reducer never produces a document the loader rejects: check after serialization. */
+function requireLoadableSnapshot(state: PipelineV2RunState): void {
+  const draft = draftOf(state);
+  const loaded = validatePipelineV2RunState(draft);
+  expect(loaded).toEqual(draft);
+}
+
+/** Driver wrapper asserting every accepted command stays loader-compatible after JSON serialization. */
+function loadableDriver(driver: Driver): Driver {
+  return {
+    apply(command) {
+      const state = driver.apply(command);
+      requireLoadableSnapshot(state);
+      return state;
+    },
+    reject(command, messagePart) {
+      driver.reject(command, messagePart);
+    },
+    get current() {
+      return driver.current;
+    },
+  };
 }
 
 function expectDeepFrozen(value: unknown, path = "state"): void {
@@ -382,7 +406,7 @@ describe("pipeline v2 run state schema v3", () => {
         result: {
           status: "selected",
           outcome: "approved",
-          decision: "approve",
+          decision: "approved",
           rule_id: "R1",
           active_constraint_ids: ["HC1", "HC2"],
         },
@@ -440,7 +464,7 @@ describe("pipeline v2 run state schema v3", () => {
       result: {
         status: "selected",
         outcome: "approved",
-        decision: "approve",
+        decision: "approved",
         rule_id: "R1",
         active_constraint_ids: [],
       },
@@ -452,6 +476,143 @@ describe("pipeline v2 run state schema v3", () => {
         executionIndex: 1,
       },
       'transition carries outcome "rejected", but execution 1 recorded decision outcome "approved"',
+    );
+  });
+
+  test("rejects unsafe transition steps and terminal ids in the reducer", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    startAgent(driver, "implement", "sess-1");
+    acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
+    driver.reject(
+      {
+        kind: "transition_committed",
+        step: { from: "../bad", outcome: "completed", to: "check", transition_index: 0 },
+        executionIndex: 1,
+      },
+      "transition_committed step.from must be a safe non-empty identifier",
+    );
+    driver.reject(
+      {
+        kind: "transition_committed",
+        step: { from: "implement", outcome: "completed", to: "../bad", transition_index: 0 },
+        executionIndex: 1,
+      },
+      "transition_committed step.to must be a safe non-empty identifier",
+    );
+    driver.reject(
+      {
+        kind: "transition_committed",
+        step: { from: "implement", outcome: "", to: "check", transition_index: 0 },
+        executionIndex: 1,
+      },
+      "transition_committed step.outcome must be a non-empty string",
+    );
+    driver.reject(
+      {
+        kind: "transition_committed",
+        step: { from: "implement", outcome: "completed", to: "check", transition_index: -1 },
+        executionIndex: 1,
+      },
+      "transition_committed step.transition_index must be a non-negative safe integer",
+    );
+    commitTransition(driver, "implement", "completed", "check", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: {
+        status: "selected",
+        outcome: "approved",
+        decision: "approved",
+        rule_id: "R1",
+        active_constraint_ids: [],
+      },
+    });
+    commitTransition(driver, "check", "approved", "done", 2);
+    driver.reject(
+      { kind: "terminal_reached", terminalStateId: "../bad", terminalResult: "success" },
+      "terminal_reached terminal state id must be a safe non-empty identifier",
+    );
+    driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
+    driver.apply({ kind: "run_outputs_published", outputs: [] });
+    driver.apply({ kind: "run_succeeded" });
+    const state = driver.current as PipelineV2RunState;
+    expect(state.terminal?.state_id).toBe("done");
+    expect(state.transitions[1]).toEqual({
+      index: 0,
+      from: "check",
+      outcome: "approved",
+      to: "done",
+      execution_index: 2,
+    });
+    expect(state.cursor).toEqual({ current_state: "done", transition_count: 2 });
+  });
+
+  test("a selected decision record must carry outcome equal to decision", () => {
+    const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
+    driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.reject(
+      {
+        kind: "decision_evaluated",
+        result: {
+          status: "selected",
+          outcome: "alpha",
+          decision: "beta",
+          rule_id: "R1",
+          active_constraint_ids: [],
+        },
+      },
+      'records the selected decision "beta", but its outcome is "alpha"',
+    );
+    driver.apply({
+      kind: "decision_evaluated",
+      result: {
+        status: "selected",
+        outcome: "alpha",
+        decision: "alpha",
+        rule_id: "R1",
+        active_constraint_ids: [],
+      },
+    });
+    commitTransition(driver, "check", "alpha", "done", 1);
+    const state = driver.current as PipelineV2RunState;
+    const execution = state.executions[0]!;
+    if (execution.type !== "decision" || execution.result === undefined) {
+      throw new Error("expected a settled decision execution with a recorded result");
+    }
+    if (execution.result.status !== "selected") {
+      throw new Error("expected a selected decision record");
+    }
+    expect(execution.result.outcome).toBe("alpha");
+    expect(execution.result.decision).toBe("alpha");
+    expect(state.transitions).toEqual([
+      { index: 0, from: "check", outcome: "alpha", to: "done", execution_index: 1 },
+    ]);
+  });
+
+  test("the loader rejects a persisted selected record whose outcome differs from its decision", () => {
+    const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
+    driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: {
+        status: "selected",
+        outcome: "alpha",
+        decision: "alpha",
+        rule_id: "R1",
+        active_constraint_ids: [],
+      },
+    });
+    const state = driver.current as PipelineV2RunState;
+    expectInvalid(
+      state,
+      (draft) => {
+        const execution = draft.executions[0]!;
+        execution.result.decision = "beta";
+      },
+      'records the selected decision "beta", but its outcome is "alpha"',
     );
   });
 
@@ -1120,6 +1281,15 @@ describe("pipeline v2 run state schema v3", () => {
     expect(parsed).toEqual(state);
   });
 
+  test("every accepted command in the happy path serializes into a document the loader accepts", () => {
+    const driver = createDriver();
+    playSuccessRun(loadableDriver(driver));
+    const state = driver.current as PipelineV2RunState;
+    expect(state.status).toBe("success");
+    requireLoadableSnapshot(state);
+    expect(parsePipelineV2RunState(JSON.stringify(state))).toEqual(state);
+  });
+
   test("rejects create_run on an existing run and foreign commands without a run", () => {
     const driver = createDriver();
     driver.apply(createRun());
@@ -1251,7 +1421,7 @@ describe("pipeline v2 run state schema v3", () => {
         result: {
           status: "selected",
           outcome: "approved",
-          decision: "approve",
+          decision: "approved",
           rule_id: "R1",
           active_constraint_ids: [],
           facts: { implement: true },
@@ -1323,7 +1493,7 @@ describe("pipeline v2 run state schema v3", () => {
         result: {
           status: "selected",
           outcome: "",
-          decision: "approve",
+          decision: "approved",
           rule_id: "R1",
           active_constraint_ids: [],
         } as unknown as PipelineDecisionStateRecord,

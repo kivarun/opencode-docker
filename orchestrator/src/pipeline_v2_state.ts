@@ -686,10 +686,17 @@ function validateDecisionRecord(value: unknown, what: string): PipelineDecisionS
       "rule_id",
       "active_constraint_ids",
     ]);
+    const outcome = expectSafeId(obj.outcome, `${what}.outcome`);
+    const decision = expectSafeId(obj.decision, `${what}.decision`);
+    if (outcome !== decision) {
+      throw new PipelineV2StateError(
+        `${what} records the selected decision ${JSON.stringify(decision)}, but its outcome is ${JSON.stringify(outcome)}`,
+      );
+    }
     return {
       status: "selected",
-      outcome: expectSafeId(obj.outcome, `${what}.outcome`),
-      decision: expectSafeId(obj.decision, `${what}.decision`),
+      outcome,
+      decision,
       rule_id: expectSafeId(obj.rule_id, `${what}.rule_id`),
       active_constraint_ids: expectSafeIdList(obj.active_constraint_ids, `${what}.active_constraint_ids`),
     };
@@ -1400,16 +1407,23 @@ function requireUnfinishedDecision(current: PipelineV2RunState, what: string): P
   return execution;
 }
 
-function isWellFormedStep(step: unknown): step is TransitionStep {
-  return (
-    step !== null &&
-    typeof step === "object" &&
-    !Array.isArray(step) &&
-    isNonEmptyString((step as TransitionStep).from) &&
-    isNonEmptyString((step as TransitionStep).outcome) &&
-    isNonEmptyString((step as TransitionStep).to) &&
-    isSafeNonNegativeInteger((step as TransitionStep).transition_index)
-  );
+/**
+ * The single TransitionStep contract shared by the reducer and the loader:
+ * an engine step obeys the same safe-id and integer rules as the persisted
+ * transition record, so an accepted command can never produce a document
+ * the loader rejects.
+ */
+function expectTransitionStep(step: unknown, what: string): TransitionStep {
+  if (step === null || typeof step !== "object" || Array.isArray(step)) {
+    throw new PipelineV2StateError(`${what} is not a JSON object`);
+  }
+  const obj = step as Record<string, unknown>;
+  return {
+    from: expectSafeId(obj.from, `${what}.from`),
+    outcome: expectNonEmptyString(obj.outcome, `${what}.outcome`),
+    to: expectSafeId(obj.to, `${what}.to`),
+    transition_index: expectSafeNonNegativeInteger(obj.transition_index, `${what}.transition_index`),
+  };
 }
 
 /** Guards shared by both start commands: cursor match, previous commit, budget. */
@@ -1717,14 +1731,12 @@ export function reducePipelineV2RunCommand(
       if (current.terminal !== undefined) {
         fail(current, "the terminal state is already reached; no further transitions are possible");
       }
-      if (!isWellFormedStep(command.step)) {
-        throw new PipelineV2StateError("transition_committed requires a well-formed engine TransitionStep");
-      }
       if (!isSafePositiveInteger(command.executionIndex)) {
         throw new PipelineV2StateError(
           `transition_committed requires a positive execution index, got ${JSON.stringify(command.executionIndex)}`,
         );
       }
+      const step = expectTransitionStep(command.step, "transition_committed step");
       const execution = requireLastExecution(current);
       if (command.executionIndex !== execution.index) {
         fail(
@@ -1746,20 +1758,20 @@ export function reducePipelineV2RunCommand(
             `committing a transition requires the decision execution to be evaluated, execution ${execution.index} has phase ${JSON.stringify(execution.phase)}`,
           );
         }
-        if (execution.result !== undefined && execution.result.outcome !== command.step.outcome) {
+        if (execution.result !== undefined && execution.result.outcome !== step.outcome) {
           fail(
             current,
-            `transition carries outcome ${JSON.stringify(command.step.outcome)}, but execution ${execution.index} recorded decision outcome ${JSON.stringify(execution.result.outcome)}`,
+            `transition carries outcome ${JSON.stringify(step.outcome)}, but execution ${execution.index} recorded decision outcome ${JSON.stringify(execution.result.outcome)}`,
           );
         }
       }
       if (current.transitions.some((existing) => existing.execution_index === command.executionIndex)) {
         fail(current, `execution ${execution.index} already carries a committed transition`);
       }
-      if (command.step.from !== current.cursor.current_state) {
+      if (step.from !== current.cursor.current_state) {
         fail(
           current,
-          `transition starts at ${JSON.stringify(command.step.from)}, but the cursor is at ${JSON.stringify(current.cursor.current_state)}`,
+          `transition starts at ${JSON.stringify(step.from)}, but the cursor is at ${JSON.stringify(current.cursor.current_state)}`,
         );
       }
       if (current.cursor.transition_count >= current.pipeline.max_transitions) {
@@ -1768,24 +1780,24 @@ export function reducePipelineV2RunCommand(
           `committing transition ${current.cursor.transition_count + 1} would exceed the pipeline transition budget ${current.pipeline.max_transitions}`,
         );
       }
-      if (command.step.from !== execution.state_id) {
+      if (step.from !== execution.state_id) {
         fail(
           current,
-          `transition starts at ${JSON.stringify(command.step.from)}, but execution ${execution.index} ran state ${JSON.stringify(execution.state_id)}`,
+          `transition starts at ${JSON.stringify(step.from)}, but execution ${execution.index} ran state ${JSON.stringify(execution.state_id)}`,
         );
       }
       next.transitions = [
         ...next.transitions,
         {
-          index: command.step.transition_index,
-          from: command.step.from,
-          outcome: command.step.outcome,
-          to: command.step.to,
+          index: step.transition_index,
+          from: step.from,
+          outcome: step.outcome,
+          to: step.to,
           execution_index: command.executionIndex,
         },
       ];
       next.cursor = {
-        current_state: command.step.to,
+        current_state: step.to,
         transition_count: current.cursor.transition_count + 1,
       };
       break;
@@ -1797,18 +1809,19 @@ export function reducePipelineV2RunCommand(
       if (current.terminal !== undefined) {
         fail(current, "the terminal state is already reached and immutable");
       }
-      if (!isNonEmptyString(command.terminalStateId)) {
-        throw new PipelineV2StateError("terminal_reached requires a non-empty terminal state id");
-      }
+      const terminalStateId = expectSafeId(
+        command.terminalStateId,
+        "terminal_reached terminal state id",
+      );
       if (command.terminalResult !== "success" && command.terminalResult !== "failed") {
         throw new PipelineV2StateError(
           `terminal_reached requires terminalResult "success" or "failed", got ${JSON.stringify(command.terminalResult)}`,
         );
       }
-      if (command.terminalStateId !== current.cursor.current_state) {
+      if (terminalStateId !== current.cursor.current_state) {
         fail(
           current,
-          `terminal state ${JSON.stringify(command.terminalStateId)} does not match the cursor ${JSON.stringify(current.cursor.current_state)}`,
+          `terminal state ${JSON.stringify(terminalStateId)} does not match the cursor ${JSON.stringify(current.cursor.current_state)}`,
         );
       }
       for (const execution of current.executions) {
@@ -1825,7 +1838,7 @@ export function reducePipelineV2RunCommand(
           "recording the terminal state requires every execution's transition to be committed",
         );
       }
-      next.terminal = { state_id: command.terminalStateId, result: command.terminalResult };
+      next.terminal = { state_id: terminalStateId, result: command.terminalResult };
       break;
     }
     case "run_outputs_published": {
