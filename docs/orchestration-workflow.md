@@ -270,7 +270,8 @@ count, and an ordered transition trace (`from`, `outcome`, `to`,
 level it supports sequential states, branching by outcome, and cycles bounded
 by `max_transitions`. It fails closed with `PipelineExecutionError` (stable
 reasons: `invalid_graph`, `missing_state`, `unknown_outcome`,
-`invalid_outcome`, `transition_budget_exhausted`) when the cursor is missing,
+`invalid_outcome`, `invalid_executor`, `transition_budget_exhausted`) when
+the cursor is missing,
 an outcome is not declared by the current state, a transition-bearing state
 (agent or decision) would run with an exhausted shared transition budget, an
 outcome is empty or not a string, or the resolved graph is internally
@@ -307,8 +308,12 @@ result is marked timed out, and the run fails normally with a single cleanup.
 into the production runner).** `executePipelineV2Graph(pipeline, executors)`
 accepts the provenance-checked `ResolvedPipelineV2` snapshot — clones, casts,
 spreads, and Proxies are rejected by `requireResolvedPipelineV2Provenance`
-before any content read or callback — and compiles the same engine-owned
-graph snapshot with one additional state kind: an agent state binds
+before any content read or callback — captures both executor functions
+exactly once into an engine-owned snapshot (a missing or non-function
+executor fails `invalid_executor` before compilation and before any
+callback; reassigning the caller's object mid-run cannot change the
+dispatch), and compiles the same engine-owned graph snapshot with one
+additional state kind: an agent state binds
 `executeAgent` with a frozen `V2AgentExecutionView` (type/id/profile/
 prompt/timeout/attempts only), a decision state binds only `executeDecision`
 with an identity-only frozen `V2DecisionExecutionView` (no model, facts,

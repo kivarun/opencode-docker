@@ -39,6 +39,7 @@ export type PipelineExecutionReason =
   | "missing_state"
   | "unknown_outcome"
   | "invalid_outcome"
+  | "invalid_executor"
   | "transition_budget_exhausted";
 
 export class PipelineExecutionError extends Error {
@@ -115,7 +116,10 @@ export interface V2DecisionExecutionView {
  * Executors of a v2 pipeline graph. For an agent state only `executeAgent`
  * runs, for a decision state only `executeDecision`, for a terminal state
  * neither. Both return an outcome string; neither selects the next state —
- * the engine resolves the declared transition from its own snapshot.
+ * the engine resolves the declared transition from its own snapshot. Both
+ * functions are captured exactly once into an engine-owned snapshot before
+ * graph compilation and before the first callback; reassigning properties
+ * of the caller's object during the run cannot change the dispatch.
  */
 export interface PipelineV2GraphExecutors {
   readonly executeAgent:
@@ -124,6 +128,12 @@ export interface PipelineV2GraphExecutors {
   readonly executeDecision:
     (state: V2DecisionExecutionView) => string | Promise<string>;
 }
+
+/** The engine-owned executor snapshot captured from the caller once. */
+type CapturedV2Executors = {
+  readonly agent: PipelineV2GraphExecutors["executeAgent"];
+  readonly decision: PipelineV2GraphExecutors["executeDecision"];
+};
 
 export interface TransitionStep {
   from: string;
@@ -214,6 +224,43 @@ function stateKindLabel(kind: "agent" | "decision"): string {
 function isPlainJsonObject(value: object): boolean {
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+/** Deterministic, content-free rendering of a non-function executor value. */
+function describeExecutorValue(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
+  return typeof value;
+}
+
+/**
+ * Captures the v2 executor contract exactly once, before graph compilation
+ * and before the first callback: both functions are read one time, checked
+ * against the executor contract, and stored in an engine-owned frozen
+ * snapshot. The compiler binds only the captured functions, so a
+ * reassignment of the caller's `executors` object — inside a callback or
+ * external while a callback is pending — cannot change the dispatch of a
+ * running graph. The caller's object itself is never frozen or modified.
+ */
+function captureV2Executors(
+  executors: PipelineV2GraphExecutors,
+): CapturedV2Executors {
+  const agent = executors.executeAgent;
+  const decision = executors.executeDecision;
+  if (typeof agent !== "function") {
+    throw new PipelineExecutionError(
+      "invalid_executor",
+      `pipeline v2 graph executor contract violated: executors.executeAgent must be a function, got ${describeExecutorValue(agent)}`,
+    );
+  }
+  if (typeof decision !== "function") {
+    throw new PipelineExecutionError(
+      "invalid_executor",
+      `pipeline v2 graph executor contract violated: executors.executeDecision must be a function, got ${describeExecutorValue(decision)}`,
+    );
+  }
+  return Object.freeze({ agent, decision });
 }
 
 /**
@@ -529,17 +576,22 @@ function compileV1Graph(
 }
 
 /**
- * v2 compilation adapter: after the provenance gate the same engine-owned
- * graph snapshot as v1, with one additional state kind. An agent state binds
- * `executeAgent` with its frozen `V2AgentExecutionView`, a decision state
- * only `executeDecision` with an identity-only frozen view. No second
- * pipeline compiler runs: the bundle, data-port, model and schema contracts
- * belong to `loadPipelineV2` and are not repeated here.
+ * v2 compilation adapter: after the provenance gate and the executor
+ * capture, the same engine-owned graph snapshot as v1, with one additional
+ * state kind. An agent state binds the captured `executeAgent` function with
+ * its frozen `V2AgentExecutionView`, a decision state only the captured
+ * `executeDecision` with an identity-only frozen view. No second pipeline
+ * compiler runs: the bundle, data-port, model and schema contracts belong to
+ * `loadPipelineV2` and are not repeated here. After the capture no further
+ * read of the caller's executors object happens.
  */
 function compileV2Graph(
   pipeline: ResolvedPipelineV2,
-  executors: PipelineV2GraphExecutors,
+  executors: CapturedV2Executors,
 ): CompiledGraph {
+  const agentExecutor = executors.agent;
+  const decisionExecutor = executors.decision;
+
   validateGraphPrologue(pipeline.states, pipeline.max_transitions, pipeline.entry_state);
 
   const states = new Map<string, CompiledState>();
@@ -571,7 +623,7 @@ function compileV2Graph(
         kind: "decision",
         view,
         transitions,
-        execute: () => executors.executeDecision(view),
+        execute: () => decisionExecutor(view),
       });
       continue;
     }
@@ -587,7 +639,7 @@ function compileV2Graph(
       kind: "agent",
       view,
       transitions,
-      execute: () => executors.executeAgent(view),
+      execute: () => agentExecutor(view),
     });
   }
 
@@ -702,9 +754,12 @@ export async function executePipelineGraph(
  * Executes a loaded pipeline v2 graph through the same single execution
  * loop as `executePipelineGraph`. The trusted `ResolvedPipelineV2` snapshot
  * is provenance-checked first (hand-built objects, casts, clones and
- * Proxies are rejected before any content is read), then the version-
- * specific adapter compiles the same internal engine-owned snapshot: agent
- * and decision states dispatch to their declared executor with a frozen,
+ * Proxies are rejected before any content is read), then both executor
+ * functions are captured exactly once into an engine-owned snapshot — a
+ * missing or non-function executor fails `invalid_executor` here, before
+ * graph compilation and before any callback — and the version-specific
+ * adapter compiles the same internal engine-owned snapshot: agent and
+ * decision states dispatch to their captured executor with a frozen,
  * transition-free view, and the shared core owns the outcome resolution,
  * transition budget, commit-hook ordering and terminal selection.
  */
@@ -714,6 +769,7 @@ export async function executePipelineV2Graph(
   options: GraphExecutionOptions = {},
 ): Promise<GraphExecutionResult> {
   requireResolvedPipelineV2Provenance(pipeline, "executePipelineV2Graph");
-  const graph = compileV2Graph(pipeline, executors);
+  const captured = captureV2Executors(executors);
+  const graph = compileV2Graph(pipeline, captured);
   return runCompiledGraph(graph, options.onTransitionCommit);
 }

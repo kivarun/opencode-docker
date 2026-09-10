@@ -6,6 +6,7 @@ import { PipelineError } from "../src/pipeline.ts";
 import {
   executePipelineV2Graph,
   PipelineExecutionError,
+  type PipelineV2GraphExecutors,
   type V2AgentExecutionView,
   type V2DecisionExecutionView,
 } from "../src/pipeline_engine.ts";
@@ -249,6 +250,15 @@ const PIPELINE_STATE_OUTPUT_YAML = pipelineYaml(
   OUTPUTS_DIGEST_YAML,
 );
 
+/** The agent/decision cycle variant with an exit (test 7 and the capture tests). */
+const PIPELINE_AGENT_DECISION_CYCLE = pipelineYaml(
+  "coder",
+  20,
+  AGENT_TO_DECISION_STATES_YAML.replace(DECISION_TRANSITIONS_YAML, DECISION_TRANSITIONS_CYCLE_YAML) + TERMINALS_YAML,
+  "",
+  OUTPUTS_DIGEST_YAML,
+);
+
 interface BundleDirs {
   root: string;
   bundle: string;
@@ -339,6 +349,16 @@ function scriptedExecutors(
     agentSeen,
     decisionSeen,
   };
+}
+
+/**
+ * Mutable view of the v2 executor contract used by the reassignment tests:
+ * the engine treats the caller's object as untrusted runtime input and
+ * dispatches only its own captured executor snapshot.
+ */
+interface MutableV2Executors {
+  executeAgent: (state: V2AgentExecutionView) => string | Promise<string>;
+  executeDecision: (state: V2DecisionExecutionView) => string | Promise<string>;
 }
 
 /** An executor that must never be reached; reaching it fails the run. */
@@ -509,49 +529,40 @@ test("6. a decision state can hand over to another decision state", async () => 
 // --- 7. agent/decision cycle with an exit -----------------------------------
 
 test("7. an agent/decision cycle is bounded by the shared budget and exits", async () => {
-  await withPipeline(
-    pipelineYaml(
-      "coder",
-      20,
-      AGENT_TO_DECISION_STATES_YAML.replace(DECISION_TRANSITIONS_YAML, DECISION_TRANSITIONS_CYCLE_YAML) + TERMINALS_YAML,
-      "",
-      OUTPUTS_DIGEST_YAML,
-    ),
-    async ({ pipeline }) => {
-      const decisionOutcomes = ["beta", "alpha"];
-      let agentRuns = 0;
-      let decisionRuns = 0;
-      const result = await executePipelineV2Graph(pipeline, {
-        executeAgent: (state) => {
-          agentRuns += 1;
-          expect(state.id).toBe("coder");
-          return "completed";
-        },
-        executeDecision: (state) => {
-          decisionRuns += 1;
-          expect(state.id).toBe("check");
-          const outcome = decisionOutcomes[decisionRuns - 1];
-          if (outcome === undefined) {
-            throw new Error("decision script exhausted");
-          }
-          return outcome;
-        },
-      });
-      expect(result).toEqual({
-        terminalStateId: "done",
-        terminalResult: "success",
-        transitionCount: 4,
-        trace: [
-          { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
-          { from: "check", outcome: "beta", to: "coder", transition_index: 1 },
-          { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
-          { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
-        ],
-      });
-      expect(agentRuns).toBe(2);
-      expect(decisionRuns).toBe(2);
-    },
-  );
+  await withPipeline(PIPELINE_AGENT_DECISION_CYCLE, async ({ pipeline }) => {
+    const decisionOutcomes = ["beta", "alpha"];
+    let agentRuns = 0;
+    let decisionRuns = 0;
+    const result = await executePipelineV2Graph(pipeline, {
+      executeAgent: (state) => {
+        agentRuns += 1;
+        expect(state.id).toBe("coder");
+        return "completed";
+      },
+      executeDecision: (state) => {
+        decisionRuns += 1;
+        expect(state.id).toBe("check");
+        const outcome = decisionOutcomes[decisionRuns - 1];
+        if (outcome === undefined) {
+          throw new Error("decision script exhausted");
+        }
+        return outcome;
+      },
+    });
+    expect(result).toEqual({
+      terminalStateId: "done",
+      terminalResult: "success",
+      transitionCount: 4,
+      trace: [
+        { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+        { from: "check", outcome: "beta", to: "coder", transition_index: 1 },
+        { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+        { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+      ],
+    });
+    expect(agentRuns).toBe(2);
+    expect(decisionRuns).toBe(2);
+  });
 });
 
 // --- 8. budget exhaustion before the decision callback ----------------------
@@ -1039,6 +1050,257 @@ test("21. clone, spread and Proxy pipelines are rejected before any callback", a
     expect(trapCount).toBe(0);
     expect(agentRuns).toBe(0);
     expect(decisionRuns).toBe(0);
+  });
+});
+
+// --- 23-26. executor snapshot capture ---------------------------------------
+
+test("23. the captured decision executor survives an in-callback reassignment", async () => {
+  await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
+    let agentCalls = 0;
+    let originalDecisionCalls = 0;
+    let rogueCalls = 0;
+    const executors: MutableV2Executors = {
+      executeAgent: (state) => {
+        agentCalls += 1;
+        expect(state.id).toBe("coder");
+        // the agent callback swaps the decision executor: the engine must
+        // keep dispatching to the function captured before compilation
+        (executors as { executeDecision: (state: V2DecisionExecutionView) => string }).executeDecision = () => {
+          rogueCalls += 1;
+          return "beta";
+        };
+        return "completed";
+      },
+      executeDecision: (state) => {
+        originalDecisionCalls += 1;
+        expect(state.id).toBe("check");
+        return "alpha";
+      },
+    };
+    const result = await executePipelineV2Graph(pipeline, executors);
+    expect(result).toEqual({
+      terminalStateId: "done",
+      terminalResult: "success",
+      transitionCount: 2,
+      trace: [
+        { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+        { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+      ],
+    });
+    expect(agentCalls).toBe(1);
+    expect(originalDecisionCalls).toBe(1);
+    expect(rogueCalls).toBe(0);
+  });
+});
+
+test("24. an external decision-executor reassignment while a callback is pending cannot change dispatch", async () => {
+  await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
+    const gate: { release: () => void } = { release: () => {} };
+    let agentCalls = 0;
+    let originalDecisionCalls = 0;
+    let rogueCalls = 0;
+    const executors: MutableV2Executors = {
+      executeAgent: async (state) => {
+        agentCalls += 1;
+        expect(state.id).toBe("coder");
+        await new Promise<void>((resolve) => {
+          gate.release = resolve;
+        });
+        return "completed";
+      },
+      executeDecision: (state) => {
+        originalDecisionCalls += 1;
+        expect(state.id).toBe("check");
+        return "alpha";
+      },
+    };
+    const pending = executePipelineV2Graph(pipeline, executors);
+    // while the agent callback is pending, external code swaps the decision
+    // executor; the engine already holds its own executor snapshot
+    const rogue = (state: V2DecisionExecutionView): string => {
+      rogueCalls += 1;
+      expect(state.id).toBe("check");
+      return "beta";
+    };
+    executors.executeDecision = rogue;
+    gate.release();
+
+    const result = await pending;
+    expect(executors.executeDecision).toBe(rogue);
+    expect(result).toEqual({
+      terminalStateId: "done",
+      terminalResult: "success",
+      transitionCount: 2,
+      trace: [
+        { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+        { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+      ],
+    });
+    expect(agentCalls).toBe(1);
+    expect(originalDecisionCalls).toBe(1);
+    expect(rogueCalls).toBe(0);
+  });
+});
+
+test("25. an agent-executor swap after the first activation cannot change a revisit", async () => {
+  await withPipeline(PIPELINE_AGENT_DECISION_CYCLE, async ({ pipeline }) => {
+    const decisionOutcomes = ["beta", "alpha"];
+    let agentCalls = 0;
+    let rogueAgentCalls = 0;
+    let decisionCalls = 0;
+    const executors: MutableV2Executors = {
+      executeAgent: (state) => {
+        agentCalls += 1;
+        expect(state.id).toBe("coder");
+        if (agentCalls === 1) {
+          // swap the agent executor after the first activation: the revisit
+          // of the same agent state must still run the captured original
+          const rogue = (rogueState: V2AgentExecutionView): string => {
+            rogueAgentCalls += 1;
+            expect(rogueState.id).toBe("coder");
+            return "bogus";
+          };
+          executors.executeAgent = rogue;
+        }
+        return "completed";
+      },
+      executeDecision: (state) => {
+        decisionCalls += 1;
+        expect(state.id).toBe("check");
+        const outcome = decisionOutcomes[decisionCalls - 1];
+        if (outcome === undefined) {
+          throw new Error("decision script exhausted");
+        }
+        return outcome;
+      },
+    };
+    const result = await executePipelineV2Graph(pipeline, executors);
+    expect(result).toEqual({
+      terminalStateId: "done",
+      terminalResult: "success",
+      transitionCount: 4,
+      trace: [
+        { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+        { from: "check", outcome: "beta", to: "coder", transition_index: 1 },
+        { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+        { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+      ],
+    });
+    expect(agentCalls).toBe(2);
+    expect(rogueAgentCalls).toBe(0);
+    expect(decisionCalls).toBe(2);
+  });
+});
+
+test("26. a missing or non-function executor fails invalid_executor before any callback", async () => {
+  const describeValue = (value: unknown): string =>
+    value === null ? "null" : typeof value;
+
+  // non-function executeAgent values on an entry-agent pipeline: the
+  // executor contract is validated before compilation and before any callback
+  await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
+    for (const bad of [undefined, null, 42, "nope", {}]) {
+      let decisionCalls = 0;
+      let failure: unknown;
+      try {
+        await executePipelineV2Graph(
+          pipeline,
+          {
+            executeAgent: bad,
+            executeDecision: () => {
+              decisionCalls += 1;
+              return "alpha";
+            },
+          } as unknown as PipelineV2GraphExecutors,
+        );
+      } catch (cause) {
+        failure = cause;
+      }
+      if (!(failure instanceof PipelineExecutionError)) {
+        throw new Error(`expected PipelineExecutionError, got ${String(failure)}`);
+      }
+      expect(failure.reason).toBe("invalid_executor");
+      expect(failure.message).toBe(
+        `pipeline v2 graph executor contract violated: executors.executeAgent must be a function, got ${describeValue(bad)}`,
+      );
+      expect(decisionCalls).toBe(0);
+    }
+  });
+
+  // an entry decision state uses executeDecision only, yet a bad
+  // executeAgent is still rejected before the first callback
+  await withPipeline(PIPELINE_ENTRY_DECISION, async ({ pipeline }) => {
+    let decisionCalls = 0;
+    let failure: unknown;
+    try {
+      await executePipelineV2Graph(pipeline, {
+        executeAgent: undefined as unknown as (() => string),
+        executeDecision: () => {
+          decisionCalls += 1;
+          return "alpha";
+        },
+      } as unknown as PipelineV2GraphExecutors);
+    } catch (cause) {
+      failure = cause;
+    }
+    if (!(failure instanceof PipelineExecutionError)) {
+      throw new Error(`expected PipelineExecutionError, got ${String(failure)}`);
+    }
+    expect(failure.reason).toBe("invalid_executor");
+    expect(failure.message).toBe(
+      "pipeline v2 graph executor contract violated: executors.executeAgent must be a function, got undefined",
+    );
+    expect(decisionCalls).toBe(0);
+  });
+
+  // an entry terminal never runs callbacks, yet the executor contract is
+  // still validated before the graph compiles
+  await withPipeline(
+    pipelineYaml("done", 3, `  - id: done\n    type: terminal\n    result: success\n`),
+    async ({ pipeline }) => {
+      let failure: unknown;
+      try {
+        await executePipelineV2Graph(
+          pipeline,
+          { executeAgent: 42, executeDecision: null } as unknown as PipelineV2GraphExecutors,
+        );
+      } catch (cause) {
+        failure = cause;
+      }
+      if (!(failure instanceof PipelineExecutionError)) {
+        throw new Error(`expected PipelineExecutionError, got ${String(failure)}`);
+      }
+      expect(failure.reason).toBe("invalid_executor");
+      expect(failure.message).toBe(
+        "pipeline v2 graph executor contract violated: executors.executeAgent must be a function, got number",
+      );
+    },
+  );
+
+  // missing executeDecision on an entry-agent pipeline
+  await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
+    let agentCalls = 0;
+    let failure: unknown;
+    try {
+      await executePipelineV2Graph(pipeline, {
+        executeAgent: () => {
+          agentCalls += 1;
+          return "completed";
+        },
+        executeDecision: undefined as unknown as (() => string),
+      } as unknown as PipelineV2GraphExecutors);
+    } catch (cause) {
+      failure = cause;
+    }
+    if (!(failure instanceof PipelineExecutionError)) {
+      throw new Error(`expected PipelineExecutionError, got ${String(failure)}`);
+    }
+    expect(failure.reason).toBe("invalid_executor");
+    expect(failure.message).toBe(
+      "pipeline v2 graph executor contract violated: executors.executeDecision must be a function, got undefined",
+    );
+    expect(agentCalls).toBe(0);
   });
 });
 
