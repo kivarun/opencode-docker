@@ -1,8 +1,12 @@
-import { isAbsolute, relative } from "node:path";
+import { isAbsolute } from "node:path";
 import type {
   ResolvedPipeline,
   ResolvedState,
 } from "./pipeline.ts";
+import { canonicalJson } from "./canonical_json.ts";
+import { bundleRelativePathInsideRoot } from "./bundle_file.ts";
+
+export { canonicalJson } from "./canonical_json.ts";
 
 /**
  * Deterministic execution-relevant snapshot of a resolved pipeline.
@@ -25,48 +29,8 @@ export interface PipelineExecutionSnapshot {
   states: Record<string, unknown>[];
 }
 
-function canonicalJsonValue(value: unknown): string {
-  if (value === null) {
-    return "null";
-  }
-  const kind = typeof value;
-  if (kind === "string" || kind === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (kind === "number") {
-    if (!Number.isFinite(value as number)) {
-      throw new Error("canonical JSON supports finite numbers only");
-    }
-    return JSON.stringify(value);
-  }
-  if (kind === "bigint" || kind === "function" || kind === "undefined" || kind === "symbol") {
-    throw new Error(`canonical JSON does not support values of type ${kind}`);
-  }
-  if (kind !== "object") {
-    throw new Error(`canonical JSON does not support values of type ${kind}`);
-  }
-  if (Array.isArray(value)) {
-    return `[${(value as unknown[]).map((item) => canonicalJsonValue(item)).join(",")}]`;
-  }
-  // Own enumerable string keys, deterministically sorted. Built as a string,
-  // never as an object, so hostile own keys such as "__proto__" cannot hit
-  // prototype setters and are preserved verbatim.
-  const keys = Object.keys(value as Record<string, unknown>).sort();
-  const parts = keys.map((key) => `${JSON.stringify(key)}:${canonicalJsonValue((value as Record<string, unknown>)[key])}`);
-  return `{${parts.join(",")}}`;
-}
-
-export function canonicalJson(value: unknown): string {
-  return canonicalJsonValue(value);
-}
-
 function bundleRelativePath(bundleRoot: string, absolutePath: string): string {
-  if (!isAbsolute(absolutePath) || !absolutePath.startsWith(`${bundleRoot}/`)) {
-    throw new Error(
-      `bundle file ${absolutePath} does not resolve inside bundle root ${bundleRoot}`,
-    );
-  }
-  return relative(bundleRoot, absolutePath);
+  return bundleRelativePathInsideRoot(bundleRoot, absolutePath, Error, "");
 }
 
 function snapshotAgentState(

@@ -1,4 +1,4 @@
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative } from "node:path";
 import { stat, realpath } from "node:fs/promises";
 import { describeError } from "./docker_helper.ts";
 
@@ -103,6 +103,29 @@ export async function requireBundleFileInsideRoot(
     throw new errorClass(`${what} ${path} resolves outside the ${scopeName}`);
   }
   return canonical;
+}
+
+/**
+ * Derives the bundle-relative path of a verified canonical file path that
+ * must resolve inside the canonical bundle root. Fail-closed: a canonical
+ * path that cannot be represented as inside the root is rejected. This is a
+ * pure path computation shared by the v1 and v2 pipeline digests — it
+ * re-reads nothing from the filesystem. An empty `what` keeps the bare
+ * historical v1 message.
+ */
+export function bundleRelativePathInsideRoot(
+  bundleRoot: string,
+  absolutePath: string,
+  errorClass: BundleFileErrorClass,
+  what: string,
+): string {
+  if (!isAbsolute(absolutePath) || !absolutePath.startsWith(`${bundleRoot}/`)) {
+    const prefix = what === "" ? "" : `${what} `;
+    throw new errorClass(
+      `${prefix}bundle file ${absolutePath} does not resolve inside bundle root ${bundleRoot}`,
+    );
+  }
+  return relative(bundleRoot, absolutePath);
 }
 
 export async function readBundleFile(
