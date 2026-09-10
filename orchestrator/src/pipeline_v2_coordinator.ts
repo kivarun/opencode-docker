@@ -2,7 +2,7 @@
  * Production-neutral coordinator for pipeline schema version 2: the first
  * orchestration layer that assembles the already existing v2 components —
  * `executePipelineV2Graph`, the v2 data plane, the decision evaluator, the
- * execution snapshot/digest, the durable state schema v3, the run state
+ * execution snapshot/digest, the durable state schema v4, the run state
  * sink and the typed runtime failures — into one coordination flow.
  *
  * The coordinator owns the durable run state end to end: it creates the
@@ -16,24 +16,35 @@
  * outcome `completed` after the void agent callback, and the transition
  * commit hook is the only writer of transitions.
  *
- * The agent runtime boundary is production-neutral: an injected
- * `PipelineV2AgentRuntime` creates one Session per agent-state activation
- * and returns a session whose `run()` reports only the lifecycle result
- * (completed, or a typed worker failure) and whose `cleanup()` releases it.
- * The runtime never sees transitions, transition targets, accepted records
- * or any right to choose an outcome. Runtime and session contract
- * functions are captured exactly once before the first side effect and
- * again right after the Session is created, so swapping methods while a
- * callback is pending cannot change the dispatch; user objects are never
- * frozen or modified.
+ * The agent runtime boundary follows the two-session capability model: an
+ * injected `PipelineV2AgentRuntime` creates the orchestrator-owned
+ * Execution Session (run-root scope; it launches the worker and is never
+ * handed to the worker) and the Tool Session (project scope; its bearer is
+ * the worker's only authority) for one agent-state activation. The
+ * Execution session reports the worker run result through `runAgent(tool)`
+ * (completed, or a typed worker failure) and both sessions expose a
+ * `cleanup()`. The cleanup order is fixed: the Tool session first — it
+ * revokes the authority handed to the worker — then the Execution
+ * session. The runtime never sees transitions, transition targets,
+ * accepted records or any right to choose an outcome, and the concrete
+ * runtime keeps bearers in private state; the coordinator sees only
+ * opaque session objects, ids and lifecycle methods. Runtime and session
+ * contract functions are captured exactly once before the first side
+ * effect and again right after each Session is created (cleanup first,
+ * then the session id, then the run entry point), so swapping methods
+ * while a callback is pending cannot change the dispatch; user objects
+ * are never frozen or modified.
  *
  * Failure policy is classification by typed errors and context only — no
  * message parsing. Every expected failure becomes the reason of the
- * durable state; an agent execution records `agent_failed` with the
- * correct session cleanup outcome, a decision execution records
- * `decision_failed`, a session cleanup failure takes priority and
- * finalizes the run as `run_cleanup_failed`, and everything unexpected is
- * `internal_error`.
+ * durable state; an agent execution records `agent_failed` with the two
+ * independent session cleanup outcomes (a durable slot says `completed`
+ * or `failed`; a never-durably-recorded slot says `not_required`), a
+ * decision execution records `decision_failed`, a durably failed session
+ * cleanup takes priority and finalizes the run as `run_cleanup_failed`,
+ * and everything unexpected is `internal_error`. The cleanup sequence is
+ * never interrupted by a first cleanup error: the second session is
+ * still cleaned exactly once.
  *
  * Every failure/final write is outcome-aware: one internal helper
  * distinguishes a committed write, a not-committed write (the previous
@@ -93,12 +104,14 @@ import {
   PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
   PIPELINE_V2_TERMINAL_FAILURE_REASON,
   type PipelineDecisionStateRecord,
+  type PipelineV2AgentExecutionState,
   type PipelineV2ExecutionState,
   type PipelineV2FailureReason,
   type PipelineV2RunCommand,
   type PipelineV2RunOutputState,
   type PipelineV2RunState,
   type PipelineV2SessionCleanup,
+  type PipelineV2SessionCleanupPair,
 } from "./pipeline_v2_state.ts";
 import {
   PipelineV2RunStateDurabilityError,
@@ -111,8 +124,8 @@ import {
 } from "./pipeline_v2.ts";
 
 /**
- * Lifecycle result of one worker run, reported by the injected agent
- * session. It carries no stdout, no artifacts and no outcome string: after
+ * Lifecycle result of one worker run, reported by the injected Execution
+ * Session. It carries no stdout, no artifacts and no outcome string: after
  * a completed run the engine applies its own fixed `completed` outcome,
  * and a typed worker failure fails the execution.
  */
@@ -121,27 +134,44 @@ export type PipelineV2WorkerRunResult =
   | { readonly status: "failed"; readonly reason: "worker_failed" | "worker_timeout" };
 
 /**
- * One agent Session created by the injected runtime for one activation.
- * `run()` reports only the lifecycle result; `cleanup()` releases the
- * session and is invoked exactly once by the coordinator.
+ * The Tool Session of one activation: project scope, its bearer is the
+ * worker's only authority. The coordinator never receives the bearer and
+ * only releases the session exactly once.
  */
-export interface PipelineV2AgentSession {
+export interface PipelineV2ToolSession {
   readonly sessionId: string;
-  run(): Promise<PipelineV2WorkerRunResult>;
   cleanup(): Promise<void>;
 }
 
 /**
- * Production-neutral agent runtime boundary. The coordinator captures
- * `createSession` exactly once before its first side effect; the runtime
- * never sees transitions, transition targets, accepted records or any
- * right to choose an outcome.
+ * The orchestrator-owned Execution Session of one activation: run-root
+ * scope, it launches the worker and is never handed to the worker. The
+ * Tool Session object is passed to `runAgent` as the worker's authority;
+ * the concrete runtime keeps both bearers in private state.
+ */
+export interface PipelineV2ExecutionSession {
+  readonly sessionId: string;
+  runAgent(toolSession: PipelineV2ToolSession): Promise<PipelineV2WorkerRunResult>;
+  cleanup(): Promise<void>;
+}
+
+/**
+ * Production-neutral agent runtime boundary of the two-session capability
+ * model. The coordinator captures `createExecutionSession` and
+ * `createToolSession` exactly once before their first side effect; the
+ * runtime never sees transitions, transition targets, accepted records or
+ * any right to choose an outcome.
  */
 export interface PipelineV2AgentRuntime {
-  createSession(
+  createExecutionSession(
     state: V2AgentExecutionView,
     activation: PreparedActivationData,
-  ): Promise<PipelineV2AgentSession>;
+  ): Promise<PipelineV2ExecutionSession>;
+
+  createToolSession(
+    state: V2AgentExecutionView,
+    activation: PreparedActivationData,
+  ): Promise<PipelineV2ToolSession>;
 }
 
 /**
@@ -207,17 +237,30 @@ function captureContractFunction<O extends object>(owner: O, name: string, owner
   return (value as (...args: never[]) => unknown).bind(owner);
 }
 
-type CapturedCreateSession = (
+type CapturedCreateExecutionSession = (
   state: V2AgentExecutionView,
   activation: PreparedActivationData,
-) => Promise<PipelineV2AgentSession>;
+) => Promise<PipelineV2ExecutionSession>;
 
-function captureCreateSession(runtime: PipelineV2AgentRuntime): CapturedCreateSession {
+type CapturedCreateToolSession = (
+  state: V2AgentExecutionView,
+  activation: PreparedActivationData,
+) => Promise<PipelineV2ToolSession>;
+
+function captureCreateExecutionSession(runtime: PipelineV2AgentRuntime): CapturedCreateExecutionSession {
   return captureContractFunction(
     runtime,
-    "createSession",
+    "createExecutionSession",
     "pipeline v2 agent runtime",
-  ) as CapturedCreateSession;
+  ) as CapturedCreateExecutionSession;
+}
+
+function captureCreateToolSession(runtime: PipelineV2AgentRuntime): CapturedCreateToolSession {
+  return captureContractFunction(
+    runtime,
+    "createToolSession",
+    "pipeline v2 agent runtime",
+  ) as CapturedCreateToolSession;
 }
 
 /**
@@ -228,8 +271,8 @@ function captureCreateSession(runtime: PipelineV2AgentRuntime): CapturedCreateSe
  * frozen or modified. Diagnostics carry no values.
  */
 function captureSessionFunction(
-  session: PipelineV2AgentSession,
-  name: "run" | "cleanup",
+  session: PipelineV2ExecutionSession | PipelineV2ToolSession,
+  name: "runAgent" | "cleanup",
 ): unknown {
   let value: unknown;
   try {
@@ -252,7 +295,9 @@ function captureSessionFunction(
  * Session is created. Reassigning the property later cannot change the
  * dispatch; the violation diagnostics never echo values.
  */
-function captureSessionId(session: PipelineV2AgentSession): string {
+function captureSessionId(
+  session: PipelineV2ExecutionSession | PipelineV2ToolSession,
+): string {
   let sessionId: unknown;
   try {
     sessionId = session.sessionId;
@@ -311,7 +356,7 @@ function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined
 /**
  * Classifies one unexpected failure by typed errors and context only —
  * never by parsing messages. The typed data-plane reasons, the engine
- * reasons (all of which exist in state schema v3) and the store/durability
+ * reasons (all of which exist in state schema v4) and the store/durability
  * failures keep their reasons; everything else is `internal_error`.
  */
 function classifyCause(cause: unknown): PipelineV2FailureReason {
@@ -473,9 +518,9 @@ function executionSettled(execution: PipelineV2ExecutionState): boolean {
  * Whether the reducer would still accept a `run_failed` with the given
  * reason from the given committed snapshot, decided by typed context
  * only — never by parsing messages. Mirrors the reducer's admissibility:
- * every execution must be settled, a failed session cleanup finalizes
- * only with `run_cleanup_failed`, and a failed terminal with published
- * run outputs finalizes only with the terminal failure reason.
+ * every execution must be settled, a durably failed session cleanup
+ * finalizes only with `run_cleanup_failed`, and a failed terminal with
+ * published run outputs finalizes only with the terminal failure reason.
  */
 function runFailedAdmissible(
   state: PipelineV2RunState,
@@ -491,7 +536,7 @@ function runFailedAdmissible(
     last !== undefined &&
     last.type === "agent" &&
     last.phase === "failed" &&
-    last.session_cleanup === "failed"
+    hasDurableFailedCleanup(last)
   ) {
     return false;
   }
@@ -505,15 +550,28 @@ function runFailedAdmissible(
   return reason !== PIPELINE_V2_TERMINAL_FAILURE_REASON;
 }
 
-/** Bookkeeping of the current agent session (one agent execution only). */
-interface AgentSessionTracking {
-  /** The session id was durably recorded by `agent_session_created`. */
-  createdDurably: boolean;
+/** Mirrors the loader: at least one durable cleanup slot failed. */
+function hasDurableFailedCleanup(execution: PipelineV2AgentExecutionState): boolean {
+  const cleanup = execution.session_cleanup;
+  return cleanup !== undefined && (cleanup.execution === "failed" || cleanup.tool === "failed");
+}
+
+/** The two independent cleanup slots of one agent execution. */
+interface SessionSlotTracking {
+  /** The captured cleanup; null until the session object existed. */
+  cleanup: (() => Promise<void>) | null;
   /** The captured cleanup ran exactly once (successfully or not). */
   cleanupDone: boolean;
   cleanupFailed: boolean;
-  /** The captured cleanup function; bound exactly once at session capture. */
-  cleanup: () => Promise<void>;
+}
+
+interface AgentSessionTracking {
+  execution: SessionSlotTracking;
+  tool: SessionSlotTracking;
+  /** The execution session id was durably recorded. */
+  executionCreatedDurably: boolean;
+  /** The tool session id was durably recorded. */
+  toolCreatedDurably: boolean;
 }
 
 interface ExecutionTracking {
@@ -548,9 +606,11 @@ export async function coordinatePipelineV2Run(
 
   // The runtime contract functions are captured exactly once, before the
   // first filesystem or state side effect.
-  let capturedCreateSession: CapturedCreateSession;
+  let capturedCreateExecutionSession: CapturedCreateExecutionSession;
+  let capturedCreateToolSession: CapturedCreateToolSession;
   try {
-    capturedCreateSession = captureCreateSession(runtime);
+    capturedCreateExecutionSession = captureCreateExecutionSession(runtime);
+    capturedCreateToolSession = captureCreateToolSession(runtime);
   } catch {
     return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
   }
@@ -649,37 +709,57 @@ export async function coordinatePipelineV2Run(
     return { outcome: "committed" };
   };
 
+  /**
+   * The durable cleanup pair the authoritative record can honestly
+   * claim: a slot whose session was never durably recorded (never
+   * created, or the durable write was not confirmed) is `not_required`
+   * — the record never claims the session existed; a durably recorded
+   * slot is `completed` when its cleanup succeeded and `failed` when it
+   * did not.
+   */
+  const durableCleanupPair = (session: AgentSessionTracking | null): PipelineV2SessionCleanupPair => {
+    if (session === null) {
+      return { execution: "not_required", tool: "not_required" };
+    }
+    const slotOutcome = (slot: SessionSlotTracking, createdDurably: boolean): PipelineV2SessionCleanup =>
+      createdDurably ? (slot.cleanupFailed ? "failed" : "completed") : "not_required";
+    return {
+      execution: slotOutcome(session.execution, session.executionCreatedDurably),
+      tool: slotOutcome(session.tool, session.toolCreatedDurably),
+    };
+  };
+
+  /** At least one durable cleanup slot failed (mirrors the loader). */
+  const durableCleanupFailed = (): boolean => {
+    const pair = durableCleanupPair(tracking.session);
+    return pair.execution === "failed" || pair.tool === "failed";
+  };
+
   /** The agent_failed command for the still-unfinished agent execution. */
   const agentFailureCommand = (reason: PipelineV2FailureReason): PipelineV2RunCommand => {
-    // Session not durably recorded -> "not_required"; created and cleanup
-    // confirmed -> "completed"; cleanup not confirmed -> "failed" with the
-    // session cleanup failure reason.
-    const sessionCleanup: PipelineV2SessionCleanup =
-      tracking.session === null || !tracking.session.createdDurably
-        ? "not_required"
-        : tracking.session.cleanupFailed ? "failed" : "completed";
-    let recordReason = tracking.session !== null && tracking.session.cleanupFailed
+    const sessionCleanup = durableCleanupPair(tracking.session);
+    // The session cleanup failure reason is used if and only if at least
+    // one durable cleanup outcome failed; a durably failed slot forces
+    // the priority reason, everything else keeps the classified reason.
+    const recordReason = durableCleanupFailed()
       ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
       : executionReasonFor("agent", reason);
-    if (sessionCleanup === "not_required" && recordReason === PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON) {
-      recordReason = "internal_error";
-    }
     return { kind: "agent_failed", reason: recordReason, sessionCleanup };
   };
 
   /**
-   * Records one failure exactly once, outcome-aware: best-effort session
-   * cleanup (the only allowed side effect after a failed durable write),
-   * the execution-level failure record for a still-unfinished execution —
-   * whose commit must be confirmed before the execution counts as settled
-   * — and the run-level finalize. A not-committed failure write never
-   * clears the tracking, never triggers a knowingly incompatible run-level
-   * write, and reports `state_persist_failed` on the last authoritative
-   * snapshot. Exactly one bounded `run_failed: state_persist_failed`
-   * attempt follows a not-committed first finalize, only when the reducer
-   * still accepts it from the committed snapshot. No recursive
-   * finalization; after a durability-unknown commit all further writes
-   * stop.
+   * Records one failure exactly once, outcome-aware: best-effort cleanup
+   * of every created session (the only allowed side effect after a
+   * failed durable write), the execution-level failure record for a
+   * still-unfinished execution — whose commit must be confirmed before
+   * the execution counts as settled — and the run-level finalize. A
+   * not-committed failure write never clears the tracking, never
+   * triggers a knowingly incompatible run-level write, and reports
+   * `state_persist_failed` on the last authoritative snapshot. Exactly
+   * one bounded `run_failed: state_persist_failed` attempt follows a
+   * not-committed first finalize, only when the reducer still accepts it
+   * from the committed snapshot. No recursive finalization; after a
+   * durability-unknown commit all further writes stop.
    */
   const finalizeFailure = async (
     cause: unknown,
@@ -691,19 +771,11 @@ export async function coordinatePipelineV2Run(
     finalized = true;
     let reason = reasonOverride ?? classifyCause(cause);
 
-    // Best-effort cleanup of an existing session, exactly once; the only
-    // allowed side effect after a failed durable write. The cleanup
-    // outcome decides the session-cleanup failure priority.
-    if (tracking.session !== null && !tracking.session.cleanupDone) {
-      const session = tracking.session;
-      session.cleanupDone = true;
-      try {
-        await session.cleanup();
-      } catch {
-        session.cleanupFailed = true;
-      }
-    }
-    if (tracking.session !== null && tracking.session.cleanupFailed) {
+    // Best-effort cleanup of every created session, exactly once, tool
+    // first; the first error never blocks the second. The cleanup
+    // outcomes then decide the session-cleanup failure priority.
+    await runSessionCleanups();
+    if (durableCleanupFailed()) {
       reason = PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON;
     }
     failureReason = reason;
@@ -729,20 +801,19 @@ export async function coordinatePipelineV2Run(
       return;
     }
 
-    // The run-level finalize: never a knowingly incompatible command.
-    if (
-      tracking.session === null || !tracking.session.cleanupFailed
-    ) {
+    // The run-level finalize: never a knowingly incompatible command. A
+    // durably failed session cleanup finalizes with run_cleanup_failed.
+    const cleanupFailedDurably = durableCleanupFailed();
+    if (!cleanupFailedDurably) {
       const state = sink.snapshot;
       if (state !== null && !runFailedAdmissible(state, reason)) {
         failureReason = "state_persist_failed";
         return;
       }
     }
-    const finalizeCommand: RunFinalizeCommand =
-      tracking.session !== null && tracking.session.cleanupFailed
-        ? { kind: "run_cleanup_failed" }
-        : { kind: "run_failed", reason };
+    const finalizeCommand: RunFinalizeCommand = cleanupFailedDurably
+      ? { kind: "run_cleanup_failed" }
+      : { kind: "run_failed", reason };
     const finalizeOutcome = await dispatchOutcomeAware(finalizeCommand);
     if (finalizeOutcome.outcome === "committed") {
       failureReason =
@@ -766,22 +837,29 @@ export async function coordinatePipelineV2Run(
   };
 
   /**
-   * The captured cleanup of the current agent session, runnable exactly
-   * once on every path; a cleanup failure takes priority in the failure
-   * policy.
+   * The captured cleanups of the current agent execution, run in the
+   * fixed order — the Tool session first (it revokes the worker's
+   * authority), then the Execution session — each exactly once; the
+   * first error never blocks the second.
    */
-  const runSessionCleanup = async (): Promise<void> => {
+  const runSessionCleanups = async (): Promise<void> => {
     const session = tracking.session;
-    if (session === null || session.cleanupDone) {
+    if (session === null) {
       return;
     }
-    session.cleanupDone = true;
-    try {
-      await session.cleanup();
-    } catch (cause) {
-      session.cleanupFailed = true;
-      throw cause;
-    }
+    const cleanupSlot = async (slot: SessionSlotTracking): Promise<void> => {
+      if (slot.cleanup === null || slot.cleanupDone) {
+        return;
+      }
+      slot.cleanupDone = true;
+      try {
+        await slot.cleanup();
+      } catch {
+        slot.cleanupFailed = true;
+      }
+    };
+    await cleanupSlot(session.tool);
+    await cleanupSlot(session.execution);
   };
 
   // --- the single execution flow through the engine -----------------------
@@ -791,10 +869,10 @@ export async function coordinatePipelineV2Run(
       tracking.kind = "agent";
       tracking.unfinished = false;
       const sessionTracking: AgentSessionTracking = {
-        createdDurably: false,
-        cleanupDone: false,
-        cleanupFailed: false,
-        cleanup: async () => {},
+        execution: { cleanup: null, cleanupDone: false, cleanupFailed: false },
+        tool: { cleanup: null, cleanupDone: false, cleanupFailed: false },
+        executionCreatedDurably: false,
+        toolCreatedDurably: false,
       };
       tracking.session = sessionTracking;
 
@@ -812,74 +890,113 @@ export async function coordinatePipelineV2Run(
       // 4. agent_data_prepared
       await dispatchState({ kind: "agent_data_prepared" });
 
-      // 5. runtime.createSession (captured once at coordination start)
-      const session = await capturedCreateSession(view, activation);
-
-      // The session contract is captured exactly once, right after the
-      // Session is created, in a fixed order: the cleanup first — when a
-      // later member violates the contract, the already-captured cleanup
-      // is still runnable exactly once — then the session id, then the
-      // run entry point. Reassigning any member afterwards cannot change
-      // the dispatch.
-      let capturedCleanup: () => Promise<void>;
+      // 5. runtime.createExecutionSession (captured once at coordination
+      //    start). The session contract is captured exactly once, right
+      //    after the Session is created, in a fixed order: the cleanup
+      //    first — when a later member violates the contract, the
+      //    already-captured cleanup is still runnable exactly once — then
+      //    the session id, then the run entry point. All captures happen
+      //    before the durable write, so a durably recorded session always
+      //    has a captured cleanup. Reassigning any member afterwards
+      //    cannot change the dispatch.
+      const executionSession = await capturedCreateExecutionSession(view, activation);
+      let executionCleanup: () => Promise<void>;
       try {
-        capturedCleanup = captureSessionFunction(session, "cleanup") as () => Promise<void>;
+        executionCleanup = captureSessionFunction(executionSession, "cleanup") as () => Promise<void>;
       } catch {
         // A missing or non-callable cleanup is a trusted runtime contract
         // violation: nothing runnable exists, so the coordinator must not
         // claim a confirmed cleanup.
-        sessionTracking.cleanupDone = true;
+        sessionTracking.execution.cleanupDone = true;
         throw new Error(
           "pipeline v2 agent session contract violated: cleanup must be a function",
         );
       }
-      sessionTracking.cleanup = capturedCleanup;
-      const sessionId = captureSessionId(session);
-      const capturedRun = captureSessionFunction(session, "run") as () => Promise<unknown>;
+      sessionTracking.execution.cleanup = executionCleanup;
+      const executionSessionId = captureSessionId(executionSession);
+      const capturedRunAgent = captureSessionFunction(executionSession, "runAgent") as (
+        toolSession: PipelineV2ToolSession,
+      ) => Promise<unknown>;
 
-      // 6. agent_session_created — recorded immediately
-      await dispatchState({ kind: "agent_session_created", sessionId });
-      sessionTracking.createdDurably = true;
+      // 6. agent_execution_session_created — recorded immediately
+      await dispatchState({
+        kind: "agent_execution_session_created",
+        sessionId: executionSessionId,
+      });
+      sessionTracking.executionCreatedDurably = true;
 
-      // 7. agent_running
+      // 7. runtime.createToolSession — the worker's authority is created
+      //    only after the Execution Session is durably recorded.
+      const toolSession = await capturedCreateToolSession(view, activation);
+      let toolCleanup: () => Promise<void>;
+      try {
+        toolCleanup = captureSessionFunction(toolSession, "cleanup") as () => Promise<void>;
+      } catch {
+        sessionTracking.tool.cleanupDone = true;
+        throw new Error(
+          "pipeline v2 agent session contract violated: cleanup must be a function",
+        );
+      }
+      sessionTracking.tool.cleanup = toolCleanup;
+      const toolSessionId = captureSessionId(toolSession);
+
+      // 8. agent_tool_session_created — recorded immediately
+      await dispatchState({
+        kind: "agent_tool_session_created",
+        sessionId: toolSessionId,
+      });
+      sessionTracking.toolCreatedDurably = true;
+
+      // 9. agent_running — both sessions are durably recorded
       await dispatchState({ kind: "agent_running" });
 
-      // 8. session.run() — only the lifecycle result crosses the boundary
-      const outcome = await capturedRun();
+      // 10. executionSession.runAgent(toolSession) — only the lifecycle
+      //     result crosses the boundary
+      const outcome = await capturedRunAgent(toolSession);
       const parsed = parseWorkerRunResult(outcome);
       if (parsed === undefined) {
         throw new Error(
-          "pipeline v2 agent session contract violated: run must return a completed or a typed failed result",
+          "pipeline v2 agent session contract violated: runAgent must return a completed or a typed failed result",
         );
       }
       if (parsed.status === "failed") {
-        // The session cleanup still runs exactly once; the failure is
-        // recorded durably and the engine stops before any transition.
-        await runSessionCleanup().catch(() => undefined);
+        // Both sessions are cleaned exactly once, tool first; the
+        // failure is recorded durably and the engine stops before any
+        // transition.
+        await runSessionCleanups();
         await finalizeFailure(undefined, parsed.reason);
         throw new CoordinationAbortedError();
       }
 
-      // 9. accept the activation outputs (the worker held them read-write)
+      // 11. accept the activation outputs (the worker held them read-write)
       const records = await acceptActivationOutputs(pipeline, activation);
 
-      // 10. agent_outputs_accepted
+      // 12. agent_outputs_accepted
       await dispatchState({
         kind: "agent_outputs_accepted",
         outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
       });
 
-      // 11. session.cleanup() exactly once
-      await runSessionCleanup();
+      // 13./14. cleanup the Tool session, then the Execution session,
+      // each exactly once; the first error never blocks the second.
+      await runSessionCleanups();
 
-      // 12. agent_cleanup_completed
+      // A durably failed cleanup becomes the agent failure; the run
+      // finalizes with run_cleanup_failed and no transition is recorded.
+      if (durableCleanupFailed()) {
+        await finalizeFailure(undefined);
+        throw new CoordinationAbortedError();
+      }
+
+      // 15. agent_cleanup_completed — both sessions were confirmed
+      //     cleaned
       await dispatchState({ kind: "agent_cleanup_completed" });
       tracking.unfinished = false;
 
-      // 13. the accepted records join the runner-owned history
+      // 16. the accepted records join the runner-owned history
       accepted.push(...records);
 
-      // 14. return void: the engine applies its own fixed completed outcome
+      // 17. return void: the engine applies its own fixed completed outcome
     },
 
     executeDecision: async (view: V2DecisionExecutionView): Promise<string> => {

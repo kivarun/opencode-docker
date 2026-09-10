@@ -164,54 +164,54 @@ describe("pipeline v2 run state sink", () => {
     const states = buildStates(RUN_ID);
     await withSink(
       async ({ sink, statePath, counts }) => {
-        await playUpTo(sink, 19); // create .. terminal_reached
-        // dispatch 20 (run_outputs_published) fails before the rename
+        await playUpTo(sink, 21); // create .. terminal_reached
+        // dispatch 22 (run_outputs_published) fails before the rename
         const error = await sink
-          .dispatch(successCommands(RUN_ID)[19]!)
+          .dispatch(successCommands(RUN_ID)[21]!)
           .catch((cause: unknown) => cause);
         expect(error).toBeInstanceOf(PipelineV2RunStateStoreError);
         expect(error).not.toBeInstanceOf(PipelineV2RunStateDurabilityError);
         const snapshot = sink.snapshot as PipelineV2RunState;
         // the previous snapshot remains authoritative, byte-for-byte
-        expect(snapshot.revision).toBe(19);
+        expect(snapshot.revision).toBe(21);
         expect(snapshot.terminal?.state_id).toBe("done");
         expect(sink.poisoned).toBe(false);
         const raw = await readFile(statePath, "utf8");
-        expect(parsePipelineV2RunState(raw).revision).toBe(19);
-        expect(counts.renames).toBe(19);
+        expect(parsePipelineV2RunState(raw).revision).toBe(21);
+        expect(counts.renames).toBe(21);
         // recovery: record the normalized failure from the unchanged state
         await sink.dispatch({ kind: "run_failed", reason: "state_persist_failed" });
         const recovered = sink.snapshot as PipelineV2RunState;
-        expect(recovered.revision).toBe(20);
+        expect(recovered.revision).toBe(22);
         expect(recovered.status).toBe("failed");
         expect(recovered.failure?.reason).toBe("state_persist_failed");
         const persisted = parsePipelineV2RunState(await readFile(statePath, "utf8"));
         expect(persisted.status).toBe("failed");
         expect(persisted.failure?.reason).toBe("state_persist_failed");
       },
-      faultIo({ failCommit: 20, failStep: "write" }),
+      faultIo({ failCommit: 22, failStep: "write" }),
     );
   });
 
   test("a durability_unknown commit adopts the candidate, poisons the sink, and stops all writes", async () => {
     const states = buildStates(RUN_ID);
-    const counted = countingIo(faultIo({ failCommit: 20, failStep: "dirsync" }));
+    const counted = countingIo(faultIo({ failCommit: 22, failStep: "dirsync" }));
     await withSink(
       async ({ sink, statePath, counts, runDir }) => {
-        await playUpTo(sink, 19);
-        // dispatch 20 (run_outputs_published) fails after the rename
+        await playUpTo(sink, 21);
+        // dispatch 22 (run_outputs_published) fails after the rename
         const error = await sink
-          .dispatch(successCommands(RUN_ID)[19]!)
+          .dispatch(successCommands(RUN_ID)[21]!)
           .catch((cause: unknown) => cause);
         expect(error).toBeInstanceOf(PipelineV2RunStateDurabilityError);
         const durability = error as PipelineV2RunStateDurabilityError;
         expect(durability.message).toContain("durability could not be confirmed");
-        expect(durability.revision).toBe(20);
-        expect(durability.candidate).toEqual(states[19]!);
+        expect(durability.revision).toBe(22);
+        expect(durability.candidate).toEqual(states[21]!);
         // the visible candidate was adopted and the sink is poisoned
         expect(sink.snapshot).toBe(durability.candidate);
         expect(sink.poisoned).toBe(true);
-        expect(parsePipelineV2RunState(await readFile(statePath, "utf8"))).toEqual(states[19]!);
+        expect(parsePipelineV2RunState(await readFile(statePath, "utf8"))).toEqual(states[21]!);
         const committed = { tempOpens: counts.tempOpens, renames: counts.renames, dirSyncs: counts.dirSyncs };
         // every further dispatch is refused before the reducer and the store
         await expect(sink.dispatch({ kind: "run_succeeded" })).rejects.toThrow(/poisoned/);
@@ -223,12 +223,12 @@ describe("pipeline v2 run state sink", () => {
   });
 
   test("the poisoned sink rejects commands that the reducer would reject too, before the reducer", async () => {
-    const counted = countingIo(faultIo({ failCommit: 20, failStep: "dirsync" }));
+    const counted = countingIo(faultIo({ failCommit: 22, failStep: "dirsync" }));
     await withSink(
       async ({ sink, counts }) => {
-        await playUpTo(sink, 19);
+        await playUpTo(sink, 21);
         const poisonError = await sink
-          .dispatch(successCommands(RUN_ID)[19]!)
+          .dispatch(successCommands(RUN_ID)[21]!)
           .catch((cause: unknown) => cause);
         expect(poisonError).toBeInstanceOf(PipelineV2RunStateDurabilityError);
         const attempts = { tempOpens: counts.tempOpens, renames: counts.renames, dirSyncs: counts.dirSyncs };

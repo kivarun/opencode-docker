@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   PIPELINE_V2_RUN_STATE_SCHEMA_VERSION,
   PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
@@ -53,6 +56,8 @@ interface Driver {
   apply(command: PipelineV2RunCommand): PipelineV2RunState;
   reject(command: PipelineV2RunCommand, messagePart: string): void;
   readonly current: PipelineV2RunState | null;
+  /** A per-driver counter for deterministic default session ids. */
+  nextSessionNumber(): number;
 }
 
 function createDriver(
@@ -62,6 +67,7 @@ function createDriver(
 ): Driver {
   let state: PipelineV2RunState | null = null;
   let tickIndex = 0;
+  let sessionCounter = 0;
   const nextTick = (): Date => {
     const at = tick(tickIndex);
     tickIndex += 1;
@@ -71,6 +77,10 @@ function createDriver(
     apply(command) {
       state = reducePipelineV2RunCommand(state, command, nextTick());
       return state as PipelineV2RunState;
+    },
+    nextSessionNumber() {
+      sessionCounter += 1;
+      return sessionCounter;
     },
     reject(command, messagePart) {
       const before = state === null ? null : JSON.parse(JSON.stringify(state));
@@ -98,13 +108,32 @@ function createRun(
   return { kind: "create_run", runId, pipeline: identity, inputs };
 }
 
-function startAgent(driver: Driver, stateId: string, sessionId?: string): void {
+/**
+ * Drives one agent activation up to "running". Both durable sessions are
+ * created by default with distinct ids derived from the driver's own
+ * counter; `sessions` renames them and `"none"` stops right after data
+ * preparation (no sessions at all).
+ */
+function startAgent(
+  driver: Driver,
+  stateId: string,
+  sessions?: { execution?: string; tool?: string } | "none",
+): void {
   driver.apply({ kind: "start_agent_execution", stateId, profile: "coder" });
   driver.apply({ kind: "agent_data_prepared" });
-  if (sessionId !== undefined) {
-    driver.apply({ kind: "agent_session_created", sessionId });
-    driver.apply({ kind: "agent_running" });
+  if (sessions === "none") {
+    return;
   }
+  const number = driver.nextSessionNumber();
+  driver.apply({
+    kind: "agent_execution_session_created",
+    sessionId: sessions?.execution ?? `exec-${number}`,
+  });
+  driver.apply({
+    kind: "agent_tool_session_created",
+    sessionId: sessions?.tool ?? `tool-${number}`,
+  });
+  driver.apply({ kind: "agent_running" });
 }
 
 function acceptOutputs(driver: Driver, outputs: readonly { id: string; digest: string }[]): void {
@@ -135,7 +164,7 @@ function commitTransition(
  */
 function playSuccessRun(driver: Driver): void {
   driver.apply(createRun());
-  startAgent(driver, "implement", "sess-1");
+  startAgent(driver, "implement", { execution: "sess-1" });
   acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
   commitTransition(driver, "implement", "completed", "check", 1);
   driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
@@ -150,7 +179,7 @@ function playSuccessRun(driver: Driver): void {
     },
   });
   commitTransition(driver, "check", "approved", "ship", 2);
-  startAgent(driver, "ship", "sess-2");
+  startAgent(driver, "ship", { execution: "sess-2" });
   acceptOutputs(driver, []);
   commitTransition(driver, "ship", "completed", "done", 3);
   driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
@@ -167,7 +196,7 @@ function playSuccessRun(driver: Driver): void {
  */
 function playUpToTerminal(driver: Driver): void {
   driver.apply(createRun());
-  startAgent(driver, "implement", "sess-1");
+  startAgent(driver, "implement", { execution: "sess-1" });
   acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
   commitTransition(driver, "implement", "completed", "check", 1);
   driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
@@ -176,7 +205,7 @@ function playUpToTerminal(driver: Driver): void {
     result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
   });
   commitTransition(driver, "check", "uncovered", "ship", 2);
-  startAgent(driver, "ship", "sess-2");
+  startAgent(driver, "ship", { execution: "sess-2" });
   acceptOutputs(driver, []);
   commitTransition(driver, "ship", "completed", "done", 3);
 }
@@ -221,6 +250,9 @@ function loadableDriver(driver: Driver): Driver {
     reject(command, messagePart) {
       driver.reject(command, messagePart);
     },
+    nextSessionNumber() {
+      return driver.nextSessionNumber();
+    },
     get current() {
       return driver.current;
     },
@@ -256,13 +288,13 @@ function collectKeys(value: unknown, into: Set<string>): void {
   }
 }
 
-describe("pipeline v2 run state schema v3", () => {
+describe("pipeline v2 run state schema v4", () => {
   test("reduces agent -> decision -> agent -> terminal success with the shared execution index", () => {
     const driver = createDriver();
     playSuccessRun(driver);
     const state = driver.current as PipelineV2RunState;
-    expect(state.schema_version).toBe(3);
-    expect(state.revision).toBe(21);
+    expect(state.schema_version).toBe(4);
+    expect(state.revision).toBe(23);
     expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
     expect(state.pipeline.schema_version).toBe(2);
@@ -282,7 +314,7 @@ describe("pipeline v2 run state schema v3", () => {
       { index: 0, from: "check", outcome: "approved", to: "ship", execution_index: 2 },
       { index: 0, from: "ship", outcome: "completed", to: "done", execution_index: 3 },
     ]);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(3);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(4);
   });
 
   test("every accepted command grows the revision by exactly one and refreshes updated_at", () => {
@@ -301,12 +333,15 @@ describe("pipeline v2 run state schema v3", () => {
     driver.apply({ kind: "agent_data_prepared" });
     expect((driver.current as PipelineV2RunState).revision).toBe(revision);
     revision += 1;
-    driver.apply({ kind: "agent_session_created", sessionId: "sess-1" });
+    driver.apply({ kind: "agent_execution_session_created", sessionId: "sess-1" });
+    expect((driver.current as PipelineV2RunState).revision).toBe(revision);
+    revision += 1;
+    driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-1" });
     expect((driver.current as PipelineV2RunState).revision).toBe(revision);
     revision += 1;
     driver.apply({ kind: "agent_running" });
     expect((driver.current as PipelineV2RunState).revision).toBe(revision);
-    expect((driver.current as PipelineV2RunState).updated_at).toBe(tick(4).toISOString());
+    expect((driver.current as PipelineV2RunState).updated_at).toBe(tick(5).toISOString());
   });
 
   test("reduces an entry terminal with zero executions and an empty output publication", () => {
@@ -328,7 +363,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, entry_state: "work", max_transitions: 2 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "work", "sess-1");
+    startAgent(driver, "work", { execution: "sess-1" });
     acceptOutputs(driver, [{ id: "report", digest: hex("f") }]);
     commitTransition(driver, "work", "completed", "reject", 1);
     driver.apply({ kind: "terminal_reached", terminalStateId: "reject", terminalResult: "failed" });
@@ -352,13 +387,13 @@ describe("pipeline v2 run state schema v3", () => {
   test("runs an agent cycle and revisit inside the transition budget", () => {
     const driver = createDriver(CYCLE_IDENTITY, INPUTS);
     driver.apply(createRun(CYCLE_IDENTITY, INPUTS));
-    startAgent(driver, "a", "sess-a1");
+    startAgent(driver, "a", { execution: "sess-a1" });
     acceptOutputs(driver, [{ id: "plan-a", digest: hex("1") }]);
     commitTransition(driver, "a", "completed", "b", 1);
-    startAgent(driver, "b", "sess-b");
+    startAgent(driver, "b", { execution: "sess-b" });
     acceptOutputs(driver, []);
     commitTransition(driver, "b", "retry", "a", 2);
-    startAgent(driver, "a", "sess-a2");
+    startAgent(driver, "a", { execution: "sess-a2" });
     acceptOutputs(driver, [{ id: "plan-b", digest: hex("2") }]);
     commitTransition(driver, "a", "done", "done", 3);
     driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
@@ -372,10 +407,14 @@ describe("pipeline v2 run state schema v3", () => {
       "2:b",
       "3:a",
     ]);
-    const sessions = state.executions
-      .map((execution) => (execution.type === "agent" ? execution.session_id : undefined))
-      .filter((id): id is string => id !== undefined);
-    expect(new Set(sessions).size).toBe(3);
+    const sessionIds = state.executions.flatMap((execution) => {
+      if (execution.type !== "agent") {
+        return [];
+      }
+      return [execution.execution_session_id, execution.tool_session_id];
+    }).filter((id): id is string => id !== undefined);
+    expect(sessionIds).toHaveLength(6);
+    expect(new Set(sessionIds).size).toBe(6);
     const revisited = state.executions.filter(
       (execution) => execution.type === "agent" && execution.state_id === "a",
     );
@@ -386,7 +425,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, entry_state: "work", max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "work", "sess-1");
+    startAgent(driver, "work", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "work", "completed", "done", 1);
     driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
@@ -482,7 +521,7 @@ describe("pipeline v2 run state schema v3", () => {
   test("rejects unsafe transition steps and terminal ids in the reducer", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
     driver.reject(
       {
@@ -619,7 +658,7 @@ describe("pipeline v2 run state schema v3", () => {
   test("rejects a transition before the agent execution is cleaned up", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
     driver.reject(
       {
@@ -648,8 +687,8 @@ describe("pipeline v2 run state schema v3", () => {
   test("a failed execution never receives a transition", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    startAgent(driver, "implement", "sess-1");
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: "completed" });
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
     driver.reject(
       {
         kind: "transition_committed",
@@ -691,7 +730,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 4 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
     driver.reject(
@@ -720,7 +759,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 2 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
     driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
@@ -766,7 +805,7 @@ describe("pipeline v2 run state schema v3", () => {
     // a terminal while the last execution's transition was never committed
     const awaitingCommit = createDriver();
     awaitingCommit.apply(createRun());
-    startAgent(awaitingCommit, "implement", "sess-1");
+    startAgent(awaitingCommit, "implement", { execution: "sess-1" });
     acceptOutputs(awaitingCommit, []);
     commitTransition(awaitingCommit, "implement", "completed", "check", 1);
     awaitingCommit.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
@@ -775,7 +814,7 @@ describe("pipeline v2 run state schema v3", () => {
       result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
     });
     commitTransition(awaitingCommit, "check", "uncovered", "ship", 2);
-    startAgent(awaitingCommit, "ship", "sess-2");
+    startAgent(awaitingCommit, "ship", { execution: "sess-2" });
     acceptOutputs(awaitingCommit, []);
     expectInvalid(awaitingCommit.current as PipelineV2RunState, (draft) => {
       draft.terminal = { state_id: "ship", result: "success" };
@@ -792,7 +831,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "done", 1);
     driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
@@ -815,8 +854,8 @@ describe("pipeline v2 run state schema v3", () => {
       { kind: "run_cleanup_failed" },
       "a cleanup failure requires the last agent execution to have failed with an unconfirmed session cleanup",
     );
-    startAgent(driver, "implement", "sess-1");
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: "completed" });
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
     driver.reject(
       { kind: "run_cleanup_failed" },
       "a cleanup failure requires the last agent execution to have failed with an unconfirmed session cleanup",
@@ -824,15 +863,31 @@ describe("pipeline v2 run state schema v3", () => {
     driver.apply({ kind: "run_failed", reason: "worker_failed" });
   });
 
+  test("run_cleanup_failed accepts a failed tool slot with a completed execution slot", () => {
+    const identity = { ...IDENTITY, max_transitions: 1 };
+    const driver = createDriver(identity, []);
+    driver.apply(createRun(identity, []));
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({
+      kind: "agent_failed",
+      reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
+      sessionCleanup: { execution: "completed", tool: "failed" },
+    });
+    driver.apply({ kind: "run_cleanup_failed" });
+    const state = driver.current as PipelineV2RunState;
+    expect(state.status).toBe("cleanup_failed");
+    expect(state.failure).toEqual({ reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON });
+  });
+
   test("records the cleanup failure priority path", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     driver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: "failed",
+      sessionCleanup: { execution: "failed", tool: "completed" },
     });
     driver.reject(
       { kind: "run_failed", reason: "worker_failed" },
@@ -852,12 +907,12 @@ describe("pipeline v2 run state schema v3", () => {
       { type: "agent" }
     >;
     expect(execution.phase).toBe("failed");
-    expect(execution.session_cleanup).toBe("failed");
+    expect(execution.session_cleanup).toEqual({ execution: "failed", tool: "completed" });
     expect(execution.failure_reason).toBe(PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON);
 
     expectInvalid(state, (draft) => {
-      draft.executions[0].session_cleanup = "completed";
-    }, 'records the session cleanup failure reason but its cleanup outcome is "completed"');
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed" };
+    }, "records the session cleanup failure reason but no cleanup outcome failed");
     expectInvalid(state, (draft) => {
       draft.executions.length = 0;
     }, "requires the last agent execution to have failed with an unconfirmed session cleanup");
@@ -870,11 +925,13 @@ describe("pipeline v2 run state schema v3", () => {
     const driver = createDriver();
     driver.apply(createRun());
     driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
-    const preparing = driver.current as PipelineV2RunState;
+    const started = driver.current as PipelineV2RunState;
     driver.apply({ kind: "agent_data_prepared" });
-    const creatingSession = driver.current as PipelineV2RunState;
-    driver.apply({ kind: "agent_session_created", sessionId: "sess-1" });
-    const sessionCreated = driver.current as PipelineV2RunState;
+    const dataPrepared = driver.current as PipelineV2RunState;
+    driver.apply({ kind: "agent_execution_session_created", sessionId: "sess-1" });
+    const executionSessionCreated = driver.current as PipelineV2RunState;
+    driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-1" });
+    const sessionsCreated = driver.current as PipelineV2RunState;
     driver.apply({ kind: "agent_running" });
     const running = driver.current as PipelineV2RunState;
     driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] });
@@ -883,41 +940,51 @@ describe("pipeline v2 run state schema v3", () => {
     const cleanupCompleted = driver.current as PipelineV2RunState;
     commitTransition(driver, "implement", "completed", "check", 1);
 
-    expectInvalid(preparing, (draft) => {
-      draft.executions[0].session_id = "sneaky";
-    }, "has no session yet but records a session_id");
-    expectInvalid(preparing, (draft) => {
-      draft.executions[0].outputs = [];
-    }, "already records accepted outputs");
-    expectInvalid(preparing, (draft) => {
+    // both phases before any session must not record a session
+    for (const snapshot of [started, dataPrepared]) {
+      expectInvalid(snapshot, (draft) => {
+        draft.executions[0].execution_session_id = "sneaky";
+      }, 'already records a session');
+      expectInvalid(snapshot, (draft) => {
+        draft.executions[0].tool_session_id = "sneaky";
+      }, 'already records a session');
+      expectInvalid(snapshot, (draft) => {
+        draft.executions[0].outputs = [];
+      }, "already records accepted outputs");
+    }
+    expectInvalid(started, (draft) => {
       draft.executions[0].failure_reason = "internal_error";
-    }, 'records a failure reason but has phase "preparing"');
-    expectInvalid(creatingSession, (draft) => {
-      draft.executions[0].session_cleanup = "completed";
+    }, 'records a failure reason but has phase "started"');
+    expectInvalid(dataPrepared, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed" };
     }, "already records a session cleanup outcome");
-    expectInvalid(creatingSession, (draft) => {
-      draft.executions[0].session_id = "sneaky";
-    }, "has no session yet but records a session_id");
-    expectInvalid(creatingSession, (draft) => {
+    // only the execution session exists in "execution_session_created"
+    expectInvalid(executionSessionCreated, (draft) => {
+      draft.executions[0].tool_session_id = "tool-1";
+    }, 'already records a tool session');
+    expectInvalid(executionSessionCreated, (draft) => {
       draft.executions[0].outputs = [];
     }, "already records accepted outputs");
-    expectInvalid(sessionCreated, (draft) => {
-      draft.executions[0].outputs = [];
-    }, "already records accepted outputs");
-    expectInvalid(sessionCreated, (draft) => {
-      draft.executions[0].session_cleanup = "completed";
+    expectInvalid(executionSessionCreated, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed" };
     }, "already records a session cleanup outcome");
-    expectInvalid(sessionCreated, (draft) => {
+    expectInvalid(executionSessionCreated, (draft) => {
       draft.executions[0].failure_reason = "worker_failed";
-    }, 'records a failure reason but has phase "session_created"');
+    }, 'records a failure reason but has phase "execution_session_created"');
+    expectInvalid(sessionsCreated, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed" };
+    }, "already records a session cleanup outcome");
+    expectInvalid(sessionsCreated, (draft) => {
+      draft.executions[0].outputs = [];
+    }, "already records accepted outputs");
     expectInvalid(running, (draft) => {
-      draft.executions[0].session_cleanup = "completed";
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed" };
     }, "already records a session cleanup outcome");
     expectInvalid(running, (draft) => {
       draft.executions[0].outputs = [];
     }, "already records accepted outputs");
     expectInvalid(outputsAccepted, (draft) => {
-      draft.executions[0].session_cleanup = "completed";
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed" };
     }, "already records a session cleanup outcome");
     expectInvalid(outputsAccepted, (draft) => {
       draft.executions[0].failure_reason = "internal_error";
@@ -926,8 +993,8 @@ describe("pipeline v2 run state schema v3", () => {
       delete draft.executions[0].outputs;
     }, 'has phase "outputs_accepted" but does not record accepted outputs');
     expectInvalid(cleanupCompleted, (draft) => {
-      draft.executions[0].session_cleanup = "failed";
-    }, 'has phase "cleanup_completed" but records session cleanup "failed"');
+      draft.executions[0].session_cleanup = { execution: "failed", tool: "completed" };
+    }, 'has phase "cleanup_completed" but records session cleanup');
     expectInvalid(cleanupCompleted, (draft) => {
       draft.executions[0].failure_reason = "worker_failed";
     }, 'records a failure reason but has phase "cleanup_completed"');
@@ -940,8 +1007,8 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: "completed" });
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
     const failed = driver.current as PipelineV2RunState;
     expectInvalid(failed, (draft) => {
       delete draft.executions[0].failure_reason;
@@ -949,21 +1016,46 @@ describe("pipeline v2 run state schema v3", () => {
     expectInvalid(failed, (draft) => {
       delete draft.executions[0].session_cleanup;
     }, "failed but does not record its session cleanup outcome");
+    // per-slot biconditional: a durable id exists -> completed/failed
     expectInvalid(failed, (draft) => {
-      delete draft.executions[0].session_id;
-      draft.executions[0].session_cleanup = "completed";
-    }, "records a session cleanup outcome without a recorded session");
+      delete draft.executions[0].execution_session_id;
+    }, 'records no execution session, so its cleanup outcome must be "not_required"');
     expectInvalid(failed, (draft) => {
-      draft.executions[0].session_cleanup = "not_required";
-    }, 'records a session but marks its cleanup not_required');
+      draft.executions[0].execution_session_id = undefined;
+      draft.executions[0].session_cleanup = { execution: "not_required", tool: "not_required" };
+    }, 'records a tool session but marks its cleanup not_required');
     expectInvalid(failed, (draft) => {
-      draft.executions[0].session_cleanup = "failed";
+      draft.executions[0].session_cleanup = { execution: "not_required", tool: "completed" };
+    }, 'records an execution session but marks its cleanup not_required');
+    // no durable id -> only not_required
+    expectInvalid(failed, (draft) => {
+      draft.executions[0].execution_session_id = undefined;
+      draft.executions[0].tool_session_id = undefined;
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "not_required" };
+    }, 'records no execution session, so its cleanup outcome must be "not_required"');
+    expectInvalid(failed, (draft) => {
+      draft.executions[0].tool_session_id = undefined;
+    }, 'records no tool session, so its cleanup outcome must be "not_required"');
+    expectInvalid(failed, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "failed", tool: "failed" };
       draft.executions[0].failure_reason = "worker_failed";
     }, 'records a failed session cleanup but carries failure reason "worker_failed"');
     expectInvalid(failed, (draft) => {
-      draft.executions[0].session_cleanup = "completed";
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed" };
       draft.executions[0].failure_reason = PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON;
-    }, 'records the session cleanup failure reason but its cleanup outcome is "completed"');
+    }, "records the session cleanup failure reason but no cleanup outcome failed");
+    expectInvalid(failed, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "unknown", tool: "completed" };
+    }, "session_cleanup.execution must be one of");
+    expectInvalid(failed, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "completed" };
+    }, 'session_cleanup is missing required field "tool"');
+    expectInvalid(failed, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "completed", extra: 1 };
+    }, 'session_cleanup has unknown field "extra"');
+    expectInvalid(failed, (draft) => {
+      draft.executions[0].session_cleanup = "completed";
+    }, "session_cleanup is not a JSON object");
   });
 
   test("rejects forbidden fields in every decision execution phase", () => {
@@ -1017,7 +1109,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 4 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
     driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
@@ -1026,18 +1118,131 @@ describe("pipeline v2 run state schema v3", () => {
       result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
     });
     commitTransition(driver, "check", "uncovered", "ship", 2);
-    startAgent(driver, "ship");
+    startAgent(driver, "ship", "none");
+    // a reused id is rejected for the execution command
     driver.reject(
-      { kind: "agent_session_created", sessionId: "sess-1" },
-      'session "sess-1" already belongs to execution 1',
+      { kind: "agent_execution_session_created", sessionId: "sess-1" },
+      'session "sess-1" already belongs to execution 1 as an execution session',
     );
-    driver.apply({ kind: "agent_session_created", sessionId: "sess-3" });
+    driver.apply({ kind: "agent_execution_session_created", sessionId: "sess-3" });
+    // a reused id is rejected for the tool command, and the tool session of
+    // the same execution cannot reuse that execution's id either
+    driver.reject(
+      { kind: "agent_tool_session_created", sessionId: "sess-1" },
+      'session "sess-1" already belongs to execution 1 as an execution session',
+    );
+    driver.reject(
+      { kind: "agent_tool_session_created", sessionId: "sess-3" },
+      'session "sess-3" already belongs to execution 3 as an execution session',
+    );
+    driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-3" });
 
     const loaderDriver = createDriver();
     playSuccessRun(loaderDriver);
+    // a duplicate id across executions
     expectInvalid(loaderDriver.current as PipelineV2RunState, (draft) => {
-      draft.executions[2].session_id = draft.executions[0].session_id;
-    }, 'reuses session "sess-1"; a session belongs to exactly one execution');
+      draft.executions[2].execution_session_id = draft.executions[0].execution_session_id;
+    }, 'reuses session "sess-1"; a session id belongs to exactly one durable session slot');
+    // the same execution reusing its own execution id as the tool id
+    expectInvalid(loaderDriver.current as PipelineV2RunState, (draft) => {
+      draft.executions[0].tool_session_id = draft.executions[0].execution_session_id;
+    }, 'reuses session "sess-1"; a session id belongs to exactly one durable session slot');
+  });
+
+  test("the loader enforces the two-session phase and cleanup invariants", () => {
+    // (a) forged phase: "running" with only one durable session.
+    const driver = createDriver();
+    playSuccessRun(driver);
+    const state = driver.current as PipelineV2RunState;
+    expectInvalid(state, (draft) => {
+      delete draft.executions[0].tool_session_id;
+    }, 'but does not record both durable sessions');
+    expectInvalid(state, (draft) => {
+      delete draft.executions[0].execution_session_id;
+    }, 'but does not record both durable sessions');
+
+    // (b) "execution_session_created" phase coherence in both directions.
+    expectInvalid(state, (draft) => {
+      draft.executions[0].phase = "execution_session_created";
+      draft.executions[0].execution_session_id = undefined;
+      draft.executions[0].tool_session_id = undefined;
+      draft.executions[0].session_cleanup = undefined;
+      draft.executions[0].outputs = undefined;
+    }, 'has phase "execution_session_created" but records no execution session');
+    expectInvalid(state, (draft) => {
+      draft.executions[0].phase = "execution_session_created";
+      draft.executions[0].session_cleanup = undefined;
+      draft.executions[0].outputs = undefined;
+    }, 'has phase "execution_session_created" but already records a tool session');
+
+    // (c) forged successful cleanup with a not_required slot: the
+    // cleanup_completed phase check fires first.
+    expectInvalid(state, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "not_required" };
+    }, 'has phase "cleanup_completed" but records session cleanup');
+    expectInvalid(state, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "not_required", tool: "completed" };
+    }, 'has phase "cleanup_completed" but records session cleanup');
+
+    // (d) a settled failed execution without a cleanup pair.
+    const identity = { ...IDENTITY, max_transitions: 1 };
+    const failedDriver = createDriver(identity, []);
+    failedDriver.apply(createRun(identity, []));
+    startAgent(failedDriver, "implement", { execution: "sess-1" });
+    failedDriver.apply({
+      kind: "agent_failed",
+      reason: "worker_failed",
+      sessionCleanup: { execution: "completed", tool: "completed" },
+    });
+    failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
+    const failedState = failedDriver.current as PipelineV2RunState;
+    expectInvalid(failedState, (draft) => {
+      delete draft.executions[0].session_cleanup;
+    }, "failed but does not record its session cleanup outcome");
+    // cleanup outcomes without the matching durable ids
+    expectInvalid(failedState, (draft) => {
+      delete draft.executions[0].tool_session_id;
+    }, 'records no tool session, so its cleanup outcome must be "not_required"');
+    expectInvalid(failedState, (draft) => {
+      delete draft.executions[0].execution_session_id;
+    }, 'records no execution session, so its cleanup outcome must be "not_required"');
+    // a not_required slot beside its durable id is rejected in the failed
+    // phase too
+    expectInvalid(failedState, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "completed", tool: "not_required" };
+    }, 'records a tool session but marks its cleanup not_required');
+    expectInvalid(failedState, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "not_required", tool: "completed" };
+    }, 'records an execution session but marks its cleanup not_required');
+
+    // (e) a failed execution with no durable sessions at all is valid: both
+    // slots are not_required and the failure reason stays a normal one.
+    const noSessionDriver = createDriver(identity, []);
+    noSessionDriver.apply(createRun(identity, []));
+    noSessionDriver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    noSessionDriver.apply({ kind: "agent_data_prepared" });
+    noSessionDriver.apply({
+      kind: "agent_failed",
+      reason: "internal_error",
+      sessionCleanup: { execution: "not_required", tool: "not_required" },
+    });
+    noSessionDriver.apply({ kind: "run_failed", reason: "internal_error" });
+    const noSessionState = noSessionDriver.current as PipelineV2RunState;
+    const loaded = validatePipelineV2RunState(draftOf(noSessionState));
+    const noSessionExecution = loaded.executions[0];
+    if (noSessionExecution === undefined || noSessionExecution.type !== "agent") {
+      throw new Error("expected an agent execution");
+    }
+    expect(noSessionExecution.session_cleanup).toEqual({
+      execution: "not_required",
+      tool: "not_required",
+    });
+
+    // (f) a successful cleanup pair with an earlier failed slot impossible:
+    // cleanup_completed must record completed/completed.
+    expectInvalid(state, (draft) => {
+      draft.executions[0].session_cleanup = { execution: "failed", tool: "failed" };
+    }, 'has phase "cleanup_completed" but records session cleanup');
   });
 
   test("loader re-derives the cursor and transition chain from the authoritative records", () => {
@@ -1139,11 +1344,11 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const cleanupDriver = createDriver(identity, []);
     cleanupDriver.apply(createRun(identity, []));
-    startAgent(cleanupDriver, "implement", "sess-1");
+    startAgent(cleanupDriver, "implement", { execution: "sess-1" });
     cleanupDriver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: "failed",
+      sessionCleanup: { execution: "failed", tool: "completed" },
     });
     cleanupDriver.apply({ kind: "run_cleanup_failed" });
     const cleanupFailed = cleanupDriver.current as PipelineV2RunState;
@@ -1153,19 +1358,61 @@ describe("pipeline v2 run state schema v3", () => {
     }, 'execution 1 records a failed session cleanup, so the run must finalize as status "cleanup_failed"');
   });
 
-  test("parse rejects schema versions 1 and 2 without any migration", () => {
+  test("parse rejects schema versions 1, 2 and 3 without any migration", () => {
     expect(() => parsePipelineV2RunState('{"schema_version":1}')).toThrow(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 3 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v1 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":2}')).toThrow(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 3 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 4 is the supported contract; no v2 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 2 })).toThrow(
-      "not a pipeline v2 run state (schema version 3 is the supported contract; no v2 migration exists)",
+      "not a pipeline v2 run state (schema version 4 is the supported contract; no v2 migration exists)",
     );
-    expect(() => parsePipelineV2RunState('{"schema_version":4}')).toThrow(
-      "pipeline v2 run state has schema_version 4, expected 3",
+    expect(() => parsePipelineV2RunState('{"schema_version":3}')).toThrow(
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v3 migration exists)",
     );
+    expect(() => validatePipelineV2RunState({ schema_version: 3 })).toThrow(
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v3 migration exists)",
+    );
+    expect(() => parsePipelineV2RunState('{"schema_version":5}')).toThrow(
+      "pipeline v2 run state has schema_version 5, expected 4",
+    );
+  });
+
+  test("a stored schema v3 document is rejected and left byte-for-byte identical", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipeline-v2-state-v3-"));
+    const path = join(root, "state.json");
+    // A plausible v3 document: single session_id, old phases, old cleanup.
+    const v3Document = JSON.stringify({
+      schema_version: 3,
+      revision: 5,
+      run_id: "old-run",
+      status: "active",
+      phase: "running",
+      started_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      pipeline: IDENTITY,
+      inputs: [],
+      cursor: { current_state: "implement", transition_count: 0 },
+      executions: [
+        {
+          index: 1,
+          type: "agent",
+          state_id: "implement",
+          attempt: 1,
+          profile: "coder",
+          phase: "session_created",
+          session_id: "sess-1",
+        },
+      ],
+      transitions: [],
+    });
+    await writeFile(path, v3Document);
+    expect(() => parsePipelineV2RunState(v3Document)).toThrow(
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v3 migration exists)",
+    );
+    expect(await readFile(path, "utf8")).toBe(v3Document);
+    await rm(root, { recursive: true, force: true });
   });
 
   test("parse hides malformed JSON content and parser fragments", () => {
@@ -1227,7 +1474,7 @@ describe("pipeline v2 run state schema v3", () => {
   test("the reducer never mutates its inputs and always freezes the snapshot", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
     commitTransition(driver, "implement", "completed", "check", 1);
     const before = driver.current as PipelineV2RunState;
@@ -1270,7 +1517,7 @@ describe("pipeline v2 run state schema v3", () => {
     expect(JSON.stringify(a)).toBe(JSON.stringify(b));
     const reloaded = parsePipelineV2RunState(JSON.stringify(a));
     expect(reloaded).toEqual(a);
-    expect(reloaded.revision).toBe(21);
+    expect(reloaded.revision).toBe(23);
   });
 
   test("round-trips the loader through parse", () => {
@@ -1307,7 +1554,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 4 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
     driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
@@ -1316,8 +1563,8 @@ describe("pipeline v2 run state schema v3", () => {
       "agent_data_prepared applies to an agent execution, but execution 2 is a decision execution",
     );
     driver.reject(
-      { kind: "agent_session_created", sessionId: "sess-2" },
-      "agent_session_created applies to an agent execution, but execution 2 is a decision execution",
+      { kind: "agent_execution_session_created", sessionId: "sess-2" },
+      "agent_execution_session_created applies to an agent execution, but execution 2 is a decision execution",
     );
     driver.reject(
       { kind: "agent_outputs_accepted", outputs: [] },
@@ -1334,7 +1581,7 @@ describe("pipeline v2 run state schema v3", () => {
     );
     agentDriver.reject(
       { kind: "agent_running" },
-      'starting the agent requires execution phase "session_created", got "creating_session"',
+      'starting the agent requires execution phase "sessions_created", got "data_prepared"',
     );
     driver.reject(
       { kind: "decision_failed", reason: "worker_failed" },
@@ -1348,15 +1595,15 @@ describe("pipeline v2 run state schema v3", () => {
     driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
     driver.apply({ kind: "agent_data_prepared" });
     driver.reject(
-      { kind: "agent_failed", reason: "decision_input_invalid", sessionCleanup: "not_required" },
+      { kind: "agent_failed", reason: "decision_input_invalid", sessionCleanup: { execution: "not_required", tool: "not_required" } },
       "agent_failed reason must be one of",
     );
     driver.reject(
-      { kind: "agent_failed", reason: "state_persist_failed", sessionCleanup: "not_required" },
+      { kind: "agent_failed", reason: "state_persist_failed", sessionCleanup: { execution: "not_required", tool: "not_required" } },
       "agent_failed reason must be one of",
     );
     driver.reject(
-      { kind: "agent_failed", reason: "terminal_failed", sessionCleanup: "not_required" },
+      { kind: "agent_failed", reason: "terminal_failed", sessionCleanup: { execution: "not_required", tool: "not_required" } },
       "agent_failed reason must be one of",
     );
 
@@ -1380,8 +1627,8 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: "completed" });
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
     driver.apply({ kind: "run_failed", reason: "worker_failed" });
     const state = driver.current as PipelineV2RunState;
     expectInvalid(state, (draft) => {
@@ -1396,7 +1643,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 4 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
     driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
@@ -1552,7 +1799,8 @@ describe("pipeline v2 run state schema v3", () => {
     driver.apply(createRun());
     driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
     driver.apply({ kind: "agent_data_prepared" });
-    driver.apply({ kind: "agent_session_created", sessionId: "sess-1" });
+    driver.apply({ kind: "agent_execution_session_created", sessionId: "sess-1" });
+    driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-1" });
     driver.apply({ kind: "agent_running" });
     driver.reject(
       {
@@ -1588,12 +1836,12 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] });
     driver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: "failed",
+      sessionCleanup: { execution: "failed", tool: "completed" },
     });
     driver.apply({ kind: "run_cleanup_failed" });
     const state = driver.current as PipelineV2RunState;
@@ -1603,7 +1851,7 @@ describe("pipeline v2 run state schema v3", () => {
     >;
     expect(execution.phase).toBe("failed");
     expect(execution.outputs).toEqual([{ id: "plan", digest: hex("d") }]);
-    expect(execution.session_cleanup).toBe("failed");
+    expect(execution.session_cleanup).toEqual({ execution: "failed", tool: "completed" });
     const loaded = validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
     expect(loaded.executions[0]).toEqual(execution);
   });
@@ -1612,7 +1860,7 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "done", 1);
     driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
@@ -1636,11 +1884,11 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    startAgent(driver, "implement", "sess-1");
+    startAgent(driver, "implement", { execution: "sess-1" });
     driver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: "failed",
+      sessionCleanup: { execution: "failed", tool: "completed" },
     });
     driver.apply({ kind: "run_cleanup_failed" });
     const state = driver.current as PipelineV2RunState;
@@ -1671,8 +1919,8 @@ describe("pipeline v2 run state schema v3", () => {
     const identity = { ...IDENTITY, max_transitions: 1 };
     const failedDriver = createDriver(identity, INPUTS);
     failedDriver.apply(createRun(identity, INPUTS));
-    startAgent(failedDriver, "implement", "sess-1");
-    failedDriver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: "completed" });
+    startAgent(failedDriver, "implement", { execution: "sess-1" });
+    failedDriver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
     failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
     const failed = failedDriver.current as PipelineV2RunState;
 

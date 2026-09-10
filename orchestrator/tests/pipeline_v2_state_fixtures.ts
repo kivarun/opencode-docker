@@ -35,14 +35,15 @@ export function tick(index: number): Date {
 
 /**
  * The full happy path: implement -> check (decision) -> ship -> done
- * (terminal success) -> publish -> succeed. 21 commands, revisions 1..21.
+ * (terminal success) -> publish -> succeed. 23 commands, revisions 1..23.
  */
 export function successCommands(runId = "run-1"): PipelineV2RunCommand[] {
   return [
     { kind: "create_run", runId, pipeline: V2_IDENTITY, inputs: V2_INPUTS },
     { kind: "start_agent_execution", stateId: "implement", profile: "coder" },
     { kind: "agent_data_prepared" },
-    { kind: "agent_session_created", sessionId: "sess-1" },
+    { kind: "agent_execution_session_created", sessionId: "sess-1" },
+    { kind: "agent_tool_session_created", sessionId: "tool-1" },
     { kind: "agent_running" },
     { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
     { kind: "agent_cleanup_completed" },
@@ -69,7 +70,8 @@ export function successCommands(runId = "run-1"): PipelineV2RunCommand[] {
     },
     { kind: "start_agent_execution", stateId: "ship", profile: "coder" },
     { kind: "agent_data_prepared" },
-    { kind: "agent_session_created", sessionId: "sess-2" },
+    { kind: "agent_execution_session_created", sessionId: "sess-2" },
+    { kind: "agent_tool_session_created", sessionId: "tool-2" },
     { kind: "agent_running" },
     { kind: "agent_outputs_accepted", outputs: [] },
     { kind: "agent_cleanup_completed" },

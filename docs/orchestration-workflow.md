@@ -1196,33 +1196,49 @@ Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
 them.
 
-### Pipeline v2 run state (schema version 3, unwired substrate)
+### Pipeline v2 run state (state schema version 4, unwired substrate)
 
 `orchestrator/src/pipeline_v2_state.ts` already defines the durable run state
-for pipeline schema v2 as a pure substrate (schema version 3, with the nested
-pipeline identity carrying `schema_version: 2`): logical run inputs (id,
-port type, protected flag, snapshot digest), a shared contiguous execution
-index covering both agent and decision executions (agent executions reuse it
-as their activation index; a decision occupies an index without an
-activation directory), per-execution phase records with their session and
-cleanup outcomes, committed transitions that bind exactly one settled
-execution, the terminal, published run outputs (present/absent variants
-with digests only), and a normalized failure reason. The pure reducer
-applies 17 commands and enforces the same shape as the v1 state (execution
-only at the cursor, one in-flight execution, a new execution only after the
-previous transition commit, session-id uniqueness, transition only after
-agent cleanup or a matching evaluated decision outcome, the transition
-budget, one terminal at the cursor, publication exactly once after the
-terminal, `run_succeeded` requiring published outputs, a published failed
-terminal finalizing as `run_failed` with `terminal_failed`, cleanup failures
-finalizing only as `cleanup_failed`, and an immutable final status); the
-loader re-derives the same invariants from those records in both
-directions. There is no `events[]` by design: `executions`, `transitions`,
-`terminal`, and `run_outputs` are the single authoritative journal, so a
-later audit/observation layer must never duplicate them as a second source
-of truth. The schema v2 document stays the production state of pipeline v1;
-no v1/v2 migration exists, and production v2 execution, store/sink
-integration, and resume are still not implemented.
+for pipeline schema v2 as a pure substrate (state schema version 4, with the
+nested pipeline identity carrying `schema_version: 2`): logical run inputs
+(id, port type, protected flag, snapshot digest), a shared contiguous
+execution index covering both agent and decision executions (agent
+executions reuse it as their activation index; a decision occupies an index
+without an activation directory), per-execution phase records, committed
+transitions that bind exactly one settled execution, the terminal, published
+run outputs (present/absent variants with digests only), and a normalized
+failure reason.
+
+One agent execution records two independent, durable, non-secret session
+ids following the two-session capability model: `execution_session_id`
+(the orchestrator-owned Execution Session, scope `run_root`, never handed
+to the worker) and `tool_session_id` (the Tool Session, scope `project`,
+its bearer is the worker's only authority), plus an independent cleanup
+pair `{execution, tool}` of `not_required`/`completed`/`failed` outcomes.
+Global session-id uniqueness spans both fields of every execution, so an
+id can never be reused — not even once as an Execution and once as a Tool
+session. Bearers, endpoints, and credentials never enter the document.
+
+The pure reducer applies 18 commands and enforces the same shape as the v1
+state (execution only at the cursor, one in-flight execution, a new
+execution only after the previous transition commit, two-slot session-id
+uniqueness, the phase successor chain `started` → `data_prepared` →
+`execution_session_created` → `sessions_created` → `running` →
+`outputs_accepted` → `cleanup_completed`, the tool session only after the
+execution session, transition only after agent cleanup or a matching
+evaluated decision outcome, the transition budget, one terminal at the
+cursor, publication exactly once after the terminal, `run_succeeded`
+requiring published outputs, a published failed terminal finalizing as
+`run_failed` with `terminal_failed`, cleanup failures finalizing only as
+`cleanup_failed`, and an immutable final status); the loader re-derives the
+same invariants from those records in both directions. There is no
+`events[]` by design: `executions`, `transitions`, `terminal`, and
+`run_outputs` are the single authoritative journal, so a later
+audit/observation layer must never duplicate them as a second source of
+truth. State schema versions 1, 2, and 3 are explicitly rejected (no
+migration); the schema v2 document stays the production state of pipeline
+v1, and production v2 execution, store/sink integration, and resume are
+still not implemented.
 
 ## User intervention
 

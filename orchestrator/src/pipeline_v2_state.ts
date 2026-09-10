@@ -1,5 +1,5 @@
 /**
- * Durable run state for pipeline schema v2 (state schema version 3).
+ * Durable run state for pipeline schema v2 (state schema version 4).
  *
  * Pure substrate: a versioned state document, an exact-field loader, and a
  * pure command reducer. Nothing here touches the filesystem, docker-helper,
@@ -15,6 +15,15 @@
  * no bidirectional event/record coherence layer). Audit and observation
  * streams are a separate later layer.
  *
+ * Two-session capability model: one agent execution durably records two
+ * independent session ids — the orchestrator-owned Execution Session
+ * (scope: the run root; it launches the worker and is never handed to the
+ * worker) and the Tool Session (scope: the project; its bearer is the
+ * worker's only authority). Session ids are not secrets and are durable;
+ * bearers, endpoints and credentials never enter the document. Each slot
+ * has its own cleanup outcome, and one id can never be reused — not even
+ * once as an Execution and once as a Tool session.
+ *
  * Runtime layout paths (`run_root`, `project_root`, snapshot and activation
  * paths) are intentionally absent: they belong to the fixed runtime layout
  * and are derived from the run directory and the record indexes. Agent
@@ -25,7 +34,7 @@
 import type { DecisionFactValidationReason } from "./decision.ts";
 import type { TransitionStep } from "./pipeline_engine.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 3;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 4;
 
 export const PIPELINE_V2_RUN_STATUSES = [
   "active",
@@ -39,9 +48,10 @@ export const PIPELINE_V2_RUN_PHASES = ["running", "publishing_outputs", "finishe
 export type PipelineV2RunPhase = (typeof PIPELINE_V2_RUN_PHASES)[number];
 
 export const PIPELINE_V2_AGENT_EXECUTION_PHASES = [
-  "preparing",
-  "creating_session",
-  "session_created",
+  "started",
+  "data_prepared",
+  "execution_session_created",
+  "sessions_created",
   "running",
   "outputs_accepted",
   "cleanup_completed",
@@ -136,6 +146,29 @@ export type PipelineV2PortType = (typeof PIPELINE_V2_PORT_TYPES)[number];
 
 export type PipelineV2SessionCleanup = "not_required" | "completed" | "failed";
 
+const PIPELINE_V2_SESSION_CLEANUP_VALUES: readonly PipelineV2SessionCleanup[] = [
+  "not_required",
+  "completed",
+  "failed",
+];
+
+/**
+ * Independent cleanup outcomes of the two durable sessions of one agent
+ * execution. Each slot obeys the same biconditional with its durable
+ * session id: no durable id -> only "not_required"; a durable id ->
+ * "completed" or "failed".
+ */
+export interface PipelineV2SessionCleanupPair {
+  execution: PipelineV2SessionCleanup;
+  tool: PipelineV2SessionCleanup;
+}
+
+/** Whether at least one durable cleanup slot failed (mirrors the loader). */
+function hasFailedSessionCleanup(execution: PipelineV2AgentExecutionState): boolean {
+  const cleanup = execution.session_cleanup;
+  return cleanup !== undefined && (cleanup.execution === "failed" || cleanup.tool === "failed");
+}
+
 export interface PipelineV2RunPipelineIdentity {
   schema_version: 2;
   bundle_root: string;
@@ -169,8 +202,12 @@ export interface PipelineV2AgentExecutionState {
   attempt: number;
   profile: string;
   phase: PipelineV2AgentExecutionPhase;
-  session_id?: string;
-  session_cleanup?: PipelineV2SessionCleanup;
+  /** Durable id of the orchestrator-owned Execution Session (run-root scope). */
+  execution_session_id?: string;
+  /** Durable id of the Tool Session (project scope; the worker's bearer). */
+  tool_session_id?: string;
+  /** Independent cleanup outcomes of both durable sessions. */
+  session_cleanup?: PipelineV2SessionCleanupPair;
   outputs?: PipelineV2AgentOutputState[];
   failure_reason?: PipelineV2FailureReason;
 }
@@ -241,7 +278,7 @@ export type PipelineDecisionStateRecord =
     };
 
 export interface PipelineV2RunState {
-  schema_version: 3;
+  schema_version: 4;
   revision: number;
   run_id: string;
   status: PipelineV2RunStatus;
@@ -267,14 +304,15 @@ export type PipelineV2RunCommand =
     }
   | { kind: "start_agent_execution"; stateId: string; profile: string }
   | { kind: "agent_data_prepared" }
-  | { kind: "agent_session_created"; sessionId: string }
+  | { kind: "agent_execution_session_created"; sessionId: string }
+  | { kind: "agent_tool_session_created"; sessionId: string }
   | { kind: "agent_running" }
   | { kind: "agent_outputs_accepted"; outputs: readonly PipelineV2AgentOutputState[] }
   | { kind: "agent_cleanup_completed" }
   | {
       kind: "agent_failed";
       reason: PipelineV2FailureReason;
-      sessionCleanup: PipelineV2SessionCleanup;
+      sessionCleanup: PipelineV2SessionCleanupPair;
     }
   | { kind: "start_decision_execution"; stateId: string; inputDigest: string }
   | { kind: "decision_evaluated"; result: PipelineDecisionStateRecord }
@@ -460,12 +498,17 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 3 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 3 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 4 is the supported contract; no v2 migration exists)",
+    );
+  }
+  if (version === 3) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v3 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -539,7 +582,7 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
     value,
     what,
     ["index", "type", "state_id", "attempt", "profile", "phase"],
-    ["session_id", "session_cleanup", "outputs", "failure_reason"],
+    ["execution_session_id", "tool_session_id", "session_cleanup", "outputs", "failure_reason"],
   );
   if (obj.type !== "agent") {
     throw new PipelineV2StateError(`${what}.type must be "agent", got ${JSON.stringify(obj.type)}`);
@@ -558,15 +601,29 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
       `execution ${execution.index} declares attempt ${execution.attempt}; only attempt 1 is supported`,
     );
   }
-  if (obj.session_id !== undefined) {
-    execution.session_id = expectNonEmptyString(obj.session_id, `${what}.session_id`);
+  if (obj.execution_session_id !== undefined) {
+    execution.execution_session_id = expectNonEmptyString(
+      obj.execution_session_id,
+      `${what}.execution_session_id`,
+    );
+  }
+  if (obj.tool_session_id !== undefined) {
+    execution.tool_session_id = expectNonEmptyString(obj.tool_session_id, `${what}.tool_session_id`);
   }
   if (obj.session_cleanup !== undefined) {
-    execution.session_cleanup = expectEnum(
+    const pair = expectExactObject(
       obj.session_cleanup,
-      ["not_required", "completed", "failed"] as const,
       `${what}.session_cleanup`,
+      ["execution", "tool"],
     );
+    execution.session_cleanup = {
+      execution: expectEnum(
+        pair.execution,
+        PIPELINE_V2_SESSION_CLEANUP_VALUES,
+        `${what}.session_cleanup.execution`,
+      ),
+      tool: expectEnum(pair.tool, PIPELINE_V2_SESSION_CLEANUP_VALUES, `${what}.session_cleanup.tool`),
+    };
   }
   if (obj.outputs !== undefined) {
     if (!Array.isArray(obj.outputs)) {
@@ -593,17 +650,37 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
     );
   }
 
-  if ((phase === "preparing" || phase === "creating_session") && execution.session_id !== undefined) {
-    throw new PipelineV2StateError(`${what} has no session yet but records a session_id`);
+  // Phase coherence of the two durable session slots: neither session
+  // exists before "execution_session_created"; the Tool session only
+  // after the Execution session; both must exist from "sessions_created"
+  // on (a successful execution requires both durable sessions).
+  const hasExecutionSession = execution.execution_session_id !== undefined;
+  const hasToolSession = execution.tool_session_id !== undefined;
+  if ((phase === "started" || phase === "data_prepared") && (hasExecutionSession || hasToolSession)) {
+    throw new PipelineV2StateError(
+      `${what} has phase ${JSON.stringify(phase)} but already records a session`,
+    );
+  }
+  if (phase === "execution_session_created" && (!hasExecutionSession || hasToolSession)) {
+    if (!hasExecutionSession) {
+      throw new PipelineV2StateError(
+        `${what} has phase "execution_session_created" but records no execution session`,
+      );
+    }
+    throw new PipelineV2StateError(
+      `${what} has phase "execution_session_created" but already records a tool session`,
+    );
   }
   if (
-    (phase === "session_created" ||
+    (phase === "sessions_created" ||
       phase === "running" ||
       phase === "outputs_accepted" ||
       phase === "cleanup_completed") &&
-    execution.session_id === undefined
+    (!hasExecutionSession || !hasToolSession)
   ) {
-    throw new PipelineV2StateError(`${what} has phase ${JSON.stringify(phase)} but no session_id`);
+    throw new PipelineV2StateError(
+      `${what} has phase ${JSON.stringify(phase)} but does not record both durable sessions`,
+    );
   }
   if (execution.session_cleanup !== undefined && phase !== "cleanup_completed" && phase !== "failed") {
     throw new PipelineV2StateError(
@@ -614,7 +691,10 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
     if (execution.session_cleanup === undefined) {
       throw new PipelineV2StateError(`${what} finished cleanup but does not record the cleanup outcome`);
     }
-    if (execution.session_cleanup !== "completed") {
+    if (
+      execution.session_cleanup.execution !== "completed" ||
+      execution.session_cleanup.tool !== "completed"
+    ) {
       throw new PipelineV2StateError(
         `${what} has phase "cleanup_completed" but records session cleanup ${JSON.stringify(execution.session_cleanup)}`,
       );
@@ -623,14 +703,25 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
   if (phase === "failed" && execution.session_cleanup === undefined) {
     throw new PipelineV2StateError(`${what} failed but does not record its session cleanup outcome`);
   }
-  if (execution.session_cleanup === "not_required" && execution.session_id !== undefined) {
-    throw new PipelineV2StateError(`${what} records a session but marks its cleanup not_required`);
-  }
-  if (
-    (execution.session_cleanup === "completed" || execution.session_cleanup === "failed") &&
-    execution.session_id === undefined
-  ) {
-    throw new PipelineV2StateError(`${what} records a session cleanup outcome without a recorded session`);
+  // Per-slot biconditional: a durable session id exists -> the slot is
+  // "completed" or "failed"; no durable id -> the slot is "not_required".
+  if (execution.session_cleanup !== undefined) {
+    const slots: readonly [string | undefined, PipelineV2SessionCleanup, string, string][] = [
+      [execution.execution_session_id, execution.session_cleanup.execution, "execution", "an"],
+      [execution.tool_session_id, execution.session_cleanup.tool, "tool", "a"],
+    ];
+    for (const [sessionId, outcome, label, article] of slots) {
+      if (sessionId === undefined && outcome !== "not_required") {
+        throw new PipelineV2StateError(
+          `${what} records no ${label} session, so its cleanup outcome must be "not_required"`,
+        );
+      }
+      if (sessionId !== undefined && outcome === "not_required") {
+        throw new PipelineV2StateError(
+          `${what} records ${article} ${label} session but marks its cleanup not_required`,
+        );
+      }
+    }
   }
   if (
     execution.outputs !== undefined &&
@@ -660,14 +751,14 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
   }
   if (
     execution.failure_reason === PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON &&
-    execution.session_cleanup !== "failed"
+    !hasFailedSessionCleanup(execution)
   ) {
     throw new PipelineV2StateError(
-      `${what} records the session cleanup failure reason but its cleanup outcome is ${JSON.stringify(execution.session_cleanup)}`,
+      `${what} records the session cleanup failure reason but no cleanup outcome failed`,
     );
   }
   if (
-    execution.session_cleanup === "failed" &&
+    hasFailedSessionCleanup(execution) &&
     execution.failure_reason !== PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
   ) {
     throw new PipelineV2StateError(
@@ -1016,13 +1107,21 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         `execution at position ${index} declares index ${execution.index}; execution indexes must be contiguous from 1`,
       );
     }
-    if (execution.type === "agent" && execution.session_id !== undefined) {
-      if (sessionIds.has(execution.session_id)) {
-        throw new PipelineV2StateError(
-          `execution ${execution.index} reuses session ${JSON.stringify(execution.session_id)}; a session belongs to exactly one execution`,
-        );
+    // Global session id uniqueness across both durable slots of every
+    // execution: one id can never be reused, not even once as an
+    // Execution and once as a Tool session.
+    if (execution.type === "agent") {
+      for (const sessionId of [execution.execution_session_id, execution.tool_session_id]) {
+        if (sessionId === undefined) {
+          continue;
+        }
+        if (sessionIds.has(sessionId)) {
+          throw new PipelineV2StateError(
+            `execution ${execution.index} reuses session ${JSON.stringify(sessionId)}; a session id belongs to exactly one durable session slot`,
+          );
+        }
+        sessionIds.add(sessionId);
       }
-      sessionIds.add(execution.session_id);
     }
     if (index < executions.length - 1 && !isSettledExecution(execution)) {
       throw new PipelineV2StateError(
@@ -1173,7 +1272,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       );
     }
     for (const execution of executions) {
-      if (execution.type === "agent" && execution.session_cleanup === "failed") {
+      if (execution.type === "agent" && hasFailedSessionCleanup(execution)) {
         throw new PipelineV2StateError(
           `execution ${execution.index} records a failed session cleanup, so the run must finalize as status "cleanup_failed"`,
         );
@@ -1199,7 +1298,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       last === undefined ||
       last.type !== "agent" ||
       last.phase !== "failed" ||
-      last.session_cleanup !== "failed"
+      !hasFailedSessionCleanup(last)
     ) {
       throw new PipelineV2StateError(
         "run status cleanup_failed requires the last agent execution to have failed with an unconfirmed session cleanup",
@@ -1228,7 +1327,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   }
 
   const state: PipelineV2RunState = {
-    schema_version: 3,
+    schema_version: 4,
     revision,
     run_id: runId,
     status,
@@ -1313,9 +1412,18 @@ function cloneDecisionRecord(record: PipelineDecisionStateRecord): PipelineDecis
   }
 }
 
+function cloneSessionCleanupPair(
+  pair: PipelineV2SessionCleanupPair,
+): PipelineV2SessionCleanupPair {
+  return { execution: pair.execution, tool: pair.tool };
+}
+
 function cloneExecution(execution: PipelineV2ExecutionState): PipelineV2ExecutionState {
   if (execution.type === "agent") {
     const clone: PipelineV2AgentExecutionState = { ...execution };
+    if (execution.session_cleanup !== undefined) {
+      clone.session_cleanup = cloneSessionCleanupPair(execution.session_cleanup);
+    }
     if (execution.outputs !== undefined) {
       clone.outputs = execution.outputs.map(cloneAgentOutput);
     }
@@ -1409,6 +1517,31 @@ function requireUnfinishedDecision(current: PipelineV2RunState, what: string): P
     );
   }
   return execution;
+}
+
+/**
+ * Global durable session id uniqueness across both slots of every agent
+ * execution, including the in-flight one: one id can never be reused, not
+ * even once as an Execution and once as a Tool session.
+ */
+function rejectDurableSessionId(current: PipelineV2RunState, sessionId: string): void {
+  for (const existing of current.executions) {
+    if (existing.type !== "agent") {
+      continue;
+    }
+    if (existing.execution_session_id === sessionId) {
+      fail(
+        current,
+        `session ${JSON.stringify(sessionId)} already belongs to execution ${existing.index} as an execution session`,
+      );
+    }
+    if (existing.tool_session_id === sessionId) {
+      fail(
+        current,
+        `session ${JSON.stringify(sessionId)} already belongs to execution ${existing.index} as a tool session`,
+      );
+    }
+  }
 }
 
 /**
@@ -1571,42 +1704,58 @@ export function reducePipelineV2RunCommand(
         state_id: command.stateId,
         attempt: 1,
         profile: command.profile,
-        phase: "preparing",
+        phase: "started",
       };
       next.executions = [...next.executions, execution];
       break;
     }
     case "agent_data_prepared": {
       const execution = requireUnfinishedAgent(current, "agent_data_prepared");
-      if (execution.phase !== "preparing") {
-        fail(current, `data preparation requires execution phase "preparing", got ${JSON.stringify(execution.phase)}`);
+      if (execution.phase !== "started") {
+        fail(current, `data preparation requires execution phase "started", got ${JSON.stringify(execution.phase)}`);
       }
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
-      last.phase = "creating_session";
+      last.phase = "data_prepared";
       break;
     }
-    case "agent_session_created": {
-      const execution = requireUnfinishedAgent(current, "agent_session_created");
-      if (execution.phase !== "creating_session") {
-        fail(current, `session creation requires execution phase "creating_session", got ${JSON.stringify(execution.phase)}`);
+    case "agent_execution_session_created": {
+      const execution = requireUnfinishedAgent(current, "agent_execution_session_created");
+      if (execution.phase !== "data_prepared") {
+        fail(
+          current,
+          `the execution session requires execution phase "data_prepared", got ${JSON.stringify(execution.phase)}`,
+        );
       }
       if (!isNonEmptyString(command.sessionId)) {
-        throw new PipelineV2StateError("agent_session_created requires a non-empty session id");
+        throw new PipelineV2StateError("agent_execution_session_created requires a non-empty session id");
       }
-      for (const existing of current.executions) {
-        if (existing.type === "agent" && existing.session_id === command.sessionId) {
-          fail(current, `session ${JSON.stringify(command.sessionId)} already belongs to execution ${existing.index}`);
-        }
-      }
+      rejectDurableSessionId(current, command.sessionId);
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
-      last.session_id = command.sessionId;
-      last.phase = "session_created";
+      last.execution_session_id = command.sessionId;
+      last.phase = "execution_session_created";
+      break;
+    }
+    case "agent_tool_session_created": {
+      const execution = requireUnfinishedAgent(current, "agent_tool_session_created");
+      if (execution.phase !== "execution_session_created") {
+        fail(
+          current,
+          `the tool session requires execution phase "execution_session_created", got ${JSON.stringify(execution.phase)}`,
+        );
+      }
+      if (!isNonEmptyString(command.sessionId)) {
+        throw new PipelineV2StateError("agent_tool_session_created requires a non-empty session id");
+      }
+      rejectDurableSessionId(current, command.sessionId);
+      const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
+      last.tool_session_id = command.sessionId;
+      last.phase = "sessions_created";
       break;
     }
     case "agent_running": {
       const execution = requireUnfinishedAgent(current, "agent_running");
-      if (execution.phase !== "session_created") {
-        fail(current, `starting the agent requires execution phase "session_created", got ${JSON.stringify(execution.phase)}`);
+      if (execution.phase !== "sessions_created") {
+        fail(current, `starting the agent requires execution phase "sessions_created", got ${JSON.stringify(execution.phase)}`);
       }
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
       last.phase = "running";
@@ -1642,12 +1791,12 @@ export function reducePipelineV2RunCommand(
       if (execution.phase !== "outputs_accepted") {
         fail(current, `recording the session cleanup requires execution phase "outputs_accepted", got ${JSON.stringify(execution.phase)}`);
       }
-      if (execution.session_id === undefined) {
-        fail(current, `execution ${execution.index} has no recorded session to clean up`);
+      if (execution.execution_session_id === undefined || execution.tool_session_id === undefined) {
+        fail(current, `execution ${execution.index} has no recorded tool or execution session to clean up`);
       }
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
       last.phase = "cleanup_completed";
-      last.session_cleanup = "completed";
+      last.session_cleanup = { execution: "completed", tool: "completed" };
       break;
     }
     case "agent_failed": {
@@ -1657,33 +1806,63 @@ export function reducePipelineV2RunCommand(
         PIPELINE_V2_AGENT_EXECUTION_FAILURE_REASONS,
         "agent_failed reason",
       );
-      const sessionCleanup = expectEnum(
-        command.sessionCleanup,
-        ["not_required", "completed", "failed"] as const,
-        "agent_failed sessionCleanup",
-      );
-      if (execution.session_id === undefined && sessionCleanup !== "not_required") {
+      const cleanup = command.sessionCleanup;
+      if (cleanup === null || typeof cleanup !== "object" || Array.isArray(cleanup)) {
+        throw new PipelineV2StateError("agent_failed requires a session cleanup pair");
+      }
+      const sessionCleanup: PipelineV2SessionCleanupPair = {
+        execution: expectEnum(
+          cleanup.execution,
+          PIPELINE_V2_SESSION_CLEANUP_VALUES,
+          "agent_failed sessionCleanup.execution",
+        ),
+        tool: expectEnum(
+          cleanup.tool,
+          PIPELINE_V2_SESSION_CLEANUP_VALUES,
+          "agent_failed sessionCleanup.tool",
+        ),
+      };
+      if (execution.execution_session_id === undefined && sessionCleanup.execution !== "not_required") {
         fail(
           current,
-          `execution ${execution.index} records no session, so its cleanup outcome must be "not_required"`,
+          `execution ${execution.index} records no execution session, so its cleanup outcome must be "not_required"`,
         );
       }
-      if (execution.session_id !== undefined && sessionCleanup === "not_required") {
+      if (execution.execution_session_id !== undefined && sessionCleanup.execution === "not_required") {
         fail(
           current,
-          `execution ${execution.index} has a recorded session, so its cleanup outcome must be "completed" or "failed"`,
+          `execution ${execution.index} has a recorded execution session, so its cleanup outcome must be "completed" or "failed"`,
         );
       }
-      if (reason === PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON && sessionCleanup !== "failed") {
-        fail(current, 'the session cleanup failure reason requires sessionCleanup "failed"');
+      if (execution.tool_session_id === undefined && sessionCleanup.tool !== "not_required") {
+        fail(
+          current,
+          `execution ${execution.index} records no tool session, so its cleanup outcome must be "not_required"`,
+        );
       }
-      if (sessionCleanup === "failed" && reason !== PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON) {
+      if (execution.tool_session_id !== undefined && sessionCleanup.tool === "not_required") {
+        fail(
+          current,
+          `execution ${execution.index} has a recorded tool session, so its cleanup outcome must be "completed" or "failed"`,
+        );
+      }
+      if (
+        reason === PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON &&
+        sessionCleanup.execution !== "failed" &&
+        sessionCleanup.tool !== "failed"
+      ) {
+        fail(current, 'the session cleanup failure reason requires a failed session cleanup outcome');
+      }
+      if (
+        (sessionCleanup.execution === "failed" || sessionCleanup.tool === "failed") &&
+        reason !== PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+      ) {
         fail(current, 'a failed session cleanup requires the session cleanup failure reason');
       }
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
       last.phase = "failed";
       last.failure_reason = reason;
-      last.session_cleanup = sessionCleanup;
+      last.session_cleanup = cloneSessionCleanupPair(sessionCleanup);
       break;
     }
     case "start_decision_execution": {
@@ -1907,7 +2086,7 @@ export function reducePipelineV2RunCommand(
         if (
           last.type === "agent" &&
           last.phase === "failed" &&
-          last.session_cleanup === "failed"
+          hasFailedSessionCleanup(last)
         ) {
           fail(current, "a failed session cleanup finalizes with run_cleanup_failed");
         }
@@ -1939,7 +2118,7 @@ export function reducePipelineV2RunCommand(
         last === undefined ||
         last.type !== "agent" ||
         last.phase !== "failed" ||
-        last.session_cleanup !== "failed"
+        !hasFailedSessionCleanup(last)
       ) {
         fail(
           current,
