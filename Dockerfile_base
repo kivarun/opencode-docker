@@ -12,6 +12,7 @@ RUN install -d \
       -m 0755 \
       -o opencode \
       -g opencode \
+      /home/opencode/.config/ \
       /home/opencode/.config/opencode \
       /home/opencode/.local \
       /home/opencode/.local/share \
