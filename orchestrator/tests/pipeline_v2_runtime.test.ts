@@ -750,6 +750,7 @@ test("10. the highest activation index wins, independent of list order", async (
     const one = await prepareActivationData(pipeline, snap, [
       ...secondRecords.filter((record) => record.output === "patch"),
       ...firstRecords,
+      ...secondRecords.filter((record) => record.output === "scratch"),
     ], "architect", 3);
     expect(await readFile(join(one.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
 
@@ -758,6 +759,7 @@ test("10. the highest activation index wins, independent of list order", async (
       ...firstRecords.filter((record) => record.output === "scratch"),
       ...secondRecords.filter((record) => record.output === "patch"),
       ...firstRecords.filter((record) => record.output === "patch"),
+      ...secondRecords.filter((record) => record.output === "scratch"),
     ], "architect", 4);
     expect(await readFile(join(two.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
   });
@@ -776,7 +778,8 @@ test("11. missing, future and first-visit self state outputs are rejected", asyn
     await expect(lstat(join(runRoot, "activations", "1-architect"))).rejects.toThrow();
 
     // a specific reference stays missing while another reference is present:
-    // the accepted records list a patch record but no scratch record
+    // a partially constructed runner history is rejected as incoherent
+    // before any missing-reference resolution happens
     const coderPrep = await prepareActivationData(pipeline, snap, [], "coder", 1);
     await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH-1");
     const coderRecords = await acceptActivationOutputs(pipeline, coderPrep);
@@ -784,7 +787,7 @@ test("11. missing, future and first-visit self state outputs are rejected", asyn
       await prepareActivationData(pipeline, snap, [
         ...coderRecords.filter((record) => record.output === "patch"),
       ], "architect", 2);
-    }, /input port "scratch" of agent state "architect" references state output "coder"\."scratch" which has no accepted output yet/);
+    }, /accepted history activation index 1 of state "coder" is incomplete: the activation must record exactly the declared output ports \["patch","scratch"\], missing \["scratch"\]/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
   });
 
@@ -803,10 +806,18 @@ test("11. missing, future and first-visit self state outputs are rejected", asyn
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
 
     // a revisit resolves the self-reference from the fixed location of an
-    // earlier architect activation whose worker produced the output
+    // earlier architect activation whose worker produced the output; the
+    // planted record set must be complete (report + facts), exactly as a
+    // real acceptance of that activation would have released it
     const factsLeaf = join(runRoot, "activations", "2-architect", "data", "outputs");
     await mkdir(factsLeaf, { recursive: true });
+    await writeFile(join(factsLeaf, "report"), "REPORT-2");
     await writeFile(join(factsLeaf, "facts"), JSON.stringify({ revision: 7 }));
+    const reportDigest = await acceptedOutputDigest(
+      "file",
+      join(factsLeaf, "report"),
+      "planted architect report output",
+    );
     const factsDigest = await acceptedOutputDigest(
       "json",
       join(factsLeaf, "facts"),
@@ -814,6 +825,7 @@ test("11. missing, future and first-visit self state outputs are rejected", asyn
     );
     const revisit = await prepareActivationData(pipeline, snap, [
       ...coderRecords,
+      { state: "architect", output: "report", activation_index: 2, digest: reportDigest },
       { state: "architect", output: "facts", activation_index: 2, digest: factsDigest },
     ], "architect", 3);
     expect(await readFile(join(revisit.inputs_root, "facts"), "utf8")).toBe(
@@ -898,10 +910,12 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
     }, /activation index 1 cannot belong to both state "coder" and state "architect"/);
 
     // the fixed location must exist: missing activation leaf (the index is
-    // below the current one, but no leaf for that index and state exists)
+    // below the current one, but no leaf for that index and state exists;
+    // the record set is complete, so coherence passes and resolution fails)
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
         rec("architect", "report", 2),
+        rec("architect", "facts", 2),
       ], "architect", 3);
     }, /activation leaf .*2-architect does not exist/);
 
@@ -909,6 +923,7 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
         rec("coder", "patch", 1),
+        rec("coder", "scratch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
 
@@ -917,6 +932,7 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
         rec("coder", "patch", 1),
+        rec("coder", "scratch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch is not a regular file/);
     await rm(join(coderOutputs, "patch"), { recursive: true, force: true });
@@ -926,6 +942,7 @@ test("12. accepted records are validated: shape, declaration, index, fixed locat
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
         rec("coder", "patch", 1),
+        rec("coder", "scratch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
   });
@@ -1042,6 +1059,7 @@ test("15. records resolve only the fixed location; arbitrary paths never satisfy
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
         rec("coder", "patch", 1),
+        rec("coder", "scratch", 1),
       ], "architect", 2);
     }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
     await expect(lstat(join(runRoot, "activations", "2-architect"))).rejects.toThrow();
@@ -1056,6 +1074,7 @@ test("15. records resolve only the fixed location; arbitrary paths never satisfy
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
         rec("coder", "patch", 1),
+        rec("coder", "scratch", 1),
       ], "architect", 3);
     }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
     expect(await readFile(outside, "utf8")).toBe("ESCAPED");
@@ -1223,14 +1242,15 @@ test("19. failed operations clean up exactly what they created", async () => {
     const coderRecords = await acceptActivationOutputs(pipeline, coderPrep);
     await chmod(join(scratch, "unreadable.txt"), 0o000);
 
-    // the scratch handoff is missing first, then fails during digest
-    // verification once the record is present; both attempts remove
-    // exactly their own leaf tree
+    // the scratch handoff is missing first: a partially constructed
+    // history is rejected as incoherent before the leaf is created, then a
+    // complete history fails during digest verification once the unreadable
+    // file is present; both attempts remove exactly their own leaf tree
     await expectReject(async () => {
       await prepareActivationData(pipeline, snap, [
         ...coderRecords.filter((record) => record.output === "patch"),
       ], "architect", 3);
-    }, /input port "scratch" of agent state "architect" references state output "coder"\."scratch" which has no accepted output yet/);
+    }, /accepted history activation index 1 of state "coder" is incomplete: the activation must record exactly the declared output ports \["patch","scratch"\], missing \["scratch"\]/);
     await expect(lstat(join(runRoot, "activations", "3-architect"))).rejects.toThrow();
 
     await expectReject(async () => {
@@ -1263,7 +1283,7 @@ test("20. runtime APIs honor the loadPipelineV2 and snapshotRunInputs provenance
 
     // snapshot provenance: clones and forged objects are rejected before
     // any field is read
-    const forgedMessage = /activation data preparation requires the frozen run input snapshot object returned by a successful snapshotRunInputs call for the same trusted pipeline/;
+    const forgedMessage = /the operation requires the frozen run input snapshot object returned by a successful snapshotRunInputs call for the same trusted pipeline/;
     await expectReject(async () => {
       await prepareActivationData(pipeline, structuredClone(snap), [], "coder", 1);
     }, forgedMessage);
@@ -1443,7 +1463,8 @@ test("25. the whole accepted history is validated before the latest record is se
       join(runRoot, "activations", `${index}-architect`);
 
     // a phantom index 1 is rejected even though index 2 of the same pair
-    // is correct; the index-2 records are minted by real acceptance
+    // is correct; the index-2 records are minted by real acceptance and the
+    // index-1 set is complete, so coherence passes and resolution fails
     {
       const { runRoot, pipeline, snap } = await setup("r-phantom");
       const second = await prepareActivationData(pipeline, snap, [], "coder", 2);
@@ -1452,7 +1473,8 @@ test("25. the whole accepted history is validated before the latest record is se
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
           rec("coder", "patch", 1),
-          ...secondRecords.filter((record) => record.output === "patch"),
+          rec("coder", "scratch", 1),
+          ...secondRecords,
         ], "architect", 3);
       }, /accepted state output for "coder"\."patch" at activation index 1 activation leaf .*1-coder does not exist/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1469,7 +1491,8 @@ test("25. the whole accepted history is validated before the latest record is se
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
           rec("coder", "patch", 1),
-          ...secondRecords.filter((record) => record.output === "patch"),
+          rec("coder", "scratch", 1),
+          ...secondRecords,
         ], "architect", 3);
       }, /fixed output .*1-coder\/data\/outputs\/patch does not exist/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1489,7 +1512,8 @@ test("25. the whole accepted history is validated before the latest record is se
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
           rec("coder", "patch", 1),
-          ...secondRecords.filter((record) => record.output === "patch"),
+          rec("coder", "scratch", 1),
+          ...secondRecords,
         ], "architect", 3);
       }, /fixed output .*1-coder\/data\/outputs\/patch is a symbolic link/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1509,7 +1533,8 @@ test("25. the whole accepted history is validated before the latest record is se
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
           rec("coder", "patch", 1),
-          ...secondRecords.filter((record) => record.output === "patch"),
+          rec("coder", "scratch", 1),
+          ...secondRecords,
         ], "architect", 3);
       }, /fixed output .*1-coder\/data\/outputs\/patch is not a regular file/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1528,8 +1553,8 @@ test("25. the whole accepted history is validated before the latest record is se
       await symlink(join(dirs.root, "outside-data"), join(first.activation_root, "data"));
       await expectReject(async () => {
         await prepareActivationData(pipeline, snap, [
-          ...firstRecords.filter((record) => record.output === "patch"),
-          ...secondRecords.filter((record) => record.output === "patch"),
+          ...firstRecords,
+          ...secondRecords,
         ], "architect", 3);
       }, /activation data root .*1-coder\/data exists but is a symbolic link/);
       await expect(lstat(architectLeaf(runRoot, 3))).rejects.toThrow();
@@ -1546,15 +1571,13 @@ test("25. the whole accepted history is validated before the latest record is se
       const firstRecords = await acceptActivationOutputs(pipeline, first);
       const secondRecords = await acceptActivationOutputs(pipeline, second);
       const ascending = await prepareActivationData(pipeline, snap, [
-        ...firstRecords.filter((record) => record.output === "patch"),
-        ...secondRecords.filter((record) => record.output === "patch"),
-        ...firstRecords.filter((record) => record.output === "scratch"),
+        ...firstRecords,
+        ...secondRecords,
       ], "architect", 3);
       expect(await readFile(join(ascending.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
       const descending = await prepareActivationData(pipeline, snap, [
-        ...secondRecords.filter((record) => record.output === "patch"),
-        ...firstRecords.filter((record) => record.output === "patch"),
-        ...firstRecords.filter((record) => record.output === "scratch"),
+        ...secondRecords,
+        ...firstRecords,
       ], "architect", 4);
       expect(await readFile(join(descending.inputs_root, "patch"), "utf8")).toBe("PATCH-2");
     }

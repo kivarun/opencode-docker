@@ -126,13 +126,69 @@ import { validatePipelineJson } from "./pipeline_v2_schema.ts";
  * Accepted-history binding: `prepareActivationData` requires the exact
  * record form `{state, output, activation_index, digest}` and re-verifies
  * the whole history before anything is prepared — every record (including
- * old, non-winning ones) is resolved to its fixed location and its digest
- * recomputed and compared, and only then is the winning record per
- * `state`/`output` pair selected. An accepted output that changed after
- * acceptance — content, entry name, empty directory, kind, or JSON bytes —
- * fails the next activation before its leaf is created. The records remain
- * trusted runner-owned input: agent envelopes, stdout and worker files can
- * never create one.
+ * old, non-winning ones) is resolved to its fixed orchestrator-derived
+ * location and its digest is recomputed and compared, and only then is the
+ * winning record per `state`/`output` pair selected by highest activation
+ * index. An accepted output that changed after acceptance — content, entry
+ * name, empty directory, kind, or JSON bytes — fails the next activation
+ * before its leaf is created. The records remain trusted runner-owned
+ * input: agent envelopes, stdout and worker files can never create one.
+ *
+ * Accepted-history coherence: for every `{activation_index, state}` pair
+ * the recorded set must be exactly the declared output ports of that agent
+ * state — one record per declared output, no missing and no extra records.
+ * `acceptActivationOutputs` always releases a full set, so a correct
+ * runtime path is unaffected; a partially constructed runner history is
+ * rejected as incoherent before any location is resolved, both before the
+ * next activation and before run-output collection.
+ *
+ * Run-input integrity (`verifyRunInputsSnapshot`): before every
+ * `prepareActivationData` call and before `collectRunOutputs`, each
+ * snapshot entry is re-verified at its fixed orchestrator-owned path — it
+ * must still be a real non-symlink object of its declared kind resolving
+ * exactly to itself inside the canonical run root, its directory tree may
+ * contain only real directories and regular files, and its digest is
+ * recomputed with the `pipeline-v2-input` framing and must still match the
+ * recorded digest. A modified, relocated or escaped run-input snapshot is
+ * detected before the activation leaf or the run-output staging tree is
+ * created. The original user binding paths are never read again.
+ *
+ * Run-output collection (`collectRunOutputs`): when a terminal state has
+ * been reached (deciding that is the graph runner's job — this function
+ * takes no terminal id, no user paths, no types, no mounts and no Docker
+ * options), every declared run-level output is resolved and materialized
+ * into the fixed orchestrator-owned `<runRoot>/outputs/<run-output-id>`
+ * tree. A source is either a declared pipeline input (resolved only from
+ * the trusted run-input snapshot — a pipeline input counts as existing
+ * once its snapshot succeeded, and its digest is re-verified) or an agent
+ * state output (resolved only from the runner-owned accepted history;
+ * the record with the highest activation index wins, and the whole
+ * history is parsed, resolved, digest-verified and coherence-checked
+ * before any winner is selected — a corrupted old non-winning record
+ * fails the whole publication). A present source is published regardless
+ * of `required`; a missing source fails the whole operation before
+ * publication when `required: true` and marks the output absent (no
+ * filesystem entry) when `required: false` — optionality never masks a
+ * damaged accepted history. Outputs are processed strictly in declaration
+ * order. `json` sources are re-parsed and re-validated against the same
+ * loader-compiled Draft 2020-12 schema carried by the resolved run
+ * output, and the original JSON bytes are published — never a
+ * reserialization. The `outputs` path must be absent beforehand (any
+ * pre-existing object fails closed, nothing is ever overwritten; a
+ * repeated call after successful publication is therefore rejected); the
+ * publication is built in an exclusive temporary sibling directory inside
+ * the canonical run root (directories 0700, files 0600, no shell, no
+ * `cp`, no `tar`; only real directories and regular files — symlinks,
+ * FIFOs, sockets and devices rejected), and is published with a single
+ * `rename()` after the full staging tree checks out; a failure before the
+ * rename removes exactly the staging tree and touches nothing else —
+ * run inputs, activations, accepted outputs and the shared project are
+ * never modified. The returned `RunOutputsSnapshot` is deep-frozen, lists
+ * one discriminated entry per declared run output in declaration order
+ * (`snapshot_path` and `digest` only for published outputs, with the
+ * digest taken over a separate `pipeline-v2-run-output` domain from the
+ * actually published copy), and is registered in a module-private
+ * provenance registry only after the atomic publish succeeded.
  *
  * Failure behavior: all validation happens before any mutation; every
  * created object is tracked and removed again when the operation fails, so
@@ -154,7 +210,8 @@ import { validatePipelineJson } from "./pipeline_v2_schema.ts";
  * activation leaf is created exclusively (mkdir), so pre-placed leaves,
  * symlink traps on `runRoot/data`, `data/inputs`, `activations` and leaf
  * paths are rejected, and nothing outside `runRoot` is ever created,
- * written or removed.
+ * written or removed. The same applies to the run-output staging
+ * directory.
  */
 
 /**
@@ -182,7 +239,7 @@ const runInputSnapshotProvenance = new WeakMap<object, RunInputSnapshotProvenanc
 
 /** Stable rejection message for any snapshot argument without provenance. */
 const UNTRUSTED_RUN_INPUT_SNAPSHOT_MESSAGE =
-  "activation data preparation requires the frozen run input snapshot object " +
+  "the operation requires the frozen run input snapshot object " +
   "returned by a successful snapshotRunInputs call for the same trusted pipeline; " +
   "hand-built objects, casts, clones, snapshots of another pipeline and Proxies " +
   "are rejected before any field is read";
@@ -214,6 +271,27 @@ const UNTRUSTED_PREPARED_ACTIVATION_MESSAGE =
   "returned by a successful prepareActivationData call for the same trusted pipeline; " +
   "hand-built objects, casts, clones, activations of another pipeline and Proxies " +
   "are rejected before any field is read";
+
+/**
+ * Module-private provenance registry of published run output snapshots.
+ *
+ * `collectRunOutputs` registers the exact deep-frozen snapshot object it
+ * returns, together with the trusted pipeline object, the canonical run
+ * root and the canonical outputs root — but only after the atomic publish
+ * succeeded, so an object that never reached `rename()` can never acquire
+ * provenance. The registry is keyed by object identity: hand-built
+ * objects, casts, clones and Proxies are unregistered. It is never
+ * exported, never serialized, and no provenance marker is embedded in the
+ * snapshot itself; a future download/API layer can consume only registered
+ * snapshots.
+ */
+interface RunOutputsSnapshotProvenance {
+  readonly pipeline: ResolvedPipelineV2;
+  readonly runRootCanonical: string;
+  readonly outputsRootCanonical: string;
+}
+
+const runOutputsSnapshotProvenance = new WeakMap<object, RunOutputsSnapshotProvenance>();
 
 export interface RunInputBinding {
   readonly id: string;
@@ -579,6 +657,10 @@ function outputDigestHasher(type: PortType): Bun.CryptoHasher {
   return portValueDigestHasher("pipeline-v2-output\0", type);
 }
 
+function runOutputDigestHasher(type: PortType): Bun.CryptoHasher {
+  return portValueDigestHasher("pipeline-v2-run-output\0", type);
+}
+
 function hashRelativePath(hasher: Bun.CryptoHasher, relativePath: string): void {
   hashBytes(hasher, Buffer.from(relativePath, "utf8"));
 }
@@ -728,6 +810,87 @@ export async function acceptedOutputDigest(
 ): Promise<string> {
   const portType = parsePortType(type, "accepted output digest type");
   return (await readPortValueForDigest(portType, path, what, false)).digest;
+}
+
+/**
+ * Re-verify the full integrity of a trusted run-input snapshot at its fixed
+ * orchestrator-owned paths, without ever re-reading the original user
+ * binding paths. Every snapshot entry must still be a real non-symlink
+ * object of its declared kind (`file`/`json` regular file, `directory`
+ * real directory) whose canonical resolution is exactly its recorded
+ * snapshot path — so a replaced final component, a relocated or symlinked
+ * ancestor, or an escape out of the canonical run root is detected. A
+ * directory snapshot is scanned fail-closed (only real directories and
+ * regular files; symlinks, FIFOs, sockets and devices rejected) and every
+ * digest is recomputed with the exact `pipeline-v2-input` framing and
+ * compared against the recorded digest, so any changed byte, entry name,
+ * empty directory, or kind fails before anything is built from the
+ * snapshot. Called before every `prepareActivationData` and before
+ * `collectRunOutputs`.
+ */
+async function verifyRunInputsSnapshot(
+  runInputs: RunInputsSnapshot,
+  provenance: RunInputSnapshotProvenance,
+): Promise<void> {
+  for (const entry of runInputs.inputs) {
+    const what = `run input snapshot of ${JSON.stringify(entry.id)}`;
+    const path = entry.snapshot_path;
+    const info = await lstatOrNull(path);
+    if (info === null) {
+      throw new PipelineError(`${what} snapshot object ${path} does not exist`);
+    }
+    if (info.isSymbolicLink()) {
+      throw new PipelineError(`${what} snapshot object ${path} is a symbolic link`);
+    }
+    if (entry.type === "directory") {
+      if (!info.isDirectory()) {
+        throw new PipelineError(
+          `${what} snapshot object ${path} is not a real directory, found ${describeEntry(info)}`,
+        );
+      }
+    } else if (!info.isFile()) {
+      throw new PipelineError(
+        `${what} snapshot object ${path} is not a regular file, found ${describeEntry(info)}`,
+      );
+    }
+    let canonical: string;
+    try {
+      canonical = await realpath(path);
+    } catch (cause) {
+      throw fail(`${what} snapshot object ${path} cannot be canonicalized`, cause);
+    }
+    if (canonical !== path) {
+      throw new PipelineError(
+        `${what} snapshot object ${path} no longer resolves to itself; the snapshot was relocated or escaped`,
+      );
+    }
+    const hasher = inputDigestHasher(entry.type);
+    let recomputed: string;
+    if (entry.type === "directory") {
+      const tree = await scanDirectoryTree(path, what);
+      for (const treeEntry of tree) {
+        if (treeEntry.kind === "directory") {
+          hashDirectoryEntry(hasher, treeEntry, undefined);
+          continue;
+        }
+        const content = await readRegularFileBytes(
+          treeEntry.absolutePath,
+          `${what} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+        );
+        hashDirectoryEntry(hasher, treeEntry, content);
+      }
+      recomputed = hasher.digest("hex");
+    } else {
+      const content = await readRegularFileBytes(path, what);
+      hashBytes(hasher, content);
+      recomputed = hasher.digest("hex");
+    }
+    if (recomputed !== entry.digest) {
+      throw new PipelineError(
+        `${what} digest mismatch at ${path}: recorded ${entry.digest}, recomputed ${recomputed}`,
+      );
+    }
+  }
 }
 
 let tmpCounter = 0;
@@ -1063,19 +1226,28 @@ const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
  * Phase 1 of accepted-history validation. Parse and validate the
  * runner-owned accepted records `{state, output, activation_index, digest}`:
  * the argument must be a list (never a stray `TypeError`), every record has
- * exact fields, safe ids, a positive safe index below the current
- * activation index, a lowercase SHA-256 hex digest, a declared agent state,
- * and a declared output port (whose declared type becomes the derived
- * record type). Cross-record invariants: no duplicate records for one
- * activation, and one activation index can never belong to two different
- * states. List order is irrelevant — selection happens only after every
- * record has been fully resolved and digest-verified (see
+ * exact fields, safe ids, a positive safe index, a lowercase SHA-256 hex
+ * digest, a declared agent state, and a declared output port (whose
+ * declared type becomes the derived record type). When
+ * `currentActivationIndex` is provided (the next-activation path), every
+ * index must be below it; run-output collection passes no bound because
+ * there is no current activation — there, activation existence is proven by
+ * resolving every record's fixed location. Cross-record invariants: no
+ * duplicate records for one activation, one activation index can never
+ * belong to two different states, and — for every recorded
+ * `{activation_index, state}` pair — the recorded set must be exactly the
+ * declared output ports of that agent state: `acceptActivationOutputs`
+ * releases one record per declared output, so a partially constructed
+ * runner history is incoherent and rejected as a whole before any location
+ * is resolved, both before the next activation and before run-output
+ * publication. List order is irrelevant — selection happens only after
+ * every record has been fully resolved and digest-verified (see
  * `resolveAllAcceptedOutputs` and `verifyAcceptedOutputDigests`).
  */
 function parseAcceptedStateOutputs(
   acceptedOutputs: readonly unknown[],
   pipeline: ResolvedPipelineV2,
-  currentActivationIndex: number,
+  currentActivationIndex: number | undefined,
 ): ParsedAcceptedOutput[] {
   if (!Array.isArray(acceptedOutputs)) {
     throw new PipelineError("accepted state outputs must be a list");
@@ -1121,7 +1293,7 @@ function parseAcceptedStateOutputs(
         `${what} references output ${JSON.stringify(output)} which is not declared by state ${JSON.stringify(state)}`,
       );
     }
-    if (activationIndex >= currentActivationIndex) {
+    if (currentActivationIndex !== undefined && activationIndex >= currentActivationIndex) {
       throw new PipelineError(
         `${what} records activation index ${activationIndex} which is not below the current activation index ${currentActivationIndex}`,
       );
@@ -1145,6 +1317,44 @@ function parseAcceptedStateOutputs(
     } else if (declaredState !== record.state) {
       throw new PipelineError(
         `activation index ${record.activationIndex} cannot belong to both state ${JSON.stringify(declaredState)} and state ${JSON.stringify(record.state)}`,
+      );
+    }
+  }
+
+  // Accepted-history coherence: every recorded activation must have
+  // recorded exactly the declared output ports of its state. The one-index-
+  // one-state invariant above already guarantees a single state per index.
+  const recordedByActivation = new Map<number, Set<string>>();
+  for (const record of parsed) {
+    let recorded = recordedByActivation.get(record.activationIndex);
+    if (recorded === undefined) {
+      recorded = new Set<string>();
+      recordedByActivation.set(record.activationIndex, recorded);
+    }
+    recorded.add(record.output);
+  }
+  for (const [activationIndex, recorded] of recordedByActivation) {
+    const stateId = activationStates.get(activationIndex);
+    const declaredOutputs = stateId === undefined ? undefined : agentStates.get(stateId);
+    if (stateId === undefined || declaredOutputs === undefined) {
+      throw new PipelineError(
+        `accepted history activation index ${activationIndex} records state ${JSON.stringify(stateId)} which is not a declared agent state`,
+      );
+    }
+    const declaredIds = [...declaredOutputs.keys()];
+    const missing = declaredIds.filter((id) => !recorded.has(id));
+    if (missing.length > 0) {
+      throw new PipelineError(
+        `accepted history activation index ${activationIndex} of state ${JSON.stringify(stateId)} is incomplete: ` +
+          `the activation must record exactly the declared output ports ${JSON.stringify(declaredIds)}, ` +
+          `missing ${JSON.stringify(missing)}`,
+      );
+    }
+    const extra = [...recorded].filter((id) => !declaredOutputs.has(id));
+    if (extra.length > 0) {
+      throw new PipelineError(
+        `accepted history activation index ${activationIndex} of state ${JSON.stringify(stateId)} ` +
+          `records output ports that the state does not declare: ${JSON.stringify(extra)}`,
       );
     }
   }
@@ -1344,6 +1554,12 @@ export async function prepareActivationData(
 
   await requireRealDirectory(runRootCanonical, "run root");
   await requireRealDirectory(projectRoot, "run project root");
+
+  // The run-owned snapshot is re-verified before anything else happens: a
+  // modified, relocated or escaped snapshot input fails the activation
+  // before the accepted history is parsed and long before the activation
+  // leaf is created.
+  await verifyRunInputsSnapshot(runInputs, provenance);
 
   const parsedAccepted = parseAcceptedStateOutputs(acceptedOutputs, pipeline, activationIndex);
   const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
@@ -1622,4 +1838,274 @@ export async function acceptActivationOutputs(
     });
   }
   return deepFreeze(records);
+}
+
+/**
+ * One published run output as recorded in the returned snapshot: an
+ * optional output whose source was absent is listed as `present: false`
+ * (with `required: false` — a missing required source fails the whole
+ * publication), a published output carries its fixed orchestrator-owned
+ * `snapshot_path` and the deterministic `pipeline-v2-run-output` digest of
+ * the actually published copy. No user paths, no accepted-history paths,
+ * no timestamps.
+ */
+export type RunOutputSnapshotEntry =
+  | {
+      readonly id: string;
+      readonly type: PortType;
+      readonly required: boolean;
+      readonly present: true;
+      readonly snapshot_path: string;
+      readonly digest: string;
+    }
+  | {
+      readonly id: string;
+      readonly type: PortType;
+      readonly required: false;
+      readonly present: false;
+    };
+
+/**
+ * The deep-frozen result of a successful `collectRunOutputs`: the canonical
+ * run root, the fixed canonical outputs root, and one entry per declared
+ * run output in declaration order.
+ */
+export interface RunOutputsSnapshot {
+  readonly run_root: string;
+  readonly outputs_root: string;
+  readonly outputs: readonly RunOutputSnapshotEntry[];
+}
+
+/**
+ * Collect and publish the run-level outputs of a v2 pipeline whose graph
+ * runner has already reached a terminal state — deciding whether a
+ * terminal may be entered is the graph runner's responsibility; this
+ * function only materializes the declared run outputs. It accepts no
+ * terminal id, no user paths, no types, no mounts and no Docker options:
+ * sources, types and destinations come only from the trusted resolved
+ * pipeline.
+ *
+ * Arguments are provenance-gated: `pipeline` must be the exact deep-frozen
+ * snapshot a successful `loadPipelineV2` returned, and `runInputs` must be
+ * the exact frozen `RunInputsSnapshot` a successful `snapshotRunInputs`
+ * call returned for that same pipeline object. The run root and the shared
+ * project directory must still be real directories, and the fixed
+ * `<runRoot>/outputs` path must be absent (any pre-existing file,
+ * directory or symlink fails closed before anything is created, so a
+ * repeated call after a successful publication is rejected and never
+ * overwrites).
+ *
+ * The whole accepted history is validated first (exact record shape,
+ * declared state/output, per-activation coherence, fixed-location
+ * resolution, digest recomputation of every record including old
+ * non-winning ones); only then is the winning record per `state`/`output`
+ * pair selected by highest activation index. Each declared run output is
+ * then resolved in declaration order from either the verified run-input
+ * snapshot (`pipeline_input`) or the winner map (`state_output`). A
+ * missing `required: true` source fails the whole operation before any
+ * publication; a missing `required: false` source is listed as absent and
+ * creates no filesystem entry; a present source is published regardless
+ * of `required`. `json` sources are re-parsed and re-validated against the
+ * loader-compiled schema of the resolved run output (parser diagnostics
+ * stay content-free; the original bytes are published, never
+ * reserialized).
+ *
+ * The publication is staged in an exclusive temporary sibling directory
+ * inside the canonical run root (directories 0700, files 0600; only real
+ * directories and regular files), digest-hashed with the separate
+ * `pipeline-v2-run-output` domain while being copied, and published with a
+ * single `rename()` after the full staging tree checks out. A failure
+ * before the rename removes exactly the staging tree — run inputs,
+ * activations, accepted outputs and the shared project are never
+ * modified. On success the deep-frozen `RunOutputsSnapshot` is registered
+ * in the module-private provenance registry and returned.
+ */
+export async function collectRunOutputs(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+): Promise<RunOutputsSnapshot> {
+  requireResolvedPipelineV2Provenance(pipeline, "run output collection");
+  const provenance = runInputSnapshotProvenance.get(runInputs);
+  if (provenance === undefined || provenance.pipeline !== pipeline) {
+    throw new PipelineError(UNTRUSTED_RUN_INPUT_SNAPSHOT_MESSAGE);
+  }
+  const runRootCanonical = provenance.runRootCanonical;
+
+  await requireRealDirectory(runRootCanonical, "run root");
+  await requireRealDirectory(provenance.projectRootCanonical, "run project root");
+
+  // The publication target is fixed by the runtime, must be absent, and is
+  // never overwritten: this also makes a repeated call after a successful
+  // publication fail closed.
+  const outputsPath = join(runRootCanonical, "outputs");
+  await requireAbsent(outputsPath, "run outputs root");
+
+  // The run-owned snapshot must still be intact before anything is
+  // resolved or staged; the original user binding paths are never read.
+  await verifyRunInputsSnapshot(runInputs, provenance);
+
+  // The whole accepted history is validated before any winner is selected
+  // and before anything is staged. There is no current activation bound
+  // here: every record must name an activation that actually happened,
+  // which is proven by resolving its fixed location below.
+  const parsedAccepted = parseAcceptedStateOutputs(acceptedOutputs, pipeline, undefined);
+  const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
+  await verifyAcceptedOutputDigests(fullyResolved);
+  const acceptedByRef = selectWinningAcceptedOutputs(fullyResolved);
+
+  const stagingPath = join(runRootCanonical, tmpEntryName("run-outputs"));
+  let stagingCreated = false;
+  try {
+    await createRealDirectoryExclusive(stagingPath, "run outputs staging root");
+    stagingCreated = true;
+
+    const entries: RunOutputSnapshotEntry[] = [];
+    for (const output of pipeline.outputs) {
+      const what = `run output ${JSON.stringify(output.id)}`;
+      let sourcePath: string;
+      let sourceWhat: string;
+      if ("pipeline_input" in output.source) {
+        let entry: RunInputSnapshotEntry | undefined;
+        for (const candidate of runInputs.inputs) {
+          if (candidate.id === output.source.pipeline_input) {
+            entry = candidate;
+            break;
+          }
+        }
+        if (entry === undefined) {
+          throw new PipelineError(
+            `${what} references pipeline input ${JSON.stringify(output.source.pipeline_input)} which has no run input snapshot entry`,
+          );
+        }
+        if (entry.type !== output.type) {
+          throw new PipelineError(
+            `${what} expects type ${JSON.stringify(output.type)} but the run input snapshot entry has type ${JSON.stringify(entry.type)}`,
+          );
+        }
+        sourcePath = entry.snapshot_path;
+        sourceWhat = `${what} source pipeline input ${JSON.stringify(output.source.pipeline_input)}`;
+      } else {
+        const accepted = acceptedByRef.get(
+          `${output.source.state_output.state}\u0000${output.source.state_output.output}`,
+        );
+        if (accepted === undefined) {
+          if (output.required) {
+            throw new PipelineError(
+              `${what} references required state output ${JSON.stringify(output.source.state_output.state)}.${JSON.stringify(output.source.state_output.output)} which has no accepted output yet`,
+            );
+          }
+          // Absent optional output: recorded in the snapshot, no
+          // filesystem entry, nothing staged for it.
+          entries.push({
+            id: output.id,
+            type: output.type,
+            required: false,
+            present: false,
+          });
+          continue;
+        }
+        if (accepted.type !== output.type) {
+          throw new PipelineError(
+            `${what} expects type ${JSON.stringify(output.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
+          );
+        }
+        sourcePath = accepted.canonicalPath;
+        sourceWhat = `${what} source state output ${JSON.stringify(output.source.state_output.state)}.${JSON.stringify(output.source.state_output.output)}`;
+      }
+
+      const target = join(stagingPath, output.id);
+      const hasher = runOutputDigestHasher(output.type);
+      let parsedJson: unknown;
+      if (output.type === "directory") {
+        await createRealDirectoryExclusive(target, sourceWhat);
+        const tree = await scanDirectoryTree(sourcePath, sourceWhat);
+        for (const treeEntry of tree) {
+          const entryTarget = join(target, treeEntry.relativePath);
+          if (treeEntry.kind === "directory") {
+            hashDirectoryEntry(hasher, treeEntry, undefined);
+            await createRealDirectoryExclusive(
+              entryTarget,
+              `${sourceWhat} directory entry ${JSON.stringify(treeEntry.relativePath)}`,
+            );
+            continue;
+          }
+          const content = await readRegularFileBytes(
+            treeEntry.absolutePath,
+            `${sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          );
+          hashDirectoryEntry(hasher, treeEntry, content);
+          await writeRegularFileExclusive(
+            entryTarget,
+            content,
+            `${sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          );
+        }
+      } else {
+        const content = await readRegularFileBytes(sourcePath, sourceWhat);
+        hashBytes(hasher, content);
+        await writeRegularFileExclusive(target, content, sourceWhat);
+        if (output.type === "json") {
+          try {
+            parsedJson = JSON.parse(content.toString("utf8"));
+          } catch {
+            // Stable, content-free diagnostic: the parser message can echo
+            // the offending token or an input fragment, so it is never
+            // included.
+            throw new PipelineError(`${sourceWhat} ${sourcePath} is not valid JSON`);
+          }
+        }
+      }
+      if (output.type === "json") {
+        if (output.schema === undefined) {
+          throw new PipelineError(`${what} has no compiled JSON schema`);
+        }
+        // The same compiled Draft 2020-12 mechanism that validated the
+        // declaring site validates the collected value again here; the
+        // value is never modified and the original bytes are published.
+        validatePipelineJson(output.schema, parsedJson, sourceWhat);
+      }
+      entries.push({
+        id: output.id,
+        type: output.type,
+        required: output.required,
+        present: true,
+        snapshot_path: join(outputsPath, output.id),
+        digest: hasher.digest("hex"),
+      });
+    }
+
+    const snapshot = deepFreeze({
+      run_root: runRootCanonical,
+      outputs_root: outputsPath,
+      outputs: entries,
+    });
+
+    // Defensively re-check the target right before the single atomic
+    // publish; an adversarially created object at the target still fails
+    // closed here (an empty directory could in principle still be replaced
+    // by rename — an honest limitation shared with directory snapshots).
+    await requireAbsent(outputsPath, "run outputs root");
+    try {
+      await rename(stagingPath, outputsPath);
+    } catch (cause) {
+      throw fail(`run outputs root ${outputsPath} could not be published`, cause);
+    }
+
+    // Provenance is registered only after the atomic publish succeeded.
+    runOutputsSnapshotProvenance.set(snapshot, {
+      pipeline,
+      runRootCanonical,
+      outputsRootCanonical: outputsPath,
+    });
+    return snapshot;
+  } catch (cause) {
+    // A failure before the rename removes exactly the staging tree this
+    // call created (only when it actually was created); run inputs,
+    // activations, accepted outputs and the shared project are untouched.
+    if (stagingCreated) {
+      await removeTrackedPath(stagingPath, runRootCanonical);
+    }
+    throw cause;
+  }
 }

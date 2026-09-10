@@ -546,8 +546,80 @@ output is detected by digest recomputation of the whole accepted history
 (including old, non-winning records) before the next activation leaf is
 created. Accepted records remain runner-owned input; agent envelopes,
 stdout, and worker files can never create one. Not implemented: Session
-creation, mounts, worker launch, and terminal/run-output collection are
-later increments.
+creation, mounts, worker launch, and terminal state execution are later
+increments.
+
+### Run-input integrity and run-level output publication (pure substrate, not wired)
+
+Two integrity guarantees apply before anything else happens on the v2 data
+plane. First, accepted-history coherence: for every recorded
+`{activation_index, state}` pair the recorded set must be exactly the
+declared output ports of that agent state — one record per declared output,
+no missing and no extra records. `acceptActivationOutputs` always releases a
+full set, so a correct runtime path is unaffected; a partially constructed
+runner history is rejected as incoherent before any location is resolved,
+both before the next activation (`prepareActivationData`) and before
+publication (`collectRunOutputs`). Second, run-input integrity:
+`verifyRunInputsSnapshot` re-verifies the full snapshot before every
+`prepareActivationData` call and before `collectRunOutputs` — every entry
+must still be a real non-symlink object of its declared kind resolving
+exactly to its recorded snapshot path inside the canonical run root,
+directory snapshots may contain only real directories and regular files,
+and every digest is recomputed with the `pipeline-v2-input` framing and
+compared. A modified, relocated or escaped snapshot fails before the
+activation leaf or the run-output staging tree is created; the original
+user binding paths are never read again.
+
+Run-level output publication (`collectRunOutputs`) materializes the declared
+run outputs once the graph runner has reached a terminal state — deciding
+whether a terminal may be entered is the graph runner's job; the function
+takes no terminal id, no user paths, no types, no mounts, and no Docker
+options (arity 3: trusted pipeline, trusted run-input snapshot, runner-owned
+accepted history). The fixed `<runRoot>/outputs` path must be absent
+beforehand: any pre-existing file, directory, or symlink fails closed
+before anything is created, so a repeated call after a successful
+publication is rejected and never overwrites. The whole accepted history is
+validated again (shape, per-activation coherence, fixed-location
+resolution, digest recomputation of every record including old non-winning
+ones) before any winner is selected; there is no current-activation bound
+at the terminal — activation existence is proven by resolving each record's
+fixed location. Each declared run output is then resolved strictly in
+declaration order: a `pipeline_input` source resolves only from the
+verified run-input snapshot (a pipeline input counts as existing once its
+snapshot succeeded, and its digest is re-verified); a `state_output` source
+resolves only from the runner-owned winner map (highest activation index
+wins). A present source is published regardless of `required`; a missing
+`required: true` source fails the whole operation before publication; a
+missing `required: false` source is recorded as `present: false` with no
+filesystem entry — optionality never masks a damaged accepted history.
+`json` sources are re-parsed and re-validated against the same
+loader-compiled Draft 2020-12 schema carried by the resolved run output
+(parser diagnostics stay content-free), and the original JSON bytes are
+published — never a reserialization. The publication is staged in an
+exclusive temporary sibling directory inside the canonical run root
+(directories 0700, files 0600; only real directories and regular files —
+symlinks, FIFOs, sockets, devices rejected; no shell, no `cp`, no `tar`),
+every staged byte is hashed with the separate `pipeline-v2-run-output\0`
+domain (same unambiguous framing as input/output digests; host paths,
+inodes, permissions, and timestamps never participate), the target is
+defensively re-checked absent, and a single `rename()` publishes the
+finished staging tree atomically. A failure before the rename removes
+exactly the staging tree — run inputs, activations, accepted outputs, and
+the shared project are never modified. The returned deep-frozen
+`RunOutputsSnapshot` lists one discriminated entry per declared run output
+in declaration order (`id`, `type`, `required`, `present`; published
+entries additionally carry the fixed orchestrator-owned `snapshot_path` and
+the digest of the actually published copy) and is registered in a
+module-private provenance registry only after the atomic publish succeeded
+— no serializable markers; a future download/API layer can consume only
+registered snapshots. Honest limitations: a trusted host process may mutate
+a source during the read; an adversarially created empty directory at the
+rename target could in principle be replaced; crash recovery and a
+directory `rename` no-replace primitive remain absent. Not implemented:
+production runner wiring, terminal state execution, durable state
+v3/resume, API/T3 download, decision evaluator integration,
+Sessions/mounts/worker launch, retries, quotas, and old-activation cleanup;
+the production loader still rejects schema v2 before Launcher auth/session.
 
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
