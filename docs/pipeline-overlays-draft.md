@@ -154,11 +154,14 @@ the accepted report to process outcomes.
 The early-feedback variant attaches the testing subgraph to the transition
 from the coder to the reviewers:
 
-```text
-coder -> tester -> test decision
-  ^                    |
-  |------ rework ------|
-                       +-> reviewers -> architect
+```mermaid
+flowchart TD
+    C["Coder"] --> T["Tester"]
+    T --> D{"Test decision"}
+    D -->|rework| CR["Coder rework"]
+    CR --> T
+    D -->|pass| R["Reviewers"]
+    R --> A["Architect"]
 ```
 
 A failed test outcome returns work to a coder activation; a passing outcome
@@ -176,8 +179,11 @@ must not be invented implicitly merely to make the example work.
 The end-of-iteration variant attaches the same tester role after the reviewers
 and before the architect's iteration decision:
 
-```text
-coder -> reviewers -> tester -> architect
+```mermaid
+flowchart LR
+    C["Coder"] --> R["Reviewers"]
+    R --> T["Tester"]
+    T --> A["Architect"]
 ```
 
 Here the architect receives the structured test report together with the
