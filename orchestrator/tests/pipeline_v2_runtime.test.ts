@@ -19,6 +19,7 @@ import {
   acceptActivationOutputs,
   acceptedOutputDigest,
   prepareActivationData,
+  prepareActivationExecutionDocument,
   snapshotRunInputs,
 } from "../src/pipeline_v2_runtime.ts";
 import { runAgentSmoke, type AgentSmokeDeps } from "../src/agent_smoke.ts";
@@ -1648,6 +1649,169 @@ test("26. data-plane failures carry typed runtime reasons assigned by operation 
       expect((failure as PipelineV2RuntimeError).reason).toBe("run_input_modified");
       expect((failure as Error).message).toMatch(/digest mismatch at .*: recorded [0-9a-f]{64}, recomputed [0-9a-f]{64}/);
       await expect(lstat(join(runRoot, "activations"))).rejects.toThrow();
+    }
+  });
+});
+
+test("27. the execution document has a fixed path, deterministic bytes, and exact ports", async () => {
+  await withRuntime(async (dirs, sources) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const runRoot = await makeRunRoot(dirs.root);
+    const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
+    const prep = await prepareActivationData(pipeline, snap, [], "coder", 1);
+
+    // fixed host/container path pair on the prepared object; the prompt
+    // body itself is never a field of the prepared object
+    expect(prep.execution_document.container_path).toBe("/pipeline/inputs/.orchestrator/execution.md");
+    expect(prep.execution_document.host_path).toBe(join(prep.inputs_root, ".orchestrator", "execution.md"));
+    expect(JSON.stringify(prep).includes("implement the task")).toBe(false);
+
+    const doc = await readFile(prep.execution_document.host_path, "utf8");
+    const inputsDirEntries = (await readdir(prep.inputs_root)).sort();
+    expect(inputsDirEntries).toEqual([".orchestrator", "config", "specs", "task"]);
+    const docDirMode = (await lstat(join(prep.inputs_root, ".orchestrator"))).mode & 0o777;
+    expect(docDirMode).toBe(0o700);
+    const docMode = (await lstat(prep.execution_document.host_path)).mode & 0o777;
+    expect(docMode).toBe(0o600);
+
+    // deterministic content: state id, execution index, the exact prompt
+    // body, ports in declaration order, and the canonical json schemas
+    expect(doc).toContain('# Pipeline execution document\n\nstate_id: "coder"\nexecution_index: 1\n');
+    expect(doc).toContain("## Instruction\n\nimplement the task\n\n");
+    expect(doc).toContain("mounted at `/workspace` read-write");
+    expect(doc).toContain("1. `task` — type `file`, path `/pipeline/inputs/task` (read-only)");
+    expect(doc).toContain("2. `specs` — type `directory`, path `/pipeline/inputs/specs` (read-only)");
+    expect(doc).toContain("3. `config` — type `json`, path `/pipeline/inputs/config` (read-only)");
+    expect(doc).toContain('{"required":["ok"],"type":"object"}');
+    expect(doc).toContain("1. `patch` — type `file`, path `/pipeline/outputs/patch`");
+    expect(doc).toContain("2. `scratch` — type `directory`, path `/pipeline/outputs/scratch`");
+    expect(doc).toContain("- Create only the declared top-level outputs under `/pipeline/outputs`.");
+    expect(doc).toContain("- Finish only after all declared outputs have been written.");
+    expect(doc).toContain("they are not part of the pipeline output-port namespace");
+
+    // no host paths, no run identity, no sources, no input bodies
+    expect(doc.includes(runRoot)).toBe(false);
+    expect(doc.includes(dirs.root)).toBe(false);
+    expect(doc.includes(sources)).toBe(false);
+    expect(doc.includes('"goal"')).toBe(false);
+    expect(doc.includes('"nested"')).toBe(false);
+    expect(doc.includes("README")).toBe(false);
+
+    // deterministic across two preparations of the same state in two
+    // different run roots (same trusted bundle)
+    const runRoot2 = await makeRunRoot(join(dirs.root, "run-2"));
+    const snap2 = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot2);
+    const prep2 = await prepareActivationData(pipeline, snap2, [], "coder", 1);
+    expect(await readFile(prep2.execution_document.host_path, "utf8")).toBe(doc);
+
+    // a json OUTPUT port carries its declaring schema; a second state's
+    // document lists its own ports and its own prompt
+    await writeFile(join(prep.outputs_root, "patch"), "PATCH");
+    const coderComplete = await acceptActivationOutputs(pipeline, prep);
+    const prep3 = await prepareActivationData(pipeline, snap, coderComplete, "architect", 2);
+    const architectDoc = await readFile(prep3.execution_document.host_path, "utf8");
+    expect(architectDoc).toContain('state_id: "architect"');
+    expect(architectDoc).toContain("review the patch");
+    expect(architectDoc).toContain('{"required":["revision"],"type":"object"}');
+    expect(coderComplete.length).toBe(2);
+  });
+});
+
+test("28. preplaced execution document objects are rejected and sentinels stay untouched", async () => {
+  await withRuntime(async (dirs, sources) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const runRoot = await makeRunRoot(dirs.root);
+    const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
+
+    // the sentinel lives outside the run root and must never be modified
+    const sentinelDir = join(dirs.root, "sentinel");
+    await mkdir(sentinelDir, { recursive: true });
+    await writeFile(join(sentinelDir, "real.md"), "REAL");
+    const sentinelReal = join(sentinelDir, "real.md");
+    const readSentinel = async (): Promise<string> => await readFile(sentinelReal, "utf8");
+
+    // a pre-placed .orchestrator directory is a typed preparation failure
+    {
+      const docWriterRoot = join(runRoot, "doc-trap-dir");
+      await mkdir(docWriterRoot, { recursive: true });
+      await mkdir(join(docWriterRoot, ".orchestrator"), { mode: 0o700 });
+      let failure: unknown;
+      try {
+        await prepareActivationExecutionDocument(docWriterRoot, "DOC");
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineError);
+      expect((failure as Error).message).toContain(
+        "orchestrator execution document directory",
+      );
+      expect((failure as Error).message).toContain("already exists, found an existing directory");
+    }
+
+    // a pre-placed .orchestrator symlink is rejected without touching the
+    // sentinel target
+    {
+      const docWriterRoot = join(runRoot, "doc-trap-symlink");
+      await mkdir(docWriterRoot, { recursive: true });
+      await symlink(sentinelDir, join(docWriterRoot, ".orchestrator"));
+      let failure: unknown;
+      try {
+        await prepareActivationExecutionDocument(docWriterRoot, "DOC");
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineError);
+      expect((failure as Error).message).toContain("found a symbolic link");
+      expect(await readSentinel()).toBe("REAL");
+      expect((await readdir(join(docWriterRoot, ".orchestrator"))).sort()).toEqual(["real.md"]);
+    }
+
+    // a pre-placed execution.md regular file is rejected
+    {
+      const docWriterRoot = join(runRoot, "doc-trap-file");
+      await mkdir(join(docWriterRoot, ".orchestrator"), { recursive: true });
+      await writeFile(join(docWriterRoot, ".orchestrator", "execution.md"), "PREPLACED");
+      let failure: unknown;
+      try {
+        await prepareActivationExecutionDocument(docWriterRoot, "DOC");
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineError);
+      expect((failure as Error).message).toContain("execution document");
+      expect((failure as Error).message).toContain("already exists");
+      expect(await readFile(join(docWriterRoot, ".orchestrator", "execution.md"), "utf8")).toBe("PREPLACED");
+    }
+
+    // a pre-placed execution.md symlink pointing outside the run root is
+    // rejected without following it or touching the sentinel
+    {
+      const docWriterRoot = join(runRoot, "doc-trap-file-symlink");
+      await mkdir(join(docWriterRoot, ".orchestrator"), { recursive: true });
+      await symlink(sentinelReal, join(docWriterRoot, ".orchestrator", "execution.md"));
+      let failure: unknown;
+      try {
+        await prepareActivationExecutionDocument(docWriterRoot, "DOC");
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineError);
+      expect((failure as Error).message).toContain("execution document");
+      expect(await readSentinel()).toBe("REAL");
+    }
+
+    // through prepareActivationData the same trap becomes the typed
+    // `activation_prepare_failed` reason: a second preparation of the same
+    // state and index is rejected before any new object is created, and
+    // the genuine prepared activation is untouched
+    {
+      const prep = await prepareActivationData(pipeline, snap, [], "coder", 1);
+      const originalDoc = await readFile(prep.execution_document.host_path, "utf8");
+      await expect(prepareActivationData(pipeline, snap, [], "coder", 1)).rejects.toThrow(
+        /activation index 1 is already in use/,
+      );
+      expect(await readFile(prep.execution_document.host_path, "utf8")).toBe(originalDoc);
+      expect(await readSentinel()).toBe("REAL");
     }
   });
 });

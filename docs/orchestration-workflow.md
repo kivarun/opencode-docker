@@ -1240,6 +1240,64 @@ migration); the schema v2 document stays the production state of pipeline
 v1, and production v2 execution, store/sink integration, and resume are
 still not implemented.
 
+### Docker Helper 2.1.1 runtime adapter (unwired)
+
+`orchestrator/src/pipeline_v2_docker_runtime.ts` is a real implementation of
+the coordinator's two-session runtime boundary on the official
+docker-helper CLI 2.1.1 — still not wired into the CLI, `agent-smoke`, the
+lifecycle, or the default pipeline, and the production loader keeps
+rejecting pipeline schema v2 before Launcher auth and before any Session.
+
+The factory `createDockerHelperPipelineV2Runtime` validates everything
+before the first helper/filesystem side effect: the trusted pipeline
+snapshot, one loaded profile per agent state, an immutable per-state
+execution snapshot (profile name, image, OpenCode config content, and the
+destination-sorted profile env bindings), the CLI runner, the helper
+config, the minimal launcher operator environment, and the launcher id
+learned from `/auth` when known. Mutating the source profile map or the
+profile objects during activations changes nothing; user objects are never
+frozen or modified, and profile secrets never appear on public objects.
+
+Two sessions per activation, both created through the official CLI with
+the launcher operator env only: the Execution Session with workspace =
+canonical run root (its bearer authorizes every helper CLI call and is
+never handed to the worker) and the Tool Session with workspace = the
+canonical project directory (its bearer is the worker's only authority).
+A mismatch between the created session's `launcher_id` and the expected
+launcher id makes the adapter delete the known session itself before
+throwing `wrong_authority`; a Tool Session additionally requires the
+uncleaned Execution Session of the same activation. Bearer tokens live
+only in an instance-private registry keyed by the exact handle object;
+handles carry the session id and lifecycle methods only.
+
+The worker launch follows the fixed CLI 2.1.1 contract: a `pull` through
+the Execution Session (a failed pull is a worker failure and never falls
+back to a cached image), then one `run` with the fixed mount order
+(project `/workspace` RW, activation inputs `/pipeline/inputs` RO,
+activation outputs `/pipeline/outputs` RW), `--helper-socket` exactly
+once, workspace-relative mount sources cross-checked against the prepared
+activation, and no secret value in argv — the Tool bearer, the OpenCode
+config content, and every profile env value travel only through
+`--env-from` from deterministic private source variables of the run
+subprocess environment. The prompt travels in the orchestrator-owned
+execution document at the fixed container path
+`/pipeline/inputs/.orchestrator/execution.md`; argv carries only the
+static instruction to read it. A failed pull reports `worker_failed`, a
+timed-out run `worker_timeout`, a nonzero exit `worker_failed`, and exit 0
+`completed`; stdout never participates, and signals are not wired yet
+(130/143 are not classified). Cleanup is a memoized Launcher-authority
+delete — the physical delete runs at most once per session, and Tool and
+Execution cleanups remain separate operations.
+
+Known boundary: while `--env-from` keeps secret values out of the
+adapter's argv, the legacy daemon-side Docker CLI may still see resolved
+values in its own argv; that risk is documented, not eliminated. The
+UID/GID contract (orchestrator and shipped agent images as `opencode`
+1000:1000; external profile images only as operator-approved, filesystem-
+compatible images) is a runtime compatibility requirement of the profile,
+not a verified guarantee — the adapter cannot prove a default image UID
+through CLI 2.1.1.
+
 ## User intervention
 
 User intervention is an explicit state transition, not an interactive agent

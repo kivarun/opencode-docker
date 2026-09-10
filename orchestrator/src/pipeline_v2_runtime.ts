@@ -1,4 +1,4 @@
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { constants, type Stats } from "node:fs";
 import {
   link,
@@ -31,11 +31,13 @@ import {
   type PipelinePortSource,
   type PortType,
   type ResolvedPipelineV2,
+  type ResolvedV2AgentInputPort,
   type ResolvedV2AgentOutputPort,
   type ResolvedV2DecisionState,
   type ResolvedV2State,
 } from "./pipeline_v2.ts";
 import { validatePipelineJson } from "./pipeline_v2_schema.ts";
+import { canonicalJson } from "./canonical_json.ts";
 import {
   PipelineV2RuntimeError,
   type PipelineV2RuntimeFailureReason,
@@ -351,6 +353,30 @@ const UNTRUSTED_PREPARED_ACTIVATION_MESSAGE =
   "hand-built objects, casts, clones, activations of another pipeline and Proxies " +
   "are rejected before any field is read";
 
+/** Stable rejection message for a runtime handed an untrusted prepared activation. */
+const UNTRUSTED_PREPARED_ACTIVATION_RUNTIME_MESSAGE =
+  "the runtime requires the frozen prepared activation data object " +
+  "returned by a successful prepareActivationData call for the same trusted pipeline; " +
+  "hand-built objects, casts, clones, activations of another pipeline and Proxies " +
+  "are rejected before any field is read";
+
+/**
+ * Verify that the argument is the exact deep-frozen prepared activation
+ * object a successful `prepareActivationData` call returned for the given
+ * trusted pipeline. The check is a WeakMap lookup: getters and Proxy traps
+ * of the argument are never invoked. Session runtimes use this gate before
+ * any field of an activation is read.
+ */
+export function requirePreparedActivationForPipeline(
+  activation: PreparedActivationData,
+  pipeline: ResolvedPipelineV2,
+): void {
+  const provenance = preparedActivationProvenance.get(activation);
+  if (provenance === undefined || provenance.pipeline !== pipeline) {
+    throw new PipelineError(UNTRUSTED_PREPARED_ACTIVATION_RUNTIME_MESSAGE);
+  }
+}
+
 /**
  * Module-private provenance registry of published run output snapshots.
  *
@@ -467,6 +493,25 @@ export interface PreparedActivationMount {
   readonly read_only: boolean;
 }
 
+/**
+ * Name of the orchestrator-owned directory inside the prepared activation
+ * inputs root; it holds the execution document for one agent activation.
+ * The directory is created exclusively (0700) during activation
+ * preparation; a pre-placed object of any kind is a preparation failure.
+ */
+export const PIPELINE_V2_EXECUTION_DOCUMENT_DIR_NAME = ".orchestrator";
+
+/** Fixed container path of the execution document inside the worker. */
+export const PIPELINE_V2_EXECUTION_DOCUMENT_CONTAINER_PATH =
+  `${ACTIVATION_INPUTS_ROOT}/${PIPELINE_V2_EXECUTION_DOCUMENT_DIR_NAME}/execution.md`;
+
+export interface PreparedActivationExecutionDocument {
+  /** Canonical host path of the execution document inside the run root. */
+  readonly host_path: string;
+  /** Fixed container path the worker reads the document from. */
+  readonly container_path: string;
+}
+
 export interface PreparedActivationData {
   readonly run_root: string;
   readonly state_id: string;
@@ -479,6 +524,12 @@ export interface PreparedActivationData {
   readonly input_ports: readonly PreparedActivationInputPort[];
   readonly output_ports: readonly PreparedActivationOutputPort[];
   readonly mounts: readonly PreparedActivationMount[];
+  /**
+   * The orchestrator-owned execution document of this activation: the only
+   * host/container path pair the prepared object gains, and never the
+   * prompt body itself (the prompt travels inside the document file).
+   */
+  readonly execution_document: PreparedActivationExecutionDocument;
   /**
    * Kept from the compiled plan and enforced by `acceptActivationOutputs`
    * since the output-acceptance increment: the top-level entries of the
@@ -1727,6 +1778,156 @@ function findStateById(
 }
 
 /**
+ * The container path of one prepared input port inside the worker.
+ */
+function inputPortContainerPath(portId: string): string {
+  return `${ACTIVATION_INPUTS_ROOT}/${portId}`;
+}
+
+/**
+ * The container path of one prepared output port inside the worker.
+ */
+function outputPortContainerPath(portId: string): string {
+  return `${ACTIVATION_OUTPUTS_ROOT}/${portId}`;
+}
+
+function describeInputPort(
+  port: ResolvedV2AgentInputPort,
+  position: number,
+): string {
+  const lines = [
+    `${position}. \`${port.id}\` — type \`${port.type}\`, path \`${
+      inputPortContainerPath(port.id)
+    }\` (read-only)`,
+  ];
+  if (port.type === "json" && port.schema !== undefined) {
+    lines.push(
+      "   JSON schema (canonical JSON):",
+      "   ```json",
+      `   ${canonicalJson(port.schema)}`,
+      "   ```",
+    );
+  }
+  return lines.join("\n");
+}
+
+function describeOutputPort(
+  port: ResolvedV2AgentOutputPort,
+  position: number,
+): string {
+  const lines = [
+    `${position}. \`${port.id}\` — type \`${port.type}\`, path \`${
+      outputPortContainerPath(port.id)
+    }\``,
+  ];
+  if (port.type === "json" && port.schema !== undefined) {
+    lines.push(
+      "   JSON schema (canonical JSON):",
+      "   ```json",
+      `   ${canonicalJson(port.schema)}`,
+      "   ```",
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Create the orchestrator-owned execution document of one activation at
+ * its fixed location inside the prepared activation inputs root: the
+ * `.orchestrator` directory (real non-symlink directory, 0700, created
+ * exclusively) and `execution.md` (created with `O_CREAT|O_EXCL|O_NOFOLLOW`,
+ * mode 0600). Any pre-placed file, directory, symlink or other object at
+ * either path is rejected; existing external objects are never modified.
+ * `prepareActivationData` calls exactly this writer for every activation;
+ * it is exported for deterministic trap testing only and builds no
+ * activation data itself.
+ */
+export async function prepareActivationExecutionDocument(
+  inputsRoot: string,
+  document: string,
+): Promise<PreparedActivationExecutionDocument> {
+  const orchestratorDir = join(inputsRoot, PIPELINE_V2_EXECUTION_DOCUMENT_DIR_NAME);
+  await createRealDirectoryExclusive(
+    orchestratorDir,
+    "orchestrator execution document directory",
+  );
+  const executionDocumentHostPath = join(orchestratorDir, "execution.md");
+  await writeRegularFileExclusive(
+    executionDocumentHostPath,
+    Buffer.from(document, "utf8"),
+    "execution document",
+  );
+  return {
+    host_path: executionDocumentHostPath,
+    container_path: PIPELINE_V2_EXECUTION_DOCUMENT_CONTAINER_PATH,
+  };
+}
+
+/**
+ * Build the deterministic execution document of one agent activation.
+ *
+ * The document is the only carrier of the pipeline prompt body between the
+ * orchestrator and the worker: it is written into the prepared activation
+ * inputs root and the worker reads it at its fixed container path. The
+ * bytes are fully determined by the trusted pipeline state and the
+ * activation index — no timestamps, no run identity, no host paths, no
+ * profile env values, no credentials, no helper endpoint, no model config,
+ * and no input file contents ever appear in it.
+ */
+function buildExecutionDocument(
+  agentState: Extract<ResolvedV2State, { type: "agent" }>,
+  activationIndex: number,
+): string {
+  const inputLines = agentState.inputs.map((port, position) =>
+    describeInputPort(port, position + 1),
+  );
+  const outputLines = agentState.outputs.map((port, position) =>
+    describeOutputPort(port, position + 1),
+  );
+  const parts: string[] = [
+    "# Pipeline execution document",
+    "",
+    `state_id: ${JSON.stringify(agentState.id)}`,
+    `execution_index: ${activationIndex}`,
+    "",
+    "## Instruction",
+    "",
+    agentState.promptContent,
+    "",
+    "## Workspace",
+    "",
+    `The shared project directory is mounted at \`${PROJECT_MOUNT_TARGET}\` read-write.`,
+    "The project sources at `/workspace` are the working product of this activation.",
+    "They are not part of the pipeline output-port namespace; do not place",
+    "declared outputs anywhere but their declared paths below.",
+    "",
+    "## Input ports (declaration order)",
+    "",
+  ];
+  if (inputLines.length === 0) {
+    parts.push("This activation declares no input ports.", "");
+  } else {
+    parts.push(...inputLines, "");
+  }
+  parts.push("## Output ports (declaration order)", "");
+  if (outputLines.length === 0) {
+    parts.push("This activation declares no output ports.", "");
+  } else {
+    parts.push(...outputLines, "");
+  }
+  parts.push(
+    "## Rules",
+    "",
+    "- Create only the declared top-level outputs under `/pipeline/outputs`.",
+    "- Finish only after all declared outputs have been written.",
+    "- The project sources at `/workspace` are the working product of this",
+    "  activation; they are not part of the pipeline output-port namespace.",
+    "",
+  );
+  return parts.join("\n");
+}
+
+/**
  * Prepare the host-side data layout for one activation of an agent state:
  * a fresh `<runRoot>/activations/<activation-index>-<state-id>/data/` tree
  * with per-port `inputs/` (copied in declaration order from the run-owned
@@ -1892,7 +2093,7 @@ export async function prepareActivationData(
     // below, while the still-observable failure order stays unchanged.
     const resolvedInputSources = resolveInputPortSources();
 
-    const { dataRoot, inputsRoot, outputsRoot, preparedInputs, preparedOutputs } =
+    const { dataRoot, inputsRoot, outputsRoot, preparedInputs, preparedOutputs, executionDocument } =
       await withRuntimeReason("activation_prepare_failed", async () => {
         const dataRoot = join(activationRoot, "data");
         await ensureRealDirectory(dataRoot, "activation data root");
@@ -1925,7 +2126,18 @@ export async function prepareActivationData(
           }
           preparedOutputs.push({ id: port.id, type: port.type, path: target });
         }
-        return { dataRoot, inputsRoot, outputsRoot, preparedInputs, preparedOutputs };
+
+        // The orchestrator-owned execution document: the prompt travels
+        // only inside this file at its fixed container path. Both the
+        // directory and the file must be created exclusively, so a
+        // pre-placed file, directory, symlink or any other object is a
+        // preparation failure; existing external objects are never
+        // modified.
+        const executionDocument = await prepareActivationExecutionDocument(
+          inputsRoot,
+          buildExecutionDocument(agentState, activationIndex),
+        );
+        return { dataRoot, inputsRoot, outputsRoot, preparedInputs, preparedOutputs, executionDocument };
       });
 
     const mounts: PreparedActivationMount[] = [
@@ -1950,6 +2162,10 @@ export async function prepareActivationData(
       input_ports: preparedInputs,
       output_ports: preparedOutputs,
       mounts,
+      execution_document: {
+        host_path: executionDocument.host_path,
+        container_path: executionDocument.container_path,
+      },
       reject_undeclared_outputs: true as const,
     });
     // Register provenance only after the full preparation succeeded; the
