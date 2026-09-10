@@ -22,6 +22,10 @@ import {
   snapshotRunInputs,
 } from "../src/pipeline_v2_runtime.ts";
 import { runAgentSmoke, type AgentSmokeDeps } from "../src/agent_smoke.ts";
+import {
+  PipelineV2RuntimeError,
+  isPipelineV2RuntimeError,
+} from "../src/pipeline_v2_runtime_error.ts";
 import { STANDARD_AGENT_RESULT_SCHEMA } from "../src/agent_result.ts";
 
 const TASK_JSON = JSON.stringify({ goal: "the task" });
@@ -1592,6 +1596,58 @@ test("25. the whole accepted history is validated before the latest record is se
         }, /accepted state outputs must be a list/);
       }
       await expect(lstat(architectLeaf(runRoot, 1))).rejects.toThrow();
+    }
+  });
+});
+
+
+test("26. data-plane failures carry typed runtime reasons assigned by operation semantics", async () => {
+  await withRuntime(async (dirs, sources) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+
+    // a symlinked binding source is an invalid run input
+    {
+      const runRoot = await makeRunRoot(join(dirs.root, "r-typed-symlink"));
+      await symlink(join(sources, "task.txt"), join(sources, "task-typed-link.txt"));
+      let failure: unknown;
+      try {
+        await snapshotRunInputs(
+          pipeline,
+          [
+            { id: "task", path: join(sources, "task-typed-link.txt") },
+            { id: "specs", path: join(sources, "specs") },
+            { id: "config", path: join(sources, "config.json") },
+          ],
+          runRoot,
+        );
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineV2RuntimeError);
+      expect(failure).toBeInstanceOf(PipelineError);
+      expect(isPipelineV2RuntimeError(failure)).toBe(true);
+      expect((failure as PipelineV2RuntimeError).reason).toBe("run_input_invalid");
+      await expect(lstat(join(runRoot, "data"))).rejects.toThrow();
+    }
+
+    // tampering with an already-created snapshot before preparation reports
+    // `run_input_modified`, and the message stays the unchanged diagnostic
+    {
+      const runRoot = await makeRunRoot(join(dirs.root, "r-typed-tamper"));
+      const snap = await snapshotRunInputs(pipeline, ALL_BINDINGS(sources), runRoot);
+      await writeFile(snap.inputs[0]?.snapshot_path ?? "", "TAMPERED-SNAPSHOT");
+      let failure: unknown;
+      try {
+        await prepareActivationData(pipeline, snap, [], "coder", 1);
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineV2RuntimeError);
+      expect(failure).toBeInstanceOf(PipelineError);
+      expect(isPipelineV2RuntimeError(failure)).toBe(true);
+      expect((failure as PipelineV2RuntimeError).reason).toBe("run_input_modified");
+      expect((failure as Error).message).toMatch(/digest mismatch at .*: recorded [0-9a-f]{64}, recomputed [0-9a-f]{64}/);
+      await expect(lstat(join(runRoot, "activations"))).rejects.toThrow();
     }
   });
 });

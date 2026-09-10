@@ -36,6 +36,11 @@ import {
   type ResolvedV2State,
 } from "./pipeline_v2.ts";
 import { validatePipelineJson } from "./pipeline_v2_schema.ts";
+import {
+  PipelineV2RuntimeError,
+  pipelineV2RuntimeFailure,
+  withPipelineV2RuntimeReason,
+} from "./pipeline_v2_runtime_error.ts";
 
 /**
  * Pipeline schema v2 data plane: host-side runtime substrate for run-input
@@ -863,65 +868,73 @@ async function verifyRunInputsSnapshot(
   runInputs: RunInputsSnapshot,
   provenance: RunInputSnapshotProvenance,
 ): Promise<void> {
-  for (const entry of runInputs.inputs) {
-    const what = `run input snapshot of ${JSON.stringify(entry.id)}`;
-    const path = entry.snapshot_path;
-    const info = await lstatOrNull(path);
-    if (info === null) {
-      throw new PipelineError(`${what} snapshot object ${path} does not exist`);
-    }
-    if (info.isSymbolicLink()) {
-      throw new PipelineError(`${what} snapshot object ${path} is a symbolic link`);
-    }
-    if (entry.type === "directory") {
-      if (!info.isDirectory()) {
-        throw new PipelineError(
-          `${what} snapshot object ${path} is not a real directory, found ${describeEntry(info)}`,
-        );
+  /**
+   * Every failure of this verifier means an already-created run-input
+   * snapshot changed after it was created, so the whole body carries the
+   * single stable reason; each message stays the unchanged diagnostic
+   * text.
+   */
+  await withPipelineV2RuntimeReason("run_input_modified", async () => {
+    for (const entry of runInputs.inputs) {
+      const what = `run input snapshot of ${JSON.stringify(entry.id)}`;
+      const path = entry.snapshot_path;
+      const info = await lstatOrNull(path);
+      if (info === null) {
+        throw new PipelineError(`${what} snapshot object ${path} does not exist`);
       }
-    } else if (!info.isFile()) {
-      throw new PipelineError(
-        `${what} snapshot object ${path} is not a regular file, found ${describeEntry(info)}`,
-      );
-    }
-    let canonical: string;
-    try {
-      canonical = await realpath(path);
-    } catch (cause) {
-      throw fail(`${what} snapshot object ${path} cannot be canonicalized`, cause);
-    }
-    if (canonical !== path) {
-      throw new PipelineError(
-        `${what} snapshot object ${path} no longer resolves to itself; the snapshot was relocated or escaped`,
-      );
-    }
-    const hasher = inputDigestHasher(entry.type);
-    let recomputed: string;
-    if (entry.type === "directory") {
-      const tree = await scanDirectoryTree(path, what);
-      for (const treeEntry of tree) {
-        if (treeEntry.kind === "directory") {
-          hashDirectoryEntry(hasher, treeEntry, undefined);
-          continue;
+      if (info.isSymbolicLink()) {
+        throw new PipelineError(`${what} snapshot object ${path} is a symbolic link`);
+      }
+      if (entry.type === "directory") {
+        if (!info.isDirectory()) {
+          throw new PipelineError(
+            `${what} snapshot object ${path} is not a real directory, found ${describeEntry(info)}`,
+          );
         }
-        const content = await readRegularFileBytes(
-          treeEntry.absolutePath,
-          `${what} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+      } else if (!info.isFile()) {
+        throw new PipelineError(
+          `${what} snapshot object ${path} is not a regular file, found ${describeEntry(info)}`,
         );
-        hashDirectoryEntry(hasher, treeEntry, content);
       }
-      recomputed = hasher.digest("hex");
-    } else {
-      const content = await readRegularFileBytes(path, what);
-      hashBytes(hasher, content);
-      recomputed = hasher.digest("hex");
+      let canonical: string;
+      try {
+        canonical = await realpath(path);
+      } catch (cause) {
+        throw fail(`${what} snapshot object ${path} cannot be canonicalized`, cause);
+      }
+      if (canonical !== path) {
+        throw new PipelineError(
+          `${what} snapshot object ${path} no longer resolves to itself; the snapshot was relocated or escaped`,
+        );
+      }
+      const hasher = inputDigestHasher(entry.type);
+      let recomputed: string;
+      if (entry.type === "directory") {
+        const tree = await scanDirectoryTree(path, what);
+        for (const treeEntry of tree) {
+          if (treeEntry.kind === "directory") {
+            hashDirectoryEntry(hasher, treeEntry, undefined);
+            continue;
+          }
+          const content = await readRegularFileBytes(
+            treeEntry.absolutePath,
+            `${what} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          );
+          hashDirectoryEntry(hasher, treeEntry, content);
+        }
+        recomputed = hasher.digest("hex");
+      } else {
+        const content = await readRegularFileBytes(path, what);
+        hashBytes(hasher, content);
+        recomputed = hasher.digest("hex");
+      }
+      if (recomputed !== entry.digest) {
+        throw new PipelineError(
+          `${what} digest mismatch at ${path}: recorded ${entry.digest}, recomputed ${recomputed}`,
+        );
+      }
     }
-    if (recomputed !== entry.digest) {
-      throw new PipelineError(
-        `${what} digest mismatch at ${path}: recorded ${entry.digest}, recomputed ${recomputed}`,
-      );
-    }
-  }
+  });
 }
 
 let tmpCounter = 0;
@@ -1003,29 +1016,37 @@ export async function snapshotRunInputs(
   runRoot: string,
 ): Promise<RunInputsSnapshot> {
   requireResolvedPipelineV2Provenance(pipeline, "run input binding");
-  const parsedBindings = parseRunInputBindings(bindings);
-  const declared = pipeline.inputs;
-  const declaredById = new Map(declared.map((input) => [input.id, input]));
+  // Region 1 — binding shape and declared-input matching: a malformed
+  // binding list, an unknown id, a duplicate binding or a missing binding
+  // is an invalid run input, not an internal error. The provenance gate
+  // above stays plain.
+  const parsedBindings = await withPipelineV2RuntimeReason("run_input_invalid", async () => {
+    const parsed = parseRunInputBindings(bindings);
+    const declared = pipeline.inputs;
+    const declaredById = new Map(declared.map((input) => [input.id, input]));
 
-  const seenIds = new Set<string>();
-  for (const binding of parsedBindings) {
-    if (!declaredById.has(binding.id)) {
-      throw new PipelineError(
-        `run input binding ${JSON.stringify(binding.id)} does not match a declared pipeline input`,
-      );
+    const seenIds = new Set<string>();
+    for (const binding of parsed) {
+      if (!declaredById.has(binding.id)) {
+        throw new PipelineError(
+          `run input binding ${JSON.stringify(binding.id)} does not match a declared pipeline input`,
+        );
+      }
+      if (seenIds.has(binding.id)) {
+        throw new PipelineError(
+          `pipeline input ${JSON.stringify(binding.id)} is bound more than once`,
+        );
+      }
+      seenIds.add(binding.id);
     }
-    if (seenIds.has(binding.id)) {
-      throw new PipelineError(
-        `pipeline input ${JSON.stringify(binding.id)} is bound more than once`,
-      );
+    for (const input of pipeline.inputs) {
+      if (!seenIds.has(input.id)) {
+        throw new PipelineError(`pipeline input ${JSON.stringify(input.id)} is not bound`);
+      }
     }
-    seenIds.add(binding.id);
-  }
-  for (const input of declared) {
-    if (!seenIds.has(input.id)) {
-      throw new PipelineError(`pipeline input ${JSON.stringify(input.id)} is not bound`);
-    }
-  }
+    return parsed;
+  });
+  const declaredById = new Map(pipeline.inputs.map((input) => [input.id, input]));
 
   const runRootCanonical = await requireCanonicalRunRoot(runRoot, "run root");
 
@@ -1038,79 +1059,88 @@ export async function snapshotRunInputs(
 
   // Validate every bound object (real kind, json parseability, clean tree,
   // outside the run root) and cache contents/plans before any mutation.
+  // Region 2 — per-binding source validation: a missing, symlinked or
+  // wrong-kind source, a forbidden object in a directory, malformed JSON or
+  // a schema violation is an invalid run input.
   interface PreparedBinding extends RunInputBinding {
     readonly content?: Buffer;
     readonly tree?: ScannedTreeEntry[];
   }
-  const prepared: PreparedBinding[] = [];
-  for (const binding of parsedBindings) {
-    const input = declaredById.get(binding.id);
-    if (input === undefined) {
-      throw new PipelineError(
-        `run input binding ${JSON.stringify(binding.id)} does not match a declared pipeline input`,
-      );
-    }
-    const what = `pipeline input ${JSON.stringify(binding.id)}`;
-    const info = await lstatOrNull(binding.path);
-    if (info === null) {
-      throw new PipelineError(`${what} bound path ${binding.path} does not exist`);
-    }
-    if (info.isSymbolicLink()) {
-      throw new PipelineError(
-        `${what} bound path ${binding.path} is a symbolic link; bind the real object`,
-      );
-    }
-    if (input.type === "directory") {
-      if (!info.isDirectory()) {
-        throw new PipelineError(
-          `${what} declares type "directory" but the bound path is not a real directory`,
-        );
-      }
-    } else if (!info.isFile()) {
-      throw new PipelineError(
-        `${what} declares type ${JSON.stringify(input.type)} but the bound path is not a regular file`,
-      );
-    }
-    let canonicalSource: string;
-    try {
-      canonicalSource = await realpath(binding.path);
-    } catch (cause) {
-      throw fail(`${what} bound path ${binding.path} cannot be canonicalized`, cause);
-    }
-    if (
-      canonicalSource === runRootCanonical ||
-      isInsideRoot(runRootCanonical, canonicalSource)
-    ) {
-      throw new PipelineError(
-        `${what} bound path must resolve outside the canonical run root ${runRootCanonical}`,
-      );
-    }
-    if (input.type === "directory") {
-      prepared.push({ ...binding, tree: await scanDirectoryTree(binding.path, what) });
-    } else {
-      const content = await readRegularFileBytes(binding.path, what);
-      if (input.type === "json") {
-        let parsedJson: unknown;
-        try {
-          parsedJson = JSON.parse(content.toString("utf8"));
-        } catch {
-          // Stable, content-free diagnostic: the parser message can echo
-          // the offending token or an input fragment, so it is never
-          // included.
+  const prepared: PreparedBinding[] = await withPipelineV2RuntimeReason(
+    "run_input_invalid",
+    async () => {
+      const prepared: PreparedBinding[] = [];
+      for (const binding of parsedBindings) {
+        const input = declaredById.get(binding.id);
+        if (input === undefined) {
           throw new PipelineError(
-            `${what} bound file ${binding.path} is not valid JSON`,
+            `run input binding ${JSON.stringify(binding.id)} does not match a declared pipeline input`,
           );
         }
-        // The same compiled Draft 2020-12 mechanism that validates JSON
-        // agent outputs validates declared json run inputs here, before any
-        // snapshot is created. Diagnostics never contain parsed values.
-        if (input.schema !== undefined) {
-          validatePipelineJson(input.schema, parsedJson, `${what} bound file ${binding.path}`);
+        const what = `pipeline input ${JSON.stringify(binding.id)}`;
+        const info = await lstatOrNull(binding.path);
+        if (info === null) {
+          throw new PipelineError(`${what} bound path ${binding.path} does not exist`);
+        }
+        if (info.isSymbolicLink()) {
+          throw new PipelineError(
+            `${what} bound path ${binding.path} is a symbolic link; bind the real object`,
+          );
+        }
+        if (input.type === "directory") {
+          if (!info.isDirectory()) {
+            throw new PipelineError(
+              `${what} declares type "directory" but the bound path is not a real directory`,
+            );
+          }
+        } else if (!info.isFile()) {
+          throw new PipelineError(
+            `${what} declares type ${JSON.stringify(input.type)} but the bound path is not a regular file`,
+          );
+        }
+        let canonicalSource: string;
+        try {
+          canonicalSource = await realpath(binding.path);
+        } catch (cause) {
+          throw fail(`${what} bound path ${binding.path} cannot be canonicalized`, cause);
+        }
+        if (
+          canonicalSource === runRootCanonical ||
+          isInsideRoot(runRootCanonical, canonicalSource)
+        ) {
+          throw new PipelineError(
+            `${what} bound path must resolve outside the canonical run root ${runRootCanonical}`,
+          );
+        }
+        if (input.type === "directory") {
+          prepared.push({ ...binding, tree: await scanDirectoryTree(binding.path, what) });
+        } else {
+          const content = await readRegularFileBytes(binding.path, what);
+          if (input.type === "json") {
+            let parsedJson: unknown;
+            try {
+              parsedJson = JSON.parse(content.toString("utf8"));
+            } catch {
+              // Stable, content-free diagnostic: the parser message can echo
+              // the offending token or an input fragment, so it is never
+              // included.
+              throw new PipelineError(
+                `${what} bound file ${binding.path} is not valid JSON`,
+              );
+            }
+            // The same compiled Draft 2020-12 mechanism that validates JSON
+            // agent outputs validates declared json run inputs here, before any
+            // snapshot is created. Diagnostics never contain parsed values.
+            if (input.schema !== undefined) {
+              validatePipelineJson(input.schema, parsedJson, `${what} bound file ${binding.path}`);
+            }
+          }
+          prepared.push({ ...binding, content });
         }
       }
-      prepared.push({ ...binding, content });
-    }
-  }
+      return prepared;
+    },
+  );
 
   const dataPath = join(runRootCanonical, "data");
   const inputsRoot = join(dataPath, "inputs");
@@ -1132,114 +1162,118 @@ export async function snapshotRunInputs(
     }
   };
 
-  try {
-    // Fail fast before any copy when a snapshot entry already exists.
-    for (const input of declared) {
-      await requireAbsent(
-        join(inputsRoot, input.id),
-        `run input snapshot of ${JSON.stringify(input.id)}`,
-      );
-    }
-
-    const entries: RunInputSnapshotEntry[] = [];
-    for (const input of declared) {
-      const binding = prepared.find((entry) => entry.id === input.id);
-      if (binding === undefined) {
-        throw new PipelineError(
-          `run input binding for ${JSON.stringify(input.id)} disappeared during snapshot`,
+  // Region 3 — snapshot formation and publication: a snapshot entry that
+  // cannot be formed or published atomically is an invalid run input.
+  return await withPipelineV2RuntimeReason("run_input_invalid", async () => {
+    try {
+      // Fail fast before any copy when a snapshot entry already exists.
+      for (const input of pipeline.inputs) {
+        await requireAbsent(
+          join(inputsRoot, input.id),
+          `run input snapshot of ${JSON.stringify(input.id)}`,
         );
       }
-      const what = `run input snapshot of ${JSON.stringify(input.id)}`;
-      const finalPath = join(inputsRoot, input.id);
-      const hasher = inputDigestHasher(input.type);
-      if (input.type === "directory") {
-        const tree = binding.tree;
-        if (tree === undefined) {
-          throw new PipelineError(`${what} has no scanned source tree`);
+
+      const entries: RunInputSnapshotEntry[] = [];
+      for (const input of pipeline.inputs) {
+        const binding = prepared.find((entry) => entry.id === input.id);
+        if (binding === undefined) {
+          throw new PipelineError(
+            `run input binding for ${JSON.stringify(input.id)} disappeared during snapshot`,
+          );
         }
-        const tmpDir = join(inputsRoot, tmpEntryName(input.id));
-        createdPaths.add(tmpDir);
-        await createRealDirectoryExclusive(tmpDir, what);
-        for (const entry of tree) {
-          const target = join(tmpDir, entry.relativePath);
-          if (entry.kind === "directory") {
-            hashDirectoryEntry(hasher, entry, undefined);
-            await createRealDirectoryExclusive(
-              target,
-              `${what} directory entry ${JSON.stringify(entry.relativePath)}`,
+        const what = `run input snapshot of ${JSON.stringify(input.id)}`;
+        const finalPath = join(inputsRoot, input.id);
+        const hasher = inputDigestHasher(input.type);
+        if (input.type === "directory") {
+          const tree = binding.tree;
+          if (tree === undefined) {
+            throw new PipelineError(`${what} has no scanned source tree`);
+          }
+          const tmpDir = join(inputsRoot, tmpEntryName(input.id));
+          createdPaths.add(tmpDir);
+          await createRealDirectoryExclusive(tmpDir, what);
+          for (const entry of tree) {
+            const target = join(tmpDir, entry.relativePath);
+            if (entry.kind === "directory") {
+              hashDirectoryEntry(hasher, entry, undefined);
+              await createRealDirectoryExclusive(
+                target,
+                `${what} directory entry ${JSON.stringify(entry.relativePath)}`,
+              );
+              continue;
+            }
+            const content = await readRegularFileBytes(
+              entry.absolutePath,
+              `${what} file entry ${JSON.stringify(entry.relativePath)}`,
             );
-            continue;
+            hashDirectoryEntry(hasher, entry, content);
+            await writeRegularFileExclusive(
+              target,
+              content,
+              `${what} file entry ${JSON.stringify(entry.relativePath)}`,
+            );
           }
-          const content = await readRegularFileBytes(
-            entry.absolutePath,
-            `${what} file entry ${JSON.stringify(entry.relativePath)}`,
-          );
-          hashDirectoryEntry(hasher, entry, content);
-          await writeRegularFileExclusive(
-            target,
-            content,
-            `${what} file entry ${JSON.stringify(entry.relativePath)}`,
-          );
-        }
-        await requireAbsent(finalPath, what);
-        try {
-          await rename(tmpDir, finalPath);
-        } catch (cause) {
-          throw fail(`${what} could not be published at ${finalPath}`, cause);
-        }
-        createdPaths.delete(tmpDir);
-        createdPaths.add(finalPath);
-      } else {
-        const content = binding.content;
-        if (content === undefined) {
-          throw new PipelineError(`${what} has no cached source content`);
-        }
-        hashBytes(hasher, content);
-        const tmpPath = join(inputsRoot, tmpEntryName(input.id));
-        createdPaths.add(tmpPath);
-        await writeRegularFileExclusive(tmpPath, content, what);
-        try {
-          await link(tmpPath, finalPath);
-        } catch (cause) {
-          if (isErrnoException(cause, "EEXIST")) {
-            throw new PipelineError(`${what} ${finalPath} already exists`);
+          await requireAbsent(finalPath, what);
+          try {
+            await rename(tmpDir, finalPath);
+          } catch (cause) {
+            throw fail(`${what} could not be published at ${finalPath}`, cause);
           }
-          throw fail(`${what} could not be published at ${finalPath}`, cause);
+          createdPaths.delete(tmpDir);
+          createdPaths.add(finalPath);
+        } else {
+          const content = binding.content;
+          if (content === undefined) {
+            throw new PipelineError(`${what} has no cached source content`);
+          }
+          hashBytes(hasher, content);
+          const tmpPath = join(inputsRoot, tmpEntryName(input.id));
+          createdPaths.add(tmpPath);
+          await writeRegularFileExclusive(tmpPath, content, what);
+          try {
+            await link(tmpPath, finalPath);
+          } catch (cause) {
+            if (isErrnoException(cause, "EEXIST")) {
+              throw new PipelineError(`${what} ${finalPath} already exists`);
+            }
+            throw fail(`${what} could not be published at ${finalPath}`, cause);
+          }
+          createdPaths.delete(tmpPath);
+          createdPaths.add(finalPath);
+          await unlink(tmpPath).catch(() => {
+            // leftover temporary name is harmless garbage, never a snapshot
+          });
         }
-        createdPaths.delete(tmpPath);
-        createdPaths.add(finalPath);
-        await unlink(tmpPath).catch(() => {
-          // leftover temporary name is harmless garbage, never a snapshot
+        entries.push({
+          id: input.id,
+          type: input.type,
+          protected: input.protected,
+          snapshot_path: finalPath,
+          digest: hasher.digest("hex"),
         });
       }
-      entries.push({
-        id: input.id,
-        type: input.type,
-        protected: input.protected,
-        snapshot_path: finalPath,
-        digest: hasher.digest("hex"),
-      });
-    }
 
-    const snapshot = deepFreeze({
-      run_root: runRootCanonical,
-      inputs_root: inputsRoot,
-      project_root: projectRootCanonical,
-      inputs: entries,
-    });
-    // Register provenance only after the full snapshot succeeded; the
-    // exact frozen object is the key, so hand-built objects, casts,
-    // clones and Proxies can never acquire provenance.
-    runInputSnapshotProvenance.set(snapshot, {
-      pipeline,
-      runRootCanonical,
-      projectRootCanonical,
-    });
-    return snapshot;
-  } catch (cause) {
-    await cleanupCreated();
-    throw cause;
-  }
+      const snapshot = deepFreeze({
+        run_root: runRootCanonical,
+        inputs_root: inputsRoot,
+        project_root: projectRootCanonical,
+        inputs: entries,
+      });
+      // Register provenance only after the full snapshot succeeded; the
+      // exact frozen object is the key, so hand-built objects, casts,
+      // clones and Proxies can never acquire provenance.
+      runInputSnapshotProvenance.set(snapshot, {
+        pipeline,
+        runRootCanonical,
+        projectRootCanonical,
+      });
+      return snapshot;
+    } catch (cause) {
+      await cleanupCreated();
+      throw cause;
+    }
+  });
 }
 
 interface ParsedAcceptedOutput {
@@ -1412,50 +1446,59 @@ async function resolveAllAcceptedOutputs(
   acceptedOutputs: readonly ParsedAcceptedOutput[],
   runRootCanonical: string,
 ): Promise<FullyResolvedRecord[]> {
-  const activationsRoot = join(runRootCanonical, "activations");
-  const fullyResolved: FullyResolvedRecord[] = [];
-  if (acceptedOutputs.length > 0) {
-    await requireRealDirectory(activationsRoot, "activations root");
-  }
-  for (const record of acceptedOutputs) {
-    const what = `accepted state output for ${JSON.stringify(record.state)}.${JSON.stringify(record.output)} at activation index ${record.activationIndex}`;
-    const leafPath = join(activationsRoot, `${record.activationIndex}-${record.state}`);
-    await requireRealDirectory(leafPath, `${what} activation leaf`);
-    await requireRealDirectory(join(leafPath, "data"), `${what} activation data root`);
-    await requireRealDirectory(join(leafPath, "data", "outputs"), `${what} activation outputs root`);
-    const fixedPath = join(leafPath, "data", "outputs", record.output);
-    const info = await lstatOrNull(fixedPath);
-    if (info === null) {
-      throw new PipelineError(`${what} fixed output path ${fixedPath} does not exist`);
+  /**
+   * Every failure here concerns a runner-owned record that was already
+   * structurally accepted: its fixed output location disappeared, was
+   * replaced, broke containment or changed kind. The whole body carries
+   * the single stable reason; each message stays the unchanged diagnostic
+   * text. Record-shape and coherence violations never reach this phase.
+   */
+  return await withPipelineV2RuntimeReason("accepted_output_modified", async () => {
+    const activationsRoot = join(runRootCanonical, "activations");
+    const fullyResolved: FullyResolvedRecord[] = [];
+    if (acceptedOutputs.length > 0) {
+      await requireRealDirectory(activationsRoot, "activations root");
     }
-    if (info.isSymbolicLink()) {
-      throw new PipelineError(`${what} fixed output path ${fixedPath} is a symbolic link`);
-    }
-    if (record.type === "directory") {
-      if (!info.isDirectory()) {
+    for (const record of acceptedOutputs) {
+      const what = `accepted state output for ${JSON.stringify(record.state)}.${JSON.stringify(record.output)} at activation index ${record.activationIndex}`;
+      const leafPath = join(activationsRoot, `${record.activationIndex}-${record.state}`);
+      await requireRealDirectory(leafPath, `${what} activation leaf`);
+      await requireRealDirectory(join(leafPath, "data"), `${what} activation data root`);
+      await requireRealDirectory(join(leafPath, "data", "outputs"), `${what} activation outputs root`);
+      const fixedPath = join(leafPath, "data", "outputs", record.output);
+      const info = await lstatOrNull(fixedPath);
+      if (info === null) {
+        throw new PipelineError(`${what} fixed output path ${fixedPath} does not exist`);
+      }
+      if (info.isSymbolicLink()) {
+        throw new PipelineError(`${what} fixed output path ${fixedPath} is a symbolic link`);
+      }
+      if (record.type === "directory") {
+        if (!info.isDirectory()) {
+          throw new PipelineError(
+            `${what} fixed output ${fixedPath} is not a real directory, found ${describeEntry(info)}`,
+          );
+        }
+      } else if (!info.isFile()) {
         throw new PipelineError(
-          `${what} fixed output ${fixedPath} is not a real directory, found ${describeEntry(info)}`,
+          `${what} fixed output ${fixedPath} is not a regular file, found ${describeEntry(info)}`,
         );
       }
-    } else if (!info.isFile()) {
-      throw new PipelineError(
-        `${what} fixed output ${fixedPath} is not a regular file, found ${describeEntry(info)}`,
-      );
+      let canonical: string;
+      try {
+        canonical = await realpath(fixedPath);
+      } catch (cause) {
+        throw fail(`${what} fixed output ${fixedPath} cannot be canonicalized`, cause);
+      }
+      if (!isInsideRoot(runRootCanonical, canonical)) {
+        throw new PipelineError(
+          `${what} fixed output resolves outside the canonical run root ${runRootCanonical}`,
+        );
+      }
+      fullyResolved.push({ record, type: record.type, canonicalPath: canonical });
     }
-    let canonical: string;
-    try {
-      canonical = await realpath(fixedPath);
-    } catch (cause) {
-      throw fail(`${what} fixed output ${fixedPath} cannot be canonicalized`, cause);
-    }
-    if (!isInsideRoot(runRootCanonical, canonical)) {
-      throw new PipelineError(
-        `${what} fixed output resolves outside the canonical run root ${runRootCanonical}`,
-      );
-    }
-    fullyResolved.push({ record, type: record.type, canonicalPath: canonical });
-  }
-  return fullyResolved;
+    return fullyResolved;
+  });
 }
 
 /**
@@ -1469,20 +1512,28 @@ async function resolveAllAcceptedOutputs(
 async function verifyAcceptedOutputDigests(
   fullyResolved: readonly FullyResolvedRecord[],
 ): Promise<void> {
-  for (const resolvedRecord of fullyResolved) {
-    const what = `accepted state output for ${JSON.stringify(resolvedRecord.record.state)}.${JSON.stringify(resolvedRecord.record.output)} at activation index ${resolvedRecord.record.activationIndex}`;
-    const recomputed = (await readPortValueForDigest(
-      resolvedRecord.type,
-      resolvedRecord.canonicalPath,
-      what,
-      false,
-    )).digest;
-    if (recomputed !== resolvedRecord.record.digest) {
-      throw new PipelineError(
-        `${what} digest mismatch: recorded ${resolvedRecord.record.digest}, recomputed ${recomputed}`,
-      );
+  /**
+   * Digest recomputation of every record — including old, non-winning
+   * ones — against the recorded digests. Any mismatch means an accepted
+   * output changed after acceptance, so the whole body carries the single
+   * stable reason; each message stays the unchanged diagnostic text.
+   */
+  return await withPipelineV2RuntimeReason("accepted_output_modified", async () => {
+    for (const resolvedRecord of fullyResolved) {
+      const what = `accepted state output for ${JSON.stringify(resolvedRecord.record.state)}.${JSON.stringify(resolvedRecord.record.output)} at activation index ${resolvedRecord.record.activationIndex}`;
+      const recomputed = (await readPortValueForDigest(
+        resolvedRecord.type,
+        resolvedRecord.canonicalPath,
+        what,
+        false,
+      )).digest;
+      if (recomputed !== resolvedRecord.record.digest) {
+        throw new PipelineError(
+          `${what} digest mismatch: recorded ${resolvedRecord.record.digest}, recomputed ${recomputed}`,
+        );
+      }
     }
-  }
+  });
 }
 
 interface ResolvedAcceptedOutput {
@@ -1630,133 +1681,142 @@ export async function prepareActivationData(
     activationIndex,
   );
 
-  const activationsRoot = join(runRootCanonical, "activations");
-  await ensureRealDirectory(activationsRoot, "activations root");
+  // Region — activation tree preparation: an occupied activation index, a
+  // leaf or data/input/output tree that cannot be created safely, a
+  // pre-placed object in the activation tree, or an input port that cannot
+  // be materialized is an activation preparation failure. Run-input
+  // tampering above reports `run_input_modified`, accepted-output
+  // tampering `accepted_output_modified`, and provenance/caller-contract
+  // violations stay plain `PipelineError`s.
+  return await withPipelineV2RuntimeReason("activation_prepare_failed", async () => {
+    const activationsRoot = join(runRootCanonical, "activations");
+    await ensureRealDirectory(activationsRoot, "activations root");
 
-  // The activation index is globally unique within the run: any existing
-  // entry with the same `<index>-` prefix (any state, any object kind,
-  // symlinks never followed) rejects the request before the leaf is made.
-  const indexPrefix = `${activationIndex}-`;
-  let dirents;
-  try {
-    dirents = await readdir(activationsRoot, { withFileTypes: true });
-  } catch (cause) {
-    throw fail(`activations root ${activationsRoot} could not be listed`, cause);
-  }
-  const sortedNames = dirents.map((dirent) => dirent.name).sort();
-  for (const name of sortedNames) {
-    if (name.startsWith(indexPrefix)) {
-      throw new PipelineError(
-        `activation index ${activationIndex} is already in use at ${join(activationsRoot, name)}`,
-      );
+    // The activation index is globally unique within the run: any existing
+    // entry with the same `<index>-` prefix (any state, any object kind,
+    // symlinks never followed) rejects the request before the leaf is made.
+    const indexPrefix = `${activationIndex}-`;
+    let dirents;
+    try {
+      dirents = await readdir(activationsRoot, { withFileTypes: true });
+    } catch (cause) {
+      throw fail(`activations root ${activationsRoot} could not be listed`, cause);
     }
-  }
-
-  const activationRoot = join(activationsRoot, `${activationIndex}-${safeStateId}`);
-  await requireAbsent(activationRoot, "activation leaf");
-
-  try {
-    await mkdir(activationRoot, { mode: 0o700 });
-  } catch (cause) {
-    throw fail(`activation leaf ${activationRoot} could not be created as a new directory`, cause);
-  }
-
-  try {
-    const dataRoot = join(activationRoot, "data");
-    await ensureRealDirectory(dataRoot, "activation data root");
-    const inputsRoot = join(dataRoot, "inputs");
-    await ensureRealDirectory(inputsRoot, "activation inputs root");
-    const outputsRoot = join(dataRoot, "outputs");
-    await ensureRealDirectory(outputsRoot, "activation outputs root");
-
-    const preparedInputs: PreparedActivationInputPort[] = [];
-    for (const port of agentState.inputs) {
-      const what = `input port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)}`;
-      const target = join(inputsRoot, port.id);
-      let sourcePath: string;
-      if ("pipeline_input" in port.source) {
-        let entry: RunInputSnapshotEntry | undefined;
-        for (const candidate of runInputs.inputs) {
-          if (candidate.id === port.source.pipeline_input) {
-            entry = candidate;
-            break;
-          }
-        }
-        if (entry === undefined) {
-          throw new PipelineError(
-            `${what} references pipeline input ${JSON.stringify(port.source.pipeline_input)} which has no run input snapshot entry`,
-          );
-        }
-        sourcePath = entry.snapshot_path;
-      } else {
-        const accepted = acceptedByRef.get(
-          `${port.source.state_output.state}\u0000${port.source.state_output.output}`,
+    const sortedNames = dirents.map((dirent) => dirent.name).sort();
+    for (const name of sortedNames) {
+      if (name.startsWith(indexPrefix)) {
+        throw new PipelineError(
+          `activation index ${activationIndex} is already in use at ${join(activationsRoot, name)}`,
         );
-        if (accepted === undefined) {
-          throw new PipelineError(
-            `${what} references state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)} which has no accepted output yet (missing, forward or first-visit self reference)`,
-          );
-        }
-        if (accepted.type !== port.type) {
-          throw new PipelineError(
-            `${what} expects type ${JSON.stringify(port.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
-          );
-        }
-        sourcePath = accepted.canonicalPath;
       }
-      await copyTypedValue(sourcePath, port.type, target, what);
-      preparedInputs.push({
-        id: port.id,
-        source: port.source,
-        type: port.type,
-        path: target,
+    }
+
+    const activationRoot = join(activationsRoot, `${activationIndex}-${safeStateId}`);
+    await requireAbsent(activationRoot, "activation leaf");
+
+    try {
+      await mkdir(activationRoot, { mode: 0o700 });
+    } catch (cause) {
+      throw fail(`activation leaf ${activationRoot} could not be created as a new directory`, cause);
+    }
+
+    try {
+      const dataRoot = join(activationRoot, "data");
+      await ensureRealDirectory(dataRoot, "activation data root");
+      const inputsRoot = join(dataRoot, "inputs");
+      await ensureRealDirectory(inputsRoot, "activation inputs root");
+      const outputsRoot = join(dataRoot, "outputs");
+      await ensureRealDirectory(outputsRoot, "activation outputs root");
+
+      const preparedInputs: PreparedActivationInputPort[] = [];
+      for (const port of agentState.inputs) {
+        const what = `input port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)}`;
+        const target = join(inputsRoot, port.id);
+        let sourcePath: string;
+        if ("pipeline_input" in port.source) {
+          let entry: RunInputSnapshotEntry | undefined;
+          for (const candidate of runInputs.inputs) {
+            if (candidate.id === port.source.pipeline_input) {
+              entry = candidate;
+              break;
+            }
+          }
+          if (entry === undefined) {
+            throw new PipelineError(
+              `${what} references pipeline input ${JSON.stringify(port.source.pipeline_input)} which has no run input snapshot entry`,
+            );
+          }
+          sourcePath = entry.snapshot_path;
+        } else {
+          const accepted = acceptedByRef.get(
+            `${port.source.state_output.state}\u0000${port.source.state_output.output}`,
+          );
+          if (accepted === undefined) {
+            throw new PipelineError(
+              `${what} references state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)} which has no accepted output yet (missing, forward or first-visit self reference)`,
+            );
+          }
+          if (accepted.type !== port.type) {
+            throw new PipelineError(
+              `${what} expects type ${JSON.stringify(port.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
+            );
+          }
+          sourcePath = accepted.canonicalPath;
+        }
+        await copyTypedValue(sourcePath, port.type, target, what);
+        preparedInputs.push({
+          id: port.id,
+          source: port.source,
+          type: port.type,
+          path: target,
+        });
+      }
+
+      const preparedOutputs: PreparedActivationOutputPort[] = [];
+      for (const port of agentState.outputs) {
+        const what = `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)}`;
+        const target = join(outputsRoot, port.id);
+        if (port.type === "directory") {
+          await createRealDirectoryExclusive(target, what);
+        } else {
+          await requireAbsent(target, `${what} path`);
+        }
+        preparedOutputs.push({ id: port.id, type: port.type, path: target });
+      }
+
+      const mounts: PreparedActivationMount[] = [
+        { source: projectRoot, target: PROJECT_MOUNT_TARGET, read_only: false },
+        { source: inputsRoot, target: ACTIVATION_INPUTS_ROOT, read_only: true },
+        { source: outputsRoot, target: ACTIVATION_OUTPUTS_ROOT, read_only: false },
+      ];
+
+      const prepared: PreparedActivationData = deepFreeze({
+        run_root: runRootCanonical,
+        state_id: agentState.id,
+        activation_index: activationIndex,
+        activation_root: activationRoot,
+        data_root: dataRoot,
+        inputs_root: inputsRoot,
+        outputs_root: outputsRoot,
+        project_root: projectRoot,
+        input_ports: preparedInputs,
+        output_ports: preparedOutputs,
+        mounts,
+        reject_undeclared_outputs: true as const,
       });
+      // Register provenance only after the full preparation succeeded; the
+      // exact frozen object is the key, so hand-built objects, casts, clones
+      // and Proxies can never acquire provenance.
+      preparedActivationProvenance.set(prepared, { pipeline, runRootCanonical });
+      return prepared;
+    } catch (cause) {
+      // The leaf was created exclusively by this call; remove exactly this
+      // tree and nothing else. Run-level infrastructure (data, activations
+      // root) and the shared project directory persist.
+      await removeTrackedPath(activationRoot, runRootCanonical);
+      throw cause;
     }
-
-    const preparedOutputs: PreparedActivationOutputPort[] = [];
-    for (const port of agentState.outputs) {
-      const what = `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)}`;
-      const target = join(outputsRoot, port.id);
-      if (port.type === "directory") {
-        await createRealDirectoryExclusive(target, what);
-      } else {
-        await requireAbsent(target, `${what} path`);
-      }
-      preparedOutputs.push({ id: port.id, type: port.type, path: target });
-    }
-
-    const mounts: PreparedActivationMount[] = [
-      { source: projectRoot, target: PROJECT_MOUNT_TARGET, read_only: false },
-      { source: inputsRoot, target: ACTIVATION_INPUTS_ROOT, read_only: true },
-      { source: outputsRoot, target: ACTIVATION_OUTPUTS_ROOT, read_only: false },
-    ];
-
-    const prepared: PreparedActivationData = deepFreeze({
-      run_root: runRootCanonical,
-      state_id: agentState.id,
-      activation_index: activationIndex,
-      activation_root: activationRoot,
-      data_root: dataRoot,
-      inputs_root: inputsRoot,
-      outputs_root: outputsRoot,
-      project_root: projectRoot,
-      input_ports: preparedInputs,
-      output_ports: preparedOutputs,
-      mounts,
-      reject_undeclared_outputs: true as const,
-    });
-    // Register provenance only after the full preparation succeeded; the
-    // exact frozen object is the key, so hand-built objects, casts, clones
-    // and Proxies can never acquire provenance.
-    preparedActivationProvenance.set(prepared, { pipeline, runRootCanonical });
-    return prepared;
-  } catch (cause) {
-    // The leaf was created exclusively by this call; remove exactly this
-    // tree and nothing else. Run-level infrastructure (data, activations
-    // root) and the shared project directory persist.
-    await removeTrackedPath(activationRoot, runRootCanonical);
-    throw cause;
-  }
+  });
 }
 
 /**
@@ -1807,101 +1867,109 @@ export async function acceptActivationOutputs(
   const agentState = state;
 
   await requireRealDirectory(runRootCanonical, "run root");
-  await requireRealDirectory(activation.outputs_root, "activation outputs root");
-  let outputsRootCanonical: string;
-  try {
-    outputsRootCanonical = await realpath(activation.outputs_root);
-  } catch (cause) {
-    throw fail(
-      `activation outputs root ${activation.outputs_root} cannot be canonicalized`,
-      cause,
-    );
-  }
-  if (outputsRootCanonical !== activation.outputs_root) {
-    throw new PipelineError(
-      `activation outputs root ${activation.outputs_root} does not resolve exactly to itself; it was replaced or escaped`,
-    );
-  }
-  if (!isInsideRoot(runRootCanonical, outputsRootCanonical)) {
-    throw new PipelineError(
-      `activation outputs root resolves outside the canonical run root ${runRootCanonical}`,
-    );
-  }
-
-  let dirents;
-  try {
-    dirents = await readdir(activation.outputs_root, { withFileTypes: true });
-  } catch (cause) {
-    throw fail(`activation outputs root ${activation.outputs_root} could not be listed`, cause);
-  }
-  const declaredPorts = new Map<string, ResolvedV2AgentOutputPort>(
-    agentState.outputs.map((port) => [port.id, port]),
-  );
-  const found = new Set<string>();
-  for (const dirent of dirents) {
-    if (!declaredPorts.has(dirent.name)) {
-      throw new PipelineError(
-        `activation outputs root ${activation.outputs_root} contains undeclared entry ${JSON.stringify(dirent.name)}`,
-      );
-    }
-    found.add(dirent.name);
-  }
-  for (const port of agentState.outputs) {
-    if (!found.has(port.id)) {
-      throw new PipelineError(
-        `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)} activation ${activation.activation_index} is missing from the activation outputs root ${activation.outputs_root}`,
-      );
-    }
-  }
-
-  const records: AcceptedStateOutput[] = [];
-  for (const port of agentState.outputs) {
-    const what = `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)} activation ${activation.activation_index}`;
-    const target = join(activation.outputs_root, port.id);
-    const info = await lstatOrNull(target);
-    if (info === null) {
-      throw new PipelineError(`${what} output ${target} does not exist`);
-    }
-    if (info.isSymbolicLink()) {
-      throw new PipelineError(`${what} output ${target} is a symbolic link`);
-    }
-    let canonicalTarget: string;
+  // Region — finished-output validation: a replaced or escaped outputs
+  // root, a missing declared output, an undeclared entry, a wrong kind, a
+  // symlink, broken containment, a forbidden object in a directory tree,
+  // malformed JSON or a schema violation means the output cannot be
+  // safely accepted. Nothing here can mask provenance failures: the
+  // gates above stay plain.
+  return await withPipelineV2RuntimeReason("activation_output_invalid", async () => {
+    await requireRealDirectory(activation.outputs_root, "activation outputs root");
+    let outputsRootCanonical: string;
     try {
-      canonicalTarget = await realpath(target);
+      outputsRootCanonical = await realpath(activation.outputs_root);
     } catch (cause) {
-      throw fail(`${what} output ${target} cannot be canonicalized`, cause);
-    }
-    if (!isInsideRoot(outputsRootCanonical, canonicalTarget)) {
-      throw new PipelineError(
-        `${what} output resolves outside the activation outputs root ${outputsRootCanonical}`,
+      throw fail(
+        `activation outputs root ${activation.outputs_root} cannot be canonicalized`,
+        cause,
       );
     }
-    if (port.type === "directory") {
-      if (!info.isDirectory()) {
+    if (outputsRootCanonical !== activation.outputs_root) {
+      throw new PipelineError(
+        `activation outputs root ${activation.outputs_root} does not resolve exactly to itself; it was replaced or escaped`,
+      );
+    }
+    if (!isInsideRoot(runRootCanonical, outputsRootCanonical)) {
+      throw new PipelineError(
+        `activation outputs root resolves outside the canonical run root ${runRootCanonical}`,
+      );
+    }
+
+    let dirents;
+    try {
+      dirents = await readdir(activation.outputs_root, { withFileTypes: true });
+    } catch (cause) {
+      throw fail(`activation outputs root ${activation.outputs_root} could not be listed`, cause);
+    }
+    const declaredPorts = new Map<string, ResolvedV2AgentOutputPort>(
+      agentState.outputs.map((port) => [port.id, port]),
+    );
+    const found = new Set<string>();
+    for (const dirent of dirents) {
+      if (!declaredPorts.has(dirent.name)) {
         throw new PipelineError(
-          `${what} declares type "directory" but the output is ${describeEntry(info)}`,
+          `activation outputs root ${activation.outputs_root} contains undeclared entry ${JSON.stringify(dirent.name)}`,
         );
       }
-    } else if (!info.isFile()) {
-      throw new PipelineError(
-        `${what} declares type ${JSON.stringify(port.type)} but the output is ${describeEntry(info)}`,
-      );
+      found.add(dirent.name);
     }
-    const read = await readPortValueForDigest(port.type, target, what, true);
-    if (port.type === "json") {
-      if (port.schema === undefined) {
-        throw new PipelineError(`${what} has no compiled JSON schema`);
+    for (const port of agentState.outputs) {
+      if (!found.has(port.id)) {
+        throw new PipelineError(
+          `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)} activation ${activation.activation_index} is missing from the activation outputs root ${activation.outputs_root}`,
+        );
       }
-      validatePipelineJson(port.schema, read.parsedJson, what);
     }
-    records.push({
-      state: agentState.id,
-      output: port.id,
-      activation_index: activation.activation_index,
-      digest: read.digest,
-    });
-  }
-  return deepFreeze(records);
+
+    const records: AcceptedStateOutput[] = [];
+    for (const port of agentState.outputs) {
+      const what = `output port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)} activation ${activation.activation_index}`;
+      const target = join(activation.outputs_root, port.id);
+      const info = await lstatOrNull(target);
+      if (info === null) {
+        throw new PipelineError(`${what} output ${target} does not exist`);
+      }
+      if (info.isSymbolicLink()) {
+        throw new PipelineError(`${what} output ${target} is a symbolic link`);
+      }
+      let canonicalTarget: string;
+      try {
+        canonicalTarget = await realpath(target);
+      } catch (cause) {
+        throw fail(`${what} output ${target} cannot be canonicalized`, cause);
+      }
+      if (!isInsideRoot(outputsRootCanonical, canonicalTarget)) {
+        throw new PipelineError(
+          `${what} output resolves outside the activation outputs root ${outputsRootCanonical}`,
+        );
+      }
+      if (port.type === "directory") {
+        if (!info.isDirectory()) {
+          throw new PipelineError(
+            `${what} declares type "directory" but the output is ${describeEntry(info)}`,
+          );
+        }
+      } else if (!info.isFile()) {
+        throw new PipelineError(
+          `${what} declares type ${JSON.stringify(port.type)} but the output is ${describeEntry(info)}`,
+        );
+      }
+      const read = await readPortValueForDigest(port.type, target, what, true);
+      if (port.type === "json") {
+        if (port.schema === undefined) {
+          throw new PipelineError(`${what} has no compiled JSON schema`);
+        }
+        validatePipelineJson(port.schema, read.parsedJson, what);
+      }
+      records.push({
+        state: agentState.id,
+        output: port.id,
+        activation_index: activation.activation_index,
+        digest: read.digest,
+      });
+    }
+    return deepFreeze(records);
+  });
 }
 
 /**
@@ -2003,7 +2071,9 @@ export async function collectRunOutputs(
   // never overwritten: this also makes a repeated call after a successful
   // publication fail closed.
   const outputsPath = join(runRootCanonical, "outputs");
-  await requireAbsent(outputsPath, "run outputs root");
+  await withPipelineV2RuntimeReason("run_output_publish_failed", () =>
+    requireAbsent(outputsPath, "run outputs root"),
+  );
 
   // The run-owned snapshot must still be intact before anything is
   // resolved or staged; the original user binding paths are never read.
@@ -2023,7 +2093,9 @@ export async function collectRunOutputs(
   const stagingPath = join(runRootCanonical, tmpEntryName("run-outputs"));
   let stagingCreated = false;
   try {
-    await createRealDirectoryExclusive(stagingPath, "run outputs staging root");
+    await withPipelineV2RuntimeReason("run_output_publish_failed", () =>
+      createRealDirectoryExclusive(stagingPath, "run outputs staging root"),
+    );
     stagingCreated = true;
 
     const entries: RunOutputSnapshotEntry[] = [];
@@ -2057,7 +2129,8 @@ export async function collectRunOutputs(
         );
         if (accepted === undefined) {
           if (output.required) {
-            throw new PipelineError(
+            throw pipelineV2RuntimeFailure(
+              "run_output_missing",
               `${what} references required state output ${JSON.stringify(output.source.state_output.state)}.${JSON.stringify(output.source.state_output.output)} which has no accepted output yet`,
             );
           }
@@ -2084,33 +2157,47 @@ export async function collectRunOutputs(
       const hasher = runOutputDigestHasher(output.type);
       let parsedJson: unknown;
       if (output.type === "directory") {
-        await createRealDirectoryExclusive(target, sourceWhat);
-        const tree = await scanDirectoryTree(sourcePath, sourceWhat);
+        await withPipelineV2RuntimeReason("run_output_publish_failed", () =>
+          createRealDirectoryExclusive(target, sourceWhat),
+        );
+        const tree = await withPipelineV2RuntimeReason("run_output_invalid", () =>
+          scanDirectoryTree(sourcePath, sourceWhat),
+        );
         for (const treeEntry of tree) {
           const entryTarget = join(target, treeEntry.relativePath);
           if (treeEntry.kind === "directory") {
             hashDirectoryEntry(hasher, treeEntry, undefined);
-            await createRealDirectoryExclusive(
-              entryTarget,
-              `${sourceWhat} directory entry ${JSON.stringify(treeEntry.relativePath)}`,
+            await withPipelineV2RuntimeReason("run_output_publish_failed", () =>
+              createRealDirectoryExclusive(
+                entryTarget,
+                `${sourceWhat} directory entry ${JSON.stringify(treeEntry.relativePath)}`,
+              ),
             );
             continue;
           }
-          const content = await readRegularFileBytes(
-            treeEntry.absolutePath,
-            `${sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          const content = await withPipelineV2RuntimeReason("run_output_invalid", () =>
+            readRegularFileBytes(
+              treeEntry.absolutePath,
+              `${sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+            ),
           );
           hashDirectoryEntry(hasher, treeEntry, content);
-          await writeRegularFileExclusive(
-            entryTarget,
-            content,
-            `${sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          await withPipelineV2RuntimeReason("run_output_publish_failed", () =>
+            writeRegularFileExclusive(
+              entryTarget,
+              content,
+              `${sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+            ),
           );
         }
       } else {
-        const content = await readRegularFileBytes(sourcePath, sourceWhat);
+        const content = await withPipelineV2RuntimeReason("run_output_invalid", () =>
+          readRegularFileBytes(sourcePath, sourceWhat),
+        );
         hashBytes(hasher, content);
-        await writeRegularFileExclusive(target, content, sourceWhat);
+        await withPipelineV2RuntimeReason("run_output_publish_failed", () =>
+          writeRegularFileExclusive(target, content, sourceWhat),
+        );
         if (output.type === "json") {
           try {
             parsedJson = JSON.parse(content.toString("utf8"));
@@ -2118,18 +2205,27 @@ export async function collectRunOutputs(
             // Stable, content-free diagnostic: the parser message can echo
             // the offending token or an input fragment, so it is never
             // included.
-            throw new PipelineError(`${sourceWhat} ${sourcePath} is not valid JSON`);
+            throw pipelineV2RuntimeFailure(
+              "run_output_invalid",
+              `${sourceWhat} ${sourcePath} is not valid JSON`,
+            );
           }
         }
       }
       if (output.type === "json") {
         if (output.schema === undefined) {
-          throw new PipelineError(`${what} has no compiled JSON schema`);
+          throw pipelineV2RuntimeFailure(
+            "run_output_invalid",
+            `${what} has no compiled JSON schema`,
+          );
         }
+        const runOutputSchema = output.schema;
         // The same compiled Draft 2020-12 mechanism that validated the
         // declaring site validates the collected value again here; the
         // value is never modified and the original bytes are published.
-        validatePipelineJson(output.schema, parsedJson, sourceWhat);
+        await withPipelineV2RuntimeReason("run_output_invalid", async () =>
+          validatePipelineJson(runOutputSchema, parsedJson, sourceWhat),
+        );
       }
       entries.push({
         id: output.id,
@@ -2151,12 +2247,14 @@ export async function collectRunOutputs(
     // publish; an adversarially created object at the target still fails
     // closed here (an empty directory could in principle still be replaced
     // by rename — an honest limitation shared with directory snapshots).
-    await requireAbsent(outputsPath, "run outputs root");
-    try {
-      await rename(stagingPath, outputsPath);
-    } catch (cause) {
-      throw fail(`run outputs root ${outputsPath} could not be published`, cause);
-    }
+    await withPipelineV2RuntimeReason("run_output_publish_failed", async () => {
+      await requireAbsent(outputsPath, "run outputs root");
+      try {
+        await rename(stagingPath, outputsPath);
+      } catch (cause) {
+        throw fail(`run outputs root ${outputsPath} could not be published`, cause);
+      }
+    });
 
     // Provenance is registered only after the atomic publish succeeded.
     runOutputsSnapshotProvenance.set(snapshot, {
@@ -2287,70 +2385,86 @@ export async function evaluateDecisionStateFromData(
       `decision state ${JSON.stringify(safeStateId)} declares no input port`,
     );
   }
-  const portWhat = `input port ${JSON.stringify(port.id)} of decision state ${JSON.stringify(safeStateId)}`;
-  let sourcePath: string;
-  let sourceWhat: string;
-  if ("pipeline_input" in port.source) {
-    let entry: RunInputSnapshotEntry | undefined;
-    for (const candidate of runInputs.inputs) {
-      if (candidate.id === port.source.pipeline_input) {
-        entry = candidate;
-        break;
+  // Region — decision input consumption: a logically unavailable declared
+  // decision input, an unreadable value at its fixed orchestrator-owned
+  // location, malformed JSON or a port-schema violation is an invalid
+  // decision input. Run-input tampering above reports `run_input_modified`,
+  // accepted-output tampering `accepted_output_modified`, and the
+  // evaluator below runs outside this region so an unexpected evaluator
+  // failure is never reclassified.
+  const { parsedJson } = await withPipelineV2RuntimeReason(
+    "decision_input_invalid",
+    async () => {
+      const portWhat = `input port ${JSON.stringify(port.id)} of decision state ${JSON.stringify(safeStateId)}`;
+      let sourcePath: string;
+      let sourceWhat: string;
+      if ("pipeline_input" in port.source) {
+        let entry: RunInputSnapshotEntry | undefined;
+        for (const candidate of runInputs.inputs) {
+          if (candidate.id === port.source.pipeline_input) {
+            entry = candidate;
+            break;
+          }
+        }
+        if (entry === undefined) {
+          throw new PipelineError(
+            `${portWhat} references pipeline input ${JSON.stringify(port.source.pipeline_input)} which has no run input snapshot entry`,
+          );
+        }
+        if (entry.type !== port.type) {
+          throw new PipelineError(
+            `${portWhat} expects type ${JSON.stringify(port.type)} but the run input snapshot entry has type ${JSON.stringify(entry.type)}`,
+          );
+        }
+        sourcePath = entry.snapshot_path;
+        sourceWhat = `${portWhat} source pipeline input ${JSON.stringify(port.source.pipeline_input)}`;
+      } else {
+        const accepted = acceptedByRef.get(
+          `${port.source.state_output.state}\u0000${port.source.state_output.output}`,
+        );
+        if (accepted === undefined) {
+          throw new PipelineError(
+            `${portWhat} references state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)} which has no accepted output yet (missing, forward or first-visit self reference)`,
+          );
+        }
+        if (accepted.type !== port.type) {
+          throw new PipelineError(
+            `${portWhat} expects type ${JSON.stringify(port.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
+          );
+        }
+        sourcePath = accepted.canonicalPath;
+        sourceWhat = `${portWhat} source state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)}`;
       }
-    }
-    if (entry === undefined) {
-      throw new PipelineError(
-        `${portWhat} references pipeline input ${JSON.stringify(port.source.pipeline_input)} which has no run input snapshot entry`,
-      );
-    }
-    if (entry.type !== port.type) {
-      throw new PipelineError(
-        `${portWhat} expects type ${JSON.stringify(port.type)} but the run input snapshot entry has type ${JSON.stringify(entry.type)}`,
-      );
-    }
-    sourcePath = entry.snapshot_path;
-    sourceWhat = `${portWhat} source pipeline input ${JSON.stringify(port.source.pipeline_input)}`;
-  } else {
-    const accepted = acceptedByRef.get(
-      `${port.source.state_output.state}\u0000${port.source.state_output.output}`,
-    );
-    if (accepted === undefined) {
-      throw new PipelineError(
-        `${portWhat} references state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)} which has no accepted output yet (missing, forward or first-visit self reference)`,
-      );
-    }
-    if (accepted.type !== port.type) {
-      throw new PipelineError(
-        `${portWhat} expects type ${JSON.stringify(port.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
-      );
-    }
-    sourcePath = accepted.canonicalPath;
-    sourceWhat = `${portWhat} source state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)}`;
-  }
 
-  // 11. The value lives at its fixed orchestrator-owned path, verified by
-  // the snapshot/history validation above; reading goes through
-  // O_NOFOLLOW so a swapped symlink never resolves.
-  const content = await readRegularFileBytes(sourcePath, sourceWhat);
+      // 11. The value lives at its fixed orchestrator-owned path, verified by
+      // the snapshot/history validation above; reading goes through
+      // O_NOFOLLOW so a swapped symlink never resolves.
+      const content = await readRegularFileBytes(sourcePath, sourceWhat);
 
-  // 12. Content-free parse diagnostic: no parser message, offending token,
-  // position or input fragment.
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(content.toString("utf8"));
-  } catch {
-    throw new PipelineError(`${sourceWhat} ${sourcePath} is not valid JSON`);
-  }
+      // 12. Content-free parse diagnostic: no parser message, offending
+      // token, position or input fragment.
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(content.toString("utf8"));
+      } catch {
+        throw new PipelineError(`${sourceWhat} ${sourcePath} is not valid JSON`);
+      }
 
-  // 13. The loader-compiled schema snapshot of this input port is the only
-  // contract; no second schema compiler exists.
-  if (port.schema === undefined) {
-    throw new PipelineError(`${portWhat} has no compiled JSON schema`);
-  }
-  validatePipelineJson(port.schema, parsedJson, sourceWhat);
+      // 13. The loader-compiled schema snapshot of this input port is the
+      // only contract; no second schema compiler exists.
+      if (port.schema === undefined) {
+        throw new PipelineError(`${portWhat} has no compiled JSON schema`);
+      }
+      validatePipelineJson(port.schema, parsedJson, sourceWhat);
+      return { sourcePath, sourceWhat, parsedJson };
+    },
+  );
 
   // 14. The existing pure evaluator maps the parsed fact assignment; any
-  // earlier failure above never becomes `invalid_facts`. Raw bytes, parsed
-  // facts and fact values are not returned or recorded.
+  // earlier failure above never becomes `invalid_facts`. The evaluator is
+  // deliberately outside the typed region: an unexpected evaluator failure
+  // propagates unchanged instead of becoming a runtime failure.
+  // `invalid_facts` is a normal result, never an exception. Raw bytes,
+  // parsed facts and fact values are not returned or recorded.
   return evaluatePipelineDecisionState(pipeline, safeStateId, parsedJson);
 }
