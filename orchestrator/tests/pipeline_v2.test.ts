@@ -680,7 +680,7 @@ test("12. graph shape is shared with v1 semantics", () => {
       .concat(
         "inputs: []\noutputs: []\nstates:\n  - id: coder\n    type: agent\n    profile: coder\n    prompt: prompts/coder.md\n    inputs: []\n    outputs: []\n    timeout_seconds: 60\n    max_attempts: 1\n    transitions:\n      - outcome: completed\n        to: coder\n      - outcome: completed\n        to: done\n  - id: done\n    type: terminal\n    result: success\n",
       ),
-    /declares outcome "completed" more than once/,
+    /agent state "coder" must declare exactly one transition with outcome "completed", got 2/,
   );
   rejectParse(
     V2_TOP_PREFIX
@@ -1362,4 +1362,94 @@ test("31. derived run outputs and serialized plans carry no schema paths or prov
     expect(serializedOutputs).not.toContain("schemaPath");
     expect(serializedOutputs).not.toContain("provenance");
   });
+});
+
+test("32. an agent state has exactly one completed transition and max_attempts 1", () => {
+  const agentState = (
+    transitions: string,
+    maxAttempts: string,
+    outputs = "    outputs: []\n",
+  ): string =>
+    `  - id: coder\n    type: agent\n    profile: coder\n    prompt: prompts/coder.md\n    inputs: []\n${outputs}    timeout_seconds: 60\n    max_attempts: ${maxAttempts}\n${transitions}`;
+  const doneState = "  - id: done\n    type: terminal\n    result: success\n";
+  const emptyTransitions = "    transitions: []\n";
+  const oneCompleted = '    transitions:\n      - outcome: completed\n        to: done\n';
+
+  // zero transitions
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState(emptyTransitions, "1"),
+    ).concat(doneState),
+    /agent state "coder" must declare exactly one transition with outcome "completed", got 0/,
+  );
+  // two transitions
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState(oneCompleted + '      - outcome: needs_changes\n        to: done\n', "1"),
+    ).concat(doneState),
+    /agent state "coder" must declare exactly one transition with outcome "completed", got 2/,
+  );
+  // duplicate completed transitions
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState(oneCompleted + '      - outcome: completed\n        to: done\n', "1"),
+    ).concat(doneState),
+    /agent state "coder" must declare exactly one transition with outcome "completed", got 2/,
+  );
+  // the single transition must carry the fixed outcome "completed"
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState('    transitions:\n      - outcome: needs_changes\n        to: done\n', "1"),
+    ).concat(doneState),
+    /declares transition outcome "needs_changes"; an agent state has the single lifecycle outcome "completed" and content-based branching belongs to a decision state/,
+  );
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState('    transitions:\n      - outcome: retry\n        to: done\n', "1"),
+    ).concat(doneState),
+    /declares transition outcome "retry"; an agent state has the single lifecycle outcome "completed" and content-based branching belongs to a decision state/,
+  );
+  // max_attempts: 0 and non-integer values fail the positive-safe-integer check
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState(oneCompleted, "0"),
+    ).concat(doneState),
+    /agent state "coder" max_attempts must be a positive safe integer, got 0/,
+  );
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState(oneCompleted, "1.5"),
+    ).concat(doneState),
+    /agent state "coder" max_attempts must be a positive safe integer, got 1.5/,
+  );
+  // max_attempts: 2 is rejected by the v2 agent contract itself
+  rejectParse(
+    V2_TOP_PREFIX.concat("inputs: []\noutputs: []\nstates:\n").concat(
+      agentState(oneCompleted, "2"),
+    ).concat(doneState),
+    /agent state "coder" max_attempts must be exactly 1; agent-state retries are not implemented yet/,
+  );
+
+  // a valid cycle: agent -> decision -> agent with the single completed
+  // agent edge, plus every declared model outcome and reserved outcome
+  const cycleYaml = V2_TOP_PREFIX.concat(
+    "inputs:\n  - id: task\n    type: json\n    protected: true\n    schema: schemas/task.schema.json\noutputs: []\nstates:\n  - id: coder\n    type: agent\n    profile: coder\n    prompt: prompts/coder.md\n    inputs: []\n    outputs: []\n    timeout_seconds: 60\n    max_attempts: 1\n    transitions:\n      - outcome: completed\n        to: check\n  - id: check\n    type: decision\n    model: decisions/gate.yaml\n    inputs:\n      - id: facts\n        source:\n          pipeline_input: task\n    transitions:\n      - outcome: proceed\n        to: coder\n      - outcome: uncovered\n        to: done\n      - outcome: inconsistent_facts\n        to: done\n      - outcome: invalid_facts\n        to: done\n  - id: done\n    type: terminal\n    result: success\n",
+  );
+  const parsed = parsePipelineV2Spec(cycleYaml);
+  const coderState = parsed.states.find((state) => state.type === "agent");
+  if (coderState === undefined || coderState.type !== "agent") {
+    throw new Error("expected the coder agent state");
+  }
+  expect(coderState.transitions).toEqual([{ outcome: "completed", to: "check" }]);
+  expect(coderState.max_attempts).toBe(1);
+  const checkState = parsed.states.find((state) => state.type === "decision");
+  if (checkState === undefined || checkState.type !== "decision") {
+    throw new Error("expected the check decision state");
+  }
+  expect(checkState.transitions.map((transition) => transition.outcome)).toEqual([
+    "proceed",
+    "uncovered",
+    "inconsistent_facts",
+    "invalid_facts",
+  ]);
 });

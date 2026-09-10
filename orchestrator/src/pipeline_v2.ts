@@ -465,6 +465,20 @@ function parseV2Output(raw: unknown, index: number): PipelineV2OutputSpecDraft {
   };
 }
 
+/**
+ * Parse one agent state: exact fields only. The v2 agent-state contract is
+ * fixed: an agent state runs the work and completes with exactly one
+ * transition whose outcome is `completed` (the target is the user's
+ * choice and may lead to an agent, decision or terminal state), and
+ * `max_attempts` is exactly `1` — content-based branching belongs to a
+ * decision state and retries are not implemented yet, so there is no
+ * second attempt and no other agent lifecycle outcome. Zero transitions,
+ * several transitions, any other outcome, `max_attempts: 0`, a
+ * non-integer or a `max_attempts` above 1 are rejected with a
+ * `PipelineError` during the trusted load, before the resolved snapshot
+ * registration. Agent failures never become transitions: they fail the
+ * execution, and an intervention/retry policy may arrive separately.
+ */
 function parseV2AgentState(raw: Record<string, unknown>): PipelineV2AgentStateDraft {
   const id = validateSafeId(raw.id, "agent state id");
   const what = `agent state ${JSON.stringify(id)}`;
@@ -511,9 +525,24 @@ function parseV2AgentState(raw: Record<string, unknown>): PipelineV2AgentStateDr
   }
 
   const transitionsRaw = expectArray(raw.transitions, `${what} transitions`);
-  const transitions: PipelineTransitionSpec[] = [];
-  for (let index = 0; index < transitionsRaw.length; index++) {
-    transitions.push(parseTransition(transitionsRaw[index], id, index));
+  if (transitionsRaw.length !== 1) {
+    throw new PipelineError(
+      `${what} must declare exactly one transition with outcome "completed", got ${transitionsRaw.length}`,
+    );
+  }
+  const transition = parseTransition(transitionsRaw[0], id, 0);
+  if (transition.outcome !== "completed") {
+    throw new PipelineError(
+      `${what} declares transition outcome ${JSON.stringify(transition.outcome)}; an agent state has the single lifecycle outcome "completed" and content-based branching belongs to a decision state`,
+    );
+  }
+  const transitions: PipelineTransitionSpec[] = [transition];
+
+  const maxAttempts = expectPositiveSafeInteger(raw.max_attempts, `${what} max_attempts`);
+  if (maxAttempts !== 1) {
+    throw new PipelineError(
+      `${what} max_attempts must be exactly 1; agent-state retries are not implemented yet`,
+    );
   }
 
   return {
@@ -528,7 +557,7 @@ function parseV2AgentState(raw: Record<string, unknown>): PipelineV2AgentStateDr
     inputs,
     outputs,
     timeout_seconds: expectPositiveSafeInteger(raw.timeout_seconds, `${what} timeout_seconds`),
-    max_attempts: expectPositiveSafeInteger(raw.max_attempts, `${what} max_attempts`),
+    max_attempts: maxAttempts,
     transitions,
   };
 }

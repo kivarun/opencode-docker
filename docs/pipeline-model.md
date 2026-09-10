@@ -122,6 +122,15 @@ Agent output never selects an arbitrary next state. The agent returns an
 outcome allowed by the current state; the orchestrator validates it and owns
 the outcome-to-transition mapping.
 
+In the executable pipeline schema (v2) this is concrete: an agent state
+performs the work and has exactly one transition whose outcome is
+`completed` (its target is the user's choice and may lead to an agent,
+decision or terminal state), and `max_attempts` is exactly 1. The agent and
+its runtime never choose an outcome or a target; content-based branching
+belongs to a decision state, whose outcomes remain the declared model
+outcomes. Retries are not implemented yet, so `max_attempts` must be 1
+(today the production schema v1 planner enforces the same shape).
+
 Decision conditions use a small typed expression language over declared data.
 They may combine comparisons, existence checks, boolean operators, and similar
 deterministic predicates. They cannot inspect ambient environment, filesystem,

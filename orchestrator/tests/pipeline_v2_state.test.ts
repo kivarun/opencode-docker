@@ -1701,4 +1701,46 @@ describe("pipeline v2 run state schema v3", () => {
       expect(keys.has(banned), `state must not carry a ${banned} field`).toBe(false);
     }
   });
+
+  test("agent-state contract alignment: every agent execution is attempt 1 and every agent transition carries the fixed completed outcome", () => {
+    const driver = loadableDriver(createDriver());
+    playSuccessRun(driver);
+    const state = driver.current;
+    if (state === null) {
+      throw new Error("expected a reduced state");
+    }
+
+    // every start_agent_execution creates exactly attempt 1: retries are
+    // not implemented, so the coordinator needs no retry mapping
+    let agentExecutions = 0;
+    for (const execution of state.executions) {
+      if (execution.type === "agent") {
+        agentExecutions += 1;
+        expect(execution.attempt).toBe(1);
+        expect(execution.state_id).not.toBe("check");
+      }
+    }
+    expect(agentExecutions).toBe(2);
+
+    // the engine's fixed agent lifecycle outcome "completed" is the only
+    // outcome agent executions ever transition with
+    const agentOutcomes = state.transitions
+      .filter((transition) => transition.outcome === "completed")
+      .map((transition) => transition.from);
+    expect(agentOutcomes).toEqual(["implement", "ship"]);
+
+    // a fabricated attempt 2 is rejected by the loader: no retry mapping
+    // exists in state schema v3
+    expectInvalid(
+      state,
+      (draft) => {
+        const first = draft.executions[0];
+        if (first?.state_id !== "implement") {
+          throw new Error("expected the first agent execution");
+        }
+        first.attempt = 2;
+      },
+      "only attempt 1 is supported",
+    );
+  });
 });

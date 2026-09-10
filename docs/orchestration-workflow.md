@@ -254,9 +254,15 @@ schema — a corrupted non-JSON schema in an artificially damaged resolved
 pipeline is rejected as `invalid_graph` before the callback); for a v2
 agent/decision state the frozen views are the exact `V2AgentExecutionView`/
 `V2DecisionExecutionView` compiled at snapshot time (no transitions, targets,
-transition indexes, data ports, schemas, or credentials). Both executors
-return only a validated outcome: they can never select the next state, and
-the agent/decision dispatch is bound at compile time (`agent` →
+agent/decision state the frozen views are the exact `V2AgentExecutionView`/
+`V2DecisionExecutionView` compiled at snapshot time (no transitions, targets,
+transition indexes, data ports, schemas, or credentials). A v2 agent callback
+returns nothing: after it resolves, the engine applies the fixed lifecycle
+outcome `completed` from its own compiled snapshot, and a value returned by
+the callback against the void contract is dropped and never reaches
+transition selection; only a decision executor still reports a validated
+outcome. Neither executor can ever select the next state, and the
+agent/decision dispatch is bound at compile time (`agent` →
 `executeAgent` only, `decision` → `executeDecision` only, `terminal` → no
 callback). The engine starts strictly at `entry_state`, resolves
 the declared transition by outcome itself, enforces `max_transitions` with a
@@ -318,17 +324,27 @@ additional state kind: an agent state binds
 prompt/timeout/attempts only), a decision state binds only `executeDecision`
 with an identity-only frozen `V2DecisionExecutionView` (no model, facts,
 schemas, data paths or credentials ever cross this boundary), and a terminal
-state runs no callback. `PipelineV2GraphExecutors` return only outcome
-strings; neither executor selects the next state, and the engine never
-parses decision facts or knows the decision table — the future production
-runner closes the trusted pipeline/run data over `executeDecision` (e.g.
-`evaluateDecisionStateFromData(...).outcome`). Agent and decision states
-share one transition budget (the exhaustion message names the state kind
-explicitly), reserved decision outcomes (`uncovered`, `inconsistent_facts`,
-`invalid_facts`) are routed like any other declared outcome, and all v1
-hook/budget/mutation semantics are unchanged and covered by
-`orchestrator/tests/pipeline_v2_engine.test.ts`, including a run whose
-decision executor is the real `evaluateDecisionStateFromData`. The
+state runs no callback. `PipelineV2GraphExecutors` is
+`{ executeAgent: (state: V2AgentExecutionView) => void | Promise<void>;
+executeDecision: (state: V2DecisionExecutionView) => string | Promise<string> }`:
+an agent callback reports nothing — after it resolves, the engine applies the
+fixed lifecycle outcome `completed` from its own compiled snapshot (a value
+returned against the void contract is dropped and never reaches transition
+selection; a defensive `compileV2AgentContract` guard repeats the loader's
+agent-state contract — exactly one transition with outcome `completed`,
+`max_attempts` exactly 1 — against an internally damaged agent state as
+`invalid_graph` before the first callback), and only a decision executor
+still reports its selected model outcome. Neither executor selects the next
+state, and the engine never parses decision facts or knows the decision
+table — the future production runner closes the trusted pipeline/run data
+over `executeDecision` (e.g. `evaluateDecisionStateFromData(...).outcome`).
+Agent and decision states share one transition budget (the exhaustion
+message names the state kind explicitly), reserved decision outcomes
+(`uncovered`, `inconsistent_facts`, `invalid_facts`) are routed like any
+other declared outcome, and all v1 hook/budget/mutation semantics are
+unchanged and covered by `orchestrator/tests/pipeline_v2_engine.test.ts`,
+including a run whose decision executor is the real
+`evaluateDecisionStateFromData`. The
 production `agent-smoke` wiring for v2 is absent: the production loader
 still rejects schema version 2 before Launcher auth and before any Session.
 
@@ -408,8 +424,18 @@ mutation, and repeated-evaluation determinism.
 ### Pipeline schema v2 data ports and activation layout planner (implemented, not yet used by the production runner)
 
 `orchestrator/src/pipeline_v2.ts` implements the `schema_version: 2`
-compile branch as pure substrate. v2 replaces workspace paths with named
-ports: run-level `inputs` are logical run inputs whose host paths are bound
+compile branch as pure substrate. The v2 agent-state contract is fixed:
+every agent state declares exactly one transition whose outcome is
+`completed` (the target is the user's choice — an agent, decision or
+terminal state) and `max_attempts` exactly 1; zero transitions, several
+transitions, any other outcome, and `max_attempts` other than 1 are
+rejected with a `PipelineError` during the trusted load before provenance
+registration. An agent state performs the work; it does not manage the
+state machine — content-based branching belongs to a decision state and
+agent failures are not transitions. Retries are not implemented yet, so
+`max_attempts` must be 1. This is the current executable semantics of
+schema v2, not a rule of the default pipeline. v2 replaces workspace paths
+with named ports: run-level `inputs` are logical run inputs whose host paths are bound
 later by the CLI/API (never in the document); run-level `outputs` are the
 data handed back to the user after completion (`required: true` outputs
 fail the run if absent at the terminal; optional outputs may be absent —

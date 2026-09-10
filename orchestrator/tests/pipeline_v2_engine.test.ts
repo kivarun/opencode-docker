@@ -7,6 +7,7 @@ import {
   executePipelineV2Graph,
   PipelineExecutionError,
   type PipelineV2GraphExecutors,
+  type TransitionStep,
   type V2AgentExecutionView,
   type V2DecisionExecutionView,
 } from "../src/pipeline_engine.ts";
@@ -28,9 +29,11 @@ import {
  * adapter feeding the same single pure graph execution core that owns the
  * outcome -> transition -> next-state mapping, the transition budget, the
  * commit-hook ordering and the terminal selection for both pipeline
- * versions. The executors return only outcome strings and can never select
- * the next state; the production runner is not wired (schema v2 is still
- * rejected before Launcher auth and before any Session).
+ * versions. An agent state has the single lifecycle outcome "completed"
+ * which the engine applies from its own snapshot after the void agent
+ * callback resolves; a decision state reports its selected model outcome
+ * and can never select the next state. The production runner is not wired
+ * (schema v2 is still rejected before Launcher auth and before any Session).
  */
 
 const MODEL_YAML = `
@@ -259,6 +262,15 @@ const PIPELINE_AGENT_DECISION_CYCLE = pipelineYaml(
   OUTPUTS_DIGEST_YAML,
 );
 
+/** The same agent/decision cycle bounded so exhaustion hits the agent state. */
+const PIPELINE_AGENT_CYCLE_BUDGET_TWO = pipelineYaml(
+  "coder",
+  2,
+  AGENT_TO_DECISION_STATES_YAML.replace(DECISION_TRANSITIONS_YAML, DECISION_TRANSITIONS_CYCLE_YAML) + TERMINALS_YAML,
+  "",
+  OUTPUTS_DIGEST_YAML,
+);
+
 interface BundleDirs {
   root: string;
   bundle: string;
@@ -317,26 +329,24 @@ async function withPipeline(
 }
 
 interface TrackedExecutors {
-  executeAgent: (state: V2AgentExecutionView) => string;
+  executeAgent: (state: V2AgentExecutionView) => void;
   executeDecision: (state: V2DecisionExecutionView) => string;
   agentSeen: string[];
   decisionSeen: string[];
 }
 
-function scriptedExecutors(
-  agentScript: Record<string, string>,
-  decisionScript: Record<string, string>,
-): TrackedExecutors {
+/**
+ * The v2 agent callback reports nothing: it only records the states it was
+ * invoked for. The engine applies its own "completed" outcome, so there is
+ * no agent script any more; only the decision executor still selects an
+ * outcome.
+ */
+function scriptedExecutors(decisionScript: Record<string, string>): TrackedExecutors {
   const agentSeen: string[] = [];
   const decisionSeen: string[] = [];
   return {
     executeAgent: (state) => {
       agentSeen.push(state.id);
-      const outcome = agentScript[state.id];
-      if (outcome === undefined) {
-        throw new Error(`agent script has no outcome for state ${JSON.stringify(state.id)}`);
-      }
-      return outcome;
     },
     executeDecision: (state) => {
       decisionSeen.push(state.id);
@@ -357,15 +367,17 @@ function scriptedExecutors(
  * dispatches only its own captured executor snapshot.
  */
 interface MutableV2Executors {
-  executeAgent: (state: V2AgentExecutionView) => string | Promise<string>;
+  executeAgent: (state: V2AgentExecutionView) => void | Promise<void>;
   executeDecision: (state: V2DecisionExecutionView) => string | Promise<string>;
 }
 
-/** An executor that must never be reached; reaching it fails the run. */
-function refuse(kind: "agent" | "decision"): (state: { readonly id: string }) => string {
-  return (state) => {
-    throw new Error(`${kind} executor must not be called for state ${JSON.stringify(state.id)}`);
-  };
+/** Executors that must never be reached; reaching them fails the run. */
+function refuseAgent(state: V2AgentExecutionView): void {
+  throw new Error(`agent executor must not be called for state ${JSON.stringify(state.id)}`);
+}
+
+function refuseDecision(state: V2DecisionExecutionView): string {
+  throw new Error(`decision executor must not be called for state ${JSON.stringify(state.id)}`);
 }
 
 async function rejectEngine(
@@ -397,7 +409,7 @@ function mutationThrew(mutate: () => void): boolean {
 
 test("1. agent -> decision -> success terminal through the shared core", async () => {
   await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
-    const executors = scriptedExecutors({ coder: "completed" }, { check: "alpha" });
+    const executors = scriptedExecutors({ check: "alpha" });
     const result = await executePipelineV2Graph(pipeline, executors);
     expect(result).toEqual({
       terminalStateId: "done",
@@ -418,7 +430,7 @@ test("1. agent -> decision -> success terminal through the shared core", async (
 test("2. an entry decision state runs without the agent executor", async () => {
   await withPipeline(PIPELINE_ENTRY_DECISION, async ({ pipeline }) => {
     const result = await executePipelineV2Graph(pipeline, {
-      executeAgent: refuse("agent"),
+      executeAgent: refuseAgent,
       executeDecision: () => "alpha",
     });
     expect(result).toEqual({
@@ -437,8 +449,8 @@ test("3. an entry terminal executes zero callbacks and records no transitions", 
     pipelineYaml("done", 3, `  - id: done\n    type: terminal\n    result: success\n`),
     async ({ pipeline }) => {
       const result = await executePipelineV2Graph(pipeline, {
-        executeAgent: refuse("agent"),
-        executeDecision: refuse("decision"),
+        executeAgent: refuseAgent,
+        executeDecision: refuseDecision,
       });
       expect(result).toEqual({
         terminalStateId: "done",
@@ -456,7 +468,7 @@ test("4. the selected decision outcome is routed by the declared transition only
   await withPipeline(PIPELINE_ENTRY_DECISION, async ({ pipeline }) => {
     let decisionRuns = 0;
     const result = await executePipelineV2Graph(pipeline, {
-      executeAgent: refuse("agent"),
+      executeAgent: refuseAgent,
       executeDecision: () => {
         decisionRuns += 1;
         return "beta";
@@ -488,7 +500,7 @@ test("5. uncovered, inconsistent_facts and invalid_facts route as declared outco
       }
       let decisionRuns = 0;
       const result = await executePipelineV2Graph(pipeline, {
-        executeAgent: refuse("agent"),
+        executeAgent: refuseAgent,
         executeDecision: (state) => {
           decisionRuns += 1;
           expect(state.id).toBe("check");
@@ -511,7 +523,7 @@ test("5. uncovered, inconsistent_facts and invalid_facts route as declared outco
 test("6. a decision state can hand over to another decision state", async () => {
   await withPipeline(PIPELINE_DECISION_CHAIN, async ({ pipeline }) => {
     const result = await executePipelineV2Graph(pipeline, {
-      executeAgent: refuse("agent"),
+      executeAgent: refuseAgent,
       executeDecision: (state) => (state.id === "d1" ? "alpha" : "beta"),
     });
     expect(result).toEqual({
@@ -537,7 +549,6 @@ test("7. an agent/decision cycle is bounded by the shared budget and exits", asy
       executeAgent: (state) => {
         agentRuns += 1;
         expect(state.id).toBe("coder");
-        return "completed";
       },
       executeDecision: (state) => {
         decisionRuns += 1;
@@ -572,7 +583,7 @@ test("8. an exhausted budget rejects a decision state before its callback", asyn
     let decisionRuns = 0;
     const error = await rejectEngine(() =>
       executePipelineV2Graph(pipeline, {
-        executeAgent: refuse("agent"),
+        executeAgent: refuseAgent,
         executeDecision: () => {
           decisionRuns += 1;
           return "beta";
@@ -593,7 +604,7 @@ test("9. a terminal is reached exactly at the budget boundary", async () => {
   await withPipeline(PIPELINE_BOUNDARY, async ({ pipeline }) => {
     let decisionRuns = 0;
     const result = await executePipelineV2Graph(pipeline, {
-      executeAgent: refuse("agent"),
+      executeAgent: refuseAgent,
       executeDecision: () => {
         decisionRuns += 1;
         return "alpha";
@@ -609,33 +620,68 @@ test("9. a terminal is reached exactly at the budget boundary", async () => {
   });
 });
 
-// --- 10. unknown agent outcome ----------------------------------------------
+// --- 10. rogue agent-callback return values are ignored ---------------------
 
-test("10. an unknown agent outcome is rejected without moving the cursor", async () => {
+/**
+ * A JS function that returns a value is assignable to a void-returning
+ * executor type; these values must be dropped entirely: the engine applies
+ * its own "completed" outcome from its compiled snapshot and the value can
+ * never participate in transition selection.
+ */
+function returnRogue(
+  value: unknown,
+  runs: { count: number },
+): (state: V2AgentExecutionView) => string {
+  return () => {
+    runs.count += 1;
+    return value as string;
+  };
+}
+
+test("10. a rogue agent-callback return value is ignored; the engine applies completed", async () => {
   await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
-    let agentRuns = 0;
-    const error = await rejectEngine(() =>
-      executePipelineV2Graph(
+    const rogueValues: unknown[] = [
+      "rogue",
+      "",
+      "   ",
+      "bogus",
+      42,
+      { hijack: "done" },
+      undefined,
+      null,
+    ];
+    for (const rogue of rogueValues) {
+      const runs = { count: 0 };
+      const result = await executePipelineV2Graph(
         pipeline,
         {
-          executeAgent: () => {
-            agentRuns += 1;
-            return "bogus";
-          },
-          executeDecision: refuse("decision"),
+          executeAgent: returnRogue(rogue, runs) as unknown as PipelineV2GraphExecutors["executeAgent"],
+          executeDecision: () => "alpha",
         },
-        {
-          onTransitionCommit: () => {
-            throw new Error("hook must not run for an unknown outcome");
-          },
-        },
-      ),
-    );
-    expect(error.reason).toBe("unknown_outcome");
-    expect(error.message).toBe(
-      'agent result outcome "bogus" does not match any transition outcome of state "coder"',
-    );
-    expect(agentRuns).toBe(1);
+      );
+      expect(runs.count).toBe(1);
+      expect(result.terminalStateId).toBe("done");
+      expect(result.terminalResult).toBe("success");
+      expect(result.trace).toEqual([
+        { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+        { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+      ]);
+    }
+
+    // an async rogue value is awaited and dropped as well
+    const asyncRuns = { count: 0 };
+    const asyncResult = await executePipelineV2Graph(pipeline, {
+      executeAgent: (async (): Promise<string> => {
+        asyncRuns.count += 1;
+        return "rogue";
+      }) as unknown as (state: V2AgentExecutionView) => Promise<void>,
+      executeDecision: () => "alpha",
+    });
+    expect(asyncRuns.count).toBe(1);
+    expect(asyncResult.trace).toEqual([
+      { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+      { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+    ]);
   });
 });
 
@@ -646,7 +692,7 @@ test("11. an unknown decision outcome is rejected", async () => {
     let decisionRuns = 0;
     const error = await rejectEngine(() =>
       executePipelineV2Graph(pipeline, {
-        executeAgent: refuse("agent"),
+        executeAgent: refuseAgent,
         executeDecision: () => {
           decisionRuns += 1;
           return "bogus";
@@ -661,16 +707,16 @@ test("11. an unknown decision outcome is rejected", async () => {
   });
 });
 
-// --- 12. empty/whitespace/non-string outcomes from both executors -----------
+// --- 12. invalid decision outcomes are rejected -----------------------------
 
-test("12. empty, whitespace and non-string outcomes are rejected from both executors", async () => {
+test("12. empty, whitespace and non-string decision outcomes are rejected", async () => {
   const invalid: unknown[] = ["", "   ", 42, undefined, null];
   await withPipeline(PIPELINE_ENTRY_DECISION, async ({ pipeline }) => {
     for (const outcome of invalid) {
       let decisionRuns = 0;
       const error = await rejectEngine(() =>
         executePipelineV2Graph(pipeline, {
-          executeAgent: refuse("agent"),
+          executeAgent: refuseAgent,
           executeDecision: () => {
             decisionRuns += 1;
             return outcome as string;
@@ -683,27 +729,13 @@ test("12. empty, whitespace and non-string outcomes are rejected from both execu
       );
     }
   });
-  await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
-    for (const outcome of ["", "   ", 42, undefined, null]) {
-      const error = await rejectEngine(() =>
-        executePipelineV2Graph(pipeline, {
-          executeAgent: () => outcome as string,
-          executeDecision: refuse("decision"),
-        }),
-      );
-      expect(error.reason).toBe("invalid_outcome");
-      expect(error.message).toBe(
-        `agent state "coder" produced an invalid outcome ${JSON.stringify(outcome)}; the agent reports an outcome and never selects the next state`,
-      );
-    }
-  });
 });
 
 // --- 13. dispatch exclusivity ------------------------------------------------
 
 test("13. agent and decision executors are never called for each other's states", async () => {
   await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
-    const executors = scriptedExecutors({ coder: "completed" }, { check: "beta" });
+    const executors = scriptedExecutors({ check: "beta" });
     const result = await executePipelineV2Graph(pipeline, executors);
     expect(result.terminalStateId).toBe("failed_end");
     expect(executors.agentSeen).toEqual(["coder"]);
@@ -711,7 +743,7 @@ test("13. agent and decision executors are never called for each other's states"
   });
   await withPipeline(PIPELINE_ENTRY_DECISION, async ({ pipeline }) => {
     const result = await executePipelineV2Graph(pipeline, {
-      executeAgent: refuse("agent"),
+      executeAgent: refuseAgent,
       executeDecision: () => "uncovered",
     });
     expect(result.terminalStateId).toBe("failed_end");
@@ -724,6 +756,7 @@ test("14. a callback exception propagates with its identity and records nothing"
   await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
     const thrown = new Error("agent exploded");
     let agentRuns = 0;
+    let hookRuns = 0;
     const failure: unknown = await executePipelineV2Graph(
       pipeline,
       {
@@ -731,15 +764,22 @@ test("14. a callback exception propagates with its identity and records nothing"
           agentRuns += 1;
           throw thrown;
         },
-        executeDecision: refuse("decision"),
+        executeDecision: refuseDecision,
       },
-      { onTransitionCommit: () => undefined },
+      {
+        onTransitionCommit: () => {
+          hookRuns += 1;
+        },
+      },
     ).then(
       () => null,
       (cause: unknown) => cause,
     );
+    // the agent exception stops the graph before the transition hook: no
+    // transition is recorded and the cursor does not move
     expect(failure).toBe(thrown);
     expect(agentRuns).toBe(1);
+    expect(hookRuns).toBe(0);
   });
   await withPipeline(PIPELINE_ENTRY_DECISION, async ({ pipeline }) => {
     const thrown = new Error("decision exploded");
@@ -748,7 +788,7 @@ test("14. a callback exception propagates with its identity and records nothing"
     const failure: unknown = await executePipelineV2Graph(
       pipeline,
       {
-        executeAgent: refuse("agent"),
+        executeAgent: refuseAgent,
         executeDecision: () => {
           decisionRuns += 1;
           throw thrown;
@@ -774,13 +814,13 @@ test("14. a callback exception propagates with its identity and records nothing"
 test("15. the commit hook runs after the outcome resolution and before the next callback", async () => {
   await withPipeline(PIPELINE_AGENT_TO_DECISION, async ({ pipeline }) => {
     const events: string[] = [];
+    const steps: TransitionStep[] = [];
     const result = await executePipelineV2Graph(
       pipeline,
       {
         executeAgent: (state) => {
           expect(state.id).toBe("coder");
           events.push("agent-callback");
-          return "completed";
         },
         executeDecision: (state) => {
           expect(state.id).toBe("check");
@@ -791,16 +831,25 @@ test("15. the commit hook runs after the outcome resolution and before the next 
       {
         onTransitionCommit: (step) => {
           events.push(`hook:${step.from}->${step.to}`);
+          events.push(`hook-outcome:${step.outcome}:index:${step.transition_index}`);
+          steps.push(step);
         },
       },
     );
+    expect(steps).toEqual([
+      { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+      { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+    ]);
     // the hook for a transition runs after the executor that produced the
-    // outcome and before the callback of the next state
+    // outcome and before the callback of the next state; the agent hook
+    // carries the engine's own "completed" outcome and its exact step
     expect(events).toEqual([
       "agent-callback",
       "hook:coder->check",
+      "hook-outcome:completed:index:0",
       "decision-callback",
       "hook:check->done",
+      "hook-outcome:alpha:index:0",
     ]);
     expect(result.terminalStateId).toBe("done");
   });
@@ -816,7 +865,7 @@ test("16. a hook failure stops the graph before the next executor runs", async (
     const failure: unknown = await executePipelineV2Graph(
       pipeline,
       {
-        executeAgent: () => "completed",
+        executeAgent: () => {},
         executeDecision: () => {
           decisionRuns += 1;
           return "alpha";
@@ -843,7 +892,7 @@ test("16. a hook failure stops the graph before the next executor runs", async (
 test("17. the trace preserves the exact original transition indexes in order", async () => {
   await withPipeline(PIPELINE_DECISION_CHAIN, async ({ pipeline }) => {
     const result = await executePipelineV2Graph(pipeline, {
-      executeAgent: refuse("agent"),
+      executeAgent: refuseAgent,
       executeDecision: (state) => (state.id === "d1" ? "alpha" : "alpha"),
     });
     expect(result.terminalStateId).toBe("failed_end");
@@ -881,7 +930,6 @@ test("18. executor views are frozen, fresh and contain no graph data", async () 
         expect(state.promptContent).toBe("implement the task\n");
         expect(state.timeout_seconds).toBe(60);
         expect(state.max_attempts).toBe(1);
-        return "completed";
       },
       executeDecision: (state) => {
         decisionViews += 1;
@@ -926,7 +974,6 @@ test("19. callback mutation attempts of the pipeline or view never redirect the 
         })).toBe(true);
         expect(state.id).toBe("coder");
         expect(pipeline.max_transitions).toBe(20);
-        return "completed";
       },
       executeDecision: (state) => {
         expect(state.id).toBe("check");
@@ -952,7 +999,7 @@ test("20. mutation attempts while a callback is pending cannot change the engine
     const gate: { release: () => void } = { release: () => {} };
     let decisionRuns = 0;
     const pending = executePipelineV2Graph(pipeline, {
-      executeAgent: refuse("agent"),
+      executeAgent: refuseAgent,
       executeDecision: async (state) => {
         expect(state.id).toBe("check");
         expect(Object.isFrozen(state)).toBe(true);
@@ -1012,9 +1059,8 @@ test("21. clone, spread and Proxy pipelines are rejected before any callback", a
     let agentRuns = 0;
     let decisionRuns = 0;
     const executors = {
-      executeAgent: (_state: V2AgentExecutionView): string => {
+      executeAgent: (_state: V2AgentExecutionView): void => {
         agentRuns += 1;
-        return "completed";
       },
       executeDecision: (_state: V2DecisionExecutionView): string => {
         decisionRuns += 1;
@@ -1070,7 +1116,6 @@ test("23. the captured decision executor survives an in-callback reassignment", 
           rogueCalls += 1;
           return "beta";
         };
-        return "completed";
       },
       executeDecision: (state) => {
         originalDecisionCalls += 1;
@@ -1107,7 +1152,6 @@ test("24. an external decision-executor reassignment while a callback is pending
         await new Promise<void>((resolve) => {
           gate.release = resolve;
         });
-        return "completed";
       },
       executeDecision: (state) => {
         originalDecisionCalls += 1;
@@ -1159,11 +1203,10 @@ test("25. an agent-executor swap after the first activation cannot change a revi
           const rogue = (rogueState: V2AgentExecutionView): string => {
             rogueAgentCalls += 1;
             expect(rogueState.id).toBe("coder");
-            return "bogus";
+            return "rogue";
           };
-          executors.executeAgent = rogue;
+          executors.executeAgent = rogue as unknown as (state: V2AgentExecutionView) => void;
         }
-        return "completed";
       },
       executeDecision: (state) => {
         decisionCalls += 1;
@@ -1286,7 +1329,6 @@ test("26. a missing or non-function executor fails invalid_executor before any c
       await executePipelineV2Graph(pipeline, {
         executeAgent: () => {
           agentCalls += 1;
-          return "completed";
         },
         executeDecision: undefined as unknown as (() => string),
       } as unknown as PipelineV2GraphExecutors);
@@ -1333,7 +1375,6 @@ test("22. the real evaluateDecisionStateFromData feeds the shared engine to the 
         // acceptance mints one runner-owned record per declared output
         const records = await acceptActivationOutputs(pipeline, prepared);
         accepted.push(...records);
-        return "completed";
       },
       executeDecision: async (state) => {
         seen.push(`decision:${state.id}`);
@@ -1369,5 +1410,90 @@ test("22. the real evaluateDecisionStateFromData feeds the shared engine to the 
     expect(factsRecord.state).toBe("coder");
     expect(factsRecord.activation_index).toBe(1);
     expect(factsRecord.digest).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+// --- 27. budget exhaustion happens before the next agent callback ----------
+
+test("27. an exhausted budget rejects an agent state before its callback", async () => {
+  await withPipeline(PIPELINE_AGENT_CYCLE_BUDGET_TWO, async ({ pipeline }) => {
+    let agentRuns = 0;
+    let decisionRuns = 0;
+    const error = await rejectEngine(() =>
+      executePipelineV2Graph(pipeline, {
+        executeAgent: (state) => {
+          agentRuns += 1;
+          expect(state.id).toBe("coder");
+        },
+        executeDecision: (state) => {
+          decisionRuns += 1;
+          expect(state.id).toBe("check");
+          return "beta";
+        },
+      }),
+    );
+    expect(error.reason).toBe("transition_budget_exhausted");
+    expect(error.message).toBe(
+      'agent state "coder" cannot execute: transition budget exhausted (2 of 2 transitions already applied)',
+    );
+    // the second visit of the agent state is cut off before its callback
+    expect(agentRuns).toBe(1);
+    expect(decisionRuns).toBe(1);
+  });
+});
+
+// --- 28. agent-executor reassignment while a callback is pending ------------
+
+test("28. an external agent-executor reassignment while an agent callback is pending cannot change dispatch", async () => {
+  await withPipeline(PIPELINE_AGENT_DECISION_CYCLE, async ({ pipeline }) => {
+    const gate: { release: () => void } = { release: () => {} };
+    let agentCalls = 0;
+    let rogueCalls = 0;
+    let decisionCalls = 0;
+    const decisionOutcomes = ["beta", "alpha"];
+    const executors: MutableV2Executors = {
+      executeAgent: async (state) => {
+        agentCalls += 1;
+        expect(state.id).toBe("coder");
+        if (agentCalls === 1) {
+          await new Promise<void>((resolve) => {
+            gate.release = resolve;
+          });
+        }
+      },
+      executeDecision: (state) => {
+        decisionCalls += 1;
+        expect(state.id).toBe("check");
+        const outcome = decisionOutcomes[decisionCalls - 1];
+        if (outcome === undefined) {
+          throw new Error("decision script exhausted");
+        }
+        return outcome;
+      },
+    };
+    const pending = executePipelineV2Graph(pipeline, executors);
+    // while the first agent callback is pending, external code swaps the
+    // agent executor; the engine already holds its own executor snapshot,
+    // so the revisit of the same agent state runs the captured original
+    const rogue = (state: V2AgentExecutionView): string => {
+      rogueCalls += 1;
+      expect(state.id).toBe("coder");
+      return "rogue";
+    };
+    executors.executeAgent = rogue as unknown as (state: V2AgentExecutionView) => void;
+    gate.release();
+
+    const result = await pending;
+    expect(executors.executeAgent as unknown).toBe(rogue);
+    expect(result.terminalStateId).toBe("done");
+    expect(result.trace).toEqual([
+      { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+      { from: "check", outcome: "beta", to: "coder", transition_index: 1 },
+      { from: "coder", outcome: "completed", to: "check", transition_index: 0 },
+      { from: "check", outcome: "alpha", to: "done", transition_index: 0 },
+    ]);
+    expect(agentCalls).toBe(2);
+    expect(rogueCalls).toBe(0);
+    expect(decisionCalls).toBe(2);
   });
 });

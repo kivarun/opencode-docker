@@ -117,12 +117,10 @@ states:
       - id: report
         type: file
     timeout_seconds: 1800
-    max_attempts: 2
+    max_attempts: 1
     transitions:
       - outcome: completed
         to: done
-      - outcome: needs_changes
-        to: coder
 
   - id: done
     type: terminal
@@ -226,13 +224,11 @@ states:
             schema: schemas/facts.schema.json
           - type: file
             id: report
+      max_attempts: 1
       timeout_seconds: 1800
-      max_attempts: 2
       transitions:
           - to: done
             outcome: completed
-          - to: coder
-            outcome: needs_changes
 
     - result: success
       type: terminal
@@ -612,9 +608,8 @@ test("snapshot describes the compiled v2 semantics with exact shapes and origina
     ]);
     expect(architect.transitions).toEqual([
       { index: 0, outcome: "completed", to: "done" },
-      { index: 1, outcome: "needs_changes", to: "coder" },
     ]);
-    expect(architect.max_attempts).toBe(2);
+    expect(architect.max_attempts).toBe(1);
 
     expect(at(states, 3)).toEqual({ id: "done", type: "terminal", result: "success" });
     expect(at(states, 4)).toEqual({ id: "rejected", type: "terminal", result: "failed" });
@@ -771,11 +766,19 @@ test("changing an agent timeout changes the digest", async () => {
   expect(before.digest).not.toBe(after.digest);
 });
 
-test("changing max_attempts changes the digest", async () => {
-  const { before, after } = await digestAfterMutation((bundle) =>
-    replaceInPipelineYaml(bundle, "max_attempts: 2", "max_attempts: 3"),
-  );
-  expect(before.digest).not.toBe(after.digest);
+test("an agent-state max_attempts mutation is rejected by the loader, so no snapshot is produced", async () => {
+  await withTemp(async (root) => {
+    const bundle = join(root, "bundle");
+    await writeDigestBundle(bundle);
+    const before = await loadDigestBundle(bundle);
+    expect(before.digest).toMatch(/^[0-9a-f]{64}$/);
+    await replaceInPipelineYaml(bundle, "max_attempts: 1", "max_attempts: 2");
+    // the trusted load rejects the contract violation before any resolved
+    // snapshot is registered, so no execution snapshot or digest exists
+    await expect(loadPipelineV2(bundle)).rejects.toThrow(
+      /agent state "coder" max_attempts must be exactly 1; agent-state retries are not implemented yet/,
+    );
+  });
 });
 
 test("changing an agent input port source changes the digest", async () => {
@@ -873,44 +876,64 @@ test("adding a decision model constraint changes the digest", async () => {
   expect(before.digest).not.toBe(after.digest);
 });
 
-test("changing a transition target changes the digest", async () => {
+test("changing the target of the single agent transition changes the digest", async () => {
   const { before, after } = await digestAfterMutation(async (bundle) => {
     await replaceInPipelineYaml(
       bundle,
-      "      - outcome: needs_changes\n        to: coder",
-      "      - outcome: needs_changes\n        to: gate",
+      "      - outcome: completed\n        to: done",
+      "      - outcome: completed\n        to: rejected",
     );
   });
   expect(before.digest).not.toBe(after.digest);
 });
 
-test("changing a transition outcome changes the digest", async () => {
+test("changing a decision transition target changes the digest", async () => {
   const { before, after } = await digestAfterMutation(async (bundle) => {
     await replaceInPipelineYaml(
       bundle,
-      "      - outcome: needs_changes\n        to: coder",
-      "      - outcome: review_requested\n        to: coder",
+      "      - outcome: uncovered\n        to: rejected",
+      "      - outcome: uncovered\n        to: done",
     );
   });
   expect(before.digest).not.toBe(after.digest);
 });
 
-test("changing transition declaration order changes the digest", async () => {
+test("renaming a model-defined decision outcome changes the digest", async () => {
+  const { before, after } = await digestAfterMutation(async (bundle) => {
+    const modelPath = join(bundle, "decisions", "gate.yaml");
+    const model = await readFile(modelPath, "utf8");
+    await writeFile(modelPath, model.replace("  - id: d1\n", "  - id: d2\n").replace("    decision: d1\n", "    decision: d2\n"));
+    await replaceInPipelineYaml(
+      bundle,
+      "      - outcome: d1\n        to: architect",
+      "      - outcome: d2\n        to: architect",
+    );
+  });
+  expect(before.digest).not.toBe(after.digest);
+});
+
+test("changing decision transition declaration order changes the digest", async () => {
   const { before, after } = await digestAfterMutation((bundle) =>
     replaceInPipelineYaml(
       bundle,
-      "      - outcome: completed\n        to: done\n      - outcome: needs_changes\n        to: coder",
-      "      - outcome: needs_changes\n        to: coder\n      - outcome: completed\n        to: done",
+      "      - outcome: uncovered\n        to: rejected\n      - outcome: inconsistent_facts\n        to: rejected",
+      "      - outcome: inconsistent_facts\n        to: rejected\n      - outcome: uncovered\n        to: rejected",
     ),
   );
   expect(before.digest).not.toBe(after.digest);
 });
 
-test("changing the entry state changes the digest", async () => {
-  const { before, after } = await digestAfterMutation((bundle) =>
-    replaceInPipelineYaml(bundle, "entry_state: coder\n", "entry_state: gate\n"),
-  );
-  expect(before.digest).not.toBe(after.digest);
+test("an entry-state mutation that breaks reachability is rejected by the loader, so no snapshot is produced", async () => {
+  await withTemp(async (root) => {
+    const bundle = join(root, "bundle");
+    await writeDigestBundle(bundle);
+    const before = await loadDigestBundle(bundle);
+    expect(before.digest).toMatch(/^[0-9a-f]{64}$/);
+    await replaceInPipelineYaml(bundle, "entry_state: coder\n", "entry_state: gate\n");
+    await expect(loadPipelineV2(bundle)).rejects.toThrow(
+      /agent state "coder" is not reachable from entry_state/,
+    );
+  });
 });
 
 test("changing the transition budget changes the digest", async () => {

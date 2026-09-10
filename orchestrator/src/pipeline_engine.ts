@@ -115,19 +115,35 @@ export interface V2DecisionExecutionView {
 /**
  * Executors of a v2 pipeline graph. For an agent state only `executeAgent`
  * runs, for a decision state only `executeDecision`, for a terminal state
- * neither. Both return an outcome string; neither selects the next state —
- * the engine resolves the declared transition from its own snapshot. Both
- * functions are captured exactly once into an engine-owned snapshot before
- * graph compilation and before the first callback; reassigning properties
- * of the caller's object during the run cannot change the dispatch.
+ * neither. An agent state has the single lifecycle outcome `completed`
+ * which the engine applies itself from its immutable compiled snapshot
+ * after the agent callback resolves — the agent runtime therefore returns
+ * nothing and never sees the transition, target or transition index, and
+ * its callback selects no outcome at all. A decision state still reports
+ * its selected model outcome through `executeDecision`. Neither executor
+ * ever selects the next state: the engine resolves the declared transition
+ * from its own snapshot. Both functions are captured exactly once into an
+ * engine-owned snapshot before graph compilation and before the first
+ * callback; reassigning properties of the caller's object during the run
+ * cannot change the dispatch. A value returned by the agent callback
+ * against the void contract is ignored entirely.
  */
 export interface PipelineV2GraphExecutors {
   readonly executeAgent:
-    (state: V2AgentExecutionView) => string | Promise<string>;
+    (state: V2AgentExecutionView) => void | Promise<void>;
 
   readonly executeDecision:
     (state: V2DecisionExecutionView) => string | Promise<string>;
 }
+
+/**
+ * The fixed lifecycle outcome of every v2 agent state. The loader enforces
+ * it at compile time and the engine's own defensive snapshot guard repeats
+ * it, so the engine can apply this outcome from its own snapshot after a
+ * successful agent callback without asking the coordinator, the runtime or
+ * the callback.
+ */
+const AGENT_COMPLETED_OUTCOME = "completed";
 
 /** The engine-owned executor snapshot captured from the caller once. */
 type CapturedV2Executors = {
@@ -181,16 +197,25 @@ type CompiledAgentView = AgentStateView | V2AgentExecutionView;
 /**
  * One compiled transition-bearing state. The `execute` closure binds the
  * version-specific executor to the state's frozen, transition-free view at
- * compile time: an agent state always runs only its agent executor, a
- * decision state only the decision executor, and the executor can return
- * just an outcome — never a target state.
+ * compile time and yields the outcome the engine routes: an agent state
+ * always runs only its agent executor, a decision state only the decision
+ * executor, and the executor can produce just an outcome — never a target
+ * state. A v2 agent state's callback returns nothing: the closure awaits
+ * it and then reports the fixed `completed` outcome carried by the engine's
+ * own snapshot (a rogue value returned against the void contract is
+ * dropped and never participates in transition selection).
  */
 type CompiledExecutableState = {
   readonly id: string;
   readonly kind: "agent" | "decision";
   readonly view: CompiledAgentView | V2DecisionExecutionView;
   readonly transitions: readonly CompiledTransition[];
-  readonly execute: () => string | Promise<string>;
+  /**
+   * Set only for v2 agent states: the single lifecycle outcome the engine
+   * applies from its own snapshot after a successful callback.
+   */
+  readonly fixedOutcome?: "completed";
+  readonly execute: () => Promise<{ outcome: string }>;
 };
 
 type CompiledState =
@@ -524,6 +549,46 @@ function finishCompiledGraph(
 }
 
 /**
+ * The defensive v2 agent-state contract guard of the engine's own snapshot.
+ * The trusted loader is the primary compiler/validator of the bundle; this
+ * guard only protects the engine's own execution invariant against an
+ * internally damaged agent state that somehow reached it (a corrupted
+ * resolved pipeline, a future second construction path): zero or multiple
+ * transitions, an outcome other than `completed`, or `max_attempts`
+ * different from 1 must fail closed as `invalid_graph` before the first
+ * callback — never as a data-plane failure and never by asking anything
+ * outside the snapshot.
+ */
+function compileV2AgentContract(
+  stateId: string,
+  transitions: readonly CompiledTransition[],
+  maxAttempts: unknown,
+): "completed" {
+  if (transitions.length !== 1) {
+    throw contradiction(
+      `agent state ${JSON.stringify(stateId)} must declare exactly one transition with outcome "completed", got ${transitions.length}`,
+    );
+  }
+  const single = transitions[0];
+  if (single === undefined) {
+    throw contradiction(
+      `agent state ${JSON.stringify(stateId)} must declare exactly one transition with outcome "completed"`,
+    );
+  }
+  if (single.outcome !== AGENT_COMPLETED_OUTCOME) {
+    throw contradiction(
+      `agent state ${JSON.stringify(stateId)} declares transition outcome ${JSON.stringify(single.outcome)}; an agent state completes with the single lifecycle outcome "completed" and branches only through decision states`,
+    );
+  }
+  if (maxAttempts !== 1) {
+    throw contradiction(
+      `agent state ${JSON.stringify(stateId)} max_attempts must be exactly 1, got ${JSON.stringify(maxAttempts)}`,
+    );
+  }
+  return AGENT_COMPLETED_OUTCOME;
+}
+
+/**
  * v1 compilation adapter: validates the runtime graph shape of a resolved
  * v1 pipeline and compiles the immutable engine-owned snapshot, binding the
  * `executeAgent` callback into each agent state. Decision states cannot
@@ -568,7 +633,7 @@ function compileV1Graph(
       kind: "agent",
       view,
       transitions,
-      execute: () => executeAgent(view),
+      execute: async () => ({ outcome: await executeAgent(view) }),
     });
   }
 
@@ -623,7 +688,7 @@ function compileV2Graph(
         kind: "decision",
         view,
         transitions,
-        execute: () => decisionExecutor(view),
+        execute: async () => ({ outcome: await decisionExecutor(view) }),
       });
       continue;
     }
@@ -633,13 +698,22 @@ function compileV2Graph(
       );
     }
     const transitions = compileTransitions("agent", stateId, state.transitions);
+    const fixedOutcome = compileV2AgentContract(stateId, transitions, state.max_attempts);
     const view = buildV2AgentStateView(state);
     states.set(stateId, {
       id: stateId,
       kind: "agent",
       view,
       transitions,
-      execute: () => agentExecutor(view),
+      fixedOutcome,
+      execute: async () => {
+        // The agent callback reports nothing: after it resolves, the engine
+        // applies the fixed lifecycle outcome from its own snapshot. Any
+        // value the callback returns against the void contract is dropped
+        // here and never reaches transition selection.
+        await agentExecutor(view);
+        return { outcome: fixedOutcome };
+      },
     });
   }
 
@@ -696,7 +770,8 @@ async function runCompiledGraph(
         `${stateKindLabel(current.kind)} ${JSON.stringify(current.id)} cannot execute: transition budget exhausted (${transitionCount} of ${graph.maxTransitions} transitions already applied)`,
       );
     }
-    const outcome = await current.execute();
+    const outcomeResult = await current.execute();
+    const outcome = outcomeResult.outcome;
     if (typeof outcome !== "string" || outcome.trim() === "") {
       throw new PipelineExecutionError(
         "invalid_outcome",
