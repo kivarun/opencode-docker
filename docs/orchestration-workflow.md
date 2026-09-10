@@ -1265,8 +1265,12 @@ of an activation the adapter proves the projection fail-closed: the
 activation's canonical run root must equal `localRoot`, both roots must
 be real non-symlink directories resolving to their declared canonical
 paths with identical dev/ino, and the project, activation, data, inputs
-and outputs roots plus the `.orchestrator` directory and the execution
-document must have same-kind, same-dev/ino pairs under both roots — any
+and outputs roots plus the `.orchestrator` directory must be real
+non-symlink directories and the execution document a real non-symlink
+regular file, each canonically resolving to its own declared path on
+both sides (a symlinked parent component redirects `realpath` and
+fails) with identical dev/ino — same-kind substitutions such as a
+symlinked, swapped file/directory or FIFO/socket pair are rejected. Any
 divergence throws the typed `PipelineV2ProjectionError` (stable reason)
 before any Session and before any helper CLI side effect. Session
 workspaces are only `daemonRoot + relative(localRoot, localPath)`

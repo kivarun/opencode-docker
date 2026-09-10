@@ -40,9 +40,14 @@
  * activation's canonical run root must equal `localRoot`, both roots must
  * be real non-symlink directories resolving exactly to their declared
  * canonical paths with identical dev/ino, and the project, activation,
- * data, inputs and outputs roots plus the `.orchestrator` directory and
- * the execution document must have same-kind, same-dev/ino pairs under
- * both roots. Any divergence fails closed with a typed
+ * data, inputs and outputs roots plus the `.orchestrator` directory must
+ * be real non-symlink directories and the execution document a real
+ * non-symlink regular file, each canonically resolving to its own
+ * declared path on both sides (a symlinked parent component redirects
+ * `realpath` and fails) with identical dev/ino under both roots. Same-kind
+ * substitutions — a symlinked pair, a swapped file/directory pair, a
+ * FIFO/socket pair — are rejected as well. Any divergence fails closed
+ * with a typed
  * `PipelineV2ProjectionError` (stable reason, never classified from
  * message text) before any Session and before any helper CLI side effect.
  * Session workspaces use only `daemonRoot + relative(localRoot, localPath)`
@@ -497,56 +502,82 @@ export function createDockerHelperPipelineV2Runtime(
   };
 
   /**
-   * One projection pair (the same object under both roots) must match by
-   * object kind and dev/ino.
+   * One side of a projection pair must be exactly the expected object
+   * kind — a real non-symlink directory or a real non-symlink regular
+   * file — and must be canonically itself: `realpath(path) === path`,
+   * which also rejects a symlinked parent component (for example a
+   * redirected activation tree whose descendants otherwise look normal).
+   * Returns the dev/ino identity for the pair comparison.
+   */
+  const verifyProjectionPairAt = async (
+    what: string,
+    side: "local" | "daemon",
+    path: string,
+    expected: "directory" | "file",
+  ): Promise<{ dev: number; ino: number }> => {
+    let info;
+    try {
+      info = await lstat(path);
+    } catch {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `${side} path ${JSON.stringify(path)} is missing`,
+      );
+    }
+    if (info.isSymbolicLink()) {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `${side} path ${JSON.stringify(path)} is a symlink instead of a real ${expected}`,
+      );
+    }
+    if (expected === "directory" ? !info.isDirectory() : !info.isFile()) {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `${side} path ${JSON.stringify(path)} is not a real ${expected}`,
+      );
+    }
+    let resolved = "";
+    try {
+      resolved = await realpath(path);
+    } catch {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `${side} path ${JSON.stringify(path)} cannot be resolved`,
+      );
+    }
+    if (resolved !== path) {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `${side} path ${JSON.stringify(path)} resolves to ${JSON.stringify(resolved)} instead of the declared path`,
+      );
+    }
+    return { dev: info.dev, ino: info.ino };
+  };
+
+  /**
+   * One projection pair (the same object under both roots) must be
+   * exactly the expected object kind on both sides — the six directories
+   * must be real non-symlink directories and the execution document a
+   * real non-symlink regular file — canonically resolve to their own
+   * declared paths (a symlinked parent component redirects `realpath`
+   * and fails), and share identical dev/ino. Same-kind substitutions
+   * such as a symlinked pair, a swapped file/directory pair or a
+   * FIFO/socket pair can no longer pass.
    */
   const verifyProjectionPair = async (
     what: string,
     localPath: string,
+    expected: "directory" | "file",
   ): Promise<void> => {
     const daemonPath = daemonPathFor(what, localPath);
-    let localInfo;
-    try {
-      localInfo = await lstat(localPath);
-    } catch {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `local path ${JSON.stringify(localPath)} is missing`,
-      );
-    }
-    let daemonInfo;
-    try {
-      daemonInfo = await lstat(daemonPath);
-    } catch {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `daemon path ${JSON.stringify(daemonPath)} is missing`,
-      );
-    }
-    if (localInfo.isSymbolicLink() !== daemonInfo.isSymbolicLink()) {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `object kind differs between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
-      );
-    }
-    if (localInfo.isDirectory() !== daemonInfo.isDirectory()) {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `object kind differs between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
-      );
-    }
-    if (localInfo.isFile() !== daemonInfo.isFile()) {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `object kind differs between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
-      );
-    }
-    if (localInfo.dev !== daemonInfo.dev || localInfo.ino !== daemonInfo.ino) {
+    const localIdentity = await verifyProjectionPairAt(what, "local", localPath, expected);
+    const daemonIdentity = await verifyProjectionPairAt(what, "daemon", daemonPath, expected);
+    if (localIdentity.dev !== daemonIdentity.dev || localIdentity.ino !== daemonIdentity.ino) {
       throw projectionFailure(
         "projection_pair_mismatch",
         what,
@@ -561,7 +592,11 @@ export function createDockerHelperPipelineV2Runtime(
    * run root must equal the projection's local root, both roots must be
    * real non-symlink directories resolving to their declared canonical
    * paths with identical dev/ino, and every orchestrator-side object the
-   * sessions and mounts depend on must have a matching daemon-side pair.
+   * sessions and mounts depend on must be exactly its expected kind on
+   * both sides (real non-symlink directories, the execution document a
+   * real non-symlink regular file), canonically resolve to its own
+   * declared path on both sides — a symlinked parent component redirects
+   * `realpath` and fails — and share identical dev/ino across the pair.
    * Any divergence fails closed before any helper CLI side effect.
    */
   const requireActivationProjection = async (
@@ -587,17 +622,17 @@ export function createDockerHelperPipelineV2Runtime(
       0,
       activation.execution_document.host_path.lastIndexOf("/"),
     );
-    const pairs: readonly (readonly [string, string])[] = [
-      ["project root", activation.project_root],
-      ["activation root", activation.activation_root],
-      ["data root", activation.data_root],
-      ["inputs root", activation.inputs_root],
-      ["outputs root", activation.outputs_root],
-      [".orchestrator directory", executionDocumentDir],
-      ["execution document", activation.execution_document.host_path],
+    const pairs: readonly (readonly [string, string, "directory" | "file"])[] = [
+      ["project root", activation.project_root, "directory"],
+      ["activation root", activation.activation_root, "directory"],
+      ["data root", activation.data_root, "directory"],
+      ["inputs root", activation.inputs_root, "directory"],
+      ["outputs root", activation.outputs_root, "directory"],
+      [".orchestrator directory", executionDocumentDir, "directory"],
+      ["execution document", activation.execution_document.host_path, "file"],
     ];
-    for (const [what, localPath] of pairs) {
-      await verifyProjectionPair(what, localPath);
+    for (const [what, localPath, expected] of pairs) {
+      await verifyProjectionPair(what, localPath, expected);
     }
   };
 

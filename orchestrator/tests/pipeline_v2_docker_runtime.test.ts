@@ -1,3 +1,5 @@
+import { execSync } from "node:child_process";
+import { createServer } from "node:net";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1383,6 +1385,164 @@ test("36. the factory rejects a projection without absolute clean roots before a
         runRootProjection: { localRoot: "", daemonRoot: setup_.runRoot },
       }),
     ).toThrow("must be a non-empty string");
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("37. a symlink substituted for a pair object fails even when both projections see the same symlink", async () => {
+  const setup_ = await setup();
+  try {
+    // both projections resolve to the same object in host mode, so the
+    // old same-kind comparison would have accepted this; the expected-kind
+    // check must reject the symlink on its own
+    await rm(setup_.coderPrepared.outputs_root, { recursive: true });
+    await symlink(setup_.root, setup_.coderPrepared.outputs_root);
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli);
+    let failure: unknown;
+    try {
+      await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((failure as PipelineV2ProjectionError).reason).toBe("projection_pair_mismatch");
+    expect((failure as Error).message).toContain("outputs root");
+    expect((failure as Error).message).toContain("is a symlink instead of a real directory");
+    expect(fake.calls.length).toBe(0);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("38. a FIFO and a unix socket in place of pair objects are rejected before any session", async () => {
+  const setup_ = await setup();
+  try {
+    // FIFO in place of the data root directory
+    await rm(setup_.coderPrepared.data_root, { recursive: true });
+    execSync(["mkfifo", setup_.coderPrepared.data_root].join(" "));
+    const fakeFifo = makeFakeCli();
+    const runtimeFifo = makeRuntime(setup_, fakeFifo.cli);
+    let fifoFailure: unknown;
+    try {
+      await runtimeFifo.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      fifoFailure = cause;
+    }
+    expect(fifoFailure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((fifoFailure as PipelineV2ProjectionError).reason).toBe("projection_pair_mismatch");
+    expect((fifoFailure as Error).message).toContain("data root");
+    expect((fifoFailure as Error).message).toContain("is not a real directory");
+    expect(fakeFifo.calls.length).toBe(0);
+
+    // unix socket in place of the project root directory (a pair that is
+    // not below the FIFO data root); the socket file must exist while the
+    // verification runs
+    const socketPath = setup_.coderPrepared.project_root;
+    await rm(socketPath, { recursive: true });
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+    try {
+      const fakeSocket = makeFakeCli();
+      const runtimeSocket = makeRuntime(setup_, fakeSocket.cli);
+      let socketFailure: unknown;
+      try {
+        await runtimeSocket.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+      } catch (cause) {
+        socketFailure = cause;
+      }
+      expect(socketFailure).toBeInstanceOf(PipelineV2ProjectionError);
+      expect((socketFailure as PipelineV2ProjectionError).reason).toBe("projection_pair_mismatch");
+      expect((socketFailure as Error).message).toContain("project root");
+      expect((socketFailure as Error).message).toContain("is not a real directory");
+      expect(fakeSocket.calls.length).toBe(0);
+    } finally {
+      server.close();
+    }
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("39. a swapped file/directory substitution is rejected for both expected kinds", async () => {
+  const setup_ = await setup();
+  try {
+    // a regular file in place of the data root directory
+    await rm(setup_.coderPrepared.data_root, { recursive: true });
+    await writeFile(setup_.coderPrepared.data_root, "not a directory\n");
+    const fakeFile = makeFakeCli();
+    const runtimeFile = makeRuntime(setup_, fakeFile.cli);
+    let fileFailure: unknown;
+    try {
+      await runtimeFile.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      fileFailure = cause;
+    }
+    expect(fileFailure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((fileFailure as PipelineV2ProjectionError).reason).toBe("projection_pair_mismatch");
+    expect((fileFailure as Error).message).toContain("data root");
+    expect((fileFailure as Error).message).toContain("is not a real directory");
+    expect(fakeFile.calls.length).toBe(0);
+  } finally {
+    await dispose(setup_);
+  }
+
+  const documentSetup = await setup();
+  try {
+    // a directory in place of the execution document regular file
+    await rm(documentSetup.coderPrepared.execution_document.host_path);
+    await mkdir(documentSetup.coderPrepared.execution_document.host_path);
+    const fakeDir = makeFakeCli();
+    const runtimeDir = makeRuntime(documentSetup, fakeDir.cli);
+    let dirFailure: unknown;
+    try {
+      await runtimeDir.createExecutionSession(documentSetup.coderView, documentSetup.coderPrepared);
+    } catch (cause) {
+      dirFailure = cause;
+    }
+    expect(dirFailure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((dirFailure as PipelineV2ProjectionError).reason).toBe("projection_pair_mismatch");
+    expect((dirFailure as Error).message).toContain("execution document");
+    expect((dirFailure as Error).message).toContain("is not a real file");
+    expect(fakeDir.calls.length).toBe(0);
+  } finally {
+    await dispose(documentSetup);
+  }
+});
+
+test("40. a symlinked parent with an external sentinel tree is rejected by the canonical identity check", async () => {
+  const setup_ = await setup();
+  try {
+    const external = await mkdtemp(join(tmpdir(), "pipeline-v2-projection-sentinel-"));
+    try {
+      // redirect the whole activations tree to a directory outside the run
+      // root: the activation root pair itself resolves fine through the
+      // symlinked parent, so only the realpath identity check can catch it
+      await mkdir(join(external, "1-coder"));
+      await writeFile(join(external, "1-coder", "sentinel"), "sentinel\n");
+      await rm(join(setup_.runRoot, "activations"), { recursive: true });
+      await symlink(external, join(setup_.runRoot, "activations"));
+      const fake = makeFakeCli();
+      const runtime = makeRuntime(setup_, fake.cli);
+      let failure: unknown;
+      try {
+        await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineV2ProjectionError);
+      expect((failure as PipelineV2ProjectionError).reason).toBe("projection_pair_mismatch");
+      expect((failure as Error).message).toContain("activation root");
+      expect((failure as Error).message).toContain("resolves to");
+      expect((failure as Error).message).toContain("instead of the declared path");
+      expect((failure as Error).message).toContain(external.slice(0, 24));
+      expect(fake.calls.length).toBe(0);
+      // the external sentinel stays untouched
+      expect(await readFile(join(external, "1-coder", "sentinel"), "utf8")).toBe("sentinel\n");
+    } finally {
+      await rm(external, { recursive: true, force: true });
+    }
   } finally {
     await dispose(setup_);
   }
