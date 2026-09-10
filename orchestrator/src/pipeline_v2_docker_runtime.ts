@@ -25,11 +25,30 @@
  * helper or filesystem side effect: the trusted pipeline snapshot, one
  * immutable execution snapshot per agent state (profile name, image,
  * OpenCode config content and the destination-sorted profile env bindings),
- * the CLI runner function, the helper config and the launcher operator
- * environment. Mutating the source profile map or the profile objects
- * during activations cannot change a later activation; user objects are
- * never frozen or modified, and profile secrets never appear on any public
- * object.
+ * the CLI runner function, the helper config, the launcher operator
+ * environment and the trusted run-root projection
+ * `{localRoot, daemonRoot}`. Mutating the source profile map, the profile
+ * objects or the projection object during activations cannot change a
+ * later activation; user objects are never frozen or modified, and profile
+ * secrets never appear on any public object.
+ *
+ * Daemon-visible run-root projection: the orchestrator works on the
+ * canonical run root (`localRoot`); the Docker Helper daemon may see the
+ * same directory under a different absolute path (`daemonRoot`, equal to
+ * `localRoot` in host mode). Before every `createChildSession` of an
+ * activation the adapter proves the projection fail-closed: the
+ * activation's canonical run root must equal `localRoot`, both roots must
+ * be real non-symlink directories resolving exactly to their declared
+ * canonical paths with identical dev/ino, and the project, activation,
+ * data, inputs and outputs roots plus the `.orchestrator` directory and
+ * the execution document must have same-kind, same-dev/ino pairs under
+ * both roots. Any divergence fails closed with a typed
+ * `PipelineV2ProjectionError` (stable reason, never classified from
+ * message text) before any Session and before any helper CLI side effect.
+ * Session workspaces use only `daemonRoot + relative(localRoot, localPath)`
+ * translations; mount sources stay workspace-relative, so neither root
+ * path ever appears in worker argv, worker environment, the execution
+ * document or durable state.
  *
  * Pair provenance: `runAgent(toolSession)` accepts only the exact Tool
  * Session handle created by this runtime for the same activation and the
@@ -74,6 +93,7 @@
  * support.
  */
 import { isAbsolute, relative } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
 import {
   DockerHelperError,
   MAX_RUN_TIMEOUT_SECONDS,
@@ -123,6 +143,42 @@ export interface DockerHelperPipelineV2RuntimeParams {
   readonly operatorEnv: Readonly<Record<string, string>>;
   /** The launcher id learned from `/auth`, when it is known. */
   readonly expectedLauncherId?: string;
+  /**
+   * Trusted runtime configuration mapping the orchestrator-side canonical
+   * run root to the exact absolute path by which the Docker Helper daemon
+   * sees the same directory. `localRoot` is the canonical run root the
+   * data plane works on; `daemonRoot` is the same directory by its
+   * host-visible absolute path (host-mode deployments pass the same
+   * string for both). The projection is captured at factory creation and
+   * is never part of the pipeline, profile, execution document, worker
+   * environment or durable state.
+   */
+  readonly runRootProjection: {
+    readonly localRoot: string;
+    readonly daemonRoot: string;
+  };
+}
+
+/** Stable fail-closed reasons of the runtime projection contract. */
+export type PipelineV2ProjectionFailureReason =
+  | "local_root_mismatch"
+  | "projection_root_invalid"
+  | "projection_pair_mismatch"
+  | "projection_suffix_unclean";
+
+/**
+ * Typed runtime-contract failure for an unprovable run-root projection.
+ * Carries a stable machine-readable reason; never classified from the
+ * message text.
+ */
+export class PipelineV2ProjectionError extends Error {
+  readonly reason: PipelineV2ProjectionFailureReason;
+
+  constructor(reason: PipelineV2ProjectionFailureReason, message: string) {
+    super(message);
+    this.name = "PipelineV2ProjectionError";
+    this.reason = reason;
+  }
 }
 
 /** Private source env variable carrying the Tool Session bearer. */
@@ -239,6 +295,29 @@ export function createDockerHelperPipelineV2Runtime(
 ): PipelineV2AgentRuntime {
   requireResolvedPipelineV2Provenance(params.pipeline, "docker helper pipeline v2 runtime factory");
 
+  // The projection is trusted runtime configuration: its values are
+  // captured now, so mutating the caller's object after factory creation
+  // cannot influence execution.
+  const projectionLocalRoot = requireNonEmptyString(
+    params.runRootProjection?.localRoot,
+    "run root projection localRoot",
+  );
+  const projectionDaemonRoot = requireNonEmptyString(
+    params.runRootProjection?.daemonRoot,
+    "run root projection daemonRoot",
+  );
+  if (
+    !isAbsolute(projectionLocalRoot) ||
+    !isAbsolute(projectionDaemonRoot) ||
+    projectionLocalRoot !== projectionLocalRoot.trim() ||
+    projectionDaemonRoot !== projectionDaemonRoot.trim()
+  ) {
+    throw new Error(
+      "pipeline v2 agent runtime factory: run root projection roots must be absolute clean paths",
+    );
+  }
+  const projection = { localRoot: projectionLocalRoot, daemonRoot: projectionDaemonRoot };
+
   const profileMap = params.profiles;
   if (profileMap === null || typeof profileMap !== "object" || typeof profileMap.get !== "function") {
     throw new Error("pipeline v2 agent runtime factory requires a profile map");
@@ -346,6 +425,180 @@ export function createDockerHelperPipelineV2Runtime(
     );
     record.cleanupPromise = cleanupPromise;
     return cleanupPromise;
+  };
+
+  const projectionFailure = (
+    reason: PipelineV2ProjectionFailureReason,
+    what: string,
+    detail: string,
+  ): PipelineV2ProjectionError =>
+    new PipelineV2ProjectionError(
+      reason,
+      `pipeline v2 runtime projection contract violated: ${what} ${detail}`,
+    );
+
+  /**
+   * One root of the projection pair must exist as a real non-symlink
+   * directory that resolves exactly to the declared canonical path.
+   */
+  const verifyProjectionRoot = async (
+    what: string,
+    path: string,
+  ): Promise<{ dev: number; ino: number }> => {
+    let info;
+    try {
+      info = await lstat(path);
+    } catch {
+      throw projectionFailure("projection_root_invalid", what, `is missing at ${JSON.stringify(path)}`);
+    }
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw projectionFailure(
+        "projection_root_invalid",
+        what,
+        `is not a real non-symlink directory at ${JSON.stringify(path)}`,
+      );
+    }
+    let resolved = "";
+    try {
+      resolved = await realpath(path);
+    } catch {
+      throw projectionFailure("projection_root_invalid", what, `cannot be resolved at ${JSON.stringify(path)}`);
+    }
+    if (resolved !== path) {
+      throw projectionFailure(
+        "projection_root_invalid",
+        what,
+        `resolves to ${JSON.stringify(resolved)} instead of the declared canonical path ${JSON.stringify(path)}`,
+      );
+    }
+    return { dev: info.dev, ino: info.ino };
+  };
+
+  /**
+   * Translate one orchestrator-side canonical path into the daemon
+   * namespace: strictly `daemonRoot + relative(localRoot, localPath)`.
+   * The relative suffix must be clean — non-empty segments only, no `.`
+   * or `..`. Arbitrary per-path mappings do not exist.
+   */
+  const daemonPathFor = (what: string, localPath: string): string => {
+    const suffix = relative(projection.localRoot, localPath);
+    if (suffix === "") {
+      return projection.daemonRoot;
+    }
+    const segments = suffix.split("/");
+    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+      throw projectionFailure(
+        "projection_suffix_unclean",
+        what,
+        `relative suffix ${JSON.stringify(suffix)} is not clean`,
+      );
+    }
+    return `${projection.daemonRoot}/${suffix}`;
+  };
+
+  /**
+   * One projection pair (the same object under both roots) must match by
+   * object kind and dev/ino.
+   */
+  const verifyProjectionPair = async (
+    what: string,
+    localPath: string,
+  ): Promise<void> => {
+    const daemonPath = daemonPathFor(what, localPath);
+    let localInfo;
+    try {
+      localInfo = await lstat(localPath);
+    } catch {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `local path ${JSON.stringify(localPath)} is missing`,
+      );
+    }
+    let daemonInfo;
+    try {
+      daemonInfo = await lstat(daemonPath);
+    } catch {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `daemon path ${JSON.stringify(daemonPath)} is missing`,
+      );
+    }
+    if (localInfo.isSymbolicLink() !== daemonInfo.isSymbolicLink()) {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `object kind differs between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
+      );
+    }
+    if (localInfo.isDirectory() !== daemonInfo.isDirectory()) {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `object kind differs between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
+      );
+    }
+    if (localInfo.isFile() !== daemonInfo.isFile()) {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `object kind differs between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
+      );
+    }
+    if (localInfo.dev !== daemonInfo.dev || localInfo.ino !== daemonInfo.ino) {
+      throw projectionFailure(
+        "projection_pair_mismatch",
+        what,
+        `dev/ino differ between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
+      );
+    }
+  };
+
+  /**
+   * Prove the daemon-visible run-root projection for one prepared
+   * activation before any Session is created: the activation's canonical
+   * run root must equal the projection's local root, both roots must be
+   * real non-symlink directories resolving to their declared canonical
+   * paths with identical dev/ino, and every orchestrator-side object the
+   * sessions and mounts depend on must have a matching daemon-side pair.
+   * Any divergence fails closed before any helper CLI side effect.
+   */
+  const requireActivationProjection = async (
+    activation: PreparedActivationData,
+  ): Promise<void> => {
+    if (activation.run_root !== projection.localRoot) {
+      throw projectionFailure(
+        "local_root_mismatch",
+        "activation run root",
+        `${JSON.stringify(activation.run_root)} is not the projection local root ${JSON.stringify(projection.localRoot)}`,
+      );
+    }
+    const localRootInfo = await verifyProjectionRoot("localRoot", projection.localRoot);
+    const daemonRootInfo = await verifyProjectionRoot("daemonRoot", projection.daemonRoot);
+    if (localRootInfo.dev !== daemonRootInfo.dev || localRootInfo.ino !== daemonRootInfo.ino) {
+      throw projectionFailure(
+        "projection_root_invalid",
+        "run root projection",
+        `dev/ino differ between localRoot ${JSON.stringify(projection.localRoot)} and daemonRoot ${JSON.stringify(projection.daemonRoot)}`,
+      );
+    }
+    const executionDocumentDir = activation.execution_document.host_path.slice(
+      0,
+      activation.execution_document.host_path.lastIndexOf("/"),
+    );
+    const pairs: readonly (readonly [string, string])[] = [
+      ["project root", activation.project_root],
+      ["activation root", activation.activation_root],
+      ["data root", activation.data_root],
+      ["inputs root", activation.inputs_root],
+      ["outputs root", activation.outputs_root],
+      [".orchestrator directory", executionDocumentDir],
+      ["execution document", activation.execution_document.host_path],
+    ];
+    for (const [what, localPath] of pairs) {
+      await verifyProjectionPair(what, localPath);
+    }
   };
 
   /**
@@ -627,11 +880,16 @@ export function createDockerHelperPipelineV2Runtime(
       );
     }
 
+    // The daemon-visible projection of the run root is proven before the
+    // first Session of the activation and before any helper CLI side
+    // effect; the Execution Session workspace is the daemon-visible
+    // correspondence of the canonical run root.
+    await requireActivationProjection(activation);
     const record = await createSessionRecord(
       "execution",
       activation,
       null,
-      activation.run_root,
+      projection.daemonRoot,
     );
     let handle: PipelineV2ExecutionSession | null = null;
     handle = Object.freeze({
@@ -691,11 +949,16 @@ export function createDockerHelperPipelineV2Runtime(
       );
     }
 
+    // The projection is re-proven before the Tool Session as well: every
+    // createChildSession runs after a fail-closed verification, and the
+    // Tool Session workspace is the daemon-visible correspondence of the
+    // canonical project root.
+    await requireActivationProjection(activation);
     const record = await createSessionRecord(
       "tool",
       activation,
       executionRecord,
-      activation.project_root,
+      daemonPathFor("project root", activation.project_root),
     );
     const handle: PipelineV2ToolSession = Object.freeze({
       sessionId: record.sessionId,

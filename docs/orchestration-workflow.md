@@ -1253,10 +1253,26 @@ before the first helper/filesystem side effect: the trusted pipeline
 snapshot, one loaded profile per agent state, an immutable per-state
 execution snapshot (profile name, image, OpenCode config content, and the
 destination-sorted profile env bindings), the CLI runner, the helper
-config, the minimal launcher operator environment, and the launcher id
-learned from `/auth` when known. Mutating the source profile map or the
-profile objects during activations changes nothing; user objects are never
-frozen or modified, and profile secrets never appear on public objects.
+config, the minimal launcher operator environment, the launcher id
+learned from `/auth` when known, and the trusted run-root projection
+(`localRoot` — the canonical run root the orchestrator works on;
+`daemonRoot` — the same directory by its daemon-visible absolute path;
+host mode passes the same string for both). Mutating the source profile
+map, the profile objects or the projection object during activations
+changes nothing; user objects are never frozen or modified, and profile
+secrets never appear on public objects. Before every `createChildSession`
+of an activation the adapter proves the projection fail-closed: the
+activation's canonical run root must equal `localRoot`, both roots must
+be real non-symlink directories resolving to their declared canonical
+paths with identical dev/ino, and the project, activation, data, inputs
+and outputs roots plus the `.orchestrator` directory and the execution
+document must have same-kind, same-dev/ino pairs under both roots — any
+divergence throws the typed `PipelineV2ProjectionError` (stable reason)
+before any Session and before any helper CLI side effect. Session
+workspaces are only `daemonRoot + relative(localRoot, localPath)`
+translations; mount sources stay workspace-relative, so neither root path
+appears in worker argv or environment, the execution document or durable
+state.
 
 Two sessions per activation, both created through the official CLI with
 the launcher operator env only: the Execution Session with workspace =

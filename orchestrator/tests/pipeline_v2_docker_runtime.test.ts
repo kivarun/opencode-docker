@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -11,8 +11,10 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import {
   createDockerHelperPipelineV2Runtime,
+  PipelineV2ProjectionError,
   PIPELINE_V2_OPENCODE_CONFIG_SOURCE,
   PIPELINE_V2_TOOL_SESSION_TOKEN_SOURCE,
+  type PipelineV2ProjectionFailureReason,
 } from "../src/pipeline_v2_docker_runtime.ts";
 import type { CliRunOptions, CliRunner, CliStdio } from "../src/docker_helper.ts";
 import { DockerHelperError } from "../src/docker_helper.ts";
@@ -280,6 +282,7 @@ function makeRuntime(
   overrides: {
     profiles?: Map<string, ResolvedProfile>;
     expectedLauncherId?: string;
+    runRootProjection?: { localRoot: string; daemonRoot: string };
   } = {},
 ) {
   return createDockerHelperPipelineV2Runtime({
@@ -289,6 +292,10 @@ function makeRuntime(
     helperConfig: { socketPath: SOCKET, credentialFile: CREDENTIAL_FILE },
     operatorEnv: OPERATOR_ENV,
     expectedLauncherId: overrides.expectedLauncherId ?? EXPECTED_LAUNCHER_ID,
+    runRootProjection: overrides.runRootProjection ?? {
+      localRoot: setup_.runRoot,
+      daemonRoot: setup_.runRoot,
+    },
   });
 }
 
@@ -402,7 +409,7 @@ test("2. profile snapshots are immune to mutations of the source map and profile
   }
 });
 
-test("3. the Execution Session is created with the run-root workspace", async () => {
+test("3. the Execution Session is created with the daemon-visible run-root workspace", async () => {
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
@@ -425,7 +432,7 @@ test("3. the Execution Session is created with the run-root workspace", async ()
   }
 });
 
-test("4. the Tool Session is created with the project-root workspace", async () => {
+test("4. the Tool Session is created with the daemon-visible project-root workspace", async () => {
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
@@ -1132,6 +1139,250 @@ test("27. the run argv carries no absolute host paths", async () => {
     }
     await driven.execution.cleanup();
     await driven.tool.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("28. host-mode projection: identical roots pass and the workspaces are the exact daemon roots", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli, {
+      runRootProjection: { localRoot: setup_.runRoot, daemonRoot: setup_.runRoot },
+    });
+    await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
+    expect(fake.calls[0]!.args).toContain(setup_.runRoot);
+    expect(fake.calls[1]!.args).toContain(setup_.coderPrepared.project_root);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("29. an activation run root that is not the projection local root fails closed before any session", async () => {
+  const setup_ = await setup();
+  try {
+    const other = await mkdtemp(join(tmpdir(), "pipeline-v2-projection-other-"));
+    try {
+      const fake = makeFakeCli();
+      const runtime = makeRuntime(setup_, fake.cli, {
+        runRootProjection: { localRoot: other, daemonRoot: other },
+      });
+      let failure: unknown;
+      try {
+        await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineV2ProjectionError);
+      expect((failure as PipelineV2ProjectionError).reason).toBe("local_root_mismatch");
+      expect(fake.calls.length).toBe(0);
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("30. a missing daemonRoot fails closed before any session", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli, {
+      runRootProjection: { localRoot: setup_.runRoot, daemonRoot: join(setup_.root, "absent") },
+    });
+    let failure: unknown;
+    try {
+      await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((failure as PipelineV2ProjectionError).reason).toBe("projection_root_invalid");
+    expect((failure as Error).message).toContain("daemonRoot");
+    expect((failure as Error).message).toContain("is missing");
+    expect(fake.calls.length).toBe(0);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("31. a symlinked daemonRoot to the same directory is rejected before any session", async () => {
+  const setup_ = await setup();
+  try {
+    const alias = join(setup_.root, "run-alias");
+    await symlink(setup_.runRoot, alias);
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli, {
+      runRootProjection: { localRoot: setup_.runRoot, daemonRoot: alias },
+    });
+    let failure: unknown;
+    try {
+      await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((failure as PipelineV2ProjectionError).reason).toBe("projection_root_invalid");
+    expect((failure as Error).message).toContain("not a real non-symlink directory");
+    expect(fake.calls.length).toBe(0);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("32. a file in place of daemonRoot and different-directory roots both fail closed", async () => {
+  const setup_ = await setup();
+  try {
+    const filePath = join(setup_.root, "not-a-dir");
+    await writeFile(filePath, "x");
+    const fakeFile = makeFakeCli();
+    const runtimeFile = makeRuntime(setup_, fakeFile.cli, {
+      runRootProjection: { localRoot: setup_.runRoot, daemonRoot: filePath },
+    });
+    let fileFailure: unknown;
+    try {
+      await runtimeFile.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      fileFailure = cause;
+    }
+    expect(fileFailure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((fileFailure as PipelineV2ProjectionError).reason).toBe("projection_root_invalid");
+    expect(fakeFile.calls.length).toBe(0);
+
+    // a real directory at a different path has a different inode: the
+    // root pair dev/ino check fails closed before any pair is inspected
+    const otherDir = join(setup_.root, "other-root");
+    await mkdir(otherDir, { mode: 0o700 });
+    const fakeDir = makeFakeCli();
+    const runtimeDir = makeRuntime(setup_, fakeDir.cli, {
+      runRootProjection: { localRoot: setup_.runRoot, daemonRoot: otherDir },
+    });
+    let dirFailure: unknown;
+    try {
+      await runtimeDir.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      dirFailure = cause;
+    }
+    expect(dirFailure).toBeInstanceOf(PipelineV2ProjectionError);
+    expect((dirFailure as PipelineV2ProjectionError).reason).toBe("projection_root_invalid");
+    expect((dirFailure as Error).message).toContain("dev/ino differ");
+    expect(fakeDir.calls.length).toBe(0);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("33. a missing projection pair object fails closed naming the pair, for every pair", async () => {
+  const setup_ = await setup();
+  try {
+    const prepared = setup_.coderPrepared;
+    const pairs: readonly (readonly [string, "dir" | "file"])[] = [
+      ["project root", "dir"],
+      ["activation root", "dir"],
+      ["data root", "dir"],
+      ["inputs root", "dir"],
+      ["outputs root", "dir"],
+      [".orchestrator directory", "dir"],
+      ["execution document", "file"],
+    ];
+    for (const [what, kind] of pairs) {
+      const missingSetup = await setup();
+      try {
+        if (what === "project root") {
+          await rm(missingSetup.coderPrepared.project_root, { recursive: true });
+        } else if (what === "activation root") {
+          await rm(missingSetup.coderPrepared.activation_root, { recursive: true });
+        } else if (what === "data root") {
+          await rm(missingSetup.coderPrepared.data_root, { recursive: true });
+        } else if (what === "inputs root") {
+          await rm(missingSetup.coderPrepared.inputs_root, { recursive: true });
+        } else if (what === "outputs root") {
+          await rm(missingSetup.coderPrepared.outputs_root, { recursive: true });
+        } else if (what === ".orchestrator directory") {
+          await rm(join(missingSetup.coderPrepared.inputs_root, ".orchestrator"), { recursive: true });
+        } else {
+          await rm(missingSetup.coderPrepared.execution_document.host_path);
+        }
+        void kind;
+        const fake = makeFakeCli();
+        const runtime = makeRuntime(missingSetup, fake.cli);
+        let failure: unknown;
+        try {
+          await runtime.createExecutionSession(missingSetup.coderView, missingSetup.coderPrepared);
+        } catch (cause) {
+          failure = cause;
+        }
+        expect(failure).toBeInstanceOf(PipelineV2ProjectionError);
+        expect((failure as PipelineV2ProjectionError).reason).toBe("projection_pair_mismatch");
+        expect((failure as Error).message).toContain(what);
+        expect((failure as Error).message).toContain("is missing");
+        expect(fake.calls.length).toBe(0);
+      } finally {
+        await dispose(missingSetup);
+      }
+    }
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("34. mutating the projection object after factory creation cannot influence execution", async () => {
+  const setup_ = await setup();
+  try {
+    const projection = { localRoot: setup_.runRoot, daemonRoot: setup_.runRoot };
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli, { runRootProjection: projection });
+    projection.localRoot = "/totally/other/root";
+    projection.daemonRoot = "/totally/other/daemon";
+    const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
+    expect(fake.calls[0]!.args).toContain(setup_.runRoot);
+    expect(fake.calls[1]!.args).toContain(setup_.coderPrepared.project_root);
+    const result = await execution.runAgent(tool);
+    expect(result).toEqual({ status: "completed" });
+    const run = runCall(fake.calls);
+    expect(JSON.stringify(run.args)).not.toContain("/totally/other");
+    await execution.cleanup();
+    await tool.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("35. neither projection root appears in the worker argv or env, nor in the execution document", async () => {
+  const setup_ = await setup();
+  try {
+    const driven = await driveCoderActivation(setup_);
+    const run = runCall(driven.calls);
+    const serializedArgs = JSON.stringify(run.args);
+    const serializedEnv = JSON.stringify(run.env);
+    expect(serializedArgs).not.toContain(setup_.runRoot);
+    expect(serializedEnv).not.toContain(setup_.runRoot);
+    const document = await readFile(setup_.coderPrepared.execution_document.host_path, "utf8");
+    expect(document).not.toContain(setup_.runRoot);
+    await driven.execution.cleanup();
+    await driven.tool.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("36. the factory rejects a projection without absolute clean roots before any side effect", async () => {
+  const setup_ = await setup();
+  try {
+    expect(() =>
+      makeRuntime(setup_, makeFakeCli().cli, {
+        runRootProjection: { localRoot: "relative/path", daemonRoot: setup_.runRoot },
+      }),
+    ).toThrow("must be absolute clean paths");
+    expect(() =>
+      makeRuntime(setup_, makeFakeCli().cli, {
+        runRootProjection: { localRoot: "", daemonRoot: setup_.runRoot },
+      }),
+    ).toThrow("must be a non-empty string");
   } finally {
     await dispose(setup_);
   }
