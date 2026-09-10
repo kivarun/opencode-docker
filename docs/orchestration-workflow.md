@@ -621,6 +621,60 @@ v3/resume, API/T3 download, decision evaluator integration,
 Sessions/mounts/worker launch, retries, quotas, and old-activation cleanup;
 the production loader still rejects schema v2 before Launcher auth/session.
 
+### Pipeline v2 deterministic decision states (compile-time substrate, not wired)
+
+A v2 pipeline may declare a third state type `type: decision`. A decision
+state runs no container and no Session: it names a decision model (a clean
+bundle-relative `.yaml` path loaded and compiled once at trusted load time
+through the existing decision substrate), receives exactly one `json` input
+data port whose parsed value is the boolean fact assignment, and routes the
+deterministic evaluation outcome through an exhaustive transition table.
+Exact fields are `id`, `type`, `model`, `inputs`, `transitions`; container
+concerns (`profile`, `prompt`, `outputs`, `timeout_seconds`,
+`max_attempts`, `image`, `env`, `mounts`, `command`, `credentials`,
+`paths`) are unknown fields there. The input type is derived from its
+source and must resolve to `json`; the user never re-declares it, and the
+port keeps the normal data-port contract including the inherited JSON
+schema snapshot. Model loading reuses the unchanged realpath containment
+(internal symlinks allowed; escapes, traversal, absolute paths, `~`,
+non-`.yaml` files, directories, and missing files rejected) and every model
+error carries the state id. The compiled model travels deep-frozen on the
+resolved state and is never re-read afterwards; states referencing one
+canonical model file (for example through an internal symlink) share one
+compiled snapshot via a cache local to the single `loadPipelineV2` call —
+no global mutable cache, no second decision compiler or evaluator.
+
+The outcome contract is explicit and closed. The reserved outcomes
+`uncovered`, `inconsistent_facts`, and `invalid_facts` may never be
+declared as model decision ids, and a decision state must declare exactly
+one transition per model decision id plus one per reserved outcome — no
+extras, no duplicates, document order preserved, several outcomes may
+share a target. Every routable situation is therefore declared by the
+pipeline author: there is no automatic fallback and no hidden terminal
+failure. The shared graph-shape layer treats agent and decision states as
+transition-bearing (terminals have none) and includes decision states in
+reachability and cycle checks; the v1 representation and the production
+engine are unchanged, and neither `pipeline_engine.ts` nor production
+`agent-smoke` executes v2 decision states.
+
+The pure adapter `evaluatePipelineDecisionState(pipeline, stateId, facts)`
+(provenance-gated, decision states only) maps an already-parsed fact
+assignment through the existing `evaluateDecision` to a deep-frozen result
+union: `selected` (whose `outcome` equals the selected decision id),
+`uncovered`, `inconsistent_facts` (with the violated relation ids), and
+`invalid_facts` for the fail-closed fact-validation failures of the shared
+evaluator. The `invalid_facts` reason is value-free — it embeds only
+declared fact ids and type names, never fact values or bodies — and
+unexpected errors propagate instead of being disguised as
+`invalid_facts`. The adapter selects no target state (targets come only
+from the transition table) and contains no timestamps, randomness, stdout,
+LLM, callbacks, expressions, or user code. Not implemented yet: resolving
+the `json` facts port through the run-input snapshot or the accepted
+history, production execution of decision states, an `intervention` state
+with pause/resume, and treating engine-level `max_transitions` exhaustion
+as a decision outcome; P01 and specific stage names stay out of the
+generic orchestrator.
+
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 
 The first increment of trusted execution profiles is implemented for

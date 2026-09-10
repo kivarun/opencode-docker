@@ -24,10 +24,18 @@ The user controls two planes:
 - the **data plane**: pipeline inputs, outputs, shared context, protected files,
   and accepted artifacts.
 
-The user does not manage container internals. Images, mounts, container paths,
-environment projection, Session credentials, helper transport, and test
-containers launched by agents remain runtime concerns owned by trusted
-configuration, docker-helper, and the orchestrator.
+The user controls agent roles and selects their execution profiles. Each
+profile may specify the agent image, model/provider configuration, and
+explicit environment bindings, allowing different roles to use different
+images and LLM backends without requiring the project to ship images for
+every use case.
+
+The user does not manage the container mechanics derived from those profiles.
+Mount construction, fixed container paths, Session credentials, helper
+transport, capability projection, and test containers launched by agents
+remain runtime concerns owned by validated profiles, docker-helper, and the
+orchestrator. Pipeline states refer to profiles by name and do not embed
+mounts, credentials, helper endpoints, or arbitrary container commands.
 
 ## Responsibility model
 

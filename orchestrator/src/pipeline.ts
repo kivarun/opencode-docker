@@ -275,12 +275,13 @@ function parseState(raw: unknown, index: number): PipelineStateSpec {
 /**
  * Shared graph-shape validation for both pipeline schema versions: terminal
  * existence, declared entry state, unique per-state outcomes, declared
- * transition targets, and agent reachability from the entry state. Port and
- * input reference checks are version-specific and live with their parsers.
+ * transition targets, and transition-bearing (agent and decision) states
+ * reachable from the entry state. Port and input reference checks are
+ * version-specific and live with their parsers.
  */
 export interface GraphShapeState {
   id: string;
-  type: "agent" | "terminal";
+  type: "agent" | "decision" | "terminal";
   transitions: readonly { outcome: string; to: string }[];
 }
 
@@ -299,21 +300,22 @@ export function checkGraphShape(entryState: string, states: readonly GraphShapeS
   }
   const declaredOutcomeTargets = new Map<string, string[]>();
   for (const state of states) {
-    if (state.type !== "agent") {
+    if (state.type === "terminal") {
       continue;
     }
+    const stateLabel = `${state.type} state ${JSON.stringify(state.id)}`;
     const outcomes = new Set<string>();
     const targets: string[] = [];
     for (const transition of state.transitions) {
       if (outcomes.has(transition.outcome)) {
         throw new PipelineError(
-          `agent state ${JSON.stringify(state.id)} declares outcome ${JSON.stringify(transition.outcome)} more than once`,
+          `${stateLabel} declares outcome ${JSON.stringify(transition.outcome)} more than once`,
         );
       }
       outcomes.add(transition.outcome);
       if (!stateIds.has(transition.to)) {
         throw new PipelineError(
-          `agent state ${JSON.stringify(state.id)} transition outcome ${JSON.stringify(transition.outcome)} targets unknown state ${JSON.stringify(transition.to)}`,
+          `${stateLabel} transition outcome ${JSON.stringify(transition.outcome)} targets unknown state ${JSON.stringify(transition.to)}`,
         );
       }
       targets.push(transition.to);
@@ -336,8 +338,10 @@ export function checkGraphShape(entryState: string, states: readonly GraphShapeS
     }
   }
   for (const state of states) {
-    if (state.type === "agent" && !reachable.has(state.id)) {
-      throw new PipelineError(`agent state ${JSON.stringify(state.id)} is not reachable from entry_state`);
+    if (state.type !== "terminal" && !reachable.has(state.id)) {
+      throw new PipelineError(
+        `${state.type} state ${JSON.stringify(state.id)} is not reachable from entry_state`,
+      );
     }
   }
 }

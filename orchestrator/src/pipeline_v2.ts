@@ -23,6 +23,13 @@ import {
 } from "./bundle_file.ts";
 import { describeError } from "./docker_helper.ts";
 import { compilePipelineJsonSchema } from "./pipeline_v2_schema.ts";
+import {
+  DecisionModelError,
+  evaluateDecision,
+  loadDecisionModel,
+  type CompiledDecisionModel,
+  type DecisionOutcome,
+} from "./decision.ts";
 
 /**
  * Pipeline schema version 2: declarative data ports.
@@ -44,6 +51,20 @@ import { compilePipelineJsonSchema } from "./pipeline_v2_schema.ts";
  * Self-references and cycles between state outputs compile fine: value
  * availability is a runtime question.
  *
+ * A v2 pipeline may also declare deterministic `decision` states. A decision
+ * state runs no container and no Session: it names a bundle-relative
+ * decision-model file (loaded and compiled once at trusted load time via the
+ * existing `loadDecisionModel`), receives exactly one `json` data port whose
+ * parsed value is the boolean fact assignment, and maps the deterministic
+ * evaluation outcome to the declared transition. Decision outcomes are the
+ * model's decision ids plus the three reserved outcomes `uncovered`,
+ * `inconsistent_facts` and `invalid_facts`; the transition table must be
+ * exhaustive and exact — every routable situation is declared explicitly,
+ * with no fallback and no hidden terminal failure. The pure evaluator
+ * adapter `evaluatePipelineDecisionState` maps an already-parsed fact
+ * assignment to a frozen result; filesystem input resolution and production
+ * execution are later increments.
+ *
  * The activation completion envelope for v2 is orchestrator-owned; work
  * products are defined only by the declared outputs — there is no
  * free-form artifact path list.
@@ -56,6 +77,21 @@ import { compilePipelineJsonSchema } from "./pipeline_v2_schema.ts";
  */
 
 export const PIPELINE_SCHEMA_VERSION_V2 = 2;
+
+/**
+ * Decision outcomes that never come from a declared decision id: they are
+ * produced by the deterministic evaluator itself (no matching rule, violated
+ * consistency relations, malformed fact assignment). A decision model may
+ * not declare a decision with one of these ids, and a decision state must
+ * declare exactly one transition for each of them.
+ */
+export const DECISION_RESERVED_OUTCOMES: readonly string[] = Object.freeze([
+  "uncovered",
+  "inconsistent_facts",
+  "invalid_facts",
+]);
+
+const DECISION_RESERVED_OUTCOME_SET: ReadonlySet<string> = new Set(DECISION_RESERVED_OUTCOMES);
 
 export type PortType = "file" | "directory" | "json";
 
@@ -152,7 +188,49 @@ export interface PipelineV2AgentStateSpec {
   transitions: PipelineTransitionSpec[];
 }
 
-export type PipelineV2StateSpec = PipelineV2AgentStateSpec | TerminalStateSpec;
+/** Decision input port as parsed, before the type is derived from the source. */
+export interface PipelineV2DecisionInputSpecDraft {
+  id: string;
+  source: PipelinePortSource;
+}
+
+/** Decision input port after derivation: the type is always "json". */
+export interface PipelineV2DecisionInputSpec {
+  id: string;
+  source: PipelinePortSource;
+  type: "json";
+}
+
+/** Decision state as parsed, before the input type is derived from its source. */
+export interface PipelineV2DecisionStateDraft {
+  id: string;
+  type: "decision";
+  /** Clean bundle-relative `.yaml` path of the decision model file. */
+  model: string;
+  inputs: PipelineV2DecisionInputSpecDraft[];
+  transitions: PipelineTransitionSpec[];
+}
+
+/**
+ * Decision state as declared (after derivation): a deterministic, container-free
+ * state that evaluates a decision model against one `json` input port and maps
+ * the deterministic evaluation outcome to the declared transition. The input
+ * type is derived from the source and must be `json`; the user never declares
+ * it. There is no profile, prompt, output port, timeout, retry or container
+ * concern here.
+ */
+export interface PipelineV2DecisionStateSpec {
+  id: string;
+  type: "decision";
+  model: string;
+  inputs: PipelineV2DecisionInputSpec[];
+  transitions: PipelineTransitionSpec[];
+}
+
+export type PipelineV2StateSpec =
+  | PipelineV2AgentStateSpec
+  | PipelineV2DecisionStateSpec
+  | TerminalStateSpec;
 
 export interface PipelineV2Spec {
   schema_version: 2;
@@ -213,7 +291,38 @@ export interface ResolvedV2AgentState {
   readonly transitions: readonly PipelineTransitionSpec[];
 }
 
-export type ResolvedV2State = ResolvedV2AgentState | TerminalStateSpec;
+/**
+ * Decision input port as resolved: the derived `json` type plus the schema
+ * snapshot inherited by value from the declaring site (same data-port
+ * contract as agent inputs). The decision model additionally enforces the
+ * exact set of declared boolean facts.
+ */
+export interface ResolvedV2DecisionInputPort {
+  readonly id: string;
+  readonly source: PipelinePortSource;
+  readonly type: "json";
+  readonly schema?: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Decision state as resolved: the deep-frozen compiled model travels with
+ * the snapshot; the runtime never re-reads the model file after load. The
+ * model path is the verified canonical bundle path (diagnostics/durable
+ * state only).
+ */
+export interface ResolvedV2DecisionState {
+  readonly id: string;
+  readonly type: "decision";
+  readonly modelPath: string;
+  readonly model: CompiledDecisionModel;
+  readonly inputs: readonly ResolvedV2DecisionInputPort[];
+  readonly transitions: readonly PipelineTransitionSpec[];
+}
+
+export type ResolvedV2State =
+  | ResolvedV2AgentState
+  | ResolvedV2DecisionState
+  | TerminalStateSpec;
 
 export interface ResolvedPipelineV2 {
   readonly schema_version: 2;
@@ -423,6 +532,52 @@ function parseV2AgentState(raw: Record<string, unknown>): PipelineV2AgentStateDr
 }
 
 /**
+ * Parse one decision state: exact fields only. `profile`, `prompt`,
+ * `outputs`, `timeout_seconds`, `max_attempts`, `image`, `env`, `mounts`,
+ * `command`, `credentials` and `paths` are unknown fields here and are
+ * rejected — a decision state runs no container and declares no filesystem
+ * work products. Exactly one input data port; the type is derived from its
+ * source and must resolve to `json` (checked during contract derivation).
+ */
+function parseV2DecisionState(raw: Record<string, unknown>): PipelineV2DecisionStateDraft {
+  const id = validateSafeId(raw.id, "decision state id");
+  const what = `decision state ${JSON.stringify(id)}`;
+  expectExactKeys(raw, ["id", "type", "model", "inputs", "transitions"], what);
+
+  const inputsRaw = expectArray(raw.inputs, `${what} inputs`);
+  if (inputsRaw.length !== 1) {
+    throw new PipelineError(
+      `${what} must declare exactly one input data port, got ${inputsRaw.length}`,
+    );
+  }
+  const portWhat = `${what} input port 0`;
+  const entry = expectObject(inputsRaw[0], portWhat);
+  expectExactKeys(entry, ["id", "source"], portWhat);
+  const input = {
+    id: validateSafeId(entry.id, `${portWhat} id`),
+    source: parsePortSource(entry.source, portWhat),
+  };
+
+  const transitionsRaw = expectArray(raw.transitions, `${what} transitions`);
+  const transitions: PipelineTransitionSpec[] = [];
+  for (let index = 0; index < transitionsRaw.length; index++) {
+    transitions.push(parseTransition(transitionsRaw[index], id, index));
+  }
+
+  return {
+    id,
+    type: "decision",
+    model: validateBundleRelativePath(
+      expectNonEmptyString(raw.model, `${what} model`),
+      `${what} model`,
+      PipelineError,
+    ),
+    inputs: [input],
+    transitions,
+  };
+}
+
+/**
  * Compile a parsed v2 document into the plain v2 spec: exact-field
  * validation at every level, unique safe ids, declared references, graph
  * shape, and input-type derivation from port sources. Input port types are
@@ -471,17 +626,22 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
   if (statesRaw.length === 0) {
     throw new PipelineError("pipeline must declare at least one state");
   }
-  const states: (PipelineV2AgentStateDraft | TerminalStateSpec)[] = [];
+  const states: (PipelineV2AgentStateDraft | PipelineV2DecisionStateDraft | TerminalStateSpec)[] = [];
   const stateIds = new Set<string>();
   for (let index = 0; index < statesRaw.length; index++) {
     const entry = expectObject(statesRaw[index], `state ${index}`);
     const type = entry.type;
-    if (type !== "agent" && type !== "terminal") {
+    if (type !== "agent" && type !== "decision" && type !== "terminal") {
       throw new PipelineError(
-        `state ${index} has unsupported type ${JSON.stringify(type)}, expected "agent" or "terminal"`,
+        `state ${index} has unsupported type ${JSON.stringify(type)}, expected "agent", "decision" or "terminal"`,
       );
     }
-    const state = type === "agent" ? parseV2AgentState(entry) : parseTerminalState(entry);
+    const state =
+      type === "agent"
+        ? parseV2AgentState(entry)
+        : type === "decision"
+          ? parseV2DecisionState(entry)
+          : parseTerminalState(entry);
     if (stateIds.has(state.id)) {
       throw new PipelineError(`pipeline declares state ${JSON.stringify(state.id)} more than once`);
     }
@@ -492,7 +652,7 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
   const graphStates: GraphShapeState[] = states.map((state) => ({
     id: state.id,
     type: state.type,
-    transitions: state.type === "agent" ? state.transitions : [],
+    transitions: state.type === "terminal" ? [] : state.transitions,
   }));
   checkGraphShape(entryState, graphStates);
 
@@ -546,6 +706,30 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
   };
 
   const resolvedStates: PipelineV2StateSpec[] = states.map((state) => {
+    if (state.type === "decision") {
+      const port = state.inputs[0];
+      if (port === undefined) {
+        throw new PipelineError(
+          `decision state ${JSON.stringify(state.id)} must declare exactly one input data port`,
+        );
+      }
+      const derived = resolveSourceContract(
+        port.source,
+        `decision state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)}`,
+      );
+      if (derived.type !== "json") {
+        throw new PipelineError(
+          `decision state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)} source must resolve to type "json", got ${JSON.stringify(derived.type)}`,
+        );
+      }
+      return {
+        id: state.id,
+        type: "decision",
+        model: state.model,
+        inputs: [{ id: port.id, source: port.source, type: "json" }],
+        transitions: state.transitions,
+      };
+    }
     if (state.type !== "agent") {
       return state;
     }
@@ -715,8 +899,14 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
     );
   }
 
-  // Phase 2: agent states. Prompts load with the usual containment; declared
-  // agent output schemas load on the output ports that declare them.
+  // Phase 2: agent and decision states. Prompts load with the usual
+  // containment; declared agent output schemas load on the output ports that
+  // declare them. Decision models load through the existing
+  // `loadDecisionModel` (the only decision loader — no second compiler) and
+  // are compiled once at trusted load time; states sharing one canonical
+  // model file share one compiled snapshot via a cache local to this load
+  // call. The runtime never re-reads the model file afterwards.
+  const decisionModelsByCanonicalPath = new Map<string, CompiledDecisionModel>();
   const states: ResolvedV2State[] = [];
   for (const state of spec.states) {
     if (state.type === "agent") {
@@ -772,6 +962,77 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
           outputs: Object.freeze(outputPorts),
           timeout_seconds: state.timeout_seconds,
           max_attempts: state.max_attempts,
+          transitions: Object.freeze(
+            state.transitions.map((transition) =>
+              deepFreeze({ outcome: transition.outcome, to: transition.to }),
+            ),
+          ),
+        }),
+      );
+    } else if (state.type === "decision") {
+      const stateWhat = `decision state ${JSON.stringify(state.id)}`;
+      const modelWhat = `${stateWhat} model`;
+      const modelPath = await requireBundleFileInsideRoot(
+        join(rootCanonical, state.model),
+        rootCanonical,
+        modelWhat,
+        PipelineError,
+        "pipeline bundle",
+      );
+      let model = decisionModelsByCanonicalPath.get(modelPath);
+      if (model === undefined) {
+        try {
+          model = await loadDecisionModel(rootCanonical, state.model);
+        } catch (cause) {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          throw new PipelineError(`${stateWhat}: ${detail}`);
+        }
+        decisionModelsByCanonicalPath.set(modelPath, model);
+      }
+      for (const decisionId of model.decisionIds) {
+        if (DECISION_RESERVED_OUTCOME_SET.has(decisionId)) {
+          throw new PipelineError(
+            `${stateWhat} model declares decision ${JSON.stringify(decisionId)}, which is a reserved outcome; decision ids must not be ${DECISION_RESERVED_OUTCOMES.map((entry) => JSON.stringify(entry)).join(", ")}`,
+          );
+        }
+      }
+      const requiredOutcomes = new Set<string>([
+        ...model.decisionIds,
+        ...DECISION_RESERVED_OUTCOMES,
+      ]);
+      for (const transition of state.transitions) {
+        if (!requiredOutcomes.has(transition.outcome)) {
+          throw new PipelineError(
+            `${stateWhat} declares transition outcome ${JSON.stringify(transition.outcome)} which is neither a decision of its model nor a reserved outcome (${DECISION_RESERVED_OUTCOMES.map((entry) => JSON.stringify(entry)).join(", ")})`,
+          );
+        }
+      }
+      const declaredOutcomes = new Set<string>(state.transitions.map((entry) => entry.outcome));
+      for (const decisionId of model.decisionIds) {
+        if (!declaredOutcomes.has(decisionId)) {
+          throw new PipelineError(
+            `${stateWhat} is missing a transition for decision ${JSON.stringify(decisionId)}`,
+          );
+        }
+      }
+      for (const reserved of DECISION_RESERVED_OUTCOMES) {
+        if (!declaredOutcomes.has(reserved)) {
+          throw new PipelineError(
+            `${stateWhat} is missing a transition for reserved outcome ${JSON.stringify(reserved)}`,
+          );
+        }
+      }
+      states.push(
+        deepFreeze({
+          id: state.id,
+          type: "decision",
+          modelPath,
+          model,
+          inputs: Object.freeze(
+            state.inputs.map((port) =>
+              deepFreeze({ id: port.id, source: port.source, type: "json" as const }),
+            ),
+          ),
           transitions: Object.freeze(
             state.transitions.map((transition) =>
               deepFreeze({ outcome: transition.outcome, to: transition.to }),
@@ -835,6 +1096,35 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
   });
 
   const resolvedStates: ResolvedV2State[] = states.map((state) => {
+    if (state.type === "decision") {
+      const port = state.inputs[0];
+      if (port === undefined) {
+        throw new PipelineError(
+          `decision state ${JSON.stringify(state.id)} must declare exactly one input data port`,
+        );
+      }
+      const derived = contractForSource(
+        port.source,
+        `decision state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)}`,
+      );
+      if (derived.type !== "json") {
+        throw new PipelineError(
+          `decision state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)} source must resolve to type "json", got ${JSON.stringify(derived.type)}`,
+        );
+      }
+      return deepFreeze({
+        id: state.id,
+        type: "decision",
+        modelPath: state.modelPath,
+        model: state.model,
+        inputs: [
+          derived.schema === undefined
+            ? deepFreeze({ id: port.id, source: port.source, type: "json" })
+            : deepFreeze({ id: port.id, source: port.source, type: "json", schema: derived.schema }),
+        ],
+        transitions: state.transitions,
+      });
+    }
     if (state.type !== "agent") {
       return state;
     }
@@ -880,6 +1170,119 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
   return snapshot;
 }
 
+
+/**
+ * Deterministic result of evaluating one declared decision state. The
+ * outcome is exactly the routed situation: a selected decision id, one of
+ * the three reserved outcomes, or `invalid_facts` for a malformed fact
+ * assignment. The result never contains the fact values or the fact body —
+ * `invalid_facts.reason` is the value-free diagnostic of the shared
+ * evaluator (declared fact ids and type names only). No timestamps, no
+ * randomness, no stdout, no LLM, and no target-state selection: the next
+ * state is chosen only by the pipeline's transition table.
+ */
+export type PipelineDecisionStateResult =
+  | {
+      readonly state_id: string;
+      readonly status: "selected";
+      readonly outcome: string;
+      readonly decision: string;
+      readonly rule_id: string;
+      readonly active_constraint_ids: readonly string[];
+    }
+  | {
+      readonly state_id: string;
+      readonly status: "uncovered";
+      readonly outcome: "uncovered";
+      readonly active_constraint_ids: readonly string[];
+    }
+  | {
+      readonly state_id: string;
+      readonly status: "inconsistent_facts";
+      readonly outcome: "inconsistent_facts";
+      readonly violated_relation_ids: readonly string[];
+    }
+  | {
+      readonly state_id: string;
+      readonly status: "invalid_facts";
+      readonly outcome: "invalid_facts";
+      readonly reason: string;
+    };
+
+/**
+ * Pure evaluator adapter for one declared decision state: evaluate the
+ * state's compiled model against an already-parsed fact assignment and map
+ * the shared evaluator's outcome to the frozen pipeline-level result. This
+ * adapter reads no filesystem and resolves no data ports — the runtime
+ * adapter that resolves the `json` input through the run-input snapshot and
+ * the accepted history is a later increment. Unexpected failures are never
+ * disguised as `invalid_facts`: only the shared evaluator's fail-closed
+ * fact-validation errors (`DecisionModelError`) map to it, everything else
+ * propagates.
+ */
+export function evaluatePipelineDecisionState(
+  pipeline: ResolvedPipelineV2,
+  stateId: string,
+  facts: unknown,
+): PipelineDecisionStateResult {
+  requireResolvedPipelineV2Provenance(pipeline, "evaluatePipelineDecisionState");
+  validateSafeId(stateId, "decision state id");
+  let state: ResolvedV2State | undefined;
+  for (const candidate of pipeline.states) {
+    if (candidate.id === stateId) {
+      state = candidate;
+      break;
+    }
+  }
+  if (state === undefined) {
+    throw new PipelineError(`state ${JSON.stringify(stateId)} is not declared by the pipeline`);
+  }
+  if (state.type !== "decision") {
+    throw new PipelineError(
+      `state ${JSON.stringify(stateId)} is not a decision state; the decision evaluator exists for decision states only`,
+    );
+  }
+
+  let outcome: DecisionOutcome;
+  try {
+    outcome = evaluateDecision(state.model, facts as Readonly<Record<string, unknown>>);
+  } catch (cause) {
+    if (cause instanceof DecisionModelError) {
+      return deepFreeze({
+        state_id: stateId,
+        status: "invalid_facts",
+        outcome: "invalid_facts",
+        reason: cause.message,
+      });
+    }
+    throw cause;
+  }
+  switch (outcome.status) {
+    case "selected":
+      return deepFreeze({
+        state_id: stateId,
+        status: "selected",
+        outcome: outcome.decision,
+        decision: outcome.decision,
+        rule_id: outcome.rule_id,
+        active_constraint_ids: Object.freeze([...outcome.active_constraint_ids]),
+      });
+    case "uncovered":
+      return deepFreeze({
+        state_id: stateId,
+        status: "uncovered",
+        outcome: "uncovered",
+        active_constraint_ids: Object.freeze([...outcome.active_constraint_ids]),
+      });
+    case "inconsistent_facts":
+      return deepFreeze({
+        state_id: stateId,
+        status: "inconsistent_facts",
+        outcome: "inconsistent_facts",
+        violated_relation_ids: Object.freeze([...outcome.violated_relation_ids]),
+      });
+  }
+}
 
 /** Fixed container locations. Users and agents never name these paths. */
 export const PROJECT_MOUNT_TARGET = "/workspace";
