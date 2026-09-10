@@ -27,9 +27,8 @@ import {
   PipelineV2RuntimeError,
   type PipelineV2RuntimeFailureReason,
   isPipelineV2RuntimeError,
-  pipelineV2RuntimeFailure,
-  withPipelineV2RuntimeReason,
 } from "../src/pipeline_v2_runtime_error.ts";
+import * as runtimeErrorModule from "../src/pipeline_v2_runtime_error.ts";
 
 /**
  * Focused tests for the typed runtime failure contract of the pipeline v2
@@ -500,42 +499,33 @@ test("2. PipelineV2RuntimeError keeps the PipelineError identity with an immutab
   ).toThrow(TypeError);
 });
 
-test("3. the reason wrapper assigns explicit reasons without message parsing", async () => {
-  const converted = await withPipelineV2RuntimeReason("run_input_invalid", async () => {
-    throw new PipelineError("original diagnostic");
-  }).then(
-    () => null,
-    (cause: unknown) => cause,
+test("3. the error module exposes exactly the fixed four-member contract", () => {
+  // The only runtime exports of the neutral error module: the fixed reason
+  // list, the typed error class and the type guard. The
+  // `PipelineV2RuntimeFailureReason` type is compile-time only. No broad
+  // retagging or construction helper is exported — the coordinator reads
+  // `reason`, it never gets a tool to broadly retag arbitrary errors.
+  expect(Object.keys(runtimeErrorModule).sort()).toEqual([
+    "PIPELINE_V2_RUNTIME_FAILURE_REASONS",
+    "PipelineV2RuntimeError",
+    "isPipelineV2RuntimeError",
+  ]);
+  const exports = runtimeErrorModule as Record<string, unknown>;
+  expect("pipelineV2RuntimeFailure" in exports).toBe(false);
+  expect("withPipelineV2RuntimeReason" in exports).toBe(false);
+  expect(typeof exports.isPipelineV2RuntimeError).toBe("function");
+  expect(typeof exports.PipelineV2RuntimeError).toBe("function");
+  expect(Object.isFrozen(PIPELINE_V2_RUNTIME_FAILURE_REASONS) || Array.isArray(PIPELINE_V2_RUNTIME_FAILURE_REASONS)).toBe(
+    true,
   );
-  expect(converted).toBeInstanceOf(PipelineV2RuntimeError);
-  expect(converted).toBeInstanceOf(PipelineError);
-  expect((converted as PipelineV2RuntimeError).message).toBe("original diagnostic");
-  expect((converted as PipelineV2RuntimeError).reason).toBe("run_input_invalid");
 
-  let passedThrough: unknown;
-  try {
-    await withPipelineV2RuntimeReason("run_output_invalid", async () => {
-      throw new PipelineV2RuntimeError("accepted_output_modified", "inner");
-    });
-  } catch (cause) {
-    passedThrough = cause;
-  }
-  expect(passedThrough).toBeInstanceOf(PipelineV2RuntimeError);
-  expect((passedThrough as PipelineV2RuntimeError).reason).toBe("accepted_output_modified");
-  expect((passedThrough as PipelineV2RuntimeError).message).toBe("inner");
-
-  const boom = new TypeError("unexpected evaluator failure");
-  let propagated: unknown;
-  try {
-    await withPipelineV2RuntimeReason("run_input_invalid", async () => {
-      throw boom;
-    });
-  } catch (cause) {
-    propagated = cause;
-  }
-  expect(propagated).toBe(boom);
-  expect(propagated).not.toBeInstanceOf(PipelineError);
-  expect(isPipelineV2RuntimeError(propagated)).toBe(false);
+  // Explicit typed construction stays available through the class itself,
+  // with the reason validated against the fixed list.
+  const constructed = new PipelineV2RuntimeError("run_input_invalid", "explicit message");
+  expect(constructed).toBeInstanceOf(PipelineV2RuntimeError);
+  expect(constructed).toBeInstanceOf(PipelineError);
+  expect(constructed.reason).toBe("run_input_invalid");
+  expect(constructed.message).toBe("explicit message");
 });
 
 test("4. malformed json run input rejects as run_input_invalid with a content-free diagnostic", async () => {
@@ -1009,7 +999,7 @@ test("26. forged pipeline, snapshot and activation stay plain PipelineErrors; Pr
 });
 
 test("27. run_output_invalid is a real typed reason but unreachable without a trusted-host race", () => {
-  const error = pipelineV2RuntimeFailure(
+  const error = new PipelineV2RuntimeError(
     "run_output_invalid",
     `run output "summary" source state output "coder"."report" /x is not valid JSON`,
   );
@@ -1017,4 +1007,86 @@ test("27. run_output_invalid is a real typed reason but unreachable without a tr
   expect(error.reason).toBe("run_output_invalid");
   expect(error).toBeInstanceOf(PipelineError);
   expect(isPipelineV2RuntimeError(error)).toBe(true);
+});
+
+test("28. a non-PipelineError propagates by identity through a typed region", async () => {
+  await withAgentsRun(async ({ pipeline, runRoot }) => {
+    const boom = new TypeError("unexpected probe failure");
+    const trap = new Proxy(
+      {},
+      {
+        get() {
+          throw boom;
+        },
+        ownKeys() {
+          throw boom;
+        },
+      },
+    );
+    let failure: unknown;
+    try {
+      await snapshotRunInputs(pipeline, [trap], runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    // The retagging region converts only its own PipelineError
+    // diagnostics; an unexpected exception keeps its identity and is
+    // never masked or classified.
+    expect(failure).toBe(boom);
+    expect(failure).not.toBeInstanceOf(PipelineError);
+    expect(isPipelineV2RuntimeError(failure)).toBe(false);
+  });
+});
+
+test("29. run and project root infrastructure failures stay plain PipelineErrors", async () => {
+  await withAgentsRun(async ({ pipeline, runRoot, sources }) => {
+    const snap = await snapshotRunInputs(pipeline, ALL_AGENT_BINDINGS(sources), runRoot);
+
+    // The shared project directory disappearing is run infrastructure,
+    // not an invalid run input.
+    await rm(join(runRoot, "project"), { recursive: true, force: true });
+    await expectPlainPipelineError(
+      () => snapshotRunInputs(pipeline, ALL_AGENT_BINDINGS(sources), runRoot),
+      `run project root ${join(runRoot, "project")} does not exist`,
+    );
+    await mkdir(join(runRoot, "project"), { mode: 0o700 });
+
+    // The run root disappearing before a preparation is run-level
+    // infrastructure, not an activation preparation failure.
+    await rm(runRoot, { recursive: true, force: true });
+    await expectPlainPipelineError(
+      () => prepareActivationData(pipeline, snap, [], "coder", 1),
+      `run root ${runRoot} does not exist`,
+    );
+    await expectPlainPipelineError(
+      () => collectRunOutputs(pipeline, snap, []),
+      `run root ${runRoot} does not exist`,
+    );
+  });
+});
+
+test("30. invalid caller indexes and unknown state ids stay plain PipelineErrors", async () => {
+  await withAgentsRun(async ({ pipeline, runRoot, sources }) => {
+    const snap = await snapshotRunInputs(pipeline, ALL_AGENT_BINDINGS(sources), runRoot);
+    // The activation index must be a positive safe integer.
+    await expectPlainPipelineError(
+      () => prepareActivationData(pipeline, snap, [], "coder", 0),
+      /activation index/,
+    );
+    await expectPlainPipelineError(
+      () => evaluateDecisionStateFromData(pipeline, snap, [], "check", 0),
+      /next activation index/,
+    );
+    // An unknown state id is a caller-contract violation, never a
+    // data-plane failure.
+    await expectPlainPipelineError(
+      () => prepareActivationData(pipeline, snap, [], "ghost", 1),
+      `state "ghost" is not declared by the pipeline`,
+    );
+    await expectPlainPipelineError(
+      () =>
+        evaluateDecisionStateFromData(pipeline, snap, [], "coder", 3),
+      `state "coder" is not a decision state; the decision data adapter exists for decision states only`,
+    );
+  });
 });

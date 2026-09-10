@@ -1,12 +1,3 @@
-import { PipelineError } from "./pipeline.ts";
-import {
-  describeError,
-} from "./docker_helper.ts";
-import {
-  PIPELINE_V2_FAILURE_REASONS,
-  type PipelineV2FailureReason,
-} from "./pipeline_v2_state.ts";
-
 /**
  * Typed runtime failures of the pipeline v2 data plane.
  *
@@ -26,6 +17,14 @@ import {
  * `PipelineError`s and are normalized to `internal_error` by the
  * coordinator, not by this module.
  *
+ * The public surface is deliberately the minimum the coordinator needs:
+ * the fixed reason list, its type, the typed error class and the type
+ * guard. Construction and region-wrapping helpers for the data plane live
+ * inside the data plane (`pipeline_v2_runtime.ts`) — this module exposes no
+ * general-purpose retagging tool, so a consumer can never broadly retag
+ * arbitrary `PipelineError`s; the coordinator works with `reason`, not with
+ * a classifier.
+ *
  * This module is substrate only; the production runner does not execute v2
  * pipelines yet and nothing here is wired into durable state — the state
  * will record the reason string only, never the error object, stack or
@@ -37,6 +36,9 @@ import {
  * subset of `PIPELINE_V2_FAILURE_REASONS` (state schema v3): compile-time
  * proof below fails the build if the lists ever diverge.
  */
+import { PipelineError } from "./pipeline.ts";
+import { PIPELINE_V2_FAILURE_REASONS, type PipelineV2FailureReason } from "./pipeline_v2_state.ts";
+
 export const PIPELINE_V2_RUNTIME_FAILURE_REASONS = [
   "run_input_invalid",
   "run_input_modified",
@@ -92,51 +94,4 @@ export function isPipelineV2RuntimeError(
   value: unknown,
 ): value is PipelineV2RuntimeError {
   return value instanceof PipelineV2RuntimeError;
-}
-
-/**
- * Builds one typed failure for an explicit failure site: the owner of the
- * operation names the reason where the semantics are known. The message is
- * the unchanged diagnostic text; an optional cause contributes only its
- * safe description (never user data — the callers own the message text).
- */
-export function pipelineV2RuntimeFailure(
-  reason: PipelineV2RuntimeFailureReason,
-  what: string,
-  cause?: unknown,
-): PipelineV2RuntimeError {
-  if (cause === undefined) {
-    return new PipelineV2RuntimeError(reason, what);
-  }
-  return new PipelineV2RuntimeError(reason, `${what}: ${describeError(cause)}`);
-}
-
-/**
- * Runs one operation whose whole failure region carries one reason and
- * retags its own `PipelineError` diagnostics into typed runtime failures
- * with that reason, preserving the message byte-for-byte. Never parses
- * messages: the reason is assigned explicitly by the operation owner.
- *
- * Already-typed failures keep their original reason (first assignment
- * wins), so a nested verifier such as the run-input snapshot check reports
- * `run_input_modified` through an outer region unchanged. Exceptions that
- * are not `PipelineError`s — trust-boundary rejections, programmer errors,
- * unexpected evaluator failures — propagate unchanged and are never
- * masked.
- */
-export async function withPipelineV2RuntimeReason<T>(
-  reason: PipelineV2RuntimeFailureReason,
-  operation: () => Promise<T>,
-): Promise<T> {
-  try {
-    return await operation();
-  } catch (cause) {
-    if (cause instanceof PipelineV2RuntimeError) {
-      throw cause;
-    }
-    if (cause instanceof PipelineError) {
-      throw new PipelineV2RuntimeError(reason, cause.message);
-    }
-    throw cause;
-  }
 }
