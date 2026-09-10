@@ -679,14 +679,49 @@ model-declared `fact_id` (`missing_fact`, `non_boolean_fact`) and the
 value's type name (`non_boolean_fact`). It never embeds a fact value or a
 fact body, and for an unknown fact not even the provided property name is
 returned or logged; the evaluator's own error message is canary-free for
-the same reasons. The adapter selects no target state (targets come only
-from the transition table) and contains no timestamps, randomness, stdout,
-LLM, callbacks, expressions, or user code. Not implemented yet: resolving
-the `json` facts port through the run-input snapshot or the accepted
-history, production execution of decision states, an `intervention` state
-with pause/resume, and treating engine-level `max_transitions` exhaustion
-as a decision outcome; P01 and specific stage names stay out of the
-generic orchestrator.
+the same reasons. The adapter selects no target state (targets come only from the
+transition table) and contains no timestamps, randomness, stdout, LLM,
+callbacks, expressions, or user code.
+
+A pure host-side data adapter,
+`evaluateDecisionStateFromData(pipeline, runInputs, acceptedOutputs,
+stateId, nextActivationIndex)` in `pipeline_v2_runtime.ts`, now resolves
+the `json` facts port through the existing v2 data plane and calls that
+evaluator. It is read-only substrate: it creates nothing (no decision
+activation leaf, no `data/inputs`, no `data/outputs`), modifies and
+deletes nothing, launches no Session or container, and consumes no
+activation index — `nextActivationIndex` is only the bound every accepted
+record's index must stay strictly below. Execution order is strict: both
+provenance gates (pipeline, then the snapshot minted for that same
+pipeline object) before any field is read, then the bound, the safe state
+id and the `type: "decision"` check, then the canonical run/project root
+checks, then the full `verifyRunInputsSnapshot` of every run input (not
+only the decision's own input; the original user binding paths are never
+re-read), then the complete accepted history through the one shared
+`resolveAcceptedHistory` chain also used by `prepareActivationData` and
+`collectRunOutputs` — parse, per-activation coherence, fixed-location
+resolution and digest recomputation of every record including old
+non-winning ones, and only then highest-index winner selection. The
+single input port then resolves by its declared source: a pipeline input
+only from the verified snapshot (the original user binding path is never
+read again) or a state output only from the verified winner map
+(missing/forward/first-visit references, kind mismatches, symlinks and
+digest mismatches fail before the evaluator). The JSON bytes are read
+from the fixed orchestrator-owned path through `O_NOFOLLOW`, parsed with
+the content-free diagnostic (`<what> <path> is not valid JSON`), and
+validated against the port's loader-compiled schema snapshot. Malformed
+JSON and schema failures are `PipelineError`s and never become
+`invalid_facts`; only a schema-conforming value that fails the model's
+fact-assignment contract yields the typed `invalid_facts`. Raw JSON
+bytes, parsed facts, and fact values never appear in results, errors or
+diagnostics; the deep-frozen result carries no transition target and is
+never written to state. Not implemented yet: wiring decision states into
+the production runner (the production loader still rejects schema v2
+before Launcher auth), graph-engine integration, durable state/activation
+records for decision states, an `intervention` state with pause/resume,
+and treating engine-level `max_transitions` exhaustion as a decision
+outcome; P01 and specific stage names stay out of the generic
+orchestrator.
 
 ## Execution profiles (implementation complete, end-to-end UAT pending)
 

@@ -24,12 +24,15 @@ import {
   ACTIVATION_INPUTS_ROOT,
   ACTIVATION_OUTPUTS_ROOT,
   PROJECT_MOUNT_TARGET,
+  evaluatePipelineDecisionState,
   parsePortType,
   requireResolvedPipelineV2Provenance,
+  type PipelineDecisionStateResult,
   type PipelinePortSource,
   type PortType,
   type ResolvedPipelineV2,
   type ResolvedV2AgentOutputPort,
+  type ResolvedV2DecisionState,
   type ResolvedV2State,
 } from "./pipeline_v2.ts";
 import { validatePipelineJson } from "./pipeline_v2_schema.ts";
@@ -152,6 +155,34 @@ import { validatePipelineJson } from "./pipeline_v2_schema.ts";
  * recorded digest. A modified, relocated or escaped run-input snapshot is
  * detected before the activation leaf or the run-output staging tree is
  * created. The original user binding paths are never read again.
+ *
+ * Decision-state data adapter (`evaluateDecisionStateFromData`): a pure,
+ * read-only host-side adapter that resolves a declared v2 `decision`
+ * state's single `json` input through the same data plane and evaluates the
+ * state's compiled decision model via `evaluatePipelineDecisionState`. It
+ * creates nothing (no decision activation leaf, no `data/inputs`, no
+ * `data/outputs`), modifies and deletes nothing, launches nothing, and
+ * consumes no activation index: `nextActivationIndex` is only the bound
+ * that every accepted record's index must stay strictly below. After both
+ * provenance gates, the whole run-input snapshot is re-verified (not just
+ * the decision's own input) and the complete accepted history is validated
+ * through the same single `resolveAcceptedHistory` chain used by
+ * `prepareActivationData` and `collectRunOutputs` (parse, coherence,
+ * fixed-location resolution, digest verification, then highest-index
+ * winner selection); the decision input then resolves by its declared
+ * source — a pipeline input only from the verified snapshot, a state
+ * output only from the verified winner map — and its JSON bytes are read
+ * from the fixed orchestrator-owned path through `O_NOFOLLOW`, parsed
+ * with a content-free diagnostic and validated against the port's
+ * loader-compiled schema snapshot. Malformed JSON and schema failures are
+ * `PipelineError`s before the evaluator and never become `invalid_facts`;
+ * only a schema-conforming value that fails the model's fact-assignment
+ * contract yields the existing typed `invalid_facts`. Raw JSON bytes,
+ * parsed facts and fact values never appear in results, errors or
+ * diagnostics. The adapter returns exactly the existing
+ * `PipelineDecisionStateResult`; it never selects a transition target and
+ * never moves a graph cursor, and it is not wired into the production
+ * runner.
  *
  * Run-output collection (`collectRunOutputs`): when a terminal state has
  * been reached (deciding that is the graph runner's job — this function
@@ -1484,7 +1515,38 @@ function selectWinningAcceptedOutputs(
   return resolved;
 }
 
-function findAgentState(
+/**
+ * The single accepted-history validation chain shared by every runtime API
+ * that consumes accepted state outputs: parse + exact-record/coherence
+ * validation (`parseAcceptedStateOutputs`), fixed-location resolution of
+ * every record including old non-winning ones
+ * (`resolveAllAcceptedOutputs`), digest recomputation against the recorded
+ * digests (`verifyAcceptedOutputDigests`), and only then the
+ * highest-activation-index winner selection per `state`/`output` pair
+ * (`selectWinningAcceptedOutputs`). `currentActivationIndex` binds the
+ * next-activation path (every recorded index must be strictly below it);
+ * run-output collection and other consumers without a current activation
+ * pass `undefined` so activation existence is proven by resolving each
+ * record's fixed location. Callers must never re-implement this chain: a
+ * second resolver could diverge in error order or skip a phase.
+ */
+async function resolveAcceptedHistory(
+  pipeline: ResolvedPipelineV2,
+  acceptedOutputs: readonly unknown[],
+  runRootCanonical: string,
+  currentActivationIndex: number | undefined,
+): Promise<Map<string, ResolvedAcceptedOutput>> {
+  const parsedAccepted = parseAcceptedStateOutputs(
+    acceptedOutputs,
+    pipeline,
+    currentActivationIndex,
+  );
+  const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
+  await verifyAcceptedOutputDigests(fullyResolved);
+  return selectWinningAcceptedOutputs(fullyResolved);
+}
+
+function findStateById(
   pipeline: ResolvedPipelineV2,
   stateId: string,
 ): ResolvedV2State | undefined {
@@ -1539,7 +1601,7 @@ export async function prepareActivationData(
 
   expectPositiveSafeInteger(activationIndex, "activation index");
   const safeStateId = validateSafeId(stateId, "activation state id");
-  const state = findAgentState(pipeline, safeStateId);
+  const state = findStateById(pipeline, safeStateId);
   if (state === undefined) {
     throw new PipelineError(
       `state ${JSON.stringify(safeStateId)} is not declared by the pipeline`,
@@ -1561,10 +1623,12 @@ export async function prepareActivationData(
   // leaf is created.
   await verifyRunInputsSnapshot(runInputs, provenance);
 
-  const parsedAccepted = parseAcceptedStateOutputs(acceptedOutputs, pipeline, activationIndex);
-  const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
-  await verifyAcceptedOutputDigests(fullyResolved);
-  const acceptedByRef = selectWinningAcceptedOutputs(fullyResolved);
+  const acceptedByRef = await resolveAcceptedHistory(
+    pipeline,
+    acceptedOutputs,
+    runRootCanonical,
+    activationIndex,
+  );
 
   const activationsRoot = join(runRootCanonical, "activations");
   await ensureRealDirectory(activationsRoot, "activations root");
@@ -1734,7 +1798,7 @@ export async function acceptActivationOutputs(
   }
   const runRootCanonical = provenance.runRootCanonical;
 
-  const state = findAgentState(pipeline, activation.state_id);
+  const state = findStateById(pipeline, activation.state_id);
   if (state === undefined || state.type !== "agent") {
     throw new PipelineError(
       `prepared activation names state ${JSON.stringify(activation.state_id)} which is not a declared agent state of the trusted pipeline`,
@@ -1949,10 +2013,12 @@ export async function collectRunOutputs(
   // and before anything is staged. There is no current activation bound
   // here: every record must name an activation that actually happened,
   // which is proven by resolving its fixed location below.
-  const parsedAccepted = parseAcceptedStateOutputs(acceptedOutputs, pipeline, undefined);
-  const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
-  await verifyAcceptedOutputDigests(fullyResolved);
-  const acceptedByRef = selectWinningAcceptedOutputs(fullyResolved);
+  const acceptedByRef = await resolveAcceptedHistory(
+    pipeline,
+    acceptedOutputs,
+    runRootCanonical,
+    undefined,
+  );
 
   const stagingPath = join(runRootCanonical, tmpEntryName("run-outputs"));
   let stagingCreated = false;
@@ -2108,4 +2174,183 @@ export async function collectRunOutputs(
     }
     throw cause;
   }
+}
+
+/**
+ * Pure host-side data adapter for one declared v2 `decision` state: resolve
+ * the state's single `json` input through the existing v2 data plane, parse
+ * and validate it, and evaluate the compiled decision model — without
+ * creating anything. No decision activation leaf, no `data/inputs` or
+ * `data/outputs`, no Session, no container, no helper call, no env and no
+ * credentials; nothing on the filesystem is created, modified or removed,
+ * so a repeated call with the same inputs returns a structurally identical
+ * (deep-frozen) result.
+ *
+ * Execution order is strict: pipeline provenance, then run-input snapshot
+ * provenance for the same pipeline object (both before any field is read),
+ * then the `nextActivationIndex` bound, then the safe state id and the
+ * `type: "decision"` check, then the canonical run/project root checks, the
+ * full `verifyRunInputsSnapshot` of every run input (not only the
+ * decision's own input), and the complete accepted-history chain
+ * (`resolveAcceptedHistory` — the same single chain `prepareActivationData`
+ * and `collectRunOutputs` use) with every record's index required to stay
+ * strictly below `nextActivationIndex`. The winner is selected only after
+ * the whole history checks out. `nextActivationIndex` is the next unused
+ * global activation index of the run; the decision state itself consumes no
+ * index and creates no record. Finally the single input port resolves by
+ * its declared source — a pipeline input only from the verified snapshot
+ * (the original user binding path is never read) or a state output only
+ * from the fully verified winner map — and the JSON bytes are read from the
+ * fixed orchestrator-owned path through `O_NOFOLLOW`.
+ *
+ * JSON handling: the parser diagnostic stays content-free (`<what> <path>
+ * is not valid JSON` — no parser message, offending token, position or
+ * input fragment), and the parsed value is validated against the
+ * loader-compiled Draft 2020-12 schema snapshot carried by the input port
+ * (value-free diagnostics; the same compiled schema, no second compiler).
+ * Malformed JSON and schema failures are `PipelineError`s before the
+ * evaluator and never become `invalid_facts`; only a structurally valid,
+ * schema-conforming JSON value that does not satisfy the decision model's
+ * fact-assignment contract maps to the existing typed `invalid_facts` via
+ * `evaluatePipelineDecisionState`. Raw JSON bytes, parsed facts and fact
+ * values never appear in results, errors or diagnostics.
+ *
+ * The function never selects a transition target and never moves a graph
+ * cursor: it returns exactly the existing `PipelineDecisionStateResult`,
+ * whose outcome is routed to the next state only by the pipeline's
+ * transition table. This is substrate only — the production runner does not
+ * execute v2 pipelines or decision states yet.
+ */
+export async function evaluateDecisionStateFromData(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+  stateId: string,
+  nextActivationIndex: number,
+): Promise<PipelineDecisionStateResult> {
+  // 1. Pipeline provenance: only the exact loadPipelineV2 snapshot.
+  requireResolvedPipelineV2Provenance(pipeline, "evaluateDecisionStateFromData");
+  // 2. Snapshot provenance for the same pipeline object, before any of its
+  //    fields are read.
+  const provenance = runInputSnapshotProvenance.get(runInputs);
+  if (provenance === undefined || provenance.pipeline !== pipeline) {
+    throw new PipelineError(UNTRUSTED_RUN_INPUT_SNAPSHOT_MESSAGE);
+  }
+  const runRootCanonical = provenance.runRootCanonical;
+  const projectRoot = provenance.projectRootCanonical;
+
+  // 3. The next activation index is a plain runner-owned input.
+  expectPositiveSafeInteger(nextActivationIndex, "next activation index");
+
+  // 4. The safe state id must name a declared decision state.
+  const safeStateId = validateSafeId(stateId, "decision state id");
+  const state = findStateById(pipeline, safeStateId);
+  if (state === undefined) {
+    throw new PipelineError(
+      `state ${JSON.stringify(safeStateId)} is not declared by the pipeline`,
+    );
+  }
+  if (state.type !== "decision") {
+    throw new PipelineError(
+      `state ${JSON.stringify(safeStateId)} is not a decision state; the decision data adapter exists for decision states only`,
+    );
+  }
+  const decisionState: ResolvedV2DecisionState = state;
+
+  // 5. The canonical run root and the shared project root must still be
+  // real non-symlink directories.
+  await requireRealDirectory(runRootCanonical, "run root");
+  await requireRealDirectory(projectRoot, "run project root");
+
+  // 6. The whole run-owned snapshot is re-verified before anything else:
+  // not only the decision's own input — every run input must still be
+  // intact, and the original user binding paths are never read again.
+  await verifyRunInputsSnapshot(runInputs, provenance);
+
+  // 7./8./9. The complete accepted history is validated (parse, coherence,
+  // fixed-location resolution, digest verification of every record
+  // including old non-winning ones) with every activation index strictly
+  // below `nextActivationIndex`; only then is the winner per
+  // state/output pair selected by highest index, independent of record
+  // order.
+  const acceptedByRef = await resolveAcceptedHistory(
+    pipeline,
+    acceptedOutputs,
+    runRootCanonical,
+    nextActivationIndex,
+  );
+
+  // 10. The single declared input port resolves by its declared source.
+  const port = decisionState.inputs[0];
+  if (port === undefined) {
+    throw new PipelineError(
+      `decision state ${JSON.stringify(safeStateId)} declares no input port`,
+    );
+  }
+  const portWhat = `input port ${JSON.stringify(port.id)} of decision state ${JSON.stringify(safeStateId)}`;
+  let sourcePath: string;
+  let sourceWhat: string;
+  if ("pipeline_input" in port.source) {
+    let entry: RunInputSnapshotEntry | undefined;
+    for (const candidate of runInputs.inputs) {
+      if (candidate.id === port.source.pipeline_input) {
+        entry = candidate;
+        break;
+      }
+    }
+    if (entry === undefined) {
+      throw new PipelineError(
+        `${portWhat} references pipeline input ${JSON.stringify(port.source.pipeline_input)} which has no run input snapshot entry`,
+      );
+    }
+    if (entry.type !== port.type) {
+      throw new PipelineError(
+        `${portWhat} expects type ${JSON.stringify(port.type)} but the run input snapshot entry has type ${JSON.stringify(entry.type)}`,
+      );
+    }
+    sourcePath = entry.snapshot_path;
+    sourceWhat = `${portWhat} source pipeline input ${JSON.stringify(port.source.pipeline_input)}`;
+  } else {
+    const accepted = acceptedByRef.get(
+      `${port.source.state_output.state}\u0000${port.source.state_output.output}`,
+    );
+    if (accepted === undefined) {
+      throw new PipelineError(
+        `${portWhat} references state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)} which has no accepted output yet (missing, forward or first-visit self reference)`,
+      );
+    }
+    if (accepted.type !== port.type) {
+      throw new PipelineError(
+        `${portWhat} expects type ${JSON.stringify(port.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
+      );
+    }
+    sourcePath = accepted.canonicalPath;
+    sourceWhat = `${portWhat} source state output ${JSON.stringify(port.source.state_output.state)}.${JSON.stringify(port.source.state_output.output)}`;
+  }
+
+  // 11. The value lives at its fixed orchestrator-owned path, verified by
+  // the snapshot/history validation above; reading goes through
+  // O_NOFOLLOW so a swapped symlink never resolves.
+  const content = await readRegularFileBytes(sourcePath, sourceWhat);
+
+  // 12. Content-free parse diagnostic: no parser message, offending token,
+  // position or input fragment.
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(content.toString("utf8"));
+  } catch {
+    throw new PipelineError(`${sourceWhat} ${sourcePath} is not valid JSON`);
+  }
+
+  // 13. The loader-compiled schema snapshot of this input port is the only
+  // contract; no second schema compiler exists.
+  if (port.schema === undefined) {
+    throw new PipelineError(`${portWhat} has no compiled JSON schema`);
+  }
+  validatePipelineJson(port.schema, parsedJson, sourceWhat);
+
+  // 14. The existing pure evaluator maps the parsed fact assignment; any
+  // earlier failure above never becomes `invalid_facts`. Raw bytes, parsed
+  // facts and fact values are not returned or recorded.
+  return evaluatePipelineDecisionState(pipeline, safeStateId, parsedJson);
 }
