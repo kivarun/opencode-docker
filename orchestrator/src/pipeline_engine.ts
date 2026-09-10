@@ -2,20 +2,36 @@ import type {
   ResolvedAgentState,
   ResolvedPipeline,
 } from "./pipeline.ts";
+import {
+  requireResolvedPipelineV2Provenance,
+  type ResolvedPipelineV2,
+  type ResolvedV2AgentState,
+  type ResolvedV2DecisionState,
+} from "./pipeline_v2.ts";
 
 /**
- * Pure graph execution core. It owns the outcome -> transition -> next-state
- * mapping for any already loaded pipeline: the agent callback reports only a
- * validated outcome, never the next state. No timestamps, no randomness, no
- * I/O; execution is bounded by the pipeline's `max_transitions`.
+ * Pure graph execution core. It is the single owner of the
+ * `cursor -> outcome -> transition -> next-state` mapping for any already
+ * loaded pipeline: an executor callback reports only a validated outcome,
+ * never the next state. No timestamps, no randomness, no I/O; execution is
+ * bounded by the pipeline's `max_transitions`.
+ *
+ * The execution loop exists exactly once. Version-specific compile adapters
+ * (`compileV1Graph` for `ResolvedPipeline`, `compileV2Graph` for
+ * `ResolvedPipelineV2`) each build the same internal engine-owned snapshot:
+ * `entry_state`, the fixed `max_transitions`, state ids/types, terminal
+ * results, the ordered transitions with their original indices, and the
+ * frozen, transition-free execution view each state hands to its callback.
+ * V2 adds the agent/decision dispatch at compile time; the loop itself,
+ * the outcome -> transition mapping, the transition budget, the frozen
+ * `TransitionStep` construction, the commit-hook ordering and the cursor
+ * movement are one shared implementation for both versions.
  *
  * Before the first callback the engine compiles an immutable, engine-owned
- * snapshot of exactly the data it needs to execute the graph (`entry_state`,
- * `max_transitions`, state ids/types, terminal results, and the ordered
- * transitions with their original indices). During execution the engine reads
- * transitions, terminal results, and the transition budget only from that
- * snapshot, so neither mutations of the source `ResolvedPipeline` nor of the
- * callback view can redirect the graph.
+ * snapshot of exactly the data it needs to execute the graph. During
+ * execution the engine reads transitions, terminal results, and the
+ * transition budget only from that snapshot, so neither mutations of the
+ * source pipeline nor of the callback view can redirect the graph.
  */
 
 export type PipelineExecutionReason =
@@ -36,7 +52,7 @@ export class PipelineExecutionError extends Error {
 }
 
 /**
- * Execution view of an agent state handed to the callback: a frozen fresh
+ * Execution view of a v1 agent state handed to the callback: a frozen fresh
  * copy of the data a step needs (identity, profile, prompt, inputs, result
  * schema, timeout, attempts). It deliberately contains no transitions.
  */
@@ -68,6 +84,47 @@ export type AgentOutcomeExecutor = (
   state: AgentStateView,
 ) => string | Promise<string>;
 
+/**
+ * Execution view of a v2 agent state handed to `executeAgent`: a fresh frozen
+ * copy of exactly the fields the v2 agent executor needs. It carries no
+ * transitions, no target states, no data ports, no schemas and no runtime
+ * authority; the engine never reads graph data back from the view.
+ */
+export interface V2AgentExecutionView {
+  readonly type: "agent";
+  readonly id: string;
+  readonly profile: string;
+  readonly promptPath: string;
+  readonly promptContent: string;
+  readonly timeout_seconds: number;
+  readonly max_attempts: number;
+}
+
+/**
+ * Execution view of a v2 decision state handed to `executeDecision`: only
+ * identity. The engine never sees the decision model, facts, schemas or any
+ * data; the production runner closes the trusted pipeline/run data over the
+ * callback and returns only the selected outcome string.
+ */
+export interface V2DecisionExecutionView {
+  readonly type: "decision";
+  readonly id: string;
+}
+
+/**
+ * Executors of a v2 pipeline graph. For an agent state only `executeAgent`
+ * runs, for a decision state only `executeDecision`, for a terminal state
+ * neither. Both return an outcome string; neither selects the next state —
+ * the engine resolves the declared transition from its own snapshot.
+ */
+export interface PipelineV2GraphExecutors {
+  readonly executeAgent:
+    (state: V2AgentExecutionView) => string | Promise<string>;
+
+  readonly executeDecision:
+    (state: V2DecisionExecutionView) => string | Promise<string>;
+}
+
 export interface TransitionStep {
   from: string;
   outcome: string;
@@ -80,8 +137,8 @@ export interface TransitionStep {
  * validated outcome against its immutable graph snapshot. The hook receives
  * the exact immutable TransitionStep and must persist it before the engine
  * allows the next state callback. A rejecting or throwing hook stops the
- * graph immediately: the transition never appears in the trace and the cursor
- * does not move. Two commit outcomes are possible. A `not_committed` failure
+ * graph immediately: the transition never appears in the trace and the
+ * cursor does not move. Two commit outcomes are possible. A `not_committed` failure
  * rejects before the durable write lands: the transition is not recorded
  * anywhere. A `durability_unknown` failure means the rename already landed:
  * the new candidate revision may already be visible on disk even though the
@@ -109,9 +166,26 @@ interface CompiledTransition {
   index: number;
 }
 
+type CompiledAgentView = AgentStateView | V2AgentExecutionView;
+
+/**
+ * One compiled transition-bearing state. The `execute` closure binds the
+ * version-specific executor to the state's frozen, transition-free view at
+ * compile time: an agent state always runs only its agent executor, a
+ * decision state only the decision executor, and the executor can return
+ * just an outcome — never a target state.
+ */
+type CompiledExecutableState = {
+  readonly id: string;
+  readonly kind: "agent" | "decision";
+  readonly view: CompiledAgentView | V2DecisionExecutionView;
+  readonly transitions: readonly CompiledTransition[];
+  readonly execute: () => string | Promise<string>;
+};
+
 type CompiledState =
-  | { id: string; type: "agent"; view: AgentStateView; transitions: readonly CompiledTransition[] }
-  | { id: string; type: "terminal"; result: "success" | "failed" };
+  | CompiledExecutableState
+  | { readonly id: string; readonly kind: "terminal"; readonly result: "success" | "failed" };
 
 interface CompiledGraph {
   entryState: string;
@@ -133,9 +207,23 @@ function notAJsonValue(stateId: string, detail: string): PipelineExecutionError 
   );
 }
 
+function stateKindLabel(kind: "agent" | "decision"): string {
+  return kind === "decision" ? "decision state" : "agent state";
+}
+
 function isPlainJsonObject(value: object): boolean {
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Minimal shape used defensively during transition compilation: corrupted
+ * runtime objects must fail as an internal graph inconsistency, never as an
+ * accidental TypeError.
+ */
+interface PipelineTransitionSpecLike {
+  outcome?: unknown;
+  to?: unknown;
 }
 
 /**
@@ -210,7 +298,7 @@ function snapshotJsonValue(
 }
 
 /**
- * Builds the frozen execution view of an agent state: a fresh copy of the
+ * Builds the frozen execution view of a v1 agent state: a fresh copy of the
  * data a step needs, deeply isolated from the source pipeline (the result
  * schema is deep-cloned and recursively frozen). It deliberately contains no
  * transitions; freezing it is an additional defense, the primary one being
@@ -232,30 +320,175 @@ function buildAgentStateView(state: ResolvedAgentState): AgentStateView {
 }
 
 /**
- * Compiles the engine-owned immutable execution graph and validates exactly
- * the runtime data needed for safe execution. This is not the bundle/path/
- * profile/result-schema validation of the pipeline loader; it only guards the
- * graph data itself and runs before the first callback.
+ * Builds the frozen, fresh execution view of a v2 agent state at graph
+ * compile time. It contains exactly the runtime fields of the v2 agent
+ * contract and deliberately no transitions, targets, transition indexes,
+ * data ports, schemas or credentials.
  */
-function compileGraph(pipeline: ResolvedPipeline): CompiledGraph {
-  if (!Array.isArray(pipeline.states) || pipeline.states.length === 0) {
+function buildV2AgentStateView(state: ResolvedV2AgentState): V2AgentExecutionView {
+  const view: V2AgentExecutionView = {
+    type: "agent",
+    id: state.id,
+    profile: state.profile,
+    promptPath: state.promptPath,
+    promptContent: state.promptContent,
+    timeout_seconds: state.timeout_seconds,
+    max_attempts: state.max_attempts,
+  };
+  return Object.freeze(view);
+}
+
+/**
+ * Builds the frozen, fresh execution view of a v2 decision state: identity
+ * only. Facts, the decision model, data paths and schemas never cross this
+ * boundary; the outcome-producing executor is bound at compile time and the
+ * callback returns only an outcome string.
+ */
+function buildV2DecisionStateView(state: ResolvedV2DecisionState): V2DecisionExecutionView {
+  return Object.freeze({
+    type: "decision",
+    id: state.id,
+  });
+}
+
+/**
+ * Validates exactly the runtime graph data shared by both pipeline versions:
+ * a non-empty states list, a positive safe integer transition budget, and a
+ * non-empty entry state. This is not the bundle/path/profile/model/schema
+ * validation of the pipeline loaders; it only guards the graph data itself
+ * and runs before the first callback.
+ */
+function validateGraphPrologue(
+  states: unknown,
+  maxTransitions: unknown,
+  entryState: unknown,
+): void {
+  if (!Array.isArray(states) || states.length === 0) {
     throw contradiction("the states list is empty");
   }
   if (
-    typeof pipeline.max_transitions !== "number" ||
-    !Number.isSafeInteger(pipeline.max_transitions) ||
-    pipeline.max_transitions <= 0
+    typeof maxTransitions !== "number" ||
+    !Number.isSafeInteger(maxTransitions) ||
+    maxTransitions <= 0
   ) {
     throw contradiction(
-      `max_transitions must be a positive safe integer, got ${JSON.stringify(pipeline.max_transitions)}`,
+      `max_transitions must be a positive safe integer, got ${JSON.stringify(maxTransitions)}`,
     );
   }
-  if (typeof pipeline.entry_state !== "string" || pipeline.entry_state === "") {
+  if (typeof entryState !== "string" || entryState === "") {
     throw contradiction("entry_state must be a non-empty string");
   }
+}
+
+/**
+ * Compiles the declared transitions of one transition-bearing state into the
+ * engine-owned snapshot. The state-kind label only names the message; the
+ * transition data itself is identical for v1 and v2.
+ */
+function compileTransitions(
+  kind: "agent" | "decision",
+  stateId: string,
+  transitions: readonly unknown[],
+): CompiledTransition[] {
+  const label = stateKindLabel(kind);
+  if (!Array.isArray(transitions)) {
+    throw contradiction(
+      `${label} ${JSON.stringify(stateId)} transitions must be an array`,
+    );
+  }
+  const compiled: CompiledTransition[] = [];
+  const outcomes = new Set<string>();
+  for (let index = 0; index < transitions.length; index++) {
+    const transition = transitions[index];
+    if (
+      transition === undefined ||
+      transition === null ||
+      typeof (transition as PipelineTransitionSpecLike).outcome !== "string" ||
+      ((transition as PipelineTransitionSpecLike).outcome as string).trim() === ""
+    ) {
+      throw contradiction(
+        `${label} ${JSON.stringify(stateId)} transition ${index} outcome must be a non-empty string`,
+      );
+    }
+    const outcome = (transition as PipelineTransitionSpecLike).outcome as string;
+    if (outcomes.has(outcome)) {
+      throw contradiction(
+        `state ${JSON.stringify(stateId)} declares outcome ${JSON.stringify(outcome)} more than once`,
+      );
+    }
+    outcomes.add(outcome);
+    if (
+      typeof (transition as PipelineTransitionSpecLike).to !== "string" ||
+      (transition as PipelineTransitionSpecLike).to === ""
+    ) {
+      throw contradiction(
+        `${label} ${JSON.stringify(stateId)} transition ${index} target must be a non-empty string`,
+      );
+    }
+    compiled.push({ outcome, to: (transition as PipelineTransitionSpecLike).to as string, index });
+  }
+  return compiled;
+}
+
+/**
+ * Finishes the engine-owned graph snapshot: the entry state must exist,
+ * every declared transition target must exist, and at least one terminal
+ * state must be declared. The transition budget is captured as a primitive.
+ */
+function finishCompiledGraph(
+  states: Map<string, CompiledState>,
+  entryState: string,
+  maxTransitions: number,
+): CompiledGraph {
+  const entry = states.get(entryState);
+  if (entry === undefined) {
+    throw contradiction(
+      `entry_state ${JSON.stringify(entryState)} does not name a declared state`,
+    );
+  }
+  for (const state of states.values()) {
+    if (state.kind === "terminal") {
+      continue;
+    }
+    for (const transition of state.transitions) {
+      if (!states.has(transition.to)) {
+        throw contradiction(
+          `state ${JSON.stringify(state.id)} transition outcome ${JSON.stringify(transition.outcome)} targets unknown state ${JSON.stringify(transition.to)}`,
+        );
+      }
+    }
+  }
+  let hasTerminal = false;
+  for (const state of states.values()) {
+    if (state.kind === "terminal") {
+      hasTerminal = true;
+      break;
+    }
+  }
+  if (!hasTerminal) {
+    throw contradiction("the pipeline declares no terminal state");
+  }
+
+  return {
+    entryState: entry.id,
+    maxTransitions,
+    states,
+  };
+}
+
+/**
+ * v1 compilation adapter: validates the runtime graph shape of a resolved
+ * v1 pipeline and compiles the immutable engine-owned snapshot, binding the
+ * `executeAgent` callback into each agent state. Decision states cannot
+ * exist in a v1 graph, so no decision executor is bound.
+ */
+function compileV1Graph(
+  pipeline: ResolvedPipeline,
+  executeAgent: AgentOutcomeExecutor,
+): CompiledGraph {
+  validateGraphPrologue(pipeline.states, pipeline.max_transitions, pipeline.entry_state);
 
   const states = new Map<string, CompiledState>();
-  let hasTerminal = false;
   for (const state of pipeline.states) {
     if (typeof state.id !== "string" || state.id === "") {
       throw contradiction("every state id must be a non-empty string");
@@ -273,8 +506,7 @@ function compileGraph(pipeline: ResolvedPipeline): CompiledGraph {
           `terminal state ${JSON.stringify(stateId)} result must be "success" or "failed", got ${JSON.stringify(state.result)}`,
         );
       }
-      hasTerminal = true;
-      states.set(state.id, { id: state.id, type: "terminal", result: state.result });
+      states.set(state.id, { id: state.id, kind: "terminal", result: state.result });
       continue;
     }
     if (state.type !== "agent") {
@@ -282,76 +514,88 @@ function compileGraph(pipeline: ResolvedPipeline): CompiledGraph {
         `state ${JSON.stringify(stateId)} has unsupported type ${JSON.stringify(stateType)}, expected "agent" or "terminal"`,
       );
     }
-    if (!Array.isArray(state.transitions)) {
-      throw contradiction(
-        `agent state ${JSON.stringify(stateId)} transitions must be an array`,
-      );
-    }
-    const transitions: CompiledTransition[] = [];
-    const outcomes = new Set<string>();
-    for (let index = 0; index < state.transitions.length; index++) {
-      const transition = state.transitions[index];
-      if (
-        transition === undefined ||
-        typeof transition.outcome !== "string" ||
-        transition.outcome.trim() === ""
-      ) {
-        throw contradiction(
-          `agent state ${JSON.stringify(stateId)} transition ${index} outcome must be a non-empty string`,
-        );
-      }
-      if (outcomes.has(transition.outcome)) {
-        throw contradiction(
-          `state ${JSON.stringify(stateId)} declares outcome ${JSON.stringify(transition.outcome)} more than once`,
-        );
-      }
-      outcomes.add(transition.outcome);
-      if (typeof transition.to !== "string" || transition.to === "") {
-        throw contradiction(
-          `agent state ${JSON.stringify(stateId)} transition ${index} target must be a non-empty string`,
-        );
-      }
-      transitions.push({ outcome: transition.outcome, to: transition.to, index });
-    }
+    const transitions = compileTransitions("agent", stateId, state.transitions);
+    const view = buildAgentStateView(state);
     states.set(stateId, {
       id: stateId,
-      type: "agent",
-      view: buildAgentStateView(state),
+      kind: "agent",
+      view,
       transitions,
+      execute: () => executeAgent(view),
     });
   }
 
-  const entry = states.get(pipeline.entry_state);
-  if (entry === undefined) {
-    throw contradiction(
-      `entry_state ${JSON.stringify(pipeline.entry_state)} does not name a declared state`,
-    );
-  }
-  for (const state of states.values()) {
-    if (state.type !== "agent") {
-      continue;
+  return finishCompiledGraph(states, pipeline.entry_state, pipeline.max_transitions);
+}
+
+/**
+ * v2 compilation adapter: after the provenance gate the same engine-owned
+ * graph snapshot as v1, with one additional state kind. An agent state binds
+ * `executeAgent` with its frozen `V2AgentExecutionView`, a decision state
+ * only `executeDecision` with an identity-only frozen view. No second
+ * pipeline compiler runs: the bundle, data-port, model and schema contracts
+ * belong to `loadPipelineV2` and are not repeated here.
+ */
+function compileV2Graph(
+  pipeline: ResolvedPipelineV2,
+  executors: PipelineV2GraphExecutors,
+): CompiledGraph {
+  validateGraphPrologue(pipeline.states, pipeline.max_transitions, pipeline.entry_state);
+
+  const states = new Map<string, CompiledState>();
+  for (const state of pipeline.states) {
+    if (typeof state.id !== "string" || state.id === "") {
+      throw contradiction("every state id must be a non-empty string");
     }
-    for (const transition of state.transitions) {
-      if (!states.has(transition.to)) {
+    if (states.has(state.id)) {
+      throw contradiction(`state ${JSON.stringify(state.id)} is declared more than once`);
+    }
+    const stateId: string = state.id;
+    // `unknown` copy keeps the defensive type check alive against cast
+    // inputs; TypeScript narrowing would collapse it to `never`
+    const stateType: unknown = state.type;
+    if (state.type === "terminal") {
+      if (state.result !== "success" && state.result !== "failed") {
         throw contradiction(
-          `state ${JSON.stringify(state.id)} transition outcome ${JSON.stringify(transition.outcome)} targets unknown state ${JSON.stringify(transition.to)}`,
+          `terminal state ${JSON.stringify(stateId)} result must be "success" or "failed", got ${JSON.stringify(state.result)}`,
         );
       }
+      states.set(state.id, { id: state.id, kind: "terminal", result: state.result });
+      continue;
     }
-  }
-  if (!hasTerminal) {
-    throw contradiction("the pipeline declares no terminal state");
+    if (state.type === "decision") {
+      const transitions = compileTransitions("decision", stateId, state.transitions);
+      const view = buildV2DecisionStateView(state);
+      states.set(stateId, {
+        id: stateId,
+        kind: "decision",
+        view,
+        transitions,
+        execute: () => executors.executeDecision(view),
+      });
+      continue;
+    }
+    if (state.type !== "agent") {
+      throw contradiction(
+        `state ${JSON.stringify(stateId)} has unsupported type ${JSON.stringify(stateType)}, expected "agent", "decision" or "terminal"`,
+      );
+    }
+    const transitions = compileTransitions("agent", stateId, state.transitions);
+    const view = buildV2AgentStateView(state);
+    states.set(stateId, {
+      id: stateId,
+      kind: "agent",
+      view,
+      transitions,
+      execute: () => executors.executeAgent(view),
+    });
   }
 
-  return {
-    entryState: entry.id,
-    maxTransitions: pipeline.max_transitions,
-    states,
-  };
+  return finishCompiledGraph(states, pipeline.entry_state, pipeline.max_transitions);
 }
 
 function findTransition(
-  state: CompiledState & { type: "agent" },
+  state: CompiledExecutableState,
   outcome: string,
 ): CompiledTransition | undefined {
   for (const transition of state.transitions) {
@@ -363,27 +607,17 @@ function findTransition(
 }
 
 /**
- * Executes the graph starting strictly at `entry_state`. For an agent state
- * the injected `executeAgent` callback is invoked with the frozen execution
- * view compiled before the run and must return a validated outcome string;
- * the engine resolves the declared transition by outcome from its own
- * snapshot and moves to the declared target state. When `options`
- * `.onTransitionCommit` is set, the engine hands the hook the exact immutable
- * TransitionStep and waits for it to complete before recording the
- * transition and starting the next state callback; a hook failure stops the
- * graph with no transition recorded. A terminal state ends the execution.
- * Callback failures propagate unchanged: no transition is recorded and the
- * cursor does not move. A terminal `result: "failed"` is a normal graph
- * result, not an engine error.
+ * The single execution loop of the project. It owns the outcome ->
+ * transition -> next-state mapping for every already loaded pipeline: the
+ * version-specific compile adapter binds each state's executor and frozen
+ * view, and the loop reads transitions, the transition budget, and terminal
+ * results only from the engine-owned snapshot. Both v1 and v2 graphs run
+ * through this one loop — there is no second execution machine.
  */
-export async function executePipelineGraph(
-  pipeline: ResolvedPipeline,
-  executeAgent: AgentOutcomeExecutor,
-  options: GraphExecutionOptions = {},
+async function runCompiledGraph(
+  graph: CompiledGraph,
+  onTransitionCommit: TransitionCommitHook | undefined,
 ): Promise<GraphExecutionResult> {
-  const graph = compileGraph(pipeline);
-  const onTransitionCommit = options.onTransitionCommit;
-
   const trace: TransitionStep[] = [];
   let cursor: string = graph.entryState;
   let transitionCount = 0;
@@ -396,7 +630,7 @@ export async function executePipelineGraph(
         `pipeline cursor ${JSON.stringify(cursor)} does not name a declared state`,
       );
     }
-    if (current.type === "terminal") {
+    if (current.kind === "terminal") {
       return {
         terminalStateId: current.id,
         terminalResult: current.result,
@@ -407,21 +641,21 @@ export async function executePipelineGraph(
     if (transitionCount >= graph.maxTransitions) {
       throw new PipelineExecutionError(
         "transition_budget_exhausted",
-        `agent state ${JSON.stringify(current.id)} cannot execute: transition budget exhausted (${transitionCount} of ${graph.maxTransitions} transitions already applied)`,
+        `${stateKindLabel(current.kind)} ${JSON.stringify(current.id)} cannot execute: transition budget exhausted (${transitionCount} of ${graph.maxTransitions} transitions already applied)`,
       );
     }
-    const outcome = await executeAgent(current.view);
+    const outcome = await current.execute();
     if (typeof outcome !== "string" || outcome.trim() === "") {
       throw new PipelineExecutionError(
         "invalid_outcome",
-        `agent state ${JSON.stringify(current.id)} produced an invalid outcome ${JSON.stringify(outcome)}; the agent reports an outcome and never selects the next state`,
+        `${stateKindLabel(current.kind)} ${JSON.stringify(current.id)} produced an invalid outcome ${JSON.stringify(outcome)}; the ${current.kind} reports an outcome and never selects the next state`,
       );
     }
     const match = findTransition(current, outcome);
     if (match === undefined) {
       throw new PipelineExecutionError(
         "unknown_outcome",
-        `agent result outcome ${JSON.stringify(outcome)} does not match any transition outcome of state ${JSON.stringify(current.id)}`,
+        `${current.kind === "decision" ? "decision" : "agent"} result outcome ${JSON.stringify(outcome)} does not match any transition outcome of state ${JSON.stringify(current.id)}`,
       );
     }
     // The step is built and frozen by the engine from its own snapshot: the
@@ -439,4 +673,47 @@ export async function executePipelineGraph(
     transitionCount += 1;
     cursor = step.to;
   }
+}
+
+/**
+ * Executes the v1 graph starting strictly at `entry_state`. For an agent
+ * state the injected `executeAgent` callback is invoked with the frozen
+ * execution view compiled before the run and must return a validated
+ * outcome string; the engine resolves the declared transition by outcome
+ * from its own snapshot and moves to the declared target state. When
+ * `options.onTransitionCommit` is set, the engine hands the hook the exact
+ * immutable TransitionStep and waits for it to complete before recording
+ * the transition and starting the next state callback; a hook failure stops
+ * the graph with no transition recorded. A terminal state ends the
+ * execution. Callback failures propagate unchanged: no transition is
+ * recorded and the cursor does not move. A terminal `result: "failed"` is a
+ * normal graph result, not an engine error.
+ */
+export async function executePipelineGraph(
+  pipeline: ResolvedPipeline,
+  executeAgent: AgentOutcomeExecutor,
+  options: GraphExecutionOptions = {},
+): Promise<GraphExecutionResult> {
+  const graph = compileV1Graph(pipeline, executeAgent);
+  return runCompiledGraph(graph, options.onTransitionCommit);
+}
+
+/**
+ * Executes a loaded pipeline v2 graph through the same single execution
+ * loop as `executePipelineGraph`. The trusted `ResolvedPipelineV2` snapshot
+ * is provenance-checked first (hand-built objects, casts, clones and
+ * Proxies are rejected before any content is read), then the version-
+ * specific adapter compiles the same internal engine-owned snapshot: agent
+ * and decision states dispatch to their declared executor with a frozen,
+ * transition-free view, and the shared core owns the outcome resolution,
+ * transition budget, commit-hook ordering and terminal selection.
+ */
+export async function executePipelineV2Graph(
+  pipeline: ResolvedPipelineV2,
+  executors: PipelineV2GraphExecutors,
+  options: GraphExecutionOptions = {},
+): Promise<GraphExecutionResult> {
+  requireResolvedPipelineV2Provenance(pipeline, "executePipelineV2Graph");
+  const graph = compileV2Graph(pipeline, executors);
+  return runCompiledGraph(graph, options.onTransitionCommit);
 }

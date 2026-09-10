@@ -236,24 +236,34 @@ as its own.
 
 ### Pure graph engine (implemented, single transition-mapping owner)
 
-`orchestrator/src/pipeline_engine.ts` implements `executePipelineGraph`, a
-pure, deterministic graph execution core. Before the first callback it
-compiles an immutable, engine-owned snapshot of exactly the graph data it
-needs (`entry_state`, `max_transitions`, state ids/types, terminal results,
-ordered transitions with original indices) and validates it fail-closed;
-during execution it reads transitions, terminal results, and the budget only
-from that snapshot, so mutations of the source `ResolvedPipeline` —
+`orchestrator/src/pipeline_engine.ts` implements the pure, deterministic
+graph execution core. The execution loop exists exactly once
+(`runCompiledGraph`); version-specific compilation adapters (`compileV1Graph`
+over `ResolvedPipeline`, `compileV2Graph` over the provenance-checked
+`ResolvedPipelineV2`) each build the same immutable, engine-owned snapshot of
+exactly the graph data it needs (`entry_state`, `max_transitions`, state
+ids/types, terminal results, ordered transitions with original indices, and
+each state's frozen, transition-free execution view) and validate it
+fail-closed; during execution the loop reads transitions, terminal results,
+and the budget only from that snapshot, so mutations of the source pipeline —
 synchronous inside the callback or external while a callback is pending —
-cannot redirect the graph. The callback receives a separate frozen, deeply
-isolated, transition-free execution view (state id, profile, prompt, inputs,
-and a deep-cloned, recursively frozen JSON result schema — a corrupted
-non-JSON schema in an artificially damaged resolved pipeline is rejected as
-`invalid_graph` before the callback) and returns only a validated outcome: it
-can never select the next state. The engine starts strictly at `entry_state`, resolves
+cannot redirect the graph. For a v1 agent state the callback receives a
+separate frozen, deeply isolated, transition-free execution view (state id,
+profile, prompt, inputs, and a deep-cloned, recursively frozen JSON result
+schema — a corrupted non-JSON schema in an artificially damaged resolved
+pipeline is rejected as `invalid_graph` before the callback); for a v2
+agent/decision state the frozen views are the exact `V2AgentExecutionView`/
+`V2DecisionExecutionView` compiled at snapshot time (no transitions, targets,
+transition indexes, data ports, schemas, or credentials). Both executors
+return only a validated outcome: they can never select the next state, and
+the agent/decision dispatch is bound at compile time (`agent` →
+`executeAgent` only, `decision` → `executeDecision` only, `terminal` → no
+callback). The engine starts strictly at `entry_state`, resolves
 the declared transition by outcome itself, enforces `max_transitions` with a
-single reachable contract — an agent state cursor with an exhausted budget
-fails before the callback, and reaching a terminal exactly at the boundary
-succeeds — and finishes at a terminal state with `result: success|failed`. It
+single reachable contract — a transition-bearing cursor (agent or decision)
+with an exhausted budget fails before the callback, and reaching a terminal
+exactly at the boundary succeeds — and finishes at a terminal state with
+`result: success|failed`. It
 returns the terminal state id, the terminal result, the applied transition
 count, and an ordered transition trace (`from`, `outcome`, `to`,
 `transition_index`); it contains no timestamps or randomness. At the core
@@ -261,9 +271,11 @@ level it supports sequential states, branching by outcome, and cycles bounded
 by `max_transitions`. It fails closed with `PipelineExecutionError` (stable
 reasons: `invalid_graph`, `missing_state`, `unknown_outcome`,
 `invalid_outcome`, `transition_budget_exhausted`) when the cursor is missing,
-an outcome is not declared by the current agent state, an agent state would
-run with an exhausted transition budget, an outcome is empty or not a string,
-or the resolved graph is internally inconsistent. A callback failure
+an outcome is not declared by the current state, a transition-bearing state
+(agent or decision) would run with an exhausted shared transition budget, an
+outcome is empty or not a string, or the resolved graph is internally
+inconsistent. The budget-exhaustion message names `agent state`/`decision
+state` explicitly. A callback failure
 propagates unchanged: no transition is recorded and the cursor does not move.
 A terminal `result: failed` is a normal graph result, not an engine
 exception. Free text, stdout, and exit codes never participate in transition
@@ -290,6 +302,30 @@ The pipeline's `timeout_seconds` is enforced by the CLI runner on the
 signalable worker `docker-helper run` only; the deadline sends SIGTERM, the
 result is marked timed out, and the run fails normally with a single cleanup.
 `max_attempts` is 1, so no retries are implemented.
+
+**Pipeline v2 through the same engine (pure adapter implemented, not wired
+into the production runner).** `executePipelineV2Graph(pipeline, executors)`
+accepts the provenance-checked `ResolvedPipelineV2` snapshot — clones, casts,
+spreads, and Proxies are rejected by `requireResolvedPipelineV2Provenance`
+before any content read or callback — and compiles the same engine-owned
+graph snapshot with one additional state kind: an agent state binds
+`executeAgent` with a frozen `V2AgentExecutionView` (type/id/profile/
+prompt/timeout/attempts only), a decision state binds only `executeDecision`
+with an identity-only frozen `V2DecisionExecutionView` (no model, facts,
+schemas, data paths or credentials ever cross this boundary), and a terminal
+state runs no callback. `PipelineV2GraphExecutors` return only outcome
+strings; neither executor selects the next state, and the engine never
+parses decision facts or knows the decision table — the future production
+runner closes the trusted pipeline/run data over `executeDecision` (e.g.
+`evaluateDecisionStateFromData(...).outcome`). Agent and decision states
+share one transition budget (the exhaustion message names the state kind
+explicitly), reserved decision outcomes (`uncovered`, `inconsistent_facts`,
+`invalid_facts`) are routed like any other declared outcome, and all v1
+hook/budget/mutation semantics are unchanged and covered by
+`orchestrator/tests/pipeline_v2_engine.test.ts`, including a run whose
+decision executor is the real `evaluateDecisionStateFromData`. The
+production `agent-smoke` wiring for v2 is absent: the production loader
+still rejects schema version 2 before Launcher auth and before any Session.
 
 ### Pure decision-table substrate (implemented, not yet used by the production runner)
 
