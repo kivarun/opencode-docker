@@ -133,6 +133,51 @@ Cycles are allowed only with explicit bounds. Every reachable path must either
 terminate, wait for input, or remain covered by a finite transition or
 iteration budget.
 
+## Stages and tasks
+
+A stage is a plan-level coordination boundary, not necessarily one monolithic
+unit of work. Each stage contains a finite task graph. Tasks may be independent,
+strictly ordered, or joined after several prerequisites.
+
+The serialized plan may keep tasks in declaration order for stable identity and
+diagnostics, but execution semantics come from explicit dependencies. A stage
+with one task and no dependencies is the baseline used by the initial default
+pipeline; it is a degenerate one-node task graph rather than a different model.
+
+A task is the smallest plan-defined unit that may be assigned a role and
+produce independently accepted outputs. A task is not a pipeline state: states
+define the reusable control protocol, while tasks are runtime instances created
+from the task plan. The same task subpipeline may be instantiated for many
+tasks without generating workflow-specific states in the orchestrator.
+
+An architect model may propose the task decomposition and dependency graph as
+structured plan data. It does not schedule agents directly. Before execution,
+the orchestrator validates unique task ids, dependency references, acyclicity,
+bounds, input/output compatibility, and the accepted plan revision. It then
+computes the ready set deterministically: tasks with no unfinished dependencies
+may run subject to the declared concurrency ceiling; dependent tasks become
+ready only after all required predecessors have completed successfully.
+
+The authoritative root state machine remains ordered and single-owned. A
+bounded task-DAG scheduler is a composite execution facility beneath a stage,
+not a collection of model-controlled cursors. Task completion, failure,
+cancellation, retry eligibility, and stage completion are recorded as
+orchestrator events. A stage can close only after its required task graph has
+reached an accepted state and the stage decision permits closure.
+
+Parallel task executions require isolated writable workspaces or another
+explicit synchronization boundary. They must not concurrently mutate the same
+project tree by accident. Source-control-backed isolation with one worktree or
+branch per task is a future integration described in
+[the SCM and Git-flow draft](scm-integration-draft.md); the file-only pipeline
+continues to work without any SCM provider.
+
+Plan changes are versioned operations. Re-decomposition may add, supersede, or
+invalidate pending work according to an explicit decision, but it cannot
+rewrite the recorded history of completed task activations. If a proposed plan
+cannot be reconciled safely with the current stage, the pipeline waits for an
+architectural or user decision instead of guessing.
+
 ## Pipeline data
 
 Inputs and outputs have logical identifiers and declared contracts. A pipeline
