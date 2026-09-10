@@ -10,7 +10,15 @@ import {
  * failure injection and rename gates without sleeps.
  */
 
-export type FaultStep = "open" | "write" | "sync" | "rename" | "dirsync";
+export type FaultStep =
+  | "open"
+  | "write"
+  | "sync"
+  | "close"
+  | "rename"
+  | "dirsync"
+  | "dirfsync"
+  | "dirclose";
 
 export function isTempStatePath(path: string): boolean {
   return basename(path).startsWith("state.json.tmp-");
@@ -19,6 +27,10 @@ export function isTempStatePath(path: string): boolean {
 /**
  * Wraps the real IO so that exactly one commit (1-based ordinal) fails at the
  * given protocol step. Every earlier commit and every later commit works.
+ * Steps: `open`/`write`/`sync`/`close`/`rename` fail before the rename
+ * (`not_committed`); `dirsync` fails opening the run directory after the
+ * rename, `dirfsync` fails the directory fsync, and `dirclose` fails closing
+ * the directory handle (`durability_unknown` outcomes).
  */
 export function faultIo(options: {
   failCommit: number;
@@ -64,7 +76,19 @@ export function faultIo(options: {
           }
           return await handle.sync();
         },
-        close: () => handle.close(),
+        close: async () => {
+          if (failStep === "close") {
+            // Close the real handle first so no descriptor leaks; the fault
+            // is still observed by the caller as a failed close.
+            try {
+              await handle.close();
+            } catch {
+              // best effort
+            }
+            throw fault;
+          }
+          return await handle.close();
+        },
       };
     },
     async rename(from, to) {
@@ -77,10 +101,77 @@ export function faultIo(options: {
       if (commit === options.failCommit && failStep === "dirsync") {
         throw fault;
       }
-      return await defaultPipelineStateIo.openDir(path);
+      const handle = await defaultPipelineStateIo.openDir(path);
+      if (commit !== options.failCommit) {
+        return handle;
+      }
+      return {
+        sync: async () => {
+          if (failStep === "dirfsync") {
+            throw fault;
+          }
+          return await handle.sync();
+        },
+        close: async () => {
+          if (failStep === "dirclose") {
+            // Close the real handle first so no descriptor leaks; the fault
+            // is still observed by the caller as a failed close.
+            try {
+              await handle.close();
+            } catch {
+              // best effort
+            }
+            throw fault;
+          }
+          return await handle.close();
+        },
+      };
     },
   };
   return io;
+}
+
+export interface IoCounts {
+  /** Exclusive temp-file opens (one per write attempt). */
+  tempOpens: number;
+  /** Renames of a temp file over the state path (one per successful write). */
+  renames: number;
+  /** Directory fsyncs (one per successful commit). */
+  dirSyncs: number;
+}
+
+/** Real IO that counts temp opens, renames, and directory fsyncs. */
+export function countingIo(base: PipelineStateIo = defaultPipelineStateIo): {
+  io: PipelineStateIo;
+  counts: IoCounts;
+} {
+  const counts: IoCounts = { tempOpens: 0, renames: 0, dirSyncs: 0 };
+  const io: PipelineStateIo = {
+    ...base,
+    async openExclusive(path, mode) {
+      if (isTempStatePath(path)) {
+        counts.tempOpens += 1;
+      }
+      return await base.openExclusive(path, mode);
+    },
+    async rename(from, to) {
+      if (isTempStatePath(from)) {
+        counts.renames += 1;
+      }
+      return await base.rename(from, to);
+    },
+    async openDir(path) {
+      const handle = await base.openDir(path);
+      return {
+        sync: async () => {
+          await handle.sync();
+          counts.dirSyncs += 1;
+        },
+        close: () => handle.close(),
+      };
+    },
+  };
+  return { io, counts };
 }
 
 export interface GateControl {
