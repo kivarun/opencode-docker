@@ -384,7 +384,11 @@ function expectEnum<T extends string>(value: unknown, allowed: readonly T[], wha
   return value as T;
 }
 
-function expectSafeId(value: unknown, what: string): string {
+/**
+ * The single safe-id contract of schema v3, shared by the reducer's
+ * `create_run`, the durable store, the sink, and the v2 path helper.
+ */
+export function expectSafeId(value: unknown, what: string): string {
   if (!isSafeId(value)) {
     throw new PipelineV2StateError(`${what} must be a safe non-empty identifier, got ${JSON.stringify(value)}`);
   }

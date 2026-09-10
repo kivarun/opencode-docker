@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parsePipelineV2RunState } from "../src/pipeline_v2_state.ts";
+import { parsePipelineV2RunState, PipelineV2StateError } from "../src/pipeline_v2_state.ts";
 import {
   PipelineV2RunStateDurabilityError,
   PipelineV2RunStateStore,
@@ -239,20 +239,122 @@ describe("pipeline v2 run state store", () => {
     });
   });
 
-  test("the run id must be a safe single path component before any filesystem I/O", async () => {
+  test("the run id must obey the shared schema-v3 safe-id contract", async () => {
     await withStore("store-run", async ({ root }) => {
-      for (const badRunId of ["../escape", "a/b", "..", ".", ""] as const) {
-        let message = "";
+      const badRunIds = [
+        "../escape",
+        "a/b",
+        "..",
+        ".",
+        "",
+        "a..b",
+        "run id",
+        "rün",
+        "a\\b",
+        "a".repeat(129),
+      ];
+      for (const badRunId of badRunIds) {
+        let constructorMessage = "";
         try {
           new PipelineV2RunStateStore({ stateRoot: root, runId: badRunId });
         } catch (cause) {
-          expect(cause).toBeInstanceOf(PipelineV2RunStateStoreError);
-          message = (cause as Error).message;
+          expect(cause).toBeInstanceOf(PipelineV2StateError);
+          constructorMessage = (cause as Error).message;
         }
-        expect(message).toContain("safe single path component");
+        expect(constructorMessage).toBe(
+          'pipeline v2 run id must be a safe non-empty identifier, got ' + JSON.stringify(badRunId),
+        );
+        // the path helper rejects with the same grammar and the same message
+        let pathMessage = "";
+        try {
+          pipelineV2RunStatePath(root, badRunId);
+        } catch (cause) {
+          expect(cause).toBeInstanceOf(PipelineV2StateError);
+          pathMessage = (cause as Error).message;
+        }
+        expect(pathMessage).toBe(constructorMessage);
       }
-      // the constructor performed no filesystem I/O at all
+      // neither the constructor nor the path helper performed filesystem I/O
       expect(await listDir(root)).toEqual([]);
+    });
+  });
+
+  test("valid boundary run ids are accepted and produce the documented path", async () => {
+    const boundaryId = "a" + "b".repeat(127); // exactly 128 characters
+    await withStore(boundaryId, async ({ root, store, statePath }) => {
+      expect(statePath).toBe(
+        join(root, "pipeline-runs", boundaryId, "state.json"),
+      );
+      expect(pipelineV2RunStatePath(root, boundaryId)).toBe(statePath);
+      expect(pipelineV2RunStatePath(root, "run-1.x_y")).toBe(
+        join(root, "pipeline-runs", "run-1.x_y", "state.json"),
+      );
+      const states = buildStates(RUN_ID);
+      const withBoundary = states.map((state) => ({ ...state, run_id: boundaryId }));
+      await store.create(withBoundary[0]!);
+      await store.commit(withBoundary[1]!, 1);
+      expect((await store.load())?.run_id).toBe(boundaryId);
+    });
+  });
+
+  test("load on a missing tree returns null and creates nothing", async () => {
+    await withStore("store-run", async ({ root, store }) => {
+      expect(await store.load()).toBeNull();
+      expect(await listDir(root)).toEqual([]);
+      // a second load behaves identically
+      expect(await store.load()).toBeNull();
+      expect(await listDir(root)).toEqual([]);
+    });
+  });
+
+  test("a symlinked pipeline-runs directory is rejected and the outside directory is untouched", async () => {
+    const states = buildStates(RUN_ID);
+    await withStore("store-run", async ({ root, store }) => {
+      const outside = join(root, "outside");
+      await mkdir(outside, { recursive: true });
+      const sentinel = join(outside, "sentinel.txt");
+      await writeFile(sentinel, "keep");
+      await symlink(outside, join(root, "pipeline-runs"));
+      await expect(store.load()).rejects.toThrow(/is a symlink; symlinked state directories are rejected/);
+      await expect(store.create(states[0]!)).rejects.toThrow(/is a symlink; symlinked state directories are rejected/);
+      await expect(store.commit(states[1]!, 1)).rejects.toThrow(/symlink/);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+      expect(await listDir(outside)).toEqual(["sentinel.txt"]);
+    });
+  });
+
+  test("a symlinked run directory is rejected and the outside state file is never read", async () => {
+    const states = buildStates(RUN_ID);
+    await withStore("store-run", async ({ root, store }) => {
+      await mkdir(join(root, "pipeline-runs"), { recursive: true });
+      const outside = join(root, "outside-run");
+      await mkdir(outside, { recursive: true });
+      const outsideState = join(outside, "state.json");
+      await writeFile(outsideState, "not state");
+      await symlink(outside, join(root, "pipeline-runs", "store-run"));
+      // a symlink error, never a parse error: the outside file was not read
+      await expect(store.load()).rejects.toThrow(/is a symlink; symlinked state directories are rejected/);
+      await expect(store.load()).rejects.not.toThrow(/not valid JSON/);
+      await expect(store.create(states[0]!)).rejects.toThrow(/symlink/);
+      await expect(store.commit(states[1]!, 1)).rejects.toThrow(/symlink/);
+      expect(await readFile(outsideState, "utf8")).toBe("not state");
+    });
+  });
+
+  test("regular files in place of store-owned directories are rejected", async () => {
+    const states = buildStates(RUN_ID);
+    await withStore("store-run", async ({ root, store }) => {
+      await writeFile(join(root, "pipeline-runs"), "not a directory");
+      await expect(store.load()).rejects.toThrow(/is not a directory/);
+      await expect(store.create(states[0]!)).rejects.toThrow(/is not a directory/);
+      await expect(store.commit(states[1]!, 1)).rejects.toThrow(/is not a directory/);
+      expect(await readFile(join(root, "pipeline-runs"), "utf8")).toBe("not a directory");
+      await rm(join(root, "pipeline-runs"));
+      await mkdir(join(root, "pipeline-runs"), { recursive: true });
+      await writeFile(join(root, "pipeline-runs", "store-run"), "not a directory");
+      await expect(store.load()).rejects.toThrow(/is not a directory/);
+      await expect(store.create(states[0]!)).rejects.toThrow(/is not a directory/);
+      expect(await readFile(join(root, "pipeline-runs", "store-run"), "utf8")).toBe("not a directory");
     });
   });
 

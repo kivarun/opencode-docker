@@ -1,4 +1,5 @@
 import {
+  expectSafeId,
   parsePipelineV2RunState,
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
@@ -28,9 +29,11 @@ import {
  *   revision and snapshot.
  *
  * Parser and validator errors (`PipelineV2StateError`) propagate unchanged;
- * they are never masked as I/O errors. The run id is validated as a safe
- * single path component before any filesystem I/O. Multi-process locking is
- * intentionally out of scope.
+ * they are never masked as I/O errors. The run id obeys the shared schema-v3
+ * safe-id contract (`[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, no `..`) and is
+ * validated before any filesystem I/O, both here and in
+ * `pipelineV2RunStatePath()`. Multi-process locking is intentionally out of
+ * scope.
  */
 
 export class PipelineV2RunStateStoreError extends Error {
@@ -54,25 +57,10 @@ export class PipelineV2RunStateDurabilityError extends PipelineV2RunStateStoreEr
 
 const V2_DOCUMENT_LABEL = "pipeline v2 run state";
 
-/** Rejects anything that is not a safe single path component. */
-export function assertSafeRunIdPathComponent(value: unknown, what: string): string {
-  if (
-    typeof value !== "string" ||
-    value === "" ||
-    value === "." ||
-    value === ".." ||
-    value.includes("/") ||
-    value.includes("\\") ||
-    value.includes("\0")
-  ) {
-    throw new PipelineV2RunStateStoreError(
-      `${what} must be a safe single path component, got ${JSON.stringify(value)}`,
-    );
-  }
-  return value;
-}
-
 export function pipelineV2RunStatePath(stateRoot: string, runId: string): string {
+  // The path helper validates the run id with the shared schema-v3 safe-id
+  // contract itself, never relying on the store constructor having run.
+  expectSafeId(runId, "pipeline v2 run id");
   return runSnapshotStatePath(stateRoot, runId);
 }
 
@@ -98,7 +86,7 @@ export class PipelineV2RunStateStore {
   private readonly inner: RunSnapshotStore<PipelineV2RunState>;
 
   constructor(params: { stateRoot: string; runId: string; io?: PipelineStateIo }) {
-    const runId = assertSafeRunIdPathComponent(params.runId, "pipeline v2 run id");
+    const runId = expectSafeId(params.runId, "pipeline v2 run id");
     this.inner = new RunSnapshotStore<PipelineV2RunState>(params.stateRoot, runId, {
       parseSnapshot: parsePipelineV2RunState,
       documentLabel: V2_DOCUMENT_LABEL,

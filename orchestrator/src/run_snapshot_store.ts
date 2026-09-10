@@ -242,32 +242,34 @@ export class RunSnapshotStore<S extends { revision: number }> {
 
   private async loadNow(): Promise<S | null> {
     const file = this.path;
-    const label = this.documentLabel;
-    let info;
-    try {
-      info = await this.io.lstat(file);
-    } catch (cause) {
-      throw new RunSnapshotStoreError(
-        `cannot inspect ${label} ${file}: ${describeError(cause)}`,
-      );
+    const dir = this.runDir;
+    // The state root is the trusted boundary; every store-owned component
+    // below it is verified separately, and nothing is created or modified
+    // during a load.
+    if (!(await this.requireRealDirectory(dirname(dir)))) {
+      return null; // no `pipeline-runs` directory yet
     }
+    if (!(await this.requireRealDirectory(dir))) {
+      return null; // no run directory yet
+    }
+    const info = await this.lstatInspected(file, "");
     if (info === null) {
       return null;
     }
     if (info.isSymbolicLink) {
       throw new RunSnapshotStoreError(
-        `${label} ${file} is a symlink; symlinked state targets are rejected`,
+        `${this.documentLabel} ${file} is a symlink; symlinked state targets are rejected`,
       );
     }
     if (!info.isFile) {
-      throw new RunSnapshotStoreError(`${label} ${file} is not a regular file`);
+      throw new RunSnapshotStoreError(`${this.documentLabel} ${file} is not a regular file`);
     }
     let raw: string;
     try {
       raw = await this.io.readText(file);
     } catch (cause) {
       throw new RunSnapshotStoreError(
-        `cannot read ${label} ${file}: ${describeError(cause)}`,
+        `cannot read ${this.documentLabel} ${file}: ${describeError(cause)}`,
       );
     }
     return this.parseSnapshot(raw);
@@ -312,31 +314,71 @@ export class RunSnapshotStore<S extends { revision: number }> {
     return await result;
   }
 
+  /**
+   * lstat with a wrapped diagnostic; null means the path does not exist.
+   * `noun` is "" for the state file and "directory" for store directories.
+   */
+  private async lstatInspected(
+    path: string,
+    noun: string,
+  ): Promise<{ isFile: boolean; isSymbolicLink: boolean } | null> {
+    try {
+      return await this.io.lstat(path);
+    } catch (cause) {
+      throw new RunSnapshotStoreError(
+        `cannot inspect ${this.documentLabel}${noun ? ` ${noun}` : ""} ${path}: ${describeError(cause)}`,
+      );
+    }
+  }
+
+  /**
+   * Load path: returns whether the directory exists. An existing entry must
+   * be a real non-symlink directory; symlinks and other object types are
+   * rejected with a typed store error. Never creates anything.
+   */
+  private async requireRealDirectory(dir: string): Promise<boolean> {
+    const info = await this.lstatInspected(dir, "directory");
+    if (info === null) {
+      return false;
+    }
+    await this.io.assertRealDirectory(dir);
+    return true;
+  }
+
+  /**
+   * Write path: creates `dir` with 0700 when missing, then verifies it is a
+   * real non-symlink directory (symlinks are never followed or created
+   * through).
+   */
+  private async ensureRealDirectory(dir: string): Promise<void> {
+    const info = await this.lstatInspected(dir, "directory");
+    if (info === null) {
+      await this.io.ensureDir(dir, 0o700);
+    }
+    await this.io.assertRealDirectory(dir);
+  }
+
   private async writeSnapshot(snapshot: S, options: WriteOptions): Promise<void> {
     const file = this.path;
     const dir = this.runDir;
     const label = this.documentLabel;
-    if (options.requireAbsent === true) {
-      let existing: { isFile: boolean; isSymbolicLink: boolean } | null;
-      try {
-        existing = await this.io.lstat(file);
-      } catch (cause) {
-        throw new RunSnapshotStoreError(
-          `cannot inspect ${label} ${file}: ${describeError(cause)}`,
-        );
-      }
-      if (existing !== null) {
-        throw new RunSnapshotStoreError(
-          `refusing to overwrite an existing ${label} at ${file}`,
-        );
-      }
-    }
-    const bytes = new TextEncoder().encode(`${JSON.stringify(snapshot, null, 2)}\n`);
-    const tempPath = `${this.runDir}/state.json.tmp-${crypto.randomUUID()}`;
     let renamed = false;
+    const tempPath = `${dir}/state.json.tmp-${crypto.randomUUID()}`;
     try {
-      await this.io.ensureDir(dir, 0o700);
-      await this.io.assertRealDirectory(dir);
+      // Build and verify the store-owned tree component by component below
+      // the trusted state root; the full run directory is never created
+      // recursively before `pipeline-runs` itself has been checked.
+      await this.ensureRealDirectory(dirname(dir)); // `<stateRoot>/pipeline-runs`
+      await this.ensureRealDirectory(dir); // `<stateRoot>/pipeline-runs/<run-id>`
+      if (options.requireAbsent === true) {
+        const existing = await this.lstatInspected(file, "");
+        if (existing !== null) {
+          throw new RunSnapshotStoreError(
+            `refusing to overwrite an existing ${label} at ${file}`,
+          );
+        }
+      }
+      const bytes = new TextEncoder().encode(`${JSON.stringify(snapshot, null, 2)}\n`);
       const handle = await this.io.openExclusive(tempPath, 0o600);
       try {
         await handle.chmod(0o600);
@@ -347,7 +389,7 @@ export class RunSnapshotStore<S extends { revision: number }> {
       }
       await this.io.rename(tempPath, file);
       renamed = true;
-      const dirHandle = await this.io.openDir(this.runDir);
+      const dirHandle = await this.io.openDir(dir);
       try {
         await dirHandle.sync();
       } finally {

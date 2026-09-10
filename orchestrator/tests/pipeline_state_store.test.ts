@@ -313,6 +313,36 @@ describe("pipeline run state store", () => {
     });
   });
 
+  test("store-owned directories are verified component-wise below the trusted state root", async () => {
+    const states = buildStates();
+    await withStore("store-run", async ({ root, store }) => {
+      // a missing tree: load returns null and creates nothing
+      expect(await store.load()).toBeNull();
+      expect((await readdir(root)).length).toBe(0);
+      // a symlinked `pipeline-runs` directory is rejected before anything is
+      // created inside the outside directory, with the unchanged v1 message
+      const outside = join(root, "outside");
+      await mkdir(outside, { recursive: true });
+      const sentinel = join(outside, "sentinel.txt");
+      await writeFile(sentinel, "keep");
+      await symlink(outside, join(root, "pipeline-runs"));
+      const symlinkError = await store.load().catch((cause: unknown) => cause);
+      expect(symlinkError).toBeInstanceOf(PipelineStateStoreError);
+      expect((symlinkError as Error).message).toBe(
+        `pipeline run state directory ${join(root, "pipeline-runs")} is a symlink; symlinked state directories are rejected`,
+      );
+      await expect(store.create(states[0]!)).rejects.toThrow(/symlink/);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+      expect(await readdir(outside)).toEqual(["sentinel.txt"]);
+      // a regular file in place of a store-owned directory is rejected
+      await rm(join(root, "pipeline-runs"));
+      await writeFile(join(root, "pipeline-runs"), "not a directory");
+      await expect(store.load()).rejects.toThrow(
+        `pipeline run state directory ${join(root, "pipeline-runs")} is not a directory`,
+      );
+    });
+  });
+
   test("the state path lives under the state root, never inside the workspace", async () => {
     await withStore("store-run", async ({ root, statePath, workspace }) => {
       expect(statePath).toBe(join(root, "pipeline-runs", "store-run", "state.json"));
