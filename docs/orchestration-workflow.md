@@ -1265,8 +1265,13 @@ never handed to the worker) and the Tool Session with workspace = the
 canonical project directory (its bearer is the worker's only authority).
 A mismatch between the created session's `launcher_id` and the expected
 launcher id makes the adapter delete the known session itself before
-throwing `wrong_authority`; a Tool Session additionally requires the
-uncleaned Execution Session of the same activation. Bearer tokens live
+throwing, with exactly one delete attempt: a confirmed delete reports
+`wrong_authority` with the confirmed cleanup; a failed delete is never
+swallowed — the adapter reports `cli_failure` naming the mismatch, the
+session id and the explicit "cleanup could not be confirmed" fact, so a
+mismatched session that could not be removed stays observable and is never
+claimed to be gone. A Tool Session additionally requires the uncleaned
+Execution Session of the same activation. Bearer tokens live
 only in an instance-private registry keyed by the exact handle object;
 handles carry the session id and lifecycle methods only.
 

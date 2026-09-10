@@ -225,6 +225,9 @@ interface FakeCliOptions {
   runTimedOut?: boolean;
   /** Launcher id reported per create call; a function is consumed in order. */
   createLauncherId?: string | ((sessionNumber: number) => string);
+  /** Exit code and diagnostics for session delete calls. */
+  deleteCode?: number;
+  deleteStderr?: string;
 }
 
 function makeFakeCli(
@@ -254,7 +257,11 @@ function makeFakeCli(
     }
     if (args[0] === "session" && args[1] === "delete") {
       const id = args[args.indexOf("--id") + 1] ?? "";
-      return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id }) };
+      return {
+        code: options.deleteCode ?? 0,
+        stderr: options.deleteStderr,
+        stdout: options.deleteCode === undefined ? JSON.stringify({ ok: true, deleted: true, id }) : "",
+      };
     }
     if (args[0] === "pull") {
       return { code: options.pullCode ?? 0 };
@@ -474,8 +481,9 @@ test("6. a launcher ownership mismatch deletes the known session and throws", as
       failure = cause;
     }
     expect(failure).toBeInstanceOf(DockerHelperError);
+    expect((failure as DockerHelperError).kind).toBe("wrong_authority");
     expect((failure as Error).message).toContain(
-      "session dhs_1 belongs to launcher dhl_other, expected dhl_launcher; the known session was deleted",
+      "session dhs_1 belongs to launcher dhl_other, expected dhl_launcher; the known session was deleted (cleanup confirmed)",
     );
     expect(fake.calls.length).toBe(2);
     expect(fake.calls[1]!.args).toEqual([
@@ -502,10 +510,11 @@ test("6. a launcher ownership mismatch deletes the known session and throws", as
     } catch (cause) {
       toolFailure = cause;
     }
+    expect((toolFailure as DockerHelperError).kind).toBe("wrong_authority");
     expect((toolFailure as Error).message).toContain(
       "session dhs_2 belongs to launcher dhl_other, expected dhl_launcher",
     );
-    expect((toolFailure as Error).message).toContain("the known session was deleted");
+    expect((toolFailure as Error).message).toContain("the known session was deleted (cleanup confirmed)");
     expect(fake2.calls.length).toBe(3);
     expect(fake2.calls[2]!.args).toEqual([
       "session",
@@ -517,6 +526,102 @@ test("6. a launcher ownership mismatch deletes the known session and throws", as
       "dhs_2",
     ]);
     await execution2.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("6a. an Execution session mismatch with a failing delete surfaces cli_failure and claims nothing about deletion", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli({
+      createLauncherId: "dhl_other",
+      deleteCode: 1,
+      deleteStderr: "error: API error (status 403, code forbidden): delete rejected",
+    });
+    const runtime = makeRuntime(setup_, fake.cli, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
+    let failure: unknown;
+    try {
+      await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(DockerHelperError);
+    expect((failure as DockerHelperError).kind).toBe("cli_failure");
+    const message = (failure as Error).message;
+    expect(message).toContain(
+      "session dhs_1 belongs to launcher dhl_other, expected dhl_launcher",
+    );
+    expect(message).toContain("cleanup could not be confirmed");
+    expect(message).toContain("delete rejected");
+    expect(message).not.toContain("was deleted");
+    expect(message).not.toContain("dhc_");
+    expect(message).not.toContain("dhc_1");
+    // exactly one physical delete attempt: create + delete, no retry
+    expect(fake.calls.length).toBe(2);
+    expect(fake.calls[1]!.args).toEqual([
+      "session",
+      "delete",
+      "--endpoint",
+      SOCKET,
+      "--json",
+      "--id",
+      "dhs_1",
+    ]);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("6b. a Tool session mismatch with a failing delete surfaces cli_failure and claims nothing about deletion", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli({
+      createLauncherId: (sessionNumber) =>
+        sessionNumber === 1 ? EXPECTED_LAUNCHER_ID : "dhl_other",
+      deleteCode: 2,
+      deleteStderr: "error: helper daemon unreachable",
+    });
+    const runtime = makeRuntime(setup_, fake.cli, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
+    const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    let toolFailure: unknown;
+    try {
+      await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      toolFailure = cause;
+    }
+    expect(toolFailure).toBeInstanceOf(DockerHelperError);
+    expect((toolFailure as DockerHelperError).kind).toBe("cli_failure");
+    const message = (toolFailure as Error).message;
+    expect(message).toContain(
+      "session dhs_2 belongs to launcher dhl_other, expected dhl_launcher",
+    );
+    expect(message).toContain("cleanup could not be confirmed");
+    expect(message).toContain("helper daemon unreachable");
+    expect(message).not.toContain("was deleted");
+    expect(message).not.toContain("dhc_");
+    expect(message).not.toContain("dhc_2");
+    // exactly one physical delete attempt for the Tool session: two creates
+    // (execution matched) + one delete, no retry
+    expect(fake.calls.length).toBe(3);
+    expect(fake.calls[2]!.args).toEqual([
+      "session",
+      "delete",
+      "--endpoint",
+      SOCKET,
+      "--json",
+      "--id",
+      "dhs_2",
+    ]);
+    // the fake fails every delete, so the deferred Execution cleanup also
+    // reports its failure instead of claiming success
+    let cleanupFailure: unknown;
+    try {
+      await execution.cleanup();
+    } catch (cause) {
+      cleanupFailure = cause;
+    }
+    expect(cleanupFailure).toBeInstanceOf(DockerHelperError);
   } finally {
     await dispose(setup_);
   }

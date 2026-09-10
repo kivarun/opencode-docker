@@ -53,10 +53,14 @@
  *
  * Every created Session is cleaned through memoized Launcher-authority
  * deletes: the physical delete runs at most once, repeated cleanup calls
- * return the same promise, and a known Session whose launcher provenance
- * does not match the expected launcher id is deleted by the adapter itself
- * before the error is thrown — the adapter never leaves a known Session
- * unowned.
+ * return the same promise. A known Session whose launcher provenance does
+ * not match the expected launcher id is deleted by the adapter itself
+ * before the error is thrown, with exactly one delete attempt: when that
+ * delete succeeds, the `wrong_authority` failure reports the confirmed
+ * cleanup; when the delete itself fails, the `cli_failure` failure names
+ * the mismatch, the session id and the explicit "cleanup could not be
+ * confirmed" fact — a mismatched session that could not be removed stays
+ * observable and is never claimed to be gone.
  *
  * UID/GID boundary: the adapter cannot prove a default image UID through
  * the CLI 2.1.1. The supported contract is the orchestrator image running
@@ -347,9 +351,13 @@ export function createDockerHelperPipelineV2Runtime(
   /**
    * Create one child Session through the official CLI, verify its launcher
    * provenance against the expected launcher id (a mismatched known
-   * Session is deleted by the adapter itself before the error is thrown),
-   * and build the instance-private record. The Tool session is linked to
-   * the exact Execution Session record of the same activation.
+   * Session is deleted by the adapter itself with exactly one delete
+   * attempt before the error is thrown: a confirmed delete reports
+   * `wrong_authority` with the confirmed cleanup, a failed delete reports
+   * `cli_failure` with "cleanup could not be confirmed" and never claims
+   * the session is gone), and build the instance-private record. The Tool
+   * session is linked to the exact Execution Session record of the same
+   * activation.
    */
   const createSessionRecord = async (
     kind: "execution" | "tool",
@@ -365,9 +373,16 @@ export function createDockerHelperPipelineV2Runtime(
     );
 
     // Launcher ownership: a known Session whose provenance does not match
-    // the expected launcher is deleted before the error is thrown; the
-    // adapter never leaves a known Session without an owner.
+    // the expected launcher is deleted by the adapter itself before the
+    // error is thrown — exactly one delete attempt. When the delete
+    // succeeds, the wrong_authority failure reports the confirmed cleanup.
+    // When the delete itself fails, the failure is never swallowed: the
+    // cli_failure error names the mismatch, the session id and the explicit
+    // "cleanup could not be confirmed" fact, so a mismatched session that
+    // could not be removed stays observable instead of being claimed gone.
     if (expectedLauncherId !== undefined && created.launcherId !== expectedLauncherId) {
+      let cleanupConfirmed = false;
+      let cleanupFailureMessage = "";
       try {
         await deleteChildSession(
           cli,
@@ -375,12 +390,19 @@ export function createDockerHelperPipelineV2Runtime(
           created.sessionId,
           { ...operatorEnv },
         );
-      } catch {
-        // The mismatch is reported even when the best-effort delete failed.
+        cleanupConfirmed = true;
+      } catch (cause) {
+        cleanupFailureMessage = cause instanceof Error ? cause.message : String(cause);
+      }
+      if (cleanupConfirmed) {
+        throw new DockerHelperError(
+          "wrong_authority",
+          `docker-helper session create: session ${created.sessionId} belongs to launcher ${created.launcherId ?? "unknown"}, expected ${expectedLauncherId}; the known session was deleted (cleanup confirmed)`,
+        );
       }
       throw new DockerHelperError(
-        "wrong_authority",
-        `docker-helper session create: session ${created.sessionId} belongs to launcher ${created.launcherId ?? "unknown"}, expected ${expectedLauncherId}; the known session was deleted`,
+        "cli_failure",
+        `docker-helper session create: session ${created.sessionId} belongs to launcher ${created.launcherId ?? "unknown"}, expected ${expectedLauncherId}; cleanup could not be confirmed: ${cleanupFailureMessage}`,
       );
     }
 
