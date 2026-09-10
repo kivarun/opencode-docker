@@ -33,11 +33,29 @@
  * correct session cleanup outcome, a decision execution records
  * `decision_failed`, a session cleanup failure takes priority and
  * finalizes the run as `run_cleanup_failed`, and everything unexpected is
- * `internal_error`. No recursive finalization: a failed failure-write
- * admits exactly one bounded `run_failed: state_persist_failed` attempt
- * when the reducer still accepts it; after a durability-unknown commit the
- * sink is poisoned, the visible snapshot is adopted, all state writes stop
- * and the run fails with `state_persist_failed`.
+ * `internal_error`.
+ *
+ * Every failure/final write is outcome-aware: one internal helper
+ * distinguishes a committed write, a not-committed write (the previous
+ * snapshot stays authoritative) and a durability-unknown write (the
+ * rename landed, the sink is poisoned) instead of swallowing commit
+ * outcomes. The unfinished-execution tracking clears only after a
+ * confirmed `agent_failed`/`decision_failed` commit, a knowingly
+ * incompatible run-level write is never attempted, and any unconfirmed
+ * failure or final-status write reports `state_persist_failed` on the
+ * last authoritative snapshot. No recursive finalization: a failed
+ * failure-write admits exactly one bounded `run_failed:
+ * state_persist_failed` attempt when the reducer still accepts it from
+ * the committed snapshot; after a durability-unknown commit the sink is
+ * poisoned, the visible snapshot is adopted, all state writes stop and
+ * the run fails with `state_persist_failed`.
+ *
+ * The result contract mirrors the durable state: `ok: true` is returned
+ * only after a confirmed `run_succeeded` commit, and a failed terminal —
+ * whose run outputs are still published — returns
+ * `{ok: false, reason: "terminal_failed", state}` with the durable failed
+ * state. Whenever the returned reason is not `state_persist_failed`, it
+ * equals the final `state.failure.reason`.
  *
  * Resume is not supported: the coordinator accepts only a fresh sink with
  * `snapshot === null` and no poisoning. This module is still not wired
@@ -75,6 +93,7 @@ import {
   PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
   PIPELINE_V2_TERMINAL_FAILURE_REASON,
   type PipelineDecisionStateRecord,
+  type PipelineV2ExecutionState,
   type PipelineV2FailureReason,
   type PipelineV2RunCommand,
   type PipelineV2RunOutputState,
@@ -201,36 +220,92 @@ function captureCreateSession(runtime: PipelineV2AgentRuntime): CapturedCreateSe
   ) as CapturedCreateSession;
 }
 
-/** Captured, bound worker entry points of one session. */
-interface CapturedSession {
-  readonly run: () => Promise<unknown>;
-  readonly cleanup: () => Promise<void>;
-}
-
-function captureSession(session: PipelineV2AgentSession): CapturedSession {
-  return {
-    run: captureContractFunction(session, "run", "pipeline v2 agent session") as () => Promise<unknown>,
-    cleanup: captureContractFunction(session, "cleanup", "pipeline v2 agent session") as () => Promise<void>,
-  };
-}
-
-function isWorkerCompleted(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { status?: unknown }).status === "completed"
-  );
-}
-
-function isWorkerFailure(
-  value: unknown,
-): value is { status: "failed"; reason: "worker_failed" | "worker_timeout" } {
-  if (typeof value !== "object" || value === null) {
-    return false;
+/**
+ * Captures one session contract member exactly once: the property is read
+ * one time (a throwing getter is a contract violation, never propagated),
+ * checked against the contract, and bound to its owner. Reassigning the
+ * property later cannot change the dispatch, and the user object is never
+ * frozen or modified. Diagnostics carry no values.
+ */
+function captureSessionFunction(
+  session: PipelineV2AgentSession,
+  name: "run" | "cleanup",
+): unknown {
+  let value: unknown;
+  try {
+    value = (session as unknown as Record<string, unknown>)[name];
+  } catch {
+    throw new Error(
+      `pipeline v2 agent session contract violated: ${name} must be a function`,
+    );
   }
-  const record = value as { status?: unknown; reason?: unknown };
-  return record.status === "failed" &&
-    (record.reason === "worker_failed" || record.reason === "worker_timeout");
+  if (typeof value !== "function") {
+    throw new Error(
+      `pipeline v2 agent session contract violated: ${name} must be a function`,
+    );
+  }
+  return (value as (...args: never[]) => unknown).bind(session);
+}
+
+/**
+ * Captures one session contract member exactly once, right after the
+ * Session is created. Reassigning the property later cannot change the
+ * dispatch; the violation diagnostics never echo values.
+ */
+function captureSessionId(session: PipelineV2AgentSession): string {
+  let sessionId: unknown;
+  try {
+    sessionId = session.sessionId;
+  } catch {
+    throw new Error(
+      "pipeline v2 agent session contract violated: sessionId must be a non-empty string",
+    );
+  }
+  if (typeof sessionId !== "string" || sessionId === "") {
+    throw new Error(
+      "pipeline v2 agent session contract violated: sessionId must be a non-empty string",
+    );
+  }
+  return sessionId;
+}
+
+/**
+ * The exact worker run result shapes. Anything else — arrays, missing or
+ * extra fields, wrong literals, throwing getters — is rejected without
+ * echoing the offending value or field names.
+ */
+type ParsedWorkerRunResult =
+  | { readonly status: "completed" }
+  | { readonly status: "failed"; readonly reason: "worker_failed" | "worker_timeout" };
+
+function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  let keys: string[];
+  let status: unknown;
+  try {
+    keys = Object.keys(value);
+    status = (value as Record<string, unknown>).status;
+  } catch {
+    return undefined;
+  }
+  if (status === "completed") {
+    return keys.length === 1 && keys[0] === "status" ? { status: "completed" } : undefined;
+  }
+  if (status !== "failed" || keys.length !== 2 || !keys.includes("reason")) {
+    return undefined;
+  }
+  let reason: unknown;
+  try {
+    reason = (value as Record<string, unknown>).reason;
+  } catch {
+    return undefined;
+  }
+  if (reason === "worker_failed" || reason === "worker_timeout") {
+    return { status: "failed", reason };
+  }
+  return undefined;
 }
 
 /**
@@ -335,9 +410,6 @@ function toDecisionRecord(result: PipelineDecisionStateResult): PipelineDecision
       if (result.actual_type !== undefined) {
         return { ...record, actual_type: result.actual_type };
       }
-      if (result.actual_type !== undefined) {
-        return { ...record, actual_type: result.actual_type };
-      }
       return record;
     }
   }
@@ -370,6 +442,67 @@ function deepFreeze<T>(value: T): T {
     return Object.freeze(record) as unknown as T;
   }
   return value;
+}
+
+/**
+ * The three explicit outcomes of one durable state write inside the
+ * failure finalizer. Nothing is ever swallowed: `committed` means the
+ * reducer accepted the command and the commit is confirmed,
+ * `not_committed` means the rename did not happen and the previous
+ * snapshot stays authoritative, and `durability_unknown` means the rename
+ * landed while its crash survival is unknown (the sink is poisoned).
+ */
+type DispatchOutcome =
+  | { readonly outcome: "committed" }
+  | { readonly outcome: "not_committed"; readonly durabilityUnknown: boolean };
+
+/** A run-level finalize command the reducer can still accept. */
+type RunFinalizeCommand =
+  | { readonly kind: "run_cleanup_failed" }
+  | { readonly kind: "run_failed"; readonly reason: PipelineV2FailureReason };
+
+/** An execution whose phase can never change again (mirrors the reducer). */
+function executionSettled(execution: PipelineV2ExecutionState): boolean {
+  if (execution.type === "agent") {
+    return execution.phase === "cleanup_completed" || execution.phase === "failed";
+  }
+  return execution.phase === "evaluated" || execution.phase === "failed";
+}
+
+/**
+ * Whether the reducer would still accept a `run_failed` with the given
+ * reason from the given committed snapshot, decided by typed context
+ * only — never by parsing messages. Mirrors the reducer's admissibility:
+ * every execution must be settled, a failed session cleanup finalizes
+ * only with `run_cleanup_failed`, and a failed terminal with published
+ * run outputs finalizes only with the terminal failure reason.
+ */
+function runFailedAdmissible(
+  state: PipelineV2RunState,
+  reason: PipelineV2FailureReason,
+): boolean {
+  for (const execution of state.executions) {
+    if (!executionSettled(execution)) {
+      return false;
+    }
+  }
+  const last = state.executions[state.executions.length - 1];
+  if (
+    last !== undefined &&
+    last.type === "agent" &&
+    last.phase === "failed" &&
+    last.session_cleanup === "failed"
+  ) {
+    return false;
+  }
+  const terminalFailedPublished =
+    state.terminal !== undefined &&
+    state.terminal.result === "failed" &&
+    state.run_outputs !== undefined;
+  if (terminalFailedPublished) {
+    return reason === PIPELINE_V2_TERMINAL_FAILURE_REASON;
+  }
+  return reason !== PIPELINE_V2_TERMINAL_FAILURE_REASON;
 }
 
 /** Bookkeeping of the current agent session (one agent execution only). */
@@ -490,29 +623,63 @@ export async function coordinatePipelineV2Run(
     return last.index;
   };
 
-  /** A state write inside the failure finalizer: contained, never recursive. */
-  const recordQuietly = async (write: () => Promise<void>): Promise<void> => {
+  /**
+   * One outcome-aware durable state write for the failure finalizer: it
+   * distinguishes a committed write, a not-committed write and a
+   * durability-unknown write instead of swallowing the commit outcome.
+   * When the state is already abandoned the command is never dispatched.
+   * A reducer rejection and a store failure are both `not_committed` —
+   * nothing was durably changed.
+   */
+  const dispatchOutcomeAware = async (
+    command: PipelineV2RunCommand,
+  ): Promise<DispatchOutcome> => {
     if (stateAbandoned) {
-      return;
+      return { outcome: "not_committed", durabilityUnknown: true };
     }
     try {
-      await write();
+      await sink.dispatch(command);
     } catch (cause) {
       if (cause instanceof PipelineV2RunStateDurabilityError) {
         stateAbandoned = true;
+        return { outcome: "not_committed", durabilityUnknown: true };
       }
-      // Any other failure of this record is given up on here; the
-      // run-level finalize below performs the one bounded retry.
+      return { outcome: "not_committed", durabilityUnknown: false };
     }
+    return { outcome: "committed" };
+  };
+
+  /** The agent_failed command for the still-unfinished agent execution. */
+  const agentFailureCommand = (reason: PipelineV2FailureReason): PipelineV2RunCommand => {
+    // Session not durably recorded -> "not_required"; created and cleanup
+    // confirmed -> "completed"; cleanup not confirmed -> "failed" with the
+    // session cleanup failure reason.
+    const sessionCleanup: PipelineV2SessionCleanup =
+      tracking.session === null || !tracking.session.createdDurably
+        ? "not_required"
+        : tracking.session.cleanupFailed ? "failed" : "completed";
+    let recordReason = tracking.session !== null && tracking.session.cleanupFailed
+      ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+      : executionReasonFor("agent", reason);
+    if (sessionCleanup === "not_required" && recordReason === PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON) {
+      recordReason = "internal_error";
+    }
+    return { kind: "agent_failed", reason: recordReason, sessionCleanup };
   };
 
   /**
-   * Records one failure exactly once: best-effort session cleanup (the
-   * only allowed side effect after a failed durable write), the
-   * execution-level failure record for a still-unfinished execution, and
-   * the run-level finalize with exactly one bounded
-   * `run_failed: state_persist_failed` retry. No recursive finalization;
-   * after a durability-unknown commit all further writes stop.
+   * Records one failure exactly once, outcome-aware: best-effort session
+   * cleanup (the only allowed side effect after a failed durable write),
+   * the execution-level failure record for a still-unfinished execution —
+   * whose commit must be confirmed before the execution counts as settled
+   * — and the run-level finalize. A not-committed failure write never
+   * clears the tracking, never triggers a knowingly incompatible run-level
+   * write, and reports `state_persist_failed` on the last authoritative
+   * snapshot. Exactly one bounded `run_failed: state_persist_failed`
+   * attempt follows a not-committed first finalize, only when the reducer
+   * still accepts it from the committed snapshot. No recursive
+   * finalization; after a durability-unknown commit all further writes
+   * stop.
    */
   const finalizeFailure = async (
     cause: unknown,
@@ -535,9 +702,6 @@ export async function coordinatePipelineV2Run(
       } catch {
         session.cleanupFailed = true;
       }
-      if (session.cleanupFailed) {
-        reason = PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON;
-      }
     }
     if (tracking.session !== null && tracking.session.cleanupFailed) {
       reason = PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON;
@@ -546,27 +710,17 @@ export async function coordinatePipelineV2Run(
 
     if (tracking.unfinished && tracking.kind !== null && !stateAbandoned) {
       const kind = tracking.kind;
-      if (kind === "agent") {
-        // Session not durably recorded -> "not_required"; created and
-        // cleanup confirmed -> "completed"; cleanup not confirmed ->
-        // "failed" with the session cleanup failure reason.
-        const sessionCleanup: PipelineV2SessionCleanup =
-          tracking.session === null || !tracking.session.createdDurably
-            ? "not_required"
-            : tracking.session.cleanupFailed ? "failed" : "completed";
-        let recordReason = tracking.session !== null && tracking.session.cleanupFailed
-          ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
-          : executionReasonFor("agent", reason);
-        if (sessionCleanup === "not_required" && recordReason === PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON) {
-          recordReason = "internal_error";
-        }
-        await recordQuietly(async () => {
-          await sink.dispatch({ kind: "agent_failed", reason: recordReason, sessionCleanup });
-        });
-      } else {
-        await recordQuietly(() =>
-          sink.dispatch({ kind: "decision_failed", reason: executionReasonFor("decision", reason) }),
-        );
+      const outcome = kind === "agent"
+        ? await dispatchOutcomeAware(agentFailureCommand(reason))
+        : await dispatchOutcomeAware({
+            kind: "decision_failed",
+            reason: executionReasonFor("decision", reason),
+          });
+      if (outcome.outcome !== "committed") {
+        // The execution stays unfinished in the authoritative snapshot;
+        // no knowingly incompatible run-level write is attempted.
+        failureReason = "state_persist_failed";
+        return;
       }
       tracking.unfinished = false;
     }
@@ -574,30 +728,41 @@ export async function coordinatePipelineV2Run(
     if (stateAbandoned) {
       return;
     }
-    try {
-      await sink.dispatch(
-        tracking.session !== null && tracking.session.cleanupFailed
-          ? { kind: "run_cleanup_failed" }
-          : { kind: "run_failed", reason },
-      );
-    } catch (runFinalizeCause) {
-      if (runFinalizeCause instanceof PipelineV2RunStateDurabilityError) {
-        stateAbandoned = true;
+
+    // The run-level finalize: never a knowingly incompatible command.
+    if (
+      tracking.session === null || !tracking.session.cleanupFailed
+    ) {
+      const state = sink.snapshot;
+      if (state !== null && !runFailedAdmissible(state, reason)) {
+        failureReason = "state_persist_failed";
         return;
-      }
-      // One bounded attempt at the normalized state failure, only when
-      // the reducer still accepts it from the committed snapshot; no
-      // recursive finalization beyond that.
-      if (stateAbandoned) {
-        return;
-      }
-      try {
-        await sink.dispatch({ kind: "run_failed", reason: "state_persist_failed" });
-      } catch {
-        // The single bounded attempt is exhausted; the last good snapshot
-        // stays authoritative.
       }
     }
+    const finalizeCommand: RunFinalizeCommand =
+      tracking.session !== null && tracking.session.cleanupFailed
+        ? { kind: "run_cleanup_failed" }
+        : { kind: "run_failed", reason };
+    const finalizeOutcome = await dispatchOutcomeAware(finalizeCommand);
+    if (finalizeOutcome.outcome === "committed") {
+      failureReason =
+        finalizeCommand.kind === "run_cleanup_failed"
+          ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+          : finalizeCommand.reason;
+      return;
+    }
+    if (finalizeOutcome.durabilityUnknown) {
+      // The caller reports state_persist_failed on the adopted candidate.
+      return;
+    }
+    // One bounded attempt at the normalized state failure, only when the
+    // reducer still accepts it from the committed snapshot; no recursive
+    // finalization beyond that.
+    const snapshot = sink.snapshot;
+    if (snapshot !== null && runFailedAdmissible(snapshot, "state_persist_failed")) {
+      await dispatchOutcomeAware({ kind: "run_failed", reason: "state_persist_failed" });
+    }
+    failureReason = "state_persist_failed";
   };
 
   /**
@@ -650,16 +815,27 @@ export async function coordinatePipelineV2Run(
       // 5. runtime.createSession (captured once at coordination start)
       const session = await capturedCreateSession(view, activation);
 
-      // The session contract functions and the session id are captured
-      // exactly once, right after the Session is created.
-      const captured = captureSession(session);
-      sessionTracking.cleanup = captured.cleanup;
-      const sessionId = session.sessionId;
-      if (typeof sessionId !== "string" || sessionId === "") {
+      // The session contract is captured exactly once, right after the
+      // Session is created, in a fixed order: the cleanup first — when a
+      // later member violates the contract, the already-captured cleanup
+      // is still runnable exactly once — then the session id, then the
+      // run entry point. Reassigning any member afterwards cannot change
+      // the dispatch.
+      let capturedCleanup: () => Promise<void>;
+      try {
+        capturedCleanup = captureSessionFunction(session, "cleanup") as () => Promise<void>;
+      } catch {
+        // A missing or non-callable cleanup is a trusted runtime contract
+        // violation: nothing runnable exists, so the coordinator must not
+        // claim a confirmed cleanup.
+        sessionTracking.cleanupDone = true;
         throw new Error(
-          "pipeline v2 agent session contract violated: sessionId must be a non-empty string",
+          "pipeline v2 agent session contract violated: cleanup must be a function",
         );
       }
+      sessionTracking.cleanup = capturedCleanup;
+      const sessionId = captureSessionId(session);
+      const capturedRun = captureSessionFunction(session, "run") as () => Promise<unknown>;
 
       // 6. agent_session_created — recorded immediately
       await dispatchState({ kind: "agent_session_created", sessionId });
@@ -669,18 +845,19 @@ export async function coordinatePipelineV2Run(
       await dispatchState({ kind: "agent_running" });
 
       // 8. session.run() — only the lifecycle result crosses the boundary
-      const outcome = await captured.run();
-      if (isWorkerFailure(outcome)) {
-        // The session cleanup still runs exactly once; the failure is
-        // recorded durably and the engine stops before any transition.
-        await runSessionCleanup().catch(() => undefined);
-        await finalizeFailure(undefined, outcome.reason);
-        throw new CoordinationAbortedError();
-      }
-      if (!isWorkerCompleted(outcome)) {
+      const outcome = await capturedRun();
+      const parsed = parseWorkerRunResult(outcome);
+      if (parsed === undefined) {
         throw new Error(
           "pipeline v2 agent session contract violated: run must return a completed or a typed failed result",
         );
+      }
+      if (parsed.status === "failed") {
+        // The session cleanup still runs exactly once; the failure is
+        // recorded durably and the engine stops before any transition.
+        await runSessionCleanup().catch(() => undefined);
+        await finalizeFailure(undefined, parsed.reason);
+        throw new CoordinationAbortedError();
       }
 
       // 9. accept the activation outputs (the worker held them read-write)
@@ -769,15 +946,22 @@ export async function coordinatePipelineV2Run(
       outputs: runOutputs.outputs.map(toRunOutputState),
     });
 
-    // 4./5. finalize the run status
+    // 4./5. finalize the run status. `ok: true` is reserved for a
+    // confirmed `run_succeeded` commit; a failed terminal still publishes
+    // its outputs and returns the durable failed state with the terminal
+    // failure reason — never a second finalize after the committed write.
     if (engineResult.terminalResult === "success") {
       await dispatchState({ kind: "run_succeeded" });
-    } else {
-      await dispatchState({ kind: "run_failed", reason: PIPELINE_V2_TERMINAL_FAILURE_REASON });
+      const state = requireSnapshot();
+      return deepFreeze({ ok: true as const, state });
     }
-
+    await dispatchState({ kind: "run_failed", reason: PIPELINE_V2_TERMINAL_FAILURE_REASON });
     const state = requireSnapshot();
-    return deepFreeze({ ok: true as const, state });
+    return deepFreeze({
+      ok: false as const,
+      reason: PIPELINE_V2_TERMINAL_FAILURE_REASON,
+      state,
+    });
   } catch (cause) {
     await finalizeFailure(cause);
     if (stateAbandoned) {

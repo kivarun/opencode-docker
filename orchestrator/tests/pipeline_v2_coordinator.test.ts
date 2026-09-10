@@ -5,6 +5,7 @@ import { expect, test } from "bun:test";
 import {
   coordinatePipelineV2Run,
   type PipelineV2AgentRuntime,
+  type PipelineV2AgentSession,
   type PipelineV2CoordinationResult,
   type PipelineV2CoordinatorStateSink,
   type PipelineV2WorkerRunResult,
@@ -25,6 +26,7 @@ import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import type {
   PipelineV2AgentExecutionState,
   PipelineV2DecisionExecutionState,
+  PipelineV2FailureReason,
   PipelineV2RunState,
 } from "../src/pipeline_v2_state.ts";
 import type { PipelineStateIo } from "../src/run_snapshot_store.ts";
@@ -505,13 +507,18 @@ test("3. entry success terminal publishes outputs with zero executions and sessi
   ]);
 });
 
-test("4. failed terminal publishes outputs and finalizes with terminal_failed", async () => {
+test("4. failed terminal publishes outputs, reports ok:false with the terminal failure, and finalizes durably", async () => {
   const harness = await setupHarness(PIPELINE_ENTRY_FAILED);
   const fake = fakeRuntime([]);
   const result = await coordinate(harness, fake.runtime);
-  const state = expectOk(result);
-
+  expect(result.ok).toBe(false);
+  if (result.ok || result.state === null) {
+    throw new Error("unexpected result shape");
+  }
+  expect(result.reason).toBe("terminal_failed");
+  const state = result.state;
   expect(state.status).toBe("failed");
+  expect(state.phase).toBe("finished");
   expect(state.failure).toEqual({ reason: "terminal_failed" });
   expect(state.terminal).toEqual({ state_id: "failed_end", result: "failed" });
   const published = state.run_outputs ?? [];
@@ -524,6 +531,8 @@ test("4. failed terminal publishes outputs and finalizes with terminal_failed", 
     "run_failed",
   ]);
   expect(harness.recording.commands[3]?.reason).toBe("terminal_failed");
+  // no second finalize after the committed run_failed{terminal_failed}
+  expect(kinds(harness.recording).filter((kind) => kind === "run_failed")).toHaveLength(1);
 });
 
 test("5. an agent with zero output ports accepts an empty output list", async () => {
@@ -693,7 +702,20 @@ test("10. decision results produce exact content-free records and route through 
     const harness = await setupHarness(PIPELINE_AGENT_DECISION, { facts: testCase.facts });
     const fake = fakeRuntime([{}]);
     const result = await coordinate(harness, fake.runtime);
-    const state = expectOk(result);
+    let state: PipelineV2RunState;
+    if (testCase.finalStatus === "success") {
+      state = expectOk(result);
+    } else {
+      // a failed terminal is a durable failed run, never ok:true
+      expect(result.ok).toBe(false);
+      if (result.ok || result.state === null) {
+        throw new Error("unexpected result shape");
+      }
+      expect(result.reason).toBe("terminal_failed");
+      expect(result.state.status).toBe("failed");
+      expect(result.state.failure).toEqual({ reason: "terminal_failed" });
+      state = result.state;
+    }
     const decisionExecution = decisionAt(state, 1);
     expect(decisionExecution.phase).toBe("evaluated");
     expect(decisionExecution.result as unknown).toEqual(testCase.expectedRecord);
@@ -1185,6 +1207,376 @@ test("22. the existing evaluateDecisionStateFromData stays the wrapper over prep
   expect(result.rule_id).toBe("rule-b");
 });
 
+test("23. the result reason and the durable failure reason stay consistent on every write outcome", async () => {
+  // (a) a normal worker failure: the result reason and the durable
+  // state.failure.reason are both worker_failed; no extra filesystem work.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+    const fake = fakeRuntime([{ run: "worker_failed" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "worker_failed");
+    expect(state.failure).toEqual({ reason: "worker_failed" });
+    expect(agentAt(state, 0).failure_reason).toBe("worker_failed");
+    expect(agentAt(state, 0).session_cleanup).toBe("completed");
+    expect(state.status).toBe("failed");
+    expect(harness.ioCounts).toEqual({ tempOpens: 7, renames: 7, dirSyncs: 7 });
+  }
+
+  // (b) the first run_failed{worker_failed} is not committed; the one
+  // bounded normalized retry commits: both reasons reflect
+  // state_persist_failed while the execution keeps its own reason.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+      faults: new Map([["run_failed", failOnce("injected store failure at the first run_failed")]]),
+    });
+    const fake = fakeRuntime([{ run: "worker_failed" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(state.failure).toEqual({ reason: "state_persist_failed" });
+    expect(agentAt(state, 0).failure_reason).toBe("worker_failed");
+    expect(agentAt(state, 0).session_cleanup).toBe("completed");
+    expect(kinds(harness.recording).filter((kind) => kind === "run_failed")).toHaveLength(2);
+    expect(harness.recording.commands.at(-1)?.reason).toBe("state_persist_failed");
+    // the faulted attempt consumed no reducer/filesystem work
+    expect(harness.ioCounts).toEqual({ tempOpens: 7, renames: 7, dirSyncs: 7 });
+  }
+
+  // (c) the normalized retry is not committed either: the result reports
+  // state_persist_failed and the last authoritative snapshot stays active
+  // with the execution recorded as failed.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+      faults: new Map([
+        ["run_failed", () => new PipelineV2RunStateStoreError("injected store failure at run_failed")],
+      ]),
+    });
+    const fake = fakeRuntime([{ run: "worker_failed" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(state.status).toBe("active");
+    expect(state.failure).toBeUndefined();
+    expect(agentAt(state, 0).phase).toBe("failed");
+    expect(agentAt(state, 0).failure_reason).toBe("worker_failed");
+    expect(agentAt(state, 0).session_cleanup).toBe("completed");
+    expect(kinds(harness.recording).filter((kind) => kind === "run_failed")).toHaveLength(2);
+    expect(kinds(harness.recording)).not.toContain("run_cleanup_failed");
+    // both rejected attempts stayed off the filesystem and the reducer
+    expect(harness.ioCounts).toEqual({ tempOpens: 6, renames: 6, dirSyncs: 6 });
+  }
+
+  // (d) agent_failed is not committed: the execution stays unfinished, no
+  // incompatible run_failed is attempted, the result is state_persist_failed.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+      faults: new Map([
+        ["agent_failed", () => new PipelineV2RunStateStoreError("injected store failure at agent_failed")],
+      ]),
+    });
+    const fake = fakeRuntime([{ run: "worker_failed" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(state.status).toBe("active");
+    expect(state.failure).toBeUndefined();
+    expect(agentAt(state, 0).phase).toBe("running");
+    expect(agentAt(state, 0).failure_reason).toBeUndefined();
+    expect(state.transitions).toEqual([]);
+    expect(kinds(harness.recording).at(-1)).toBe("agent_failed");
+    expect(kinds(harness.recording)).not.toContain("run_failed");
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    expect(harness.ioCounts).toEqual({ tempOpens: 5, renames: 5, dirSyncs: 5 });
+  }
+
+  // (e) the same for decision_failed: the decision execution stays
+  // unfinished and no run-level write follows.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+      faults: new Map([
+        [
+          "decision_evaluated",
+          () => new PipelineV2RunStateStoreError("injected store failure at decision_evaluated"),
+        ],
+        [
+          "decision_failed",
+          () => new PipelineV2RunStateStoreError("injected store failure at decision_failed"),
+        ],
+      ]),
+    });
+    const fake = fakeRuntime([{}]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(state.status).toBe("active");
+    expect(state.failure).toBeUndefined();
+    const decisionExecution = decisionAt(state, 1);
+    expect(decisionExecution.phase).toBe("evaluating");
+    expect(decisionExecution.failure_reason).toBeUndefined();
+    expect(state.transitions).toHaveLength(1);
+    expect(kinds(harness.recording).at(-1)).toBe("decision_failed");
+    expect(kinds(harness.recording)).not.toContain("run_failed");
+    expect(harness.ioCounts).toEqual({ tempOpens: 9, renames: 9, dirSyncs: 9 });
+  }
+
+  // (f) a not-committed run_cleanup_failed: no incompatible run_failed is
+  // attempted; the result is state_persist_failed on the active snapshot.
+  {
+    const harness = await setupHarness(PIPELINE_TWO_AGENTS, {
+      faults: new Map([
+        [
+          "run_cleanup_failed",
+          () => new PipelineV2RunStateStoreError("injected store failure at run_cleanup_failed"),
+        ],
+      ]),
+    });
+    const fake = fakeRuntime([{ run: "completed", cleanup: "throw" }, {}]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(state.status).toBe("active");
+    expect(state.failure).toBeUndefined();
+    const agentExecution = agentAt(state, 0);
+    expect(agentExecution.phase).toBe("failed");
+    expect(agentExecution.failure_reason).toBe("session_cleanup_failed");
+    expect(agentExecution.session_cleanup).toBe("failed");
+    expect(kinds(harness.recording).filter((kind) => kind === "run_cleanup_failed")).toHaveLength(1);
+    expect(kinds(harness.recording)).not.toContain("run_failed");
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    expect(fake.createCalls).toEqual([{ stateId: "first", activationIndex: 1 }]);
+    expect(harness.ioCounts).toEqual({ tempOpens: 7, renames: 7, dirSyncs: 7 });
+  }
+
+  // (g) a not-committed run_failed{terminal_failed}: the outputs stay
+  // published, the run stays active, and no normalized fallback is written.
+  {
+    const harness = await setupHarness(PIPELINE_ENTRY_FAILED, {
+      faults: new Map([
+        ["run_failed", () => new PipelineV2RunStateStoreError("injected store failure at run_failed")],
+      ]),
+    });
+    const fake = fakeRuntime([]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(state.status).toBe("active");
+    expect(state.phase).toBe("publishing_outputs");
+    expect(state.failure).toBeUndefined();
+    expect(state.terminal).toEqual({ state_id: "failed_end", result: "failed" });
+    expect(state.run_outputs ?? []).toHaveLength(1);
+    expect((state.run_outputs ?? [])[0]?.present).toBe(true);
+    expect(kinds(harness.recording)).toEqual([
+      "create_run",
+      "terminal_reached",
+      "run_outputs_published",
+      "run_failed",
+    ]);
+    expect(harness.recording.commands[3]?.reason).toBe("terminal_failed");
+    expect(harness.ioCounts).toEqual({ tempOpens: 3, renames: 3, dirSyncs: 3 });
+  }
+});
+
+test("24. durability unknown at every failure-write level stops all further dispatches", async () => {
+  // (a) during the agent_failed write: the adopted candidate is visible,
+  // the sink is poisoned, and no command follows the poisoned dispatch.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+      io: faultIo({ failCommit: 6, failStep: "dirfsync" }),
+    });
+    const fake = fakeRuntime([{ run: "worker_failed" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(harness.sink.poisoned).toBe(true);
+    expect(kinds(harness.recording)).toEqual([
+      "create_run",
+      "start_agent_execution",
+      "agent_data_prepared",
+      "agent_session_created",
+      "agent_running",
+      "agent_failed",
+    ]);
+    expect(state.revision).toBe(6);
+    expect(state.status).toBe("active");
+    expect(state.failure).toBeUndefined();
+    expect(agentAt(state, 0).phase).toBe("failed");
+    expect(agentAt(state, 0).failure_reason).toBe("worker_failed");
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    expect(harness.ioCounts).toEqual({ tempOpens: 6, renames: 6, dirSyncs: 5 });
+  }
+
+  // (b) during the decision_failed write: same containment, no further
+  // dispatch, decision execution settled only in the adopted candidate.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+      io: faultIo({ failCommit: 10, failStep: "dirfsync" }),
+      faults: new Map([
+        [
+          "decision_evaluated",
+          () => new PipelineV2RunStateStoreError("injected store failure at decision_evaluated"),
+        ],
+      ]),
+    });
+    const fake = fakeRuntime([{}]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(harness.sink.poisoned).toBe(true);
+    expect(kinds(harness.recording).at(-1)).toBe("decision_failed");
+    expect(kinds(harness.recording).filter((kind) => kind === "decision_failed")).toHaveLength(1);
+    expect(state.revision).toBe(10);
+    expect(state.status).toBe("active");
+    expect(state.failure).toBeUndefined();
+    expect(decisionAt(state, 1).phase).toBe("failed");
+    expect(state.transitions).toHaveLength(1);
+    expect(harness.ioCounts).toEqual({ tempOpens: 10, renames: 10, dirSyncs: 9 });
+  }
+
+  // (c) during the run_cleanup_failed write: the adopted candidate already
+  // carries the cleanup_failed status, and nothing follows.
+  {
+    const harness = await setupHarness(PIPELINE_TWO_AGENTS, {
+      io: faultIo({ failCommit: 8, failStep: "dirfsync" }),
+    });
+    const fake = fakeRuntime([{ run: "completed", cleanup: "throw" }, {}]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(harness.sink.poisoned).toBe(true);
+    expect(kinds(harness.recording).at(-1)).toBe("run_cleanup_failed");
+    expect(kinds(harness.recording)).not.toContain("run_failed");
+    expect(state.revision).toBe(8);
+    expect(state.status).toBe("cleanup_failed");
+    expect(state.failure).toEqual({ reason: "session_cleanup_failed" });
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    expect(harness.ioCounts).toEqual({ tempOpens: 8, renames: 8, dirSyncs: 7 });
+  }
+
+  // (d) during the terminal run_failed{terminal_failed} write: the outputs
+  // stay published in the adopted candidate and nothing follows.
+  {
+    const harness = await setupHarness(PIPELINE_ENTRY_FAILED, {
+      io: faultIo({ failCommit: 4, failStep: "dirfsync" }),
+    });
+    const fake = fakeRuntime([]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "state_persist_failed");
+    expect(harness.sink.poisoned).toBe(true);
+    expect(kinds(harness.recording)).toEqual([
+      "create_run",
+      "terminal_reached",
+      "run_outputs_published",
+      "run_failed",
+    ]);
+    expect(state.revision).toBe(4);
+    expect(state.status).toBe("failed");
+    expect(state.failure).toEqual({ reason: "terminal_failed" });
+    expect(state.run_outputs ?? []).toHaveLength(1);
+    expect(harness.ioCounts).toEqual({ tempOpens: 4, renames: 4, dirSyncs: 3 });
+  }
+});
+
+test("25. the worker run result is accepted only in its two exact shapes", async () => {
+  const cases: Array<{ run: NonNullable<FakeSessionSpec["run"]>; canaries: string[] }> = [
+    { run: "rogue_completed", canaries: ["rogue"] },
+    { run: "extra_failed", canaries: ["extra"] },
+    { run: "missing_reason", canaries: [] },
+    { run: "array", canaries: [] },
+    { run: "null", canaries: [] },
+    { run: "string", canaries: [] },
+    { run: "getter_throw", canaries: ["GETTER-EXPLODED"] },
+  ];
+  for (const testCase of cases) {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+    const fake = fakeRuntime([{ run: testCase.run }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "internal_error");
+    const agentExecution = agentAt(state, 0);
+    expect(agentExecution.phase).toBe("failed");
+    expect(agentExecution.failure_reason).toBe("internal_error");
+    expect(agentExecution.session_cleanup).toBe("completed");
+    expect(state.failure).toEqual({ reason: "internal_error" });
+    expect(state.transitions).toEqual([]);
+    expect(fake.sessions[0]?.runCount).toBe(1);
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    const resultJson = JSON.stringify(result);
+    const stateJson = JSON.stringify(state);
+    for (const canary of testCase.canaries) {
+      expect(resultJson.includes(canary)).toBe(false);
+      expect(stateJson.includes(canary)).toBe(false);
+    }
+  }
+});
+
+test("26. a damaged session handle still cleans up exactly once through the captured cleanup", async () => {
+  // (a) no run member, valid cleanup: internal_error, the captured cleanup
+  // runs exactly once, no durable session record.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+    const fake = fakeRuntime([{ damaged: "no_run" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "internal_error");
+    expect(agentAt(state, 0).session_cleanup).toBe("not_required");
+    expect(agentAt(state, 0).session_id).toBeUndefined();
+    expect(kinds(harness.recording)).not.toContain("agent_session_created");
+    expect(fake.sessions[0]?.runCount).toBe(0);
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+  }
+
+  // (b) an empty session id with a valid cleanup: cleanup exactly once.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+    const fake = fakeRuntime([{ damaged: "empty_session_id" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "internal_error");
+    expect(kinds(harness.recording)).not.toContain("agent_session_created");
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    expect(agentAt(state, 0).session_cleanup).toBe("not_required");
+  }
+
+  // (c) a non-string session id behaves the same.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+    const fake = fakeRuntime([{ damaged: "nonstring_session_id" }]);
+    const result = await coordinate(harness, fake.runtime);
+    expectFailedState(result, "internal_error");
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    expect(kinds(harness.recording)).not.toContain("agent_session_created");
+  }
+
+  // (d) no cleanup member at all is a trusted runtime contract violation:
+  // nothing runnable exists, so no cleanup is claimed or confirmed.
+  {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+    const fake = fakeRuntime([{ damaged: "no_cleanup" }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "internal_error");
+    expect(agentAt(state, 0).session_cleanup).toBe("not_required");
+    expect(agentAt(state, 0).session_id).toBeUndefined();
+    expect(kinds(harness.recording)).not.toContain("agent_session_created");
+    expect(fake.sessions[0]?.runCount).toBe(0);
+    expect(fake.sessions[0]?.cleanupCount).toBe(0);
+  }
+
+  // (e) reassigning the session methods after the capture cannot change
+  // the calls: the captured cleanup runs exactly once, the rogue never.
+  {
+    const harness = await setupHarness(PIPELINE_TWO_AGENTS);
+    const fake = fakeRuntime([
+      { run: "worker_failed", sabotageDuringRun: true },
+      {},
+    ]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectFailedState(result, "worker_failed");
+    expect(fake.sessions[0]?.cleanupCount).toBe(1);
+    expect(fake.sessions[0]?.rogueCount).toBe(0);
+    expect(agentAt(state, 0).session_cleanup).toBe("completed");
+  }
+
+  // (f) the same sabotage on the success path: the captured cleanup is
+  // still the one invoked, exactly once.
+  {
+    const harness = await setupHarness(PIPELINE_TWO_AGENTS);
+    const fake = fakeRuntime([{ sabotageDuringRun: true }, {}]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectOk(result);
+    expect(state.status).toBe("success");
+    expect(fake.sessions.map((session) => session.cleanupCount)).toEqual([1, 1]);
+    expect(fake.sessions[0]?.rogueCount).toBe(0);
+  }
+});
+
 // --- helpers used above ----------------------------------------------------
 
 interface BundleDirs {
@@ -1243,11 +1635,31 @@ function bindingsFor(dirs: BundleDirs, pipeline: ResolvedPipelineV2): Array<{ id
 
 interface FakeSessionSpec {
   sessionId?: string;
-  run?: "completed" | "worker_failed" | "worker_timeout" | "throw" | "invalid";
+  /**
+   * createSession hands the coordinator a damaged facade: `no_cleanup`
+   * has no cleanup member, `no_run` has no run member, and the
+   * `*_session_id` variants carry an invalid session id.
+   */
+  damaged?: "no_cleanup" | "no_run" | "empty_session_id" | "nonstring_session_id";
+  run?:
+    | "completed"
+    | "worker_failed"
+    | "worker_timeout"
+    | "throw"
+    | "invalid"
+    | "rogue_completed"
+    | "extra_failed"
+    | "missing_reason"
+    | "array"
+    | "null"
+    | "string"
+    | "getter_throw";
   runError?: unknown;
   cleanup?: "throw";
   onRun?: (session: FakeAgentSession) => void | Promise<void>;
   onCleanup?: (session: FakeAgentSession) => void | Promise<void>;
+  /** Replaces the session's own run/cleanup members while run executes. */
+  sabotageDuringRun?: boolean;
   /** The createSession call waits for this promise before resolving. */
   gate?: Promise<void>;
 }
@@ -1255,6 +1667,7 @@ interface FakeSessionSpec {
 class FakeAgentSession {
   runCount = 0;
   cleanupCount = 0;
+  rogueCount = 0;
   readonly sessionId: string;
 
   constructor(
@@ -1268,6 +1681,17 @@ class FakeAgentSession {
 
   async run(): Promise<PipelineV2WorkerRunResult> {
     this.runCount += 1;
+    if (this.spec.sabotageDuringRun) {
+      // Reassign both members while the coordinator holds its captured
+      // bindings; the captures must stay in charge.
+      const rogue = async () => {
+        this.rogueCount += 1;
+        throw new Error("ROGUE-MEMBER");
+      };
+      const mutable = this as unknown as { run: unknown; cleanup: unknown };
+      mutable.run = rogue;
+      mutable.cleanup = rogue;
+    }
     await this.spec.onRun?.(this);
     // A real worker writes exactly its declared outputs; the fake does the
     // same for every declared port before reporting completion.
@@ -1289,6 +1713,28 @@ class FakeAgentSession {
         throw this.spec.runError ?? new Error("WORKER-EXPLODED");
       case "invalid":
         return { status: "failed", reason: "exploded" } as unknown as PipelineV2WorkerRunResult;
+      case "rogue_completed":
+        return { status: "completed", outcome: "rogue" } as unknown as PipelineV2WorkerRunResult;
+      case "extra_failed":
+        return {
+          status: "failed",
+          reason: "worker_failed",
+          extra: 1,
+        } as unknown as PipelineV2WorkerRunResult;
+      case "missing_reason":
+        return { status: "failed" } as unknown as PipelineV2WorkerRunResult;
+      case "array":
+        return [] as unknown as PipelineV2WorkerRunResult;
+      case "null":
+        return null as unknown as PipelineV2WorkerRunResult;
+      case "string":
+        return "completed" as unknown as PipelineV2WorkerRunResult;
+      case "getter_throw":
+        return {
+          get status(): string {
+            throw new Error("GETTER-EXPLODED");
+          },
+        } as unknown as PipelineV2WorkerRunResult;
       default:
         return { status: "completed" };
     }
@@ -1322,7 +1768,25 @@ function fakeRuntime(specs: readonly FakeSessionSpec[]): FakeRuntimeHandle {
       }
       const session = new FakeAgentSession(spec, state.id, activation, `session-${index + 1}`);
       sessions.push(session);
-      return session;
+      if (spec.damaged === undefined) {
+        return session;
+      }
+      // A damaged facade: the named member is missing or damaged; every
+      // other member delegates to the real session (whose counters stay
+      // observable).
+      const facade: Record<string, unknown> = { sessionId: session.sessionId };
+      if (spec.damaged !== "no_cleanup") {
+        facade.cleanup = () => session.cleanup();
+      }
+      if (spec.damaged !== "no_run") {
+        facade.run = () => session.run();
+      }
+      if (spec.damaged === "empty_session_id") {
+        facade.sessionId = "";
+      } else if (spec.damaged === "nonstring_session_id") {
+        facade.sessionId = 42;
+      }
+      return facade as unknown as PipelineV2AgentSession;
     },
   };
   return { runtime: runtime as unknown as PipelineV2AgentRuntime, sessions, createCalls };
@@ -1335,7 +1799,7 @@ class RecordingSink implements PipelineV2CoordinatorStateSink {
 
   constructor(
     private readonly inner: PipelineV2RunStateSink,
-    private readonly faults?: ReadonlyMap<string, () => Error>,
+    private readonly faults?: ReadonlyMap<string, () => Error | undefined>,
   ) {}
 
   get snapshot(): PipelineV2RunState | null {
@@ -1350,7 +1814,10 @@ class RecordingSink implements PipelineV2CoordinatorStateSink {
     this.commands.push({ ...command });
     const fault = this.faults?.get(command.kind);
     if (fault !== undefined) {
-      throw fault();
+      const failure = fault();
+      if (failure !== undefined) {
+        throw failure;
+      }
     }
     await this.inner.dispatch(command);
   }
@@ -1370,7 +1837,7 @@ async function setupHarness(
     facts?: string;
     source?: string;
     io?: PipelineStateIo;
-    faults?: ReadonlyMap<string, () => Error>;
+    faults?: ReadonlyMap<string, () => Error | undefined>;
   } = {},
 ): Promise<Harness> {
   const dirs = await makeDirs();
@@ -1417,12 +1884,33 @@ function expectOk(result: PipelineV2CoordinationResult): PipelineV2RunState {
   return result.state;
 }
 
-function expectFailedState(result: PipelineV2CoordinationResult): PipelineV2RunState {
+function expectFailedState(
+  result: PipelineV2CoordinationResult,
+  reason: PipelineV2FailureReason,
+): PipelineV2RunState {
   expect(result.ok).toBe(false);
   if (result.ok || result.state === null) {
     throw new Error("unexpected coordination result shape");
   }
+  expect(result.reason).toBe(reason);
+  // whenever the reason is not state_persist_failed it must equal the
+  // final durable failure reason
+  if (reason !== "state_persist_failed") {
+    expect(result.state.failure).toEqual({ reason });
+  }
   return result.state;
+}
+
+/** A recording fault that throws only on its first invocation. */
+function failOnce(message: string): () => Error | undefined {
+  let seen = 0;
+  return () => {
+    seen += 1;
+    if (seen === 1) {
+      return new PipelineV2RunStateStoreError(message);
+    }
+    return undefined;
+  };
 }
 
 function agentAt(state: PipelineV2RunState, index: number): PipelineV2AgentExecutionState {
