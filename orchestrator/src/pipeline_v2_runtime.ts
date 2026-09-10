@@ -372,6 +372,30 @@ interface RunOutputsSnapshotProvenance {
 
 const runOutputsSnapshotProvenance = new WeakMap<object, RunOutputsSnapshotProvenance>();
 
+/**
+ * Digest domain of one prepared decision-state input: the exact bytes read
+ * from the fixed orchestrator-owned location, length-framed. Host paths,
+ * parsed values and fact contents never participate.
+ */
+const DECISION_INPUT_DIGEST_DOMAIN = "pipeline-v2-decision-input\0";
+
+/**
+ * Module-private provenance of one prepared decision state: the trusted
+ * pipeline object it was prepared for, the exact bytes read (read exactly
+ * once), and the read location/schema context for the content-free
+ * diagnostics of the evaluation phase. The bytes never leave this module.
+ */
+interface PreparedDecisionDataProvenance {
+  readonly pipeline: ResolvedPipelineV2;
+  readonly stateId: string;
+  readonly bytes: Buffer;
+  readonly sourcePath: string;
+  readonly sourceWhat: string;
+  readonly schema: Exclude<ResolvedV2DecisionState["inputs"][number]["schema"], undefined>;
+}
+
+const preparedDecisionProvenance = new WeakMap<object, PreparedDecisionDataProvenance>();
+
 export interface RunInputBinding {
   readonly id: string;
   readonly path: string;
@@ -2429,49 +2453,27 @@ export async function collectRunOutputs(
 }
 
 /**
- * Pure host-side data adapter for one declared v2 `decision` state: resolve
- * the state's single `json` input through the existing v2 data plane, parse
- * and validate it, and evaluate the compiled decision model — without
- * creating anything. No decision activation leaf, no `data/inputs` or
- * `data/outputs`, no Session, no container, no helper call, no env and no
- * credentials; nothing on the filesystem is created, modified or removed,
- * so a repeated call with the same inputs returns a structurally identical
- * (deep-frozen) result.
- *
- * Execution order is strict: pipeline provenance, then run-input snapshot
- * provenance for the same pipeline object (both before any field is read),
- * then the `nextActivationIndex` bound, then the safe state id and the
- * `type: "decision"` check, then the canonical run/project root checks, the
- * full `verifyRunInputsSnapshot` of every run input (not only the
- * decision's own input), and the complete accepted-history chain
- * (`resolveAcceptedHistory` — the same single chain `prepareActivationData`
- * and `collectRunOutputs` use) with every record's index required to stay
- * strictly below `nextActivationIndex`. The winner is selected only after
- * the whole history checks out. `nextActivationIndex` is the next unused
- * global activation index of the run; the decision state itself consumes no
- * index and creates no record. Finally the single input port resolves by
- * its declared source — a pipeline input only from the verified snapshot
- * (the original user binding path is never read) or a state output only
- * from the fully verified winner map — and the JSON bytes are read from the
- * fixed orchestrator-owned path through `O_NOFOLLOW`.
- *
- * JSON handling: the parser diagnostic stays content-free (`<what> <path>
- * is not valid JSON` — no parser message, offending token, position or
- * input fragment), and the parsed value is validated against the
- * loader-compiled Draft 2020-12 schema snapshot carried by the input port
- * (value-free diagnostics; the same compiled schema, no second compiler).
- * Malformed JSON and schema failures are `PipelineError`s before the
- * evaluator and never become `invalid_facts`; only a structurally valid,
- * schema-conforming JSON value that does not satisfy the decision model's
- * fact-assignment contract maps to the existing typed `invalid_facts` via
- * `evaluatePipelineDecisionState`. Raw JSON bytes, parsed facts and fact
- * values never appear in results, errors or diagnostics.
- *
- * The function never selects a transition target and never moves a graph
- * cursor: it returns exactly the existing `PipelineDecisionStateResult`,
- * whose outcome is routed to the next state only by the pipeline's
- * transition table. This is substrate only — the production runner does not
- * execute v2 pipelines or decision states yet.
+ * Compatibility wrapper over the two-phase decision-data adapter:
+ * `prepareDecisionStateData` + `evaluatePreparedDecisionState`. It resolves
+ * one declared v2 `decision` state's single `json` input through the
+ * existing data plane, reads its bytes exactly once, then parses,
+ * validates and evaluates them — without creating anything and without a
+ * second resolver, reader, parser or evaluator. `nextActivationIndex` is
+ * the next unused global execution index of the run and the strict upper
+ * bound for the accepted history; the decision state itself consumes no
+ * index and creates no record. No decision activation leaf, no
+ * `data/inputs` or `data/outputs`, no Session, no container, no helper
+ * call, no env and no credentials; nothing on the filesystem is created,
+ * modified or removed. Malformed JSON and schema failures stay
+ * `decision_input_invalid` and never become `invalid_facts`; only a
+ * structurally valid, schema-conforming JSON value that does not satisfy
+ * the decision model's fact-assignment contract maps to the existing typed
+ * `invalid_facts` via `evaluatePipelineDecisionState`. The function never
+ * selects a transition target and never moves a graph cursor: it returns
+ * exactly the existing `PipelineDecisionStateResult`, whose outcome is
+ * routed to the next state only by the pipeline's transition table. Raw
+ * JSON bytes, parsed facts and fact values never appear in results, errors
+ * or diagnostics.
  */
 export async function evaluateDecisionStateFromData(
   pipeline: ResolvedPipelineV2,
@@ -2480,8 +2482,54 @@ export async function evaluateDecisionStateFromData(
   stateId: string,
   nextActivationIndex: number,
 ): Promise<PipelineDecisionStateResult> {
+  const prepared = await prepareDecisionStateData(
+    pipeline,
+    runInputs,
+    acceptedOutputs,
+    stateId,
+    nextActivationIndex,
+  );
+  return evaluatePreparedDecisionState(pipeline, prepared);
+}
+
+/**
+ * Phase one of the two-phase decision-data adapter: resolve one declared v2
+ * `decision` state's single `json` input through the existing data plane
+ * and read its exact bytes once from the fixed orchestrator-owned
+ * location. Nothing is created, modified or removed; no decision
+ * activation leaf, no Session, no container, no helper call.
+ *
+ * Execution order is strict: pipeline provenance, then run-input snapshot
+ * provenance for the same pipeline object (both before any field is read),
+ * then the `executionIndex` check (the next unused global execution index
+ * of the run; every accepted-history record's index must stay strictly
+ * below it), then the safe state id and the `type: "decision"` check, then
+ * the canonical run/project root checks, the full
+ * `verifyRunInputsSnapshot` of every run input, and the complete
+ * accepted-history chain with digest verification of every record. Then
+ * the single input port resolves by its declared source and the JSON
+ * bytes are read exactly once from the fixed orchestrator-owned path
+ * through `O_NOFOLLOW`. The digest is computed over those exact bytes with
+ * the separate `pipeline-v2-decision-input\0` domain and the same
+ * unambiguous 8-byte big-endian length framing as the other data-plane
+ * digests; parsed JSON, schema and facts are the next phase's business.
+ *
+ * The returned deep-frozen `PreparedDecisionStateData` is registered in a
+ * module-private provenance registry together with the trusted pipeline,
+ * the exact bytes, the read location and the compiled port schema. It is
+ * content-free: no path, no bytes, no parsed JSON, no schema value and no
+ * facts. Only the exact registered object can be passed to
+ * `evaluatePreparedDecisionState` for the same pipeline.
+ */
+export async function prepareDecisionStateData(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+  stateId: string,
+  executionIndex: number,
+): Promise<PreparedDecisionStateData> {
   // 1. Pipeline provenance: only the exact loadPipelineV2 snapshot.
-  requireResolvedPipelineV2Provenance(pipeline, "evaluateDecisionStateFromData");
+  requireResolvedPipelineV2Provenance(pipeline, "prepareDecisionStateData");
   // 2. Snapshot provenance for the same pipeline object, before any of its
   //    fields are read.
   const provenance = runInputSnapshotProvenance.get(runInputs);
@@ -2491,8 +2539,10 @@ export async function evaluateDecisionStateFromData(
   const runRootCanonical = provenance.runRootCanonical;
   const projectRoot = provenance.projectRootCanonical;
 
-  // 3. The next activation index is a plain runner-owned input.
-  expectPositiveSafeInteger(nextActivationIndex, "next activation index");
+  // 3. The execution index is a plain runner-owned input: the next unused
+  // global execution index of the run and the strict upper bound for the
+  // accepted history.
+  expectPositiveSafeInteger(executionIndex, "decision execution index");
 
   // 4. The safe state id must name a declared decision state.
   const safeStateId = validateSafeId(stateId, "decision state id");
@@ -2522,14 +2572,14 @@ export async function evaluateDecisionStateFromData(
   // 7./8./9. The complete accepted history is validated (parse, coherence,
   // fixed-location resolution, digest verification of every record
   // including old non-winning ones) with every activation index strictly
-  // below `nextActivationIndex`; only then is the winner per
+  // below `executionIndex`; only then is the winner per
   // state/output pair selected by highest index, independent of record
   // order.
   const acceptedByRef = await resolveAcceptedHistory(
     pipeline,
     acceptedOutputs,
     runRootCanonical,
-    nextActivationIndex,
+    executionIndex,
   );
 
   // 10. The single declared input port resolves by its declared source.
@@ -2593,46 +2643,111 @@ export async function evaluateDecisionStateFromData(
   }
   const portSchema = port.schema;
 
-  // Region — decision input consumption: reading the value at its fixed
-  // orchestrator-owned location, parsing it and validating it against the
-  // port's compiled schema are the expected data failures. Malformed JSON
-  // or a port-schema violation means the JSON bytes break their declared
-  // contract. Run-input tampering above reports `run_input_modified`,
-  // accepted-output tampering `accepted_output_modified`, and the
-  // evaluator below runs outside this region so an unexpected evaluator
-  // failure is never reclassified.
-  const { parsedJson } = await withRuntimeReason(
-    "decision_input_invalid",
-    async () => {
-      // 11. The value lives at its fixed orchestrator-owned path, verified
-      // by the snapshot/history validation above; reading goes through
-      // O_NOFOLLOW so a swapped symlink never resolves.
-      const content = await readRegularFileBytes(sourcePath, sourceWhat);
-
-      // 12. Content-free parse diagnostic: no parser message, offending
-      // token, position or input fragment.
-      let parsedJson: unknown;
-      try {
-        parsedJson = JSON.parse(content.toString("utf8"));
-      } catch {
-        throw runtimeFailure(
-          "decision_input_invalid",
-          `${sourceWhat} ${sourcePath} is not valid JSON`,
-        );
-      }
-
-      // 13. The loader-compiled schema snapshot of this input port is the
-      // only contract; no second schema compiler exists.
-      validatePipelineJson(portSchema, parsedJson, sourceWhat);
-      return { parsedJson };
-    },
+  // Region — decision input read: reading the value at its fixed
+  // orchestrator-owned location is the expected data failure. Parsing and
+  // schema validation below belong to the evaluation phase; run-input
+  // tampering above reports `run_input_modified`, accepted-output
+  // tampering `accepted_output_modified`.
+  const bytes = await withRuntimeReason("decision_input_invalid", async () =>
+    // 11. The value lives at its fixed orchestrator-owned path, verified
+    // by the snapshot/history validation above; reading goes through
+    // O_NOFOLLOW so a swapped symlink never resolves. The bytes are read
+    // exactly once.
+    readRegularFileBytes(sourcePath, sourceWhat),
   );
 
-  // 14. The existing pure evaluator maps the parsed fact assignment; any
+  // The digest is computed over the exact bytes just read, with the
+  // separate `pipeline-v2-decision-input` domain and the unambiguous
+  // 8-byte big-endian length framing.
+  const hasher = new Bun.CryptoHasher("sha256");
+  hashTag(hasher, DECISION_INPUT_DIGEST_DOMAIN);
+  hashBytes(hasher, bytes);
+  const inputDigest = hasher.digest("hex");
+
+  const prepared: PreparedDecisionStateData = deepFreeze({
+    state_id: safeStateId,
+    execution_index: executionIndex,
+    input_digest: inputDigest,
+  });
+  // Provenance is registered only after the full preparation succeeded.
+  preparedDecisionProvenance.set(prepared, {
+    pipeline,
+    stateId: safeStateId,
+    bytes,
+    sourcePath,
+    sourceWhat,
+    schema: portSchema,
+  });
+  return prepared;
+}
+
+/**
+ * Content-free result of one prepared decision state: the state id, the
+ * global execution index the coordinator assigned to this decision
+ * execution, and the digest of the exact input bytes read at the fixed
+ * orchestrator-owned location. No path, no bytes, no parsed JSON, no
+ * schema value and no facts are exposed; only the module-private
+ * provenance registry connects this object to them.
+ */
+export interface PreparedDecisionStateData {
+  readonly state_id: string;
+  readonly execution_index: number;
+  readonly input_digest: string;
+}
+
+/**
+ * Phase two of the two-phase decision-data adapter: evaluate an already
+ * prepared decision state. The public `prepared` object is
+ * provenance-gated against the module-private registry — only the exact
+ * `PreparedDecisionStateData` object a successful `prepareDecisionStateData`
+ * returned for the same trusted pipeline is accepted (hand-built objects,
+ * clones and objects prepared for another pipeline are rejected before any
+ * field is read). The evaluation never re-reads the file: it JSON-parses
+ * the bytes saved during preparation, validates the value against the
+ * loader-compiled schema snapshot, and calls the existing pure evaluator.
+ * Malformed JSON and schema failures stay `decision_input_invalid`;
+ * `invalid_facts` stays a normal decision result. The evaluator runs
+ * outside the typed region so an unexpected evaluator failure propagates
+ * unchanged, and raw bytes, parsed facts and fact values never appear in
+ * results, errors or diagnostics.
+ */
+export function evaluatePreparedDecisionState(
+  pipeline: ResolvedPipelineV2,
+  prepared: PreparedDecisionStateData,
+): PipelineDecisionStateResult {
+  requireResolvedPipelineV2Provenance(pipeline, "evaluatePreparedDecisionState");
+  const entry = preparedDecisionProvenance.get(prepared);
+  if (entry === undefined || entry.pipeline !== pipeline) {
+    throw new PipelineError(
+      "evaluatePreparedDecisionState requires the exact PreparedDecisionStateData object returned by prepareDecisionStateData for the same pipeline",
+    );
+  }
+  const stateId = entry.stateId;
+  const sourcePath = entry.sourcePath;
+  const sourceWhat = entry.sourceWhat;
+
+  // Region — decision input consumption: parsing the saved bytes and
+  // validating the value against the loader-compiled schema snapshot are
+  // the expected data failures; the file is never re-read.
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(entry.bytes.toString("utf8"));
+  } catch {
+    throw runtimeFailure(
+      "decision_input_invalid",
+      `${sourceWhat} ${sourcePath} is not valid JSON`,
+    );
+  }
+
+  // The loader-compiled schema snapshot saved at preparation time is the
+  // only contract; no second schema compiler exists.
+  validatePipelineJson(entry.schema, parsedJson, sourceWhat);
+
+  // The existing pure evaluator maps the parsed fact assignment; any
   // earlier failure above never becomes `invalid_facts`. The evaluator is
   // deliberately outside the typed region: an unexpected evaluator failure
   // propagates unchanged instead of becoming a runtime failure.
   // `invalid_facts` is a normal result, never an exception. Raw bytes,
   // parsed facts and fact values are not returned or recorded.
-  return evaluatePipelineDecisionState(pipeline, safeStateId, parsedJson);
+  return evaluatePipelineDecisionState(pipeline, stateId, parsedJson);
 }

@@ -731,17 +731,17 @@ test("10. records at or beyond nextActivationIndex and invalid bounds are reject
       );
       await expectReject(
         () => evaluateDecisionStateFromData(pipeline, snap, records, "check", 0),
-        /next activation index must be a positive safe integer, got 0/,
+        /decision execution index must be a positive safe integer, got 0/,
       );
       await expectReject(
         () => evaluateDecisionStateFromData(pipeline, snap, records, "check", 1.5),
-        /next activation index must be a positive safe integer, got 1\.5/,
+        /decision execution index must be a positive safe integer, got 1\.5/,
       );
 
       // The index bound is checked before the state id is resolved.
       await expectReject(
         () => evaluateDecisionStateFromData(pipeline, snap, [], "absent", 0),
-        /next activation index must be a positive safe integer/,
+        /decision execution index must be a positive safe integer/,
       );
     },
     PIPELINE_FROM_STATE_OUTPUT,
@@ -962,7 +962,7 @@ test("15. clones, casts, other-pipeline snapshots and Proxies reject before any 
     );
 
     const forgedPipelineMessage =
-      /evaluateDecisionStateFromData requires the deep-frozen snapshot object returned by loadPipelineV2/;
+      /prepareDecisionStateData requires the deep-frozen snapshot object returned by loadPipelineV2/;
     await expectReject(
       () => evaluateDecisionStateFromData(structuredClone(pipeline) as ResolvedPipelineV2, snap, [], "check", 1),
       forgedPipelineMessage,

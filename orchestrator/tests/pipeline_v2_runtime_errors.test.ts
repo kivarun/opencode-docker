@@ -1075,7 +1075,7 @@ test("30. invalid caller indexes and unknown state ids stay plain PipelineErrors
     );
     await expectPlainPipelineError(
       () => evaluateDecisionStateFromData(pipeline, snap, [], "check", 0),
-      /next activation index/,
+      /decision execution index/,
     );
     // An unknown state id is a caller-contract violation, never a
     // data-plane failure.
