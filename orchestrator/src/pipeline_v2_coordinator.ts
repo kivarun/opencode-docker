@@ -92,6 +92,7 @@ import {
   evaluatePreparedDecisionState,
   prepareActivationData,
   prepareDecisionStateData,
+  prepareRunProject,
   snapshotRunInputs,
   type AcceptedStateOutput,
   type PreparedActivationData,
@@ -189,8 +190,16 @@ export interface PipelineV2CoordinatorParams {
   /** The exact deep-frozen snapshot a successful `loadPipelineV2` returned. */
   readonly pipeline: ResolvedPipelineV2;
   readonly runId: string;
-  /** Canonical orchestrator-owned run root; `project/` must already exist. */
+  /** Canonical orchestrator-owned run root. */
   readonly runRoot: string;
+  /**
+   * The caller-provided project source directory. The coordinator prepares
+   * the run-owned `<runRoot>/project` copy from it itself; the source is
+   * never modified, its path never enters the pipeline, execution
+   * document, worker env/argv, durable state or results, and a ready-made
+   * `PreparedRunProject` is never accepted.
+   */
+  readonly projectSourcePath: string;
   /** The original run-input bindings, bound once by the caller. */
   readonly inputBindings: readonly RunInputBinding[];
   readonly sink: PipelineV2CoordinatorStateSink;
@@ -615,8 +624,25 @@ export async function coordinatePipelineV2Run(
     return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
   }
 
+  // Phase 0a: the run-owned project copy is prepared by the coordinator
+  // from the caller's project source. The source is never modified; the
+  // copy is published atomically as `<runRoot>/project`. A preparation
+  // failure reaches no command and no Session: the run fails with
+  // `run_input_invalid` and no state document, and the staging tree is
+  // removed by the data plane.
+  try {
+    await prepareRunProject(params.projectSourcePath, runRoot);
+  } catch (cause) {
+    if (cause instanceof PipelineV2RuntimeError && cause.reason === "run_input_invalid") {
+      return deepFreeze({ ok: false as const, reason: "run_input_invalid" as const, state: null });
+    }
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
   // Phase 0: the run-input snapshot is created here, by the coordinator;
-  // a caller-provided snapshot is never accepted.
+  // a caller-provided snapshot is never accepted. An already published
+  // project copy stays in the run root for diagnostics when this or the
+  // state creation below fails.
   let runInputs: RunInputsSnapshot;
   try {
     runInputs = await snapshotRunInputs(pipeline, params.inputBindings, runRoot);

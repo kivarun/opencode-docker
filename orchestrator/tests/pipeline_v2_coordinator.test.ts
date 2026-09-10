@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -826,6 +826,9 @@ test("11. decision input failures stay typed after start_decision_execution", as
   const dirs = await makeDirs();
   await writeBundle(dirs, PIPELINE_DECISION_FROM_OUTPUT);
   const pipeline = await loadPipelineV2(dirs.bundle);
+  // data-plane-level test: the run-owned project copy must exist here;
+  // the coordinator's own preparation is covered by the dedicated tests
+  await mkdir(join(dirs.runRoot, "project"), { recursive: true });
   const runInputs = await snapshotRunInputs(pipeline, bindingsFor(dirs, pipeline), dirs.runRoot);
   const activationDir = join(dirs.runRoot, "activations", "1-coder", "data", "outputs");
   await mkdir(activationDir, { recursive: true });
@@ -1327,6 +1330,9 @@ test("22. the existing evaluateDecisionStateFromData stays the wrapper over prep
     facts: JSON.stringify({ f1: false, f2: false }),
   });
   const pipeline = await loadPipelineV2(dirs.bundle);
+  // data-plane-level test: the run-owned project copy must exist here;
+  // the coordinator's own preparation is covered by the dedicated tests
+  await mkdir(join(dirs.runRoot, "project"), { recursive: true });
   const runInputs = await snapshotRunInputs(pipeline, bindingsFor(dirs, pipeline), dirs.runRoot);
   // The decision input is fed by an accepted agent output living at the
   // fixed activation location; the file carries valid facts.
@@ -2103,6 +2109,7 @@ interface BundleDirs {
   root: string;
   bundle: string;
   sources: string;
+  projectSource: string;
   runRoot: string;
   stateRoot: string;
 }
@@ -2115,11 +2122,13 @@ async function makeDirs(): Promise<BundleDirs> {
   await mkdir(join(bundle, "decisions"), { recursive: true });
   const sources = join(root, "userdata");
   await mkdir(sources, { recursive: true });
+  const projectSource = join(root, "project-source");
+  await mkdir(projectSource, { recursive: true });
   const runRoot = join(root, "runs", "coord-run");
-  await mkdir(join(runRoot, "project"), { recursive: true });
+  await mkdir(runRoot, { recursive: true });
   const stateRoot = join(root, "state");
   await mkdir(stateRoot, { recursive: true });
-  return { root, bundle, sources, runRoot, stateRoot };
+  return { root, bundle, sources, projectSource, runRoot, stateRoot };
 }
 
 async function writeBundle(
@@ -2455,6 +2464,7 @@ async function coordinate(
     pipeline: harness.pipeline,
     runId: options.runId ?? "coord-run",
     runRoot: harness.dirs.runRoot,
+    projectSourcePath: harness.dirs.projectSource,
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime,
@@ -2522,4 +2532,119 @@ const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 function isHexDigest(value: unknown): boolean {
   return typeof value === "string" && SHA256_HEX.test(value);
+}
+
+test("34. a project preparation failure reaches no command and no session", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  const fake = fakeRuntime([{}]);
+  const missingSource = join(harness.dirs.root, "missing-project-source");
+  const result = await coordinatePipelineV2Run({
+    pipeline: harness.pipeline,
+    runId: "coord-run",
+    runRoot: harness.dirs.runRoot,
+    projectSourcePath: missingSource,
+    inputBindings: bindingsFor(harness.dirs, harness.pipeline),
+    sink: harness.recording,
+    runtime: fake.runtime,
+  });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("run_input_invalid");
+  }
+  expect(result.state).toBeNull();
+  expect(harness.recording.commands.length).toBe(0);
+  expect(fake.createCalls.length).toBe(0);
+  expect((await lstatOrNull(join(harness.dirs.runRoot, "project"))) === null).toBe(true);
+  expect((await readdir(harness.dirs.runRoot)).filter((name) => name.startsWith(".project-staging-")).length).toBe(0);
+  // the durable state document was never created
+  expect(
+    (await lstatOrNull(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"))) === null,
+  ).toBe(true);
+});
+
+test("35. a late run-input failure keeps the published project copy and an untouched source", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  await writeFile(join(harness.dirs.projectSource, "seed.md"), "PROJECT-SEED\n");
+  const fake = fakeRuntime([{}]);
+  // a binding to a missing path fails the snapshot after the project copy
+  // was already published
+  const brokenBindings = bindingsFor(harness.dirs, harness.pipeline).map((binding) =>
+    binding.id === "source" ? { id: binding.id, path: join(harness.dirs.root, "no-such-input.txt") } : binding,
+  );
+  const result = await coordinatePipelineV2Run({
+    pipeline: harness.pipeline,
+    runId: "coord-run",
+    runRoot: harness.dirs.runRoot,
+    projectSourcePath: harness.dirs.projectSource,
+    inputBindings: brokenBindings,
+    sink: harness.recording,
+    runtime: fake.runtime,
+  });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("run_input_invalid");
+  }
+  expect(result.state).toBeNull();
+  expect(harness.recording.commands.length).toBe(0);
+  expect(fake.createCalls.length).toBe(0);
+  // the published project copy stays for diagnostics
+  const projectInfo = await lstat(join(harness.dirs.runRoot, "project"));
+  expect(projectInfo.isDirectory()).toBe(true);
+  expect(await readFile(join(harness.dirs.runRoot, "project", "seed.md"), "utf8")).toBe("PROJECT-SEED\n");
+  // the source stays untouched
+  expect((await readdir(harness.dirs.projectSource)).sort()).toEqual(["seed.md"]);
+});
+
+test("36. a create_run store failure keeps the published project copy", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+    faults: new Map([["create_run", () => new PipelineV2RunStateStoreError("WRITE-FAULT")]]),
+  });
+  await writeFile(join(harness.dirs.projectSource, "seed.md"), "PROJECT-SEED\n");
+  const fake = fakeRuntime([{}]);
+  const result = await coordinate(harness, fake.runtime);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("state_persist_failed");
+  }
+  expect(result.state).toBeNull();
+  expect(fake.createCalls.length).toBe(0);
+  const projectInfo = await lstat(join(harness.dirs.runRoot, "project"));
+  expect(projectInfo.isDirectory()).toBe(true);
+  expect(await readFile(join(harness.dirs.runRoot, "project", "seed.md"), "utf8")).toBe("PROJECT-SEED\n");
+  expect((await readdir(harness.dirs.projectSource)).sort()).toEqual(["seed.md"]);
+});
+
+test("37. a successful coordination leaves the source untouched and keeps the source out of the durable state", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  await writeFile(join(harness.dirs.projectSource, "seed.md"), "PROJECT-SEED\n");
+  const fake = fakeRuntime([{}]);
+  const result = await coordinate(harness, fake.runtime);
+  const state = expectOk(result);
+  expect(state.status).toBe("success");
+  // the coordinator prepared the run-owned copy inside the run root
+  const projectInfo = await lstat(join(harness.dirs.runRoot, "project"));
+  expect(projectInfo.isDirectory()).toBe(true);
+  expect(await readFile(join(harness.dirs.runRoot, "project", "seed.md"), "utf8")).toBe("PROJECT-SEED\n");
+  // the source stayed byte-identical: exactly the seeded file, unchanged
+  expect((await readdir(harness.dirs.projectSource)).sort()).toEqual(["seed.md"]);
+  expect(await readFile(join(harness.dirs.projectSource, "seed.md"), "utf8")).toBe("PROJECT-SEED\n");
+  // neither the source path nor the source file content appears in the
+  // durable state document or in the coordination result
+  const stateDoc = await readFile(
+    join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"),
+    "utf8",
+  );
+  expect(stateDoc).not.toContain(harness.dirs.projectSource);
+  expect(stateDoc).not.toContain("PROJECT-SEED");
+  const resultJson = JSON.stringify(result);
+  expect(resultJson).not.toContain(harness.dirs.projectSource);
+  expect(resultJson).not.toContain("PROJECT-SEED");
+});
+
+async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {
+  try {
+    return await lstat(path);
+  } catch {
+    return null;
+  }
 }

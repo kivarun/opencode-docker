@@ -529,10 +529,29 @@ are untouched; wiring v2 execution into `agent-smoke` is a later increment.
 
 `orchestrator/src/pipeline_v2_runtime.ts` materializes the v2 data plane on
 the host, without Sessions or containers. Run layout: `<runRoot>/project` is
-the shared project directory of the whole run. It must exist as a real
-non-symlink directory before `snapshotRunInputs` is called; the runtime never
-creates, clears, or copies it (preparing the initial project content is the
-caller's responsibility), and every activation mounts exactly this one
+the shared project directory of the whole run. The coordinator prepares the
+run-owned copy from the caller's source directory via
+`prepareRunProject(projectSourcePath, runRoot)` before the run-input
+snapshot: the caller (the user today, a future API or SCM provider
+tomorrow) hands over only the source directory path, the source is never
+modified, its path never enters the pipeline, execution document, worker
+env/argv, durable state or results, and the internal run-root layout is not
+presented to the user. The copy is staged in an exclusive hidden staging
+directory inside the canonical run root and published with one atomic
+`rename` — real directories (0700), regular files (0600, or 0700 when the
+source carries any execute bit), symlinks copied as symlinks with verbatim
+target text, hidden entries including `.git` and empty directories, in
+deterministic code-unit sorted order; FIFOs, sockets, devices and
+kind/inode changes between scan and open fail closed; every failure before
+the rename removes exactly the staging tree and every expected failure is
+`run_input_invalid`; after the rename the copy is authoritative and is
+never removed by the data plane even on later run failures. Honest
+boundaries: a portable `rename()` can replace a concurrently created empty
+directory; there is no protection against a trusted host process mutating
+the source while it is being read, and there is no crash recovery. The data
+plane itself still requires the prepared `<runRoot>/project` to exist as a
+real non-symlink directory before `snapshotRunInputs` is called and never
+clears or copies it itself, and every activation mounts exactly this one
 directory at `/workspace` read-write, so changes persist across activations —
 there is no per-activation project directory. `snapshotRunInputs` binds every
 declared pipeline input exactly once to an absolute host path whose real
@@ -1239,6 +1258,27 @@ truth. State schema versions 1, 2, and 3 are explicitly rejected (no
 migration); the schema v2 document stays the production state of pipeline
 v1, and production v2 execution, store/sink integration, and resume are
 still not implemented.
+
+### Run-owned project copy and the production-neutral coordinator (implemented, not wired)
+
+The v2 data plane also implements the run-owned project copy:
+`prepareRunProject(projectSourcePath, runRoot)` publishes an
+orchestrator-owned `<runRoot>/project` copy from the caller's source
+directory with one atomic rename (see the data-plane section above). The
+production-neutral coordinator `coordinatePipelineV2Run` assembles the
+whole v2 substrate — graph execution, the data plane, the decision
+evaluator, durable state v4, the state sink and the two-session runtime —
+and takes the caller's project source directory as an explicit
+`projectSourcePath` parameter: it prepares the run-owned copy itself
+before the run-input snapshot (validate/capture runtime contract →
+`prepareRunProject` → `snapshotRunInputs` → `create_run` → graph
+execution), never accepts a ready-made `PreparedRunProject`, and keeps the
+source untouched. A project preparation failure returns
+`{ok:false, reason:"run_input_invalid", state:null}` with zero sink
+commands and zero sessions; a copy published before a later snapshot or
+`create_run` failure stays in the run root for diagnostics. This
+coordinator remains production-neutral: `agent-smoke`, the CLI and the
+default pipeline are not wired to it.
 
 ### Docker Helper 2.1.1 runtime adapter (unwired)
 

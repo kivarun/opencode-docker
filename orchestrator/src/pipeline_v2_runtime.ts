@@ -1,14 +1,18 @@
 import { isAbsolute, join, relative } from "node:path";
 import { constants, type Stats } from "node:fs";
+import { randomBytes } from "node:crypto";
 import {
+  chmod,
   link,
   lstat,
   mkdir,
   open,
+  readlink,
   readdir,
   realpath,
   rename,
   rm,
+  symlink,
   unlink,
   type FileHandle,
 } from "node:fs/promises";
@@ -1118,6 +1122,331 @@ function parseRunInputBindings(bindings: readonly unknown[]): RunInputBinding[] 
     }
     return { id, path };
   });
+}
+
+/** The fixed name of the run-owned shared project directory. */
+const PROJECT_ROOT_NAME = "project";
+const PROJECT_STAGING_PREFIX = ".project-staging-";
+const MAX_STAGING_ATTEMPTS = 8;
+const PROJECT_COPY_CHUNK = 128 * 1024;
+
+/**
+ * Run-owned project copy metadata. The source path is deliberately not
+ * part of the object: after preparation the runtime works only inside the
+ * orchestrator-owned copy and never reads or names the user source again.
+ */
+export interface PreparedRunProject {
+  readonly run_root: string;
+  readonly project_root: string;
+}
+
+/**
+ * Prepare the run-owned shared project directory `<runRoot>/project` as
+ * an orchestrator-owned copy of the user's project source directory.
+ *
+ * Ownership: the caller (the user today, a future API or SCM provider
+ * tomorrow) hands over only the source directory path. The source is never
+ * modified, renamed, cleared or read beyond this copy; agents work only on
+ * the run-owned copy. The source path is not part of the returned object,
+ * never enters the execution document, worker env/argv, durable state or
+ * results, and the internal run-root layout is not presented to the user.
+ *
+ * Validation, fail-closed: `runRoot` must be an existing absolute canonical
+ * real non-symlink directory (`realpath(runRoot) === runRoot`) and is never
+ * created or removed by this function; `<runRoot>/project` must not exist
+ * as an object of any kind. The source must be an absolute real non-symlink
+ * directory whose canonical path is fixed before copying; source and run
+ * root may not overlap in either direction. Repeated calls fail closed and
+ * never touch an existing project.
+ *
+ * Copy contract (current, explicit): real directories (created 0700),
+ * regular files (0600, or 0700 when the source carries any execute bit),
+ * symlinks copied as symlinks through `readlink` — the target text is
+ * copied verbatim and never resolved — hidden entries (including `.git`)
+ * and empty directories, in deterministic relative-path code-unit sorted
+ * order. uid/gid, timestamps, xattrs, ACLs and hardlink identity are not
+ * preserved: hardlinks become independent regular files. Destination
+ * regular files are read through `O_NOFOLLOW|O_NONBLOCK` sources and
+ * created `O_CREAT|O_EXCL|O_NOFOLLOW`, streamed without shell, `cp` or
+ * `tar`, and fsynced before publication. FIFOs, unix sockets, devices and
+ * unknown kinds are rejected, as is an object that changed kind or inode
+ * between scan and open. Absolute source paths and file contents never
+ * enter diagnostics.
+ *
+ * Publication: the tree is staged in an exclusive staging directory inside
+ * the canonical run root and published with one `rename` after a fresh
+ * absence re-check of `<runRoot>/project`. Any failure before the rename
+ * removes exactly the created staging tree; existing objects and the
+ * source stay byte-identical. After the rename the copy is authoritative
+ * and is never removed by this function, even on later run failures.
+ *
+ * Honest boundaries: the portable `rename()` can replace a concurrently
+ * created empty directory at the target; there is no protection against a
+ * trusted host process mutating the source while it is being read, and
+ * there is no crash recovery.
+ *
+ * Every expected failure of this operation is a run-level input failure:
+ * a `PipelineV2RuntimeError` with reason `run_input_invalid` and a
+ * content-free diagnostic. No new failure reason is introduced and the
+ * state schema stays v4.
+ */
+export async function prepareRunProject(
+  projectSourcePath: string,
+  runRoot: string,
+): Promise<PreparedRunProject> {
+  return await withRuntimeReason("run_input_invalid", async () => {
+    if (typeof projectSourcePath !== "string" || projectSourcePath === "") {
+      throw new PipelineError("project source path must be a non-empty string");
+    }
+    if (!isAbsolute(projectSourcePath)) {
+      throw new PipelineError(
+        "project source path must be an absolute path, got a relative path",
+      );
+    }
+    if (!isAbsolute(runRoot)) {
+      throw new PipelineError("run root must be an absolute path");
+    }
+    const runRootCanonical = await requireCanonicalRunRoot(runRoot, "run root");
+    if (runRootCanonical !== runRoot) {
+      throw new PipelineError(
+        `run root ${runRoot} is not canonical; pass the canonical path ${runRootCanonical}`,
+      );
+    }
+
+    const projectPath = join(runRootCanonical, PROJECT_ROOT_NAME);
+    const existingProject = await lstatOrNull(projectPath);
+    if (existingProject !== null) {
+      throw new PipelineError(
+        `run project root already exists at the fixed run-root location and is ${describeEntry(existingProject)}`,
+      );
+    }
+
+    const sourceInfo = await lstatOrNull(projectSourcePath);
+    if (sourceInfo === null) {
+      throw new PipelineError("project source does not exist");
+    }
+    if (sourceInfo.isSymbolicLink() || !sourceInfo.isDirectory()) {
+      throw new PipelineError(
+        `project source exists but is ${describeEntry(sourceInfo)}; pass a real non-symlink directory`,
+      );
+    }
+    let sourceCanonical: string;
+    try {
+      sourceCanonical = await realpath(projectSourcePath);
+    } catch (cause) {
+      throw fail("project source cannot be canonicalized", cause);
+    }
+    if (
+      sourceCanonical === runRootCanonical ||
+      isInsideRoot(runRootCanonical, sourceCanonical) ||
+      isInsideRoot(sourceCanonical, runRootCanonical)
+    ) {
+      throw new PipelineError(
+        "project source and the canonical run root must not overlap in either direction",
+      );
+    }
+
+    let stagingPath = "";
+    try {
+      stagingPath = await createProjectStagingDirectory(runRootCanonical);
+      await copyProjectTree(sourceCanonical, stagingPath);
+      // Fresh absence re-check immediately before the atomic publication.
+      const beforeRename = await lstatOrNull(projectPath);
+      if (beforeRename !== null) {
+        throw new PipelineError(
+          `run project root appeared at the fixed run-root location during preparation and is ${describeEntry(beforeRename)}`,
+        );
+      }
+      await rename(stagingPath, projectPath);
+    } catch (cause) {
+      if (stagingPath !== "") {
+        await removeProjectStagingTree(stagingPath, runRootCanonical);
+      }
+      throw cause;
+    }
+    return deepFreeze({ run_root: runRootCanonical, project_root: projectPath });
+  });
+}
+
+/**
+ * Create one exclusive staging directory inside the canonical run root.
+ * The name is hidden and random; creation is exclusive, so a concurrent
+ * creator loses instead of being adopted.
+ */
+async function createProjectStagingDirectory(runRootCanonical: string): Promise<string> {
+  let lastCause: unknown = undefined;
+  for (let attempt = 0; attempt < MAX_STAGING_ATTEMPTS; attempt += 1) {
+    const name = `${PROJECT_STAGING_PREFIX}${randomBytes(8).toString("hex")}`;
+    const path = join(runRootCanonical, name);
+    try {
+      await mkdir(path, { mode: 0o700 });
+      await chmod(path, 0o700);
+      return path;
+    } catch (cause) {
+      if (isErrnoException(cause, "EEXIST")) {
+        lastCause = cause;
+        continue;
+      }
+      throw fail("staging directory could not be created", cause);
+    }
+  }
+  throw fail("exclusive staging directory could not be created", lastCause);
+}
+
+/**
+ * Best-effort removal of exactly the staging tree this operation created.
+ * The path was built inside the canonical run root by the caller; the
+ * containment guard never deletes anything outside the run root.
+ */
+async function removeProjectStagingTree(
+  stagingPath: string,
+  runRootCanonical: string,
+): Promise<void> {
+  try {
+    const canonical = await realpath(stagingPath);
+    if (canonical !== runRootCanonical && !isInsideRoot(runRootCanonical, canonical)) {
+      return;
+    }
+    await rm(stagingPath, { recursive: true, force: true });
+  } catch {
+    await rm(stagingPath, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Copy the whole project source tree into the staging root: real
+ * directories, regular files and symlinks (target text verbatim, never
+ * resolved), including hidden entries and empty directories, in
+ * deterministic code-unit sorted order. Any other object kind fails
+ * closed.
+ */
+async function copyProjectTree(sourceCanonical: string, destinationRoot: string): Promise<void> {
+  const copyDirectory = async (sourceDir: string, relativeDir: string): Promise<void> => {
+    let dirents;
+    try {
+      dirents = await readdir(sourceDir, { withFileTypes: true });
+    } catch (cause) {
+      throw fail("project source directory could not be listed", cause);
+    }
+    dirents.sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+    );
+    for (const dirent of dirents) {
+      const childRelative = relativeDir === "" ? dirent.name : `${relativeDir}/${dirent.name}`;
+      const childSource = join(sourceDir, dirent.name);
+      const childDestination = join(destinationRoot, childRelative);
+      // The scan-time kind comes from lstat, never from the dirent type,
+      // so a replaced object is caught here and again after open.
+      const info = await lstatOrNull(childSource);
+      if (info === null) {
+        throw new PipelineError(
+          `project source entry ${JSON.stringify(childRelative)} disappeared during the copy`,
+        );
+      }
+      if (info.isSymbolicLink()) {
+        let target: string;
+        try {
+          target = await readlink(childSource);
+        } catch (cause) {
+          throw fail(
+            `project source symlink entry ${JSON.stringify(childRelative)} could not be read`,
+            cause,
+          );
+        }
+        try {
+          await symlink(target, childDestination);
+        } catch (cause) {
+          throw fail(
+            `project source symlink entry ${JSON.stringify(childRelative)} could not be copied`,
+            cause,
+          );
+        }
+      } else if (info.isDirectory()) {
+        try {
+          await mkdir(childDestination, { mode: 0o700 });
+          await chmod(childDestination, 0o700);
+        } catch (cause) {
+          throw fail(
+            `project source directory entry ${JSON.stringify(childRelative)} could not be copied`,
+            cause,
+          );
+        }
+        await copyDirectory(childSource, childRelative);
+      } else if (info.isFile()) {
+        await copyProjectRegularFile(childSource, childDestination, childRelative, info);
+      } else {
+        throw new PipelineError(
+          `project source entry ${JSON.stringify(childRelative)} is a FIFO, socket, device or another unsupported object`,
+        );
+      }
+    }
+  };
+  await copyDirectory(sourceCanonical, "");
+}
+
+/**
+ * Stream one regular file into the exclusive destination: the source is
+ * opened `O_NOFOLLOW|O_NONBLOCK` (a FIFO substituted between scan and open
+ * cannot block the run), the open object must still be the scanned regular
+ * file (same kind, same dev/ino), and the destination is created
+ * `O_CREAT|O_EXCL|O_NOFOLLOW` with the contract mode, streamed chunk by
+ * chunk without shell/`cp`/`tar`, and fsynced before publication.
+ */
+async function copyProjectRegularFile(
+  sourcePath: string,
+  destinationPath: string,
+  childRelative: string,
+  scannedInfo: Stats,
+): Promise<void> {
+  const mode = (scannedInfo.mode & 0o111) !== 0 ? 0o700 : 0o600;
+  const source = await open(
+    sourcePath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const opened = await source.stat();
+    if (opened.isSymbolicLink() || !opened.isFile()) {
+      throw new PipelineError(
+        `project source entry ${JSON.stringify(childRelative)} changed kind between scan and open`,
+      );
+    }
+    if (opened.dev !== scannedInfo.dev || opened.ino !== scannedInfo.ino) {
+      throw new PipelineError(
+        `project source entry ${JSON.stringify(childRelative)} was replaced between scan and open`,
+      );
+    }
+    const destination = await open(
+      destinationPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      mode,
+    );
+    try {
+      await destination.chmod(mode);
+      const chunk = Buffer.allocUnsafe(PROJECT_COPY_CHUNK);
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await source.read(chunk, 0, chunk.length, position);
+        if (bytesRead === 0) {
+          break;
+        }
+        await destination.write(chunk, 0, bytesRead, position);
+        position += bytesRead;
+      }
+      await destination.sync();
+    } finally {
+      await destination.close();
+    }
+  } catch (cause) {
+    if (cause instanceof PipelineError) {
+      throw cause;
+    }
+    throw fail(
+      `project source file entry ${JSON.stringify(childRelative)} could not be copied`,
+      cause,
+    );
+  } finally {
+    await source.close();
+  }
 }
 
 /**
