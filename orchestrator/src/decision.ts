@@ -5,6 +5,7 @@ import {
   readBundleFile,
   requireBundleFileInsideRoot,
   validateBundleRelativePath,
+  type BundleFileErrorClass,
 } from "./bundle_file.ts";
 
 /**
@@ -41,6 +42,46 @@ export class DecisionModelError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DecisionModelError";
+  }
+}
+
+/** Stable reason codes of a typed fact-assignment validation failure. */
+export type DecisionFactValidationReason =
+  | "not_mapping"
+  | "unknown_fact"
+  | "missing_fact"
+  | "non_boolean_fact";
+
+/**
+ * Typed fact-assignment validation failure of `evaluateDecision`, thrown for
+ * malformed, missing, extra or non-boolean facts. It is a `DecisionModelError`
+ * (an evaluation-time failure of the shared evaluator) but distinguishable
+ * from model and compilation errors. Diagnostics are canary-free: they never
+ * embed a fact value or a fact body, and for an unknown fact not even the
+ * provided property name — the stable `reason` code plus, where allowed, the
+ * model-declared `fact_id` and the value's type name are all callers get.
+ */
+export class DecisionFactValidationError extends DecisionModelError {
+  declare readonly reason: DecisionFactValidationReason;
+  /** Model-declared fact id; present exactly for missing_fact and non_boolean_fact. */
+  declare readonly fact_id?: string;
+  /** Type name of the provided value; present exactly for non_boolean_fact. Never a value. */
+  declare readonly actual_type?: string;
+
+  constructor(
+    reason: DecisionFactValidationReason,
+    message: string,
+    details: { fact_id?: string; actual_type?: string } = {},
+  ) {
+    super(message);
+    this.name = "DecisionFactValidationError";
+    this.reason = reason;
+    if (details.fact_id !== undefined) {
+      this.fact_id = details.fact_id;
+    }
+    if (details.actual_type !== undefined) {
+      this.actual_type = details.actual_type;
+    }
   }
 }
 
@@ -525,6 +566,66 @@ export function parseDecisionModel(raw: string): CompiledDecisionModel {
 }
 
 /**
+ * A loaded decision model: the canonical path the model file was actually
+ * read from, and the compiled snapshot of exactly that read.
+ */
+export interface LoadedDecisionModel {
+  readonly modelPath: string;
+  readonly model: CompiledDecisionModel;
+}
+
+/**
+ * The single decision-model loading chain for trusted loaders: validate the
+ * declared bundle-relative path (non-empty, clean, `.yaml` only), verify its
+ * realpath containment inside the canonical bundle root exactly once, read
+ * the model from the verified canonical path, and compile exactly the read
+ * bytes. The returned pair is atomic for the caller: `modelPath` is the path
+ * the compiled model was read from, so it can be used as a cache key without
+ * any re-resolution window between containment, read, and compilation.
+ *
+ * `shared` is an optional caller-owned memo (one map per load call, never a
+ * global): it is keyed by the canonical `modelPath`, so several states
+ * referencing one canonical model file share one compiled snapshot. Callers
+ * pass their own `what`/`errorClass`/`scopeName` so containment and read
+ * errors carry their context and error type; model-content errors are always
+ * `DecisionModelError` (from `parseDecisionModel`) and are wrapped by the
+ * caller.
+ */
+export async function loadDecisionModelResolved(
+  rootCanonical: string,
+  relativePath: string,
+  what: string,
+  errorClass: BundleFileErrorClass,
+  scopeName: string = "bundle root",
+  shared?: Map<string, CompiledDecisionModel>,
+): Promise<LoadedDecisionModel> {
+  if (typeof relativePath !== "string" || relativePath.trim() === "") {
+    throw new errorClass("decision model path must be a non-empty bundle-relative path");
+  }
+  if (!relativePath.endsWith(".yaml")) {
+    throw new errorClass(
+      `decision model path must end with .yaml, got ${JSON.stringify(relativePath)}`,
+    );
+  }
+  validateBundleRelativePath(relativePath, "decision model path", errorClass);
+  const modelPath = await requireBundleFileInsideRoot(
+    join(rootCanonical, relativePath),
+    rootCanonical,
+    what,
+    errorClass,
+    scopeName,
+  );
+  const cached = shared?.get(modelPath);
+  if (cached !== undefined) {
+    return { modelPath, model: cached };
+  }
+  const raw = await readBundleFile(modelPath, what, errorClass);
+  const model = parseDecisionModel(raw);
+  shared?.set(modelPath, model);
+  return { modelPath, model };
+}
+
+/**
  * Load and compile a decision model from an absolute bundle root and a clean
  * bundle-relative path. Containment follows the shared bundle-file contract:
  * the root must be a real directory, the path must stay inside it after
@@ -561,23 +662,13 @@ export async function loadDecisionModel(
       `decision bundle root ${rootCanonical} is not a directory`,
     );
   }
-  if (typeof relativePath !== "string" || relativePath.trim() === "") {
-    throw new DecisionModelError("decision model path must be a non-empty bundle-relative path");
-  }
-  if (!relativePath.endsWith(".yaml")) {
-    throw new DecisionModelError(
-      `decision model path must end with .yaml, got ${JSON.stringify(relativePath)}`,
-    );
-  }
-  validateBundleRelativePath(relativePath, "decision model path", DecisionModelError);
-  const decisionPath = await requireBundleFileInsideRoot(
-    join(rootCanonical, relativePath),
+  const loaded = await loadDecisionModelResolved(
     rootCanonical,
+    relativePath,
     "decision model file",
     DecisionModelError,
-    "bundle root",
   );
-  return parseDecisionModel(await readBundleFile(decisionPath, "decision model file", DecisionModelError));
+  return loaded.model;
 }
 
 function evalExpression(expression: CompiledExpression, values: readonly boolean[]): boolean {
@@ -597,32 +688,44 @@ function evalExpression(expression: CompiledExpression, values: readonly boolean
  * Evaluate the compiled decision model against a boolean fact assignment.
  *
  * Fail-closed validation errors (non-mapping input, missing facts, extra
- * facts, non-boolean facts) throw DecisionModelError. Consistent inputs
- * produce exactly one of: a selected decision (first matching rule whose
- * decision survived the active hard constraints), an `uncovered` outcome, or
- * an `inconsistent_facts` outcome listing every violated relation in
- * declaration order.
+ * facts, non-boolean facts) throw DecisionFactValidationError with a stable
+ * reason code and canary-free diagnostics (no fact values, no fact bodies,
+ * and for unknown facts not even the provided property name). Consistent
+ * inputs produce exactly one of: a selected decision (first matching rule
+ * whose decision survived the active hard constraints), an `uncovered`
+ * outcome, or an `inconsistent_facts` outcome listing every violated
+ * relation in declaration order.
  */
 export function evaluateDecision(
   model: CompiledDecisionModel,
   facts: Readonly<Record<string, unknown>>,
 ): DecisionOutcome {
   if (typeof facts !== "object" || facts === null || Array.isArray(facts)) {
-    throw new DecisionModelError("decision facts must be a mapping of declared fact ids");
+    throw new DecisionFactValidationError(
+      "not_mapping",
+      "decision facts must be a mapping of declared fact ids",
+    );
   }
   const values: boolean[] = new Array<boolean>(model.factIds.length).fill(false);
   const given = new Set<string>();
   for (const key of Object.keys(facts)) {
     const factIndex = factIndexOf(model, key);
     if (factIndex === undefined) {
-      throw new DecisionModelError(
-        `decision facts include unknown fact ${JSON.stringify(key)}`,
+      // The provided property name is untrusted input: it is never echoed
+      // back, not in the message and not in any structured field.
+      throw new DecisionFactValidationError(
+        "unknown_fact",
+        "decision facts include an unknown fact id",
       );
     }
     const value = facts[key];
     if (typeof value !== "boolean") {
-      throw new DecisionModelError(
+      // The key is a declared fact id here (unknown keys are rejected
+      // above), so echoing it is safe; the value itself never travels.
+      throw new DecisionFactValidationError(
+        "non_boolean_fact",
         `decision fact ${JSON.stringify(key)} must be a boolean, got ${typeof value}`,
+        { fact_id: key, actual_type: typeof value },
       );
     }
     values[factIndex] = value;
@@ -630,7 +733,11 @@ export function evaluateDecision(
   }
   for (const factId of model.factIds) {
     if (!given.has(factId)) {
-      throw new DecisionModelError(`decision fact ${JSON.stringify(factId)} is missing`);
+      throw new DecisionFactValidationError(
+        "missing_fact",
+        `decision fact ${JSON.stringify(factId)} is missing`,
+        { fact_id: factId },
+      );
     }
   }
 

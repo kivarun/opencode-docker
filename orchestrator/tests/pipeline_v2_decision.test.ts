@@ -4,6 +4,12 @@ import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { PipelineError } from "../src/pipeline.ts";
 import {
+  DecisionFactValidationError,
+  evaluateDecision,
+  parseDecisionModel,
+  type DecisionOutcome,
+} from "../src/decision.ts";
+import {
   DECISION_RESERVED_OUTCOMES,
   evaluatePipelineDecisionState,
   loadPipelineV2,
@@ -12,7 +18,6 @@ import {
   type PipelineDecisionStateResult,
   type ResolvedPipelineV2,
 } from "../src/pipeline_v2.ts";
-import { evaluateDecision, parseDecisionModel, type DecisionOutcome } from "../src/decision.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 
@@ -640,7 +645,45 @@ ${decisionState("check_link", "decisions/link.yaml")}
       throw new Error("expected decision states");
     }
     expect(second.modelPath).toBe(await realpath(join(dirs.bundle, "decisions", "model.yaml")));
+    expect(first.modelPath).toBe(second.modelPath);
     expect(second.model).toBe(first.model);
+  });
+});
+
+test("the returned modelPath is the canonical file the model was actually read from", async () => {
+  await withBundle(undefined, async (dirs) => {
+    // Two different models in one bundle; the pipeline references a symlink
+    // to the second one. The loaded pair must be (canonical target of the
+    // symlink, model compiled from that target's bytes).
+    await writeFile(
+      join(dirs.bundle, "decisions", "other.yaml"),
+      SIMPLE_MODEL_YAML.replace("forbid: [beta]", "forbid: [alpha]").replace(
+        "decision: alpha",
+        "decision: beta",
+      ),
+    );
+    await symlink(
+      join(dirs.bundle, "decisions", "other.yaml"),
+      join(dirs.bundle, "decisions", "link.yaml"),
+    );
+    await writePipeline(
+      dirs,
+      DECISION_FROM_PIPELINE_INPUT_YAML.replace(
+        "model: decisions/model.yaml",
+        "model: decisions/link.yaml",
+      ),
+    );
+    const resolved = await loadPipelineV2(dirs.bundle);
+    const state = resolved.states[0];
+    if (state === undefined || state.type !== "decision") {
+      throw new Error("expected resolved decision state");
+    }
+    expect(state.modelPath).toBe(await realpath(join(dirs.bundle, "decisions", "other.yaml")));
+    const result = evaluatePipelineDecisionState(resolved, "check", { f1: true, f2: false });
+    if (result.status !== "selected") {
+      throw new Error("expected selected");
+    }
+    expect(result.decision).toBe("beta");
   });
 });
 
@@ -669,8 +712,9 @@ test("model loading: escape, missing file, directory and wrong extension are rej
 
     const directory = DECISION_FROM_PIPELINE_INPUT_YAML.replace(
       "model: decisions/model.yaml",
-      "model: decisions",
+      "model: decisions/dir.yaml",
     );
+    await mkdir(join(dirs.bundle, "decisions", "dir.yaml"));
     await writePipeline(dirs, directory);
     await expect(loadPipelineV2(dirs.bundle)).rejects.toThrow(
       /decision state "check" model .* is not a regular file/,
@@ -683,7 +727,7 @@ test("model loading: escape, missing file, directory and wrong extension are rej
     await writeFile(join(dirs.bundle, "decisions", "model.yml"), SIMPLE_MODEL_YAML);
     await writePipeline(dirs, wrongExtension);
     await expect(loadPipelineV2(dirs.bundle)).rejects.toThrow(
-      /decision state "check": decision model path must end with .yaml, got "decisions\/model.yml"/,
+      /decision state "check" model must end with .yaml, got "decisions\/model.yml"/,
     );
   });
 });
@@ -860,7 +904,7 @@ test("the adapter maps selected, uncovered and inconsistent outcomes exactly", a
   });
 });
 
-test("malformed facts map to invalid_facts with value-free reasons", async () => {
+test("malformed facts map to invalid_facts with stable structured reasons", async () => {
   await withBundle(undefined, async (dirs) => {
     const resolved = await loadSimplePipeline(dirs);
 
@@ -869,7 +913,12 @@ test("malformed facts map to invalid_facts with value-free reasons", async () =>
       throw new Error("expected invalid_facts");
     }
     expect(missing.outcome).toBe("invalid_facts");
-    expect(missing.reason).toBe('decision fact "f2" is missing');
+    expect(missing.reason).toBe("missing_fact");
+    expect(missing.fact_id).toBe("f2");
+    expect("actual_type" in missing).toBe(false);
+    expect(Object.keys(missing).sort()).toEqual(
+      ["fact_id", "outcome", "reason", "state_id", "status"].sort(),
+    );
 
     const nonBoolean = evaluatePipelineDecisionState(resolved, "check", {
       f1: true,
@@ -878,39 +927,81 @@ test("malformed facts map to invalid_facts with value-free reasons", async () =>
     if (nonBoolean.status !== "invalid_facts") {
       throw new Error("expected invalid_facts");
     }
-    expect(nonBoolean.reason).toBe('decision fact "f2" must be a boolean, got string');
-    expect(nonBoolean.reason).not.toContain("CLASSIFIED_BODY");
+    expect(nonBoolean.reason).toBe("non_boolean_fact");
+    expect(nonBoolean.fact_id).toBe("f2");
+    expect(nonBoolean.actual_type).toBe("string");
+    expect(JSON.stringify(nonBoolean)).not.toContain("CLASSIFIED_BODY");
+    expect(Object.keys(nonBoolean).sort()).toEqual(
+      ["actual_type", "fact_id", "outcome", "reason", "state_id", "status"].sort(),
+    );
 
     const extra = evaluatePipelineDecisionState(resolved, "check", {
       f1: true,
       f2: false,
-      extra: "SECRET_VALUE",
+      "CANARY-UNKNOWN-KEY": "SECRET_VALUE",
     });
     if (extra.status !== "invalid_facts") {
       throw new Error("expected invalid_facts");
     }
-    expect(extra.reason).toBe('decision facts include unknown fact "extra"');
-    expect(extra.reason).not.toContain("SECRET_VALUE");
+    expect(extra.reason).toBe("unknown_fact");
+    expect("fact_id" in extra).toBe(false);
+    expect("actual_type" in extra).toBe(false);
+    expect(Object.keys(extra).sort()).toEqual(["outcome", "reason", "state_id", "status"].sort());
 
     const nonMapping = evaluatePipelineDecisionState(resolved, "check", "TOP-SECRET-BODY");
     if (nonMapping.status !== "invalid_facts") {
       throw new Error("expected invalid_facts");
     }
-    expect(nonMapping.reason).toBe("decision facts must be a mapping of declared fact ids");
-    expect(nonMapping.reason).not.toContain("TOP-SECRET-BODY");
+    expect(nonMapping.reason).toBe("not_mapping");
+    expect(JSON.stringify(nonMapping)).not.toContain("TOP-SECRET-BODY");
     expect(Object.keys(nonMapping).sort()).toEqual(["outcome", "reason", "state_id", "status"].sort());
 
     const arrayFacts = evaluatePipelineDecisionState(resolved, "check", [true, false]);
     if (arrayFacts.status !== "invalid_facts") {
       throw new Error("expected invalid_facts");
     }
-    expect(arrayFacts.reason).toBe("decision facts must be a mapping of declared fact ids");
+    expect(arrayFacts.reason).toBe("not_mapping");
 
     const nullFacts = evaluatePipelineDecisionState(resolved, "check", null);
     if (nullFacts.status !== "invalid_facts") {
       throw new Error("expected invalid_facts");
     }
-    expect(nullFacts.reason).toBe("decision facts must be a mapping of declared fact ids");
+    expect(nullFacts.reason).toBe("not_mapping");
+  });
+});
+
+test("unknown property names never leak into results, error messages or diagnostics", async () => {
+  await withBundle(undefined, async (dirs) => {
+    const resolved = await loadSimplePipeline(dirs);
+    const canaryKey = "CANARY-SECRET-PROPERTY-NAME";
+    const result = evaluatePipelineDecisionState(resolved, "check", {
+      f1: true,
+      f2: false,
+      [canaryKey]: "SECRET_VALUE",
+    });
+    if (result.status !== "invalid_facts") {
+      throw new Error("expected invalid_facts");
+    }
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(canaryKey);
+    expect(serialized).not.toContain("SECRET_VALUE");
+    expect(serialized).not.toContain('unknown fact "');
+
+    const model = parseDecisionModel(SIMPLE_MODEL_YAML);
+    let thrown: unknown;
+    try {
+      evaluateDecision(model, { f1: true, f2: false, [canaryKey]: "SECRET_VALUE" });
+    } catch (cause) {
+      thrown = cause;
+    }
+    if (!(thrown instanceof DecisionFactValidationError)) {
+      throw new Error("expected a typed DecisionFactValidationError");
+    }
+    expect(thrown.reason).toBe("unknown_fact");
+    expect(thrown.message).not.toContain(canaryKey);
+    expect(thrown.message).not.toContain("SECRET_VALUE");
+    expect("fact_id" in thrown).toBe(false);
+    expect("actual_type" in thrown).toBe(false);
   });
 });
 
@@ -921,12 +1012,19 @@ test("results and diagnostics never contain fact values or bodies", async () => 
       evaluatePipelineDecisionState(resolved, "check", { f1: true, f2: "VALUE-MUST-NOT-LEAK" }),
       evaluatePipelineDecisionState(resolved, "check", "BODY-MUST-NOT-LEAK"),
       evaluatePipelineDecisionState(resolved, "check", { f1: "LEAK-ME-NOT", f2: false }),
+      evaluatePipelineDecisionState(resolved, "check", {
+        f1: true,
+        f2: false,
+        "LEAK-KEY-NAME": true,
+      }),
     ];
     for (const result of results) {
-      expect(JSON.stringify(result)).not.toContain("MUST-NOT-LEAK");
-      expect(JSON.stringify(result)).not.toContain("LEAK-ME-NOT");
-      expect(JSON.stringify(result)).not.toContain("BODY-MUST-NOT-LEAK");
-      expect(JSON.stringify(result)).not.toContain("VALUE-MUST-NOT-LEAK");
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain("MUST-NOT-LEAK");
+      expect(serialized).not.toContain("LEAK-ME-NOT");
+      expect(serialized).not.toContain("BODY-MUST-NOT-LEAK");
+      expect(serialized).not.toContain("VALUE-MUST-NOT-LEAK");
+      expect(serialized).not.toContain("LEAK-KEY-NAME");
     }
   });
 });

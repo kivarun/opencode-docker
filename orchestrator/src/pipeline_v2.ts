@@ -24,11 +24,13 @@ import {
 import { describeError } from "./docker_helper.ts";
 import { compilePipelineJsonSchema } from "./pipeline_v2_schema.ts";
 import {
-  DecisionModelError,
+  DecisionFactValidationError,
   evaluateDecision,
-  loadDecisionModel,
+  loadDecisionModelResolved,
   type CompiledDecisionModel,
+  type DecisionFactValidationReason,
   type DecisionOutcome,
+  type LoadedDecisionModel,
 } from "./decision.ts";
 
 /**
@@ -558,6 +560,17 @@ function parseV2DecisionState(raw: Record<string, unknown>): PipelineV2DecisionS
     source: parsePortSource(entry.source, portWhat),
   };
 
+  const modelRelativePath = validateBundleRelativePath(
+    expectNonEmptyString(raw.model, `${what} model`),
+    `${what} model`,
+    PipelineError,
+  );
+  if (!modelRelativePath.endsWith(".yaml")) {
+    throw new PipelineError(
+      `${what} model must end with .yaml, got ${JSON.stringify(modelRelativePath)}`,
+    );
+  }
+
   const transitionsRaw = expectArray(raw.transitions, `${what} transitions`);
   const transitions: PipelineTransitionSpec[] = [];
   for (let index = 0; index < transitionsRaw.length; index++) {
@@ -567,11 +580,7 @@ function parseV2DecisionState(raw: Record<string, unknown>): PipelineV2DecisionS
   return {
     id,
     type: "decision",
-    model: validateBundleRelativePath(
-      expectNonEmptyString(raw.model, `${what} model`),
-      `${what} model`,
-      PipelineError,
-    ),
+    model: modelRelativePath,
     inputs: [input],
     transitions,
   };
@@ -901,11 +910,12 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
 
   // Phase 2: agent and decision states. Prompts load with the usual
   // containment; declared agent output schemas load on the output ports that
-  // declare them. Decision models load through the existing
-  // `loadDecisionModel` (the only decision loader — no second compiler) and
-  // are compiled once at trusted load time; states sharing one canonical
-  // model file share one compiled snapshot via a cache local to this load
-  // call. The runtime never re-reads the model file afterwards.
+  // declare them. Decision models load through the single
+  // `loadDecisionModelResolved` chain (the only model loading path here — no
+  // second compiler) and are compiled once at trusted load time; states
+  // sharing one canonical model file share one compiled snapshot via the
+  // per-load cache keyed by the resolved canonical path. The runtime never
+  // re-reads the model file afterwards.
   const decisionModelsByCanonicalPath = new Map<string, CompiledDecisionModel>();
   const states: ResolvedV2State[] = [];
   for (const state of spec.states) {
@@ -972,23 +982,28 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
     } else if (state.type === "decision") {
       const stateWhat = `decision state ${JSON.stringify(state.id)}`;
       const modelWhat = `${stateWhat} model`;
-      const modelPath = await requireBundleFileInsideRoot(
-        join(rootCanonical, state.model),
-        rootCanonical,
-        modelWhat,
-        PipelineError,
-        "pipeline bundle",
-      );
-      let model = decisionModelsByCanonicalPath.get(modelPath);
-      if (model === undefined) {
-        try {
-          model = await loadDecisionModel(rootCanonical, state.model);
-        } catch (cause) {
-          const detail = cause instanceof Error ? cause.message : String(cause);
-          throw new PipelineError(`${stateWhat}: ${detail}`);
+      // Single loading chain: the declared path is validated, canonicalized,
+      // read, and compiled exactly once, and the returned modelPath is the
+      // path the compiled model was actually read from — the same key used
+      // for the per-load cache, with no re-resolution window in between.
+      let loaded: LoadedDecisionModel;
+      try {
+        loaded = await loadDecisionModelResolved(
+          rootCanonical,
+          state.model,
+          modelWhat,
+          PipelineError,
+          "pipeline bundle",
+          decisionModelsByCanonicalPath,
+        );
+      } catch (cause) {
+        if (cause instanceof PipelineError) {
+          throw cause;
         }
-        decisionModelsByCanonicalPath.set(modelPath, model);
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        throw new PipelineError(`${stateWhat}: ${detail}`);
       }
+      const { modelPath, model } = loaded;
       for (const decisionId of model.decisionIds) {
         if (DECISION_RESERVED_OUTCOME_SET.has(decisionId)) {
           throw new PipelineError(
@@ -1175,9 +1190,12 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
  * Deterministic result of evaluating one declared decision state. The
  * outcome is exactly the routed situation: a selected decision id, one of
  * the three reserved outcomes, or `invalid_facts` for a malformed fact
- * assignment. The result never contains the fact values or the fact body —
- * `invalid_facts.reason` is the value-free diagnostic of the shared
- * evaluator (declared fact ids and type names only). No timestamps, no
+ * assignment. The `invalid_facts` branch is structured and canary-free: its
+ * `reason` is the stable typed reason code of the shared evaluator's
+ * fact-validation failure, plus — only where the code allows it — the
+ * model-declared `fact_id` (`missing_fact`, `non_boolean_fact`) and the
+ * value's type name (`non_boolean_fact`). It never embeds a fact value, a
+ * fact body, or the property name of an unknown fact. No timestamps, no
  * randomness, no stdout, no LLM, and no target-state selection: the next
  * state is chosen only by the pipeline's transition table.
  */
@@ -1206,7 +1224,9 @@ export type PipelineDecisionStateResult =
       readonly state_id: string;
       readonly status: "invalid_facts";
       readonly outcome: "invalid_facts";
-      readonly reason: string;
+      readonly reason: DecisionFactValidationReason;
+      readonly fact_id?: string;
+      readonly actual_type?: string;
     };
 
 /**
@@ -1215,10 +1235,10 @@ export type PipelineDecisionStateResult =
  * the shared evaluator's outcome to the frozen pipeline-level result. This
  * adapter reads no filesystem and resolves no data ports — the runtime
  * adapter that resolves the `json` input through the run-input snapshot and
- * the accepted history is a later increment. Unexpected failures are never
- * disguised as `invalid_facts`: only the shared evaluator's fail-closed
- * fact-validation errors (`DecisionModelError`) map to it, everything else
- * propagates.
+ * the accepted history is a later increment. Only the shared evaluator's
+ * typed fact-validation failures (`DecisionFactValidationError`) map to
+ * `invalid_facts`; any other unexpected failure propagates unchanged
+ * instead of being disguised as `invalid_facts`.
  */
 export function evaluatePipelineDecisionState(
   pipeline: ResolvedPipelineV2,
@@ -1247,12 +1267,14 @@ export function evaluatePipelineDecisionState(
   try {
     outcome = evaluateDecision(state.model, facts as Readonly<Record<string, unknown>>);
   } catch (cause) {
-    if (cause instanceof DecisionModelError) {
+    if (cause instanceof DecisionFactValidationError) {
       return deepFreeze({
         state_id: stateId,
         status: "invalid_facts",
         outcome: "invalid_facts",
-        reason: cause.message,
+        reason: cause.reason,
+        ...(cause.fact_id !== undefined ? { fact_id: cause.fact_id } : {}),
+        ...(cause.actual_type !== undefined ? { actual_type: cause.actual_type } : {}),
       });
     }
     throw cause;

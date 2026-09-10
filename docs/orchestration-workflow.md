@@ -635,14 +635,20 @@ concerns (`profile`, `prompt`, `outputs`, `timeout_seconds`,
 `paths`) are unknown fields there. The input type is derived from its
 source and must resolve to `json`; the user never re-declares it, and the
 port keeps the normal data-port contract including the inherited JSON
-schema snapshot. Model loading reuses the unchanged realpath containment
-(internal symlinks allowed; escapes, traversal, absolute paths, `~`,
-non-`.yaml` files, directories, and missing files rejected) and every model
-error carries the state id. The compiled model travels deep-frozen on the
-resolved state and is never re-read afterwards; states referencing one
+schema snapshot. Model loading goes through the single
+`loadDecisionModelResolved` chain: the declared bundle-relative `.yaml`
+path is validated, canonicalized, read, and compiled exactly once, and the
+returned pair (`modelPath`, `model`) is atomic for the caller — `modelPath`
+is the canonical path the compiled model was actually read from, so there
+is no symlink-retarget window between resolution and compilation. Realpath
+containment is unchanged (internal symlinks allowed; escapes, traversal,
+absolute paths, `~`, directories, and missing files rejected) and every
+model error carries the state id. The compiled model travels deep-frozen on
+the resolved state and is never re-read afterwards; states referencing one
 canonical model file (for example through an internal symlink) share one
-compiled snapshot via a cache local to the single `loadPipelineV2` call —
-no global mutable cache, no second decision compiler or evaluator.
+compiled snapshot via a cache local to the single `loadPipelineV2` call,
+keyed by the resolved canonical path — no global mutable cache, no second
+decision compiler or evaluator.
 
 The outcome contract is explicit and closed. The reserved outcomes
 `uncovered`, `inconsistent_facts`, and `invalid_facts` may never be
@@ -663,10 +669,17 @@ assignment through the existing `evaluateDecision` to a deep-frozen result
 union: `selected` (whose `outcome` equals the selected decision id),
 `uncovered`, `inconsistent_facts` (with the violated relation ids), and
 `invalid_facts` for the fail-closed fact-validation failures of the shared
-evaluator. The `invalid_facts` reason is value-free — it embeds only
-declared fact ids and type names, never fact values or bodies — and
-unexpected errors propagate instead of being disguised as
-`invalid_facts`. The adapter selects no target state (targets come only
+evaluator. Only the evaluator's typed fact-validation error — a subclass of
+its model error, distinguishable from compilation and model failures — maps
+to `invalid_facts`; any other unexpected error propagates instead of being
+disguised. The `invalid_facts` branch is structured and canary-free: its
+`reason` is the stable code `not_mapping`, `unknown_fact`, `missing_fact`,
+or `non_boolean_fact`, plus — only where the code allows it — the
+model-declared `fact_id` (`missing_fact`, `non_boolean_fact`) and the
+value's type name (`non_boolean_fact`). It never embeds a fact value or a
+fact body, and for an unknown fact not even the provided property name is
+returned or logged; the evaluator's own error message is canary-free for
+the same reasons. The adapter selects no target state (targets come only
 from the transition table) and contains no timestamps, randomness, stdout,
 LLM, callbacks, expressions, or user code. Not implemented yet: resolving
 the `json` facts port through the run-input snapshot or the accepted

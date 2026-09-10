@@ -4,12 +4,14 @@ import { join } from "node:path";
 import { expect, test } from "bun:test";
 import {
   DECISION_LIMITS,
+  DecisionFactValidationError,
   DecisionModelError,
   compileDecisionModel,
   evaluateDecision,
   loadDecisionModel,
   parseDecisionModel,
   type CompiledDecisionModel,
+  type DecisionFactValidationReason,
 } from "../src/decision.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
@@ -386,7 +388,7 @@ test("missing, extra and non-boolean facts fail closed instead of evaluating", (
   const model = BASE_MODEL();
   expect(() => evaluateDecision(model, { f1: true })).toThrow(/is missing/);
   expect(() => evaluateDecision(model, { f1: true, f2: false, extra: true })).toThrow(
-    /unknown fact "extra"/,
+    /unknown fact id/,
   );
   expect(() => evaluateDecision(model, { f1: "true", f2: false })).toThrow(/must be a boolean/);
   expect(() => evaluateDecision(model, { f1: 1, f2: 0 })).toThrow(/must be a boolean/);
@@ -399,6 +401,44 @@ test("missing, extra and non-boolean facts fail closed instead of evaluating", (
   expect(() => evaluateDecision(model, "facts" as unknown as Record<string, unknown>)).toThrow(
     /must be a mapping/,
   );
+});
+
+test("fact-assignment failures throw the typed error with stable canary-free reasons", () => {
+  const model = BASE_MODEL();
+  const cases: { facts: unknown; reason: DecisionFactValidationReason; fact_id?: string; actual_type?: string }[] = [
+    { facts: null, reason: "not_mapping" },
+    { facts: "body", reason: "not_mapping" },
+    { facts: [true], reason: "not_mapping" },
+    { facts: { f1: true, f2: false, "CANARY-KEY": "x" }, reason: "unknown_fact" },
+    { facts: { f1: true }, reason: "missing_fact", fact_id: "f2" },
+    { facts: { f1: "CLASSIFIED", f2: false }, reason: "non_boolean_fact", fact_id: "f1", actual_type: "string" },
+    { facts: { f1: 1, f2: 0 }, reason: "non_boolean_fact", fact_id: "f1", actual_type: "number" },
+  ];
+  for (const expected of cases) {
+    let thrown: unknown;
+    try {
+      evaluateDecision(model, expected.facts as Readonly<Record<string, unknown>>);
+    } catch (cause) {
+      thrown = cause;
+    }
+    if (!(thrown instanceof DecisionFactValidationError)) {
+      throw new Error(`expected DecisionFactValidationError for ${JSON.stringify(expected)}`);
+    }
+    expect(thrown).toBeInstanceOf(DecisionModelError);
+    expect(thrown.reason).toBe(expected.reason);
+    expect(thrown.message).not.toContain("CANARY");
+    expect(thrown.message).not.toContain("CLASSIFIED");
+    if (expected.fact_id === undefined) {
+      expect("fact_id" in thrown).toBe(false);
+    } else {
+      expect(thrown.fact_id).toBe(expected.fact_id);
+    }
+    if (expected.actual_type === undefined) {
+      expect("actual_type" in thrown).toBe(false);
+    } else {
+      expect(thrown.actual_type).toBe(expected.actual_type);
+    }
+  }
 });
 
 test("unknown fact and decision references fail compilation", () => {
