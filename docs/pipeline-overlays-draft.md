@@ -130,31 +130,73 @@ conflict diagnostics substantially harder.
 
 ## Testing extension example
 
-The first reference overlay should extend the default pipeline with a tester
-role and a testing step. It demonstrates that overlays can change both the
-process and data planes without replacing the base bundle.
+The first reference extension should provide one reusable tester role bundle
+and two alternative placement overlays. This demonstrates that role assets and
+process placement are independent: the same prompt, schema, profile reference
+and output contract can participate in different graphs without being copied
+or changed.
 
-The overlay conceptually provides:
+The shared tester extension conceptually provides:
 
 - a tester prompt;
 - a JSON schema for a structured test report;
 - a tester agent state referencing an operator-approved tester profile;
 - a declared `test_report` output;
-- insertion of the tester after the coder and before the architect;
-- a new architect input sourced from `tester.test_report`;
+- explicit data-port bindings for every state that consumes the report;
 - optionally, publication of the report as a run-level output.
 
 The tester does not choose the next state. It produces only declared outputs.
-The architect consumes the structured report and the existing deterministic
-decision layer decides whether to close the stage, request rework, change the
-plan, or require intervention.
+A deterministic decision state or the existing architect decision layer maps
+the accepted report to process outcomes.
 
-This simple example treats testing as an inserted state in the existing stage
+### Variant A: test before reviewers
+
+The early-feedback variant attaches the testing subgraph to the transition
+from the coder to the reviewers:
+
+```text
+coder -> tester -> test decision
+  ^                    |
+  |------ rework ------|
+                       +-> reviewers -> architect
+```
+
+A failed test outcome returns work to a coder activation; a passing outcome
+continues to the reviewers. The test report must be connected explicitly to
+the rework state and, if required, to the reviewers or architect.
+
+A required `test_report` input cannot simply be added to the original coder
+state because it is unavailable on the first coder activation. The first
+example should therefore use a distinct coder-rework state that reuses the
+coder role/profile while accepting the report. Optional/history-aware inputs
+must not be invented implicitly merely to make the example work.
+
+### Variant B: test after reviewers
+
+The end-of-iteration variant attaches the same tester role after the reviewers
+and before the architect's iteration decision:
+
+```text
+coder -> reviewers -> tester -> architect
+```
+
+Here the architect receives the structured test report together with the
+review results and applies the existing deterministic decision model. Any
+rework transition remains owned by that decision layer.
+
+The two overlays should differ only in graph attachment and the explicit
+data-port bindings required by that placement. The tester prompt, output
+schema and profile reference stay identical. This pair is an acceptance test
+for semantic composition: if moving the same role requires copying the
+default pipeline or editing its internals by array index, the overlay model is
+too brittle.
+
+These variants still treat testing as a subgraph inside an existing stage
 cycle. A full plan-driven “testing stage” is a separate question: stages and
-their number belong to the plan and may be revisited. The overlay must not
-hard-code a stage number. Before the example is promoted from a state insertion
-to a stage extension, the default pipeline's stage representation and the
-operation that extends it must be formalized.
+their number belong to the plan and may be revisited. An overlay must not
+hard-code a stage number. Before the example is promoted from state/subgraph
+placement to a stage extension, the default pipeline's stage representation
+and the operation that extends it must be formalized.
 
 ## Validation and conflicts
 
