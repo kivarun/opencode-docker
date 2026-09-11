@@ -1477,6 +1477,22 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       `execution ${uncommitted.index} has no committed transition; a new execution starts only after the previous execution's transition is committed`,
     );
   }
+  // The single execution without a committed transition — the one started
+  // after the last committed transition (or after the last response) — was
+  // started at the replayed cursor. Every transition-bound execution is
+  // already tied to the replay cursor through its own transition; the
+  // unbound one is tied here. This holds for agent and decision executions
+  // in any phase, including an in-flight, a settled-but-unbound, and a
+  // failed execution. The diagnostic names only the execution index and
+  // safe state ids.
+  if (executions.length === transitions.length + 1) {
+    const unbound = executions[transitions.length]!;
+    if (unbound.state_id !== replayCursor) {
+      throw new PipelineV2StateError(
+        `execution ${unbound.index} ran state ${JSON.stringify(unbound.state_id)}, expected the replayed cursor ${JSON.stringify(replayCursor)}`,
+      );
+    }
+  }
 
   if (terminal !== undefined) {
     if (terminal.state_id !== cursor.current_state) {

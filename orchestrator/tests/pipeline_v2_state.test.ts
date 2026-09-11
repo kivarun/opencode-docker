@@ -2066,6 +2066,193 @@ describe("pipeline v2 run state schema v6", () => {
   });
 });
 
+describe("pipeline v2 run state loader: the unbound execution is bound to the replayed cursor", () => {
+  /**
+   * Pre-fix regression note: on commit bf72ccd (before this invariant) the
+   * loader accepted every forged document below — the negative cases
+   * validate() without throwing — because nothing tied the one execution
+   * without a committed transition to the replayed cursor. The positive
+   * cases passed unchanged. The negatives here fail only because of the
+   * unbound-execution/cursor invariant in `validatePipelineV2RunState`.
+   */
+
+  const WAIT_IDENTITY: PipelineV2RunPipelineIdentity = {
+    ...IDENTITY,
+    entry_state: "architect",
+    max_transitions: 6,
+  };
+
+  function runWaiting(): PipelineV2RunCommand {
+    return {
+      kind: "run_waiting",
+      stateId: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    };
+  }
+
+  function waitResponded(): PipelineV2RunCommand {
+    return {
+      kind: "wait_response_recorded",
+      waitIndex: 1,
+      expectedRequestSha256: hex("7"),
+      actionId: "continue_stage",
+      responseSha256: hex("8"),
+    };
+  }
+
+  /** The cursor's unbound execution: the last execution, no transition of its own. */
+  function forgeUnboundStateId(
+    state: PipelineV2RunState,
+    stateId: string,
+  ): { draft: any; snapshot: string } {
+    const draft = draftOf(state);
+    const unbound = draft.executions[draft.executions.length - 1];
+    if (unbound === undefined) {
+      throw new Error("expected an unbound execution");
+    }
+    if (draft.transitions.length !== draft.executions.length - 1) {
+      throw new Error("expected the last execution to be the only unbound one");
+    }
+    unbound.state_id = stateId;
+    return { draft, snapshot: JSON.stringify(draft) };
+  }
+
+  test("the response target execution round-trips: agent start at the chosen action target (positive in-flight)", () => {
+    const identity = { ...WAIT_IDENTITY, max_transitions: 6 };
+    const driver = loadableDriver(createDriver(identity, []));
+    driver.apply(createRun(identity, []));
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
+    driver.apply({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+    const state = driver.current as PipelineV2RunState;
+    expect(state.status).toBe("active");
+    expect(state.cursor).toEqual({ current_state: "coder", transition_count: 0 });
+    expect(state.executions[0]).toMatchObject({ index: 1, state_id: "coder", phase: "started" });
+    // every accepted command already serialized into a loader-accepted document
+    const parsed = parsePipelineV2RunState(JSON.stringify(state));
+    expect(parsed).toEqual(state);
+  });
+
+  test("a forged unbound agent state id is rejected against the replayed response target", () => {
+    const identity = { ...WAIT_IDENTITY, max_transitions: 6 };
+    const driver = createDriver(identity, []);
+    driver.apply(createRun(identity, []));
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
+    driver.apply({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+    const state = driver.current as PipelineV2RunState;
+    const { draft, snapshot } = forgeUnboundStateId(state, "elsewhere");
+    let message = "";
+    try {
+      validatePipelineV2RunState(draft);
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(PipelineV2StateError);
+      message = (cause as Error).message;
+    }
+    // the diagnostic names only the execution index and safe state ids
+    expect(message).toBe(
+      'execution 1 ran state "elsewhere", expected the replayed cursor "coder"',
+    );
+    // the validator never mutates the document it rejects
+    expect(JSON.stringify(draft)).toBe(snapshot);
+  });
+
+  test("a forged unbound agent state id is rejected without any wait (entry cursor)", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    const state = driver.current as PipelineV2RunState;
+    const { draft } = forgeUnboundStateId(state, "elsewhere");
+    let message = "";
+    try {
+      validatePipelineV2RunState(draft);
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(PipelineV2StateError);
+      message = (cause as Error).message;
+    }
+    expect(message).toBe(
+      'execution 1 ran state "elsewhere", expected the replayed cursor "implement"',
+    );
+  });
+
+  test("a forged unbound decision state id is rejected the same way", () => {
+    const identity = { ...IDENTITY, entry_state: "check", max_transitions: 1 };
+    const driver = createDriver(identity, []);
+    driver.apply(createRun(identity, []));
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    const state = driver.current as PipelineV2RunState;
+    const { draft } = forgeUnboundStateId(state, "elsewhere");
+    let message = "";
+    try {
+      validatePipelineV2RunState(draft);
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(PipelineV2StateError);
+      message = (cause as Error).message;
+    }
+    expect(message).toBe(
+      'execution 1 ran state "elsewhere", expected the replayed cursor "check"',
+    );
+  });
+
+  test("a forged unbound failed execution state id is rejected", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({
+      kind: "agent_failed",
+      reason: "worker_failed",
+      sessionCleanup: { execution: "completed", tool: "completed" },
+    });
+    const state = driver.current as PipelineV2RunState;
+    expect(state.executions[0]).toMatchObject({ index: 1, phase: "failed" });
+    const { draft } = forgeUnboundStateId(state, "elsewhere");
+    let message = "";
+    try {
+      validatePipelineV2RunState(draft);
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(PipelineV2StateError);
+      message = (cause as Error).message;
+    }
+    expect(message).toBe(
+      'execution 1 ran state "elsewhere", expected the replayed cursor "implement"',
+    );
+  });
+
+  test("in-flight, settled-but-unbound and failed executions with the exact cursor state round-trip", () => {
+    // in-flight
+    const inFlight = createDriver();
+    inFlight.apply(createRun());
+    inFlight.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    requireLoadableSnapshot(inFlight.current as PipelineV2RunState);
+
+    // settled but unbound (cleanup recorded, transition not committed yet)
+    const settled = createDriver();
+    settled.apply(createRun());
+    startAgent(settled, "implement", { execution: "sess-1" });
+    acceptOutputs(settled, [{ id: "plan", digest: hex("d") }]);
+    const settledState = settled.current as PipelineV2RunState;
+    expect(settledState.executions[0]).toMatchObject({ index: 1, phase: "cleanup_completed" });
+    expect(settledState.transitions).toHaveLength(0);
+    requireLoadableSnapshot(settledState);
+
+    // failed
+    const failed = createDriver();
+    failed.apply(createRun());
+    startAgent(failed, "implement", { execution: "sess-1" });
+    failed.apply({
+      kind: "agent_failed",
+      reason: "worker_failed",
+      sessionCleanup: { execution: "completed", tool: "completed" },
+    });
+    requireLoadableSnapshot(failed.current as PipelineV2RunState);
+  });
+});
+
 describe("pipeline v2 run state schema v6: durable user wait and response", () => {
   /** The default-pipeline policy graph around the P01 wait: architect/coder. */
   const WAIT_IDENTITY: PipelineV2RunPipelineIdentity = {
