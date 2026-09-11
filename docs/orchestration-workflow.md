@@ -14,7 +14,7 @@ result identity, run state schema version 2). Pipeline schema v2 has its
 own production entrypoint now: `orchestrator run` (see the "The production
 pipeline v2 CLI" section) drives the assembled pipeline v2 stack —
 graph execution, the run-owned project copy, the data plane, decision
-states, the Docker Helper runtime adapter, the durable state schema v5,
+states, the Docker Helper runtime adapter, the durable state schema v6,
 and output publication — through the single production runner
 `runPipelineV2`. `agent-smoke` remains the v1 diagnostic command with its
 own schema version 1 loader; the bundled default pipeline has not been
@@ -186,7 +186,7 @@ orchestrator run \
   activations. The source directory is never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 5), and the published run outputs stay at the fixed
+  (state schema version 6), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
@@ -1418,6 +1418,36 @@ or validation, or production resume — the corresponding P01-S05…S12 policy
 validation stays unconnected, and no TASK/stage/profile/budget fields are
 added to the durable state to imitate a policy owner that does not exist
 yet.
+
+### Wait request/response manifests (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_wait_manifest.ts` fixes the canonical
+content-free format that binds user-facing wait requests and responses to
+the durable `waits[]` journal through the existing digests. The request
+manifest (`schema_version` 1; `run_id`, `wait_index`, `transition_count`,
+`state_id`, `reason`, and the declared actions in declaration order) is
+validated and normalized by `preparePipelineV2WaitRequest` or
+`parsePipelineV2WaitRequest` — one shared chain — and carries its
+canonical JSON plus `SHA-256("pipeline-v2-wait-request\0" +
+canonicalJson(manifest))`; the request digest is exactly what
+`run_waiting.requestSha256` (the durable `request_sha256`) records. The
+response manifest (`run_id`, `wait_index`, `request_sha256`,
+`action_id`) is accepted by `acceptPipelineV2WaitResponse` only against
+the exact prepared request object (module-private provenance registry:
+clones, spreads, `structuredClone` results, hand-built objects and
+Proxies are rejected before any field is read), must match the request by
+run id, wait index and request digest, and must select a declared action;
+the routing target is always the request's own `action.to`, never a
+response field, and the response digest is
+`SHA-256("pipeline-v2-wait-response\0" + canonicalJson(manifest))` — the
+value `wait_response_recorded.responseSha256` records. No user intent
+payload (no TASK revision, iteration grant, or model-profile
+replacement), no bodies, paths, timestamps, facts or credentials enter
+either manifest, and diagnostics are content-free: user-side errors never
+echo unknown property names or values, and malformed JSON produces a
+stable message without parser fragments. Filesystem publication under the
+run root, user-response reading, coordinator/runner/CLI wiring, resume,
+P01 validation, and durable-state migrations stay out of scope.
 
 ### Run-owned project copy and the production-neutral coordinator (implemented, driven by the production runner)
 
