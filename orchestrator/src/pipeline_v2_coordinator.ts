@@ -827,9 +827,22 @@ export async function coordinatePipelineV2Run(
     });
   } catch (cause) {
     if (cause instanceof PipelineV2RunStateDurabilityError) {
-      // The rename landed; the visible candidate snapshot is adopted.
+      // The rename landed; the visible candidate snapshot is adopted and
+      // the sink is poisoned. The shared memoized cutoff is taken exactly
+      // once before returning, so no signal acceptance stays open after
+      // this completion path — but an accepted signal never masks the
+      // confirmed durability-unknown failure: no durable status was
+      // committed, and the authoritative reason stays
+      // `state_persist_failed`. No further durable dispatch follows.
+      try {
+        takeCutoff();
+      } catch {
+        // A hostile cutoff control cannot change the durable outcome.
+      }
       return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
     }
+    // A not-committed failure means no durable state exists at all: the
+    // snapshot stays null and the cutoff is not required here.
     return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: null });
   }
 

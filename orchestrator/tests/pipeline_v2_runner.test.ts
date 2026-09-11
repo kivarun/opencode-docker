@@ -1364,6 +1364,91 @@ test("F1e. a throwing onSignal registration resolves with the preflight outcome"
 
 // --- fix 2: the post-snapshot signal outcome and preflight priority ----------
 
+test("F1f. the onSignal getter is read exactly once and the full run still succeeds", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runId = "onsgl-read-0000-0000-000000000000";
+  let getterReads = 0;
+  let registrations = 0;
+  let handlerSeen: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+  // A complete working fake CLI: the whole run must succeed so the test
+  // proves the single getter read happens on the success path too.
+  const calls: string[][] = [];
+  const runRoot = runRootPath(harness, runId);
+  let createCount = 0;
+  const cli: CliRunner = async (args) => {
+    calls.push([...args]);
+    if (args[0] === "session" && args[1] === "create") {
+      createCount += 1;
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          session: { id: `dhs_f1f_${createCount}`, launcher_id: EXPECTED_LAUNCHER_ID },
+          token: `dhc_f1f_${createCount}`,
+        }),
+      };
+    }
+    if (args[0] === "session" && args[1] === "delete") {
+      const id = args[args.indexOf("--id") + 1] ?? "";
+      return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id }) };
+    }
+    if (args[0] === "pull") {
+      return { code: 0 };
+    }
+    if (args[0] === "run") {
+      let mountStart = -1;
+      for (let i = 0; i < args.length; i += 1) {
+        if (args[i] === "--mount") {
+          mountStart = i;
+          break;
+        }
+      }
+      for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
+        const spec = args[i + 1] ?? "";
+        const [source, target] = spec.split(":");
+        if (target === "/pipeline/outputs") {
+          const dir = join(runRoot, source ?? "");
+          await mkdir(dir, { recursive: true });
+          await writeFile(join(dir, "report"), JSON.stringify({ f1: true, f2: false }));
+        }
+      }
+      return { code: 0 };
+    }
+    return { code: 1 };
+  };
+  const deps: PipelineV2RunnerDeps = validDeps(harness, { cli, randomId: () => runId });
+  Object.defineProperty(deps, "onSignal", {
+    get(): PipelineV2RunnerDeps["onSignal"] {
+      getterReads += 1;
+      if (getterReads > 1) {
+        throw new Error("SECOND-GETTER-READ");
+      }
+      return (handler) => {
+        registrations += 1;
+        handlerSeen = handler;
+      };
+    },
+    enumerable: true,
+  });
+  const capturedDiagnostics = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await runPipelineV2(validOptions(harness), deps);
+  } finally {
+    capturedDiagnostics.restore();
+  }
+  expect(outcome.ok).toBe(true);
+  expect(outcome.exitCode).toBe(0);
+  expect(outcome.state?.status).toBe("success");
+  // Exactly one getter read (the protected preflight capture) and exactly
+  // one registration callback; the handler is live and usable.
+  expect(getterReads).toBe(1);
+  expect(registrations).toBe(1);
+  expect(handlerSeen).not.toBeNull();
+  // No second-getter diagnostics anywhere.
+  expect(capturedDiagnostics.errors.join("\n")).not.toContain("SECOND-GETTER-READ");
+});
+
 test("F2a. a signal delivered during a successful snapshot yields the pre-create_run signal outcome", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
   const runId = "postsnap-0000-0000-0000-000000000000";

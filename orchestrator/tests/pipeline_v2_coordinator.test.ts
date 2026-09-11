@@ -2882,6 +2882,58 @@ test("60. a sigterm-then-sigint control observes exactly one freeze, so the firs
   expect(control.freezeCalls()).toBe(1);
 });
 
+test("61. create_run durability-unknown takes the cutoff exactly once and keeps state_persist_failed", async () => {
+  const harness = await setupHarness(PIPELINE_ENTRY_SUCCESS, {
+    io: faultIo({ failCommit: 1, failStep: "dirfsync" }),
+  });
+  const fake = fakeRuntime([]);
+  const control = cutoffControl("neutral");
+  const result = await coordinate(harness, fake.runtime, { control });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("state_persist_failed");
+  }
+  const adopted = result.state;
+  if (adopted === null) {
+    throw new Error("the adopted candidate snapshot is missing");
+  }
+  // The adopted candidate is the authoritative snapshot, returned by
+  // identity through the existing sink contract.
+  const adoptedSnapshot = harness.recording.snapshot;
+  if (adoptedSnapshot === null) {
+    throw new Error("the sink lost the adopted candidate snapshot");
+  }
+  expect(adopted).toBe(adoptedSnapshot);
+  expect(adopted.revision).toBe(1);
+  expect(harness.sink.poisoned).toBe(true);
+  // The cutoff froze acceptance exactly once; the accepted signal never
+  // masks the durability-unknown failure.
+  expect(control.freezeCalls()).toBe(1);
+  // No further dispatch of any kind and no Session follow the poisoned
+  // create_run.
+  expect(kinds(harness.recording)).toEqual(["create_run"]);
+  expect(fake.createCalls.length).toBe(0);
+});
+
+test("62. create_run not_committed returns state null and takes no cutoff", async () => {
+  const harness = await setupHarness(PIPELINE_ENTRY_SUCCESS, {
+    io: faultIo({ failCommit: 1, failStep: "write" }),
+  });
+  const fake = fakeRuntime([]);
+  const control = cutoffControl("neutral");
+  const result = await coordinate(harness, fake.runtime, { control });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("state_persist_failed");
+  }
+  expect(result.state).toBeNull();
+  // No durable state exists, so the cutoff is not required.
+  expect(control.freezeCalls()).toBe(0);
+  expect(kinds(harness.recording)).toEqual(["create_run"]);
+  expect(fake.createCalls.length).toBe(0);
+  expect(harness.sink.poisoned).toBe(false);
+});
+
 async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {
   try {
     return await lstat(path);

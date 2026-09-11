@@ -220,9 +220,6 @@ function validateRunnerContract(
       );
     }
   }
-  if (deps.onSignal !== undefined && typeof deps.onSignal !== "function") {
-    throw new Error("pipeline v2 runner deps.onSignal must be a function");
-  }
   if (deps.now !== undefined && typeof deps.now !== "function") {
     throw new Error("pipeline v2 runner deps.now must be a function");
   }
@@ -478,7 +475,14 @@ export async function runPipelineV2(
   let gate: RunCauseGate;
   try {
     validateRunnerContract(options, deps);
-    gate = new RunCauseGate(deps.onSignal);
+    // The signal seam is read exactly once, here, inside the protected
+    // preflight; the captured value alone is checked and handed to the
+    // gate, so the original getter or property is never read again.
+    const capturedOnSignal = deps.onSignal;
+    if (capturedOnSignal !== undefined && typeof capturedOnSignal !== "function") {
+      throw new Error("pipeline v2 runner deps.onSignal must be a function");
+    }
+    gate = new RunCauseGate(capturedOnSignal);
   } catch (cause) {
     return preflightFailure(cause);
   }
