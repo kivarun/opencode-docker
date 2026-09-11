@@ -288,12 +288,12 @@ function collectKeys(value: unknown, into: Set<string>): void {
   }
 }
 
-describe("pipeline v2 run state schema v4", () => {
+describe("pipeline v2 run state schema v5", () => {
   test("reduces agent -> decision -> agent -> terminal success with the shared execution index", () => {
     const driver = createDriver();
     playSuccessRun(driver);
     const state = driver.current as PipelineV2RunState;
-    expect(state.schema_version).toBe(4);
+    expect(state.schema_version).toBe(5);
     expect(state.revision).toBe(23);
     expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
@@ -314,7 +314,7 @@ describe("pipeline v2 run state schema v4", () => {
       { index: 0, from: "check", outcome: "approved", to: "ship", execution_index: 2 },
       { index: 0, from: "ship", outcome: "completed", to: "done", execution_index: 3 },
     ]);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(4);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(5);
   });
 
   test("every accepted command grows the revision by exactly one and refreshes updated_at", () => {
@@ -1358,24 +1358,30 @@ describe("pipeline v2 run state schema v4", () => {
     }, 'execution 1 records a failed session cleanup, so the run must finalize as status "cleanup_failed"');
   });
 
-  test("parse rejects schema versions 1, 2 and 3 without any migration", () => {
+  test("parse rejects schema versions 1, 2, 3 and 4 without any migration", () => {
     expect(() => parsePipelineV2RunState('{"schema_version":1}')).toThrow(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v1 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":2}')).toThrow(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 4 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 5 is the supported contract; no v2 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 2 })).toThrow(
-      "not a pipeline v2 run state (schema version 4 is the supported contract; no v2 migration exists)",
+      "not a pipeline v2 run state (schema version 5 is the supported contract; no v2 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":3}')).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v3 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 3 })).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v3 migration exists)",
     );
-    expect(() => parsePipelineV2RunState('{"schema_version":5}')).toThrow(
-      "pipeline v2 run state has schema_version 5, expected 4",
+    expect(() => parsePipelineV2RunState('{"schema_version":4}')).toThrow(
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v4 migration exists)",
+    );
+    expect(() => validatePipelineV2RunState({ schema_version: 4 })).toThrow(
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v4 migration exists)",
+    );
+    expect(() => parsePipelineV2RunState('{"schema_version":6}')).toThrow(
+      "pipeline v2 run state has schema_version 6, expected 5",
     );
   });
 
@@ -1409,9 +1415,35 @@ describe("pipeline v2 run state schema v4", () => {
     });
     await writeFile(path, v3Document);
     expect(() => parsePipelineV2RunState(v3Document)).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 4 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v3 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v3Document);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  test("a stored schema v4 document is rejected and left byte-for-byte identical", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipeline-v2-state-v4-"));
+    const path = join(root, "state.json");
+    // A plausible v4 document: full v4 shape without the wait record.
+    const v4Document = JSON.stringify({
+      schema_version: 4,
+      revision: 5,
+      run_id: "old-run",
+      status: "active",
+      phase: "running",
+      started_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      pipeline: IDENTITY,
+      inputs: [],
+      cursor: { current_state: "implement", transition_count: 0 },
+      executions: [],
+      transitions: [],
+    });
+    await writeFile(path, v4Document);
+    expect(() => parsePipelineV2RunState(v4Document)).toThrow(
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v4 migration exists)",
+    );
+    expect(await readFile(path, "utf8")).toBe(v4Document);
     await rm(root, { recursive: true, force: true });
   });
 
@@ -1990,5 +2022,577 @@ describe("pipeline v2 run state schema v4", () => {
       },
       "only attempt 1 is supported",
     );
+  });
+});
+
+describe("pipeline v2 run state schema v5: durable user wait", () => {
+  /** The default-pipeline policy graph around the P01 wait: architect/coder. */
+  const WAIT_IDENTITY: PipelineV2RunPipelineIdentity = {
+    ...IDENTITY,
+    entry_state: "architect",
+    max_transitions: 6,
+  };
+
+  /** P01 wait actions in oracle order: continue_stage routes to coder, revise_task to architect. */
+  const ORACLE_WAIT_ACTIONS = [
+    { id: "continue_stage", to: "coder" },
+    { id: "revise_task", to: "architect" },
+  ];
+
+  function runWaiting(
+    overrides: Partial<{ stateId: string; reason: string; requestSha256: string; actions: { id: string; to: string }[] }> = {},
+  ): PipelineV2RunCommand {
+    return {
+      kind: "run_waiting",
+      stateId: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [...ORACLE_WAIT_ACTIONS],
+      ...overrides,
+    };
+  }
+
+  /** Produces a valid waiting state: entry-state wait, zero executions, zero transitions. */
+  function produceWaitingState(): PipelineV2RunState {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    return driver.current as PipelineV2RunState;
+  }
+
+  test("run_waiting: entry-state wait without executions and transitions (P01-S01..S04 as durable wait entry)", () => {
+    const driver = loadableDriver(createDriver(WAIT_IDENTITY, []));
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    const state = driver.apply(runWaiting());
+    expect(state.status).toBe("waiting");
+    expect(state.phase).toBe("waiting");
+    expect(state.revision).toBe(2);
+    expect(state.wait).toEqual({
+      state_id: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      request_sha256: hex("7"),
+      actions: ORACLE_WAIT_ACTIONS,
+    });
+    // the wait record is content-free: exactly these four fields
+    expect(Object.keys(state.wait as object)).toEqual([
+      "state_id",
+      "reason",
+      "request_sha256",
+      "actions",
+    ]);
+    expect(state.cursor).toEqual({ current_state: "architect", transition_count: 0 });
+    expect(state.executions).toEqual([]);
+    expect(state.transitions).toEqual([]);
+    expect(state.terminal).toBeUndefined();
+    expect(state.failure).toBeUndefined();
+    expect(state.run_outputs).toBeUndefined();
+    expect(state.started_at).toBe(tick(0).toISOString());
+    expect(state.updated_at).toBe(tick(1).toISOString());
+    expectDeepFrozen(state);
+  });
+
+  test("run_waiting: wait after a decision transition commits, at the new cursor", () => {
+    const identity = { ...IDENTITY, entry_state: "check", max_transitions: 2 };
+    const driver = loadableDriver(createDriver(identity, []));
+    driver.apply(createRun(identity, []));
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "check", "uncovered", "architect", 1);
+    const state = driver.apply(runWaiting());
+    expect(state.status).toBe("waiting");
+    expect(state.phase).toBe("waiting");
+    expect(state.wait?.state_id).toBe("architect");
+    expect(state.cursor).toEqual({ current_state: "architect", transition_count: 1 });
+    expect(state.executions.map((execution) => `${execution.index}:${execution.state_id}`)).toEqual([
+      "1:check",
+    ]);
+    expect(state.transitions).toEqual([
+      { index: 0, from: "check", outcome: "uncovered", to: "architect", execution_index: 1 },
+    ]);
+  });
+
+  test("run_waiting: wait after a settled agent transition commits (P01 reason preserved)", () => {
+    const identity = { ...IDENTITY, max_transitions: 2 };
+    const driver = loadableDriver(createDriver(identity, []));
+    driver.apply(createRun(identity, []));
+    startAgent(driver, "implement", { execution: "sess-1" });
+    acceptOutputs(driver, []);
+    commitTransition(driver, "implement", "completed", "architect", 1);
+    const state = driver.apply(runWaiting());
+    expect(state.wait).toEqual({
+      state_id: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      request_sha256: hex("7"),
+      actions: ORACLE_WAIT_ACTIONS,
+    });
+    const execution = state.executions[0] as Extract<
+      PipelineV2RunState["executions"][number],
+      { type: "agent" }
+    >;
+    expect(execution.phase).toBe("cleanup_completed");
+    expect(state.transitions.length).toBe(1);
+  });
+
+  test("several wait actions may target the same state, in declaration order", () => {
+    const driver = loadableDriver(createDriver(WAIT_IDENTITY, []));
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    const state = driver.apply(
+      runWaiting({
+        actions: [
+          { id: "continue_stage", to: "coder" },
+          { id: "continue_stage_stronger", to: "coder" },
+          { id: "revise_task", to: "architect" },
+        ],
+      }),
+    );
+    expect(state.wait?.actions).toEqual([
+      { id: "continue_stage", to: "coder" },
+      { id: "continue_stage_stronger", to: "coder" },
+      { id: "revise_task", to: "architect" },
+    ]);
+  });
+
+  test("run_waiting rejects zero actions and duplicate action ids", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.reject(runWaiting({ actions: [] }), "run_waiting requires at least one action");
+    driver.reject(
+      runWaiting({ actions: "continue_stage" as never }),
+      "run_waiting requires an actions array",
+    );
+    driver.reject(
+      runWaiting({
+        actions: [
+          { id: "continue_stage", to: "coder" },
+          { id: "continue_stage", to: "architect" },
+        ],
+      }),
+      'run_waiting declares action id "continue_stage" more than once',
+    );
+  });
+
+  test("run_waiting rejects unsafe state ids, reasons, action ids, targets and unknown action fields", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.reject(runWaiting({ stateId: "../bad" }), "run_waiting state id must be a safe non-empty identifier");
+    driver.reject(runWaiting({ stateId: "a..b" }), "run_waiting state id must be a safe non-empty identifier");
+    driver.reject(runWaiting({ reason: "" }), "run_waiting reason must be a safe non-empty identifier");
+    driver.reject(
+      runWaiting({ reason: "Stage Limit!" }),
+      "run_waiting reason must be a safe non-empty identifier",
+    );
+    driver.reject(
+      runWaiting({ actions: [{ id: "../bad", to: "coder" }] }),
+      "run_waiting actions[0].id must be a safe non-empty identifier",
+    );
+    driver.reject(
+      runWaiting({ actions: [{ id: "continue_stage", to: "/coder" }] }),
+      "run_waiting actions[0].to must be a safe non-empty identifier",
+    );
+    driver.reject(
+      runWaiting({ actions: [{ id: "continue_stage", to: "coder", extra: 1 } as never] }),
+      'run_waiting actions[0] has unknown field "extra"',
+    );
+    driver.reject(
+      runWaiting({ actions: ["continue_stage" as never] }),
+      "run_waiting actions[0] is not a JSON object",
+    );
+  });
+
+  test("run_waiting rejects malformed request digests", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.reject(
+      runWaiting({ requestSha256: hex("A") }),
+      "run_waiting request_sha256 must be a lowercase hex SHA-256 digest",
+    );
+    driver.reject(
+      runWaiting({ requestSha256: "abc" }),
+      "run_waiting request_sha256 must be a lowercase hex SHA-256 digest",
+    );
+    driver.reject(
+      runWaiting({ requestSha256: "a".repeat(65) }),
+      "run_waiting request_sha256 must be a lowercase hex SHA-256 digest",
+    );
+    driver.reject(
+      runWaiting({ requestSha256: "z".repeat(64) }),
+      "run_waiting request_sha256 must be a lowercase hex SHA-256 digest",
+    );
+    driver.reject(
+      runWaiting({ requestSha256: 123 as never }),
+      "run_waiting request_sha256 must be a lowercase hex SHA-256 digest",
+    );
+  });
+
+  test("run_waiting rejects an unfinished agent execution in every in-flight phase", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    driver.reject(
+      runWaiting({ stateId: "implement" }),
+      'entering the wait requires execution 1 to be finished, it has phase "started"',
+    );
+    driver.apply({ kind: "agent_data_prepared" });
+    driver.reject(
+      runWaiting({ stateId: "implement" }),
+      'entering the wait requires execution 1 to be finished, it has phase "data_prepared"',
+    );
+    driver.apply({ kind: "agent_execution_session_created", sessionId: "sess-1" });
+    driver.reject(
+      runWaiting({ stateId: "implement" }),
+      'entering the wait requires execution 1 to be finished, it has phase "execution_session_created"',
+    );
+    driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-1" });
+    driver.reject(
+      runWaiting({ stateId: "implement" }),
+      'entering the wait requires execution 1 to be finished, it has phase "sessions_created"',
+    );
+    driver.apply({ kind: "agent_running" });
+    driver.reject(
+      runWaiting({ stateId: "implement" }),
+      'entering the wait requires execution 1 to be finished, it has phase "running"',
+    );
+  });
+
+  test("run_waiting rejects an evaluating decision execution", () => {
+    const identity = { ...IDENTITY, entry_state: "check", max_transitions: 2 };
+    const driver = createDriver(identity, []);
+    driver.apply(createRun(identity, []));
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.reject(
+      runWaiting({ stateId: "check" }),
+      'entering the wait requires execution 1 to be finished, it has phase "evaluating"',
+    );
+  });
+
+  test("run_waiting rejects a settled execution whose transition was never committed", () => {
+    const identity = { ...IDENTITY, max_transitions: 2 };
+    const driver = createDriver(identity, []);
+    driver.apply(createRun(identity, []));
+    startAgent(driver, "implement", { execution: "sess-1" });
+    acceptOutputs(driver, []);
+    driver.reject(
+      runWaiting({ stateId: "implement" }),
+      "entering the wait requires every execution's transition to be committed",
+    );
+  });
+
+  test("run_waiting rejects a state id that does not match the cursor", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.reject(
+      runWaiting({ stateId: "coder" }),
+      'wait state "coder" does not match the cursor "architect"',
+    );
+  });
+
+  test("run_waiting is rejected after the terminal, after publication and after finalization", () => {
+    const driver = createDriver();
+    playUpToTerminal(driver);
+    driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
+    driver.reject(
+      runWaiting({ stateId: "done" }),
+      "the terminal state is already reached; a waiting run cannot be recorded",
+    );
+    driver.apply({ kind: "run_outputs_published", outputs: [] });
+    driver.reject(
+      runWaiting({ stateId: "done" }),
+      'entering the wait requires phase "running", got "publishing_outputs"',
+    );
+    driver.apply({ kind: "run_succeeded" });
+    driver.reject(
+      runWaiting({ stateId: "done" }),
+      'the run is already finalized with status "success"; the terminal run status is immutable',
+    );
+
+    const failedDriver = createDriver();
+    failedDriver.apply(createRun());
+    startAgent(failedDriver, "implement", { execution: "sess-1" });
+    failedDriver.apply({
+      kind: "agent_failed",
+      reason: "worker_failed",
+      sessionCleanup: { execution: "completed", tool: "completed" },
+    });
+    failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
+    failedDriver.reject(
+      runWaiting({ stateId: "implement" }),
+      'the run is already finalized with status "failed"; the terminal run status is immutable',
+    );
+  });
+
+  test("after waiting every command is rejected, including a repeated wait", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    const waitingMessage =
+      "the run is waiting for an explicit user response; no command of this schema version advances a waiting run";
+    driver.reject(runWaiting(), waitingMessage);
+    driver.reject({ kind: "start_agent_execution", stateId: "architect", profile: "coder" }, waitingMessage);
+    driver.reject({ kind: "start_decision_execution", stateId: "architect", inputDigest: hex("e") }, waitingMessage);
+    driver.reject({ kind: "agent_data_prepared" }, waitingMessage);
+    driver.reject(
+      {
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "completed", to: "coder", transition_index: 0 },
+        executionIndex: 1,
+      },
+      waitingMessage,
+    );
+    driver.reject({ kind: "terminal_reached", terminalStateId: "architect", terminalResult: "success" }, waitingMessage);
+    driver.reject({ kind: "run_outputs_published", outputs: [] }, waitingMessage);
+    driver.reject({ kind: "run_succeeded" }, waitingMessage);
+    driver.reject({ kind: "run_failed", reason: "worker_failed" }, waitingMessage);
+    driver.reject({ kind: "run_cleanup_failed" }, waitingMessage);
+    // create_run has its own dedicated rejection path
+    driver.reject(createRun(WAIT_IDENTITY, []), 'create_run rejected: run "run-1" already exists (revision 2)');
+    const state = driver.current as PipelineV2RunState;
+    expect(state.status).toBe("waiting");
+    expect(state.revision).toBe(2);
+  });
+
+  test("the reducer never mutates the wait command or the input state; later command mutation cannot change the record", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    const before = driver.current as PipelineV2RunState;
+
+    const actions: { id: string; to: string }[] = [
+      { id: "continue_stage", to: "coder" },
+      { id: "revise_task", to: "architect" },
+    ];
+    const command = runWaiting({ actions });
+    const commandSnapshot = JSON.parse(JSON.stringify(command));
+    const next = reducePipelineV2RunCommand(before, command, tick(40));
+    expect(JSON.parse(JSON.stringify(command))).toEqual(commandSnapshot);
+    expect(JSON.parse(JSON.stringify(before))).toEqual(draftOf(before));
+
+    // mutating the caller's command array afterwards cannot change the record
+    actions.push({ id: "sneak", to: "coder" });
+    actions[0]!.id = "mutated";
+    expect(next.wait).toEqual({
+      state_id: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      request_sha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    expectDeepFrozen(next);
+    expectDeepFrozen(before);
+  });
+
+  test("the loader enforces the status/phase/wait biconditional in both directions", () => {
+    const state = produceWaitingState();
+    expectInvalid(state, (draft) => {
+      draft.status = "active";
+      draft.phase = "waiting";
+    }, 'run phase "waiting" requires run status "waiting"');
+    expectInvalid(state, (draft) => {
+      draft.status = "active";
+      draft.phase = "running";
+    }, 'a wait record requires run status "waiting"');
+    expectInvalid(state, (draft) => {
+      draft.phase = "running";
+    }, 'run status "waiting" requires phase "waiting" and a wait record');
+    expectInvalid(state, (draft) => {
+      delete draft.wait;
+    }, 'run status "waiting" requires phase "waiting" and a wait record');
+    expectInvalid(state, (draft) => {
+      draft.status = "active";
+      draft.phase = "waiting";
+    }, 'run phase "waiting" requires run status "waiting"');
+
+    // every non-waiting status forbids a wait record
+    const successDriver = createDriver();
+    playSuccessRun(successDriver);
+    expectInvalid(successDriver.current as PipelineV2RunState, (draft) => {
+      draft.wait = JSON.parse(JSON.stringify(state.wait));
+    }, 'a wait record requires run status "waiting"');
+
+    const identity = { ...IDENTITY, max_transitions: 1 };
+    const failedDriver = createDriver(identity, []);
+    failedDriver.apply(createRun(identity, []));
+    startAgent(failedDriver, "implement", { execution: "sess-1" });
+    failedDriver.apply({
+      kind: "agent_failed",
+      reason: "worker_failed",
+      sessionCleanup: { execution: "completed", tool: "completed" },
+    });
+    failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
+    expectInvalid(failedDriver.current as PipelineV2RunState, (draft) => {
+      draft.wait = JSON.parse(JSON.stringify(state.wait));
+    }, 'a wait record requires run status "waiting"');
+
+    const cleanupDriver = createDriver(identity, []);
+    cleanupDriver.apply(createRun(identity, []));
+    startAgent(cleanupDriver, "implement", { execution: "sess-1" });
+    cleanupDriver.apply({
+      kind: "agent_failed",
+      reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
+      sessionCleanup: { execution: "failed", tool: "completed" },
+    });
+    cleanupDriver.apply({ kind: "run_cleanup_failed" });
+    expectInvalid(cleanupDriver.current as PipelineV2RunState, (draft) => {
+      draft.wait = JSON.parse(JSON.stringify(state.wait));
+    }, 'a wait record requires run status "waiting"');
+  });
+
+  test("a waiting run must not carry a terminal, run outputs or a failure reason", () => {
+    const state = produceWaitingState();
+    expectInvalid(state, (draft) => {
+      draft.terminal = { state_id: "architect", result: "success" };
+    }, "a waiting run must not carry a reached terminal state");
+    // run outputs without a terminal hit the general coherence check first
+    expectInvalid(state, (draft) => {
+      draft.run_outputs = [];
+    }, "run_outputs exist but the terminal state was never reached");
+    // terminal + run outputs: the waiting terminal guard fires first
+    expectInvalid(state, (draft) => {
+      draft.terminal = { state_id: "architect", result: "success" };
+      draft.run_outputs = [];
+    }, "a waiting run must not carry a reached terminal state");
+    expectInvalid(state, (draft) => {
+      draft.failure = { reason: "worker_failed" };
+    }, "a waiting run must not carry a failure reason");
+  });
+
+  test("the wait record must name the cursor state", () => {
+    const state = produceWaitingState();
+    expectInvalid(state, (draft) => {
+      draft.wait.state_id = "coder";
+    }, 'the wait record names state "coder", which does not match the cursor "architect"');
+  });
+
+  test("the loader validates the wait record fail-closed", () => {
+    const state = produceWaitingState();
+    expectInvalid(state, (draft) => {
+      draft.wait.state_id = "../bad";
+    }, "wait.state_id must be a safe non-empty identifier");
+    expectInvalid(state, (draft) => {
+      draft.wait.reason = "Stage Limit!";
+    }, "wait.reason must be a safe non-empty identifier");
+    expectInvalid(state, (draft) => {
+      draft.wait.reason = "";
+    }, "wait.reason must be a safe non-empty identifier");
+    expectInvalid(state, (draft) => {
+      draft.wait.request_sha256 = hex("A");
+    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+    expectInvalid(state, (draft) => {
+      draft.wait.request_sha256 = "abc";
+    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+    expectInvalid(state, (draft) => {
+      draft.wait.request_sha256 = "a".repeat(65);
+    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+    expectInvalid(state, (draft) => {
+      draft.wait.request_sha256 = "z".repeat(64);
+    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+    expectInvalid(state, (draft) => {
+      draft.wait.actions = [];
+    }, "wait.actions must not be empty");
+    expectInvalid(state, (draft) => {
+      draft.wait.actions = "continue_stage";
+    }, "wait.actions must be an array");
+    expectInvalid(state, (draft) => {
+      draft.wait.actions = [
+        { id: "continue_stage", to: "coder" },
+        { id: "continue_stage", to: "architect" },
+      ];
+    }, 'wait declares action id "continue_stage" more than once');
+    expectInvalid(state, (draft) => {
+      draft.wait.actions[0].id = "../bad";
+    }, "wait.actions[0].id must be a safe non-empty identifier");
+    expectInvalid(state, (draft) => {
+      draft.wait.actions[1].to = "/architect";
+    }, "wait.actions[1].to must be a safe non-empty identifier");
+    expectInvalid(state, (draft) => {
+      draft.wait.actions[0].target = "coder";
+    }, 'wait.actions[0] has unknown field "target"');
+    expectInvalid(state, (draft) => {
+      draft.wait.evidence = "acceptance test 7 fails";
+    }, 'wait has unknown field "evidence"');
+    expectInvalid(state, (draft) => {
+      draft.wait.manifest = { intent: "continue_stage" };
+    }, 'wait has unknown field "manifest"');
+    expectInvalid(state, (draft) => {
+      draft.wait = { state_id: "architect", reason: "stage_iteration_limit_exhausted", request_sha256: hex("7") };
+    }, 'wait is missing required field "actions"');
+    expectInvalid(state, (draft) => {
+      draft.wait = "waiting";
+    }, "wait is not a JSON object");
+  });
+
+  test("the loader rejects a waiting run with an unfinished or unbound execution", () => {
+    const identity = { ...IDENTITY, max_transitions: 2 };
+    const driver = createDriver(identity, []);
+    driver.apply(createRun(identity, []));
+    startAgent(driver, "implement", { execution: "sess-1" });
+    acceptOutputs(driver, []);
+    commitTransition(driver, "implement", "completed", "architect", 1);
+    driver.apply(runWaiting());
+    const state = driver.current as PipelineV2RunState;
+
+    // an in-flight execution: phase, cleanup, outputs and the bound
+    // transition must be forged consistently so the execution-level and
+    // transition-level validations pass and the waiting coherence check is
+    // what rejects the document
+    expectInvalid(state, (draft) => {
+      draft.executions[0].phase = "running";
+      delete draft.executions[0].session_cleanup;
+      delete draft.executions[0].outputs;
+      draft.transitions = [];
+      draft.cursor = { current_state: "implement", transition_count: 0 };
+      draft.wait.state_id = "implement";
+    }, 'a waiting run requires execution 1 to be finished, it has phase "running"');
+    expectInvalid(state, (draft) => {
+      draft.transitions = [];
+      draft.cursor = { current_state: "implement", transition_count: 0 };
+      draft.wait.state_id = "implement";
+    }, "a waiting run requires every execution's transition to be committed; execution 1 has no committed transition");
+  });
+
+  test("a loaded waiting state is deep-frozen and round-trips through parse", () => {
+    const state = produceWaitingState();
+    const parsed = parsePipelineV2RunState(JSON.stringify(state));
+    expect(parsed).toEqual(state);
+    expectDeepFrozen(parsed);
+  });
+
+  test("negative secret scan of the waiting run: no manifest body, evidence, task/plan bodies, profile bindings, paths or credentials", () => {
+    const canaries = [
+      '{"intent":"continue_stage","additional_iterations":2}',
+      "unmet acceptance criteria: acceptance test 7 fails",
+      "reviewer_alternative",
+      "coder_stronger",
+      "TASK.md revision 2: rewrite the parser",
+      "PLAN: stage 3 of 5",
+      "stage_iteration=4_of_4",
+      "/var/lib/orchestrator/runs/run-1/wait-request.json",
+      "dht_session_bearer_token",
+      "OPENCODE_CONFIG_CONTENT",
+    ];
+    const state = produceWaitingState();
+    const text = JSON.stringify(state);
+    for (const canary of canaries) {
+      expect(text).not.toContain(canary);
+    }
+    const keys = new Set<string>();
+    collectKeys(state, keys);
+    for (const banned of [
+      "evidence",
+      "manifest",
+      "request",
+      "user_response",
+      "response",
+      "task",
+      "plan",
+      "profile_bindings",
+      "endpoint",
+      "token",
+    ]) {
+      expect(keys.has(banned), `state must not carry a ${banned} field`).toBe(false);
+    }
   });
 });

@@ -12,7 +12,7 @@ import type { PipelineStateIo } from "./run_snapshot_store.ts";
 
 /**
  * Durable run state sink for pipeline schema version 2 (`pipeline_v2_state.ts`,
- * state schema version 4). The sink owns no vocabulary of its own: every mutation
+ * state schema version 5). The sink owns no vocabulary of its own: every mutation
  * goes through the existing `PipelineV2RunCommand` union via
  * `dispatch(command)`, which always runs
  *

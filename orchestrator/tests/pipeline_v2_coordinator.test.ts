@@ -38,7 +38,7 @@ import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
  * Tests for the production-neutral pipeline v2 coordinator over the
  * two-session capability model: one orchestration flow through
  * `executePipelineV2Graph`, the v2 data plane, the decision evaluator, the
- * execution digest, the durable state schema v4, the run state sink and
+ * execution digest, the durable state schema v5, the run state sink and
  * the typed runtime failures — with an injected fake agent runtime that
  * creates an orchestrator-owned Execution Session and a worker-facing Tool
  * Session per activation. Everything is deterministic: no sleeps, no LLM,

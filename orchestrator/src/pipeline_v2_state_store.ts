@@ -14,7 +14,7 @@ import {
 /**
  * Typed adapter of the shared durable snapshot store substrate
  * (`run_snapshot_store.ts`) for the pipeline v2 run state contract
- * (`pipeline_v2_state.ts`, state schema version 4). The substrate owns the layout,
+ * (`pipeline_v2_state.ts`, state schema version 5). The substrate owns the layout,
  * the atomic commit protocol, permissions, symlink refusals, and the
  * in-process commit serialization; this adapter only pins the v2 parser,
  * the v2 snapshot type, and the v2 typed commit outcomes:

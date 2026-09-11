@@ -14,7 +14,7 @@ result identity, run state schema version 2). Pipeline schema v2 has its
 own production entrypoint now: `orchestrator run` (see the "The production
 pipeline v2 CLI" section) drives the assembled pipeline v2 stack —
 graph execution, the run-owned project copy, the data plane, decision
-states, the Docker Helper runtime adapter, the durable state schema v4,
+states, the Docker Helper runtime adapter, the durable state schema v5,
 and output publication — through the single production runner
 `runPipelineV2`. `agent-smoke` remains the v1 diagnostic command with its
 own schema version 1 loader; the bundled default pipeline has not been
@@ -186,7 +186,7 @@ orchestrator run \
   activations. The source directory is never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 4), and the published run outputs stay at the fixed
+  (state schema version 5), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
@@ -1316,18 +1316,21 @@ Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
 them.
 
-### Pipeline v2 run state (state schema version 4, the production run state of pipeline v2)
+### Pipeline v2 run state (state schema version 5, the production run state of pipeline v2)
 
 `orchestrator/src/pipeline_v2_state.ts` already defines the durable run state
-for pipeline schema v2 as a pure substrate (state schema version 4, with the
+for pipeline schema v2 as a pure substrate (state schema version 5, with the
 nested pipeline identity carrying `schema_version: 2`): logical run inputs
 (id, port type, protected flag, snapshot digest), a shared contiguous
 execution index covering both agent and decision executions (agent
 executions reuse it as their activation index; a decision occupies an index
 without an activation directory), per-execution phase records, committed
 transitions that bind exactly one settled execution, the terminal, published
-run outputs (present/absent variants with digests only), and a normalized
-failure reason.
+run outputs (present/absent variants with digests only), a normalized
+failure reason, and one optional content-free `wait` record
+(`{state_id, reason, request_sha256, actions}`) that durably marks the run
+as waiting for an explicit user response (`status`/`phase` `"waiting"`);
+no user-response successor exists yet, so a waiting run stays immobile.
 
 One agent execution records two independent, durable, non-secret session
 ids following the two-session capability model: `execution_session_id`
@@ -1339,14 +1342,16 @@ Global session-id uniqueness spans both fields of every execution, so an
 id can never be reused — not even once as an Execution and once as a Tool
 session. Bearers, endpoints, and credentials never enter the document.
 
-The pure reducer applies 18 commands and enforces the same shape as the v1
+The pure reducer applies 19 commands and enforces the same shape as the v1
 state (execution only at the cursor, one in-flight execution, a new
 execution only after the previous transition commit, two-slot session-id
 uniqueness, the phase successor chain `started` → `data_prepared` →
 `execution_session_created` → `sessions_created` → `running` →
 `outputs_accepted` → `cleanup_completed`, the tool session only after the
 execution session, transition only after agent cleanup or a matching
-evaluated decision outcome, the transition budget, one terminal at the
+evaluated decision outcome, the transition budget, `run_waiting` only on an
+active running run at the cursor with a settled, fully committed history
+and no terminal/outputs/failure/previous wait, one terminal at the
 cursor, publication exactly once after the terminal, `run_succeeded`
 requiring published outputs, a published failed terminal finalizing as
 `run_failed` with `terminal_failed`, cleanup failures finalizing only as

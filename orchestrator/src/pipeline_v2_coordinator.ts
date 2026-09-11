@@ -2,7 +2,7 @@
  * Production-neutral coordinator for pipeline schema version 2: the first
  * orchestration layer that assembles the already existing v2 components —
  * `executePipelineV2Graph`, the v2 data plane, the decision evaluator, the
- * execution snapshot/digest, the durable state schema v4, the run state
+ * execution snapshot/digest, the durable state schema v5, the run state
  * sink and the typed runtime failures — into one coordination flow.
  *
  * The coordinator owns the durable run state end to end: it creates the
@@ -424,7 +424,7 @@ function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined
 /**
  * Classifies one unexpected failure by typed errors and context only —
  * never by parsing messages. The typed data-plane reasons, the engine
- * reasons (all of which exist in state schema v4) and the store/durability
+ * reasons (all of which exist in state schema v5) and the store/durability
  * failures keep their reasons; everything else is `internal_error`.
  */
 function classifyCause(cause: unknown): PipelineV2FailureReason {

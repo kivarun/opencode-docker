@@ -37,7 +37,7 @@ async function listDir(path: string): Promise<string[]> {
 }
 
 describe("pipeline v2 run state store", () => {
-  test("create, commit, and load round-trip the full schema v3 document", async () => {
+  test("create, commit, and load round-trip the full schema v5 document", async () => {
     const states = buildStates(RUN_ID);
     await withStore("store-run", async ({ store, statePath }) => {
       expect(await store.load()).toBeNull();
@@ -65,8 +65,12 @@ describe("pipeline v2 run state store", () => {
           "schema_version 1",
         ],
         [
-          JSON.stringify({ schema_version: 2, revision: 1, run_id: "x", status: "active", phase: "running" }),
-          "schema_version 2",
+          JSON.stringify({ schema_version: 3, revision: 1, run_id: "x", status: "active", phase: "running" }),
+          "schema_version 3",
+        ],
+        [
+          JSON.stringify({ schema_version: 4, revision: 1, run_id: "x", status: "active", phase: "running" }),
+          "schema_version 4",
         ],
         ["{ not json", "is not valid JSON"],
         ['{"schema_version":3,"revision":1', "is not valid JSON"],

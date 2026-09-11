@@ -625,7 +625,7 @@ test("1. happy path: agent -> decision -> success through the real sink, runtime
   // Tool cleanup first, then the Execution session; exactly two deletes.
   expect(deleteIds(captured.transport)).toEqual(["dhs_fake_2", "dhs_fake_1"]);
 
-  // Durable state v4: success with two settled executions and two
+  // Durable state v5: success with two settled executions and two
   // transitions.
   expect(state.status).toBe("success");
   expect(state.executions.length).toBe(2);

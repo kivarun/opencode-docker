@@ -30,9 +30,6 @@ function cleanAbsolutePathFailure(value: unknown, what: string): string | null {
   if (value.includes("\0")) {
     return `${what} must not contain a NUL character`;
   }
-  if (value !== value.trim()) {
-    return `${what} must not contain leading or trailing whitespace`;
-  }
   if (value !== "/") {
     for (const segment of value.slice(1).split("/")) {
       if (segment === "" || segment === "." || segment === "..") {
