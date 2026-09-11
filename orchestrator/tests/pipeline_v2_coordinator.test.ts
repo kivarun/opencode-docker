@@ -347,6 +347,16 @@ ${DECISION_TRANSITIONS}
     result: failed
 `;
 
+/**
+ * Neutral signal control for the coordinator contract: no signal is ever
+ * accepted, and freezing returns none. Signal behavior itself is covered
+ * by the production runner tests.
+ */
+const NEUTRAL_CONTROL = {
+  currentSignal: (): "SIGINT" | "SIGTERM" | null => null,
+  freezeSignal: (): "SIGINT" | "SIGTERM" | null => null,
+};
+
 // --- tests -----------------------------------------------------------------
 
 test("1. agent -> decision -> success records the exact two-session command order", async () => {
@@ -2468,7 +2478,7 @@ async function coordinate(
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime,
-  });
+  }, NEUTRAL_CONTROL);
 }
 
 function kinds(recording: RecordingSink): string[] {
@@ -2546,7 +2556,7 @@ test("34. a project preparation failure reaches no command and no session", asyn
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime: fake.runtime,
-  });
+  }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
   if (!result.ok) {
     expect(result.reason).toBe("run_input_invalid");
@@ -2579,7 +2589,7 @@ test("35. a late run-input failure keeps the published project copy and an untou
     inputBindings: brokenBindings,
     sink: harness.recording,
     runtime: fake.runtime,
-  });
+  }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
   if (!result.ok) {
     expect(result.reason).toBe("run_input_invalid");
@@ -2723,7 +2733,7 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
       inputBindings: bindingsFor(harness.dirs, harness.pipeline),
       sink: guardedSink,
       runtime: guardedRuntime,
-    });
+    }, NEUTRAL_CONTROL);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("internal_error");
@@ -2754,7 +2764,7 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime: fake.runtime,
-  });
+  }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
   if (!result.ok) {
     expect(result.reason).toBe("internal_error");

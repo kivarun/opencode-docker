@@ -886,7 +886,9 @@ export async function runMultiStatePipeline(
       );
     }
 
-    const { auth, baseOperatorEnv } = await lifecycleAuthority(deps, options);
+    const { auth, baseOperatorEnv } = await lifecycleAuthority(deps, {
+      launcherId: options.launcherId,
+    });
 
     gate.checkAbort();
 

@@ -68,12 +68,29 @@
  * state. Whenever the returned reason is not `state_persist_failed`, it
  * equals the final `state.failure.reason`.
  *
+ * Signal control is a required, production-neutral synchronous boundary
+ * (`PipelineV2CoordinatorControl`): the owner of the signal state (the
+ * runner's shared `RunCauseGate`) provides `currentSignal` and
+ * `freezeSignal`, both captured exactly once after the provenance gate and
+ * before any side effect. Synchronous checkpoints run before the project
+ * copy, after the copy, after the input snapshot, after `create_run`, at
+ * the start of every execution, immediately before each Session create,
+ * before the worker run, before the decision evaluation and after the
+ * engine completes — no await between a checkpoint and the guarded call. A
+ * signal accepted up to `create_run` keeps the state document absent; a
+ * signal after `create_run` finalizes durably. The failure finalizer
+ * freezes signal acceptance synchronously after cleanup has settled and
+ * before the single final run-status write; a durably failed session
+ * cleanup outranks a signal, a signal outranks the classified cause, and a
+ * frozen signal at the cutoff of a success terminal finalizes the run as a
+ * signal failure (published outputs stay). A failed terminal is already
+ * determined and cannot be rewritten by a signal. No checkpoint runs
+ * between a settled execution and its `transition_committed` write.
+ *
  * Resume is not supported: the coordinator accepts only a fresh sink with
- * `snapshot === null` and no poisoning. This module is still not wired
- * into production: no `agent-smoke`, no CLI, no Docker Helper, no Launcher
- * auth, no real Session transport, no profiles and no default pipeline —
- * and the production loader keeps rejecting schema version 2 before
- * Launcher auth and before any Session.
+ * `snapshot === null` and no poisoning. This module is wired through the
+ * production runner (`pipeline_v2_runner.ts`); `agent-smoke`, the CLI and
+ * the default pipeline keep executing v1.
  */
 import { isAbsolute } from "node:path";
 import { validateSafeId } from "./pipeline.ts";
@@ -206,6 +223,23 @@ export interface PipelineV2CoordinatorParams {
   readonly runtime: PipelineV2AgentRuntime;
 }
 
+/**
+ * Production-neutral synchronous signal control boundary of the
+ * coordinator. `currentSignal` reports the currently accepted run-level
+ * signal (null when none); `freezeSignal` atomically snapshots the
+ * accepted signal and closes signal acceptance, returning the frozen
+ * signal (null when none was accepted). Both functions are captured
+ * exactly once by the coordinator after the provenance gate and before
+ * the first side effect; rebinding or replacing the control's methods
+ * later cannot influence a running coordination. The owner of the
+ * underlying signal state is the runner (the shared `RunCauseGate`); the
+ * coordinator never registers signal handlers itself.
+ */
+export interface PipelineV2CoordinatorControl {
+  readonly currentSignal: () => "SIGINT" | "SIGTERM" | null;
+  readonly freezeSignal: () => "SIGINT" | "SIGTERM" | null;
+}
+
 export type PipelineV2CoordinationResult =
   | {
       readonly ok: true;
@@ -223,6 +257,25 @@ class CoordinationAbortedError extends Error {
     super("pipeline v2 coordination aborted: the failure was already recorded durably");
     this.name = "CoordinationAbortedError";
   }
+}
+
+/**
+ * Internal abort marker for a signal accepted while coordination was in
+ * flight. It carries the signal literal only; the coordinator maps it onto
+ * the closed `signal_sigint`/`signal_sigterm` failure reasons and never
+ * records the signal in the durable state beyond that reason.
+ */
+class CoordinatorSignalAbort extends Error {
+  readonly signal: "SIGINT" | "SIGTERM";
+  constructor(signal: "SIGINT" | "SIGTERM") {
+    super(`pipeline v2 coordination aborted by ${signal}`);
+    this.name = "CoordinatorSignalAbort";
+    this.signal = signal;
+  }
+}
+
+function signalFailureReason(signal: "SIGINT" | "SIGTERM"): PipelineV2FailureReason {
+  return signal === "SIGINT" ? "signal_sigint" : "signal_sigterm";
 }
 
 function describeValue(value: unknown): string {
@@ -369,6 +422,9 @@ function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined
  * failures keep their reasons; everything else is `internal_error`.
  */
 function classifyCause(cause: unknown): PipelineV2FailureReason {
+  if (cause instanceof CoordinatorSignalAbort) {
+    return signalFailureReason(cause.signal);
+  }
   if (cause instanceof PipelineV2RuntimeError) {
     return cause.reason;
   }
@@ -597,13 +653,15 @@ interface ExecutionTracking {
  */
 export async function coordinatePipelineV2Run(
   params: PipelineV2CoordinatorParams,
+  control: PipelineV2CoordinatorControl,
 ): Promise<PipelineV2CoordinationResult> {
   // The provenance gate is the first statement and runs before any side
   // effect: a forged pipeline is rejected before the sink is read or
-  // dispatched, before the runtime callbacks are captured, before any
-  // filesystem operation and before any Session. The pipeline is never
-  // re-compiled or re-validated here; provenance is the structural trust
-  // anchor established by `loadPipelineV2`.
+  // dispatched, before the runtime callbacks are captured, before the
+  // control functions are captured, before any filesystem operation and
+  // before any Session. The pipeline is never re-compiled or re-validated
+  // here; provenance is the structural trust anchor established by
+  // `loadPipelineV2`.
   try {
     requireResolvedPipelineV2Provenance(params.pipeline, "pipeline v2 coordinator");
   } catch {
@@ -625,6 +683,42 @@ export async function coordinatePipelineV2Run(
     return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
   }
 
+  // The signal control functions are captured exactly once, together with
+  // the runtime contract functions and before the first filesystem or
+  // state side effect. Replacing the control's methods later cannot
+  // influence this coordination.
+  let capturedCurrentSignal: () => "SIGINT" | "SIGTERM" | null;
+  let capturedFreezeSignal: () => "SIGINT" | "SIGTERM" | null;
+  try {
+    capturedCurrentSignal = captureContractFunction(
+      control,
+      "currentSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+    capturedFreezeSignal = captureContractFunction(
+      control,
+      "freezeSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+  } catch {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
+  /**
+   * Synchronous signal checkpoint: throws the internal abort marker when a
+   * signal was accepted. Checkpoints never await; the marker propagates
+   * into the failure policy, which maps it onto the signal reason. No
+   * checkpoint runs between a settled execution and its
+   * `transition_committed` write: a committed transition already belongs
+   * to the engine and must stay durable.
+   */
+  const checkSignal = (): void => {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      throw new CoordinatorSignalAbort(signal);
+    }
+  };
+
   // The runtime contract functions are captured exactly once, before the
   // first filesystem or state side effect.
   let capturedCreateExecutionSession: CapturedCreateExecutionSession;
@@ -641,10 +735,22 @@ export async function coordinatePipelineV2Run(
   // copy is published atomically as `<runRoot>/project`. A preparation
   // failure reaches no command and no Session: the run fails with
   // `run_input_invalid` and no state document, and the staging tree is
-  // removed by the data plane.
+  // removed by the data plane. A signal accepted up to and including the
+  // copy keeps the state document absent; the signal reason wins over the
+  // classified failure (the priority below the session-cleanup failure,
+  // which cannot exist before any Session).
   try {
+    checkSignal();
     await prepareRunProject(params.projectSourcePath, runRoot);
   } catch (cause) {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      return deepFreeze({
+        ok: false as const,
+        reason: signalFailureReason(signal),
+        state: null,
+      });
+    }
     if (cause instanceof PipelineV2RuntimeError && cause.reason === "run_input_invalid") {
       return deepFreeze({ ok: false as const, reason: "run_input_invalid" as const, state: null });
     }
@@ -654,13 +760,24 @@ export async function coordinatePipelineV2Run(
   // Phase 0: the run-input snapshot is created here, by the coordinator;
   // a caller-provided snapshot is never accepted. An already published
   // project copy stays in the run root for diagnostics when this or the
-  // state creation below fails.
+  // state creation below fails. A signal accepted during the snapshot
+  // keeps the state document absent and wins over the classified failure.
   let runInputs: RunInputsSnapshot;
   try {
+    checkSignal();
     runInputs = await snapshotRunInputs(pipeline, params.inputBindings, runRoot);
   } catch (cause) {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      return deepFreeze({
+        ok: false as const,
+        reason: signalFailureReason(signal),
+        state: null,
+      });
+    }
     return deepFreeze({ ok: false as const, reason: classifyCause(cause), state: null });
   }
+  checkSignal();
 
   // Phase 1: the durable run state is created from the snapshot the
   // coordinator itself just received.
@@ -816,6 +933,18 @@ export async function coordinatePipelineV2Run(
     if (durableCleanupFailed()) {
       reason = PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON;
     }
+
+    // The signal cutoff. Cleanup has settled; freeze signal acceptance
+    // synchronously with no await between reading the accepted signal and
+    // closing acceptance. A durably failed session cleanup keeps its
+    // first-wins priority over a signal; otherwise an accepted signal
+    // becomes the failure reason, outranking the classified cause. Any
+    // signal delivered from here on is late and can no longer change the
+    // recorded failure.
+    const frozenSignal = capturedFreezeSignal();
+    if (frozenSignal !== null && reason !== PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON) {
+      reason = signalFailureReason(frozenSignal);
+    }
     failureReason = reason;
 
     if (tracking.unfinished && tracking.kind !== null && !stateAbandoned) {
@@ -904,6 +1033,10 @@ export async function coordinatePipelineV2Run(
 
   const executors: PipelineV2GraphExecutors = {
     executeAgent: async (view: V2AgentExecutionView): Promise<void> => {
+      // Execution-start checkpoint: a signal accepted between states stops
+      // here, before any new execution record or Session; the previous
+      // transition is already durable and stays.
+      checkSignal();
       tracking.kind = "agent";
       tracking.unfinished = false;
       const sessionTracking: AgentSessionTracking = {
@@ -936,7 +1069,10 @@ export async function coordinatePipelineV2Run(
       //    the session id, then the run entry point. All captures happen
       //    before the durable write, so a durably recorded session always
       //    has a captured cleanup. Reassigning any member afterwards
-      //    cannot change the dispatch.
+      //    cannot change the dispatch. The signal checkpoint sits
+      //    synchronously before the create call: a signal accepted up to
+      //    this point never creates a Session.
+      checkSignal();
       const executionSession = await capturedCreateExecutionSession(view, activation);
       let executionCleanup: () => Promise<void>;
       try {
@@ -964,7 +1100,9 @@ export async function coordinatePipelineV2Run(
       sessionTracking.executionCreatedDurably = true;
 
       // 7. runtime.createToolSession — the worker's authority is created
-      //    only after the Execution Session is durably recorded.
+      //    only after the Execution Session is durably recorded. The
+      //    signal checkpoint sits synchronously before the create call.
+      checkSignal();
       const toolSession = await capturedCreateToolSession(view, activation);
       let toolCleanup: () => Promise<void>;
       try {
@@ -989,7 +1127,10 @@ export async function coordinatePipelineV2Run(
       await dispatchState({ kind: "agent_running" });
 
       // 10. executionSession.runAgent(toolSession) — only the lifecycle
-      //     result crosses the boundary
+      //     result crosses the boundary. The signal checkpoint sits
+      //     synchronously before the call with no await in between: a
+      //     signal accepted up to this point never starts the worker.
+      checkSignal();
       const outcome = await capturedRunAgent(toolSession);
       const parsed = parseWorkerRunResult(outcome);
       if (parsed === undefined) {
@@ -1038,6 +1179,10 @@ export async function coordinatePipelineV2Run(
     },
 
     executeDecision: async (view: V2DecisionExecutionView): Promise<string> => {
+      // Execution-start checkpoint: a signal accepted between states stops
+      // here, before any new execution record; the previous transition is
+      // already durable and stays.
+      checkSignal();
       tracking.kind = "decision";
       tracking.unfinished = false;
       tracking.session = null;
@@ -1056,7 +1201,9 @@ export async function coordinatePipelineV2Run(
       });
       tracking.unfinished = true;
 
-      // 4. evaluate the prepared decision state (no second read)
+      // 4. evaluate the prepared decision state (no second read). The
+      //    signal checkpoint sits synchronously before the evaluation.
+      checkSignal();
       const result = evaluatePreparedDecisionState(pipeline, prepared);
 
       // 5. decision_evaluated with the content-free record form
@@ -1083,7 +1230,18 @@ export async function coordinatePipelineV2Run(
   };
 
   try {
+    // Checkpoint after create_run: the run state document exists from here
+    // on, so a signal accepted now finalizes durably (`run_failed` with
+    // the signal reason) instead of leaving the state absent.
+    checkSignal();
+
     const engineResult = await executePipelineV2Graph(pipeline, executors, { onTransitionCommit });
+
+    // Checkpoint after the engine, before the terminal record and the run
+    // output publication: a signal accepted while the engine ran stops the
+    // terminal phase here; every execution is settled and its transition
+    // is durable.
+    checkSignal();
 
     // --- terminal phase ---------------------------------------------------
 
@@ -1100,6 +1258,26 @@ export async function coordinatePipelineV2Run(
       kind: "run_outputs_published",
       outputs: runOutputs.outputs.map(toRunOutputState),
     });
+
+    // The signal cutoff of the success path: freeze signal acceptance
+    // synchronously before the single final run-status write. A signal
+    // accepted while the terminal outputs were collected finalizes the run
+    // as a signal failure; the already atomically published outputs are
+    // not rolled back. A signal delivered from here on — including while
+    // the final write is in flight — is late and can no longer change the
+    // recorded outcome. For a failed terminal the outcome is already
+    // determined: the reducer finalizes a failed terminal with published
+    // run outputs with the terminal failure reason only, so a frozen
+    // signal cannot rewrite it.
+    const frozenTerminalSignal = capturedFreezeSignal();
+    if (frozenTerminalSignal !== null && engineResult.terminalResult === "success") {
+      await finalizeFailure(new CoordinatorSignalAbort(frozenTerminalSignal));
+      if (stateAbandoned) {
+        return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
+      }
+      const reason = failureReason ?? signalFailureReason(frozenTerminalSignal);
+      return deepFreeze({ ok: false as const, reason, state: sink.snapshot });
+    }
 
     // 4./5. finalize the run status. `ok: true` is reserved for a
     // confirmed `run_succeeded` commit; a failed terminal still publishes

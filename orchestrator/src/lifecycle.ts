@@ -190,6 +190,21 @@ export class RunCauseGate {
     this.acceptSignals = false;
     return status;
   }
+
+  /**
+   * The signal-only cutoff, atomically and synchronously: snapshot the
+   * currently accepted signal, close signal acceptance, and return the
+   * frozen abort (null when no signal was accepted). No await may appear
+   * between reading `this.abort` and closing acceptance; both happen in
+   * this single synchronous body. The final-status cutoff
+   * (`freezeFinalStatus`) and the v1 semantics are unchanged; a caller
+   * uses exactly one of the two cutoffs per run.
+   */
+  freezeSignalAcceptance(): SignalAbort | null {
+    const frozen = this.abort;
+    this.acceptSignals = false;
+    return frozen;
+  }
 }
 
 export interface LifecycleDeps {
@@ -265,7 +280,7 @@ export interface LifecycleAuthority {
 
 export async function lifecycleAuthority(
   deps: LifecycleDeps,
-  options: { workspace: string; launcherId?: string },
+  options: { launcherId?: string },
 ): Promise<LifecycleAuthority> {
   const baseOperatorEnv = operatorEnv(deps.baseEnv ?? {});
   const auth = await requireLauncherCredential(
@@ -369,7 +384,9 @@ export async function runWithChildSession(
       );
     }
 
-    const { auth, baseOperatorEnv } = await lifecycleAuthority(deps, options);
+    const { auth, baseOperatorEnv } = await lifecycleAuthority(deps, {
+      launcherId: options.launcherId,
+    });
 
     await updateState("creating_session");
 

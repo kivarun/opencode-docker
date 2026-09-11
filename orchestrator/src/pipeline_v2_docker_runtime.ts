@@ -98,7 +98,6 @@
  * support.
  */
 import { isAbsolute, relative } from "node:path";
-import { lstat, realpath } from "node:fs/promises";
 import {
   DockerHelperError,
   MAX_RUN_TIMEOUT_SECONDS,
@@ -109,6 +108,11 @@ import {
   deleteChildSession,
   type HelperConfig,
 } from "./launcher.ts";
+import {
+  inspectProjectionObject,
+  inspectProjectionPair,
+  translateProjectionPath,
+} from "./projection_fs.ts";
 import {
   ACTIVATION_INPUTS_ROOT,
   ACTIVATION_OUTPUTS_ROOT,
@@ -444,39 +448,27 @@ export function createDockerHelperPipelineV2Runtime(
 
   /**
    * One root of the projection pair must exist as a real non-symlink
-   * directory that resolves exactly to the declared canonical path.
+   * directory that resolves exactly to the declared canonical path. The
+   * filesystem checks live once in the neutral projection helper; this
+   * layer only renders its typed failure.
    */
   const verifyProjectionRoot = async (
     what: string,
     path: string,
   ): Promise<{ dev: number; ino: number }> => {
-    let info;
-    try {
-      info = await lstat(path);
-    } catch {
-      throw projectionFailure("projection_root_invalid", what, `is missing at ${JSON.stringify(path)}`);
+    const result = await inspectProjectionObject(path, "directory");
+    if (result.failure === null) {
+      return result.identity!;
     }
-    if (info.isSymbolicLink() || !info.isDirectory()) {
-      throw projectionFailure(
-        "projection_root_invalid",
-        what,
-        `is not a real non-symlink directory at ${JSON.stringify(path)}`,
-      );
-    }
-    let resolved = "";
-    try {
-      resolved = await realpath(path);
-    } catch {
-      throw projectionFailure("projection_root_invalid", what, `cannot be resolved at ${JSON.stringify(path)}`);
-    }
-    if (resolved !== path) {
-      throw projectionFailure(
-        "projection_root_invalid",
-        what,
-        `resolves to ${JSON.stringify(resolved)} instead of the declared canonical path ${JSON.stringify(path)}`,
-      );
-    }
-    return { dev: info.dev, ino: info.ino };
+    const detail =
+      result.failure === "missing"
+        ? `is missing at ${JSON.stringify(path)}`
+        : result.failure === "cannot_resolve"
+          ? `cannot be resolved at ${JSON.stringify(path)}`
+          : result.failure === "resolves_elsewhere"
+            ? `resolves to ${JSON.stringify(result.resolved)} instead of the declared canonical path ${JSON.stringify(path)}`
+            : `is not a real non-symlink directory at ${JSON.stringify(path)}`;
+    throw projectionFailure("projection_root_invalid", what, detail);
   };
 
   /**
@@ -486,19 +478,19 @@ export function createDockerHelperPipelineV2Runtime(
    * or `..`. Arbitrary per-path mappings do not exist.
    */
   const daemonPathFor = (what: string, localPath: string): string => {
-    const suffix = relative(projection.localRoot, localPath);
-    if (suffix === "") {
-      return projection.daemonRoot;
-    }
-    const segments = suffix.split("/");
-    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    const translation = translateProjectionPath(
+      projection.localRoot,
+      projection.daemonRoot,
+      localPath,
+    );
+    if (!translation.ok) {
       throw projectionFailure(
         "projection_suffix_unclean",
         what,
-        `relative suffix ${JSON.stringify(suffix)} is not clean`,
+        `relative suffix ${JSON.stringify(translation.suffix)} is not clean`,
       );
     }
-    return `${projection.daemonRoot}/${suffix}`;
+    return translation.daemonPath;
   };
 
   /**
@@ -507,7 +499,8 @@ export function createDockerHelperPipelineV2Runtime(
    * file — and must be canonically itself: `realpath(path) === path`,
    * which also rejects a symlinked parent component (for example a
    * redirected activation tree whose descendants otherwise look normal).
-   * Returns the dev/ino identity for the pair comparison.
+   * The filesystem checks live once in the neutral projection helper; the
+   * identity for the pair comparison is returned on success.
    */
   const verifyProjectionPairAt = async (
     what: string,
@@ -515,48 +508,21 @@ export function createDockerHelperPipelineV2Runtime(
     path: string,
     expected: "directory" | "file",
   ): Promise<{ dev: number; ino: number }> => {
-    let info;
-    try {
-      info = await lstat(path);
-    } catch {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `${side} path ${JSON.stringify(path)} is missing`,
-      );
+    const result = await inspectProjectionObject(path, expected);
+    if (result.failure === null) {
+      return result.identity!;
     }
-    if (info.isSymbolicLink()) {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `${side} path ${JSON.stringify(path)} is a symlink instead of a real ${expected}`,
-      );
-    }
-    if (expected === "directory" ? !info.isDirectory() : !info.isFile()) {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `${side} path ${JSON.stringify(path)} is not a real ${expected}`,
-      );
-    }
-    let resolved = "";
-    try {
-      resolved = await realpath(path);
-    } catch {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `${side} path ${JSON.stringify(path)} cannot be resolved`,
-      );
-    }
-    if (resolved !== path) {
-      throw projectionFailure(
-        "projection_pair_mismatch",
-        what,
-        `${side} path ${JSON.stringify(path)} resolves to ${JSON.stringify(resolved)} instead of the declared path`,
-      );
-    }
-    return { dev: info.dev, ino: info.ino };
+    const detail =
+      result.failure === "missing"
+        ? `${side} path ${JSON.stringify(path)} is missing`
+        : result.failure === "symlink"
+          ? `${side} path ${JSON.stringify(path)} is a symlink instead of a real ${expected}`
+          : result.failure === "cannot_resolve"
+            ? `${side} path ${JSON.stringify(path)} cannot be resolved`
+            : result.failure === "resolves_elsewhere"
+              ? `${side} path ${JSON.stringify(path)} resolves to ${JSON.stringify(result.resolved)} instead of the declared path`
+              : `${side} path ${JSON.stringify(path)} is not a real ${expected}`;
+    throw projectionFailure("projection_pair_mismatch", what, detail);
   };
 
   /**
@@ -575,15 +541,18 @@ export function createDockerHelperPipelineV2Runtime(
     expected: "directory" | "file",
   ): Promise<void> => {
     const daemonPath = daemonPathFor(what, localPath);
-    const localIdentity = await verifyProjectionPairAt(what, "local", localPath, expected);
-    const daemonIdentity = await verifyProjectionPairAt(what, "daemon", daemonPath, expected);
-    if (localIdentity.dev !== daemonIdentity.dev || localIdentity.ino !== daemonIdentity.ino) {
+    const failure = await inspectProjectionPair(localPath, daemonPath, expected);
+    if (failure === null) {
+      return;
+    }
+    if (failure.side === null) {
       throw projectionFailure(
         "projection_pair_mismatch",
         what,
         `dev/ino differ between ${JSON.stringify(localPath)} and ${JSON.stringify(daemonPath)}`,
       );
     }
+    await verifyProjectionPairAt(what, failure.side, failure.side === "local" ? localPath : daemonPath, expected);
   };
 
   /**
