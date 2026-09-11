@@ -1,15 +1,15 @@
 import { execSync } from "node:child_process";
 import { createServer } from "node:net";
-import { chmod, lstat, mkdir, mkdtemp, readlink, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readlink, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import {
-  prepareRunProject,
-  setProjectCopyIoForTests,
-  type PreparedRunProject,
+  prepareProjectCopy,
+  realProjectCopyIo,
   type ProjectCopyIo,
-} from "../src/pipeline_v2_runtime.ts";
+} from "../src/pipeline_v2_project_copy_internal.ts";
+import { prepareRunProject, type PreparedRunProject } from "../src/pipeline_v2_runtime.ts";
 import { PipelineV2RuntimeError } from "../src/pipeline_v2_runtime_error.ts";
 
 interface Fixture {
@@ -525,34 +525,33 @@ test("17. one block is written through several partial writes and the copy is by
     await writeFile(join(fixture.source, "blob.bin"), body);
     let writeCalls = 0;
     let rmCalls = 0;
-    setProjectCopyIoForTests({
-      ...realIo(),
-      destinationWrite: async (handle, chunk, offset, length, position) => {
-        writeCalls += 1;
-        const take = Math.max(1, Math.floor(length / 2));
-        const result = await handle.write(chunk, offset, take, position);
-        return result.bytesWritten;
+    const prepared = await prepareProjectCopy(
+      {
+        ...realProjectCopyIo,
+        destinationWrite: async (handle, chunk, offset, length, position) => {
+          writeCalls += 1;
+          const take = Math.max(1, Math.floor(length / 2));
+          const result = await handle.write(chunk, offset, take, position);
+          return result.bytesWritten;
+        },
+        stagingRm: async (path, options) => {
+          rmCalls += 1;
+          await rm(path, options);
+        },
       },
-      stagingRm: async (path, options) => {
-        rmCalls += 1;
-        await rm(path, options);
-      },
-    });
-    try {
-      const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
-      const copied = await readFile(join(prepared.project_root, "blob.bin"));
-      expect(copied.equals(body)).toBe(true);
-      // 300 KiB is three full 128 KiB blocks; every block needed several
-      // writes, so the write-all loop advanced offset and position
-      const blocks = Math.ceil(300 * 1024 / (128 * 1024));
-      expect(writeCalls).toBeGreaterThan(blocks);
-      expect(writeCalls).toBeGreaterThanOrEqual(6);
-      // a successful copy never runs the staging cleanup
-      expect(rmCalls).toBe(0);
-      expect((await lstat(prepared.project_root)).isDirectory()).toBe(true);
-    } finally {
-      setProjectCopyIoForTests(null);
-    }
+      fixture.source,
+      fixture.runRoot,
+    );
+    const copied = await readFile(join(prepared.project_root, "blob.bin"));
+    expect(copied.equals(body)).toBe(true);
+    // 300 KiB is three full 128 KiB blocks; every block needed several
+    // writes, so the write-all loop advanced offset and position
+    const blocks = Math.ceil(300 * 1024 / (128 * 1024));
+    expect(writeCalls).toBeGreaterThan(blocks);
+    expect(writeCalls).toBeGreaterThanOrEqual(6);
+    // a successful copy never runs the staging cleanup
+    expect(rmCalls).toBe(0);
+    expect((await lstat(prepared.project_root)).isDirectory()).toBe(true);
   } finally {
     await dispose(fixture);
   }
@@ -564,28 +563,27 @@ test("18. a zero-progress or impossible write fails once, without looping", asyn
     await writeFile(join(fixture.source, "blob.bin"), Buffer.alloc(4096, 7));
     for (const bogus of [0, Number.NaN, Number.MAX_SAFE_INTEGER]) {
       let writeCalls = 0;
-      setProjectCopyIoForTests({
-        ...realIo(),
-        destinationWrite: async () => {
-          writeCalls += 1;
-          return bogus;
-        },
-      });
+      let failure: unknown;
       try {
-        let failure: unknown;
-        try {
-          await prepareRunProject(fixture.source, fixture.runRoot);
-        } catch (cause) {
-          failure = cause;
-        }
-        expectFailClosed(failure, "could not be written without progress");
-        // exactly one write attempt: no infinite loop
-        expect(writeCalls).toBe(1);
-        expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
-        await expectLeftoverStaging(fixture.runRoot, 0);
-      } finally {
-        setProjectCopyIoForTests(null);
+        await prepareProjectCopy(
+          {
+            ...realProjectCopyIo,
+            destinationWrite: async () => {
+              writeCalls += 1;
+              return bogus;
+            },
+          },
+          fixture.source,
+          fixture.runRoot,
+        );
+      } catch (cause) {
+        failure = cause;
       }
+      expectFailClosed(failure, "could not be written without progress");
+      // exactly one write attempt: no infinite loop
+      expect(writeCalls).toBe(1);
+      expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+      await expectLeftoverStaging(fixture.runRoot, 0);
     }
   } finally {
     await dispose(fixture);
@@ -600,29 +598,28 @@ test("19. a failing staging cleanup never replaces the original failure", async 
 
     // rm fault: the recursive removal fails after the ownership proof
     let rmCalls = 0;
-    setProjectCopyIoForTests({
-      ...realIo(),
-      stagingRm: async () => {
-        rmCalls += 1;
-        throw new Error("CLEANUP-RM-BOOM");
-      },
-    });
+    let failure: unknown;
     try {
-      let failure: unknown;
-      try {
-        await prepareRunProject(fixture.source, fixture.runRoot);
-      } catch (cause) {
-        failure = cause;
-      }
-      expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
-      expect((failure as Error).message).not.toContain("CLEANUP-RM-BOOM");
-      // the staging tree stays behind as the documented absence of crash
-      // recovery; the original failure remains authoritative
-      await expectLeftoverStaging(fixture.runRoot, 1);
-      expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
-    } finally {
-      setProjectCopyIoForTests(null);
+      await prepareProjectCopy(
+        {
+          ...realProjectCopyIo,
+          stagingRm: async () => {
+            rmCalls += 1;
+            throw new Error("CLEANUP-RM-BOOM");
+          },
+        },
+        fixture.source,
+        fixture.runRoot,
+      );
+    } catch (cause) {
+      failure = cause;
     }
+    expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
+    expect((failure as Error).message).not.toContain("CLEANUP-RM-BOOM");
+    // the staging tree stays behind as the documented absence of crash
+    // recovery; the original failure remains authoritative
+    await expectLeftoverStaging(fixture.runRoot, 1);
+    expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
     // remove the leftover staging tree of the first sub-case before the
     // second one starts on the same run root
     for (const leftover of (await readdir(fixture.runRoot)).filter((name) =>
@@ -635,28 +632,27 @@ test("19. a failing staging cleanup never replaces the original failure", async 
     // is skipped entirely
     let realpathCalls = 0;
     rmCalls = 0;
-    setProjectCopyIoForTests({
-      ...realIo(),
-      stagingRealpath: async () => {
-        realpathCalls += 1;
-        throw new Error("CLEANUP-REALPATH-BOOM");
-      },
-    });
+    failure = undefined;
     try {
-      let failure: unknown;
-      try {
-        await prepareRunProject(fixture.source, fixture.runRoot);
-      } catch (cause) {
-        failure = cause;
-      }
-      expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
-      expect((failure as Error).message).not.toContain("CLEANUP-REALPATH-BOOM");
-      expect(realpathCalls).toBe(1);
-      await expectLeftoverStaging(fixture.runRoot, 1);
-      expect(rmCalls).toBe(0);
-    } finally {
-      setProjectCopyIoForTests(null);
+      await prepareProjectCopy(
+        {
+          ...realProjectCopyIo,
+          stagingRealpath: async () => {
+            realpathCalls += 1;
+            throw new Error("CLEANUP-REALPATH-BOOM");
+          },
+        },
+        fixture.source,
+        fixture.runRoot,
+      );
+    } catch (cause) {
+      failure = cause;
     }
+    expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
+    expect((failure as Error).message).not.toContain("CLEANUP-REALPATH-BOOM");
+    expect(realpathCalls).toBe(1);
+    await expectLeftoverStaging(fixture.runRoot, 1);
+    expect(rmCalls).toBe(0);
   } finally {
     await dispose(fixture);
   }
@@ -699,32 +695,31 @@ test("20. a vanished or replaced staging tree is never removed and sentinels sta
     for (const scenario of scenarios) {
       await writeFile(join(fixture.runRoot, "sentinel.txt"), "KEEP\n");
       let rmCalls = 0;
-      setProjectCopyIoForTests({
-        ...realIo(),
-        stagingInspect: scenario.inspect,
-        ...(scenario.realpath === undefined ? {} : { stagingRealpath: scenario.realpath }),
-        stagingRm: async (path, options) => {
-          rmCalls += 1;
-          await rm(path, options);
-        },
-      });
+      let failure: unknown;
       try {
-        let failure: unknown;
-        try {
-          await prepareRunProject(fixture.source, fixture.runRoot);
-        } catch (cause) {
-          failure = cause;
-        }
-        expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
-        // the replacement is never removed: the cleanup never ran
-        expect(rmCalls).toBe(0);
-        // the external sentinel in the run root is untouched
-        expect(await readFile(join(fixture.runRoot, "sentinel.txt"), "utf8")).toBe("KEEP\n");
-        // the staging tree stays behind (documented no-crash-recovery)
-        await expectLeftoverStaging(fixture.runRoot, 1);
-      } finally {
-        setProjectCopyIoForTests(null);
+        await prepareProjectCopy(
+          {
+            ...realProjectCopyIo,
+            stagingInspect: scenario.inspect,
+            ...(scenario.realpath === undefined ? {} : { stagingRealpath: scenario.realpath }),
+            stagingRm: async (path, options) => {
+              rmCalls += 1;
+              await rm(path, options);
+            },
+          },
+          fixture.source,
+          fixture.runRoot,
+        );
+      } catch (cause) {
+        failure = cause;
       }
+      expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
+      // the replacement is never removed: the cleanup never ran
+      expect(rmCalls).toBe(0);
+      // the external sentinel in the run root is untouched
+      expect(await readFile(join(fixture.runRoot, "sentinel.txt"), "utf8")).toBe("KEEP\n");
+      // the staging tree stays behind (documented no-crash-recovery)
+      await expectLeftoverStaging(fixture.runRoot, 1);
       // clean up for the next scenario
       await rm(join(fixture.runRoot, "sentinel.txt"));
       for (const leftover of (await readdir(fixture.runRoot)).filter((name) =>
@@ -767,23 +762,352 @@ test("21. an unreadable source file fails as a sanitized run-level input failure
   }
 });
 
-function realIo(): ProjectCopyIo {
-  return {
-    destinationWrite: async (handle, chunk, offset, length, position) => {
-      const result = await handle.write(chunk, offset, length, position);
-      return result.bytesWritten;
-    },
-    stagingInspect: async (path) => {
+test("22. a fault-injected internal core cannot affect a parallel public prepareRunProject call", async () => {
+  const fixture = await setup();
+  try {
+    // the source of the fault-injected internal call
+    await writeFile(join(fixture.source, "task.md"), "injected source\n");
+    // a different source for the public production call
+    const publicSource = join(fixture.root, "public-source");
+    await mkdir(publicSource);
+    await writeFile(join(publicSource, "public.md"), "public body\n");
+
+    // The internal core is fault-injected per call and blocks on a barrier
+    // at its first destination write. There is no global IO to flip, so the
+    // public call below runs on the fixed real IO while the injected core
+    // is still parked.
+    let reachedBarrier = false;
+    let injectedWrites = 0;
+    let releaseBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const injectedIo: ProjectCopyIo = {
+      ...realProjectCopyIo,
+      destinationWrite: async (handle, chunk, offset, length, position) => {
+        injectedWrites += 1;
+        reachedBarrier = true;
+        await barrier;
+        const result = await handle.write(chunk, offset, length, position);
+        return result.bytesWritten;
+      },
+    };
+
+    const injectedCall = prepareProjectCopy(injectedIo, fixture.source, fixture.runRoot);
+    while (!reachedBarrier) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(injectedWrites).toBe(1);
+
+    // The public production call must complete while the injected core is
+    // still blocked: its IO is the fixed immutable real IO, not the
+    // injected one.
+    const prepared = await prepareRunProject(publicSource, fixture.runRoot);
+    expect(prepared.project_root).toBe(join(fixture.runRoot, "project"));
+    expect(await readFile(join(prepared.project_root, "public.md"), "utf8")).toBe("public body\n");
+    expect((await readdir(prepared.project_root)).sort()).toEqual(["public.md"]);
+    // The injected call's source never entered the public copy, and the
+    // injected hook was not used again by the public call.
+    expect(
+      await readFile(join(prepared.project_root, "task.md"), "utf8").catch(() => "absent"),
+    ).toBe("absent");
+    expect(injectedWrites).toBe(1);
+
+    // Release the barrier: the injected call continues on its own staging
+    // tree, must fail closed because the project now exists, and must clean
+    // its own staging tree. Its failure never touches the public project.
+    releaseBarrier();
+    let injectedFailure: unknown = "not-set";
+    await injectedCall.then(
+      () => {
+        injectedFailure = null;
+      },
+      (cause) => {
+        injectedFailure = cause;
+      },
+    );
+    expect(injectedFailure).not.toBe(null);
+    expectFailClosed(
+      injectedFailure,
+      "appeared at the fixed run-root location during preparation",
+    );
+    expect((injectedFailure as PipelineV2RuntimeError).reason).toBe("run_input_invalid");
+    // The public copy stands exactly as published; nothing else remains.
+    expect((await readdir(fixture.runRoot)).sort()).toEqual(["project"]);
+    expect((await readdir(prepared.project_root)).sort()).toEqual(["public.md"]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("23. a chmod failure after the staging identity is captured removes the own staging tree", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "task.md"), "body\n");
+    let chmodCalls = 0;
+    let rmCalls = 0;
+    let failure: unknown;
+    try {
+      await prepareProjectCopy(
+        {
+          ...realProjectCopyIo,
+          stagingChmod: async () => {
+            chmodCalls += 1;
+            throw new Error("CHMOD-BOOM");
+          },
+          stagingRm: async (path, options) => {
+            rmCalls += 1;
+            await rm(path, options);
+          },
+        },
+        fixture.source,
+        fixture.runRoot,
+      );
+    } catch (cause) {
+      failure = cause;
+    }
+    // The original creation failure stays authoritative; the cleanup text
+    // never replaces it.
+    expectFailClosed(failure, "staging directory could not be created");
+    expect((failure as Error).message).not.toContain("CHMOD-BOOM");
+    expect(chmodCalls).toBe(1);
+    // The own staging tree is removed exactly once.
+    expect(rmCalls).toBe(1);
+    expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+    await expectLeftoverStaging(fixture.runRoot, 0);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("24. a failed primary staging identity fixation never removes blindly", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "task.md"), "body\n");
+    await writeFile(join(fixture.root, "plain-file.txt"), "plain\n");
+    await writeFile(join(fixture.runRoot, "sentinel.txt"), "KEEP\n");
+
+    // The identity hook fails: without a captured identity the ownership
+    // proof is impossible, so no cleanup inspection and no removal may run.
+    let identityInspects = 0;
+    let cleanupInspects = 0;
+    let rmCalls = 0;
+    let failure: unknown;
+    try {
+      await prepareProjectCopy(
+        {
+          ...realProjectCopyIo,
+          stagingIdentityInspect: async () => {
+            identityInspects += 1;
+            throw new Error("IDENTITY-INSPECT-BOOM");
+          },
+          stagingInspect: async (path) => {
+            cleanupInspects += 1;
+            return await lstat(path);
+          },
+          stagingRm: async (path, options) => {
+            rmCalls += 1;
+            await rm(path, options);
+          },
+        },
+        fixture.source,
+        fixture.runRoot,
+      );
+    } catch (cause) {
+      failure = cause;
+    }
+    expectFailClosed(failure, "staging directory could not be inspected after creation");
+    expect((failure as Error).message).not.toContain("IDENTITY-INSPECT-BOOM");
+    expect(identityInspects).toBe(1);
+    expect(cleanupInspects).toBe(0);
+    expect(rmCalls).toBe(0);
+    // The staging directory stays behind (honest boundary) and nothing
+    // else in the run root was touched.
+    await expectLeftoverStaging(fixture.runRoot, 1);
+    expect(await readFile(join(fixture.runRoot, "sentinel.txt"), "utf8")).toBe("KEEP\n");
+    expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+    for (const leftover of (await readdir(fixture.runRoot)).filter((name) =>
+      name.startsWith(".project-staging-"),
+    )) {
+      await rm(join(fixture.runRoot, leftover), { recursive: true, force: true });
+    }
+
+    // The identity hook substitutes another object: the created directory
+    // has no captured identity either, so nothing is removed.
+    identityInspects = 0;
+    cleanupInspects = 0;
+    rmCalls = 0;
+    failure = undefined;
+    try {
+      await prepareProjectCopy(
+        {
+          ...realProjectCopyIo,
+          stagingIdentityInspect: async () => {
+            identityInspects += 1;
+            return await lstat(join(fixture.root, "plain-file.txt"));
+          },
+          stagingInspect: async (path) => {
+            cleanupInspects += 1;
+            return await lstat(path);
+          },
+          stagingRm: async (path, options) => {
+            rmCalls += 1;
+            await rm(path, options);
+          },
+        },
+        fixture.source,
+        fixture.runRoot,
+      );
+    } catch (cause) {
+      failure = cause;
+    }
+    expectFailClosed(failure, "staging directory is not a real directory after creation");
+    expect(identityInspects).toBe(1);
+    expect(cleanupInspects).toBe(0);
+    expect(rmCalls).toBe(0);
+    await expectLeftoverStaging(fixture.runRoot, 1);
+    expect(await readFile(join(fixture.runRoot, "sentinel.txt"), "utf8")).toBe("KEEP\n");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("25. a failing staging cleanup during creation never replaces the original failure", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "task.md"), "body\n");
+    let rmCalls = 0;
+    let failure: unknown;
+    try {
+      await prepareProjectCopy(
+        {
+          ...realProjectCopyIo,
+          stagingChmod: async () => {
+            throw new Error("CHMOD-BOOM");
+          },
+          stagingRm: async () => {
+            rmCalls += 1;
+            throw new Error("CLEANUP-RM-BOOM");
+          },
+        },
+        fixture.source,
+        fixture.runRoot,
+      );
+    } catch (cause) {
+      failure = cause;
+    }
+    // The typed reason and the original diagnostic survive; neither the
+    // chmod nor the cleanup text may replace or extend it.
+    expectFailClosed(failure, "staging directory could not be created");
+    expect((failure as Error).message).not.toContain("CHMOD-BOOM");
+    expect((failure as Error).message).not.toContain("CLEANUP-RM-BOOM");
+    // The removal was attempted exactly once and failed; the staging tree
+    // stays behind as the documented absence of crash recovery.
+    expect(rmCalls).toBe(1);
+    await expectLeftoverStaging(fixture.runRoot, 1);
+    expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("26. the errno suffix accepts only the closed system-code form and never leaks getter failures", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "blob.bin"), Buffer.alloc(4096, 1));
+
+    const errnoError = (code: string): Error => {
+      const error = new Error("synthetic fs failure");
+      (error as NodeJS.ErrnoException).code = code;
+      return error;
+    };
+    const cases: Array<{ name: string; makeCause: () => unknown; keep: string | null }> = [
+      { name: "EACCES", makeCause: () => errnoError("EACCES"), keep: "(errno EACCES)" },
+      // the upper bound of the closed form: 32 chars, uppercase + digits + _
+      {
+        name: "32-character code",
+        makeCause: () => errnoError(`E${"A".repeat(31)}`),
+        keep: `(errno E${"A".repeat(31)})`,
+      },
+      // anything outside the form renders no suffix at all
+      { name: "33-character code", makeCause: () => errnoError(`E${"A".repeat(32)}`), keep: null },
+      { name: "absolute path code", makeCause: () => errnoError("/etc/passwd"), keep: null },
+      { name: "space code", makeCause: () => errnoError("EACCES permission"), keep: null },
+      { name: "newline code", makeCause: () => errnoError("EACCES\nsecret"), keep: null },
+      { name: "lowercase code", makeCause: () => errnoError("eacces"), keep: null },
+      { name: "digit-leading code", makeCause: () => errnoError("1EACCES"), keep: null },
+      { name: "punctuated code", makeCause: () => errnoError("EACCES-OR-WORSE"), keep: null },
+      { name: "canary code", makeCause: () => errnoError("PROJECT-SECRET-CANARY"), keep: null },
+      {
+        name: "throwing code getter",
+        makeCause: () => {
+          const error = new Error("boom");
+          Object.defineProperty(error, "code", {
+            get() {
+              throw new Error("GETTER-BOOM");
+            },
+          });
+          return error;
+        },
+        keep: null,
+      },
+    ];
+    for (const testCase of cases) {
+      let failure: unknown;
       try {
-        return await lstat(path);
-      } catch {
-        return null;
+        await prepareProjectCopy(
+          {
+            ...realProjectCopyIo,
+            destinationWrite: async () => {
+              throw testCase.makeCause();
+            },
+          },
+          fixture.source,
+          fixture.runRoot,
+        );
+      } catch (cause) {
+        failure = cause;
       }
-    },
-    stagingRealpath: (path) => realpath(path),
-    stagingRm: (path, options) => rm(path, options),
-  };
-}
+      expectFailClosed(failure, 'project source file entry could not be copied "blob.bin"');
+      const message = (failure as Error).message;
+      if (testCase.keep === null) {
+        expect(`${testCase.name}: ${message}`).not.toContain("(errno");
+      } else {
+        expect(message).toContain(testCase.keep);
+      }
+      // a throwing getter and arbitrary code text are never revealed
+      expect(message).not.toContain("GETTER-BOOM");
+      expect(message).not.toContain(fixture.source);
+      // the failure cleaned its own staging tree
+      await expectLeftoverStaging(fixture.runRoot, 0);
+      expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+    }
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("27. no mutable IO seam on the runtime module; the real IO is fixed and immutable", async () => {
+  const runtime = await import("../src/pipeline_v2_runtime.ts");
+  const runtimeKeys = Object.keys(runtime);
+  expect(runtimeKeys).not.toContain("setProjectCopyIoForTests");
+  expect(runtimeKeys).not.toContain("ProjectCopyIo");
+  expect(runtimeKeys).not.toContain("projectCopyIo");
+
+  const internal = await import("../src/pipeline_v2_project_copy_internal.ts");
+  // the internal module exports exactly the per-call core, the fixed real
+  // IO and the IO type — no installer, no mutable module state
+  expect(Object.keys(internal).sort()).toEqual(["prepareProjectCopy", "realProjectCopyIo"]);
+  expect(Object.isFrozen(internal.realProjectCopyIo)).toBe(true);
+  expect(Object.keys(internal.realProjectCopyIo).sort()).toEqual([
+    "destinationWrite",
+    "stagingChmod",
+    "stagingIdentityInspect",
+    "stagingInspect",
+    "stagingRealpath",
+    "stagingRm",
+  ]);
+});
 
 async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {
   try {
