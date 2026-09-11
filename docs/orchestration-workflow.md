@@ -1445,9 +1445,49 @@ payload (no TASK revision, iteration grant, or model-profile
 replacement), no bodies, paths, timestamps, facts or credentials enter
 either manifest, and diagnostics are content-free: user-side errors never
 echo unknown property names or values, and malformed JSON produces a
-stable message without parser fragments. Filesystem publication under the
-run root, user-response reading, coordinator/runner/CLI wiring, resume,
-P01 validation, and durable-state migrations stay out of scope.
+stable message without parser fragments. Filesystem publication is the
+next substrate below; reading the user response from a file,
+coordinator/runner/CLI wiring, resume, P01 validation, and
+durable-state migrations stay out of scope.
+
+#### Wait manifest filesystem publication (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_wait_store.ts` publishes the manifests
+under the fixed flat layout
+`<runRoot>/waits/<waitIndex>.request.json` and
+`<runRoot>/waits/<waitIndex>.response.json`: `waits/` is a 0700 real
+non-symlink directory (exclusive creation, identity fixation,
+chmod-enforced 0700, canonical verification, and one run-root fsync on
+first creation), and manifest files are 0600 regular files whose bytes
+are exactly the manifest's canonical JSON without a trailing newline.
+The public API is `publishPipelineV2WaitRequest(runRoot, value)` and
+`publishPipelineV2WaitResponse(runRoot, waitIndex, raw)`; the response
+publisher reads and verifies the stored request file itself
+(`O_NOFOLLOW`, mode 0600, bytes equal to its own canonical JSON, run id
+equal to the run root's basename, wait index match) and the caller never
+passes a prepared request. Publication is atomic — exclusive temp file
+inside `waits/`, full write-all loop, file fsync, close, exclusive
+`link()` (never a replace-capable `rename()`), ownership-checked temp
+removal, waits-directory fsync — and idempotent: a repeat with the same
+canonical bytes adopts the existing file without touching its inode,
+mode, mtime or content and re-fsyncs the directory, while a different
+manifest on a busy path is a typed conflict and nothing is ever
+overwritten. The run root must be an existing absolute canonical real
+non-symlink directory whose basename is the manifest's run id; it is
+never created or removed. Errors are a closed typed contract
+(`not_published`/`durability_unknown` with the reasons
+`invalid_layout`/`conflict`/`io_failure` and an immutable candidate on
+durability-unknown outcomes); manifest validation failures keep their
+own error class, and diagnostics are content-free. The core lives in an
+explicitly internal module with a per-call IO capability and a single
+frozen production IO; the public export surface carries no test seam.
+Semantic boundary for the future coordinator (not wired here): publish
+request → dispatch `run_waiting(request_sha256)`; publish response →
+dispatch `wait_response_recorded(response_sha256)`. A manifest file
+published without the corresponding durable commit is an orphan, not
+part of the history, and an exact retry safely reuses it. Coordinator,
+runner and CLI wiring, resume, user-response reading from a file, and
+migrations stay out of scope.
 
 ### Run-owned project copy and the production-neutral coordinator (implemented, driven by the production runner)
 
