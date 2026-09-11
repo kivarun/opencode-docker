@@ -10,7 +10,15 @@ implemented. The current implementation is the tested `smoke` and
 `agent-smoke` baseline with the first trusted execution profile increment,
 the durable per-run pipeline state, and the multi-state execution
 substrate (one child Session per agent-state activation, per-activation
-result identity, run state schema version 2).
+result identity, run state schema version 2). Pipeline schema v2 has its
+own production entrypoint now: `orchestrator run` (see the "The production
+pipeline v2 CLI" section) drives the assembled pipeline v2 stack —
+graph execution, the run-owned project copy, the data plane, decision
+states, the Docker Helper runtime adapter, the durable state schema v4,
+and output publication — through the single production runner
+`runPipelineV2`. `agent-smoke` remains the v1 diagnostic command with its
+own schema version 1 loader; the bundled default pipeline has not been
+migrated to v2.
 New behavior becomes a product contract only after it is implemented, tested,
 and reflected in the canonical architecture documentation.
 
@@ -128,6 +136,80 @@ The current implementation does not yet provide:
 - run listing or inspection commands;
 - an event stream;
 - a T3 integration.
+
+## The production pipeline v2 CLI (`orchestrator run`)
+
+`orchestrator run` is the first user-facing pipeline v2 entrypoint. The CLI
+only parses arguments, resolves the trusted state-root projection from the
+environment, assembles the per-call dependencies, and invokes the single
+production runner `runPipelineV2` exactly once; every pipeline, profile,
+authentication, run-root, durable-state, runtime, and coordination decision
+lives inside the runner stack. There is no second graph loop, no second auth
+layer, and no manual Session, mount, or Docker Helper argv in the CLI.
+
+```
+orchestrator run \
+  --pipeline-root /absolute/pipeline-bundle \
+  --config-root /absolute/operator-config \
+  --project /absolute/project-source \
+  [--input SAFE_ID=/absolute/source]... \
+  [--launcher-id dhl_...] \
+  [--json]
+```
+
+- `--pipeline-root`, `--config-root`, and `--project` are required and must
+  be absolute paths. There is no default pipeline for `run`: the bundled
+  pipeline is still the v1 diagnostic pipeline and is never selected by
+  `run`.
+- `--input` is repeatable in the form `SAFE_ID=ABSOLUTE_PATH`; the pair is
+  split at the first `=`, so `=` inside the path is allowed. Zero inputs are
+  valid when the pipeline declares no run inputs; the trusted loader and
+  data plane verify that every declared run input is bound exactly once.
+- Duplicate singleton flags (including `--launcher-id`) are rejected instead
+  of silently taking the last value; `--json` takes no value and cannot
+  repeat; `--workspace`, `--image`, `--profile`, `--task`, output-path flags,
+  and state-root flags are rejected for `run`, as is every unknown flag.
+  Parse failures exit 2 with the usage text before any authentication or
+  filesystem side effect.
+- The state-root projection is runtime configuration, not a per-run flag:
+  the local root is `ORCHESTRATOR_STATE_ROOT`, else
+  `${XDG_STATE_HOME}/orchestrator`, else
+  `${HOME}/.local/state/orchestrator`; the daemon root is
+  `ORCHESTRATOR_DAEMON_STATE_ROOT`, else the local root. Both variables must
+  be non-empty absolute clean paths; the resolver creates and canonicalizes
+  nothing, and the runner itself verifies kind, canonical form, dev/ino
+  identity, and mode 0700. The paths never become pipeline fields and never
+  reach a worker.
+- The runner copies the project source once into the run-owned directory
+  `<state-root>/pipeline-runs/<run-id>/project`; every activation mounts that
+  copy read-write at `/workspace` and worker changes persist there across
+  activations. The source directory is never modified, and its path never
+  reaches the worker, the pipeline, the durable state, or the results.
+- The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
+  (state schema version 4), and the published run outputs stay at the fixed
+  location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
+  never copied to a user-chosen path; the CLI reports the location but does
+  not relocate it.
+- The pipeline's agent states select the profiles; the worker image, the
+  OpenCode configuration, and the exact environment bindings belong to those
+  profiles. The user never sets mounts, container paths, Session
+  credentials, or the helper transport.
+- Human mode prints exactly one stderr summary line — success
+  `orchestrator: run ok (run <RUN_ID>, state <RUN_ROOT>/state.json, outputs
+  <RUN_ROOT>/outputs)`, a post-run-root failure
+  `orchestrator: run failed (run <RUN_ID>, reason <REASON>, state
+  <RUN_ROOT>/state.json)` — and a failure before the run root exists relies
+  on the runner's content-free diagnostics alone. `--json` writes exactly
+  one JSON `PipelineV2RunOutcome` document plus a trailing newline to
+  stdout (no wrapper, content-free, machine-readable for success and
+  failure); the exit code is the outcome's exit code. In JSON mode every
+  inherit-asked CLI call (image pull, worker run) is captured and its output
+  is forwarded to stderr, so stdout stays a single JSON document; argv, env,
+  and every runtime decision stay untouched.
+- The signal wiring is shared with v1: the first SIGINT/SIGTERM is forwarded
+  to a running worker `run` CLI process through `killActive` (first-wins),
+  and the lifecycle records a user abort only when the signal may still be
+  classified as one. There is no second `RunCauseGate` in the CLI.
 
 ## Pipelines (schema version 1: loader, validator, multi-state execution plan)
 
@@ -310,8 +392,8 @@ signalable worker `docker-helper run` only; the deadline sends SIGTERM, the
 result is marked timed out, and the run fails normally with a single cleanup.
 `max_attempts` is 1, so no retries are implemented.
 
-**Pipeline v2 through the same engine (pure adapter implemented, not wired
-into the production runner).** `executePipelineV2Graph(pipeline, executors)`
+**Pipeline v2 through the same engine (pure adapter implemented; the production
+runner uses it).** `executePipelineV2Graph(pipeline, executors)`
 accepts the provenance-checked `ResolvedPipelineV2` snapshot — clones, casts,
 spreads, and Proxies are rejected by `requireResolvedPipelineV2Provenance`
 before any content read or callback — captures both executor functions
@@ -492,16 +574,17 @@ never run), and there is no second validation pass — structural
 correctness is owned once by the compiler. `stateId` remains a plain
 planner input (safe id + agent state of the trusted snapshot).
 
-Session capability contracts are fixed next to the planner, unwired:
-Execution Session (`type: "execution"`, scope run root; orchestrator-only
-bearer, used only to launch workers, never passed to a worker in any
-form), Tool Session (`type: "tool"`, scope project only; bearer handed to
-the worker; nested containers cannot reach pipeline inputs/outputs through
-helper), and worker mounts (project `/workspace` RW, prepared activation
-inputs `/pipeline/inputs` RO, activation outputs `/pipeline/outputs` RW).
-The helper socket projection is not a session capability: it lives in the
-separate immutable Worker Launch contract (`WORKER_LAUNCH_CONTRACT`)
-because it happens once, at worker launch through the Execution Session —
+Session capability contracts are fixed next to the planner and implemented
+by the Docker Helper runtime adapter: Execution Session (`type:
+"execution"`, scope run root; orchestrator-only bearer, used only to launch
+workers, never passed to a worker in any form), Tool Session (`type:
+"tool"`, scope project only; bearer handed to the worker; nested containers
+cannot reach pipeline inputs/outputs through helper), and worker mounts
+(project `/workspace` RW, prepared activation inputs `/pipeline/inputs` RO,
+activation outputs `/pipeline/outputs` RW). The helper socket projection is
+not a session capability: it lives in the separate immutable Worker Launch
+contract (`WORKER_LAUNCH_CONTRACT`) because it happens once, at worker
+launch through the Execution Session —
 the socket is transport, the Tool Session bearer is the worker's
 authority. No wide-Tool-Session workaround exists; the docker-helper#8
 allowed-roots RO/RW refinement is not required by this increment.
@@ -525,7 +608,7 @@ production rejection before auth/session. The decision evaluator, durable
 state, lifecycle, signal handling, helper transport, and the default bundle
 are untouched; wiring v2 execution into `agent-smoke` is a later increment.
 
-### v2 run-input snapshots and host-side activation data layout (pure substrate, not wired)
+### v2 run-input snapshots and host-side activation data layout (used by the production runner through the coordinator)
 
 `orchestrator/src/pipeline_v2_runtime.ts` materializes the v2 data plane on
 the host, without Sessions or containers. Run layout: `<runRoot>/project` is
@@ -652,7 +735,7 @@ stdout, and worker files can never create one. Not implemented: Session
 creation, mounts, worker launch, and terminal state execution are later
 increments.
 
-### Run-input integrity and run-level output publication (pure substrate, not wired)
+### Run-input integrity and run-level output publication (used by the production runner through the coordinator)
 
 Two integrity guarantees apply before anything else happens on the v2 data
 plane. First, accepted-history coherence: for every recorded
@@ -718,13 +801,14 @@ module-private provenance registry only after the atomic publish succeeded
 registered snapshots. Honest limitations: a trusted host process may mutate
 a source during the read; an adversarially created empty directory at the
 rename target could in principle be replaced; crash recovery and a
-directory `rename` no-replace primitive remain absent. Not implemented:
-production runner wiring, terminal state execution, durable state
-v3/resume, API/T3 download, decision evaluator integration,
-Sessions/mounts/worker launch, retries, quotas, and old-activation cleanup;
-the production loader still rejects schema v2 before Launcher auth/session.
+directory `rename` no-replace primitive remain absent. Implemented and used by
+the production runner: terminal state execution, decision evaluator
+integration, Sessions/mounts/worker launch, and output publication. Still
+not implemented: resume, API/T3 download, retries, quotas, and
+old-activation cleanup; `agent-smoke`'s schema version 1 loader still
+rejects schema v2 before Launcher auth/session.
 
-### Pipeline v2 deterministic decision states (compile-time substrate, not wired)
+### Pipeline v2 deterministic decision states (used by the production runner through the coordinator)
 
 A v2 pipeline may declare a third state type `type: decision`. A decision
 state runs no container and no Session: it names a decision model (a clean
@@ -1232,7 +1316,7 @@ Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
 them.
 
-### Pipeline v2 run state (state schema version 4, unwired substrate)
+### Pipeline v2 run state (state schema version 4, the production run state of pipeline v2)
 
 `orchestrator/src/pipeline_v2_state.ts` already defines the durable run state
 for pipeline schema v2 as a pure substrate (state schema version 4, with the
@@ -1276,7 +1360,7 @@ migration); the schema v2 document stays the production state of pipeline
 v1, and production v2 execution, store/sink integration, and resume are
 still not implemented.
 
-### Run-owned project copy and the production-neutral coordinator (implemented, not wired)
+### Run-owned project copy and the production-neutral coordinator (implemented, driven by the production runner)
 
 The v2 data plane also implements the run-owned project copy:
 `prepareRunProject(projectSourcePath, runRoot)` publishes an
@@ -1298,17 +1382,18 @@ execution), never accepts a ready-made `PreparedRunProject`, and keeps the
 source untouched. A project preparation failure returns
 `{ok:false, reason:"run_input_invalid", state:null}` with zero sink
 commands and zero sessions; a copy published before a later snapshot or
-`create_run` failure stays in the run root for diagnostics. This
-coordinator remains production-neutral: `agent-smoke`, the CLI and the
-default pipeline are not wired to it.
+`create_run` failure stays in the run root for diagnostics. The
+production runner drives this coordinator from `orchestrator run`;
+`agent-smoke` and the default pipeline remain on v1.
 
-### Docker Helper 2.1.1 runtime adapter (unwired)
+### Docker Helper 2.1.1 runtime adapter (wired through the production runner)
 
 `orchestrator/src/pipeline_v2_docker_runtime.ts` is a real implementation of
 the coordinator's two-session runtime boundary on the official
-docker-helper CLI 2.1.1 — still not wired into the CLI, `agent-smoke`, the
-lifecycle, or the default pipeline, and the production loader keeps
-rejecting pipeline schema v2 before Launcher auth and before any Session.
+docker-helper CLI 2.1.1 — wired through the production runner (driven from
+`orchestrator run`), not by `agent-smoke`, whose schema version 1 loader
+keeps rejecting pipeline schema v2 before Launcher auth and before any
+Session.
 
 The factory `createDockerHelperPipelineV2Runtime` validates everything
 before the first helper/filesystem side effect: the trusted pipeline
@@ -1371,8 +1456,8 @@ execution document at the fixed container path
 `/pipeline/inputs/.orchestrator/execution.md`; argv carries only the
 static instruction to read it. A failed pull reports `worker_failed`, a
 timed-out run `worker_timeout`, a nonzero exit `worker_failed`, and exit 0
-`completed`; stdout never participates, and signals are not wired yet
-(130/143 are not classified). Cleanup is a memoized Launcher-authority
+`completed`; stdout never participates, and signal delivery plus 130/143
+classification are owned by the coordinator signal control. Cleanup is a memoized Launcher-authority
 delete — the physical delete runs at most once per session, and Tool and
 Execution cleanups remain separate operations.
 

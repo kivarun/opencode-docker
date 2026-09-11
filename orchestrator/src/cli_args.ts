@@ -1,4 +1,6 @@
 import type { AgentSmokeOptions } from "./agent_smoke.ts";
+import type { RunInputBinding } from "./pipeline_v2_runtime.ts";
+import { expectSafeId } from "./pipeline_v2_state.ts";
 import { DEFAULT_WORKER_IMAGE } from "./worker.ts";
 
 export const DEFAULT_PIPELINE_ROOT = "/opt/orchestrator/pipelines/default";
@@ -18,7 +20,17 @@ export interface ParsedAgentSmokeArgs {
   launcherId?: string;
 }
 
-export type ParsedCommand = ParsedSmokeArgs | ParsedAgentSmokeArgs;
+export interface ParsedPipelineRunArgs {
+  readonly kind: "run";
+  readonly pipelineRoot: string;
+  readonly configRoot: string;
+  readonly projectSourcePath: string;
+  readonly inputBindings: readonly RunInputBinding[];
+  readonly launcherId?: string;
+  readonly json: boolean;
+}
+
+export type ParsedCommand = ParsedSmokeArgs | ParsedAgentSmokeArgs | ParsedPipelineRunArgs;
 
 export function usage(): string {
   return [
@@ -29,10 +41,14 @@ export function usage(): string {
     "               launcher credential -> child session -> worker container ->",
     "               workspace artifact -> verified cleanup",
     "  agent-smoke  OpenCode agent smoke test driven by a declarative pipeline:",
-    "               pipeline -> one-step plan -> profile and input resolution ->",
-    "               launcher credential -> child session -> OpenCode agent ->",
-    "               work product -> validated result.json -> unchanged protected",
-    "               input -> outcome transition -> verified cleanup",
+    "               pipeline -> multi-state plan -> profile and input resolution ->",
+    "               launcher credential -> child session per agent-state activation ->",
+    "               OpenCode agent -> work product -> validated result.json ->",
+    "               unchanged protected input -> outcome transition -> verified cleanup",
+    "  run          production pipeline v2 execution:",
+    "               pipeline bundle -> profiles -> launcher credential -> run root ->",
+    "               durable state -> agent/decision activations -> decision routing ->",
+    "               terminal -> published run outputs",
     "",
     "common flags:",
     "  --workspace PATH        workspace passed to 'docker-helper session create'; must exist",
@@ -43,6 +59,58 @@ export function usage(): string {
     "smoke flags:",
     `  --image WORKER_IMAGE    worker container image (default: ${DEFAULT_WORKER_IMAGE})`,
     "",
+    "run flags (production pipeline v2):",
+    "  --pipeline-root PATH    pipeline bundle root with schema_version 2; required; absolute path.",
+    "                          There is no default: the bundled pipeline is still the v1 diagnostic",
+    "                          pipeline and is never used by 'run'.",
+    "  --config-root PATH      operator-controlled configuration root holding",
+    "                          profiles/<name>.yaml and the OpenCode configurations; required;",
+    "                          absolute path",
+    "  --project PATH          project source directory; required; absolute path. The runner",
+    "                          copies it once into the run-owned directory",
+    "                          <state-root>/pipeline-runs/<run-id>/project; every activation",
+    "                          mounts that copy read-write at /workspace and worker changes",
+    "                          persist there across activations. The source directory is",
+    "                          never modified, and its path never reaches the worker.",
+    "  --input ID=PATH         bind one declared pipeline run input; repeatable, declaration",
+    "                          order is preserved. ID is a safe identifier (letters, digits,",
+    "                          '_', '.', '-', at most 128 characters) and PATH an absolute",
+    "                          host path; the pair is split at the first '=', so '=' inside",
+    "                          PATH is allowed. Omitting --input entirely is valid when the",
+    "                          pipeline declares no run inputs; the trusted pipeline loader",
+    "                          and the data plane verify that every declared input is bound",
+    "                          exactly once and reject missing, duplicate or unknown ids.",
+    "  --json                  print exactly one JSON PipelineV2RunOutcome document on stdout",
+    "                          (no progress lines); worker and image-pull output is forwarded",
+    "                          to stderr; the exit code is the outcome's exit code.",
+    "",
+    "run locations and runtime configuration:",
+    "  The durable run state is written to",
+    "    <state-root>/pipeline-runs/<run-id>/state.json",
+    "  and the published run outputs stay at the fixed location",
+    "    <state-root>/pipeline-runs/<run-id>/outputs",
+    "  (run outputs are never copied to a user-chosen path). The state root is",
+    "  runtime configuration, not a per-run flag:",
+    "    ORCHESTRATOR_STATE_ROOT          local state root; otherwise",
+    "                                     ${XDG_STATE_HOME:-$HOME/.local/state}/orchestrator",
+    "    ORCHESTRATOR_DAEMON_STATE_ROOT   the same directory by the path the Docker Helper",
+    "                                     daemon sees; defaults to the local root (host mode)",
+    "  Both variables must be non-empty absolute clean paths; nothing is created by",
+    "  the resolver, and the runner itself verifies kind, canonical form, identity",
+    "  and mode 0700.",
+    "",
+    "run profiles and worker configuration:",
+    "  The pipeline's agent states select the profiles; the worker image, the",
+    "  OpenCode configuration and the exact environment bindings belong to those",
+    "  profiles (see the profile schema under agent-smoke). There are no --image,",
+    "  --profile, --task, --workspace or output-path flags for 'run': the user never",
+    "  sets mounts, container paths, Session credentials, helper transport, or the",
+    "  state-root projection per run. Prompt and input bodies travel only inside the",
+    "  orchestrator-owned execution document and never appear in command lines,",
+    "  environment, state, or diagnostics. A failure before the run root is created",
+    "  leaves nothing behind; afterwards the run root is the diagnostic directory",
+    "  and is never removed automatically.",
+    "",
     "agent-smoke flags:",
     "  --config-root PATH      operator-controlled configuration root; must exist and be",
     "                          visible to the orchestrator at this absolute path",
@@ -52,12 +120,15 @@ export function usage(): string {
     "",
     "The pipeline is the production input for agent-smoke: the declarative pipeline",
     "selects the execution profile, the protected workspace input, the agent prompt,",
-    "the result contract, and the timeout. Only the one-step execution shape is",
-    "supported today: one agent state whose single transition with outcome",
-    '"completed" leads to a success terminal state, max_transitions 1,',
-    "max_attempts 1, exactly one protected declared input, and the standard agent",
-    "result contract. Any other structurally valid pipeline is rejected before",
+    "the result contract, and the timeout. The supported v1 execution shape covers",
+    "sequential states, branching and cycles bounded by max_transitions: any number",
+    "of agent and terminal states, an agent or terminal entry state, one transition",
+    'per agent state with outcome "completed", max_attempts 1, and the standard',
+    "agent result contract. Any other structurally valid pipeline is rejected before",
     "Launcher authentication and before any child Session is created.",
+    "",
+    "agent-smoke is the v1 diagnostic command; the production pipeline v2 path is",
+    "'orchestrator run'.",
     "",
     "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
     "input path come only from the pipeline's agent state, the worker image comes",
@@ -130,7 +201,10 @@ function parseValue(argv: string[], i: number, flag: string): { value: string; n
   throw new Error(`unknown argument: ${arg}`);
 }
 
-export function parseCommand(kind: "smoke" | "agent-smoke", argv: string[]): ParsedCommand {
+export function parseCommand(kind: "smoke" | "agent-smoke" | "run", argv: string[]): ParsedCommand {
+  if (kind === "run") {
+    return parseRunArgs(argv);
+  }
   let workspace: string | null = null;
   let workerImage: string | null = null;
   let launcherId: string | undefined;
@@ -218,6 +292,145 @@ export function parseCommand(kind: "smoke" | "agent-smoke", argv: string[]): Par
     configRoot,
     pipelineRoot: pipelineRoot ?? DEFAULT_PIPELINE_ROOT,
     launcherId,
+  };
+}
+
+/**
+ * Parses the production pipeline v2 command. The user-facing contract:
+ * `--pipeline-root`, `--config-root` and `--project` are required and must
+ * be absolute; `--input` is repeatable in `SAFE_ID=ABSOLUTE_PATH` form
+ * (split at the first `=`, so `=` inside the path is allowed); zero inputs
+ * are valid. Singleton flags reject duplicates instead of silently taking
+ * the last value; `--json` takes no value and cannot repeat; the v1 and
+ * container flags, output-path flags and state-root flags are rejected for
+ * `run`, as is every unknown flag.
+ */
+function parseRunArgs(argv: string[]): ParsedPipelineRunArgs {
+  let pipelineRoot: string | null = null;
+  let configRoot: string | null = null;
+  let projectSourcePath: string | null = null;
+  let launcherId: string | undefined;
+  let json = false;
+  const inputBindings: RunInputBinding[] = [];
+  const seenInputIds = new Set<string>();
+
+  const requireSingleton = (current: string | null, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      const { value, next } = parseValue(argv, i, "--pipeline-root");
+      requireSingleton(pipelineRoot, "--pipeline-root");
+      pipelineRoot = requireAbsolute(value, "--pipeline-root");
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      const { value, next } = parseValue(argv, i, "--project");
+      requireSingleton(projectSourcePath, "--project");
+      projectSourcePath = requireAbsolute(value, "--project");
+      i = next;
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      const { value, next } = parseValue(argv, i, "--input");
+      const equals = value.indexOf("=");
+      if (equals <= 0) {
+        throw new Error("--input requires SAFE_ID=ABSOLUTE_PATH");
+      }
+      const id = value.slice(0, equals);
+      const path = value.slice(equals + 1);
+      try {
+        expectSafeId(id, "--input id");
+      } catch (cause) {
+        throw new Error(
+          `--input id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      if (path === "") {
+        throw new Error("--input requires SAFE_ID=ABSOLUTE_PATH (the path part is empty)");
+      }
+      if (!path.startsWith("/")) {
+        throw new Error(`--input ${id} must be bound to an absolute path`);
+      }
+      if (seenInputIds.has(id)) {
+        throw new Error(`--input ${id} is bound more than once`);
+      }
+      seenInputIds.add(id);
+      inputBindings.push({ id, path });
+      i = next;
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      const { value, next } = parseValue(argv, i, "--launcher-id");
+      if (!value.startsWith("dhl_")) {
+        throw new Error("--launcher-id must be a launcher ID (dhl_...)");
+      }
+      if (launcherId !== undefined) {
+        throw new Error("--launcher-id may be given at most once");
+      }
+      launcherId = value;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error(
+        "run does not accept --workspace; the run-owned project copy is created from --project",
+      );
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("run does not accept --image; the worker image comes only from the selected profile");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error(
+        "run does not accept --profile; the execution profiles are selected by the pipeline's agent states",
+      );
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error(
+        "run does not accept --task; run inputs are declared by the pipeline and bound with --input",
+      );
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "run does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "run does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (pipelineRoot === null) {
+    throw new Error("--pipeline-root ABSOLUTE_PATH is required for run");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABSOLUTE_PATH is required for run");
+  }
+  if (projectSourcePath === null) {
+    throw new Error("--project ABSOLUTE_PATH is required for run");
+  }
+  return {
+    kind: "run",
+    pipelineRoot,
+    configRoot,
+    projectSourcePath,
+    inputBindings,
+    launcherId,
+    json,
   };
 }
 
