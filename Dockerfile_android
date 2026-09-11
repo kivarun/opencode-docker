@@ -2,29 +2,93 @@ ARG BASE_IMAGE
 
 FROM ${BASE_IMAGE}
 
+ARG JBR_VERSION=21.0.10
+ARG JBR_BUILD=b1163.110
+ARG ANDROID_CMDLINE_TOOLS_VERSION=15859902
+ARG ANDROID_CMDLINE_TOOLS_SHA256=4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583
+
 USER root
 
+# Android native host tools are glibc binaries.
+# gcompat is required because the base image is Alpine/musl.
 RUN apk add --no-cache \
-    openjdk17-jdk \
     gcompat \
-    libstdc++
+    libstdc++ \
+    libgcc
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+#
+# JetBrains Runtime SDK, musl build.
+# Gradle/AGP tried to use a glibc JBR on Alpine, so pin the working musl variant.
+#
+RUN set -eux; \
+    archive="jbrsdk-${JBR_VERSION}-linux-musl-x64-${JBR_BUILD}.tar.gz"; \
+    curl -fsSL --retry 3 \
+      "https://cache-redirector.jetbrains.com/intellij-jbr/${archive}" \
+      -o "/tmp/${archive}"; \
+    mkdir -p /opt/jbr; \
+    tar -xzf "/tmp/${archive}" -C /opt/jbr --strip-components=1; \
+    rm -f "/tmp/${archive}"; \
+    /opt/jbr/bin/java -version; \
+    /opt/jbr/bin/javac -version
+
+ENV JAVA_HOME=/opt/jbr
+ENV PATH="/opt/jbr/bin:${PATH}"
+
+#
+# Android SDK command-line tools.
+#
 ENV ANDROID_HOME=/opt/android-sdk
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
-ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
+ENV PATH="/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:${PATH}"
 
-# pinned Android command-line tools
-# sdkmanager:
-#   platforms;android-36
-#   platforms;android-37
-#   build-tools;36.0.0
-#   ndk;27.2.12479018
-#   cmake;3.22.1
+RUN set -eux; \
+    archive="commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip"; \
+    curl -fsSL --retry 3 \
+      "https://dl.google.com/android/repository/${archive}" \
+      -o "/tmp/${archive}"; \
+    echo "${ANDROID_CMDLINE_TOOLS_SHA256}  /tmp/${archive}" | sha256sum -c -; \
+    mkdir -p "${ANDROID_HOME}/cmdline-tools/latest"; \
+    unzip -q "/tmp/${archive}" -d /tmp/android-cmdline-tools; \
+    cp -a /tmp/android-cmdline-tools/cmdline-tools/. \
+      "${ANDROID_HOME}/cmdline-tools/latest/"; \
+    rm -rf "/tmp/${archive}" /tmp/android-cmdline-tools; \
+    sdkmanager --version
 
-RUN install -d -m 0755 -o opencode -g opencode \
+#
+# Accept licenses and install everything required by current BoxProbe.
+#
+RUN set -eux; \
+    yes | sdkmanager --licenses >/dev/null; \
+    sdkmanager \
+      "platform-tools" \
+      "platforms;android-36" \
+      "platforms;android-37" \
+      "build-tools;36.0.0" \
+      "ndk;27.2.12479018" \
+      "cmake;3.22.1"; \
+    test -x "${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"; \
+    test -x "${ANDROID_HOME}/cmake/3.22.1/bin/cmake"
+
+#
+# Gradle cache belongs to the agent.
+# Also expose the musl JBR under ~/.cache/jdks because that is where
+# the successful runtime workaround found it.
+#
+RUN set -eux; \
+    install -d -m 0755 -o opencode -g opencode \
       /home/opencode/.gradle \
-      /opt/android-sdk \
-    && chown -R opencode:opencode /opt/android-sdk
+      /home/opencode/.cache/jdks; \
+    ln -s /opt/jbr \
+      /home/opencode/.cache/jdks/jbrsdk-${JBR_VERSION}-linux-musl-x64-${JBR_BUILD}; \
+    chown -h opencode:opencode \
+      /home/opencode/.cache/jdks/jbrsdk-${JBR_VERSION}-linux-musl-x64-${JBR_BUILD}; \
+    chown -R root:root "${ANDROID_HOME}"; \
+    chmod -R a+rX "${ANDROID_HOME}"
 
 USER opencode
+
+RUN java -version \
+    && javac -version \
+    && sdkmanager --list_installed \
+    && "${ANDROID_HOME}/cmake/3.22.1/bin/cmake" --version \
+    && "${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
