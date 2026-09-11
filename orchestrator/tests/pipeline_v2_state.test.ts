@@ -288,12 +288,12 @@ function collectKeys(value: unknown, into: Set<string>): void {
   }
 }
 
-describe("pipeline v2 run state schema v5", () => {
+describe("pipeline v2 run state schema v6", () => {
   test("reduces agent -> decision -> agent -> terminal success with the shared execution index", () => {
     const driver = createDriver();
     playSuccessRun(driver);
     const state = driver.current as PipelineV2RunState;
-    expect(state.schema_version).toBe(5);
+    expect(state.schema_version).toBe(6);
     expect(state.revision).toBe(23);
     expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
@@ -314,7 +314,7 @@ describe("pipeline v2 run state schema v5", () => {
       { index: 0, from: "check", outcome: "approved", to: "ship", execution_index: 2 },
       { index: 0, from: "ship", outcome: "completed", to: "done", execution_index: 3 },
     ]);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(5);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(6);
   });
 
   test("every accepted command grows the revision by exactly one and refreshes updated_at", () => {
@@ -1252,10 +1252,12 @@ describe("pipeline v2 run state schema v5", () => {
 
     expectInvalid(state, (draft) => {
       draft.transitions[0].from = "elsewhere";
-    }, 'the first committed transition starts at "elsewhere", expected the entry state "implement"');
+      draft.executions[0].state_id = "elsewhere";
+    }, 'transition at position 0 starts at "elsewhere", expected the replay cursor "implement"');
     expectInvalid(state, (draft) => {
       draft.transitions[2].from = "check";
-    }, 'transition at position 2 starts at "check", expected the previous transition target "ship"');
+      draft.executions[2].state_id = "check";
+    }, 'transition at position 2 starts at "check", expected the replay cursor "ship"');
     expectInvalid(state, (draft) => {
       draft.transitions[1].execution_index = 3;
     }, "transitions must reference executions in order");
@@ -1264,10 +1266,10 @@ describe("pipeline v2 run state schema v5", () => {
     }, "cursor.transition_count 2 does not match 3 committed transitions");
     expectInvalid(state, (draft) => {
       draft.cursor.current_state = "ship";
-    }, 'cursor.current_state "ship" does not match the expected cursor "done"');
+    }, 'cursor.current_state "ship" does not match the replayed cursor "done"');
     expectInvalid(state, (draft) => {
       draft.transitions[0].to = "elsewhere";
-    }, 'transition at position 1 starts at "check", expected the previous transition target "elsewhere"');
+    }, 'transition at position 1 starts at "check", expected the replay cursor "elsewhere"');
     expectInvalid(state, (draft) => {
       draft.transitions[1].outcome = "rejected";
     }, 'carries outcome "rejected", but its decision execution recorded outcome "approved"');
@@ -1358,30 +1360,36 @@ describe("pipeline v2 run state schema v5", () => {
     }, 'execution 1 records a failed session cleanup, so the run must finalize as status "cleanup_failed"');
   });
 
-  test("parse rejects schema versions 1, 2, 3 and 4 without any migration", () => {
+  test("parse rejects schema versions 1, 2, 3, 4 and 5 without any migration", () => {
     expect(() => parsePipelineV2RunState('{"schema_version":1}')).toThrow(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v1 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":2}')).toThrow(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 5 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 6 is the supported contract; no v2 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 2 })).toThrow(
-      "not a pipeline v2 run state (schema version 5 is the supported contract; no v2 migration exists)",
+      "not a pipeline v2 run state (schema version 6 is the supported contract; no v2 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":3}')).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 3 })).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":4}')).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 4 })).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
     );
-    expect(() => parsePipelineV2RunState('{"schema_version":6}')).toThrow(
-      "pipeline v2 run state has schema_version 6, expected 5",
+    expect(() => parsePipelineV2RunState('{"schema_version":5}')).toThrow(
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
+    );
+    expect(() => validatePipelineV2RunState({ schema_version: 5 })).toThrow(
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
+    );
+    expect(() => parsePipelineV2RunState('{"schema_version":7}')).toThrow(
+      "pipeline v2 run state has schema_version 7, expected 6",
     );
   });
 
@@ -1415,7 +1423,7 @@ describe("pipeline v2 run state schema v5", () => {
     });
     await writeFile(path, v3Document);
     expect(() => parsePipelineV2RunState(v3Document)).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v3Document);
     await rm(root, { recursive: true, force: true });
@@ -1441,9 +1449,42 @@ describe("pipeline v2 run state schema v5", () => {
     });
     await writeFile(path, v4Document);
     expect(() => parsePipelineV2RunState(v4Document)).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v4Document);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  test("a stored schema v5 document is rejected and left byte-for-byte identical", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipeline-v2-state-v5-"));
+    const path = join(root, "state.json");
+    // A plausible v5 document: the supported predecessor with its single
+    // optional top-level wait record and no wait journal.
+    const v5Document = JSON.stringify({
+      schema_version: 5,
+      revision: 3,
+      run_id: "old-run",
+      status: "waiting",
+      phase: "waiting",
+      started_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:01.000Z",
+      pipeline: IDENTITY,
+      inputs: [],
+      cursor: { current_state: "architect", transition_count: 0 },
+      executions: [],
+      transitions: [],
+      wait: {
+        state_id: "architect",
+        reason: "stage_iteration_limit_exhausted",
+        request_sha256: hex("7"),
+        actions: [{ id: "continue_stage", to: "coder" }],
+      },
+    });
+    await writeFile(path, v5Document);
+    expect(() => parsePipelineV2RunState(v5Document)).toThrow(
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
+    );
+    expect(await readFile(path, "utf8")).toBe(v5Document);
     await rm(root, { recursive: true, force: true });
   });
 
@@ -2025,7 +2066,7 @@ describe("pipeline v2 run state schema v5", () => {
   });
 });
 
-describe("pipeline v2 run state schema v5: durable user wait", () => {
+describe("pipeline v2 run state schema v6: durable user wait and response", () => {
   /** The default-pipeline policy graph around the P01 wait: architect/coder. */
   const WAIT_IDENTITY: PipelineV2RunPipelineIdentity = {
     ...IDENTITY,
@@ -2052,11 +2093,38 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     };
   }
 
+  function waitResponded(
+    overrides: Partial<{
+      waitIndex: number;
+      expectedRequestSha256: string;
+      actionId: string;
+      responseSha256: string;
+    }> = {},
+  ): PipelineV2RunCommand {
+    return {
+      kind: "wait_response_recorded",
+      waitIndex: 1,
+      expectedRequestSha256: hex("7"),
+      actionId: "continue_stage",
+      responseSha256: hex("8"),
+      ...overrides,
+    };
+  }
+
   /** Produces a valid waiting state: entry-state wait, zero executions, zero transitions. */
   function produceWaitingState(): PipelineV2RunState {
     const driver = createDriver(WAIT_IDENTITY, []);
     driver.apply(createRun(WAIT_IDENTITY, []));
     driver.apply(runWaiting());
+    return driver.current as PipelineV2RunState;
+  }
+
+  /** Produces a valid responded state: the entry wait answered at the coder target. */
+  function produceRespondedState(): PipelineV2RunState {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
     return driver.current as PipelineV2RunState;
   }
 
@@ -2067,14 +2135,20 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     expect(state.status).toBe("waiting");
     expect(state.phase).toBe("waiting");
     expect(state.revision).toBe(2);
-    expect(state.wait).toEqual({
-      state_id: "architect",
-      reason: "stage_iteration_limit_exhausted",
-      request_sha256: hex("7"),
-      actions: ORACLE_WAIT_ACTIONS,
-    });
-    // the wait record is content-free: exactly these four fields
-    expect(Object.keys(state.wait as object)).toEqual([
+    expect(state.waits).toEqual([
+      {
+        index: 1,
+        transition_count: 0,
+        state_id: "architect",
+        reason: "stage_iteration_limit_exhausted",
+        request_sha256: hex("7"),
+        actions: ORACLE_WAIT_ACTIONS,
+      },
+    ]);
+    // the wait record is content-free: exactly these six fields, no response yet
+    expect(Object.keys(state.waits[0] as object)).toEqual([
+      "index",
+      "transition_count",
       "state_id",
       "reason",
       "request_sha256",
@@ -2091,6 +2165,36 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     expectDeepFrozen(state);
   });
 
+  test("wait_response_recorded: entry-cursor response returns the run to active at the action target", () => {
+    const driver = loadableDriver(createDriver(WAIT_IDENTITY, []));
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    const state = driver.apply(waitResponded());
+    expect(state.status).toBe("active");
+    expect(state.phase).toBe("running");
+    expect(state.revision).toBe(3);
+    expect(state.waits).toHaveLength(1);
+    expect(state.waits[0]).toEqual({
+      index: 1,
+      transition_count: 0,
+      state_id: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      request_sha256: hex("7"),
+      actions: ORACLE_WAIT_ACTIONS,
+      response: { action_id: "continue_stage", response_sha256: hex("8") },
+    });
+    // the response is content-free: exactly these two fields
+    expect(Object.keys(state.waits[0]?.response as object)).toEqual(["action_id", "response_sha256"]);
+    // the cursor moves to the declared action target; the transition count,
+    // the budget and the history stay untouched
+    expect(state.cursor).toEqual({ current_state: "coder", transition_count: 0 });
+    expect(state.executions).toEqual([]);
+    expect(state.transitions).toEqual([]);
+    expect(state.started_at).toBe(tick(0).toISOString());
+    expect(state.updated_at).toBe(tick(2).toISOString());
+    expectDeepFrozen(state);
+  });
+
   test("run_waiting: wait after a decision transition commits, at the new cursor", () => {
     const identity = { ...IDENTITY, entry_state: "check", max_transitions: 2 };
     const driver = loadableDriver(createDriver(identity, []));
@@ -2104,7 +2208,9 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     const state = driver.apply(runWaiting());
     expect(state.status).toBe("waiting");
     expect(state.phase).toBe("waiting");
-    expect(state.wait?.state_id).toBe("architect");
+    expect(state.waits[0]?.state_id).toBe("architect");
+    expect(state.waits[0]?.transition_count).toBe(1);
+    expect(state.waits[0]?.index).toBe(1);
     expect(state.cursor).toEqual({ current_state: "architect", transition_count: 1 });
     expect(state.executions.map((execution) => `${execution.index}:${execution.state_id}`)).toEqual([
       "1:check",
@@ -2114,26 +2220,212 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     ]);
   });
 
-  test("run_waiting: wait after a settled agent transition commits (P01 reason preserved)", () => {
+  test("wait_response_recorded after a committed transition: history untouched, execution restarts at the target with the next global index", () => {
     const identity = { ...IDENTITY, max_transitions: 2 };
     const driver = loadableDriver(createDriver(identity, []));
     driver.apply(createRun(identity, []));
     startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "architect", 1);
-    const state = driver.apply(runWaiting());
-    expect(state.wait).toEqual({
-      state_id: "architect",
-      reason: "stage_iteration_limit_exhausted",
-      request_sha256: hex("7"),
-      actions: ORACLE_WAIT_ACTIONS,
-    });
-    const execution = state.executions[0] as Extract<
-      PipelineV2RunState["executions"][number],
-      { type: "agent" }
-    >;
-    expect(execution.phase).toBe("cleanup_completed");
-    expect(state.transitions.length).toBe(1);
+    driver.apply(runWaiting());
+    const state = driver.apply(waitResponded());
+    expect(state.status).toBe("active");
+    expect(state.phase).toBe("running");
+    expect(state.waits[0]?.transition_count).toBe(1);
+    expect(state.cursor).toEqual({ current_state: "coder", transition_count: 1 });
+    // the prior history is unchanged
+    expect(state.executions).toHaveLength(1);
+    expect(state.executions[0]).toMatchObject({ index: 1, state_id: "implement", phase: "cleanup_completed" });
+    expect(state.transitions).toEqual([
+      { index: 0, from: "implement", outcome: "completed", to: "architect", execution_index: 1 },
+    ]);
+    // the next execution starts at the chosen target with the next global index
+    startAgent(driver, "coder", { execution: "sess-2" });
+    const resumed = driver.current as PipelineV2RunState;
+    expect(resumed.executions).toHaveLength(2);
+    expect(resumed.executions[1]).toMatchObject({ index: 2, state_id: "coder", phase: "running" });
+    // a graph transition after the response must start at the chosen target
+    acceptOutputs(driver, []);
+    commitTransition(driver, "coder", "completed", "done", 2);
+    const finished = driver.current as PipelineV2RunState;
+    expect(finished.transitions[1]).toMatchObject({ from: "coder", to: "done", execution_index: 2 });
+    driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
+  });
+
+  test("two wait/response cycles at one clean boundary keep the prior history unchanged", () => {
+    const driver = loadableDriver(createDriver(WAIT_IDENTITY, []));
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
+    // second wait at the coder target, still zero committed transitions
+    driver.apply(
+      runWaiting({
+        stateId: "coder",
+        requestSha256: hex("9"),
+        actions: [{ id: "continue", to: "architect" }],
+      }),
+    );
+    const waitingAgain = driver.current as PipelineV2RunState;
+    expect(waitingAgain.status).toBe("waiting");
+    expect(waitingAgain.waits).toHaveLength(2);
+    expect(waitingAgain.waits[0]).toMatchObject({ index: 1, transition_count: 0, response: { action_id: "continue_stage" } });
+    expect(waitingAgain.waits[1]).toMatchObject({ index: 2, transition_count: 0, state_id: "coder" });
+    expect(waitingAgain.cursor).toEqual({ current_state: "coder", transition_count: 0 });
+    expect(waitingAgain.executions).toEqual([]);
+    expect(waitingAgain.transitions).toEqual([]);
+    const state = driver.apply(
+      waitResponded({
+        waitIndex: 2,
+        expectedRequestSha256: hex("9"),
+        actionId: "continue",
+        responseSha256: hex("a"),
+      }),
+    );
+    expect(state.status).toBe("active");
+    expect(state.cursor).toEqual({ current_state: "architect", transition_count: 0 });
+    expect(state.waits[1]?.response).toEqual({ action_id: "continue", response_sha256: hex("a") });
+    // the first cycle is untouched
+    expect(state.waits[0]).toMatchObject({ index: 1, response: { action_id: "continue_stage", response_sha256: hex("8") } });
+  });
+
+  test("sequential waits after one committed transition share the same transition_count", () => {
+    const identity = { ...IDENTITY, max_transitions: 2 };
+    const driver = loadableDriver(createDriver(identity, []));
+    driver.apply(createRun(identity, []));
+    startAgent(driver, "implement", { execution: "sess-1" });
+    acceptOutputs(driver, []);
+    commitTransition(driver, "implement", "completed", "architect", 1);
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
+    driver.apply(
+      runWaiting({
+        stateId: "coder",
+        requestSha256: hex("9"),
+        actions: [{ id: "back", to: "implement" }],
+      }),
+    );
+    const state = driver.apply(
+      waitResponded({
+        waitIndex: 2,
+        expectedRequestSha256: hex("9"),
+        actionId: "back",
+        responseSha256: hex("b"),
+      }),
+    );
+    expect(state.waits.map((wait) => `${wait.index}@t${wait.transition_count}`)).toEqual(["1@t1", "2@t1"]);
+    expect(state.cursor).toEqual({ current_state: "implement", transition_count: 1 });
+    // the next graph transition must start at the final response target
+    startAgent(driver, "implement", { execution: "sess-2" });
+    acceptOutputs(driver, []);
+    commitTransition(driver, "implement", "completed", "check", 2);
+    const final = driver.current as PipelineV2RunState;
+    expect(final.transitions[1]).toMatchObject({ from: "implement", to: "check" });
+  });
+
+  test("the loader replays transitions and waits jointly after every accepted command", () => {
+    const driver = loadableDriver(createDriver(WAIT_IDENTITY, []));
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
+    driver.apply(
+      runWaiting({
+        stateId: "coder",
+        requestSha256: hex("9"),
+        actions: [{ id: "continue", to: "architect" }],
+      }),
+    );
+    driver.apply(
+      waitResponded({
+        waitIndex: 2,
+        expectedRequestSha256: hex("9"),
+        actionId: "continue",
+        responseSha256: hex("a"),
+      }),
+    );
+    startAgent(driver, "architect", { execution: "sess-1" });
+    acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
+    commitTransition(driver, "architect", "completed", "coder", 1);
+    const state = driver.current as PipelineV2RunState;
+    expect(state.status).toBe("active");
+    expect(state.cursor).toEqual({ current_state: "coder", transition_count: 1 });
+    expect(state.waits).toHaveLength(2);
+    const parsed = parsePipelineV2RunState(JSON.stringify(state));
+    expect(parsed).toEqual(state);
+    expectDeepFrozen(parsed);
+  });
+
+  test("wait_response_recorded rejects a stale wait index, a stale request digest, an unknown action and a repeated response", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    driver.reject(
+      waitResponded({ waitIndex: 2 }),
+      "wait_response_recorded targets wait index 2, but the open wait record is 1",
+    );
+    driver.reject(
+      waitResponded({ expectedRequestSha256: hex("9") }),
+      "the expected request digest does not match open wait record 1",
+    );
+    driver.reject(
+      waitResponded({ actionId: "sneak" }),
+      'action "sneak" is not declared in wait record 1',
+    );
+    const state = driver.apply(waitResponded());
+    expect(state.status).toBe("active");
+    // a repeated response targets a closed record
+    driver.reject(waitResponded(), "recording a wait response requires a waiting run; the run is active with no open wait record");
+    driver.reject(
+      waitResponded({ waitIndex: 1 }),
+      "recording a wait response requires a waiting run; the run is active with no open wait record",
+    );
+    const unchanged = driver.current as PipelineV2RunState;
+    expect(unchanged.revision).toBe(3);
+    expect(unchanged.waits[0]?.response).toEqual({ action_id: "continue_stage", response_sha256: hex("8") });
+  });
+
+  test("wait_response_recorded rejects malformed digests, ids and exact fields before any state check", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    driver.reject(
+      waitResponded({ waitIndex: 0 }),
+      "wait_response_recorded wait index must be a positive safe integer",
+    );
+    driver.reject(
+      waitResponded({ waitIndex: -1 }),
+      "wait_response_recorded wait index must be a positive safe integer",
+    );
+    driver.reject(
+      waitResponded({ waitIndex: 1.5 }),
+      "wait_response_recorded wait index must be a positive safe integer",
+    );
+    driver.reject(
+      waitResponded({ expectedRequestSha256: "abc" }),
+      "wait_response_recorded expected request digest must be a lowercase hex SHA-256 digest",
+    );
+    driver.reject(
+      waitResponded({ responseSha256: hex("A") }),
+      "wait_response_recorded response digest must be a lowercase hex SHA-256 digest",
+    );
+    driver.reject(
+      waitResponded({ actionId: "../bad" }),
+      "wait_response_recorded action id must be a safe non-empty identifier",
+    );
+  });
+
+  test("wait_response_recorded is rejected on an active run without a wait and on finalized runs", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.reject(
+      waitResponded(),
+      "recording a wait response requires a waiting run; the run is active with no open wait record",
+    );
+    const successDriver = createDriver();
+    playSuccessRun(successDriver);
+    successDriver.reject(
+      waitResponded(),
+      'the run is already finalized with status "success"; the terminal run status is immutable',
+    );
   });
 
   test("several wait actions may target the same state, in declaration order", () => {
@@ -2148,7 +2440,7 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
         ],
       }),
     );
-    expect(state.wait?.actions).toEqual([
+    expect(state.waits[0]?.actions).toEqual([
       { id: "continue_stage", to: "coder" },
       { id: "continue_stage_stronger", to: "coder" },
       { id: "revise_task", to: "architect" },
@@ -2323,12 +2615,12 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     );
   });
 
-  test("after waiting every command is rejected, including a repeated wait", () => {
+  test("while waiting only wait_response_recorded advances the run; every other command is rejected", () => {
     const driver = createDriver(WAIT_IDENTITY, []);
     driver.apply(createRun(WAIT_IDENTITY, []));
     driver.apply(runWaiting());
     const waitingMessage =
-      "the run is waiting for an explicit user response; no command of this schema version advances a waiting run";
+      "the run is waiting for an explicit user response; only wait_response_recorded advances a waiting run";
     driver.reject(runWaiting(), waitingMessage);
     driver.reject({ kind: "start_agent_execution", stateId: "architect", profile: "coder" }, waitingMessage);
     driver.reject({ kind: "start_decision_execution", stateId: "architect", inputDigest: hex("e") }, waitingMessage);
@@ -2351,6 +2643,10 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     const state = driver.current as PipelineV2RunState;
     expect(state.status).toBe("waiting");
     expect(state.revision).toBe(2);
+    // the one response command advances the waiting run
+    const responded = driver.apply(waitResponded());
+    expect(responded.status).toBe("active");
+    expect(responded.revision).toBe(3);
   });
 
   test("the reducer never mutates the wait command or the input state; later command mutation cannot change the record", () => {
@@ -2371,7 +2667,9 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     // mutating the caller's command array afterwards cannot change the record
     actions.push({ id: "sneak", to: "coder" });
     actions[0]!.id = "mutated";
-    expect(next.wait).toEqual({
+    expect(next.waits[0]).toEqual({
+      index: 1,
+      transition_count: 0,
       state_id: "architect",
       reason: "stage_iteration_limit_exhausted",
       request_sha256: hex("7"),
@@ -2384,7 +2682,23 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     expectDeepFrozen(before);
   });
 
-  test("the loader enforces the status/phase/wait biconditional in both directions", () => {
+  test("the response command never mutates its inputs and always freezes the snapshot", () => {
+    const driver = createDriver(WAIT_IDENTITY, []);
+    driver.apply(createRun(WAIT_IDENTITY, []));
+    driver.apply(runWaiting());
+    const before = driver.current as PipelineV2RunState;
+    const command = waitResponded();
+    const commandSnapshot = JSON.parse(JSON.stringify(command));
+    const next = reducePipelineV2RunCommand(before, command, tick(40));
+    expect(JSON.parse(JSON.stringify(command))).toEqual(commandSnapshot);
+    expect(JSON.parse(JSON.stringify(before))).toEqual(draftOf(before));
+    expect(next.waits[0]?.response).toEqual({ action_id: "continue_stage", response_sha256: hex("8") });
+    expect(next.cursor).toEqual({ current_state: "coder", transition_count: 0 });
+    expectDeepFrozen(next);
+    expectDeepFrozen(before);
+  });
+
+  test("the loader enforces the status/phase/open-wait biconditional in both directions", () => {
     const state = produceWaitingState();
     expectInvalid(state, (draft) => {
       draft.status = "active";
@@ -2393,24 +2707,48 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     expectInvalid(state, (draft) => {
       draft.status = "active";
       draft.phase = "running";
-    }, 'a wait record requires run status "waiting"');
+    }, 'an open wait record requires run status "waiting"');
     expectInvalid(state, (draft) => {
       draft.phase = "running";
-    }, 'run status "waiting" requires phase "waiting" and a wait record');
+    }, 'run status "waiting" requires phase "waiting"');
     expectInvalid(state, (draft) => {
-      delete draft.wait;
-    }, 'run status "waiting" requires phase "waiting" and a wait record');
+      draft.waits[0].response = { action_id: "continue_stage", response_sha256: hex("8") };
+    }, 'run status "waiting" requires an open wait record as the last wait record');
     expectInvalid(state, (draft) => {
-      draft.status = "active";
-      draft.phase = "waiting";
-    }, 'run phase "waiting" requires run status "waiting"');
+      draft.waits = [];
+    }, 'run status "waiting" requires an open wait record as the last wait record');
+    expectInvalid(state, (draft) => {
+      delete draft.waits;
+    }, 'is missing required field "waits"');
 
-    // every non-waiting status forbids a wait record
+    // every non-waiting status forbids an open wait record
     const successDriver = createDriver();
     playSuccessRun(successDriver);
     expectInvalid(successDriver.current as PipelineV2RunState, (draft) => {
-      draft.wait = JSON.parse(JSON.stringify(state.wait));
-    }, 'a wait record requires run status "waiting"');
+      draft.waits = [
+        {
+          index: 1,
+          transition_count: 3,
+          state_id: "done",
+          reason: "stage_iteration_limit_exhausted",
+          request_sha256: hex("7"),
+          actions: ORACLE_WAIT_ACTIONS,
+        },
+      ];
+    }, 'an open wait record requires run status "waiting"');
+    expectInvalid(successDriver.current as PipelineV2RunState, (draft) => {
+      draft.waits = [
+        {
+          index: 1,
+          transition_count: 3,
+          state_id: "elsewhere",
+          reason: "stage_iteration_limit_exhausted",
+          request_sha256: hex("7"),
+          actions: ORACLE_WAIT_ACTIONS,
+          response: { action_id: "continue_stage", response_sha256: hex("8") },
+        },
+      ];
+    }, 'wait record 1 names state "elsewhere", which does not match the replay cursor "done"');
 
     const identity = { ...IDENTITY, max_transitions: 1 };
     const failedDriver = createDriver(identity, []);
@@ -2423,8 +2761,17 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     });
     failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
     expectInvalid(failedDriver.current as PipelineV2RunState, (draft) => {
-      draft.wait = JSON.parse(JSON.stringify(state.wait));
-    }, 'a wait record requires run status "waiting"');
+      draft.waits = [
+        {
+          index: 1,
+          transition_count: 0,
+          state_id: "implement",
+          reason: "stage_iteration_limit_exhausted",
+          request_sha256: hex("7"),
+          actions: ORACLE_WAIT_ACTIONS,
+        },
+      ];
+    }, 'an open wait record requires run status "waiting"');
 
     const cleanupDriver = createDriver(identity, []);
     cleanupDriver.apply(createRun(identity, []));
@@ -2436,8 +2783,23 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     });
     cleanupDriver.apply({ kind: "run_cleanup_failed" });
     expectInvalid(cleanupDriver.current as PipelineV2RunState, (draft) => {
-      draft.wait = JSON.parse(JSON.stringify(state.wait));
-    }, 'a wait record requires run status "waiting"');
+      draft.waits = [
+        {
+          index: 1,
+          transition_count: 0,
+          state_id: "implement",
+          reason: "stage_iteration_limit_exhausted",
+          request_sha256: hex("7"),
+          actions: ORACLE_WAIT_ACTIONS,
+        },
+      ];
+    }, 'an open wait record requires run status "waiting"');
+
+    // an active responded state with a re-opened wait record is rejected too
+    const responded = produceRespondedState();
+    expectInvalid(responded, (draft) => {
+      delete draft.waits[0].response;
+    }, 'an open wait record requires run status "waiting"');
   });
 
   test("a waiting run must not carry a terminal, run outputs or a failure reason", () => {
@@ -2459,69 +2821,107 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     }, "a waiting run must not carry a failure reason");
   });
 
-  test("the wait record must name the cursor state", () => {
+  test("the wait record must name the replay cursor state", () => {
     const state = produceWaitingState();
     expectInvalid(state, (draft) => {
-      draft.wait.state_id = "coder";
-    }, 'the wait record names state "coder", which does not match the cursor "architect"');
+      draft.waits[0].state_id = "coder";
+    }, 'wait record 1 names state "coder", which does not match the replay cursor "architect"');
   });
 
   test("the loader validates the wait record fail-closed", () => {
     const state = produceWaitingState();
     expectInvalid(state, (draft) => {
-      draft.wait.state_id = "../bad";
-    }, "wait.state_id must be a safe non-empty identifier");
+      draft.waits[0].state_id = "../bad";
+    }, "waits[0].state_id must be a safe non-empty identifier");
     expectInvalid(state, (draft) => {
-      draft.wait.reason = "Stage Limit!";
-    }, "wait.reason must be a safe non-empty identifier");
+      draft.waits[0].reason = "Stage Limit!";
+    }, "waits[0].reason must be a safe non-empty identifier");
     expectInvalid(state, (draft) => {
-      draft.wait.reason = "";
-    }, "wait.reason must be a safe non-empty identifier");
+      draft.waits[0].reason = "";
+    }, "waits[0].reason must be a safe non-empty identifier");
     expectInvalid(state, (draft) => {
-      draft.wait.request_sha256 = hex("A");
-    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+      draft.waits[0].request_sha256 = hex("A");
+    }, "waits[0].request_sha256 must be a lowercase hex SHA-256 digest");
     expectInvalid(state, (draft) => {
-      draft.wait.request_sha256 = "abc";
-    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+      draft.waits[0].request_sha256 = "abc";
+    }, "waits[0].request_sha256 must be a lowercase hex SHA-256 digest");
     expectInvalid(state, (draft) => {
-      draft.wait.request_sha256 = "a".repeat(65);
-    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+      draft.waits[0].request_sha256 = "a".repeat(65);
+    }, "waits[0].request_sha256 must be a lowercase hex SHA-256 digest");
     expectInvalid(state, (draft) => {
-      draft.wait.request_sha256 = "z".repeat(64);
-    }, "wait.request_sha256 must be a lowercase hex SHA-256 digest");
+      draft.waits[0].request_sha256 = "z".repeat(64);
+    }, "waits[0].request_sha256 must be a lowercase hex SHA-256 digest");
     expectInvalid(state, (draft) => {
-      draft.wait.actions = [];
-    }, "wait.actions must not be empty");
+      draft.waits[0].actions = [];
+    }, "waits[0].actions must not be empty");
     expectInvalid(state, (draft) => {
-      draft.wait.actions = "continue_stage";
-    }, "wait.actions must be an array");
+      draft.waits[0].actions = "continue_stage";
+    }, "waits[0].actions must be an array");
     expectInvalid(state, (draft) => {
-      draft.wait.actions = [
+      draft.waits[0].actions = [
         { id: "continue_stage", to: "coder" },
         { id: "continue_stage", to: "architect" },
       ];
-    }, 'wait declares action id "continue_stage" more than once');
+    }, 'waits[0] declares action id "continue_stage" more than once');
     expectInvalid(state, (draft) => {
-      draft.wait.actions[0].id = "../bad";
-    }, "wait.actions[0].id must be a safe non-empty identifier");
+      draft.waits[0].actions[0].id = "../bad";
+    }, "waits[0].actions[0].id must be a safe non-empty identifier");
     expectInvalid(state, (draft) => {
-      draft.wait.actions[1].to = "/architect";
-    }, "wait.actions[1].to must be a safe non-empty identifier");
+      draft.waits[0].actions[1].to = "/architect";
+    }, "waits[0].actions[1].to must be a safe non-empty identifier");
     expectInvalid(state, (draft) => {
-      draft.wait.actions[0].target = "coder";
-    }, 'wait.actions[0] has unknown field "target"');
+      draft.waits[0].actions[0].target = "coder";
+    }, 'waits[0].actions[0] has unknown field "target"');
     expectInvalid(state, (draft) => {
-      draft.wait.evidence = "acceptance test 7 fails";
-    }, 'wait has unknown field "evidence"');
+      draft.waits[0].evidence = "acceptance test 7 fails";
+    }, 'waits[0] has unknown field "evidence"');
     expectInvalid(state, (draft) => {
-      draft.wait.manifest = { intent: "continue_stage" };
-    }, 'wait has unknown field "manifest"');
+      draft.waits[0].manifest = { intent: "continue_stage" };
+    }, 'waits[0] has unknown field "manifest"');
     expectInvalid(state, (draft) => {
-      draft.wait = { state_id: "architect", reason: "stage_iteration_limit_exhausted", request_sha256: hex("7") };
-    }, 'wait is missing required field "actions"');
+      draft.waits[0].index = 0;
+    }, "waits[0].index must be a positive safe integer");
     expectInvalid(state, (draft) => {
-      draft.wait = "waiting";
-    }, "wait is not a JSON object");
+      draft.waits[0].transition_count = -1;
+    }, "waits[0].transition_count must be a non-negative safe integer");
+    expectInvalid(state, (draft) => {
+      draft.waits[0].transition_count = 1.5;
+    }, "waits[0].transition_count must be a non-negative safe integer");
+    expectInvalid(state, (draft) => {
+      draft.waits[0] = { state_id: "architect", reason: "stage_iteration_limit_exhausted", request_sha256: hex("7") };
+    }, 'waits[0] is missing required field "index"');
+    expectInvalid(state, (draft) => {
+      draft.waits[0] = {
+        index: 1,
+        transition_count: 0,
+        state_id: "architect",
+        reason: "stage_iteration_limit_exhausted",
+        request_sha256: hex("7"),
+      };
+    }, 'waits[0] is missing required field "actions"');
+    expectInvalid(state, (draft) => {
+      draft.waits[0] = "waiting";
+    }, "waits[0] is not a JSON object");
+    // the response record is validated fail-closed as well
+    const responded = produceRespondedState();
+    expectInvalid(responded, (draft) => {
+      draft.waits[0].response.action_id = "../bad";
+    }, "waits[0].response.action_id must be a safe non-empty identifier");
+    expectInvalid(responded, (draft) => {
+      draft.waits[0].response.response_sha256 = hex("A");
+    }, "waits[0].response.response_sha256 must be a lowercase hex SHA-256 digest");
+    expectInvalid(responded, (draft) => {
+      draft.waits[0].response.response_sha256 = "abc";
+    }, "waits[0].response.response_sha256 must be a lowercase hex SHA-256 digest");
+    expectInvalid(responded, (draft) => {
+      draft.waits[0].response.body = "user answer text";
+    }, 'waits[0].response has unknown field "body"');
+    expectInvalid(responded, (draft) => {
+      draft.waits[0].response = { action_id: "continue_stage" };
+    }, 'waits[0].response is missing required field "response_sha256"');
+    expectInvalid(responded, (draft) => {
+      draft.waits[0].response = "continue_stage";
+    }, "waits[0].response is not a JSON object");
   });
 
   test("the loader rejects a waiting run with an unfinished or unbound execution", () => {
@@ -2534,23 +2934,160 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
     driver.apply(runWaiting());
     const state = driver.current as PipelineV2RunState;
 
-    // an in-flight execution: phase, cleanup, outputs and the bound
-    // transition must be forged consistently so the execution-level and
-    // transition-level validations pass and the waiting coherence check is
-    // what rejects the document
-    expectInvalid(state, (draft) => {
-      draft.executions[0].phase = "running";
-      delete draft.executions[0].session_cleanup;
-      delete draft.executions[0].outputs;
-      draft.transitions = [];
-      draft.cursor = { current_state: "implement", transition_count: 0 };
-      draft.wait.state_id = "implement";
-    }, 'a waiting run requires execution 1 to be finished, it has phase "running"');
+    // an in-flight execution under a waiting run is rejected by the
+    // open-wait coherence rule (no execution may follow an open wait)
     expectInvalid(state, (draft) => {
       draft.transitions = [];
       draft.cursor = { current_state: "implement", transition_count: 0 };
-      draft.wait.state_id = "implement";
-    }, "a waiting run requires every execution's transition to be committed; execution 1 has no committed transition");
+      draft.waits[0].transition_count = 0;
+      draft.waits[0].state_id = "implement";
+    }, "wait record 1 is open while execution 1 has no committed transition; an open wait record requires a fully settled and committed history");
+    // a settled but unbound execution is rejected by the same open-wait
+    // coherence rule
+    expectInvalid(state, (draft) => {
+      draft.executions.push({
+        index: 2,
+        type: "agent",
+        state_id: "architect",
+        attempt: 1,
+        profile: "coder",
+        phase: "cleanup_completed",
+        execution_session_id: "sess-2",
+        tool_session_id: "tool-2",
+        session_cleanup: { execution: "completed", tool: "completed" },
+        outputs: [],
+      });
+      draft.waits[0].state_id = "architect";
+    }, "wait record 1 is open while execution 2 has no committed transition; an open wait record requires a fully settled and committed history");
+  });
+
+  test("the loader rejects wait journal gaps, duplicates and out-of-range transition counts", () => {
+    const state = produceWaitingState();
+    expectInvalid(state, (draft) => {
+      draft.waits[0].index = 2;
+    }, "wait record at position 0 declares index 2; wait record indexes must be contiguous from 1");
+    expectInvalid(state, (draft) => {
+      draft.waits[0].index = 5;
+    }, "wait record at position 0 declares index 5; wait record indexes must be contiguous from 1");
+    expectInvalid(state, (draft) => {
+      draft.waits[0].transition_count = 1;
+    }, "wait record 1 declares transition_count 1, which exceeds the 0 committed transitions");
+
+    // a decreasing journal across two boundaries
+    const identity = { ...IDENTITY, max_transitions: 2 };
+    const driver = loadableDriver(createDriver(identity, []));
+    driver.apply(createRun(identity, []));
+    startAgent(driver, "implement", { execution: "sess-1" });
+    acceptOutputs(driver, []);
+    commitTransition(driver, "implement", "completed", "architect", 1);
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
+    driver.apply(
+      runWaiting({
+        stateId: "coder",
+        requestSha256: hex("9"),
+        actions: [{ id: "back", to: "implement" }],
+      }),
+    );
+    driver.apply(
+      waitResponded({
+        waitIndex: 2,
+        expectedRequestSha256: hex("9"),
+        actionId: "back",
+        responseSha256: hex("b"),
+      }),
+    );
+    const twoCycle = driver.current as PipelineV2RunState;
+    expectInvalid(twoCycle, (draft) => {
+      draft.waits[1].transition_count = 0;
+    }, "wait record 2 declares transition_count 0, below the replay boundary 1 already consumed by earlier wait records; wait records must be ordered by transition_count");
+    expectInvalid(twoCycle, (draft) => {
+      draft.waits[1].transition_count = 2;
+    }, "wait record 2 declares transition_count 2, which exceeds the 1 committed transitions");
+  });
+
+  test("the loader rejects duplicate wait indexes and an open wait record that is not the last", () => {
+    const identity = { ...IDENTITY, max_transitions: 2 };
+    const driver = loadableDriver(createDriver(identity, []));
+    driver.apply(createRun(identity, []));
+    startAgent(driver, "implement", { execution: "sess-1" });
+    acceptOutputs(driver, []);
+    commitTransition(driver, "implement", "completed", "architect", 1);
+    driver.apply(runWaiting());
+    driver.apply(waitResponded());
+    driver.apply(
+      runWaiting({
+        stateId: "coder",
+        requestSha256: hex("9"),
+        actions: [{ id: "back", to: "implement" }],
+      }),
+    );
+    const twoWait = driver.current as PipelineV2RunState;
+
+    // duplicate journal index
+    expectInvalid(twoWait, (draft) => {
+      draft.waits[1].index = 1;
+    }, "wait record at position 1 declares index 1; wait record indexes must be contiguous from 1");
+    // a gap in the journal index
+    expectInvalid(twoWait, (draft) => {
+      draft.waits[1].index = 3;
+    }, "wait record at position 1 declares index 3; wait record indexes must be contiguous from 1");
+
+    // an open record before a later record
+    const responded = produceRespondedState();
+    expectInvalid(responded, (draft) => {
+      draft.status = "waiting";
+      draft.phase = "waiting";
+      delete draft.waits[0].response;
+      draft.waits.push({
+        index: 2,
+        transition_count: 0,
+        state_id: "coder",
+        reason: "stage_iteration_limit_exhausted",
+        request_sha256: hex("9"),
+        actions: [{ id: "continue", to: "architect" }],
+      });
+      draft.cursor = { current_state: "coder", transition_count: 0 };
+    }, "wait record 1 is open but is not the last wait record; an open wait record may only end the wait journal");
+
+    // committed transitions after an open record
+    const waiting = produceWaitingState();
+    expectInvalid(waiting, (draft) => {
+      draft.transitions.push({
+        index: 0,
+        from: "architect",
+        outcome: "completed",
+        to: "coder",
+        execution_index: 1,
+      });
+      draft.executions.push({
+        index: 1,
+        type: "agent",
+        state_id: "architect",
+        attempt: 1,
+        profile: "coder",
+        phase: "cleanup_completed",
+        execution_session_id: "sess-1",
+        tool_session_id: "tool-1",
+        session_cleanup: { execution: "completed", tool: "completed" },
+        outputs: [],
+      });
+      draft.cursor = { current_state: "architect", transition_count: 1 };
+    }, "wait record 1 is open but 1 committed transitions follow it; no transition may follow an open wait record");
+  });
+
+  test("the loader rejects a response for an undeclared action and a cursor that ignores the response target", () => {
+    const responded = produceRespondedState();
+    expectInvalid(responded, (draft) => {
+      draft.waits[0].response.action_id = "sneak";
+    }, 'wait record 1 records response action "sneak", which it does not declare');
+    expectInvalid(responded, (draft) => {
+      draft.cursor.current_state = "architect";
+    }, 'cursor.current_state "architect" does not match the replayed cursor "coder"');
+    // a forged persisted cursor must not bypass the replayed action target
+    expectInvalid(responded, (draft) => {
+      draft.cursor.current_state = "implement";
+    }, 'cursor.current_state "implement" does not match the replayed cursor "coder"');
   });
 
   test("a loaded waiting state is deep-frozen and round-trips through parse", () => {
@@ -2585,7 +3122,6 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
       "manifest",
       "request",
       "user_response",
-      "response",
       "task",
       "plan",
       "profile_bindings",
@@ -2593,6 +3129,17 @@ describe("pipeline v2 run state schema v5: durable user wait", () => {
       "token",
     ]) {
       expect(keys.has(banned), `state must not carry a ${banned} field`).toBe(false);
+    }
+    // the response record is content-free: only action_id and response_sha256
+    const responded = produceRespondedState();
+    const respondedKeys = new Set<string>();
+    collectKeys(responded, respondedKeys);
+    expect(respondedKeys.has("response")).toBe(true);
+    expect(respondedKeys.has("user_response")).toBe(false);
+    expect(respondedKeys.has("body")).toBe(false);
+    const respondedText = JSON.stringify(responded);
+    for (const canary of ["user answer text", '{"intent":"revise_task"}', "TASK.md"]) {
+      expect(respondedText).not.toContain(canary);
     }
   });
 });

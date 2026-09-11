@@ -1316,10 +1316,10 @@ Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
 them.
 
-### Pipeline v2 run state (state schema version 5, the production run state of pipeline v2)
+### Pipeline v2 run state (state schema version 6, the production run state of pipeline v2)
 
 `orchestrator/src/pipeline_v2_state.ts` already defines the durable run state
-for pipeline schema v2 as a pure substrate (state schema version 5, with the
+for pipeline schema v2 as a pure substrate (state schema version 6, with the
 nested pipeline identity carrying `schema_version: 2`): logical run inputs
 (id, port type, protected flag, snapshot digest), a shared contiguous
 execution index covering both agent and decision executions (agent
@@ -1327,10 +1327,55 @@ executions reuse it as their activation index; a decision occupies an index
 without an activation directory), per-execution phase records, committed
 transitions that bind exactly one settled execution, the terminal, published
 run outputs (present/absent variants with digests only), a normalized
-failure reason, and one optional content-free `wait` record
-(`{state_id, reason, request_sha256, actions}`) that durably marks the run
-as waiting for an explicit user response (`status`/`phase` `"waiting"`);
-no user-response successor exists yet, so a waiting run stays immobile.
+failure reason, and the required wait journal `waits` — the ordered,
+content-free record list of every user wait and accepted response.
+
+One wait record (`PipelineV2WaitRecord`) carries its journal `index`
+(contiguous from 1), the `transition_count` of committed graph transitions
+at the moment the run entered the wait, the waiting graph `state_id`, a
+normalized policy `reason` (for example the P01 reason
+`stage_iteration_limit_exhausted`), the SHA-256 of the future
+orchestrator-owned user request manifest, the declared actions
+(`{id, to}` in declaration order; several action ids may target the same
+state), and — once answered — a content-free `response` record
+(`{action_id, response_sha256}`) referencing a declared action of the same
+record. Both digests reserve the link to future orchestrator-owned
+manifests; validating user intent (for the P01 reasons: the TASK revision,
+the budget grant, and the model-profile replacements) belongs to a future
+policy/controller layer that dispatches an already validated command — the
+reducer itself records no user intent payload. No response body, evidence,
+TASK/PLAN content, facts, paths, environment values, profiles or
+credentials ever enter the document.
+
+The 20-command union keeps the v5 successor rules and adds the explicit
+user-response successor: `run_waiting {stateId, reason, requestSha256,
+actions}` appends a new open wait record on a clean boundary (active
+`running` run at the cursor, no terminal/outputs/failure, every execution
+settled and every transition committed, no open wait) and sets
+`status`/`phase` to `waiting`; `wait_response_recorded {waitIndex,
+expectedRequestSha256, actionId, responseSha256}` is accepted only on a
+waiting run whose last wait record is open, is exactly `waitIndex`, carries
+the matching request digest and declares the action — it atomically closes
+that record with the response, returns the run to `active`/`running`, and
+moves `cursor.current_state` to the declared action target without touching
+`cursor.transition_count`, `pipeline.max_transitions`, executions,
+transitions or any prior history (no execution, transition or session is
+created). After the response ordinary commands apply again under the
+existing successor rules; a new execution receives the next global index,
+identities are never reused, and repeated wait/response cycles — including
+several waits at one `transition_count` — are valid. The loader restores
+the cursor by a joint replay of both authoritative streams: starting at the
+entry state, before every graph transition with the next ordinal it applies
+in order all waits bound to that boundary; each wait must name the replay
+cursor, a response moves the replay cursor to the declared action target,
+and an open record may only end the journal (no later waits, executions or
+transitions, a fully settled and committed history). The persisted cursor
+must equal the replayed cursor, and wait/response never consume the graph
+transition budget. The triple biconditional
+(`status === "waiting"` ⇔ `phase === "waiting"` ⇔ the last wait record
+exists and is open) is enforced in both directions; waiting forbids
+terminal/run_outputs/failure, and a final state with an open wait is
+rejected.
 
 One agent execution records two independent, durable, non-secret session
 ids following the two-session capability model: `execution_session_id`
@@ -1342,8 +1387,8 @@ Global session-id uniqueness spans both fields of every execution, so an
 id can never be reused — not even once as an Execution and once as a Tool
 session. Bearers, endpoints, and credentials never enter the document.
 
-The pure reducer applies 19 commands and enforces the same shape as the v1
-state (execution only at the cursor, one in-flight execution, a new
+The pure reducer applies the 20 commands and enforces the same shape as the
+v1 state (execution only at the cursor, one in-flight execution, a new
 execution only after the previous transition commit, two-slot session-id
 uniqueness, the phase successor chain `started` → `data_prepared` →
 `execution_session_created` → `sessions_created` → `running` →
@@ -1351,19 +1396,28 @@ uniqueness, the phase successor chain `started` → `data_prepared` →
 execution session, transition only after agent cleanup or a matching
 evaluated decision outcome, the transition budget, `run_waiting` only on an
 active running run at the cursor with a settled, fully committed history
-and no terminal/outputs/failure/previous wait, one terminal at the
-cursor, publication exactly once after the terminal, `run_succeeded`
-requiring published outputs, a published failed terminal finalizing as
-`run_failed` with `terminal_failed`, cleanup failures finalizing only as
+and no terminal/outputs/failure/open wait, one terminal at the cursor,
+publication exactly once after the terminal, `run_succeeded` requiring
+published outputs, a published failed terminal finalizing as `run_failed`
+with `terminal_failed`, cleanup failures finalizing only as
 `cleanup_failed`, and an immutable final status); the loader re-derives the
 same invariants from those records in both directions. There is no
-`events[]` by design: `executions`, `transitions`, `terminal`, and
+`events[]` by design: `executions`, `transitions`, `waits`, `terminal`, and
 `run_outputs` are the single authoritative journal, so a later
 audit/observation layer must never duplicate them as a second source of
-truth. State schema versions 1, 2, and 3 are explicitly rejected (no
+truth. State schema versions 1, 2, 3, 4, and 5 are explicitly rejected (no
 migration); the schema v2 document stays the production state of pipeline
-v1, and production v2 execution, store/sink integration, and resume are
-still not implemented.
+v1, and production v2 resume is still not implemented.
+
+P01 boundary: this increment implements only the generic durable
+request/response pair and the routing to a pre-declared action. It does
+not implement TASK-revision checks, additional stage iterations or budget
+epochs, model-profile replacements, trusted-profile/capability validation,
+architect-owned PLAN/STAGE updates, request/response manifest publication
+or validation, or production resume — the corresponding P01-S05…S12 policy
+validation stays unconnected, and no TASK/stage/profile/budget fields are
+added to the durable state to imitate a policy owner that does not exist
+yet.
 
 ### Run-owned project copy and the production-neutral coordinator (implemented, driven by the production runner)
 

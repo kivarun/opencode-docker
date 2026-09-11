@@ -1,5 +1,5 @@
 /**
- * Durable run state for pipeline schema v2 (state schema version 5).
+ * Durable run state for pipeline schema v2 (state schema version 6).
  *
  * Pure substrate: a versioned state document, an exact-field loader, and a
  * pure command reducer. Nothing here touches the filesystem, docker-helper,
@@ -8,28 +8,40 @@
  * any of this. There are no migrations between state versions in either
  * direction.
  *
- * Schema version 5 adds the durable user-wait: `status: "waiting"`,
- * `phase: "waiting"` and one optional top-level `wait` record
- * (`PipelineV2WaitRecord`). A waiting run is a temporarily immobile
- * durable state, not a terminal result: the graph cursor sits at
- * `wait.state_id` with every execution settled and every transition
- * committed, and this schema version provides no successor — a later
- * increment adds the explicit user-response command that consumes the
- * wait. The wait record is content-free: it names the waiting state, a
- * normalized policy reason (for example the P01 reason
+ * Schema version 6 adds the durable user-response successor for the user
+ * wait. The single optional top-level `wait` record of schema v5 is
+ * replaced by the required wait journal `waits` — an ordered list of
+ * content-free wait records (`PipelineV2WaitRecord`), each carrying its
+ * journal `index` (contiguous from 1), the `transition_count` of committed
+ * graph transitions at the moment the run entered the wait, the waiting
+ * graph state, a normalized policy reason (for example the P01 reason
  * `stage_iteration_limit_exhausted`), the SHA-256 of the future
  * orchestrator-owned user request manifest, and the declared wait actions
- * (`{id, to}` in declaration order; several action ids may target the
- * same state). It never carries paths, evidence bodies, TASK/PLAN
- * content, facts, prompts, worker output, environment values, profiles
- * or credentials.
+ * (`{id, to}` in declaration order; several action ids may target the same
+ * state). An open record (no `response`) marks `status: "waiting"` /
+ * `phase: "waiting"`; `run_waiting` appends a new open record on a clean
+ * boundary, and the one new command `wait_response_recorded` atomically
+ * closes the open record with a content-free response
+ * (`{action_id, response_sha256}`), returns the run to
+ * `active`/`running`, and moves the cursor to the declared action target
+ * without touching the transition count, the transition budget, or any
+ * history. `waits` is the single authoritative journal of waits and
+ * responses: there is no `events[]`, no separate response journal, and no
+ * current-wait pointer. The loader re-derives the cursor by a joint replay
+ * of the committed transitions and the wait journal. Both digests
+ * (`request_sha256`, `response_sha256`) reserve the link to future
+ * orchestrator-owned manifests; the reducer itself trusts only an already
+ * validated command from that future policy/controller layer and records
+ * no user intent payload. No paths, evidence bodies, TASK/PLAN content,
+ * facts, prompts, worker output, environment values, profiles or
+ * credentials ever enter the document.
  *
  * Deliberate difference from state schema v2: there is NO event journal.
- * `executions`, `transitions`, `terminal` and `run_outputs` are the only
- * authoritative journal of the run, and the loader re-derives every
- * invariant from those records in both directions (no second event model,
- * no bidirectional event/record coherence layer). Audit and observation
- * streams are a separate later layer.
+ * `executions`, `transitions`, `waits`, `terminal` and `run_outputs` are
+ * the only authoritative journal of the run, and the loader re-derives
+ * every invariant from those records in both directions (no second event
+ * model, no bidirectional event/record coherence layer). Audit and
+ * observation streams are a separate later layer.
  *
  * Two-session capability model: one agent execution durably records two
  * independent session ids — the orchestrator-owned Execution Session
@@ -50,7 +62,7 @@
 import type { DecisionFactValidationReason } from "./decision.ts";
 import type { TransitionStep } from "./pipeline_engine.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 5;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 6;
 
 export const PIPELINE_V2_RUN_STATUSES = [
   "active",
@@ -277,20 +289,42 @@ export interface PipelineV2WaitAction {
 }
 
 /**
- * Content-free durable record of one user wait (schema v5). The record
- * names the waiting graph state, a normalized policy reason (the P01
- * reason `stage_iteration_limit_exhausted` belongs to the policy/context
- * stage, never to the engine transition budget), the SHA-256 of the
+ * Content-free durable record of the user's accepted response to one wait
+ * (schema v6): the declared action id the response selected and the
+ * SHA-256 of the future orchestrator-owned response manifest. The routing
+ * target itself is never duplicated here — it is always the declared
+ * `to` of the referenced action. No response body, evidence, TASK/PLAN
+ * content, facts, paths, environment values, profiles or credentials ever
+ * enter the record.
+ */
+export interface PipelineV2WaitResponseRecord {
+  readonly action_id: string;
+  readonly response_sha256: string;
+}
+
+/**
+ * Content-free durable record of one user wait (schema v6). The record
+ * carries its journal `index` (contiguous from 1), the count of committed
+ * graph transitions at the moment the run entered the wait, the waiting
+ * graph state, a normalized policy reason (the P01 reason
+ * `stage_iteration_limit_exhausted` belongs to the policy/context stage,
+ * never to the engine transition budget), the SHA-256 of the
  * orchestrator-owned user request manifest that a later increment
- * publishes on the data plane, and the declared actions. No user response
- * body, evidence, TASK/PLAN content, facts, prompts, paths, environment
- * values, profiles or credentials ever enter the document.
+ * publishes on the data plane, and the declared actions. An open record
+ * (no `response`) marks the run as waiting; the response closes the same
+ * record atomically. No user response body, evidence, TASK/PLAN content,
+ * facts, prompts, paths, environment values, profiles or credentials ever
+ * enter the document.
  */
 export interface PipelineV2WaitRecord {
+  readonly index: number;
+  /** Committed graph transitions at the moment the run entered the wait. */
+  readonly transition_count: number;
   readonly state_id: string;
   readonly reason: string;
   readonly request_sha256: string;
   readonly actions: readonly PipelineV2WaitAction[];
+  readonly response?: PipelineV2WaitResponseRecord;
 }
 
 /**
@@ -322,7 +356,7 @@ export type PipelineDecisionStateRecord =
     };
 
 export interface PipelineV2RunState {
-  schema_version: 5;
+  schema_version: 6;
   revision: number;
   run_id: string;
   status: PipelineV2RunStatus;
@@ -337,8 +371,12 @@ export interface PipelineV2RunState {
   terminal?: PipelineV2TerminalState;
   run_outputs?: PipelineV2RunOutputState[];
   failure?: PipelineV2FailureState;
-  /** Present if and only if status and phase are both "waiting". */
-  wait?: PipelineV2WaitRecord;
+  /**
+   * The single authoritative wait/response journal, in chronological
+   * order. Empty for a run that never waited; an open last record marks
+   * the run as waiting.
+   */
+  waits: PipelineV2WaitRecord[];
 }
 
 export type PipelineV2RunCommand =
@@ -371,6 +409,17 @@ export type PipelineV2RunCommand =
       /** SHA-256 of the future orchestrator-owned user request manifest. */
       requestSha256: string;
       actions: readonly { id: string; to: string }[];
+    }
+  | {
+      kind: "wait_response_recorded";
+      /** The wait record the response closes; must be the open last record. */
+      waitIndex: number;
+      /** The request manifest digest of the open wait record. */
+      expectedRequestSha256: string;
+      /** A declared action id of the open wait record. */
+      actionId: string;
+      /** SHA-256 of the future orchestrator-owned response manifest. */
+      responseSha256: string;
     }
   | { kind: "terminal_reached"; terminalStateId: string; terminalResult: "success" | "failed" }
   | { kind: "run_outputs_published"; outputs: readonly PipelineV2RunOutputState[] }
@@ -552,22 +601,27 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 5 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 6 is the supported contract; no v2 migration exists)",
     );
   }
   if (version === 3) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
     );
   }
   if (version === 4) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 5 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
+    );
+  }
+  if (version === 5) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -1066,13 +1120,29 @@ function validateWaitAction(value: unknown, what: string): PipelineV2WaitAction 
 }
 
 /**
- * Exact-field validation of the optional top-level wait record: safe ids
- * for the waiting state, the normalized reason and every action id/target,
- * a lowercase hex SHA-256 for the request manifest digest, a non-empty
- * action list with unique ids, and the declaration order preserved.
+ * Exact-field validation of one wait record of the wait journal: a
+ * positive journal index and the committed-transition count, safe ids for
+ * the waiting state, the normalized reason and every action id/target, a
+ * lowercase hex SHA-256 for the request manifest digest, a non-empty
+ * action list with unique ids in preserved declaration order, and the
+ * optional content-free response record (declared action id plus the
+ * response manifest digest).
  */
+function validateWaitResponse(value: unknown, what: string): PipelineV2WaitResponseRecord {
+  const obj = expectExactObject(value, what, ["action_id", "response_sha256"]);
+  return {
+    action_id: expectSafeId(obj.action_id, `${what}.action_id`),
+    response_sha256: expectSha256(obj.response_sha256, `${what}.response_sha256`),
+  };
+}
+
 function validateWaitRecord(value: unknown, what: string): PipelineV2WaitRecord {
-  const obj = expectExactObject(value, what, ["state_id", "reason", "request_sha256", "actions"]);
+  const obj = expectExactObject(
+    value,
+    what,
+    ["index", "transition_count", "state_id", "reason", "request_sha256", "actions"],
+    ["response"],
+  );
   if (!Array.isArray(obj.actions)) {
     throw new PipelineV2StateError(`${what}.actions must be an array`);
   }
@@ -1090,20 +1160,26 @@ function validateWaitRecord(value: unknown, what: string): PipelineV2WaitRecord 
     seen.add(action.id);
     return action;
   });
-  return {
+  const record: PipelineV2WaitRecord = {
+    index: expectSafePositiveInteger(obj.index, `${what}.index`),
+    transition_count: expectSafeNonNegativeInteger(obj.transition_count, `${what}.transition_count`),
     state_id: expectSafeId(obj.state_id, `${what}.state_id`),
     reason: expectSafeId(obj.reason, `${what}.reason`),
     request_sha256: expectSha256(obj.request_sha256, `${what}.request_sha256`),
     actions,
   };
+  if (obj.response !== undefined) {
+    return { ...record, response: validateWaitResponse(obj.response, `${what}.response`) };
+  }
+  return record;
 }
 
 /**
  * Validates one pipeline v2 run state document and returns an independent,
  * deep-frozen snapshot. Every invariant the reducer enforces is re-checked
  * here against the authoritative records alone: there is no event journal
- * to reconcile against, so phantom executions, transitions, terminals and
- * run outputs are impossible by construction.
+ * to reconcile against, so phantom executions, transitions, waits,
+ * terminals and run outputs are impossible by construction.
  */
 export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   rejectLegacySchemaVersions(value);
@@ -1123,8 +1199,9 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       "cursor",
       "executions",
       "transitions",
+      "waits",
     ],
-    ["terminal", "run_outputs", "failure", "wait"],
+    ["terminal", "run_outputs", "failure"],
   );
   if (obj.schema_version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
     throw new PipelineV2StateError(
@@ -1189,20 +1266,42 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       return validated;
     });
   }
-  const wait = obj.wait === undefined ? undefined : validateWaitRecord(obj.wait, "pipeline v2 run state wait");
+  if (!Array.isArray(obj.waits)) {
+    throw new PipelineV2StateError("pipeline v2 run state waits must be an array");
+  }
+  const waits = obj.waits.map((wait, index) =>
+    validateWaitRecord(wait, `pipeline v2 run state waits[${index}]`),
+  );
+  // Wait record indexes are contiguous from 1: gaps and duplicates are
+  // rejected before the joint replay consumes the journal.
+  for (let position = 0; position < waits.length; position++) {
+    const wait = waits[position]!;
+    if (wait.index !== position + 1) {
+      throw new PipelineV2StateError(
+        `wait record at position ${position} declares index ${wait.index}; wait record indexes must be contiguous from 1`,
+      );
+    }
+  }
 
-  // The waiting status, the "waiting" phase and the wait record are one
-  // indivisible triple: each implies the other two, and no other status or
-  // phase may carry a wait record.
+  // The waiting status, the "waiting" phase and an open last wait record
+  // are one indivisible triple: each implies the other two, and no other
+  // status or phase may carry an open wait record.
+  const lastWaitRecord = waits.length > 0 ? waits[waits.length - 1]! : undefined;
+  const hasOpenWait = lastWaitRecord !== undefined && lastWaitRecord.response === undefined;
   if (status === "waiting") {
-    if (phase !== "waiting" || wait === undefined) {
-      throw new PipelineV2StateError('run status "waiting" requires phase "waiting" and a wait record');
+    if (phase !== "waiting") {
+      throw new PipelineV2StateError('run status "waiting" requires phase "waiting"');
+    }
+    if (!hasOpenWait) {
+      throw new PipelineV2StateError(
+        'run status "waiting" requires an open wait record as the last wait record',
+      );
     }
   } else if (phase === "waiting") {
     throw new PipelineV2StateError('run phase "waiting" requires run status "waiting"');
   }
-  if (wait !== undefined && status !== "waiting") {
-    throw new PipelineV2StateError('a wait record requires run status "waiting"');
+  if (hasOpenWait && status !== "waiting") {
+    throw new PipelineV2StateError('an open wait record requires run status "waiting"');
   }
 
   if (transitions.length > pipeline.max_transitions) {
@@ -1246,20 +1345,11 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   }
 
   // transitions bind executions in order; each referenced execution must be
-  // the completed execution whose state matches the transition's origin
+  // the completed execution whose state matches the transition's origin.
+  // The transition chain itself (entry state, response targets, cursor) is
+  // re-derived by the joint replay below.
   for (let index = 0; index < transitions.length; index++) {
     const transition = transitions[index]!;
-    if (index === 0) {
-      if (transition.from !== pipeline.entry_state) {
-        throw new PipelineV2StateError(
-          `the first committed transition starts at ${JSON.stringify(transition.from)}, expected the entry state ${JSON.stringify(pipeline.entry_state)}`,
-        );
-      }
-    } else if (transition.from !== transitions[index - 1]!.to) {
-      throw new PipelineV2StateError(
-        `transition at position ${index} starts at ${JSON.stringify(transition.from)}, expected the previous transition target ${JSON.stringify(transitions[index - 1]!.to)}`,
-      );
-    }
     if (transition.execution_index !== index + 1) {
       throw new PipelineV2StateError(
         `transition at position ${index} references execution ${transition.execution_index}; transitions must reference executions in order`,
@@ -1301,11 +1391,84 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       `cursor.transition_count ${cursor.transition_count} does not match ${transitions.length} committed transitions`,
     );
   }
-  const expectedCursor =
-    transitions.length > 0 ? transitions[transitions.length - 1]!.to : pipeline.entry_state;
-  if (cursor.current_state !== expectedCursor) {
+
+  // Joint replay of the two authoritative record streams: the committed
+  // graph transitions and the wait journal. The replay cursor starts at
+  // the entry state; before every graph transition with the next ordinal
+  // N + 1 it applies, in journal order, every wait record bound to the
+  // boundary `transition_count === N`. A wait record must name the replay
+  // cursor; a response moves the replay cursor to the declared action
+  // target; an open record may only end the journal (no later waits, no
+  // later executions or transitions, a fully settled and committed
+  // history) and pins the replay cursor at its own state. A response
+  // never consumes graph budget, and the persisted cursor must equal the
+  // replayed cursor after the full replay.
+  let replayCursor = pipeline.entry_state;
+  let waitPosition = 0;
+  for (let ordinal = 0; ordinal <= transitions.length; ordinal++) {
+    while (waitPosition < waits.length) {
+      const wait = waits[waitPosition]!;
+      if (wait.transition_count < ordinal) {
+        throw new PipelineV2StateError(
+          `wait record ${wait.index} declares transition_count ${wait.transition_count}, below the replay boundary ${ordinal} already consumed by earlier wait records; wait records must be ordered by transition_count`,
+        );
+      }
+      if (wait.transition_count > ordinal) {
+        break;
+      }
+      if (wait.state_id !== replayCursor) {
+        throw new PipelineV2StateError(
+          `wait record ${wait.index} names state ${JSON.stringify(wait.state_id)}, which does not match the replay cursor ${JSON.stringify(replayCursor)}`,
+        );
+      }
+      if (wait.response === undefined) {
+        if (waitPosition !== waits.length - 1) {
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} is open but is not the last wait record; an open wait record may only end the wait journal`,
+          );
+        }
+        if (ordinal !== transitions.length) {
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} is open but ${transitions.length - ordinal} committed transitions follow it; no transition may follow an open wait record`,
+          );
+        }
+        if (executions.length !== transitions.length) {
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} is open while execution ${transitions.length + 1} has no committed transition; an open wait record requires a fully settled and committed history`,
+          );
+        }
+        waitPosition += 1;
+        break;
+      }
+      const action = wait.actions.find((candidate) => candidate.id === wait.response!.action_id);
+      if (action === undefined) {
+        throw new PipelineV2StateError(
+          `wait record ${wait.index} records response action ${JSON.stringify(wait.response.action_id)}, which it does not declare`,
+        );
+      }
+      replayCursor = action.to;
+      waitPosition += 1;
+    }
+    if (ordinal === transitions.length) {
+      break;
+    }
+    const transition = transitions[ordinal]!;
+    if (transition.from !== replayCursor) {
+      throw new PipelineV2StateError(
+        `transition at position ${ordinal} starts at ${JSON.stringify(transition.from)}, expected the replay cursor ${JSON.stringify(replayCursor)}`,
+      );
+    }
+    replayCursor = transition.to;
+  }
+  if (waitPosition !== waits.length) {
+    const wait = waits[waitPosition]!;
     throw new PipelineV2StateError(
-      `cursor.current_state ${JSON.stringify(cursor.current_state)} does not match the expected cursor ${JSON.stringify(expectedCursor)}`,
+      `wait record ${wait.index} declares transition_count ${wait.transition_count}, which exceeds the ${transitions.length} committed transitions`,
+    );
+  }
+  if (cursor.current_state !== replayCursor) {
+    throw new PipelineV2StateError(
+      `cursor.current_state ${JSON.stringify(cursor.current_state)} does not match the replayed cursor ${JSON.stringify(replayCursor)}`,
     );
   }
   if (transitions.length < executions.length - 1) {
@@ -1423,10 +1586,9 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     // A waiting run is temporarily immobile, not finalized: it must be a
     // clean graph pause at the cursor with no terminal, no published
     // outputs, no failure, every execution settled and every committed
-    // transition bound to its execution.
-    if (wait === undefined) {
-      throw new PipelineV2StateError('run status "waiting" requires phase "waiting" and a wait record');
-    }
+    // transition bound to its execution. The open wait record itself and
+    // the cursor position are already enforced by the biconditional and
+    // the joint replay above.
     if (terminal !== undefined) {
       throw new PipelineV2StateError("a waiting run must not carry a reached terminal state");
     }
@@ -1435,11 +1597,6 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     }
     if (failure !== undefined) {
       throw new PipelineV2StateError("a waiting run must not carry a failure reason");
-    }
-    if (wait.state_id !== cursor.current_state) {
-      throw new PipelineV2StateError(
-        `the wait record names state ${JSON.stringify(wait.state_id)}, which does not match the cursor ${JSON.stringify(cursor.current_state)}`,
-      );
     }
     for (const execution of executions) {
       if (!isSettledExecution(execution)) {
@@ -1489,6 +1646,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     cursor,
     executions,
     transitions,
+    waits,
   };
   if (terminal !== undefined) {
     state.terminal = terminal;
@@ -1498,9 +1656,6 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   }
   if (failure !== undefined) {
     state.failure = failure;
-  }
-  if (wait !== undefined) {
-    state.wait = wait;
   }
   return deepFreeze(state);
 }
@@ -1598,11 +1753,21 @@ function cloneRunOutput(output: PipelineV2RunOutputState): PipelineV2RunOutputSt
 }
 
 function cloneWaitRecord(record: PipelineV2WaitRecord): PipelineV2WaitRecord {
+  const response =
+    record.response === undefined
+      ? undefined
+      : {
+          action_id: record.response.action_id,
+          response_sha256: record.response.response_sha256,
+        };
   return {
+    index: record.index,
+    transition_count: record.transition_count,
     state_id: record.state_id,
     reason: record.reason,
     request_sha256: record.request_sha256,
     actions: record.actions.map((action) => ({ id: action.id, to: action.to })),
+    ...(response !== undefined ? { response } : {}),
   };
 }
 
@@ -1620,6 +1785,7 @@ function cloneState(state: PipelineV2RunState): PipelineV2RunState {
     cursor: { ...state.cursor },
     executions: state.executions.map(cloneExecution),
     transitions: state.transitions.map(cloneTransition),
+    waits: state.waits.map(cloneWaitRecord),
   };
   if (state.terminal !== undefined) {
     clone.terminal = { ...state.terminal };
@@ -1629,9 +1795,6 @@ function cloneState(state: PipelineV2RunState): PipelineV2RunState {
   }
   if (state.failure !== undefined) {
     clone.failure = { ...state.failure };
-  }
-  if (state.wait !== undefined) {
-    clone.wait = cloneWaitRecord(state.wait);
   }
   return clone;
 }
@@ -1833,6 +1996,7 @@ export function reducePipelineV2RunCommand(
       cursor: { current_state: pipeline.entry_state, transition_count: 0 },
       executions: [],
       transitions: [],
+      waits: [],
     };
     return deepFreeze(state);
   }
@@ -1840,11 +2004,11 @@ export function reducePipelineV2RunCommand(
   if (current === null) {
     throw new PipelineV2StateError(`command ${command.kind} rejected: no pipeline v2 run state exists yet`);
   }
-  if (current.status !== "active") {
+  if (command.kind !== "wait_response_recorded" && current.status !== "active") {
     if (current.status === "waiting") {
       fail(
         current,
-        "the run is waiting for an explicit user response; no command of this schema version advances a waiting run",
+        "the run is waiting for an explicit user response; only wait_response_recorded advances a waiting run",
       );
     }
     fail(
@@ -2157,13 +2321,15 @@ export function reducePipelineV2RunCommand(
       break;
     }
     case "run_waiting": {
-      // Enters the durable user wait (schema v5). The wait is a policy /
-      // context-stage decision of the caller (for example the P01 reason
-      // "stage_iteration_limit_exhausted"); it never consumes or touches
-      // the immutable engine transition budget and it records no
-      // transition of its own. Waiting is not a terminal result: this
-      // schema version offers no successor, so the run stays immobile
-      // until a later increment adds the explicit user-response command.
+      // Appends one open wait record to the wait journal (schema v6). The
+      // wait is a policy / context-stage decision of the caller (for
+      // example the P01 reason "stage_iteration_limit_exhausted"); it
+      // never consumes or touches the immutable engine transition budget
+      // and it records no transition of its own. Waiting is not a
+      // terminal result: the record stays open until the explicit
+      // wait_response_recorded command closes it. The record index is the
+      // journal position and the transition count is the number of
+      // committed graph transitions at this clean boundary.
       const stateId = expectSafeId(command.stateId, "run_waiting state id");
       const reason = expectSafeId(command.reason, "run_waiting reason");
       const requestSha256 = expectSha256(command.requestSha256, "run_waiting request_sha256");
@@ -2195,8 +2361,15 @@ export function reducePipelineV2RunCommand(
       if (current.run_outputs !== undefined) {
         fail(current, "run outputs are already published; a waiting run cannot be recorded");
       }
-      if (current.wait !== undefined) {
-        fail(current, "the run is already waiting; the wait record is immutable");
+      if (current.failure !== undefined) {
+        fail(current, "the run already carries a failure reason; a waiting run cannot be recorded");
+      }
+      const lastWait = current.waits[current.waits.length - 1];
+      if (lastWait !== undefined && lastWait.response === undefined) {
+        fail(
+          current,
+          `wait record ${lastWait.index} is still open; record its response before entering a new wait`,
+        );
       }
       for (const execution of current.executions) {
         if (!isSettledExecution(execution)) {
@@ -2217,11 +2390,105 @@ export function reducePipelineV2RunCommand(
       }
       next.status = "waiting";
       next.phase = "waiting";
-      next.wait = {
-        state_id: stateId,
-        reason,
-        request_sha256: requestSha256,
-        actions,
+      next.waits = [
+        ...next.waits,
+        {
+          index: current.waits.length + 1,
+          transition_count: current.cursor.transition_count,
+          state_id: stateId,
+          reason,
+          request_sha256: requestSha256,
+          actions,
+        },
+      ];
+      break;
+    }
+    case "wait_response_recorded": {
+      // The single user-response successor (schema v6). The command
+      // carries only content-free references: the wait record index, the
+      // expected request manifest digest, the declared action id and the
+      // response manifest digest. The future policy/controller layer
+      // validates the user intent (for the P01 reasons: the TASK
+      // revision, the budget grant and the model-profile replacements)
+      // before dispatching this command; the reducer trusts that already
+      // validated command and records no user intent payload. Recording
+      // the response appends the content-free response to the open wait
+      // record atomically, returns the run to active/running, and moves
+      // the cursor to the declared action target without touching the
+      // transition count, the transition budget, or any history. Ordinary
+      // commands apply again afterwards under the existing successor
+      // rules.
+      const waitIndex = expectSafePositiveInteger(
+        command.waitIndex,
+        "wait_response_recorded wait index",
+      );
+      const expectedRequestSha256 = expectSha256(
+        command.expectedRequestSha256,
+        "wait_response_recorded expected request digest",
+      );
+      const actionId = expectSafeId(command.actionId, "wait_response_recorded action id");
+      const responseSha256 = expectSha256(
+        command.responseSha256,
+        "wait_response_recorded response digest",
+      );
+      if (current.status === "active") {
+        fail(current, "recording a wait response requires a waiting run; the run is active with no open wait record");
+      }
+      if (current.status !== "waiting") {
+        fail(
+          current,
+          `the run is already finalized with status ${JSON.stringify(current.status)}; the terminal run status is immutable`,
+        );
+      }
+      if (current.phase !== "waiting") {
+        fail(current, `recording a wait response requires phase "waiting", got ${JSON.stringify(current.phase)}`);
+      }
+      const last = current.waits[current.waits.length - 1];
+      if (last === undefined) {
+        fail(current, "the run records no wait to respond to");
+      }
+      if (last.response !== undefined) {
+        fail(current, `wait record ${last.index} already carries a response`);
+      }
+      if (waitIndex !== last.index) {
+        fail(
+          current,
+          `wait_response_recorded targets wait index ${waitIndex}, but the open wait record is ${last.index}`,
+        );
+      }
+      if (expectedRequestSha256 !== last.request_sha256) {
+        fail(current, `the expected request digest does not match open wait record ${last.index}`);
+      }
+      const action = last.actions.find((candidate) => candidate.id === actionId);
+      if (action === undefined) {
+        fail(current, `action ${JSON.stringify(actionId)} is not declared in wait record ${last.index}`);
+      }
+      if (current.terminal !== undefined) {
+        fail(current, "a waiting run must not carry a reached terminal state");
+      }
+      if (current.run_outputs !== undefined) {
+        fail(current, "a waiting run must not carry published run outputs");
+      }
+      if (current.failure !== undefined) {
+        fail(current, "a waiting run must not carry a failure reason");
+      }
+      next.waits = [
+        ...next.waits.slice(0, -1),
+        {
+          index: last.index,
+          transition_count: last.transition_count,
+          state_id: last.state_id,
+          reason: last.reason,
+          request_sha256: last.request_sha256,
+          actions: last.actions.map((entry) => ({ id: entry.id, to: entry.to })),
+          response: { action_id: actionId, response_sha256: responseSha256 },
+        },
+      ];
+      next.status = "active";
+      next.phase = "running";
+      next.cursor = {
+        current_state: action.to,
+        transition_count: current.cursor.transition_count,
       };
       break;
     }
