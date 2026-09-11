@@ -53,17 +53,49 @@ test("no source at all is a CLI configuration error", () => {
   );
 });
 
-test("empty, relative and unclean values are rejected", () => {
-  expectError({ ORCHESTRATOR_STATE_ROOT: "" }, "ORCHESTRATOR_STATE_ROOT must be set to a non-empty absolute clean path");
-  expectError({ ORCHESTRATOR_STATE_ROOT: "relative/state" }, "ORCHESTRATOR_STATE_ROOT must be set to a non-empty absolute clean path");
-  expectError({ ORCHESTRATOR_STATE_ROOT: " /spaced/state" }, "ORCHESTRATOR_STATE_ROOT must be set to a non-empty absolute clean path");
-  expectError({ ORCHESTRATOR_STATE_ROOT: "/double//slash" }, "ORCHESTRATOR_STATE_ROOT must be set to a non-empty absolute clean path");
-  expectError({ ORCHESTRATOR_STATE_ROOT: "/trailing/." }, "ORCHESTRATOR_STATE_ROOT must be set to a non-empty absolute clean path");
-  const withLocalRoot: Env = { ORCHESTRATOR_STATE_ROOT: "/ok/local" };
-  expectError({ ...withLocalRoot, ORCHESTRATOR_DAEMON_STATE_ROOT: "" }, "ORCHESTRATOR_DAEMON_STATE_ROOT must be set to a non-empty absolute clean path");
-  expectError({ ...withLocalRoot, ORCHESTRATOR_DAEMON_STATE_ROOT: "relative" }, "ORCHESTRATOR_DAEMON_STATE_ROOT must be set to a non-empty absolute clean path");
-  expectError({ XDG_STATE_HOME: "rel" }, "XDG_STATE_HOME must be set to a non-empty absolute clean path");
-  expectError({ HOME: "rel-home" }, "HOME must be set to a non-empty absolute clean path");
+const UNCLEAN_FORMS: Array<[string, string]> = [
+  ["", "non-empty absolute path"],
+  ["relative/state", "absolute path"],
+  [" /spaced/state", "leading or trailing whitespace"],
+  ["/spaced/state ", "leading or trailing whitespace"],
+  ["/state//run", "clean absolute path"],
+  ["/state/run/", "clean absolute path"],
+  ["/state/../other", "clean absolute path"],
+  ["/state/./run", "clean absolute path"],
+  ["/..", "clean absolute path"],
+  ["/.", "clean absolute path"],
+  ["/state\0run", "NUL character"],
+];
+
+test("unclean forms are rejected through every env source", () => {
+  for (const [value, expected] of UNCLEAN_FORMS) {
+    expectError({ ORCHESTRATOR_STATE_ROOT: value }, expected);
+    expectError({ ORCHESTRATOR_STATE_ROOT: "/ok", ORCHESTRATOR_DAEMON_STATE_ROOT: value }, expected);
+    expectError({ XDG_STATE_HOME: value }, expected);
+    expectError({ HOME: value }, expected);
+  }
+});
+
+test("the root / and ordinary clean paths are accepted", () => {
+  expect(resolvePipelineV2StateRootProjection({ ORCHESTRATOR_STATE_ROOT: "/" })).toEqual({
+    localRoot: "/",
+    daemonRoot: "/",
+  });
+  expect(
+    resolvePipelineV2StateRootProjection({ ORCHESTRATOR_STATE_ROOT: "/state/run", ORCHESTRATOR_DAEMON_STATE_ROOT: "/" }),
+  ).toEqual({ localRoot: "/state/run", daemonRoot: "/" });
+  expect(resolvePipelineV2StateRootProjection({ XDG_STATE_HOME: "/xdg/state" })).toEqual({
+    localRoot: "/xdg/state/orchestrator",
+    daemonRoot: "/xdg/state/orchestrator",
+  });
+  expect(resolvePipelineV2StateRootProjection({ HOME: "/" })).toEqual({
+    localRoot: "/.local/state/orchestrator",
+    daemonRoot: "/.local/state/orchestrator",
+  });
+  expect(resolvePipelineV2StateRootProjection({ HOME: "/home/op" })).toEqual({
+    localRoot: "/home/op/.local/state/orchestrator",
+    daemonRoot: "/home/op/.local/state/orchestrator",
+  });
 });
 
 test("the resolver creates no filesystem objects", () => {

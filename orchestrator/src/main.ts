@@ -17,7 +17,6 @@ import {
   fetchAuthOverSocket,
   type AuthFetcher,
   type CliRunOptions,
-  type CliResult,
   type CliRunner,
   type CliStdio,
   SubprocessCliRunner,
@@ -123,11 +122,16 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     return 2;
   }
 
-  const config = io.resolveHelperConfig(io.baseEnv);
-
   if (parsed.kind === "run") {
-    return await runPipelineV2Command(parsed, io, config);
+    // The production pipeline v2 command resolves its whole CLI
+    // configuration inside one protected boundary (state-root projection
+    // first, then the helper configuration); the shared v1 helper-config
+    // resolution below runs only for the v1 commands, whose observable
+    // behavior stays unchanged.
+    return await runPipelineV2Command(parsed, io);
   }
+
+  const config = io.resolveHelperConfig(io.baseEnv);
 
   const deps: LifecycleDeps = {
     cli: (args, env, stdio, opts) => io.runner.run(args, env, stdio, opts),
@@ -172,41 +176,42 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
 }
 
 /**
- * The production pipeline v2 command: parse already done. Resolves the
- * trusted state-root projection (a CLI configuration error exits 2 before
- * any auth or filesystem side effect), assembles the runner deps over the
- * single runner instance and the v1 signal wiring, invokes
- * `runPipelineV2` exactly once and reports the outcome.
+ * The production pipeline v2 command: parse already done. The whole CLI
+ * configuration lives inside one protected boundary — the state-root
+ * projection is resolved first, then the helper configuration; any failure
+ * (including a helper-configuration failure with no usable HOME/
+ * XDG_CONFIG_HOME) is a CLI configuration error: exit 2 with the usage
+ * text, `runPipelineV2` never called, no auth, no filesystem, no runner
+ * subprocess, no signal registration, and `runCli` never rejects. The deps
+ * are assembled over the single runner instance and the v1 signal wiring;
+ * `runPipelineV2` is invoked exactly once and its outcome reported.
  */
 async function runPipelineV2Command(
   parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "run" }>,
   io: CliIo,
-  config: HelperConfig,
 ): Promise<number> {
   let stateRootProjection;
+  let config: HelperConfig;
   try {
     stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+    config = io.resolveHelperConfig(io.baseEnv);
   } catch (cause) {
     io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
     io.writeError(usage());
     return 2;
   }
 
-  // In JSON mode the stdout must carry exactly one JSON document, so every
-  // call the Docker Helper runtime asks to inherit (image pull, worker
-  // run) is captured instead and its output is forwarded to stderr. argv,
-  // env and every runtime decision stay untouched; in human mode the
-  // adapter's own inheritance is kept.
+  // In JSON mode the stdout must carry exactly one JSON document, so only
+  // the calls the Docker Helper runtime asks to inherit (image pull,
+  // worker run) are switched to the streaming stderr mode: the child's
+  // stdout and stderr flow directly onto the parent's stderr with no
+  // buffering and no post-hoc forwarding. argv, env, options and every
+  // runtime decision stay untouched; `capture` calls (structured session
+  // answers) stay captured, and in human mode the adapter's own
+  // inheritance is kept.
   const cli: CliRunner = parsed.json
-    ? async (args, env, stdio, opts) => {
-        if (stdio !== "inherit") {
-          return await io.runner.run(args, env, stdio, opts);
-        }
-        const result: CliResult = await io.runner.run(args, env, "capture" satisfies CliStdio, opts);
-        forwardCaptured(io, result.stdout);
-        forwardCaptured(io, result.stderr);
-        return result;
-      }
+    ? (args, env, stdio: CliStdio, opts?: CliRunOptions) =>
+        io.runner.run(args, env, stdio === "inherit" ? "stderr" : stdio, opts)
     : (args, env, stdio: CliStdio, opts?: CliRunOptions) => io.runner.run(args, env, stdio, opts);
 
   const deps: PipelineV2RunnerDeps = {
@@ -249,13 +254,6 @@ async function runPipelineV2Command(
   // A failure before the run root was created needs no summary line: the
   // runner already printed its content-free diagnostic to stderr.
   return outcome.exitCode;
-}
-
-function forwardCaptured(io: CliIo, text: string | undefined): void {
-  if (text === undefined || text === "") {
-    return;
-  }
-  io.writeError(text.endsWith("\n") ? text.slice(0, -1) : text);
 }
 
 if (import.meta.main) {

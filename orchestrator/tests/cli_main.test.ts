@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { runCli, type CliIo } from "../src/main.ts";
 import type { CliResult, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
+import { resolveHelperConfig } from "../src/launcher.ts";
 import type { PipelineV2RunOutcome } from "../src/pipeline_v2_runner.ts";
 
 const CANARY_SECRET = "CANARY-SECRET-dhsec9f1";
@@ -155,6 +156,93 @@ test("unknown command returns 2 before any runner call", async () => {
   expect(called).toBe(0);
 });
 
+test("a real resolveHelperConfig without HOME and XDG_CONFIG_HOME is a CLI configuration error", async () => {
+  const { io, err } = makeIo();
+  let runnerCalls = 0;
+  io.runner.run = () => {
+    runnerCalls += 1;
+    return Promise.resolve({ code: 0 });
+  };
+  let pipelineV2Calls = 0;
+  io.runPipelineV2 = (async () => {
+    pipelineV2Calls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["runPipelineV2"];
+  // The production resolver (imported into the fake io) needs a home
+  // directory for the credential path; neither HOME nor XDG_CONFIG_HOME is
+  // set in the io environment.
+  io.resolveHelperConfig = resolveHelperConfig;
+  io.baseEnv = { CANARY_SECRET_ENV: CANARY_SECRET };
+  const exit = await runCli(["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr"], io);
+  expect(exit).toBe(2);
+  expect(pipelineV2Calls).toBe(0);
+  expect(runnerCalls).toBe(0);
+  expect(err.join("\n")).toContain("error:");
+  expect(err.join("\n")).toContain("docker-helper credential");
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+});
+
+test("an injected throwing resolveHelperConfig is a CLI configuration error", async () => {
+  const { io, err } = makeIo();
+  let runnerCalls = 0;
+  io.runner.run = () => {
+    runnerCalls += 1;
+    return Promise.resolve({ code: 0 });
+  };
+  let pipelineV2Calls = 0;
+  io.runPipelineV2 = (async () => {
+    pipelineV2Calls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["runPipelineV2"];
+  let registrations = 0;
+  io.resolveStateRootProjection = () => ({ localRoot: "/state", daemonRoot: "/state" });
+  io.resolveHelperConfig = () => {
+    throw new Error("helper configuration exploded");
+  };
+  const exit = await runCli(["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr"], io);
+  expect(exit).toBe(2);
+  expect(pipelineV2Calls).toBe(0);
+  expect(runnerCalls).toBe(0);
+  expect(err.join("\n")).toContain("helper configuration exploded");
+  expect(registrations).toBe(0);
+});
+
+test("with both resolvers impossible the state-root error is reported first", async () => {
+  const { io, err } = makeIo();
+  let helperConfigCalls = 0;
+  io.resolveStateRootProjection = () => {
+    throw new Error("cannot build the orchestrator state root: set ORCHESTRATOR_STATE_ROOT (or XDG_STATE_HOME or HOME)");
+  };
+  io.resolveHelperConfig = () => {
+    helperConfigCalls += 1;
+    throw new Error("helper configuration exploded");
+  };
+  const exit = await runCli(["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr"], io);
+  expect(exit).toBe(2);
+  expect(helperConfigCalls).toBe(0);
+  expect(err.join("\n")).toContain("cannot build the orchestrator state root");
+  expect(err.join("\n")).not.toContain("helper configuration exploded");
+});
+
+test("a parse error happens before both configuration resolvers", async () => {
+  const { io, err } = makeIo();
+  let projectionCalls = 0;
+  let helperConfigCalls = 0;
+  io.resolveStateRootProjection = () => {
+    projectionCalls += 1;
+    return { localRoot: "/state", daemonRoot: "/state" };
+  };
+  io.resolveHelperConfig = () => {
+    helperConfigCalls += 1;
+    return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+  };
+  const exit = await runCli(["run"], io);
+  expect(exit).toBe(2);
+  expect(projectionCalls).toBe(0);
+  expect(helperConfigCalls).toBe(0);
+  expect(err.join("\n")).toContain("--pipeline-root ABSOLUTE_PATH is required for run");
+});
+
 test("state-root resolver failure is a CLI configuration error (exit 2, no runner call)", async () => {
   const { io, err } = makeIo();
   let called = 0;
@@ -230,7 +318,7 @@ test("JSON mode: document round-trips the outcome fields without extra wrappers"
   expect(document.ok).toBe(true);
 });
 
-test("JSON mode: inherit-asked CLI calls are captured and forwarded to stderr", async () => {
+test("JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
   const { io, out, err } = makeIo();
   io.runPipelineV2 = (async (_options: unknown, deps: unknown) => {
     const cli = (deps as Record<string, unknown>).cli as (
@@ -242,24 +330,42 @@ test("JSON mode: inherit-asked CLI calls are captured and forwarded to stderr", 
     await cli(["pull", "--endpoint", "/sock", "img:1"], {}, "inherit");
     await cli(["run", "--format", "json"], {}, "inherit", { signalOnAbort: true, timeoutSeconds: 60 });
     await cli(["session", "create"], {}, "capture");
+    await cli(["session", "delete"], {}, "capture");
     return runOutcome({});
   }) as unknown as CliIo["runPipelineV2"];
   const stdios: CliStdio[] = [];
-  io.runner.run = (args, env, stdio, opts) => {
+  const opts: Array<CliRunOptions | undefined> = [];
+  io.runner.run = (args, env, stdio, options) => {
     stdios.push(stdio);
+    opts.push(options);
     if (stdio === "capture") {
-      return Promise.resolve({ code: 0, stdout: "WORKER-EVENTS\n", stderr: "helper-warning\n" });
+      return Promise.resolve({ code: 0, stdout: "STRUCTURED-ANSWER\n", stderr: "helper-warning\n" });
     }
+    // A streaming call never returns captured output.
     return Promise.resolve({ code: 0 });
   };
   const exit = await runCli([...RUN_ARGS, "--json"], io);
   expect(exit).toBe(0);
-  expect(stdios).toEqual(["capture", "capture", "capture"]);
+  expect(stdios).toEqual(["stderr", "stderr", "capture", "capture"]);
+  expect(opts).toEqual([
+    undefined,
+    { signalOnAbort: true, timeoutSeconds: 60 },
+    undefined,
+    undefined,
+  ]);
   expect(out).toHaveLength(1);
   expect(out[0]!.startsWith("{")).toBe(true);
+  expect(out[0]!.endsWith("\n")).toBe(true);
+  // The stdout carries exactly one PipelineV2RunOutcome: no worker events,
+  // no pull progress, and the streaming wrapper forwards nothing itself.
   expect(out.join("")).not.toContain("WORKER-EVENTS");
-  expect(err.join("\n")).toContain("WORKER-EVENTS");
-  expect(err.join("\n")).toContain("helper-warning");
+  expect(out.join("")).not.toContain("STRUCTURED-ANSWER");
+  expect(out.join("")).not.toContain("PULL-PROGRESS");
+  // The CLI wrapper performs no post-hoc forwarding: a fake streaming
+  // result that carried stdout would never be re-emitted.
+  expect(err.join("\n")).not.toContain("PULL-PROGRESS");
+  expect(err.join("\n")).not.toContain("WORKER-EVENTS");
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
 });
 
 test("human mode keeps the adapter's inherit plumbing untouched", async () => {

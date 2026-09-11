@@ -10,7 +10,7 @@ export interface CliResult {
   timedOut?: boolean;
 }
 
-export type CliStdio = "capture" | "inherit";
+export type CliStdio = "capture" | "inherit" | "stderr";
 
 /**
  * Largest timeout safely representable by a single JS timer: the timer delay
@@ -306,8 +306,10 @@ export class SubprocessCliRunner {
     const proc = Bun.spawn(["docker-helper", ...args], {
       env,
       stdin: "ignore",
-      stdout: stdio === "inherit" ? "inherit" : "pipe",
-      stderr: stdio === "inherit" ? "inherit" : "pipe",
+      stdout:
+        stdio === "inherit" ? "inherit" : stdio === "stderr" ? 2 : "pipe",
+      stderr:
+        stdio === "inherit" ? "inherit" : stdio === "stderr" ? 2 : "pipe",
     });
     const active: NonNullable<SubprocessCliRunner["active"]> = {
       proc,
@@ -340,7 +342,12 @@ export class SubprocessCliRunner {
       }, opts.timeoutSeconds * 1000);
     }
     try {
-      if (stdio === "inherit") {
+      if (stdio === "inherit" || stdio === "stderr") {
+        // `inherit` hands both streams to the parent's own stdout/stderr;
+        // `stderr` streams the child's stdout AND stderr directly onto the
+        // parent's file descriptor 2 (kernel-level, no buffering, nothing
+        // is read back into memory and nothing reaches the parent's
+        // stdout). Neither mode returns captured output.
         return { code: await proc.exited, timedOut };
       }
       const [stdout, stderr] = await Promise.all([

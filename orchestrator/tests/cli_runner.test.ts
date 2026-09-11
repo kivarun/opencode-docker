@@ -46,6 +46,68 @@ async function makeFifo(dir: string, name: string): Promise<string> {
   return fifo;
 }
 
+test("stderr mode streams the child's output to the parent's stderr, not its stdout, without buffering", async () => {
+  await withShim(
+    () => "#!/bin/sh\necho SHIM-STDOUT\necho SHIM-STDERR 1>&2\nexit 0\n",
+    async (dir) => {
+      // The streaming contract is observable only at a process boundary:
+      // an inner parent process performs the runner call while its own
+      // stdout and stderr are captured separately here. The shim's output
+      // must flow to the inner parent's stderr (the CLI's stderr) while
+      // the inner parent's stdout stays clean.
+      const inner = [
+        `import { SubprocessCliRunner } from ${JSON.stringify(new URL("../src/docker_helper.ts", import.meta.url).pathname)};`,
+        `const env = ${JSON.stringify(shimEnv(dir))};`,
+        "const runner = new SubprocessCliRunner();",
+        'const streamed = await runner.run(["run", "--endpoint", "/s", "img"], env, "stderr");',
+        'console.error("RESULT-STDERR-MODE code=" + streamed.code + " stdout=" + (streamed.stdout ?? "<none>") + " stderr=" + (streamed.stderr ?? "<none>"));',
+        'const captured = await runner.run(["run", "--endpoint", "/s", "img"], env, "capture");',
+        'console.log("CAPTURE code=" + captured.code + " stdout=" + JSON.stringify(captured.stdout));',
+        "process.exit(0);",
+      ].join("\n");
+      const parent = Bun.spawn([process.execPath, "-e", inner], { stdout: "pipe", stderr: "pipe" });
+      const [out, err] = await Promise.all([
+        new Response(parent.stdout as ReadableStream).text(),
+        new Response(parent.stderr as ReadableStream).text(),
+      ]);
+      await parent.exited;
+      // The inner parent's stdout carries exactly the CAPTURE report line:
+      // the streamed run contributed nothing to it.
+      expect(out.split("\n").filter((line) => line !== "")).toEqual([
+        'CAPTURE code=0 stdout="SHIM-STDOUT\\n"',
+      ]);
+      expect(err).toContain("SHIM-STDOUT");
+      expect(err).toContain("SHIM-STDERR");
+      // The runner returned no captured output for the streaming mode:
+      // nothing was read back into memory, so nothing could be forwarded.
+      expect(err).toContain("RESULT-STDERR-MODE code=0 stdout=<none> stderr=<none>");
+      expect(out).toContain('stdout="SHIM-STDOUT\\n"');
+      expect(out).toContain("code=0");
+    },
+  );
+});
+
+test("stderr mode keeps the timeout semantics unchanged", async () => {
+  await withShim(
+    () => '#!/bin/sh\nread line < "$CONTROL_FIFO"\nexec sleep 30\n',
+    async (dir) => {
+      const controlFifo = await makeFifo(dir, "control");
+      const runner = new SubprocessCliRunner();
+      const pending = runner.run(["run", "--endpoint", "/sock", "--image", "x"], shimEnv(dir, { CONTROL_FIFO: controlFifo }), "stderr", {
+        signalOnAbort: true,
+        timeoutSeconds: 1,
+      });
+      const control = await open(controlFifo, "w");
+      await control.close();
+      const result = await pending;
+      expect(result.timedOut).toBe(true);
+      expect(result.code).toBe(143);
+      expect(result.stdout).toBeUndefined();
+      expect(result.stderr).toBeUndefined();
+    },
+  );
+});
+
 test("runner timeout: long-running worker run is terminated at the deadline after confirmed start", async () => {
   await withShim(
     () => '#!/bin/sh\nread line < "$CONTROL_FIFO"\nexec sleep 30\n',

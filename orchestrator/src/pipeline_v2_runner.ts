@@ -73,6 +73,7 @@
  * facts ever appear on it.
  */
 import { lstat, mkdir } from "node:fs/promises";
+import { isCleanAbsolutePath } from "./clean_path.ts";
 import { describeError, type AuthFetcher, type CliRunner } from "./docker_helper.ts";
 import {
   RunCauseGate,
@@ -151,15 +152,6 @@ export interface PipelineV2RunOutcome {
 
 function isNonEmptyAbsolutePath(value: unknown): value is string {
   return typeof value === "string" && value !== "" && value.startsWith("/");
-}
-
-function isCleanAbsolutePath(value: unknown): value is string {
-  return (
-    isNonEmptyAbsolutePath(value) &&
-    value === (value as string).trim() &&
-    !(value as string).includes("//") &&
-    !(value as string).endsWith("/.")
-  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

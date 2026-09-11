@@ -8,6 +8,7 @@ import {
   type PipelineV2RunOptions,
   type PipelineV2RunOutcome,
   type PipelineV2RunnerDeps,
+  type PipelineV2StateRootProjection,
 } from "../src/pipeline_v2_runner.ts";
 import type { AuthFetcher, CliRunner, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
 import { translateProjectionPath } from "../src/projection_fs.ts";
@@ -1363,6 +1364,53 @@ test("F1e. a throwing onSignal registration resolves with the preflight outcome"
 });
 
 // --- fix 2: the post-snapshot signal outcome and preflight priority ----------
+
+test("F1g. unclean projection paths are rejected by the shared clean-path contract before auth", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const forms = [
+    "/state/../other",
+    "/state/./run",
+    "/state/run/",
+    "/state//run",
+    "/state\0run",
+    "",
+    "relative/state",
+    " /spaced/state",
+  ];
+  for (const form of forms) {
+    for (const field of ["localRoot", "daemonRoot"] as const) {
+      let cliCalls = 0;
+      const deps = validDeps(harness, {
+        cli: () => {
+          cliCalls += 1;
+          return Promise.resolve({ code: 1 });
+        },
+      });
+      const projection: PipelineV2StateRootProjection = {
+        localRoot: field === "localRoot" ? form : harness.stateRoot,
+        daemonRoot: field === "daemonRoot" ? form : harness.daemonStateRoot,
+      };
+      (deps as { stateRootProjection: PipelineV2StateRootProjection }).stateRootProjection = projection;
+      const { outcome, authCalls } = await runHostileDeps(harness, deps);
+      expect(outcome).toEqual({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
+      expect(authCalls).toBe(0);
+      expect(cliCalls).toBe(0);
+    }
+  }
+  // The root "/" and an ordinary clean path pass the lexical contract: the
+  // run proceeds past validateRunnerContract (the failure, if any, happens
+  // at a later stage and never mentions the projection fields).
+  for (const projection of [
+    { localRoot: "/", daemonRoot: "/" },
+    { localRoot: "/state/run", daemonRoot: harness.daemonStateRoot },
+  ]) {
+    const deps = validDeps(harness);
+    (deps as { stateRootProjection: PipelineV2StateRootProjection }).stateRootProjection = projection;
+    const { outcome, diagnostics } = await runHostileDeps(harness, deps);
+    expect(outcome.exitCode).toBe(1);
+    expect(diagnostics.join("\n")).not.toContain("stateRootProjection");
+  }
+});
 
 test("F1f. the onSignal getter is read exactly once and the full run still succeeds", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
