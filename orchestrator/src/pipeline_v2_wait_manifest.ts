@@ -38,6 +38,12 @@
  * fragments or parser positions.
  */
 import { canonicalJson } from "./canonical_json.ts";
+import {
+  isLowercaseSha256,
+  isNonNegativeSafeInteger,
+  isPipelineV2SafeId,
+  isPositiveSafeInteger,
+} from "./pipeline_v2_scalar.ts";
 
 export class PipelineV2WaitManifestError extends Error {
   constructor(message: string) {
@@ -99,29 +105,11 @@ const WAIT_REQUEST_DIGEST_DOMAIN = "pipeline-v2-wait-request\0";
 const WAIT_RESPONSE_DIGEST_DOMAIN = "pipeline-v2-wait-response\0";
 
 /**
- * The exact safe-id grammar of the durable pipeline v2 run state
- * (`pipeline_v2_state.ts`): `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, no `..`,
- * non-empty.
+ * The scalar contracts (safe id, lowercase SHA-256, safe integers) are the
+ * neutral predicates of `pipeline_v2_scalar.ts` — the single copy shared
+ * with the durable pipeline v2 run state (`pipeline_v2_state.ts`), so the
+ * two layers can never drift apart.
  */
-const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
-
-const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-
-function isSafeId(value: unknown): value is string {
-  return typeof value === "string" && value !== "" && SAFE_ID_PATTERN.test(value) && !value.includes("..");
-}
-
-function isSha256Hex(value: unknown): value is string {
-  return typeof value === "string" && SHA256_PATTERN.test(value);
-}
-
-function isPositiveSafeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
-function isNonNegativeSafeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
 
 function raise(message: string): never {
   throw new PipelineV2WaitManifestError(message);
@@ -161,14 +149,14 @@ function expectExactObject(
 }
 
 function expectSafeId(value: unknown, what: string): string {
-  if (!isSafeId(value)) {
+  if (!isPipelineV2SafeId(value)) {
     throw new PipelineV2WaitManifestError(`${what} must be a safe non-empty identifier`);
   }
   return value;
 }
 
 function expectSha256(value: unknown, what: string): string {
-  if (!isSha256Hex(value)) {
+  if (!isLowercaseSha256(value)) {
     throw new PipelineV2WaitManifestError(`${what} must be a lowercase hex SHA-256 digest`);
   }
   return value;

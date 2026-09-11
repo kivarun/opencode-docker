@@ -61,6 +61,12 @@
  */
 import type { DecisionFactValidationReason } from "./decision.ts";
 import type { TransitionStep } from "./pipeline_engine.ts";
+import {
+  isLowercaseSha256,
+  isNonNegativeSafeInteger,
+  isPipelineV2SafeId,
+  isPositiveSafeInteger,
+} from "./pipeline_v2_scalar.ts";
 
 export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 6;
 
@@ -435,8 +441,6 @@ export class PipelineV2StateError extends Error {
 }
 
 const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const JS_TYPE_NAMES: readonly string[] = [
   "string",
   "number",
@@ -458,24 +462,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value !== "";
 }
 
-function isSafeId(value: unknown): value is string {
-  return isNonEmptyString(value) && SAFE_ID_PATTERN.test(value) && !value.includes("..");
-}
-
-function isSha256Hex(value: unknown): value is string {
-  return typeof value === "string" && SHA256_PATTERN.test(value);
-}
-
 function isIsoTimestamp(value: unknown): value is string {
   return typeof value === "string" && ISO_TIMESTAMP_PATTERN.test(value);
-}
-
-function isSafePositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
-function isSafeNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isCanonicalAbsolutePath(value: unknown): value is string {
@@ -530,7 +518,7 @@ function expectEnum<T extends string>(value: unknown, allowed: readonly T[], wha
  * `create_run`, the durable store, the sink, and the v2 path helper.
  */
 export function expectSafeId(value: unknown, what: string): string {
-  if (!isSafeId(value)) {
+  if (!isPipelineV2SafeId(value)) {
     throw new PipelineV2StateError(`${what} must be a safe non-empty identifier, got ${JSON.stringify(value)}`);
   }
   return value;
@@ -544,7 +532,7 @@ function expectNonEmptyString(value: unknown, what: string): string {
 }
 
 function expectSha256(value: unknown, what: string): string {
-  if (!isSha256Hex(value)) {
+  if (!isLowercaseSha256(value)) {
     throw new PipelineV2StateError(
       `${what} must be a lowercase hex SHA-256 digest, got ${JSON.stringify(value)}`,
     );
@@ -562,7 +550,7 @@ function expectIsoTimestamp(value: unknown, what: string): string {
 }
 
 function expectSafePositiveInteger(value: unknown, what: string): number {
-  if (!isSafePositiveInteger(value)) {
+  if (!isPositiveSafeInteger(value)) {
     throw new PipelineV2StateError(
       `${what} must be a positive safe integer, got ${JSON.stringify(value)}`,
     );
@@ -571,7 +559,7 @@ function expectSafePositiveInteger(value: unknown, what: string): number {
 }
 
 function expectSafeNonNegativeInteger(value: unknown, what: string): number {
-  if (!isSafeNonNegativeInteger(value)) {
+  if (!isNonNegativeSafeInteger(value)) {
     throw new PipelineV2StateError(
       `${what} must be a non-negative safe integer, got ${JSON.stringify(value)}`,
     );
@@ -1969,13 +1957,13 @@ export function reducePipelineV2RunCommand(
     if (!isCanonicalAbsolutePath(pipeline.bundle_root)) {
       throw new PipelineV2StateError("create_run requires an absolute canonical bundle root");
     }
-    if (!isSha256Hex(pipeline.execution_snapshot_sha256)) {
+    if (!isLowercaseSha256(pipeline.execution_snapshot_sha256)) {
       throw new PipelineV2StateError("create_run requires a lowercase hex execution snapshot digest");
     }
-    if (!isSafeId(pipeline.entry_state)) {
+    if (!isPipelineV2SafeId(pipeline.entry_state)) {
       throw new PipelineV2StateError("create_run requires a safe entry state id");
     }
-    if (!isSafePositiveInteger(pipeline.max_transitions)) {
+    if (!isPositiveSafeInteger(pipeline.max_transitions)) {
       throw new PipelineV2StateError("create_run requires a positive max_transitions");
     }
     if (!Array.isArray(command.inputs)) {
@@ -1995,7 +1983,7 @@ export function reducePipelineV2RunCommand(
         ids.add(input.id);
       }
     }
-    if (!isSafeId(command.runId)) {
+    if (!isPipelineV2SafeId(command.runId)) {
       throw new PipelineV2StateError("create_run requires a safe non-empty run id");
     }
     const at = now.toISOString();
@@ -2040,7 +2028,7 @@ export function reducePipelineV2RunCommand(
 
   switch (command.kind) {
     case "start_agent_execution": {
-      if (!isSafeId(command.stateId)) {
+      if (!isPipelineV2SafeId(command.stateId)) {
         throw new PipelineV2StateError(
           `start_agent_execution requires a safe agent state id, got ${JSON.stringify(command.stateId)}`,
         );
@@ -2217,12 +2205,12 @@ export function reducePipelineV2RunCommand(
       break;
     }
     case "start_decision_execution": {
-      if (!isSafeId(command.stateId)) {
+      if (!isPipelineV2SafeId(command.stateId)) {
         throw new PipelineV2StateError(
           `start_decision_execution requires a safe decision state id, got ${JSON.stringify(command.stateId)}`,
         );
       }
-      if (!isSha256Hex(command.inputDigest)) {
+      if (!isLowercaseSha256(command.inputDigest)) {
         throw new PipelineV2StateError(
           `start_decision_execution requires a lowercase hex input digest, got ${JSON.stringify(command.inputDigest)}`,
         );
@@ -2265,7 +2253,7 @@ export function reducePipelineV2RunCommand(
       if (current.terminal !== undefined) {
         fail(current, "the terminal state is already reached; no further transitions are possible");
       }
-      if (!isSafePositiveInteger(command.executionIndex)) {
+      if (!isPositiveSafeInteger(command.executionIndex)) {
         throw new PipelineV2StateError(
           `transition_committed requires a positive execution index, got ${JSON.stringify(command.executionIndex)}`,
         );
