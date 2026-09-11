@@ -1,0 +1,30 @@
+ARG BASE_IMAGE
+
+FROM ${BASE_IMAGE}
+
+USER root
+
+RUN apk add --no-cache \
+    openjdk17-jdk \
+    gcompat \
+    libstdc++
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+ENV ANDROID_HOME=/opt/android-sdk
+ENV ANDROID_SDK_ROOT=/opt/android-sdk
+ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
+
+# pinned Android command-line tools
+# sdkmanager:
+#   platforms;android-36
+#   platforms;android-37
+#   build-tools;36.0.0
+#   ndk;27.2.12479018
+#   cmake;3.22.1
+
+RUN install -d -m 0755 -o opencode -g opencode \
+      /home/opencode/.gradle \
+      /opt/android-sdk \
+    && chown -R opencode:opencode /opt/android-sdk
+
+USER opencode
