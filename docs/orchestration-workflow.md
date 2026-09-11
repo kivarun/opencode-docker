@@ -542,8 +542,25 @@ directory inside the canonical run root and published with one atomic
 source carries any execute bit), symlinks copied as symlinks with verbatim
 target text, hidden entries including `.git` and empty directories, in
 deterministic code-unit sorted order; FIFOs, sockets, devices and
-kind/inode changes between scan and open fail closed; every failure before
-the rename removes exactly the staging tree and every expected failure is
+kind/inode changes between scan and open fail closed; every block is fully
+written by an internal write-all loop (partial writes advance the buffer
+offset and file position; zero-progress or impossible write counts fail
+after exactly one attempt), close errors never replace an already failing
+copy, and every expected filesystem failure — source
+`lstat`/`realpath`/`readdir`/`readlink`/open/read/close, destination
+open/write/fsync/close, staging create/chmod/inspect, target absence
+checks and the final rename — is a
+`PipelineV2RuntimeError("run_input_invalid", <sanitized diagnostic>)`
+whose diagnostic never contains the absolute source path, absolute paths
+of its descendants, file contents or raw system error messages: source
+entries are named only by their `JSON.stringify`-encoded relative path
+and a safe operation class, and errno codes are rendered separately. A
+failure before the rename removes exactly the created staging tree, and
+only after an ownership proof succeeds — the recorded `dev`/`ino` must
+still identify a real non-symlink directory canonically resolving to the
+expected path inside the canonical run root; a vanished tree is left
+alone, a substituted object is never removed, and a cleanup failure never
+replaces the original failure. Every expected failure reason stays
 `run_input_invalid`; after the rename the copy is authoritative and is
 never removed by the data plane even on later run failures. Honest
 boundaries: a portable `rename()` can replace a concurrently created empty
@@ -1268,9 +1285,14 @@ directory with one atomic rename (see the data-plane section above). The
 production-neutral coordinator `coordinatePipelineV2Run` assembles the
 whole v2 substrate — graph execution, the data plane, the decision
 evaluator, durable state v4, the state sink and the two-session runtime —
-and takes the caller's project source directory as an explicit
-`projectSourcePath` parameter: it prepares the run-owned copy itself
-before the run-input snapshot (validate/capture runtime contract →
+and opens with the provenance gate: `requireResolvedPipelineV2Provenance`
+is the first statement, before the sink getters, the runtime callback
+capture, any filesystem operation, any state write and any Session; a
+forged/cast/spread/`structuredClone`/Proxy pipeline returns
+`{ok:false, reason:"internal_error", state:null}` with no side effects at
+all. The coordinator takes the caller's project source directory as an
+explicit `projectSourcePath` parameter: it prepares the run-owned copy
+itself before the run-input snapshot (validate/capture runtime contract →
 `prepareRunProject` → `snapshotRunInputs` → `create_run` → graph
 execution), never accepts a ready-made `PreparedRunProject`, and keeps the
 source untouched. A project preparation failure returns

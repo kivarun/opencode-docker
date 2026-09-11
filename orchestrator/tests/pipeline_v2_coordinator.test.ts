@@ -2641,6 +2641,133 @@ test("37. a successful coordination leaves the source untouched and keeps the so
   expect(resultJson).not.toContain("PROJECT-SEED");
 });
 
+test("38. a forged pipeline is rejected by the provenance gate before any side effect", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  const fake = fakeRuntime([{}]);
+
+  // every runtime and sink member is a counting, throwing getter: any read
+  // by the coordinator would register here
+  let runtimeReads = 0;
+  const guardedRuntime = Object.defineProperties({}, {
+    createExecutionSession: {
+      get() {
+        runtimeReads += 1;
+        throw new Error("RUNTIME-READ");
+      },
+      enumerable: true,
+    },
+    createToolSession: {
+      get() {
+        runtimeReads += 1;
+        throw new Error("RUNTIME-READ");
+      },
+      enumerable: true,
+    },
+  }) as unknown as PipelineV2AgentRuntime;
+
+  let sinkReads = 0;
+  const guardedSink = Object.defineProperties({}, {
+    snapshot: {
+      get() {
+        sinkReads += 1;
+        throw new Error("SINK-READ");
+      },
+      enumerable: true,
+    },
+    poisoned: {
+      get() {
+        sinkReads += 1;
+        throw new Error("SINK-READ");
+      },
+      enumerable: true,
+    },
+    dispatch: {
+      get() {
+        sinkReads += 1;
+        throw new Error("SINK-READ");
+      },
+      enumerable: true,
+    },
+  }) as unknown as PipelineV2CoordinatorStateSink;
+
+  let proxyTrapHits = 0;
+  const forgedVariants: unknown[] = [
+    { ...harness.pipeline },
+    structuredClone(harness.pipeline),
+    new Proxy(harness.pipeline, {
+      get(target, property, receiver) {
+        proxyTrapHits += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+    new Proxy(
+      {},
+      {
+        get() {
+          proxyTrapHits += 1;
+          return undefined;
+        },
+      },
+    ),
+  ];
+
+  for (const forged of forgedVariants) {
+    runtimeReads = 0;
+    sinkReads = 0;
+    proxyTrapHits = 0;
+    const result = await coordinatePipelineV2Run({
+      pipeline: forged as ResolvedPipelineV2,
+      runId: "coord-run",
+      runRoot: harness.dirs.runRoot,
+      projectSourcePath: harness.dirs.projectSource,
+      inputBindings: bindingsFor(harness.dirs, harness.pipeline),
+      sink: guardedSink,
+      runtime: guardedRuntime,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("internal_error");
+    }
+    expect(result.state).toBeNull();
+    expect(runtimeReads).toBe(0);
+    expect(sinkReads).toBe(0);
+    expect(proxyTrapHits).toBe(0);
+    // no filesystem side effects: no project, no staging tree
+    expect((await lstatOrNull(join(harness.dirs.runRoot, "project"))) === null).toBe(true);
+    expect(
+      (await readdir(harness.dirs.runRoot)).filter((name) => name.startsWith(".project-staging-")).length,
+    ).toBe(0);
+  }
+
+  // with the real fake runtime and the recording sink the gate also runs
+  // first: zero commands, zero sessions, no durable document
+  const proxied = new Proxy(harness.pipeline, {
+    get() {
+      throw new Error("trap");
+    },
+  });
+  const result = await coordinatePipelineV2Run({
+    pipeline: proxied as ResolvedPipelineV2,
+    runId: "coord-run",
+    runRoot: harness.dirs.runRoot,
+    projectSourcePath: harness.dirs.projectSource,
+    inputBindings: bindingsFor(harness.dirs, harness.pipeline),
+    sink: harness.recording,
+    runtime: fake.runtime,
+  });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("internal_error");
+  }
+  expect(result.state).toBeNull();
+  expect(harness.recording.commands.length).toBe(0);
+  expect(fake.createCalls.length).toBe(0);
+  expect(fake.events.length).toBe(0);
+  expect(
+    (await lstatOrNull(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"))) === null,
+  ).toBe(true);
+});
+
 async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {
   try {
     return await lstat(path);

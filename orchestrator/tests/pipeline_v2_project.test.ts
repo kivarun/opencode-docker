@@ -4,7 +4,12 @@ import { chmod, lstat, mkdir, mkdtemp, readlink, readFile, readdir, realpath, rm
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { prepareRunProject, type PreparedRunProject } from "../src/pipeline_v2_runtime.ts";
+import {
+  prepareRunProject,
+  setProjectCopyIoForTests,
+  type PreparedRunProject,
+  type ProjectCopyIo,
+} from "../src/pipeline_v2_runtime.ts";
 import { PipelineV2RuntimeError } from "../src/pipeline_v2_runtime_error.ts";
 
 interface Fixture {
@@ -509,6 +514,276 @@ test("16. run root ownership: the coordinator-owned roots are not created or rem
     await dispose(fixture);
   }
 });
+
+test("17. one block is written through several partial writes and the copy is byte-exact", async () => {
+  const fixture = await setup();
+  try {
+    const body = Buffer.alloc(300 * 1024);
+    for (let index = 0; index < body.length; index += 1) {
+      body[index] = index % 251;
+    }
+    await writeFile(join(fixture.source, "blob.bin"), body);
+    let writeCalls = 0;
+    let rmCalls = 0;
+    setProjectCopyIoForTests({
+      ...realIo(),
+      destinationWrite: async (handle, chunk, offset, length, position) => {
+        writeCalls += 1;
+        const take = Math.max(1, Math.floor(length / 2));
+        const result = await handle.write(chunk, offset, take, position);
+        return result.bytesWritten;
+      },
+      stagingRm: async (path, options) => {
+        rmCalls += 1;
+        await rm(path, options);
+      },
+    });
+    try {
+      const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+      const copied = await readFile(join(prepared.project_root, "blob.bin"));
+      expect(copied.equals(body)).toBe(true);
+      // 300 KiB is three full 128 KiB blocks; every block needed several
+      // writes, so the write-all loop advanced offset and position
+      const blocks = Math.ceil(300 * 1024 / (128 * 1024));
+      expect(writeCalls).toBeGreaterThan(blocks);
+      expect(writeCalls).toBeGreaterThanOrEqual(6);
+      // a successful copy never runs the staging cleanup
+      expect(rmCalls).toBe(0);
+      expect((await lstat(prepared.project_root)).isDirectory()).toBe(true);
+    } finally {
+      setProjectCopyIoForTests(null);
+    }
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("18. a zero-progress or impossible write fails once, without looping", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "blob.bin"), Buffer.alloc(4096, 7));
+    for (const bogus of [0, Number.NaN, Number.MAX_SAFE_INTEGER]) {
+      let writeCalls = 0;
+      setProjectCopyIoForTests({
+        ...realIo(),
+        destinationWrite: async () => {
+          writeCalls += 1;
+          return bogus;
+        },
+      });
+      try {
+        let failure: unknown;
+        try {
+          await prepareRunProject(fixture.source, fixture.runRoot);
+        } catch (cause) {
+          failure = cause;
+        }
+        expectFailClosed(failure, "could not be written without progress");
+        // exactly one write attempt: no infinite loop
+        expect(writeCalls).toBe(1);
+        expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+        await expectLeftoverStaging(fixture.runRoot, 0);
+      } finally {
+        setProjectCopyIoForTests(null);
+      }
+    }
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("19. a failing staging cleanup never replaces the original failure", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(join(fixture.source, "zz"));
+    execSync(`mkfifo ${JSON.stringify(join(fixture.source, "zz", "pipe"))}`);
+
+    // rm fault: the recursive removal fails after the ownership proof
+    let rmCalls = 0;
+    setProjectCopyIoForTests({
+      ...realIo(),
+      stagingRm: async () => {
+        rmCalls += 1;
+        throw new Error("CLEANUP-RM-BOOM");
+      },
+    });
+    try {
+      let failure: unknown;
+      try {
+        await prepareRunProject(fixture.source, fixture.runRoot);
+      } catch (cause) {
+        failure = cause;
+      }
+      expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
+      expect((failure as Error).message).not.toContain("CLEANUP-RM-BOOM");
+      // the staging tree stays behind as the documented absence of crash
+      // recovery; the original failure remains authoritative
+      await expectLeftoverStaging(fixture.runRoot, 1);
+      expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+    } finally {
+      setProjectCopyIoForTests(null);
+    }
+    // remove the leftover staging tree of the first sub-case before the
+    // second one starts on the same run root
+    for (const leftover of (await readdir(fixture.runRoot)).filter((name) =>
+      name.startsWith(".project-staging-"),
+    )) {
+      await rm(join(fixture.runRoot, leftover), { recursive: true, force: true });
+    }
+
+    // realpath fault: without a confirmed canonical resolution the removal
+    // is skipped entirely
+    let realpathCalls = 0;
+    rmCalls = 0;
+    setProjectCopyIoForTests({
+      ...realIo(),
+      stagingRealpath: async () => {
+        realpathCalls += 1;
+        throw new Error("CLEANUP-REALPATH-BOOM");
+      },
+    });
+    try {
+      let failure: unknown;
+      try {
+        await prepareRunProject(fixture.source, fixture.runRoot);
+      } catch (cause) {
+        failure = cause;
+      }
+      expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
+      expect((failure as Error).message).not.toContain("CLEANUP-REALPATH-BOOM");
+      expect(realpathCalls).toBe(1);
+      await expectLeftoverStaging(fixture.runRoot, 1);
+      expect(rmCalls).toBe(0);
+    } finally {
+      setProjectCopyIoForTests(null);
+    }
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("20. a vanished or replaced staging tree is never removed and sentinels stay", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(join(fixture.source, "zz"));
+    execSync(`mkfifo ${JSON.stringify(join(fixture.source, "zz", "pipe"))}`);
+    await writeFile(join(fixture.root, "plain-file.txt"), "plain\n");
+    await symlink(join(fixture.root, "plain-file.txt"), join(fixture.root, "link"));
+    await mkdir(join(fixture.root, "other-dir"));
+
+    const scenarios: Array<{
+      name: string;
+      inspect: (path: string) => Promise<import("node:fs").Stats | null>;
+      realpath?: (path: string) => Promise<string>;
+    }> = [
+      { name: "vanished", inspect: async () => null },
+      {
+        name: "replaced by a regular file",
+        inspect: async () => await lstat(join(fixture.root, "plain-file.txt")),
+      },
+      {
+        name: "replaced by a symlink",
+        inspect: async () => await lstat(join(fixture.root, "link")),
+      },
+      {
+        name: "replaced by another directory",
+        inspect: async () => await lstat(join(fixture.root, "other-dir")),
+      },
+      {
+        name: "canonical resolution moved away",
+        inspect: async (path) => await lstat(path),
+        realpath: async () => join(fixture.root, "elsewhere"),
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      await writeFile(join(fixture.runRoot, "sentinel.txt"), "KEEP\n");
+      let rmCalls = 0;
+      setProjectCopyIoForTests({
+        ...realIo(),
+        stagingInspect: scenario.inspect,
+        ...(scenario.realpath === undefined ? {} : { stagingRealpath: scenario.realpath }),
+        stagingRm: async (path, options) => {
+          rmCalls += 1;
+          await rm(path, options);
+        },
+      });
+      try {
+        let failure: unknown;
+        try {
+          await prepareRunProject(fixture.source, fixture.runRoot);
+        } catch (cause) {
+          failure = cause;
+        }
+        expectFailClosed(failure, "FIFO, socket, device or another unsupported object");
+        // the replacement is never removed: the cleanup never ran
+        expect(rmCalls).toBe(0);
+        // the external sentinel in the run root is untouched
+        expect(await readFile(join(fixture.runRoot, "sentinel.txt"), "utf8")).toBe("KEEP\n");
+        // the staging tree stays behind (documented no-crash-recovery)
+        await expectLeftoverStaging(fixture.runRoot, 1);
+      } finally {
+        setProjectCopyIoForTests(null);
+      }
+      // clean up for the next scenario
+      await rm(join(fixture.runRoot, "sentinel.txt"));
+      for (const leftover of (await readdir(fixture.runRoot)).filter((name) =>
+        name.startsWith(".project-staging-"),
+      )) {
+        await rm(join(fixture.runRoot, leftover), { recursive: true, force: true });
+      }
+    }
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("21. an unreadable source file fails as a sanitized run-level input failure", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "unreadable.txt"), "secret body\n");
+    await chmod(join(fixture.source, "unreadable.txt"), 0o000);
+    try {
+      let failure: unknown;
+      try {
+        await prepareRunProject(fixture.source, fixture.runRoot);
+      } catch (cause) {
+        failure = cause;
+      }
+      expectFailClosed(failure, "could not be opened for reading");
+      const message = (failure as Error).message;
+      // the diagnostic names only the relative entry and the errno code
+      expect(message).toContain('"unreadable.txt"');
+      expect(message).toContain("(errno EACCES)");
+      expect(message).not.toContain(fixture.source);
+      expect(message).not.toContain("permission denied");
+      expect((await lstatOrNull(join(fixture.runRoot, "project"))) === null).toBe(true);
+      await expectLeftoverStaging(fixture.runRoot, 0);
+    } finally {
+      await chmod(join(fixture.source, "unreadable.txt"), 0o600);
+    }
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+function realIo(): ProjectCopyIo {
+  return {
+    destinationWrite: async (handle, chunk, offset, length, position) => {
+      const result = await handle.write(chunk, offset, length, position);
+      return result.bytesWritten;
+    },
+    stagingInspect: async (path) => {
+      try {
+        return await lstat(path);
+      } catch {
+        return null;
+      }
+    },
+    stagingRealpath: (path) => realpath(path),
+    stagingRm: (path, options) => rm(path, options),
+  };
+}
 
 async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {
   try {

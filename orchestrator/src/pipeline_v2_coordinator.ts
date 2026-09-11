@@ -598,6 +598,18 @@ interface ExecutionTracking {
 export async function coordinatePipelineV2Run(
   params: PipelineV2CoordinatorParams,
 ): Promise<PipelineV2CoordinationResult> {
+  // The provenance gate is the first statement and runs before any side
+  // effect: a forged pipeline is rejected before the sink is read or
+  // dispatched, before the runtime callbacks are captured, before any
+  // filesystem operation and before any Session. The pipeline is never
+  // re-compiled or re-validated here; provenance is the structural trust
+  // anchor established by `loadPipelineV2`.
+  try {
+    requireResolvedPipelineV2Provenance(params.pipeline, "pipeline v2 coordinator");
+  } catch {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
   const { pipeline, runId, runRoot, sink, runtime } = params;
 
   // Caller contract: a fresh sink for a new run; resume is not supported.

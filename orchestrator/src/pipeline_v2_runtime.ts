@@ -572,6 +572,65 @@ function isErrnoException(cause: unknown, code: string): boolean {
   );
 }
 
+/**
+ * The errno code of a filesystem failure, rendered separately and without
+ * the system message, so no path or payload text can leak into a project
+ * copy diagnostic.
+ */
+function errnoSuffix(cause: unknown): string {
+  if (typeof cause === "object" && cause !== null) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    if (typeof code === "string" && code !== "") {
+      return ` (errno ${code})`;
+    }
+  }
+  return "";
+}
+
+/**
+ * A run-level project-copy failure whose diagnostic carries only the safe
+ * operation class and an optional errno code — never an absolute source
+ * path, a file body or a raw system message.
+ */
+function projectCopyFailure(what: string, cause?: unknown): PipelineError {
+  return new PipelineError(cause === undefined ? what : `${what}${errnoSuffix(cause)}`);
+}
+
+/**
+ * A project-copy failure for one source entry, named only by its
+ * `JSON.stringify`-encoded relative path and a safe operation class.
+ */
+function projectEntryFailure(
+  what: string,
+  relativePath: string,
+  cause?: unknown,
+): PipelineError {
+  const suffix = cause === undefined ? "" : errnoSuffix(cause);
+  return new PipelineError(`${what} ${JSON.stringify(relativePath)}${suffix}`);
+}
+
+/**
+ * lstat for the project copy: ENOENT is absence; every other failure is a
+ * sanitized run-level input failure that never embeds an absolute path.
+ */
+async function projectCopyLstatOrNull(
+  path: string,
+  what: string,
+  relativePath?: string,
+): Promise<Stats | null> {
+  try {
+    return await lstat(path);
+  } catch (cause) {
+    if (isErrnoException(cause, "ENOENT")) {
+      return null;
+    }
+    if (relativePath === undefined) {
+      throw projectCopyFailure(what, cause);
+    }
+    throw projectEntryFailure(what, relativePath, cause);
+  }
+}
+
 async function lstatOrNull(path: string): Promise<Stats | null> {
   try {
     return await lstat(path);
@@ -1131,6 +1190,64 @@ const MAX_STAGING_ATTEMPTS = 8;
 const PROJECT_COPY_CHUNK = 128 * 1024;
 
 /**
+ * Module-private deterministic fault-injection seam for the run-owned
+ * project copy tests: the copy stream writes and the staging cleanup
+ * operations are routed through this indirection. The default is the real
+ * filesystem; only the test helper installs a custom implementation and
+ * restores the default afterwards. Production code never touches the
+ * installer, and the public data-plane surface is unchanged.
+ */
+export interface ProjectCopyIo {
+  /** One write call on one destination chunk of the copy stream. */
+  readonly destinationWrite: (
+    handle: FileHandle,
+    chunk: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+  ) => Promise<number>;
+  /** Identity probe of the staging tree before cleanup (lstat semantics). */
+  readonly stagingInspect: (path: string) => Promise<Stats | null>;
+  /** Canonical resolution of the staging tree before cleanup. */
+  readonly stagingRealpath: (path: string) => Promise<string>;
+  /** The single recursive removal of one owned staging tree. */
+  readonly stagingRm: (
+    path: string,
+    options: { recursive: boolean; force: boolean },
+  ) => Promise<void>;
+}
+
+const realProjectCopyIo: ProjectCopyIo = {
+  destinationWrite: async (handle, chunk, offset, length, position) => {
+    const result = await handle.write(chunk, offset, length, position);
+    return result.bytesWritten;
+  },
+  stagingInspect: async (path) => {
+    try {
+      return await lstat(path);
+    } catch (cause) {
+      if (isErrnoException(cause, "ENOENT")) {
+        return null;
+      }
+      throw cause;
+    }
+  },
+  stagingRealpath: (path) => realpath(path),
+  stagingRm: (path, options) => rm(path, options),
+};
+
+let projectCopyIo: ProjectCopyIo = realProjectCopyIo;
+
+/**
+ * Install a fault-injecting `ProjectCopyIo` implementation for one test;
+ * pass `null` to restore the real filesystem. Production code never calls
+ * this — the public production API of the data plane is unchanged.
+ */
+export function setProjectCopyIoForTests(io: ProjectCopyIo | null): void {
+  projectCopyIo = io ?? realProjectCopyIo;
+}
+
+/**
  * Run-owned project copy metadata. The source path is deliberately not
  * part of the object: after preparation the runtime works only inside the
  * orchestrator-owned copy and never reads or names the user source again.
@@ -1165,20 +1282,32 @@ export interface PreparedRunProject {
  * copied verbatim and never resolved — hidden entries (including `.git`)
  * and empty directories, in deterministic relative-path code-unit sorted
  * order. uid/gid, timestamps, xattrs, ACLs and hardlink identity are not
- * preserved: hardlinks become independent regular files. Destination
- * regular files are read through `O_NOFOLLOW|O_NONBLOCK` sources and
- * created `O_CREAT|O_EXCL|O_NOFOLLOW`, streamed without shell, `cp` or
- * `tar`, and fsynced before publication. FIFOs, unix sockets, devices and
- * unknown kinds are rejected, as is an object that changed kind or inode
- * between scan and open. Absolute source paths and file contents never
- * enter diagnostics.
+ * preserved: hardlinks become independent regular files. Sources are
+ * opened `O_NOFOLLOW|O_NONBLOCK` and destinations `O_CREAT|O_EXCL|O_NOFOLLOW`;
+ * each block is fully written by an internal write-all loop (a partial
+ * write advances the buffer offset and the file position; a zero-progress
+ * or impossible write count fails the operation), streamed without shell,
+ * `cp` or `tar`, and fsynced before publication. Close errors never
+ * replace an already failing copy; a close error after an otherwise
+ * successful copy is the typed failure itself. FIFOs, unix sockets,
+ * devices and unknown kinds are rejected, as is an object that changed
+ * kind or inode between scan and open. Absolute source paths, absolute
+ * paths of their descendants, file contents and raw system error messages
+ * never enter diagnostics: source entries are named only by their
+ * `JSON.stringify`-encoded relative path and a safe operation class, and
+ * errno codes are rendered separately.
  *
  * Publication: the tree is staged in an exclusive staging directory inside
  * the canonical run root and published with one `rename` after a fresh
  * absence re-check of `<runRoot>/project`. Any failure before the rename
- * removes exactly the created staging tree; existing objects and the
- * source stay byte-identical. After the rename the copy is authoritative
- * and is never removed by this function, even on later run failures.
+ * removes exactly the created staging tree — and only after an ownership
+ * proof succeeds: the recorded `dev`/`ino` must still identify a real
+ * non-symlink directory canonically resolving to the expected path inside
+ * the canonical run root; a vanished tree is left alone, a substituted
+ * object is never removed, and a cleanup failure never replaces the
+ * original operation failure. Existing objects and the source stay
+ * byte-identical. After the rename the copy is authoritative and is never
+ * removed by this function, even on later run failures.
  *
  * Honest boundaries: the portable `rename()` can replace a concurrently
  * created empty directory at the target; there is no protection against a
@@ -1214,14 +1343,20 @@ export async function prepareRunProject(
     }
 
     const projectPath = join(runRootCanonical, PROJECT_ROOT_NAME);
-    const existingProject = await lstatOrNull(projectPath);
+    const existingProject = await projectCopyLstatOrNull(
+      projectPath,
+      "run project root could not be inspected",
+    );
     if (existingProject !== null) {
       throw new PipelineError(
         `run project root already exists at the fixed run-root location and is ${describeEntry(existingProject)}`,
       );
     }
 
-    const sourceInfo = await lstatOrNull(projectSourcePath);
+    const sourceInfo = await projectCopyLstatOrNull(
+      projectSourcePath,
+      "project source could not be inspected",
+    );
     if (sourceInfo === null) {
       throw new PipelineError("project source does not exist");
     }
@@ -1234,7 +1369,7 @@ export async function prepareRunProject(
     try {
       sourceCanonical = await realpath(projectSourcePath);
     } catch (cause) {
-      throw fail("project source cannot be canonicalized", cause);
+      throw projectCopyFailure("project source cannot be canonicalized", cause);
     }
     if (
       sourceCanonical === runRootCanonical ||
@@ -1246,21 +1381,28 @@ export async function prepareRunProject(
       );
     }
 
-    let stagingPath = "";
+    let staging: ProjectStagingDirectory | null = null;
     try {
-      stagingPath = await createProjectStagingDirectory(runRootCanonical);
-      await copyProjectTree(sourceCanonical, stagingPath);
+      staging = await createProjectStagingDirectory(runRootCanonical);
+      await copyProjectTree(sourceCanonical, staging.path);
       // Fresh absence re-check immediately before the atomic publication.
-      const beforeRename = await lstatOrNull(projectPath);
+      const beforeRename = await projectCopyLstatOrNull(
+        projectPath,
+        "run project root could not be inspected",
+      );
       if (beforeRename !== null) {
         throw new PipelineError(
           `run project root appeared at the fixed run-root location during preparation and is ${describeEntry(beforeRename)}`,
         );
       }
-      await rename(stagingPath, projectPath);
+      try {
+        await rename(staging.path, projectPath);
+      } catch (cause) {
+        throw projectCopyFailure("run project copy could not be published", cause);
+      }
     } catch (cause) {
-      if (stagingPath !== "") {
-        await removeProjectStagingTree(stagingPath, runRootCanonical);
+      if (staging !== null) {
+        await removeProjectStagingTree(staging.path, staging, runRootCanonical);
       }
       throw cause;
     }
@@ -1269,11 +1411,25 @@ export async function prepareRunProject(
 }
 
 /**
+ * One exclusively created staging directory with its recorded filesystem
+ * identity (`dev`/`ino`): the identity is the ownership proof the cleanup
+ * later re-checks before removing anything.
+ */
+interface ProjectStagingDirectory {
+  readonly path: string;
+  readonly dev: number;
+  readonly ino: number;
+}
+
+/**
  * Create one exclusive staging directory inside the canonical run root.
  * The name is hidden and random; creation is exclusive, so a concurrent
- * creator loses instead of being adopted.
+ * creator loses instead of being adopted. Every creation failure is a
+ * sanitized run-level input failure.
  */
-async function createProjectStagingDirectory(runRootCanonical: string): Promise<string> {
+async function createProjectStagingDirectory(
+  runRootCanonical: string,
+): Promise<ProjectStagingDirectory> {
   let lastCause: unknown = undefined;
   for (let attempt = 0; attempt < MAX_STAGING_ATTEMPTS; attempt += 1) {
     const name = `${PROJECT_STAGING_PREFIX}${randomBytes(8).toString("hex")}`;
@@ -1281,35 +1437,73 @@ async function createProjectStagingDirectory(runRootCanonical: string): Promise<
     try {
       await mkdir(path, { mode: 0o700 });
       await chmod(path, 0o700);
-      return path;
     } catch (cause) {
       if (isErrnoException(cause, "EEXIST")) {
         lastCause = cause;
         continue;
       }
-      throw fail("staging directory could not be created", cause);
+      throw projectCopyFailure("staging directory could not be created", cause);
     }
+    const info = await projectCopyLstatOrNull(
+      path,
+      "staging directory could not be inspected after creation",
+    );
+    if (info === null || info.isSymbolicLink() || !info.isDirectory()) {
+      throw projectCopyFailure("staging directory is not a real directory after creation");
+    }
+    return { path, dev: info.dev, ino: info.ino };
   }
-  throw fail("exclusive staging directory could not be created", lastCause);
+  throw projectCopyFailure("exclusive staging directory could not be created", lastCause);
 }
 
 /**
  * Best-effort removal of exactly the staging tree this operation created.
- * The path was built inside the canonical run root by the caller; the
- * containment guard never deletes anything outside the run root.
+ * The removal runs only after the ownership proof succeeds: the object at
+ * the expected path must still be a real non-symlink directory with the
+ * recorded `dev`/`ino`, resolving canonically to the expected path inside
+ * the canonical run root. A vanished tree is left alone, a substituted
+ * object is never removed, and without a confirmed canonical resolution
+ * the recursive `rm` is skipped. Cleanup failures never replace the
+ * original operation failure; a leftover staging tree stays the documented
+ * absence of crash recovery.
  */
 async function removeProjectStagingTree(
   stagingPath: string,
+  identity: { readonly dev: number; readonly ino: number },
   runRootCanonical: string,
 ): Promise<void> {
   try {
-    const canonical = await realpath(stagingPath);
+    const info = await projectCopyIo.stagingInspect(stagingPath);
+    if (info === null) {
+      // The staging tree vanished; there is nothing to remove.
+      return;
+    }
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      // A substituted object is never removed.
+      return;
+    }
+    if (info.dev !== identity.dev || info.ino !== identity.ino) {
+      // A replaced directory is never removed.
+      return;
+    }
+    let canonical: string;
+    try {
+      canonical = await projectCopyIo.stagingRealpath(stagingPath);
+    } catch {
+      // Without a confirmed canonical resolution the removal is skipped.
+      return;
+    }
+    if (canonical !== stagingPath) {
+      return;
+    }
     if (canonical !== runRootCanonical && !isInsideRoot(runRootCanonical, canonical)) {
       return;
     }
-    await rm(stagingPath, { recursive: true, force: true });
+    await projectCopyIo.stagingRm(stagingPath, { recursive: true, force: true });
   } catch {
-    await rm(stagingPath, { recursive: true, force: true });
+    // Best-effort: a cleanup failure may leave the staging tree behind as
+    // the documented absence of crash recovery; it never replaces the
+    // original operation failure.
   }
 }
 
@@ -1326,7 +1520,7 @@ async function copyProjectTree(sourceCanonical: string, destinationRoot: string)
     try {
       dirents = await readdir(sourceDir, { withFileTypes: true });
     } catch (cause) {
-      throw fail("project source directory could not be listed", cause);
+      throw projectCopyFailure("project source directory could not be listed", cause);
     }
     dirents.sort((left, right) =>
       left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
@@ -1337,7 +1531,11 @@ async function copyProjectTree(sourceCanonical: string, destinationRoot: string)
       const childDestination = join(destinationRoot, childRelative);
       // The scan-time kind comes from lstat, never from the dirent type,
       // so a replaced object is caught here and again after open.
-      const info = await lstatOrNull(childSource);
+      const info = await projectCopyLstatOrNull(
+        childSource,
+        "project source entry could not be inspected",
+        childRelative,
+      );
       if (info === null) {
         throw new PipelineError(
           `project source entry ${JSON.stringify(childRelative)} disappeared during the copy`,
@@ -1348,16 +1546,18 @@ async function copyProjectTree(sourceCanonical: string, destinationRoot: string)
         try {
           target = await readlink(childSource);
         } catch (cause) {
-          throw fail(
-            `project source symlink entry ${JSON.stringify(childRelative)} could not be read`,
+          throw projectEntryFailure(
+            "project source symlink entry could not be read",
+            childRelative,
             cause,
           );
         }
         try {
           await symlink(target, childDestination);
         } catch (cause) {
-          throw fail(
-            `project source symlink entry ${JSON.stringify(childRelative)} could not be copied`,
+          throw projectEntryFailure(
+            "project source symlink entry could not be copied",
+            childRelative,
             cause,
           );
         }
@@ -1366,8 +1566,9 @@ async function copyProjectTree(sourceCanonical: string, destinationRoot: string)
           await mkdir(childDestination, { mode: 0o700 });
           await chmod(childDestination, 0o700);
         } catch (cause) {
-          throw fail(
-            `project source directory entry ${JSON.stringify(childRelative)} could not be copied`,
+          throw projectEntryFailure(
+            "project source directory entry could not be copied",
+            childRelative,
             cause,
           );
         }
@@ -1389,8 +1590,14 @@ async function copyProjectTree(sourceCanonical: string, destinationRoot: string)
  * opened `O_NOFOLLOW|O_NONBLOCK` (a FIFO substituted between scan and open
  * cannot block the run), the open object must still be the scanned regular
  * file (same kind, same dev/ino), and the destination is created
- * `O_CREAT|O_EXCL|O_NOFOLLOW` with the contract mode, streamed chunk by
- * chunk without shell/`cp`/`tar`, and fsynced before publication.
+ * `O_CREAT|O_EXCL|O_NOFOLLOW` with the contract mode. Every block is fully
+ * written with an internal write-all loop: partial writes advance the
+ * buffer offset and the file position, a zero-progress or impossible
+ * `bytesWritten` fails the operation, and only fully written blocks
+ * advance the read position. Every expected filesystem failure is a
+ * sanitized run-level input failure; close errors never replace an
+ * already failing copy, and a close error after an otherwise successful
+ * copy becomes the typed failure itself.
  */
 async function copyProjectRegularFile(
   sourcePath: string,
@@ -1399,10 +1606,20 @@ async function copyProjectRegularFile(
   scannedInfo: Stats,
 ): Promise<void> {
   const mode = (scannedInfo.mode & 0o111) !== 0 ? 0o700 : 0o600;
-  const source = await open(
-    sourcePath,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
+  let source: FileHandle;
+  try {
+    source = await open(
+      sourcePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch (cause) {
+    throw projectEntryFailure(
+      "project source file entry could not be opened for reading",
+      childRelative,
+      cause,
+    );
+  }
+  let sourceCloseFailure: unknown = undefined;
   try {
     const opened = await source.stat();
     if (opened.isSymbolicLink() || !opened.isFile()) {
@@ -1415,37 +1632,110 @@ async function copyProjectRegularFile(
         `project source entry ${JSON.stringify(childRelative)} was replaced between scan and open`,
       );
     }
-    const destination = await open(
-      destinationPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      mode,
-    );
+    let destination: FileHandle;
     try {
-      await destination.chmod(mode);
-      const chunk = Buffer.allocUnsafe(PROJECT_COPY_CHUNK);
-      let position = 0;
-      for (;;) {
-        const { bytesRead } = await source.read(chunk, 0, chunk.length, position);
-        if (bytesRead === 0) {
-          break;
+      destination = await open(
+        destinationPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        mode,
+      );
+    } catch (cause) {
+      throw projectEntryFailure(
+        "project source file entry could not be opened for writing",
+        childRelative,
+        cause,
+      );
+    }
+    let destinationCompleted = false;
+    try {
+      try {
+        await destination.chmod(mode);
+        const chunk = Buffer.allocUnsafe(PROJECT_COPY_CHUNK);
+        let position = 0;
+        for (;;) {
+          const { bytesRead } = await source.read(chunk, 0, chunk.length, position);
+          if (bytesRead === 0) {
+            break;
+          }
+          let written = 0;
+          while (written < bytesRead) {
+            const remaining = bytesRead - written;
+            const bytesWritten = await projectCopyIo.destinationWrite(
+              destination,
+              chunk,
+              written,
+              remaining,
+              position + written,
+            );
+            if (
+              !Number.isSafeInteger(bytesWritten) ||
+              bytesWritten <= 0 ||
+              bytesWritten > remaining
+            ) {
+              throw projectEntryFailure(
+                "project source file entry could not be written without progress",
+                childRelative,
+              );
+            }
+            written += bytesWritten;
+          }
+          position += bytesRead;
         }
-        await destination.write(chunk, 0, bytesRead, position);
-        position += bytesRead;
+        await destination.sync();
+        destinationCompleted = true;
+      } finally {
+        try {
+          await destination.close();
+        } catch (closeCause) {
+          if (destinationCompleted) {
+            // An otherwise successful copy that cannot be closed becomes
+            // the typed failure itself.
+            throw projectEntryFailure(
+              "project source file entry could not be closed after copying",
+              childRelative,
+              closeCause,
+            );
+          }
+          // A close failure after an already failing copy is swallowed:
+          // the original failure stays authoritative.
+        }
       }
-      await destination.sync();
-    } finally {
-      await destination.close();
+    } catch (cause) {
+      if (cause instanceof PipelineError) {
+        throw cause;
+      }
+      throw projectEntryFailure(
+        "project source file entry could not be copied",
+        childRelative,
+        cause,
+      );
     }
   } catch (cause) {
     if (cause instanceof PipelineError) {
       throw cause;
     }
-    throw fail(
-      `project source file entry ${JSON.stringify(childRelative)} could not be copied`,
+    throw projectEntryFailure(
+      "project source file entry could not be copied",
+      childRelative,
       cause,
     );
   } finally {
-    await source.close();
+    try {
+      await source.close();
+    } catch (closeCause) {
+      sourceCloseFailure = closeCause;
+    }
+  }
+  if (sourceCloseFailure !== undefined) {
+    // An otherwise successful copy whose source cannot be closed is still
+    // a typed run-level input failure; a close failure after an already
+    // failing copy never reaches this point (the original failure already
+    // propagates from above).
+    throw projectEntryFailure(
+      "project source file entry could not be closed after reading",
+      childRelative,
+      sourceCloseFailure,
+    );
   }
 }
 
