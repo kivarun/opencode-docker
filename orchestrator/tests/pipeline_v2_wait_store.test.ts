@@ -641,6 +641,13 @@ function ioWithHandleFault(
       },
       close: async () => {
         if (fault.close !== undefined) {
+          // Close the real handle first so no descriptor leaks; the fault is
+          // still observed by the caller as a failed close.
+          try {
+            await real.close();
+          } catch {
+            // best effort
+          }
           throw fault.close;
         }
         await real.close();
@@ -847,6 +854,13 @@ test("24. post-link fault matrix: temp unlink and directory durability become du
           return Object.freeze({
             sync: real.sync.bind(real),
             close: async () => {
+              // Close the real handle first so no descriptor leaks; the
+              // fault is still observed by the caller as a failed close.
+              try {
+                await real.close();
+              } catch {
+                // best effort
+              }
               throw injectedFailure("EIO");
             },
           });

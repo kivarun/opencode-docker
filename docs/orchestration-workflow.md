@@ -1485,9 +1485,44 @@ Semantic boundary for the future coordinator (not wired here): publish
 request → dispatch `run_waiting(request_sha256)`; publish response →
 dispatch `wait_response_recorded(response_sha256)`. A manifest file
 published without the corresponding durable commit is an orphan, not
-part of the history, and an exact retry safely reuses it. Coordinator,
-runner and CLI wiring, resume, user-response reading from a file, and
-migrations stay out of scope.
+part of the history, and an exact retry safely reuses it.
+
+The production-neutral wait controller
+(`orchestrator/src/pipeline_v2_wait_controller.ts`) assembles these
+layers into one flow and owns the order: the caller supplies only the
+policy `reason` and `actions` (and, for responses, the wait index and
+raw response document); `run_id`, `wait_index`, `transition_count` and
+`state_id` are derived exclusively from the authoritative sink snapshot.
+The controller prepares the manifest, pre-checks the exact
+`run_waiting` command against the real reducer before any filesystem
+side effect, publishes the request manifest, verifies the publisher
+result against the derived fields, and only then dispatches through a
+`dispatch` function captured exactly once in the synchronous preflight;
+the post-dispatch state is read from the authoritative sink snapshot,
+never from a pre-computed candidate. A durably open wait turns a repeat
+call into a re-entry: the request manifest is reconstructed from the
+durable record, the caller's `reason`/`actions` must match it exactly,
+the canonical request file is verified or restored, and no second
+`run_waiting` is dispatched. The response flow reconstructs the request
+from the durable record, verifies or restores the request file, accepts
+the raw response through the manifest module, publishes the response
+manifest, and dispatches `wait_response_recorded` with the accepted
+digests and action id only — the routing target is never accepted from
+the caller. An already-answered wait accepts only the identical
+response, restores both files if needed, and dispatches nothing.
+Failure mapping is by error class and typed fields, never by message
+text: wait-store conflicts are `wait_conflict`, other wait-store
+failures are `wait_storage_failed` with zero dispatch, reducer
+rejections are `invalid_state` after an idempotency check, and sink
+commit failures are `state_persist_failed` — a `not_committed` leaves
+the published manifest as an orphan with the previous snapshot
+authoritative, and a `durability_unknown` adopts the visible candidate
+and poisons the sink, so a fresh controller with a freshly loaded sink
+later recognizes the durable record as idempotent success. Published
+manifests are never removed on state failures, and diagnostics are
+content-free. Coordinator, runner and CLI wiring, reading the user
+response from a file, resume, P01 validation, and migrations stay out
+of scope.
 
 ### Run-owned project copy and the production-neutral coordinator (implemented, driven by the production runner)
 
