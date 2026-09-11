@@ -6,6 +6,7 @@ import {
   coordinatePipelineV2Run,
   type PipelineV2AgentRuntime,
   type PipelineV2CoordinationResult,
+  type PipelineV2CoordinatorControl,
   type PipelineV2CoordinatorStateSink,
   type PipelineV2ExecutionSession,
   type PipelineV2ToolSession,
@@ -2468,7 +2469,7 @@ async function setupHarness(
 async function coordinate(
   harness: Harness,
   runtime: PipelineV2AgentRuntime,
-  options: { runId?: string } = {},
+  options: { runId?: string; control?: PipelineV2CoordinatorControl } = {},
 ): Promise<PipelineV2CoordinationResult> {
   return await coordinatePipelineV2Run({
     pipeline: harness.pipeline,
@@ -2478,7 +2479,7 @@ async function coordinate(
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime,
-  }, NEUTRAL_CONTROL);
+  }, options.control ?? NEUTRAL_CONTROL);
 }
 
 function kinds(recording: RecordingSink): string[] {
@@ -2776,6 +2777,109 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
   expect(
     (await lstatOrNull(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"))) === null,
   ).toBe(true);
+});
+
+/**
+ * A counting coordinator control: it counts every `freezeSignal` call so a
+ * test can pin the exactly-one cutoff contract. `sigintOnFirst` freezes
+ * with SIGINT on the first call; a second call (which must never happen)
+ * either throws or would return a different signal.
+ */
+function cutoffControl(
+  mode: "neutral" | "sigint-then-throw" | "sigterm-then-sigint",
+): PipelineV2CoordinatorControl & { freezeCalls: () => number } {
+  let freezeCalls = 0;
+  const control = {
+    currentSignal: (): "SIGINT" | "SIGTERM" | null => null,
+    freezeSignal: (): "SIGINT" | "SIGTERM" | null => {
+      freezeCalls += 1;
+      if (mode === "sigint-then-throw") {
+        if (freezeCalls === 1) {
+          return "SIGINT";
+        }
+        throw new Error("SECOND-FREEZE-CALL");
+      }
+      if (mode === "sigterm-then-sigint") {
+        return freezeCalls === 1 ? "SIGTERM" : "SIGINT";
+      }
+      return null;
+    },
+    freezeCalls: (): number => freezeCalls,
+  };
+  return control;
+}
+
+test("56. the cutoff freezes signal acceptance exactly once (sigint-then-throw control)", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  const fake = fakeRuntime([{}]);
+  const control = cutoffControl("sigint-then-throw");
+  const result = await coordinate(harness, fake.runtime, { control });
+  // The single cutoff froze with SIGINT; the second freezeSignal call —
+  // which would throw — never happened, so the reason stays signal_sigint.
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("signal_sigint");
+  }
+  expect(result.state?.status).toBe("failed");
+  expect(result.state?.failure?.reason).toBe("signal_sigint");
+  expect(control.freezeCalls()).toBe(1);
+  expect(kinds(harness.recording)).not.toContain("run_succeeded");
+  const finalize = harness.recording.commands.at(-1);
+  expect(finalize?.kind).toBe("run_failed");
+  expect((finalize as { reason?: string }).reason).toBe("signal_sigint");
+});
+
+test("57. the cutoff runs exactly once for a normal success", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  const fake = fakeRuntime([{}]);
+  const control = cutoffControl("neutral");
+  const result = await coordinate(harness, fake.runtime, { control });
+  expect(result.ok).toBe(true);
+  expect(result.state?.status).toBe("success");
+  expect(control.freezeCalls()).toBe(1);
+});
+
+test("58. the cutoff runs exactly once for a normal failure", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  const fake = fakeRuntime([{ run: "worker_failed" }]);
+  const control = cutoffControl("neutral");
+  const result = await coordinate(harness, fake.runtime, { control });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("worker_failed");
+  }
+  expect(result.state?.failure?.reason).toBe("worker_failed");
+  expect(control.freezeCalls()).toBe(1);
+  expect(kinds(harness.recording)).not.toContain("run_succeeded");
+});
+
+test("59. the cutoff runs exactly once for a failed terminal, which stays terminal_failed", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
+    facts: JSON.stringify({ f1: false, f2: true }),
+  });
+  const fake = fakeRuntime([{}]);
+  const control = cutoffControl("neutral");
+  const result = await coordinate(harness, fake.runtime, { control });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("terminal_failed");
+  }
+  expect(result.state?.terminal).toEqual({ state_id: "failed_end", result: "failed" });
+  expect(result.state?.failure?.reason).toBe("terminal_failed");
+  expect(control.freezeCalls()).toBe(1);
+});
+
+test("60. a sigterm-then-sigint control observes exactly one freeze, so the first signal wins", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  const fake = fakeRuntime([{}]);
+  const control = cutoffControl("sigterm-then-sigint");
+  const result = await coordinate(harness, fake.runtime, { control });
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("signal_sigterm");
+  }
+  expect(result.state?.failure?.reason).toBe("signal_sigterm");
+  expect(control.freezeCalls()).toBe(1);
 });
 
 async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {

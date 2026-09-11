@@ -1219,6 +1219,313 @@ test("25. a runner timeout keeps worker_timeout when no signal is forwarded", as
   expect(deleteIds(captured.transport)).toEqual(["dhs_fake_2", "dhs_fake_1"]);
 });
 
+
+// --- fix 1: the protected preflight gate -------------------------------------
+
+function validOptions(
+  harness: Harness,
+  overrides: Partial<PipelineV2RunOptions> = {},
+): PipelineV2RunOptions {
+  return {
+    pipelineRoot: harness.bundle,
+    configRoot: harness.configRoot,
+    projectSourcePath: harness.projectSource,
+    inputBindings: [
+      { id: "facts_seed", path: harness.factsFile },
+      { id: "source", path: harness.sourceFile },
+    ],
+    launcherId: EXPECTED_LAUNCHER_ID,
+    ...overrides,
+  };
+}
+
+function validDeps(
+  harness: Harness,
+  overrides: Partial<PipelineV2RunnerDeps> = {},
+): PipelineV2RunnerDeps {
+  const cli: CliRunner = async () => ({ code: 1 });
+  const fetchAuth: AuthFetcher = async () => ({
+    status: 200,
+    body: { authority: "launcher", principal: "michael", launcher_id: EXPECTED_LAUNCHER_ID },
+  });
+  return {
+    cli,
+    fetchAuth,
+    helperConfig: {
+      socketPath: "/run/docker-helper/docker-helper.sock",
+      credentialFile: harness.credentialFile,
+    },
+    baseEnv: { HOME: "/home/u", XDG_CONFIG_HOME: "/cfg", CODER_SOURCE_VAR_1: SECRET_ENV_VALUE },
+    stateRootProjection: { localRoot: harness.stateRoot, daemonRoot: harness.daemonStateRoot },
+    ...overrides,
+  };
+}
+
+async function runHostileDeps(
+  harness: Harness,
+  deps: PipelineV2RunnerDeps,
+): Promise<{ outcome: PipelineV2RunOutcome; authCalls: number; diagnostics: string[] }> {
+  let authCalls = 0;
+  const depsWithCountingAuth: PipelineV2RunnerDeps = {
+    ...deps,
+    fetchAuth: async (socketPath, token) => {
+      authCalls += 1;
+      return await deps.fetchAuth(socketPath, token);
+    },
+  };
+  const capturedDiagnostics = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await runPipelineV2(validOptions(harness), depsWithCountingAuth);
+  } finally {
+    capturedDiagnostics.restore();
+  }
+  return { outcome, authCalls, diagnostics: capturedDiagnostics.errors };
+}
+
+function expectPreflightOutcome(outcome: PipelineV2RunOutcome): void {
+  expect(outcome).toEqual({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
+  expect(Object.isFrozen(outcome)).toBe(true);
+}
+
+test("F1a. a null deps resolves with the generic preflight outcome and no side effects", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const { outcome, authCalls } = await runHostileDeps(
+    harness,
+    null as unknown as PipelineV2RunnerDeps,
+  );
+  expectPreflightOutcome(outcome);
+  expect(authCalls).toBe(0);
+  expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
+});
+
+test("F1b. a primitive deps resolves with the generic preflight outcome", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const { outcome, authCalls } = await runHostileDeps(
+    harness,
+    42 as unknown as PipelineV2RunnerDeps,
+  );
+  expectPreflightOutcome(outcome);
+  expect(authCalls).toBe(0);
+  expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
+});
+
+test("F1c. a throwing getter behind onSignal resolves with the preflight outcome", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  let getterReads = 0;
+  const hostileDeps: PipelineV2RunnerDeps = validDeps(harness);
+  let authCalls = 0;
+  Object.defineProperty(hostileDeps, "onSignal", {
+    get(): PipelineV2RunnerDeps["onSignal"] {
+      getterReads += 1;
+      throw new Error("GETTER-BOOM");
+    },
+    enumerable: true,
+  });
+  const capturedDiagnostics = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await runPipelineV2(validOptions(harness), hostileDeps);
+  } finally {
+    capturedDiagnostics.restore();
+  }
+  expectPreflightOutcome(outcome);
+  expect(getterReads).toBeGreaterThanOrEqual(1);
+  expect(authCalls).toBe(0);
+  expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
+});
+
+test("F1d. a non-function onSignal resolves with the preflight outcome", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const { outcome, authCalls } = await runHostileDeps(harness, {
+    ...validDeps(harness),
+    onSignal: 42 as unknown as PipelineV2RunnerDeps["onSignal"],
+  });
+  expectPreflightOutcome(outcome);
+  expect(authCalls).toBe(0);
+  expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
+});
+
+test("F1e. a throwing onSignal registration resolves with the preflight outcome", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  let handlerSeen: unknown = "not-called";
+  const { outcome, authCalls } = await runHostileDeps(harness, {
+    ...validDeps(harness),
+    onSignal: (handler) => {
+      handlerSeen = handler;
+      throw new Error("REGISTRATION-BOOM");
+    },
+  });
+  expectPreflightOutcome(outcome);
+  expect(handlerSeen).not.toBe("not-called");
+  expect(authCalls).toBe(0);
+  expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
+});
+
+// --- fix 2: the post-snapshot signal outcome and preflight priority ----------
+
+test("F2a. a signal delivered during a successful snapshot yields the pre-create_run signal outcome", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runId = "postsnap-0000-0000-0000-000000000000";
+  const script: { deliver?: (signal: "SIGINT" | "SIGTERM") => void } = {};
+  // The binding proxy returns correct values, so the snapshot succeeds;
+  // the synchronously delivered signal is then noticed by the
+  // post-snapshot checkpoint before create_run.
+  const signalingBinding = new Proxy<{ id: string; path: string }>(
+    { id: "source", path: harness.sourceFile },
+    {
+      get(target, property, receiver) {
+        script.deliver?.("SIGINT");
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  );
+  const captured = await runScript(harness, {
+    fixedRunId: runId,
+    bindings: [{ id: "facts_seed", path: harness.factsFile }, signalingBinding],
+  }, (handler) => {
+    script.deliver = handler;
+  });
+  expect(captured.outcome?.ok).toBe(false);
+  expect(captured.outcome?.exitCode).toBe(130);
+  expect(captured.outcome?.reason).toBe("signal_sigint");
+  expect(captured.outcome?.runId).toBe(runId);
+  expect(captured.outcome?.runRoot).toBe(runRootPath(harness, runId));
+  expect(captured.outcome?.state).toBeNull();
+  expect(createCount(captured.transport)).toBe(0);
+  // create_run was never dispatched: the sink clock never ticked.
+  expect(captured.clockCalls).toBe(0);
+  // The published project copy and the input snapshot stay in the run
+  // root; no state document exists.
+  expect((await lstatOrNull(join(runRootPath(harness, runId), "project"))) !== null).toBe(true);
+  expect((await lstatOrNull(join(runRootPath(harness, runId), "data", "inputs"))) !== null).toBe(true);
+  expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
+});
+
+test("F2b. a signal accepted during auth wins over the failing authority check", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const script: { deliver?: (signal: "SIGINT" | "SIGTERM") => void } = {};
+  const captured = await runScript(harness, {
+    fixedRunId: "authfail-0000-0000-000000000000",
+    authority: "principal",
+    onAuth: () => {
+      script.deliver?.("SIGINT");
+    },
+  }, (handler) => {
+    script.deliver = handler;
+  });
+  expect(captured.outcome?.ok).toBe(false);
+  expect(captured.outcome?.exitCode).toBe(130);
+  expect(captured.outcome?.reason).toBe("signal_sigint");
+  expect(captured.outcome?.runId).toBe("");
+  expect(captured.outcome?.runRoot).toBeNull();
+  expect(captured.outcome?.state).toBeNull();
+  expect(createCount(captured.transport)).toBe(0);
+  expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
+});
+
+// --- fix 4: the exact 0700 mode policy ----------------------------------------
+
+test("F4a. an existing pipeline-runs with mode 0700 is accepted", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runsDir = join(harness.stateRoot, "pipeline-runs");
+  await mkdir(runsDir, { recursive: true });
+  chmodSync(runsDir, 0o700);
+  const runId = "safe-mode-0000-0000-0000-000000000000";
+  const captured = await runScript(harness, {
+    fixedRunId: runId,
+    workerOutputs: { coder: { report: JSON.stringify({ f1: true, f2: false }) } },
+  });
+  const state = expectOk(captured);
+  expect(state.status).toBe("success");
+  expect(modeOf((await lstat(runsDir))!)).toBe(0o700);
+});
+
+test("F4b. an existing pipeline-runs with mode 0755 is rejected unchanged", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runsDir = join(harness.stateRoot, "pipeline-runs");
+  await mkdir(runsDir, { recursive: true });
+  chmodSync(runsDir, 0o755);
+  await writeFile(join(runsDir, "sentinel.txt"), "KEEP-ME");
+  const before = await lstat(runsDir);
+  const runId = "unsafe-755-0000-0000-000000000000";
+  const captured = await runScript(harness, { fixedRunId: runId });
+  expectPreflightOutcome(captured.outcome!);
+  expect(createCount(captured.transport)).toBe(0);
+  const after = await lstat(runsDir);
+  expect(modeOf(after)).toBe(0o755);
+  expect(after.ino).toBe(before.ino);
+  expect(await readFile(join(runsDir, "sentinel.txt"), "utf8")).toBe("KEEP-ME");
+  expect((await lstatOrNull(join(runsDir, runId))) === null).toBe(true);
+  expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
+});
+
+test("F4c. an existing pipeline-runs with mode 0777 is rejected unchanged", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runsDir = join(harness.stateRoot, "pipeline-runs");
+  await mkdir(runsDir, { recursive: true });
+  chmodSync(runsDir, 0o777);
+  await writeFile(join(runsDir, "sentinel.txt"), "KEEP-ME");
+  const before = await lstat(runsDir);
+  const runId = "unsafe-777-0000-0000-000000000000";
+  const captured = await runScript(harness, { fixedRunId: runId });
+  expectPreflightOutcome(captured.outcome!);
+  const after = await lstat(runsDir);
+  expect(modeOf(after)).toBe(0o777);
+  expect(after.ino).toBe(before.ino);
+  expect(await readFile(join(runsDir, "sentinel.txt"), "utf8")).toBe("KEEP-ME");
+  expect((await lstatOrNull(join(runsDir, runId))) === null).toBe(true);
+  expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
+});
+
+// --- fix 5: the outcome boundary after the run-root creation ------------------
+
+test("F5. a runtime factory failure after the run-root creation reports runId and runRoot", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runId = "postroot-0000-0000-0000-000000000000";
+  let cliReads = 0;
+  let cliInvocations = 0;
+  const countingCli: CliRunner = async (...args) => {
+    cliInvocations += 1;
+    void args;
+    return { code: 1 };
+  };
+  const hostileDeps: PipelineV2RunnerDeps = validDeps(harness, { cli: countingCli, randomId: () => runId });
+  Object.defineProperty(hostileDeps, "cli", {
+    get(): CliRunner {
+      cliReads += 1;
+      // The runner's own validation and the authority prelude see a real
+      // function; the runtime factory's second contract read sees a
+      // non-function and fails between the run root and the coordinator.
+      return cliReads <= 2 ? countingCli : (42 as unknown as CliRunner);
+    },
+  });
+  const capturedDiagnostics = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await runPipelineV2(validOptions(harness), hostileDeps);
+  } finally {
+    capturedDiagnostics.restore();
+  }
+  expect(outcome.ok).toBe(false);
+  expect(outcome.exitCode).toBe(1);
+  expect(outcome.runId).toBe(runId);
+  expect(outcome.runRoot).toBe(runRootPath(harness, runId));
+  expect(outcome.state).toBeNull();
+  expect(Object.isFrozen(outcome)).toBe(true);
+  // The created run root exists and is never removed; no state document
+  // and no session were created.
+  const info = await lstat(runRootPath(harness, runId));
+  expect(info.isDirectory()).toBe(true);
+  expect(modeOf(info)).toBe(0o700);
+  expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
+  expect(cliInvocations).toBe(0);
+  const diagnostics = capturedDiagnostics.errors.join("\n");
+  expect(diagnostics).not.toContain(SECRET_ENV_VALUE);
+  expect(diagnostics).not.toContain(PROMPT_BODY.trim());
+  expect(diagnostics).not.toContain("SOURCE-BODY");
+});
+
 test("26. the projection suffix translation admits only clean relative paths", () => {
   expect(translateProjectionPath("/a", "/b", "/a")).toEqual({ ok: true, daemonPath: "/b" });
   expect(translateProjectionPath("/a", "/b", "/a/x/y")).toEqual({ ok: true, daemonPath: "/b/x/y" });

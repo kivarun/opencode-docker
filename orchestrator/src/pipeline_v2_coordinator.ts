@@ -73,19 +73,25 @@
  * runner's shared `RunCauseGate`) provides `currentSignal` and
  * `freezeSignal`, both captured exactly once after the provenance gate and
  * before any side effect. Synchronous checkpoints run before the project
- * copy, after the copy, after the input snapshot, after `create_run`, at
- * the start of every execution, immediately before each Session create,
- * before the worker run, before the decision evaluation and after the
- * engine completes — no await between a checkpoint and the guarded call. A
- * signal accepted up to `create_run` keeps the state document absent; a
- * signal after `create_run` finalizes durably. The failure finalizer
- * freezes signal acceptance synchronously after cleanup has settled and
- * before the single final run-status write; a durably failed session
- * cleanup outranks a signal, a signal outranks the classified cause, and a
- * frozen signal at the cutoff of a success terminal finalizes the run as a
- * signal failure (published outputs stay). A failed terminal is already
- * determined and cannot be rewritten by a signal. No checkpoint runs
- * between a settled execution and its `transition_committed` write.
+ * copy, after the copy, after the input snapshot and at its post-snapshot
+ * check (both inside the pre-`create_run` signal handling, so a signal
+ * noticed after a successful snapshot still yields the pre-`create_run`
+ * signal outcome with no state document and no escaping abort marker),
+ * after `create_run`, at the start of every execution, immediately before
+ * each Session create, before the worker run, before the decision
+ * evaluation and after the engine completes — no await between a
+ * checkpoint and the guarded call. A signal accepted up to `create_run`
+ * keeps the state document absent; a signal after `create_run` finalizes
+ * durably. After the durable state exists, every completion path freezes
+ * signal acceptance exactly once through one memoized cutoff call whose
+ * snapshot is reused everywhere; the cutoff sits synchronously after
+ * cleanup has settled (failure paths) and before the single final
+ * run-status write (both terminal results). A durably failed session
+ * cleanup outranks a signal, a signal outranks the classified cause, and
+ * a frozen signal at the cutoff of a success terminal finalizes the run
+ * as a signal failure (published outputs stay). A failed terminal is
+ * already determined and cannot be rewritten by a signal. No checkpoint
+ * runs between a settled execution and its `transition_committed` write.
  *
  * Resume is not supported: the coordinator accepts only a fresh sink with
  * `snapshot === null` and no poisoning. This module is wired through the
@@ -719,6 +725,25 @@ export async function coordinatePipelineV2Run(
     }
   };
 
+  /**
+   * The single signal cutoff of the coordination. After the durable run
+   * state exists, every completion path freezes signal acceptance exactly
+   * once: the first call wins and its snapshot is reused by every later
+   * decision — including `finalizeFailure`, which never freezes again. A
+   * hostile control whose second `freezeSignal` call would throw or
+   * return a different signal therefore never reaches that second call.
+   */
+  let cutoffTaken = false;
+  let cutoffSignal: "SIGINT" | "SIGTERM" | null = null;
+  const takeCutoff = (): "SIGINT" | "SIGTERM" | null => {
+    if (cutoffTaken) {
+      return cutoffSignal;
+    }
+    cutoffTaken = true;
+    cutoffSignal = capturedFreezeSignal();
+    return cutoffSignal;
+  };
+
   // The runtime contract functions are captured exactly once, before the
   // first filesystem or state side effect.
   let capturedCreateExecutionSession: CapturedCreateExecutionSession;
@@ -760,12 +785,19 @@ export async function coordinatePipelineV2Run(
   // Phase 0: the run-input snapshot is created here, by the coordinator;
   // a caller-provided snapshot is never accepted. An already published
   // project copy stays in the run root for diagnostics when this or the
-  // state creation below fails. A signal accepted during the snapshot
-  // keeps the state document absent and wins over the classified failure.
+  // state creation below fails. A signal accepted during the snapshot —
+  // or noticed at the post-snapshot checkpoint after it completed — keeps
+  // the state document absent, wins over the classified failure and is
+  // handled inside this region, so no abort marker can escape the
+  // coordinator before `create_run`.
   let runInputs: RunInputsSnapshot;
   try {
     checkSignal();
     runInputs = await snapshotRunInputs(pipeline, params.inputBindings, runRoot);
+    // Checkpoint after the successful snapshot: the published project
+    // copy and input snapshot stay in the run root; the signal outcome
+    // precedes `create_run`, so no state document exists yet.
+    checkSignal();
   } catch (cause) {
     const signal = capturedCurrentSignal();
     if (signal !== null) {
@@ -777,7 +809,6 @@ export async function coordinatePipelineV2Run(
     }
     return deepFreeze({ ok: false as const, reason: classifyCause(cause), state: null });
   }
-  checkSignal();
 
   // Phase 1: the durable run state is created from the snapshot the
   // coordinator itself just received.
@@ -934,14 +965,16 @@ export async function coordinatePipelineV2Run(
       reason = PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON;
     }
 
-    // The signal cutoff. Cleanup has settled; freeze signal acceptance
-    // synchronously with no await between reading the accepted signal and
-    // closing acceptance. A durably failed session cleanup keeps its
-    // first-wins priority over a signal; otherwise an accepted signal
-    // becomes the failure reason, outranking the classified cause. Any
-    // signal delivered from here on is late and can no longer change the
-    // recorded failure.
-    const frozenSignal = capturedFreezeSignal();
+    // The signal cutoff, taken at most once per run: if the terminal
+    // phase already froze acceptance, its snapshot is reused here without
+    // a second `freezeSignal` call. Cleanup has settled; the cutoff
+    // snapshot is read synchronously with no await between reading the
+    // accepted signal and closing acceptance. A durably failed session
+    // cleanup keeps its first-wins priority over a signal; otherwise an
+    // accepted signal becomes the failure reason, outranking the
+    // classified cause. Any signal delivered from here on is late and can
+    // no longer change the recorded failure.
+    const frozenSignal = takeCutoff();
     if (frozenSignal !== null && reason !== PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON) {
       reason = signalFailureReason(frozenSignal);
     }
@@ -1259,23 +1292,23 @@ export async function coordinatePipelineV2Run(
       outputs: runOutputs.outputs.map(toRunOutputState),
     });
 
-    // The signal cutoff of the success path: freeze signal acceptance
-    // synchronously before the single final run-status write. A signal
-    // accepted while the terminal outputs were collected finalizes the run
-    // as a signal failure; the already atomically published outputs are
-    // not rolled back. A signal delivered from here on — including while
-    // the final write is in flight — is late and can no longer change the
-    // recorded outcome. For a failed terminal the outcome is already
-    // determined: the reducer finalizes a failed terminal with published
-    // run outputs with the terminal failure reason only, so a frozen
-    // signal cannot rewrite it.
-    const frozenTerminalSignal = capturedFreezeSignal();
-    if (frozenTerminalSignal !== null && engineResult.terminalResult === "success") {
-      await finalizeFailure(new CoordinatorSignalAbort(frozenTerminalSignal));
+    // The single signal cutoff of the run, taken once here — synchronously
+    // before the final run-status write — and reused by every remaining
+    // decision. A signal accepted while the terminal outputs were
+    // collected finalizes the run as a signal failure; the already
+    // atomically published outputs are not rolled back. A signal
+    // delivered from here on — including while the final write is in
+    // flight — is late and can no longer change the recorded outcome. For
+    // a failed terminal the outcome is already determined: the reducer
+    // finalizes a failed terminal with published run outputs with the
+    // terminal failure reason only, so a frozen signal cannot rewrite it.
+    const cutoff = takeCutoff();
+    if (cutoff !== null && engineResult.terminalResult === "success") {
+      await finalizeFailure(new CoordinatorSignalAbort(cutoff));
       if (stateAbandoned) {
         return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
       }
-      const reason = failureReason ?? signalFailureReason(frozenTerminalSignal);
+      const reason = failureReason ?? signalFailureReason(cutoff);
       return deepFreeze({ ok: false as const, reason, state: sink.snapshot });
     }
 

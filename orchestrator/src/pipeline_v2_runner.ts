@@ -27,22 +27,37 @@
  * `<daemon-state-root>/pipeline-runs/<run-id>` — no arbitrary per-path
  * mappings exist. Before anything is created, both state roots must be
  * absolute canonical real non-symlink directories that are the same object
- * by dev/ino; `pipeline-runs` is created 0700 when missing or verified as
- * a real non-symlink directory with identical dev/ino on both sides; the
- * run directory itself is created only by an exclusive 0700 `mkdir` — a
- * pre-existing file, directory or symlink with that run id is rejected
- * without being overwritten; after the exclusive creation the daemon-side
- * run directory must exist as the same real canonical object. Symlinked
- * parents, kind mismatches and projection mismatches are rejected before
- * the sink, the runtime or the coordinator is created. After a successful
- * exclusive creation the run root is never removed automatically, whatever
- * fails later: it is the diagnostic directory of the run. Nothing is left
- * behind before that point.
+ * by dev/ino; `pipeline-runs` is created 0700 when missing, or accepted
+ * only as an existing real non-symlink directory with exactly mode 0700
+ * and identical dev/ino on both sides — an unsafe existing directory is
+ * rejected unchanged (no `chmod`, no run leaf, no Session, no state); the
+ * mode is verified explicitly for created directories too, never trusted
+ * to the current umask; the run directory itself is created only by an
+ * exclusive 0700 `mkdir`, verified to carry exactly 0700 — a pre-existing
+ * file, directory or symlink with that run id is rejected without being
+ * overwritten; after the exclusive creation the daemon-side run directory
+ * must exist as the same real canonical object. Symlinked parents, kind
+ * mismatches and projection mismatches are rejected before the sink, the
+ * runtime or the coordinator is created.
+ *
+ * Failure boundaries follow the run-root creation. Before the exclusive
+ * run-leaf creation nothing is bound yet: every failure (and every signal)
+ * yields the generic preflight outcome `runId:""`/`runRoot:null` and
+ * nothing is left behind. From the successful exclusive creation on, the
+ * run root exists and is never removed automatically — it is the
+ * diagnostic directory of the run — so every later failure reports the
+ * actual run id, the canonical run root and the last authoritative sink
+ * snapshot (`state:null` until `create_run` commits); a signal accepted
+ * after the creation yields the same boundary shape with its signal exit
+ * code.
  *
  * Signal semantics are shared with v1 through the same `RunCauseGate`: the
  * runner accepts the `onSignal` seam only (forwarding a signal to a
  * running worker CLI process stays the caller's job via
  * `SubprocessCliRunner.killActive`, exactly as v1 `main.ts` wires it). The
+ * gate is constructed only after the protected preflight validated the
+ * options/deps shape and captured `onSignal`, so a hostile contract can
+ * neither escape as a rejected promise nor register a handler first. The
  * gate is handed to the coordinator as the required synchronous control
  * boundary; the coordinator's checkpoints and cutoff own the
  * acceptance/close ordering, and the runner maps the durable outcome onto
@@ -57,7 +72,7 @@
  * value, no prompt or input body, no worker output and no raw decision
  * facts ever appear on it.
  */
-import { mkdir } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { describeError, type AuthFetcher, type CliRunner } from "./docker_helper.ts";
 import {
   RunCauseGate,
@@ -253,17 +268,51 @@ interface PreparedRunRoot {
 }
 
 /**
+ * Tracks whether the exclusive run-leaf `mkdir` succeeded. From that
+ * moment the run root exists and is never removed: every later failure
+ * must report the actual run id and the canonical run root instead of the
+ * preflight shape. Set before any verification that follows the creation,
+ * because the directory exists as soon as the `mkdir` returned.
+ */
+interface RunLeafTracker {
+  created: boolean;
+  localRunRoot: string | null;
+}
+
+/**
+ * The runner-owned directory mode policy: every runner-owned directory
+ * — `pipeline-runs` and the run leaf, whether just created or accepted as
+ * a pre-existing object — must carry exactly mode 0700. The check never
+ * chmods: an unsafe existing directory is rejected unchanged. The mode is
+ * verified explicitly, never trusted to the current umask.
+ */
+async function assertExactDirectoryMode0700(path: string, what: string): Promise<void> {
+  const info = await lstat(path);
+  const mode = info.mode & 0o7777;
+  if (mode !== 0o700) {
+    throw new Error(
+      `pipeline v2 runner: the ${what} ${JSON.stringify(path)} must have mode 0700, found 0${mode.toString(8)}`,
+    );
+  }
+}
+
+/**
  * Owns the run-root layout `<state-root>/pipeline-runs/<run-id>` and its
  * daemon-visible projection. Both state roots must already be the same
- * real canonical directory object (dev/ino); `pipeline-runs` is created or
- * verified on both sides; the run directory is created only by an
- * exclusive 0700 mkdir (any pre-existing object with that run id is
- * rejected without overwrite) and must appear on the daemon side as the
- * same real canonical object. Nothing is removed here.
+ * real canonical directory object (dev/ino); `pipeline-runs` is created
+ * 0700 when missing, or accepted only as an existing real non-symlink
+ * directory with exactly mode 0700 and identical dev/ino on both sides —
+ * an unsafe existing directory is rejected unchanged, with no `chmod` and
+ * no run leaf. The run directory is created only by an exclusive 0700
+ * `mkdir` (any pre-existing object with that run id is rejected without
+ * overwrite), is verified to carry exactly mode 0700 after creation, and
+ * must appear on the daemon side as the same real canonical object.
+ * Nothing is removed here.
  */
 async function prepareRunRoot(
   stateRootProjection: PipelineV2StateRootProjection,
   runId: string,
+  leaf: RunLeafTracker,
 ): Promise<PreparedRunRoot> {
   const localStateRoot = stateRootProjection.localRoot;
   const daemonStateRoot = stateRootProjection.daemonRoot;
@@ -306,6 +355,10 @@ async function prepareRunRoot(
       `pipeline v2 runner: ${JSON.stringify(pipelineRunsLocal)} is not a real non-symlink directory`,
     );
   }
+  // The mode belongs to the runner-owned layout, not to the shared
+  // inspection primitives: created and pre-existing directories are held
+  // to the same exact 0700 contract.
+  await assertExactDirectoryMode0700(pipelineRunsLocal, "pipeline-runs");
   const runsFailure = await verifyPair(pipelineRunsLocal, pipelineRunsDaemon, "pipeline-runs");
   if (runsFailure !== null) {
     throw runsFailure;
@@ -324,12 +377,17 @@ async function prepareRunRoot(
       `pipeline v2 runner: cannot create the run directory ${JSON.stringify(localRunRoot)}: ${describeError(cause)}`,
     );
   }
+  // From this moment the run root exists and is never removed; later
+  // verification failures report the actual run id and canonical run root.
+  leaf.created = true;
+  leaf.localRunRoot = localRunRoot;
   const runRootInfo = await inspectProjectionObject(localRunRoot, "directory");
   if (runRootInfo.failure !== null || runRootInfo.identity === null) {
     throw new Error(
       `pipeline v2 runner: the created run directory ${JSON.stringify(localRunRoot)} is not a real non-symlink directory`,
     );
   }
+  await assertExactDirectoryMode0700(localRunRoot, "run directory");
   const translation = translateProjectionPath(localStateRoot, daemonStateRoot, localRunRoot);
   if (!translation.ok) {
     throw new Error(
@@ -401,19 +459,37 @@ export async function runPipelineV2(
   options: PipelineV2RunOptions,
   deps: PipelineV2RunnerDeps,
 ): Promise<PipelineV2RunOutcome> {
-  const gate = new RunCauseGate(deps.onSignal);
-  // Read the recorded signal through a function: the gate accepts signals
-  // asynchronously between awaits, so no control-flow narrowing may hide
-  // a signal recorded after an earlier check.
-  const recordedSignal = (): SignalAbort | null => gate.recordedSignal;
-
+  // --- protected preflight gate ------------------------------------------
+  //
+  // The options/deps shape validation and the `onSignal` capture live
+  // inside one protected region, and the `RunCauseGate` is constructed
+  // only after both succeeded: a null or primitive deps, a Proxy or a
+  // throwing getter on any validated field, or a throwing
+  // `onSignal(handler)` registration must never escape as a rejected
+  // promise or an exception, must not register a signal handler before
+  // its type is confirmed, and must not touch the filesystem, the
+  // credential or any Session.
   const preflightFailure = (cause: unknown): PipelineV2RunOutcome => {
     const message = cause instanceof Error ? cause.message : String(cause);
     console.error(`orchestrator: pipeline v2 run failed: ${message}`);
     return deepFreeze({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
   };
 
-  const signalPreflightOutcome = (): PipelineV2RunOutcome => {
+  let gate: RunCauseGate;
+  try {
+    validateRunnerContract(options, deps);
+    gate = new RunCauseGate(deps.onSignal);
+  } catch (cause) {
+    return preflightFailure(cause);
+  }
+  // Read the recorded signal through a function: the gate accepts signals
+  // asynchronously between awaits, so no control-flow narrowing may hide
+  // a signal recorded after an earlier check.
+  const recordedSignal = (): SignalAbort | null => gate.recordedSignal;
+
+  // The pre-run-root signal outcome: before the exclusive run-leaf
+  // creation nothing is bound yet, so the run id and run root stay unset.
+  const signalOutcomeBeforeRunRoot = (): PipelineV2RunOutcome => {
     const abort = recordedSignal();
     if (abort === null) {
       throw new Error("no signal was recorded");
@@ -428,13 +504,10 @@ export async function runPipelineV2(
     });
   };
 
-  try {
-    validateRunnerContract(options, deps);
-  } catch (cause) {
-    return preflightFailure(cause);
-  }
-
   // --- preflight: pipeline, then profiles, then Launcher authority -------
+  //
+  // A signal accepted during an operation that then fails before the run
+  // root is created wins over that operation's error.
 
   let pipeline: ResolvedPipelineV2;
   const profiles = new Map<string, ResolvedProfile>();
@@ -444,10 +517,13 @@ export async function runPipelineV2(
       profiles.set(profileName, await loadProfile(options.configRoot, profileName, deps.baseEnv));
     }
   } catch (cause) {
+    if (recordedSignal() !== null) {
+      return signalOutcomeBeforeRunRoot();
+    }
     return preflightFailure(cause);
   }
   if (recordedSignal() !== null) {
-    return signalPreflightOutcome();
+    return signalOutcomeBeforeRunRoot();
   }
 
   let authority: Awaited<ReturnType<typeof lifecycleAuthority>>;
@@ -457,37 +533,85 @@ export async function runPipelineV2(
       { launcherId: options.launcherId },
     );
   } catch (cause) {
+    if (recordedSignal() !== null) {
+      return signalOutcomeBeforeRunRoot();
+    }
     return preflightFailure(cause);
   }
   if (recordedSignal() !== null) {
-    return signalPreflightOutcome();
+    return signalOutcomeBeforeRunRoot();
   }
 
-  // --- run root -----------------------------------------------------------
+  // --- run id and run root -------------------------------------------------
 
-  const runId = deps.randomId ? deps.randomId() : crypto.randomUUID();
+  let runId: string;
   try {
+    runId = deps.randomId ? deps.randomId() : crypto.randomUUID();
     expectSafeId(runId, "pipeline v2 run id");
   } catch (cause) {
+    if (recordedSignal() !== null) {
+      return signalOutcomeBeforeRunRoot();
+    }
     return preflightFailure(cause);
   }
 
+  const postRunRootSignalOutcome = (
+    runRootPath: string,
+    state: PipelineV2RunState | null,
+  ): PipelineV2RunOutcome => {
+    const abort = recordedSignal();
+    if (abort === null) {
+      throw new Error("no signal was recorded");
+    }
+    return deepFreeze({
+      ok: false,
+      exitCode: signalExitCode(abort.signal),
+      runId,
+      runRoot: runRootPath,
+      state,
+      reason: signalReasonOf(abort.signal),
+    });
+  };
+
+  const postRunRootFailure = (
+    cause: unknown,
+    runRootPath: string,
+    state: PipelineV2RunState | null,
+  ): PipelineV2RunOutcome => {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    console.error(`orchestrator: pipeline v2 run failed: ${message}`);
+    return deepFreeze({ ok: false, exitCode: 1, runId, runRoot: runRootPath, state });
+  };
+
+  // The run-root boundary: from the successful exclusive creation of the
+  // run leaf on, the directory exists and is deliberately never removed,
+  // so every later failure reports the actual run id and the canonical
+  // run root instead of the generic preflight shape.
+  const leaf: RunLeafTracker = { created: false, localRunRoot: null };
   let runRoot: PreparedRunRoot;
   try {
-    runRoot = await prepareRunRoot(deps.stateRootProjection, runId);
+    runRoot = await prepareRunRoot(deps.stateRootProjection, runId, leaf);
   } catch (cause) {
+    if (recordedSignal() !== null) {
+      if (leaf.created && leaf.localRunRoot !== null) {
+        return postRunRootSignalOutcome(leaf.localRunRoot, null);
+      }
+      return signalOutcomeBeforeRunRoot();
+    }
+    if (leaf.created && leaf.localRunRoot !== null) {
+      return postRunRootFailure(cause, leaf.localRunRoot, null);
+    }
     return preflightFailure(cause);
   }
 
   // --- sink, runtime, coordinator -----------------------------------------
-
-  const sink = new PipelineV2RunStateSink({
-    stateRoot: deps.stateRootProjection.localRoot,
-    runId,
-    now: deps.now,
-  });
-
-  let runtime;
+  //
+  // Both are created after the run root exists: any failure here is a
+  // post-run-root failure and reports the actual run id, the canonical
+  // run root and the last authoritative sink snapshot (absent until
+  // `create_run` commits). The created run root is never removed.
+  let sinkOrNull: PipelineV2RunStateSink | null = null;
+  let runtime: ReturnType<typeof createDockerHelperPipelineV2Runtime>;
   const runtimeParams: DockerHelperPipelineV2RuntimeParams = {
     pipeline,
     profiles,
@@ -498,20 +622,23 @@ export async function runPipelineV2(
     runRootProjection: { localRoot: runRoot.localRunRoot, daemonRoot: runRoot.daemonRunRoot },
   };
   try {
+    sinkOrNull = new PipelineV2RunStateSink({
+      stateRoot: deps.stateRootProjection.localRoot,
+      runId,
+      now: deps.now,
+    });
     runtime = createDockerHelperPipelineV2Runtime(runtimeParams);
   } catch (cause) {
-    return preflightFailure(cause);
+    const state = sinkOrNull === null ? null : sinkOrNull.snapshot;
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(runRoot.localRunRoot, state);
+    }
+    return postRunRootFailure(cause, runRoot.localRunRoot, state);
   }
+  const sink = sinkOrNull;
   const preCoordinatorSignal = recordedSignal();
   if (preCoordinatorSignal !== null) {
-    return deepFreeze({
-      ok: false,
-      exitCode: signalExitCode(preCoordinatorSignal.signal),
-      runId,
-      runRoot: runRoot.localRunRoot,
-      state: null,
-      reason: signalReasonOf(preCoordinatorSignal.signal),
-    });
+    return postRunRootSignalOutcome(runRoot.localRunRoot, sink.snapshot);
   }
 
   const control: PipelineV2CoordinatorControl = {
@@ -534,6 +661,10 @@ export async function runPipelineV2(
       control,
     );
   } catch (cause) {
+    const state = sink.snapshot;
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(runRoot.localRunRoot, state);
+    }
     console.error(
       `orchestrator: pipeline v2 run failed: ${cause instanceof Error ? cause.message : String(cause)}`,
     );
@@ -542,7 +673,7 @@ export async function runPipelineV2(
       exitCode: 1,
       runId,
       runRoot: runRoot.localRunRoot,
-      state: null,
+      state,
     });
   }
 
