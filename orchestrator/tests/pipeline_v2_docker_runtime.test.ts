@@ -229,6 +229,9 @@ interface FakeCliOptions {
   runTimedOut?: boolean;
   /** Launcher id reported per create call; a function is consumed in order. */
   createLauncherId?: string | ((sessionNumber: number) => string);
+  /** Exit code and diagnostics for session create calls; a function is consumed in order. */
+  createCode?: number | ((sessionNumber: number) => number);
+  createStderr?: string;
   /** Exit code and diagnostics for session delete calls. */
   deleteCode?: number;
   deleteStderr?: string;
@@ -250,6 +253,16 @@ function makeFakeCli(
     calls.push({ args: [...args], env: { ...env }, stdio, opts });
     if (args[0] === "session" && args[1] === "create") {
       sessionCounter += 1;
+      const configuredCode = options.createCode;
+      const code =
+        configuredCode === undefined
+          ? 0
+          : typeof configuredCode === "function"
+            ? configuredCode(sessionCounter)
+            : configuredCode;
+      if (code !== 0) {
+        return { code, stderr: options.createStderr };
+      }
       return {
         code: 0,
         stdout: JSON.stringify({
@@ -411,7 +424,7 @@ test("2. profile snapshots are immune to mutations of the source map and profile
   }
 });
 
-test("3. the Execution Session is created with the daemon-visible run-root workspace", async () => {
+test("3. the Execution Session is created with the daemon-visible run-root workspace and the four-entry policy", async () => {
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
@@ -427,6 +440,14 @@ test("3. the Execution Session is created with the daemon-visible run-root works
       "--json",
       "--workspace",
       setup_.runRoot,
+      "--filesystem-entry",
+      ".=read_only",
+      "--filesystem-entry",
+      "project=read_write",
+      "--filesystem-entry",
+      "activations/1-coder/data/inputs=read_only",
+      "--filesystem-entry",
+      "activations/1-coder/data/outputs=read_write",
     ]);
     expect(call.env).toEqual(OPERATOR_ENV);
   } finally {
@@ -434,7 +455,7 @@ test("3. the Execution Session is created with the daemon-visible run-root works
   }
 });
 
-test("4. the Tool Session is created with the daemon-visible project-root workspace", async () => {
+test("4. the Tool Session is created with the daemon-visible project-root workspace and only the root writable", async () => {
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
@@ -451,6 +472,8 @@ test("4. the Tool Session is created with the daemon-visible project-root worksp
       "--json",
       "--workspace",
       setup_.coderPrepared.project_root,
+      "--filesystem-entry",
+      ".=read_write",
     ]);
     expect(toolCreate.env).toEqual(OPERATOR_ENV);
   } finally {
@@ -1543,6 +1566,254 @@ test("40. a symlinked parent with an external sentinel tree is rejected by the c
     } finally {
       await rm(external, { recursive: true, force: true });
     }
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("41. a revisit agent activation carries its own new global execution index in the policy", async () => {
+  const setup_ = await setup();
+  try {
+    const revisitPrepared = await prepareActivationData(setup_.pipeline, setup_.snap, [], "coder", 2);
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli);
+    await runtime.createExecutionSession(setup_.coderView, revisitPrepared);
+    const tool = await runtime.createToolSession(setup_.coderView, revisitPrepared);
+    const executionCreate = fake.calls[0]!;
+    expect(executionCreate.args).toEqual([
+      "session",
+      "create",
+      "--endpoint",
+      SOCKET,
+      "--json",
+      "--workspace",
+      setup_.runRoot,
+      "--filesystem-entry",
+      ".=read_only",
+      "--filesystem-entry",
+      "project=read_write",
+      "--filesystem-entry",
+      "activations/2-coder/data/inputs=read_only",
+      "--filesystem-entry",
+      "activations/2-coder/data/outputs=read_write",
+    ]);
+    // the Tool policy is index-independent
+    expect(fake.calls[1]!.args).toEqual([
+      "session",
+      "create",
+      "--endpoint",
+      SOCKET,
+      "--json",
+      "--workspace",
+      revisitPrepared.project_root,
+      "--filesystem-entry",
+      ".=read_write",
+    ]);
+    await tool.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("42. mutations of the profile map and the projection object after the factory cannot change the policy argv", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli);
+    setup_.profiles.delete("coder");
+    setup_.profiles.set("coder", {
+      profileName: "coder",
+      image: "ghcr.io/evil/image:9",
+      opencodeConfigPath: "/cfg/evil.json",
+      opencodeConfigContent: "EVIL",
+      env: { MODEL_API_KEY: "EVIL" },
+    });
+    await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    const call = fake.calls[0]!;
+    expect(call.args).toContain("activations/1-coder/data/inputs=read_only");
+    expect(call.args).toContain("project=read_write");
+    // the policy comes from the frozen prepared activation, not from any
+    // mutable caller object
+    expect(call.args.filter((arg) => arg === "--filesystem-entry").length).toBe(4);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("43. the state id cannot inject argv: the policy paths are derived from the provenance-checked activation only", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake.cli);
+    // a hostile state id in a hand-built execution view never reaches the
+    // entries: the view must name the activation's own state
+    const hostileView = {
+      type: "agent" as const,
+      id: 'coder\n--filesystem-entry evil=read_write',
+      profile: "coder",
+      promptPath: setup_.coderView.promptPath,
+      promptContent: "x",
+      timeout_seconds: 60,
+      max_attempts: 1,
+    };
+    await expect(
+      runtime.createExecutionSession(hostileView, setup_.coderPrepared),
+    ).rejects.toThrow(/execution view names state/);
+    expect(fake.calls.length).toBe(0);
+    // a forged prepared activation (spread clone) is rejected by the
+    // provenance gate before any field is read
+    const forged = { ...setup_.coderPrepared } as unknown as PreparedActivationData;
+    await expect(runtime.createExecutionSession(hostileView, forged)).rejects.toThrow(
+      /the runtime requires the frozen prepared activation data object/,
+    );
+    expect(fake.calls.length).toBe(0);
+    // the trusted activation yields exactly the canonical safe-id paths
+    await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    const entryValues: string[] = [];
+    const args = fake.calls[0]!.args;
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] === "--filesystem-entry") {
+        entryValues.push(args[index + 1] ?? "");
+      }
+    }
+    expect(entryValues).toEqual([
+      ".=read_only",
+      "project=read_write",
+      "activations/1-coder/data/inputs=read_only",
+      "activations/1-coder/data/outputs=read_write",
+    ]);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("44. the filesystem-entry values are clean workspace-relative paths and name no host roots", async () => {
+  const setup_ = await setup();
+  try {
+    const driven = await driveCoderActivation(setup_);
+    for (const call of driven.calls.filter((candidate) => candidate.args[0] === "session" && candidate.args[1] === "create")) {
+      for (let index = 0; index < call.args.length; index += 1) {
+        if (call.args[index] !== "--filesystem-entry") {
+          continue;
+        }
+        const value = call.args[index + 1] ?? "";
+        const separator = value.indexOf("=");
+        const path = value.slice(0, separator);
+        const access = value.slice(separator + 1);
+        expect(["read_only", "read_write"]).toContain(access);
+        expect(path.startsWith("/")).toBe(false);
+        expect(path.includes(setup_.runRoot)).toBe(false);
+        expect(path.includes(setup_.root)).toBe(false);
+        expect(path.includes(setup_.bundle)).toBe(false);
+        expect(path.split("/")).not.toContain("..");
+        expect(path.split("/")).not.toContain("");
+      }
+      // no session argv value ever carries the pipeline bundle root or a
+      // user source path
+      for (const arg of call.args) {
+        expect(arg.includes(setup_.bundle)).toBe(false);
+      }
+    }
+    await driven.execution.cleanup();
+    await driven.tool.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("45. the session-create argv carries no bearer, launcher credential, profile secret or config body", async () => {
+  const setup_ = await setup();
+  try {
+    const driven = await driveCoderActivation(setup_);
+    const createCalls = driven.calls.filter(
+      (candidate) => candidate.args[0] === "session" && candidate.args[1] === "create",
+    );
+    expect(createCalls.length).toBe(2);
+    for (const call of createCalls) {
+      const argvText = call.args.join("\n");
+      expect(argvText).not.toContain("dhc_");
+      expect(argvText).not.toContain("dht_");
+      expect(argvText).not.toContain("dhl_");
+      expect(argvText).not.toContain(CREDENTIAL_FILE);
+      expect(argvText).not.toContain("sk-coder-secret");
+      expect(argvText).not.toContain("sk-architect-secret");
+      expect(argvText).not.toContain("coder-model");
+      expect(argvText).not.toContain("implement the task");
+      expect(Object.values(call.env)).not.toContain("dhc_1");
+      expect(Object.values(call.env)).not.toContain("dhc_2");
+    }
+    await driven.execution.cleanup();
+    await driven.tool.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("46. a session-create failure creates no handle, no record and triggers no delete", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli({ createCode: 3, createStderr: "error: policy rejected" });
+    const runtime = makeRuntime(setup_, fake.cli);
+    let failure: unknown;
+    try {
+      await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(DockerHelperError);
+    expect((failure as DockerHelperError).kind).toBe("cli_failure");
+    expect((failure as Error).message).toContain("policy rejected");
+    expect(fake.calls.length).toBe(1);
+    // the Tool session cannot exist without the Execution session
+    await expect(
+      runtime.createToolSession(setup_.coderView, setup_.coderPrepared),
+    ).rejects.toThrow(/the Tool Session requires the uncleaned Execution Session/);
+    expect(fake.calls.length).toBe(1);
+    expect(fake.calls.filter((call) => call.args[1] === "delete").length).toBe(0);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("47. a Tool create rejection leaves the Execution session cleanable exactly once", async () => {
+  const setup_ = await setup();
+  try {
+    const fake = makeFakeCli({
+      createCode: (sessionNumber) => (sessionNumber === 2 ? 1 : 0),
+      createStderr: "error: invalid_filesystem_policy",
+    });
+    const runtime = makeRuntime(setup_, fake.cli);
+    const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    let failure: unknown;
+    try {
+      await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(DockerHelperError);
+    expect((failure as DockerHelperError).kind).toBe("cli_failure");
+    expect((failure as Error).message).toContain("invalid_filesystem_policy");
+    // the execution session is still cleanable exactly once
+    await execution.cleanup();
+    await execution.cleanup();
+    const deletes = fake.calls.filter((call) => call.args[1] === "delete");
+    expect(deletes.length).toBe(1);
+    expect(deletes[0]!.args).toContain(execution.sessionId);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("48. both successful session cleanups delete Tool before Execution", async () => {
+  const setup_ = await setup();
+  try {
+    const driven = await driveCoderActivation(setup_);
+    await driven.tool.cleanup();
+    await driven.execution.cleanup();
+    const deletes = driven.calls.filter((call) => call.args[1] === "delete");
+    expect(deletes.length).toBe(2);
+    expect(deletes[0]!.args).toContain(driven.tool.sessionId);
+    expect(deletes[1]!.args).toContain(driven.execution.sessionId);
   } finally {
     await dispose(setup_);
   }

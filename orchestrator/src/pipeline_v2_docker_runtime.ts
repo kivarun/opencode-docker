@@ -1,13 +1,14 @@
 /**
- * Docker Helper 2.1.1 runtime adapter for pipeline schema version 2: a real
- * implementation of the coordinator's two-session `PipelineV2AgentRuntime`
- * boundary on top of the official docker-helper CLI.
+ * Docker Helper 2.2.0-rc.3 runtime adapter for pipeline schema version 2:
+ * a real implementation of the coordinator's two-session
+ * `PipelineV2AgentRuntime` boundary on top of the official docker-helper
+ * CLI.
  *
- * The adapter is deliberately NOT wired into production: `agent-smoke`, the
- * production CLI, the lifecycle and the default pipeline keep executing v1,
- * and the production loader keeps rejecting pipeline schema version 2
- * before Launcher auth and before any Session. Nothing in this module is
- * reachable from the CLI surface.
+ * The adapter is wired into production through the pipeline v2 runner
+ * (`orchestrator run`). It is not reachable from `agent-smoke` or the
+ * plain `smoke` path: the v1 runner, the v1 lifecycle and the default
+ * pipeline keep executing v1, and nothing in this module is called from
+ * the v1 CLI surface.
  *
  * Two-session capability model: `createExecutionSession` creates the
  * orchestrator-owned Execution Session scoped to the canonical run root
@@ -20,6 +21,21 @@
  * the state id, the activation index and the exact `PreparedActivationData`
  * object; a Tool Session is created only for an uncleaned Execution
  * Session of the same activation.
+ *
+ * Issuance-time Session filesystem policy (docker-helper 2.2.0-rc.3
+ * `--filesystem-entry`): the Execution Session is narrowed to exactly
+ * `.=read_only`, `project=read_write`, `activations/<index>-<state>/data/
+ * inputs=read_only`, `activations/<index>-<state>/data/outputs=read_write`
+ * (fixed order); the Tool Session is narrowed to exactly `.=read_write`.
+ * The narrowing can only constrain what the Launcher ceiling already
+ * allows — it never widens, and the daemon rejects a widening or an
+ * outside-ceiling entry with `invalid_filesystem_policy`. The entry lists
+ * are computed from the provenance-checked prepared activation through
+ * the same clean-relative machinery as the worker mount sources, frozen
+ * inside the adapter before `createChildSession` is called, and travel
+ * only as `--filesystem-entry` argv values (never env, never durable
+ * state, never the execution document). The policy is immutable after
+ * session creation and no fallback without entries exists.
  *
  * The factory captures every contract input exactly once before the first
  * helper or filesystem side effect: the trusted pipeline snapshot, one
@@ -63,17 +79,20 @@
  * the registry lookup before any field is read and before any helper CLI
  * call — getters and Proxy traps are never invoked.
  *
- * Worker launch follows the fixed CLI 2.1.1 contract: `pull` and `run`
- * through the Execution Session, `--helper-socket` exactly once, mounts in
- * the fixed order (project RW, activation inputs RO, activation outputs
- * RW) with clean workspace-relative sources verified against the prepared
- * activation before the CLI call, and no secret value in argv — the Tool
- * bearer, every profile env value and `OPENCODE_CONFIG_CONTENT` travel
- * only through `--env-from` from deterministically named private source
- * variables of the run subprocess environment. Known 2.1.1 boundary: while
- * `--env-from` keeps secret values out of the adapter's argv, the legacy
- * daemon-side Docker CLI may still see resolved values in its own argv;
- * that risk is documented, not eliminated here.
+ * Worker launch follows the fixed CLI 2.2.0-rc.3 contract: `pull` and
+ * `run` through the Execution Session, `--helper-socket` exactly once,
+ * mounts in the fixed order (project RW, activation inputs RO, activation
+ * outputs RW) with clean workspace-relative sources verified against the
+ * prepared activation before the CLI call, and no secret value in argv —
+ * the Tool bearer, every profile env value and `OPENCODE_CONFIG_CONTENT`
+ * travel only through `--env-from` from deterministically named private
+ * source variables of the run subprocess environment. Known boundary:
+ * while `--env-from` keeps secret values out of the adapter's argv, the
+ * legacy daemon-side Docker CLI may still see resolved values in its own
+ * argv; that risk is documented, not eliminated here. The issuance-time
+ * Session filesystem policy above is what makes this exact mount set
+ * workable: the project source is writable through the Session, the
+ * inputs source is read-only, and the outputs source is writable.
  *
  * Every created Session is cleaned through memoized Launcher-authority
  * deletes: the physical delete runs at most once, repeated cleanup calls
@@ -87,7 +106,7 @@
  * observable and is never claimed to be gone.
  *
  * UID/GID boundary: the adapter cannot prove a default image UID through
- * the CLI 2.1.1. The supported contract is the orchestrator image running
+ * the CLI. The supported contract is the orchestrator image running
  * as `opencode` (UID/GID 1000:1000) and shipped agent images built on
  * `Dockerfile_base` with the same UID/GID; an external profile image is
  * accepted only as an operator-approved image compatible with this
@@ -106,6 +125,8 @@ import {
 import {
   createChildSession,
   deleteChildSession,
+  type ChildSessionFilesystemAccess,
+  type ChildSessionFilesystemEntry,
   type HelperConfig,
 } from "./launcher.ts";
 import {
@@ -201,6 +222,12 @@ const PROFILE_SOURCE_PREFIX = "ORCHESTRATOR_V2_PROFILE_";
 const WORKER_ENTRYPOINT = "opencode";
 const WORKER_WORKDIR = "/workspace";
 
+/** Workspace-relative path of the shared run-owned project directory. */
+const PROJECT_WORKSPACE_PATH = "project";
+
+const ACTIVATION_SUFFIX_INPUTS = "data/inputs";
+const ACTIVATION_SUFFIX_OUTPUTS = "data/outputs";
+
 /** The static worker instruction; the prompt body travels in the document. */
 export function workerInstruction(): string {
   return `Read ${PIPELINE_V2_EXECUTION_DOCUMENT_CONTAINER_PATH} and follow it exactly.`;
@@ -275,6 +302,106 @@ function cleanRelativeSource(
     }
   }
   return relativePath;
+}
+
+/**
+ * The clean workspace-relative paths of one prepared activation under the
+ * canonical run root: the shared run-owned project directory and the
+ * current activation's inputs and outputs roots. Every path is computed
+ * from the provenance-checked prepared object through the same
+ * clean-relative machinery as the worker mount sources and is
+ * cross-checked against the canonical run layout, so caller values and
+ * state ids can never inject argv. Both the issuance-time Session
+ * filesystem entries and the worker mount sources are derived from this
+ * single computation.
+ */
+function activationPolicyPaths(
+  runRoot: string,
+  prepared: PreparedActivationData,
+  stateId: string,
+  activationIndex: number,
+): { readonly project: string; readonly inputs: string; readonly outputs: string } {
+  const project = cleanRelativeSource(
+    runRoot,
+    prepared.project_root,
+    "the prepared project mount source",
+  );
+  if (project !== PROJECT_WORKSPACE_PATH) {
+    throw new Error(
+      `the prepared project mount source ${project} does not match the canonical run project directory`,
+    );
+  }
+  const activationRelative = cleanRelativeSource(
+    runRoot,
+    prepared.activation_root,
+    "the prepared activation mount source",
+  );
+  const expectedActivationRelative = `activations/${activationIndex}-${stateId}`;
+  if (activationRelative !== expectedActivationRelative) {
+    throw new Error(
+      `the prepared activation mount source ${activationRelative} does not match the prepared activation ${expectedActivationRelative}`,
+    );
+  }
+  const inputs = cleanRelativeSource(
+    runRoot,
+    prepared.inputs_root,
+    "the prepared inputs mount source",
+  );
+  if (inputs !== `${expectedActivationRelative}/${ACTIVATION_SUFFIX_INPUTS}`) {
+    throw new Error(
+      `the prepared inputs mount source ${inputs} does not match the prepared activation inputs`,
+    );
+  }
+  const outputs = cleanRelativeSource(
+    runRoot,
+    prepared.outputs_root,
+    "the prepared outputs mount source",
+  );
+  if (outputs !== `${expectedActivationRelative}/${ACTIVATION_SUFFIX_OUTPUTS}`) {
+    throw new Error(
+      `the prepared outputs mount source ${outputs} does not match the prepared activation outputs`,
+    );
+  }
+  return { project, inputs, outputs };
+}
+
+/**
+ * The immutable Execution Session filesystem snapshot of one activation,
+ * in the fixed order: the workspace root read-only, the shared run-owned
+ * project writable, and exactly the current activation's inputs
+ * (read-only) and outputs (read-write) narrowed explicitly. Everything
+ * else in the run root — state.json, waits, other activation trees —
+ * stays under the read-only root and gains no writable entry. Built and
+ * frozen before `createChildSession` is called.
+ */
+function executionFilesystemEntries(paths: {
+  readonly project: string;
+  readonly inputs: string;
+  readonly outputs: string;
+}): readonly ChildSessionFilesystemEntry[] {
+  const entries: ChildSessionFilesystemEntry[] = [
+    { path: ".", access: "read_only" },
+    { path: paths.project, access: "read_write" },
+    { path: paths.inputs, access: "read_only" },
+    { path: paths.outputs, access: "read_write" },
+  ];
+  return deepFreezeEntries(entries);
+}
+
+/**
+ * The immutable Tool Session filesystem snapshot: the project workspace
+ * root writable and nothing else — the worker's only filesystem
+ * authority. Built and frozen before `createChildSession` is called.
+ */
+function toolFilesystemEntries(): readonly ChildSessionFilesystemEntry[] {
+  const entries: ChildSessionFilesystemEntry[] = [{ path: ".", access: "read_write" }];
+  return deepFreezeEntries(entries);
+}
+
+function deepFreezeEntries(
+  entries: ChildSessionFilesystemEntry[],
+): readonly ChildSessionFilesystemEntry[] {
+  return Object.freeze(entries.map((entry) => Object.freeze({ ...entry })));
 }
 
 function findAgentState(
@@ -621,12 +748,14 @@ export function createDockerHelperPipelineV2Runtime(
     activation: PreparedActivationData,
     executionRecord: SessionRecord | null,
     workspace: string,
+    filesystemEntries: readonly ChildSessionFilesystemEntry[],
   ): Promise<SessionRecord> => {
     const created = await createChildSession(
       cli,
       helperConfig,
       requireNonEmptyString(workspace, "session workspace"),
       { ...operatorEnv },
+      { filesystemEntries },
     );
 
     // Launcher ownership: a known Session whose provenance does not match
@@ -755,52 +884,19 @@ export function createDockerHelperPipelineV2Runtime(
       return { status: "failed", reason: "worker_failed" };
     }
 
-    // Mount sources: clean workspace-relative paths computed from the
-    // canonical Execution Session root and cross-checked against the exact
-    // structural composition of the prepared activation, before any CLI
-    // call.
-    const runRoot = executionRecord.prepared.run_root;
-    const projectSource = cleanRelativeSource(
-      runRoot,
-      executionRecord.prepared.project_root,
-      "the prepared project mount source",
+    // Mount sources: the single shared computation over the provenance-
+    // checked prepared activation (clean workspace-relative paths
+    // cross-checked against the canonical run layout) — the same paths
+    // the issuance-time Session filesystem entries were derived from.
+    const policyPaths = activationPolicyPaths(
+      executionRecord.prepared.run_root,
+      executionRecord.prepared,
+      executionRecord.stateId,
+      executionRecord.activationIndex,
     );
-    if (projectSource !== "project") {
-      throw new Error(
-        `the prepared project mount source ${projectSource} does not match the canonical run project directory`,
-      );
-    }
-    const activationRelative = cleanRelativeSource(
-      runRoot,
-      executionRecord.prepared.activation_root,
-      "the prepared activation mount source",
-    );
-    const expectedActivationRelative = `activations/${executionRecord.activationIndex}-${executionRecord.stateId}`;
-    if (activationRelative !== expectedActivationRelative) {
-      throw new Error(
-        `the prepared activation mount source ${activationRelative} does not match the prepared activation ${expectedActivationRelative}`,
-      );
-    }
-    const inputsSource = cleanRelativeSource(
-      runRoot,
-      executionRecord.prepared.inputs_root,
-      "the prepared inputs mount source",
-    );
-    if (inputsSource !== `${expectedActivationRelative}/data/inputs`) {
-      throw new Error(
-        `the prepared inputs mount source ${inputsSource} does not match the prepared activation inputs`,
-      );
-    }
-    const outputsSource = cleanRelativeSource(
-      runRoot,
-      executionRecord.prepared.outputs_root,
-      "the prepared outputs mount source",
-    );
-    if (outputsSource !== `${expectedActivationRelative}/data/outputs`) {
-      throw new Error(
-        `the prepared outputs mount source ${outputsSource} does not match the prepared activation outputs`,
-      );
-    }
+    const projectSource = policyPaths.project;
+    const inputsSource = policyPaths.inputs;
+    const outputsSource = policyPaths.outputs;
 
     // No secret value in argv: the Tool bearer, the OpenCode config
     // content and every profile env value travel only through --env-from
@@ -889,11 +985,25 @@ export function createDockerHelperPipelineV2Runtime(
     // effect; the Execution Session workspace is the daemon-visible
     // correspondence of the canonical run root.
     await requireActivationProjection(activation);
+
+    // The issuance-time filesystem snapshot is computed from the
+    // provenance-checked prepared activation and frozen before the
+    // session create: the workspace root read-only, the shared run-owned
+    // project writable, and exactly this activation's inputs (read-only)
+    // and outputs (read-write) narrowed explicitly.
+    const policyPaths = activationPolicyPaths(
+      activation.run_root,
+      activation,
+      activation.state_id,
+      activation.activation_index,
+    );
+    const entries = executionFilesystemEntries(policyPaths);
     const record = await createSessionRecord(
       "execution",
       activation,
       null,
       projection.daemonRoot,
+      entries,
     );
     let handle: PipelineV2ExecutionSession | null = null;
     handle = Object.freeze({
@@ -958,11 +1068,16 @@ export function createDockerHelperPipelineV2Runtime(
     // Tool Session workspace is the daemon-visible correspondence of the
     // canonical project root.
     await requireActivationProjection(activation);
+
+    // The Tool Session's only filesystem authority is its own project
+    // workspace root, writable; no other entries exist.
+    const entries = toolFilesystemEntries();
     const record = await createSessionRecord(
       "tool",
       activation,
       executionRecord,
       daemonPathFor("project root", activation.project_root),
+      entries,
     );
     const handle: PipelineV2ToolSession = Object.freeze({
       sessionId: record.sessionId,

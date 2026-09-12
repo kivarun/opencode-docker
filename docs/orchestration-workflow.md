@@ -1589,11 +1589,11 @@ commands and zero sessions; a copy published before a later snapshot or
 production runner drives this coordinator from `orchestrator run`;
 `agent-smoke` and the default pipeline remain on v1.
 
-### Docker Helper 2.1.1 runtime adapter (wired through the production runner)
+### Docker Helper 2.2.0-rc.3 runtime adapter (wired through the production runner)
 
 `orchestrator/src/pipeline_v2_docker_runtime.ts` is a real implementation of
 the coordinator's two-session runtime boundary on the official
-docker-helper CLI 2.1.1 — wired through the production runner (driven from
+docker-helper CLI 2.2.0-rc.3 — wired through the production runner (driven from
 `orchestrator run`), not by `agent-smoke`, whose schema version 1 loader
 keeps rejecting pipeline schema v2 before Launcher auth and before any
 Session.
@@ -1645,16 +1645,59 @@ Execution Session of the same activation. Bearer tokens live
 only in an instance-private registry keyed by the exact handle object;
 handles carry the session id and lifecycle methods only.
 
-The worker launch follows the fixed CLI 2.1.1 contract: a `pull` through
-the Execution Session (a failed pull is a worker failure and never falls
-back to a cached image), then one `run` with the fixed mount order
-(project `/workspace` RW, activation inputs `/pipeline/inputs` RO,
-activation outputs `/pipeline/outputs` RW), `--helper-socket` exactly
-once, workspace-relative mount sources cross-checked against the prepared
-activation, and no secret value in argv — the Tool bearer, the OpenCode
-config content, and every profile env value travel only through
-`--env-from` from deterministic private source variables of the run
-subprocess environment. The prompt travels in the orchestrator-owned
+Issuance-time Session filesystem policy (docker-helper 2.2.0-rc.3
+`--filesystem-entry`): every child Session is created with an immutable
+filesystem narrowing, passed as repeatable `--filesystem-entry
+PATH=ACCESS` flags after `--workspace` in a fixed order. The
+orchestrator never re-implements the helper's policy evaluator — the
+daemon decides narrowing; the orchestrator only validates the transport
+shape (workspace-relative clean paths or `.`, the exact
+`read_only`/`read_write` access union, no duplicates, a non-empty list
+carrying the workspace root `.` exactly once) inside the shared
+`createChildSession`, before any CLI call, and a daemon-side rejection
+surfaces as the ordinary `DockerHelperError("cli_failure")`. The
+Execution Session is narrowed to exactly
+`.=read_only`, `project=read_write`,
+`activations/<index>-<state>/data/inputs=read_only`,
+`activations/<index>-<state>/data/outputs=read_write` (fixed order): the
+run root itself is read-only, the shared run-owned project is the only
+writable member, exactly the current activation's inputs (read-only) and
+outputs (read-write) are narrowed explicitly, and everything else —
+state.json, waits, other activation trees — stays under the read-only
+root with no writable entry. The Tool Session is narrowed to exactly
+`.=read_write` and nothing else — the project workspace is the worker's
+only filesystem authority; run-root siblings are unreachable through it,
+and the activation inputs/outputs reach the worker container only
+through the mounts the Execution Session creates. The entry paths are
+computed from the provenance-checked prepared activation through the
+same clean-relative machinery as the worker mount sources (one shared
+computation, cross-checked against the canonical run layout), frozen
+inside the adapter before `createChildSession` is called, and travel
+only as argv values — never env, never durable state, never the
+execution document; a revisit activation carries its own new global
+execution index in the paths. Session policy is immutable after
+creation, the policy can only narrow the Launcher ceiling (a widening or
+outside-ceiling entry is rejected by the daemon with
+`invalid_filesystem_policy`, a writable mount through an effective
+read-only region with `read_only_root` — both before any workload), no
+silent downgrade exists, and there is no fallback creation without
+entries. No filesystem-policy field exists in the pipeline schema, the
+profiles, the execution document or the durable state.
+
+The worker launch follows the fixed CLI 2.2.0-rc.3 contract: a `pull`
+through the Execution Session (a failed pull is a worker failure and
+never falls back to a cached image), then one `run` with the unchanged
+mount order (project `/workspace` RW, activation inputs
+`/pipeline/inputs` RO, activation outputs `/pipeline/outputs` RW),
+`--helper-socket` exactly once, workspace-relative mount sources
+cross-checked against the prepared activation, and no secret value in
+argv — the Tool bearer, the OpenCode config content, and every profile
+env value travel only through `--env-from` from deterministic private
+source variables of the run subprocess environment. The issuance-time
+Session policy above is what makes this exact mount set workable: the
+project source is writable through the Session, the inputs source is
+read-only, and the outputs source is writable; no fallback without the
+policy exists. The prompt travels in the orchestrator-owned
 execution document at the fixed container path
 `/pipeline/inputs/.orchestrator/execution.md`; argv carries only the
 static instruction to read it. A failed pull reports `worker_failed`, a
@@ -1662,7 +1705,8 @@ timed-out run `worker_timeout`, a nonzero exit `worker_failed`, and exit 0
 `completed`; stdout never participates, and signal delivery plus 130/143
 classification are owned by the coordinator signal control. Cleanup is a memoized Launcher-authority
 delete — the physical delete runs at most once per session, and Tool and
-Execution cleanups remain separate operations.
+Execution cleanups remain separate operations, with the Tool session
+deleted first.
 
 Known boundary: while `--env-from` keeps secret values out of the
 adapter's argv, the legacy daemon-side Docker CLI may still see resolved
@@ -1671,7 +1715,7 @@ UID/GID contract (orchestrator and shipped agent images as `opencode`
 1000:1000; external profile images only as operator-approved, filesystem-
 compatible images) is a runtime compatibility requirement of the profile,
 not a verified guarantee — the adapter cannot prove a default image UID
-through CLI 2.1.1.
+through the CLI.
 
 ## User intervention
 

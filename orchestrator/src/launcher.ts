@@ -11,6 +11,7 @@ import {
   type AuthInfo,
   type CliRunner,
 } from "./docker_helper.ts";
+import { isAbsolute } from "node:path";
 
 export interface EnvLike {
   readonly [key: string]: string | undefined;
@@ -19,6 +20,26 @@ export interface EnvLike {
 export interface HelperConfig {
   socketPath: string;
   credentialFile: string;
+}
+
+export type ChildSessionFilesystemAccess = "read_only" | "read_write";
+
+export interface ChildSessionFilesystemEntry {
+  /** Workspace-relative path (`.` for the workspace root). */
+  readonly path: string;
+  readonly access: ChildSessionFilesystemAccess;
+}
+
+export interface CreateChildSessionOptions {
+  /**
+   * Issuance-time Session filesystem narrowing, passed as repeatable
+   * `--filesystem-entry PATH=ACCESS` flags after `--workspace` in list
+   * order. Transport-shape only: this layer never re-decides helper
+   * authorization semantics (the daemon narrows, the CLI validates
+   * syntax). An absent or empty list keeps the argv byte-for-byte
+   * identical to the no-policy form.
+   */
+  readonly filesystemEntries?: readonly ChildSessionFilesystemEntry[];
 }
 
 export function resolveHelperConfig(env: EnvLike): HelperConfig {
@@ -81,8 +102,70 @@ export async function createChildSession(
   config: HelperConfig,
   workspace: string,
   env: Record<string, string> = {},
+  options?: CreateChildSessionOptions,
 ): Promise<ChildSession> {
   const args = [...operatorArgs(["create"], config), "--workspace", workspace];
+  const entries = options?.filesystemEntries;
+  if (entries !== undefined) {
+    if (!Array.isArray(entries)) {
+      throw new Error("docker-helper session create: filesystem entries must be a list");
+    }
+    // Transport-shape validation and argv capture happen in one
+    // synchronous pass before the first await: the caller-owned list and
+    // entry objects are never frozen or modified, and a later mutation of
+    // them cannot change the captured argv. Values travel only in argv,
+    // never in env.
+    const seen = new Set<string>();
+    const pairs: string[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new Error(
+          "docker-helper session create: filesystem entry must be an object with path and access",
+        );
+      }
+      const path = (entry as { path?: unknown }).path;
+      const access = (entry as { access?: unknown }).access;
+      if (typeof path !== "string" || path === "") {
+        throw new Error(
+          "docker-helper session create: filesystem entry path must be a non-empty string",
+        );
+      }
+      if (path !== ".") {
+        if (isAbsolute(path)) {
+          throw new Error(
+            `docker-helper session create: filesystem entry path ${JSON.stringify(path)} must be workspace-relative`,
+          );
+        }
+        for (const component of path.split("/")) {
+          if (component === "" || component === "." || component === "..") {
+            throw new Error(
+              `docker-helper session create: filesystem entry path ${JSON.stringify(path)} is not a clean workspace-relative path`,
+            );
+          }
+        }
+      }
+      if (access !== "read_only" && access !== "read_write") {
+        throw new Error(
+          `docker-helper session create: filesystem entry access for path ${JSON.stringify(path)} must be exactly "read_only" or "read_write"`,
+        );
+      }
+      if (seen.has(path)) {
+        throw new Error(
+          `docker-helper session create: duplicate filesystem entry path ${JSON.stringify(path)}`,
+        );
+      }
+      seen.add(path);
+      pairs.push(`${path}=${access}`);
+    }
+    if (entries.length > 0 && !seen.has(".")) {
+      throw new Error(
+        'docker-helper session create: filesystem entries must include the workspace root "." exactly once',
+      );
+    }
+    for (const pair of pairs) {
+      args.push("--filesystem-entry", pair);
+    }
+  }
   const result = await cli(args, env, "capture");
   if (result.code !== 0) {
     throw new DockerHelperError(
