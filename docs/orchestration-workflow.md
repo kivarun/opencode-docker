@@ -1524,6 +1524,45 @@ content-free. Coordinator, runner and CLI wiring, reading the user
 response from a file, resume, P01 validation, and migrations stay out
 of scope.
 
+### Read-only runtime context restoration for a future resume (implemented, not wired)
+
+`orchestrator/src/pipeline_v2_resume_context.ts` adds the read-only
+substrate a future resume needs: `restorePipelineV2RuntimeContext(pipeline,
+state, runRoot)` rebuilds the runtime objects of an existing run from the
+trusted resolved pipeline, the durable state schema v6 and the fixed
+orchestrator-owned run root — a provenance-backed `RunInputsSnapshot`, the
+full accepted `AcceptedStateOutput[]` history, the durable cursor and the
+next global execution index. The API is strictly read-only (no mkdir,
+write, chmod, link, rename, unlink or rm, no activation leaf reserved, no
+Session, no sink call) and never re-reads the original user input bindings
+or the project source: after the run started, the fixed orchestrator-owned
+copies are the only source of truth. The order is fail-closed — the
+pipeline provenance gate first (before it the state is not read, the run
+root is not touched and no filesystem call happens), then the single state
+validator, the narrower resumable-boundary policy, the exact pipeline
+identity comparison plus the `basename(runRoot) === state.run_id` binding,
+the run-root layout (`project`, `data`, `data/inputs` with the
+orchestrator-owned mode 0700 on the two data directories and no mode or
+content repair for worker-writable `project`), the run-input snapshot
+restoration, the accepted-history reconstruction from `state.executions`
+only, and the full validation of every record including old non-winning
+ones (fixed paths, kinds, digests and — opt-in inside the shared
+accepted-history chain, so the established runtime consumers keep their
+typed failure reasons — full JSON re-parse and revalidation against the
+declaring schema). Only clean boundaries without unfinished work are
+restorable: an active running run whose executions are all settled and
+bound to their committed transitions (including the state right after
+`create_run`), and a waiting run with an open last wait; a waiting run's
+context is restorable, but the restore itself continues nothing.
+Failures are typed (`PipelineV2RuntimeContextRestoreError`) with reasons
+assigned by validation phase, never by message text: `invalid_state`,
+`pipeline_mismatch`, `run_layout_invalid`, `run_input_modified`,
+`accepted_output_modified`. The restored `RunInputsSnapshot` is minted
+through the same module-private provenance registry `snapshotRunInputs`
+uses (no second registry), so every existing runtime gate keeps rejecting
+hand-built, cloned or proxied look-alikes. Production resume execution,
+the coordinator, the runner and the CLI stay out of scope.
+
 ### Run-owned project copy and the production-neutral coordinator (implemented, driven by the production runner)
 
 The v2 data plane also implements the run-owned project copy:

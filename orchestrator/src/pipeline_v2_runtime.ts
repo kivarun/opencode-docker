@@ -922,6 +922,59 @@ export async function acceptedOutputDigest(
 }
 
 /**
+ * Compute the run-input digest of one typed object at `path` with the same
+ * `pipeline-v2-input` framing `snapshotRunInputs` and the restoration
+ * verifier bind into the durable state. `type` must be a declared input
+ * type. No containment or kind checks are performed and nothing is
+ * written; the path must already be established as a real non-symlink
+ * object of the declared kind by the caller. Exposed so tests (and the
+ * read-only runtime-context restoration) bind exactly the digest form
+ * recorded in the durable state.
+ */
+export async function runInputSnapshotDigest(
+  type: PortType,
+  path: string,
+  what: string,
+): Promise<string> {
+  const inputType = parsePortType(type, "run input digest type");
+  return await recomputeRunInputDigest(inputType, path, what);
+}
+
+/**
+ * Recompute the run-input digest of one typed object at `path` with the
+ * exact `pipeline-v2-input` framing used by `snapshotRunInputs` and
+ * `verifyRunInputsSnapshot`: files are read once and hashed
+ * length-framed, directory trees are scanned fail-closed and hashed with
+ * the unambiguous directory framing. The caller establishes kind and
+ * containment; this helper only reads and hashes and never writes.
+ */
+async function recomputeRunInputDigest(
+  type: PortType,
+  path: string,
+  what: string,
+): Promise<string> {
+  const hasher = inputDigestHasher(type);
+  if (type === "directory") {
+    const tree = await scanDirectoryTree(path, what);
+    for (const treeEntry of tree) {
+      if (treeEntry.kind === "directory") {
+        hashDirectoryEntry(hasher, treeEntry, undefined);
+        continue;
+      }
+      const content = await readRegularFileBytes(
+        treeEntry.absolutePath,
+        `${what} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+      );
+      hashDirectoryEntry(hasher, treeEntry, content);
+    }
+    return hasher.digest("hex");
+  }
+  const content = await readRegularFileBytes(path, what);
+  hashBytes(hasher, content);
+  return hasher.digest("hex");
+}
+
+/**
  * Re-verify the full integrity of a trusted run-input snapshot at its fixed
  * orchestrator-owned paths, without ever re-reading the original user
  * binding paths. Every snapshot entry must still be a real non-symlink
@@ -980,27 +1033,7 @@ async function verifyRunInputsSnapshot(
           `${what} snapshot object ${path} no longer resolves to itself; the snapshot was relocated or escaped`,
         );
       }
-      const hasher = inputDigestHasher(entry.type);
-      let recomputed: string;
-      if (entry.type === "directory") {
-        const tree = await scanDirectoryTree(path, what);
-        for (const treeEntry of tree) {
-          if (treeEntry.kind === "directory") {
-            hashDirectoryEntry(hasher, treeEntry, undefined);
-            continue;
-          }
-          const content = await readRegularFileBytes(
-            treeEntry.absolutePath,
-            `${what} file entry ${JSON.stringify(treeEntry.relativePath)}`,
-          );
-          hashDirectoryEntry(hasher, treeEntry, content);
-        }
-        recomputed = hasher.digest("hex");
-      } else {
-        const content = await readRegularFileBytes(path, what);
-        hashBytes(hasher, content);
-        recomputed = hasher.digest("hex");
-      }
+      const recomputed = await recomputeRunInputDigest(entry.type, path, what);
       if (recomputed !== entry.digest) {
         throw new PipelineError(
           `${what} digest mismatch at ${path}: recorded ${entry.digest}, recomputed ${recomputed}`,
@@ -1415,6 +1448,163 @@ export async function snapshotRunInputs(
   return snapshot;
 }
 
+/**
+ * One durable run-input expectation handed to the restoration mint: the
+ * exact metadata the validated durable state recorded for one declared
+ * pipeline input. The id/type/protected/digest coherence with the trusted
+ * pipeline is checked by the caller (the restoration's
+ * pipeline-mismatch phase); this helper only verifies the fixed
+ * orchestrator-owned objects and mints the registered snapshot.
+ */
+export interface RunInputSnapshotExpectation {
+  readonly id: string;
+  readonly type: PortType;
+  readonly protected: boolean;
+  readonly digest: string;
+  /**
+   * The declaring pipeline input's loader-compiled schema for `json`
+   * types (carried by the caller from the trusted pipeline; the helper
+   * never re-reads schema files).
+   */
+  readonly declaredSchema?: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Restoration-only minting of the trusted `RunInputsSnapshot` from the
+ * fixed orchestrator-owned objects of an existing run root. This is the
+ * narrow data-plane helper the read-only runtime-context restoration uses
+ * instead of re-reading the original user bindings (which no longer exist
+ * as a source of truth): for every durable expectation the object at the
+ * fixed path `<runRoot>/data/inputs/<id>` is verified with the same
+ * fail-closed contract the activation path uses before any activation —
+ * real non-symlink object of the declared kind, canonical self-resolution
+ * inside the canonical run root, clean directory trees, the exact
+ * `pipeline-v2-input` digest, and — for `json` inputs — a full re-parse
+ * plus revalidation against the declaring site's loader-compiled schema,
+ * so a fabricated durable state with invalid JSON can never mint
+ * provenance from a matching digest alone. Nothing is created, modified,
+ * chmodded or removed: the whole helper is read-only. After the full
+ * verification the exact deep-frozen snapshot is built and registered in
+ * the same module-private provenance registry `snapshotRunInputs` uses —
+ * there is no second registry and no general minter; only this fully
+ * verified restoration path can mint. The registered provenance binds the
+ * exact trusted pipeline object and the canonical run/project roots, so
+ * the existing runtime APIs accept the restored snapshot exactly like a
+ * freshly snapshotted one.
+ */
+export async function mintRestoredRunInputsSnapshot(
+  pipeline: ResolvedPipelineV2,
+  runRootCanonical: string,
+  projectRootCanonical: string,
+  durableInputs: readonly RunInputSnapshotExpectation[],
+): Promise<RunInputsSnapshot> {
+  requireResolvedPipelineV2Provenance(pipeline, "restored run input snapshot");
+  // Trusted-state invariant: every durable expectation names a declared
+  // pipeline input (the restoration matched the full metadata before
+  // calling). Guarded at a plain site outside any typed region.
+  const declaredById = new Map(pipeline.inputs.map((input) => [input.id, input]));
+  const pairs = durableInputs.map((expected) => {
+    const declared = declaredById.get(expected.id);
+    if (declared === undefined) {
+      throw new PipelineError(
+        `run input snapshot expectation ${JSON.stringify(expected.id)} does not match a declared pipeline input`,
+      );
+    }
+    return { expected, declared };
+  });
+  const inputsRoot = join(runRootCanonical, "data", "inputs");
+  const entries: RunInputSnapshotEntry[] = await withRuntimeReason(
+    "run_input_modified",
+    async () => {
+      const entries: RunInputSnapshotEntry[] = [];
+      for (const { expected } of pairs) {
+        const what = `run input snapshot of ${JSON.stringify(expected.id)}`;
+        const path = join(inputsRoot, expected.id);
+        const info = await lstatOrNull(path);
+        if (info === null) {
+          throw new PipelineError(`${what} snapshot object ${path} does not exist`);
+        }
+        if (info.isSymbolicLink()) {
+          throw new PipelineError(`${what} snapshot object ${path} is a symbolic link`);
+        }
+        if (expected.type === "directory") {
+          if (!info.isDirectory()) {
+            throw new PipelineError(
+              `${what} snapshot object ${path} is not a real directory, found ${describeEntry(info)}`,
+            );
+          }
+        } else if (!info.isFile()) {
+          throw new PipelineError(
+            `${what} snapshot object ${path} is not a regular file, found ${describeEntry(info)}`,
+          );
+        }
+        let canonical: string;
+        try {
+          canonical = await realpath(path);
+        } catch (cause) {
+          throw fail(`${what} snapshot object ${path} cannot be canonicalized`, cause);
+        }
+        if (canonical !== path) {
+          throw new PipelineError(
+            `${what} snapshot object ${path} no longer resolves to itself; the snapshot was relocated or escaped`,
+          );
+        }
+        if (!isInsideRoot(runRootCanonical, canonical)) {
+          throw new PipelineError(
+            `${what} snapshot object ${path} resolves outside the canonical run root ${runRootCanonical}`,
+          );
+        }
+        const recomputed = await recomputeRunInputDigest(expected.type, path, what);
+        if (recomputed !== expected.digest) {
+          throw new PipelineError(
+            `${what} digest mismatch at ${path}: recorded ${expected.digest}, recomputed ${recomputed}`,
+          );
+        }
+        if (expected.type === "json") {
+          // JSON re-parse plus schema revalidation against the declaring
+          // site's compiled schema: a matching digest alone never mints
+          // provenance for fabricated durable state.
+          const content = await readRegularFileBytes(path, what);
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(content.toString("utf8"));
+          } catch {
+            // Stable, content-free diagnostic: the parser message can echo
+            // the offending token or an input fragment, so it is never
+            // included.
+            throw new PipelineError(`${what} ${path} is not valid JSON`);
+          }
+          if (expected.declaredSchema !== undefined) {
+            validatePipelineJson(expected.declaredSchema, parsedJson, `${what} ${path}`);
+          }
+        }
+        entries.push({
+          id: expected.id,
+          type: expected.type,
+          protected: expected.protected,
+          snapshot_path: path,
+          digest: expected.digest,
+        });
+      }
+      return entries;
+    },
+  );
+  // Metadata construction and provenance registration happen outside any
+  // typed region: deepFreeze and the registry cannot fail here.
+  const snapshot = deepFreeze({
+    run_root: runRootCanonical,
+    inputs_root: inputsRoot,
+    project_root: projectRootCanonical,
+    inputs: entries,
+  });
+  runInputSnapshotProvenance.set(snapshot, {
+    pipeline,
+    runRootCanonical,
+    projectRootCanonical,
+  });
+  return snapshot;
+}
+
 interface ParsedAcceptedOutput {
   readonly state: string;
   readonly output: string;
@@ -1706,25 +1896,103 @@ function selectWinningAcceptedOutputs(
 }
 
 /**
+ * Phase 3.5 of accepted-history validation — shared by every consumer of
+ * the chain. Every `json` record — including old, non-winning ones — is
+ * re-parsed from its fixed location and revalidated against the declaring
+ * output port's loader-compiled schema. For legitimately accepted,
+ * unchanged outputs this phase never changes observable behavior (the
+ * bytes already passed this exact validation at acceptance time and any
+ * change would already have failed the digest phase); its purpose is the
+ * read-only runtime-context restoration, where a fabricated durable state
+ * with a matching digest must never mint accepted history for invalid
+ * JSON.
+ */
+async function verifyAcceptedOutputJsonSchemas(
+  pipeline: ResolvedPipelineV2,
+  fullyResolved: readonly FullyResolvedRecord[],
+): Promise<void> {
+  // Trusted-pipeline invariant resolution runs at a plain site outside the
+  // typed region: a `json` record always names a declared agent output
+  // port (the parse phase guaranteed this) whose compiled schema is
+  // always present (the loader invariant).
+  interface JsonSchemaBinding {
+    readonly resolved: FullyResolvedRecord;
+    readonly schema: Readonly<Record<string, unknown>>;
+  }
+  const bindings: JsonSchemaBinding[] = fullyResolved
+    .filter((resolvedRecord) => resolvedRecord.type === "json")
+    .map((resolvedRecord) => {
+      const state = findStateById(pipeline, resolvedRecord.record.state);
+      const port =
+        state !== undefined && state.type === "agent"
+          ? state.outputs.find((candidate) => candidate.id === resolvedRecord.record.output)
+          : undefined;
+      if (port === undefined || port.type !== "json" || port.schema === undefined) {
+        throw new PipelineError(
+          `accepted state output for ${JSON.stringify(resolvedRecord.record.state)}.${JSON.stringify(resolvedRecord.record.output)} does not resolve to a declared json output port with a compiled schema`,
+        );
+      }
+      return { resolved: resolvedRecord, schema: port.schema };
+    });
+  if (bindings.length === 0) {
+    return;
+  }
+  /**
+   * Every failure here means an accepted `json` output no longer parses or
+   * no longer conforms to its declared schema — the same class of damage
+   * as a changed digest — so the whole body carries the single stable
+   * accepted-output reason; each message stays the unchanged diagnostic
+   * text.
+   */
+  return await withRuntimeReason("accepted_output_modified", async () => {
+    for (const binding of bindings) {
+      const what = `accepted state output for ${JSON.stringify(binding.resolved.record.state)}.${JSON.stringify(binding.resolved.record.output)} at activation index ${binding.resolved.record.activationIndex}`;
+      const read = await readPortValueForDigest(
+        "json",
+        binding.resolved.canonicalPath,
+        what,
+        true,
+      );
+      const parsedJson = read.parsedJson;
+      if (parsedJson === undefined) {
+        throw new PipelineError(`${what} is not valid JSON`);
+      }
+      validatePipelineJson(binding.schema, parsedJson, what);
+    }
+  });
+}
+
+/**
  * The single accepted-history validation chain shared by every runtime API
  * that consumes accepted state outputs: parse + exact-record/coherence
  * validation (`parseAcceptedStateOutputs`), fixed-location resolution of
  * every record including old non-winning ones
  * (`resolveAllAcceptedOutputs`), digest recomputation against the recorded
- * digests (`verifyAcceptedOutputDigests`), and only then the
- * highest-activation-index winner selection per `state`/`output` pair
- * (`selectWinningAcceptedOutputs`). `currentActivationIndex` binds the
- * next-activation path (every recorded index must be strictly below it);
- * run-output collection and other consumers without a current activation
- * pass `undefined` so activation existence is proven by resolving each
- * record's fixed location. Callers must never re-implement this chain: a
- * second resolver could diverge in error order or skip a phase.
+ * digests (`verifyAcceptedOutputDigests`), the optional JSON schema
+ * revalidation of every `json` record (`verifyAcceptedOutputJsonSchemas`),
+ * and only then the highest-activation-index winner selection per
+ * `state`/`output` pair (`selectWinningAcceptedOutputs`).
+ * `currentActivationIndex` binds the next-activation path (every recorded
+ * index must be strictly below it); run-output collection and other
+ * consumers without a current activation pass `undefined` so activation
+ * existence is proven by resolving each record's fixed location. The JSON
+ * schema revalidation phase belongs to this one chain but stays inert for
+ * the established consumers: their runner-owned records were validated at
+ * acceptance time and any later change already fails the digest phase, so
+ * the extra phase would only move their typed failure reasons
+ * (`run_output_invalid`, `decision_input_invalid`) to
+ * `accepted_output_modified`. Only the read-only runtime-context
+ * restoration — whose records come from the durable state and must never
+ * mint provenance from a matching digest alone — requests it
+ * (`verifyRestoredAcceptedHistory`). Callers must never re-implement this
+ * chain: a second resolver could diverge in error order or skip a phase.
  */
 async function resolveAcceptedHistory(
   pipeline: ResolvedPipelineV2,
   acceptedOutputs: readonly unknown[],
   runRootCanonical: string,
   currentActivationIndex: number | undefined,
+  jsonSchemaRevalidation = false,
 ): Promise<Map<string, ResolvedAcceptedOutput>> {
   const parsedAccepted = parseAcceptedStateOutputs(
     acceptedOutputs,
@@ -1733,7 +2001,30 @@ async function resolveAcceptedHistory(
   );
   const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
   await verifyAcceptedOutputDigests(fullyResolved);
+  if (jsonSchemaRevalidation) {
+    await verifyAcceptedOutputJsonSchemas(pipeline, fullyResolved);
+  }
   return selectWinningAcceptedOutputs(fullyResolved);
+}
+
+/**
+ * Restoration-only accepted-history verification: the read-only runtime
+ * context reconstruction validates the records it rebuilt from the durable
+ * state through this exact chain — the same one every runtime consumer
+ * uses — with no current-activation bound (activation existence is proven
+ * by resolving every record's fixed location). The winner selection result
+ * is discarded; the restoration needs only the full validation. Plain
+ * record-shape or coherence failures of a restoration-built history mean a
+ * forged durable state and are classified by the caller; the typed
+ * runtime reasons (fixed location, digest, JSON schema) propagate.
+ */
+export async function verifyRestoredAcceptedHistory(
+  pipeline: ResolvedPipelineV2,
+  runRootCanonical: string,
+  records: readonly unknown[],
+): Promise<void> {
+  requireResolvedPipelineV2Provenance(pipeline, "restored accepted history");
+  await resolveAcceptedHistory(pipeline, records, runRootCanonical, undefined, true);
 }
 
 function findStateById(
