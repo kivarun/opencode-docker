@@ -1,0 +1,4 @@
+litert-cli-nightly==0.3.0.dev20260914
+litert-torch-nightly==0.10.0.dev20260909
+litert-lm-builder==0.17.1
+ai-edge-quantizer-nightly==0.10.0.dev20260915
