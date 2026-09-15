@@ -9,6 +9,18 @@ ARG DOCKER_HELPER_SHA256=4fe4fdaf774b47c1fb831dc45ae187161883084d995110dadea6e6c
 ARG BAZELISK_VERSION=1.18.0
 ARG BAZEL_VERSION=7.4.1
 
+#
+# Conversion toolchain.
+#
+# These are the exact versions used by the first successful generic
+# HF -> LiteRT-LM -> BoxProbe conversion/UAT.
+#
+ARG PIP_VERSION=26.2.1
+ARG LITERT_TORCH_VERSION=0.10.0.dev20260909
+ARG LITERT_CLI_VERSION=0.3.0.dev20260914
+ARG LITERT_LM_BUILDER_VERSION=0.17.1
+ARG AI_EDGE_LITERT_VERSION=2.2.0
+
 USER root
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -43,7 +55,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 #
-# Bazelisk. Keep Bazel aligned with LiteRT's current hermetic build environment.
+# Bazelisk.
+#
+# Keep Bazel aligned with the currently validated converter environment.
 #
 RUN set -eux; \
     curl -fsSL --retry 3 \
@@ -74,17 +88,29 @@ RUN groupadd --gid 1000 opencode \
         --shell /bin/bash \
         opencode \
     && install -d \
+        -m 0755 \
+        /etc/opencode \
+    && install -d \
         -m 0700 \
         -o opencode \
         -g opencode \
         /home/opencode/.ssh \
     && install -d \
         -m 0755 \
-        /etc/opencode \
+        -o opencode \
+        -g opencode \
         /workspace \
         /home/opencode/.cache \
         /home/opencode/.config \
-        /home/opencode/.local/share/opencode
+        /home/opencode/.local \
+        /home/opencode/.local/share \
+        /home/opencode/.local/share/opencode \
+        /home/opencode/.local/state \
+    && install -d \
+        -m 0700 \
+        -o opencode \
+        -g opencode \
+        /tmp/opencode
 
 #
 # docker-helper.
@@ -126,26 +152,63 @@ RUN set -eux; \
 # Conversion environment.
 #
 RUN python -m venv /opt/model-converter \
-    && /opt/model-converter/bin/pip install --upgrade pip setuptools wheel \
-    && /opt/model-converter/bin/pip install \
-        --pre \
-        litert-torch-nightly \
-        ai-edge-litert \
-        litert-cli-nightly \
+    && /opt/model-converter/bin/python -m pip install \
+        "pip==${PIP_VERSION}" \
+    && /opt/model-converter/bin/python -m pip install \
+        "litert-torch-nightly==${LITERT_TORCH_VERSION}" \
+        "litert-cli-nightly==${LITERT_CLI_VERSION}" \
+        "litert-lm-builder==${LITERT_LM_BUILDER_VERSION}" \
+        "ai-edge-litert==${AI_EDGE_LITERT_VERSION}" \
         transformers \
         huggingface-hub \
-        sentencepiece
+        sentencepiece \
+    && /opt/model-converter/bin/python -m pip check
 
 ENV VIRTUAL_ENV=/opt/model-converter
 ENV PATH="/opt/model-converter/bin:/usr/local/bin:${PATH}"
 
+#
+# LiteRT Torch compatibility patch.
+#
+# The validated export_hf path currently ignores
+# ExportConfig.output_logits_on_prefill=False and unconditionally exports
+# logits from prefill signatures.
+#
+# LiteRT-LM 0.12 expects prefill outputs to contain KV cache tensors only.
+#
+# patch-litert-torch.py MUST be the exact fail-closed patch validated during
+# UAT. It must refuse to modify an unexpected upstream source layout.
+#
+COPY model-converter/patch-litert-torch.py /tmp/patch-litert-torch.py
+
+RUN set -eux; \
+    /opt/model-converter/bin/python /tmp/patch-litert-torch.py; \
+    rm -f /tmp/patch-litert-torch.py
+
+#
+# Post-conversion contract verifier.
+#
+# For generic LLM artifacts it verifies:
+#   - the LiteRT-LM container is readable;
+#   - prefill signatures expose KV-cache outputs only;
+#   - decode exposes logits;
+#   - incompatible artifacts fail closed before device UAT.
+#
+COPY model-converter/verify-litertlm.py /usr/local/bin/verify-litertlm
+
+RUN chmod 0755 /usr/local/bin/verify-litertlm \
+    && /opt/model-converter/bin/python -m py_compile \
+        /usr/local/bin/verify-litertlm
+
+#
+# OpenCode entrypoint.
+#
 COPY model-converter/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
     && chown -R opencode:opencode \
         /home/opencode \
         /workspace \
-    && install -d \
         /tmp/opencode
 
 ENV HOME=/home/opencode
@@ -154,13 +217,21 @@ WORKDIR /workspace
 
 USER opencode
 
+#
+# Build-time smoke test.
+#
 RUN set -eux; \
     python --version; \
     pip --version; \
     adb version; \
     java -version; \
     bazel --version; \
+    docker-helper version; \
+    litert --help >/dev/null; \
+    litert-lm-peek --help >/dev/null; \
     python -c 'import torch; print("torch", torch.__version__)'; \
-    python -c 'import litert_torch; print("litert_torch ok")'
+    python -c 'import litert_torch; print("litert_torch ok")'; \
+    python -c 'import importlib.metadata as m; print("litert-torch-nightly", m.version("litert-torch-nightly")); print("litert-cli-nightly", m.version("litert-cli-nightly")); print("litert-lm-builder", m.version("litert-lm-builder")); print("ai-edge-litert", m.version("ai-edge-litert"))'; \
+    pip check
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
