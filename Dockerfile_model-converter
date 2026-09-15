@@ -81,7 +81,10 @@ RUN groupadd --gid 1000 opencode \
     && install -d \
         -m 0755 \
         /etc/opencode \
-        /workspace
+        /workspace \
+        /home/opencode/.cache \
+        /home/opencode/.config \
+        /home/opencode/.local/share/opencode
 
 #
 # docker-helper.
@@ -141,7 +144,9 @@ COPY model-converter/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
     && chown -R opencode:opencode \
         /home/opencode \
-        /workspace
+        /workspace \
+    && install -d \
+        /tmp/opencode
 
 ENV HOME=/home/opencode
 
