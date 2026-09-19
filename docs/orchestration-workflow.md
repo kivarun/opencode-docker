@@ -275,6 +275,63 @@ orchestrator resume \
   helper output streamed to stderr; the exit code is the outcome's exit
   code.
 
+## The production pipeline v2 wait-response CLI (`orchestrator respond`)
+
+`orchestrator respond` records the user's answer to one durably open wait.
+It is deliberately not a runner: it loads no pipeline bundle, no profiles,
+no Launcher credential, and no Docker Helper configuration, spawns no
+subprocess, and registers no signal handler. The durable state and the
+run-owned wait manifests are the only inputs.
+
+```
+orchestrator respond \
+  --run-id SAFE_ID \
+  --wait-index POSITIVE_INTEGER \
+  --action SAFE_ID \
+  [--json]
+```
+
+- All three values are required singletons; `--run-id` and `--action` are
+  validated against the shared pipeline v2 safe-id grammar, and
+  `--wait-index` must be a canonical positive decimal integer (no sign,
+  leading zeros, fraction, exponent, whitespace, or overflow). `--json`
+  takes no value. Every fresh-run and resume flag, every target/digest/body
+  flag, and every unknown flag or positional argument is rejected; parse
+  and configuration failures exit 2 before any filesystem access.
+- Only the state-root projection is resolved (the same environment resolver
+  `run` and `resume` use). The fixed preflight is read-only: shape
+  validation, read-only state-root verification, the fixed
+  `<state-root>/pipeline-runs/<run-id>` layout, the local/daemon run-root
+  projection as one real canonical 0700 object, the read-only
+  `PipelineV2RunStateSink.open`, and then the wait controller's structured
+  action path (`recordPipelineV2WaitAction`). The routing target is never
+  caller-supplied: it is the durable request's own `actions[].to` for the
+  chosen action id.
+- Success requires exactly one situation: the run is `waiting`, the last
+  wait is open, its index matches `--wait-index`, the durable request is
+  coherent, and the action id is declared by that request. An
+  already-answered wait accepts only the identical answer (idempotent
+  success, zero new dispatch); a different action is a conflict without
+  writes. Missing/foreign state, active/publishing/final states, other
+  wait indexes, undeclared actions, tampered manifests, and layout or
+  projection mismatches are refused with the run tree byte-identical.
+- Durability semantics: the response file is published before the durable
+  `wait_response_recorded` commit; a `not_committed` dispatch leaves the
+  published manifest as an orphan with the run still waiting, and the exact
+  retry completes the commit; a `durability_unknown` adopts the visible
+  candidate and poisons the loaded sink so nothing further dispatches in
+  this process. There is no multi-process locking: concurrent responders
+  race under the wait store's exclusive-link idempotency and the sink's
+  in-process dispatch serialization.
+- Recording a response never continues the pipeline: it moves the run from
+  `waiting` back to `active` at the declared target state. Continuation is
+  the separate existing command `orchestrator resume`; there is no
+  respond-and-resume.
+- Human mode prints one content-free summary line (`orchestrator: respond
+  ok|failed (...)`); `--json` writes exactly one JSON
+  `PipelineV2WaitResponseOutcome` plus a newline to stdout; the exit code
+  is the outcome's exit code.
+
 ## Pipelines (schema version 1: loader, validator, multi-state execution plan)
 
 `orchestrator/src/pipeline.ts` implements the declarative pipeline contract:

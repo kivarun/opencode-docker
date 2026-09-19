@@ -38,11 +38,20 @@ export interface ParsedPipelineResumeArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineRespondArgs {
+  readonly kind: "respond";
+  readonly runId: string;
+  readonly waitIndex: number;
+  readonly actionId: string;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
   | ParsedPipelineRunArgs
-  | ParsedPipelineResumeArgs;
+  | ParsedPipelineResumeArgs
+  | ParsedPipelineRespondArgs;
 
 export function usage(): string {
   return [
@@ -65,6 +74,10 @@ export function usage(): string {
     "               from its clean active boundary: existing run root -> durable state ->",
     "               restored runtime context -> agent/decision activations -> terminal ->",
     "               published run outputs",
+    "  respond      production pipeline v2 wait response: record the user's answer to",
+    "               one durably open wait (request manifest -> response manifest ->",
+    "               durable wait_response_recorded); the pipeline is NOT continued -",
+    "               continuation is the separate 'orchestrator resume' command",
     "",
     "common flags:",
     "  --workspace PATH        workspace passed to 'docker-helper session create'; must exist",
@@ -99,6 +112,27 @@ export function usage(): string {
     "  --json                  print exactly one JSON PipelineV2RunOutcome document on stdout",
     "                          (no progress lines); worker and image-pull output is forwarded",
     "                          to stderr; the exit code is the outcome's exit code.",
+    "",
+    "respond flags (production pipeline v2 wait response):",
+    "  --run-id SAFE_ID        the run id of the durably waiting run; required; a safe",
+    "                          identifier (letters, digits, '_', '.', '-', at most 128",
+    "                          characters)",
+    "  --wait-index N          the wait journal index of the open wait; required; a",
+    "                          positive decimal integer without sign, leading zeros,",
+    "                          fraction, exponent or whitespace",
+    "  --action SAFE_ID        one action id declared by that wait's request; required.",
+    "                          The routing target is never caller-supplied: it is",
+    "                          always the request's own declaration for that action.",
+    "  --json                  print exactly one JSON PipelineV2WaitResponseOutcome",
+    "                          document on stdout; the exit code is the outcome's",
+    "                          exit code.",
+    "",
+    "  respond records the answer durably (state waiting -> active at the declared",
+    "  target) and never continues the pipeline: run 'orchestrator resume' to",
+    "  continue. respond needs no config-root, no Launcher credential and no Docker",
+    "  Helper configuration; it accepts no fresh-run or resume flags, no target",
+    "  state, no digests and no JSON body. Repeating the same answer is an",
+    "  idempotent success; repeating with a different action is a conflict.",
     "",
     "resume flags (production pipeline v2 continuation):",
     "  --run-id SAFE_ID        the run id of the already durable run; required; a safe",
@@ -139,7 +173,8 @@ export function usage(): string {
     "  the resolver, and the runner itself verifies kind, canonical form, identity",
     "  and mode 0700. The same resolution applies to 'resume', which additionally",
     "  requires the existing run root <state-root>/pipeline-runs/<run-id> to exist",
-    "  unchanged (it is never created or chmodded by resume).",
+    "  unchanged (it is never created or chmodded by resume). The same resolution",
+    "  applies to 'respond'.",
     "",
     "run profiles and worker configuration:",
     "  The pipeline's agent states select the profiles; the worker image, the",
@@ -170,9 +205,11 @@ export function usage(): string {
     "Launcher authentication and before any child Session is created.",
     "",
     "agent-smoke is the v1 diagnostic command; the production pipeline v2 path is",
-    "'orchestrator run', and 'orchestrator resume' continues an already durable run",
+    "'orchestrator run', 'orchestrator resume' continues an already durable run",
     "from its clean active boundary (the run id and the configuration root are the",
-    "only user inputs of a resume).",
+    "only user inputs of a resume), and 'orchestrator respond' records the user's",
+    "answer to one durably open wait (the run id, the wait index and the action id",
+    "are the only user inputs of a response).",
     "",
     "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
     "input path come only from the pipeline's agent state, the worker image comes",
@@ -246,7 +283,7 @@ function parseValue(argv: string[], i: number, flag: string): { value: string; n
 }
 
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -254,6 +291,9 @@ export function parseCommand(
   }
   if (kind === "resume") {
     return parseResumeArgs(argv);
+  }
+  if (kind === "respond") {
+    return parseRespondArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;
@@ -593,6 +633,139 @@ function parseResumeArgs(argv: string[]): ParsedPipelineResumeArgs {
     runId,
     configRoot,
     launcherId,
+    json,
+  };
+}
+
+/**
+ * The canonical positive decimal safe-integer grammar for `--wait-index`:
+ * one or more digits with no leading zero, no sign, no whitespace, no
+ * fraction and no exponent, whose numeric value is a safe integer. The
+ * parser rejects everything else before any filesystem access.
+ */
+function parsePositiveDecimalSafeInteger(value: string, flag: string): number {
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(
+      `${flag} must be a positive decimal integer without sign, leading zeros, fraction, exponent or whitespace`,
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${flag} exceeds the safe integer range`);
+  }
+  return parsed;
+}
+
+/**
+ * Parses the production pipeline v2 wait-response command. The
+ * user-facing contract: `--run-id` (safe-id validated), `--wait-index`
+ * (canonical positive decimal safe integer) and `--action` (safe-id
+ * validated) are required singletons; `--json` takes no value and cannot
+ * repeat. The caller can never pass a target state, a request digest, a
+ * response digest or a JSON body: every fresh-run and resume flag is
+ * rejected for `respond`, as is every unknown flag or positional argument.
+ */
+function parseRespondArgs(argv: string[]): ParsedPipelineRespondArgs {
+  let runId: string | null = null;
+  let waitIndex: number | null = null;
+  let actionId: string | null = null;
+  let json = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      if (runId !== null) {
+        throw new Error("--run-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      const { value, next } = parseValue(argv, i, "--wait-index");
+      if (waitIndex !== null) {
+        throw new Error("--wait-index may be given at most once");
+      }
+      waitIndex = parsePositiveDecimalSafeInteger(value, "--wait-index");
+      i = next;
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      const { value, next } = parseValue(argv, i, "--action");
+      if (actionId !== null) {
+        throw new Error("--action may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--action");
+      } catch (cause) {
+        throw new Error(
+          `--action must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      actionId = value;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      throw new Error(
+        "respond does not accept --config-root; the durable wait request already binds the actions",
+      );
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      throw new Error(
+        "respond does not accept --launcher-id; the response command uses no Launcher credential",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "respond does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error("respond does not accept --project; the run-owned project copy already exists");
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error("respond does not accept --input; the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error("respond does not accept --workspace; no worker is launched by respond");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("respond does not accept --image; no worker is launched by respond");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error("respond does not accept --profile; no profile is loaded by respond");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("respond does not accept --task; there is no task input on a response");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "respond does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "respond does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for respond");
+  }
+  if (waitIndex === null) {
+    throw new Error("--wait-index POSITIVE_INTEGER is required for respond");
+  }
+  if (actionId === null) {
+    throw new Error("--action SAFE_ID is required for respond");
+  }
+  return {
+    kind: "respond",
+    runId,
+    waitIndex,
+    actionId,
     json,
   };
 }

@@ -15,11 +15,13 @@ import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 import {
   enterPipelineV2Wait,
   PipelineV2WaitControllerError,
+  recordPipelineV2WaitAction,
   recordPipelineV2WaitResponse,
   type EnterPipelineV2WaitOptions,
   type PipelineV2WaitControllerFailureReason,
   type PipelineV2WaitControllerSink,
   type RecordedPipelineV2WaitResponse,
+  type RecordPipelineV2WaitActionOptions,
 } from "../src/pipeline_v2_wait_controller.ts";
 import { preparePipelineV2WaitRequest } from "../src/pipeline_v2_wait_manifest.ts";
 
@@ -1075,6 +1077,241 @@ test("30. no message-text classification exists in the controller source", async
   expect(source.includes("new RegExp")).toBe(false);
 });
 
+// --- the structured action path ---------------------------------------------
+
+async function answeredFixture(
+  mode: "raw" | "action",
+  actionId: string,
+): Promise<{ ctx: Ctx; result: RecordedPipelineV2WaitResponse }> {
+  const ctx = await setup();
+  await enterPipelineV2Wait({
+    runRoot: ctx.runRoot,
+    sink: ctx.sink,
+    reason: REASON,
+    actions: ACTIONS,
+  });
+  const waiting = ctx.sink.snapshot as PipelineV2RunState;
+  const result =
+    mode === "raw"
+      ? await recordPipelineV2WaitResponse({
+          runRoot: ctx.runRoot,
+          sink: ctx.sink,
+          waitIndex: 1,
+          raw: responseRaw(waiting, 1, actionId),
+        })
+      : await recordPipelineV2WaitAction({
+          runRoot: ctx.runRoot,
+          sink: ctx.sink,
+          waitIndex: 1,
+          actionId,
+        });
+  return { ctx, result };
+}
+
+test("A1. the structured action and the raw response produce one canonical manifest and one digest", async () => {
+  const raw = await answeredFixture("raw", "continue_stage");
+  const structured = await answeredFixture("action", "continue_stage");
+  try {
+    const rawBytes = await readFile(join(raw.ctx.waits, "1.response.json"), "utf8");
+    const structuredBytes = await readFile(join(structured.ctx.waits, "1.response.json"), "utf8");
+    expect(structuredBytes).toBe(rawBytes);
+    const rawState = raw.ctx.sink.snapshot as PipelineV2RunState;
+    const structuredState = structured.ctx.sink.snapshot as PipelineV2RunState;
+    expect(structuredState.waits[0]!.response!.response_sha256).toBe(
+      rawState.waits[0]!.response!.response_sha256,
+    );
+    expect(structured.result.response_sha256).toBe(raw.result.response_sha256);
+    expect(structured.result.request_sha256).toBe(raw.result.request_sha256);
+    expect(structured.result.action_id).toBe(raw.result.action_id);
+    expect(structured.result.action_to).toBe(raw.result.action_to);
+    expect(
+      parsePipelineV2RunState(await readFile(structured.ctx.statePath, "utf8")).waits,
+    ).toEqual(parsePipelineV2RunState(await readFile(raw.ctx.statePath, "utf8")).waits);
+  } finally {
+    await dispose(raw.ctx);
+    await dispose(structured.ctx);
+  }
+});
+
+test("A2. both paths dispatch exactly one wait_response_recorded with the same payload", async () => {
+  const raw = await answeredFixture("raw", "continue_stage");
+  const structured = await answeredFixture("action", "continue_stage");
+  try {
+    for (const fixture of [raw, structured]) {
+      const state = fixture.ctx.sink.snapshot as PipelineV2RunState;
+      expect(state.waits[0]!.response!.action_id).toBe("continue_stage");
+      expect(state.status).toBe("active");
+      expect(state.cursor.current_state).toBe("ship");
+      expect(parsePipelineV2RunState(await readFile(fixture.ctx.statePath, "utf8"))).toEqual(state);
+    }
+  } finally {
+    await dispose(raw.ctx);
+    await dispose(structured.ctx);
+  }
+});
+
+test("A3. the action target is derived only from the request; a caller target is structurally impossible", async () => {
+  const ctx = await setup();
+  try {
+    await enterPipelineV2Wait({
+      runRoot: ctx.runRoot,
+      sink: ctx.sink,
+      reason: REASON,
+      actions: ACTIONS,
+    });
+    const hostile = {
+      runRoot: ctx.runRoot,
+      sink: ctx.sink,
+      waitIndex: 1,
+      actionId: "continue_stage",
+      target: "hijacked",
+      action_to: "hijacked",
+      to: "hijacked",
+    } as unknown as RecordPipelineV2WaitActionOptions;
+    const result = await recordPipelineV2WaitAction(hostile);
+    expect(result.action_to).toBe("ship");
+    expect(result.action_id).toBe("continue_stage");
+    const state = ctx.sink.snapshot as PipelineV2RunState;
+    expect(state.cursor.current_state).toBe("ship");
+  } finally {
+    await dispose(ctx);
+  }
+});
+
+test("A4. an undeclared action is rejected with zero filesystem writes and zero dispatch", async () => {
+  const ctx = await setup();
+  try {
+    await enterPipelineV2Wait({
+      runRoot: ctx.runRoot,
+      sink: ctx.sink,
+      reason: REASON,
+      actions: ACTIONS,
+    });
+    const stateBefore = ctx.sink.snapshot as PipelineV2RunState;
+    const stateBytes = await readFile(ctx.statePath, "utf8");
+    const waitsBefore = (await readdir(ctx.waits)).sort();
+    const commitsBefore = ctx.counts.renames;
+    let cause: unknown = null;
+    try {
+      await recordPipelineV2WaitAction({
+        runRoot: ctx.runRoot,
+        sink: ctx.sink,
+        waitIndex: 1,
+        actionId: "CANARY_undeclared",
+      });
+    } catch (caught) {
+      cause = caught;
+    }
+    expectControllerError(cause, "invalid_response", "record_response");
+    expect(ctx.counts.renames).toBe(commitsBefore);
+    expect((await readdir(ctx.waits)).sort()).toEqual(waitsBefore);
+    expect(await readFile(ctx.statePath, "utf8")).toBe(stateBytes);
+    expect(ctx.sink.snapshot).toBe(stateBefore);
+    expect((await readdir(ctx.waits)).filter((name) => name.includes("response"))).toEqual([]);
+  } finally {
+    await dispose(ctx);
+  }
+});
+
+test("A5. two action ids with one shared target are valid and differ by digest and action id", async () => {
+  const first = await answeredFixture("action", "continue_stage");
+  const second = await answeredFixture("action", "revise_task");
+  try {
+    expect(first.result.action_id).toBe("continue_stage");
+    expect(second.result.action_id).toBe("revise_task");
+    expect(first.result.action_to).toBe("ship");
+    expect(second.result.action_to).toBe("ship");
+    expect(second.result.response_sha256).not.toBe(first.result.response_sha256);
+    expect(second.result.request_sha256).toBe(first.result.request_sha256);
+    const firstBytes = await readFile(join(first.ctx.waits, "1.response.json"), "utf8");
+    const secondBytes = await readFile(join(second.ctx.waits, "1.response.json"), "utf8");
+    expect(secondBytes).not.toBe(firstBytes);
+    expect(JSON.parse(secondBytes).action_id).toBe("revise_task");
+  } finally {
+    await dispose(first.ctx);
+    await dispose(second.ctx);
+  }
+});
+
+test("A6. the structured path reads only the validated option surface; hostile getters stay silent", async () => {
+  const ctx = await setup();
+  try {
+    await enterPipelineV2Wait({
+      runRoot: ctx.runRoot,
+      sink: ctx.sink,
+      reason: REASON,
+      actions: ACTIONS,
+    });
+    const trapHits: string[] = [];
+    const hostileOptions = new Proxy(
+      {
+        runRoot: ctx.runRoot,
+        sink: ctx.sink,
+        waitIndex: 1,
+        actionId: "continue_stage",
+      },
+      {
+        get(target, property, receiver) {
+          trapHits.push(String(property));
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const result = await recordPipelineV2WaitAction(hostileOptions);
+    expect(result.action_to).toBe("ship");
+    expect(trapHits.sort()).toEqual(["actionId", "runRoot", "sink", "waitIndex"]);
+  } finally {
+    await dispose(ctx);
+  }
+});
+
+test("A7. repeating the structured answer after the raw answer is an idempotent success with zero dispatch", async () => {
+  const { ctx, result: rawResult } = await answeredFixture("raw", "continue_stage");
+  try {
+    const stateBefore = ctx.sink.snapshot as PipelineV2RunState;
+    const responseIdentity = await fileIdentity(join(ctx.waits, "1.response.json"));
+    const structured = await recordPipelineV2WaitAction({
+      runRoot: ctx.runRoot,
+      sink: ctx.sink,
+      waitIndex: 1,
+      actionId: "continue_stage",
+    });
+    expect(structured.wait_index).toBe(1);
+    expect(structured.response_sha256).toBe(rawResult.response_sha256);
+    expect(structured.action_to).toBe(rawResult.action_to);
+    expect(ctx.sink.snapshot).toBe(stateBefore);
+    expect(await fileIdentity(join(ctx.waits, "1.response.json"))).toEqual(responseIdentity);
+  } finally {
+    await dispose(ctx);
+  }
+});
+
+test("A8. repeating with a different structured action is a conflict without writes", async () => {
+  const { ctx } = await answeredFixture("action", "continue_stage");
+  try {
+    const stateBefore = ctx.sink.snapshot as PipelineV2RunState;
+    const stateBytes = await readFile(ctx.statePath, "utf8");
+    const responseIdentity = await fileIdentity(join(ctx.waits, "1.response.json"));
+    let cause: unknown = null;
+    try {
+      await recordPipelineV2WaitAction({
+        runRoot: ctx.runRoot,
+        sink: ctx.sink,
+        waitIndex: 1,
+        actionId: "revise_task",
+      });
+    } catch (caught) {
+      cause = caught;
+    }
+    expectControllerError(cause, "wait_conflict", "record_response");
+    expect(ctx.sink.snapshot).toBe(stateBefore);
+    expect(await readFile(ctx.statePath, "utf8")).toBe(stateBytes);
+    expect(await fileIdentity(join(ctx.waits, "1.response.json"))).toEqual(responseIdentity);
+  } finally {
+    await dispose(ctx);
+  }
+});
+
 test("31. the public export surface carries no IO or test seams", async () => {
   const namespace = (await import("../src/pipeline_v2_wait_controller.ts")) as Record<
     string,
@@ -1083,6 +1320,7 @@ test("31. the public export surface carries no IO or test seams", async () => {
   expect(Object.keys(namespace).sort()).toEqual([
     "PipelineV2WaitControllerError",
     "enterPipelineV2Wait",
+    "recordPipelineV2WaitAction",
     "recordPipelineV2WaitResponse",
   ]);
 });

@@ -286,6 +286,135 @@ test("resume rejects every fresh-run flag, unknown flags and positional argument
   expect(() => parseCommand("resume", [...base, "positional"])).toThrow(/unknown argument: positional/);
 });
 
+// --- respond parsing -----------------------------------------------------------
+
+test("respond parses the exact grammar with both flag forms", () => {
+  const parsed = parseCommand("respond", [
+    "--run-id", "run-1.2_abc",
+    "--wait-index", "3",
+    "--action", "continue_stage",
+    "--json",
+  ]);
+  if (parsed.kind !== "respond") {
+    throw new Error("expected respond");
+  }
+  expect(parsed.runId).toBe("run-1.2_abc");
+  expect(parsed.waitIndex).toBe(3);
+  expect(parsed.actionId).toBe("continue_stage");
+  expect(parsed.json).toBe(true);
+
+  const minimal = parseCommand("respond", ["--run-id=rid_x", "--wait-index=1", "--action=a.b_c"]);
+  if (minimal.kind !== "respond") {
+    throw new Error("expected respond");
+  }
+  expect(minimal.runId).toBe("rid_x");
+  expect(minimal.waitIndex).toBe(1);
+  expect(minimal.actionId).toBe("a.b_c");
+  expect(minimal.json).toBe(false);
+});
+
+test("respond wait-index boundaries: 1 and MAX_SAFE_INTEGER accepted; every other form rejected", () => {
+  const accepted = (value: string): number => {
+    const parsed = parseCommand("respond", ["--run-id", "rid", "--wait-index", value, "--action", "a"]);
+    if (parsed.kind !== "respond") {
+      throw new Error("expected respond");
+    }
+    return parsed.waitIndex;
+  };
+  expect(accepted("1")).toBe(1);
+  expect(accepted(String(Number.MAX_SAFE_INTEGER))).toBe(Number.MAX_SAFE_INTEGER);
+  expect(accepted("9007199254740991")).toBe(9007199254740991);
+
+  const rejected = (value: string): void => {
+    expect(() => parseCommand("respond", ["--run-id", "rid", "--wait-index", value, "--action", "a"])).toThrow();
+  };
+  rejected("0");
+  rejected("-1");
+  rejected("+1");
+  rejected("01");
+  rejected("1.5");
+  rejected("1e3");
+  rejected(" 1");
+  rejected("1 ");
+  rejected("");
+  rejected("abc");
+  rejected("9007199254740992"); // 2^53: the first unsafe integer
+  rejected("99999999999999999999"); // overflow
+});
+
+test("respond rejects missing, duplicate and unsafe required values", () => {
+  expect(() => parseCommand("respond", [])).toThrow(/--run-id SAFE_ID is required/);
+  expect(() => parseCommand("respond", ["--run-id", "rid"])).toThrow(/--wait-index POSITIVE_INTEGER is required/);
+  expect(() => parseCommand("respond", ["--run-id", "rid", "--wait-index", "1"])).toThrow(
+    /--action SAFE_ID is required/,
+  );
+  expect(() => parseCommand("respond", ["--wait-index", "1", "--action", "a"])).toThrow(
+    /--run-id SAFE_ID is required/,
+  );
+  expect(() => parseCommand("respond", ["--run-id", "a", "--run-id", "b", "--wait-index", "1", "--action", "a"])).toThrow(
+    /--run-id may be given at most once/,
+  );
+  expect(() => parseCommand("respond", ["--run-id", "rid", "--wait-index", "1", "--wait-index", "2", "--action", "a"])).toThrow(
+    /--wait-index may be given at most once/,
+  );
+  expect(() => parseCommand("respond", ["--run-id", "rid", "--wait-index", "1", "--action", "a", "--action", "b"])).toThrow(
+    /--action may be given at most once/,
+  );
+  expect(() => parseCommand("respond", ["--run-id", "bad/id", "--wait-index", "1", "--action", "a"])).toThrow(
+    /--run-id must be a safe identifier/,
+  );
+  expect(() => parseCommand("respond", ["--run-id", "rid", "--wait-index", "1", "--action", "bad id"])).toThrow(
+    /--action must be a safe identifier/,
+  );
+  expect(() => parseCommand("respond", ["--run-id", "rid", "--wait-index", "1", "--action", "a", "--json", "--json"])).toThrow(
+    /--json may be given at most once/,
+  );
+  expect(() => parseCommand("respond", ["--run-id", "rid", "--wait-index", "1", "--action", "a", "--json=x"])).toThrow(
+    /--json does not take a value/,
+  );
+});
+
+test("respond rejects fresh-run and resume flags, unknown flags and positional arguments", () => {
+  const base = ["--run-id", "rid", "--wait-index", "1", "--action", "a"];
+  expect(() => parseCommand("respond", [...base, "--config-root", "/c"])).toThrow(
+    /respond does not accept --config-root/,
+  );
+  expect(() => parseCommand("respond", [...base, "--launcher-id", "dhl_x"])).toThrow(
+    /respond does not accept --launcher-id; the response command uses no Launcher credential/,
+  );
+  expect(() => parseCommand("respond", [...base, "--pipeline-root", "/p"])).toThrow(
+    /respond does not accept --pipeline-root/,
+  );
+  expect(() => parseCommand("respond", [...base, "--project", "/p"])).toThrow(/respond does not accept --project/);
+  expect(() => parseCommand("respond", [...base, "--input", "a=/p"])).toThrow(/respond does not accept --input/);
+  expect(() => parseCommand("respond", [...base, "--workspace", "/w"])).toThrow(
+    /respond does not accept --workspace; no worker is launched by respond/,
+  );
+  expect(() => parseCommand("respond", [...base, "--image", "x:1"])).toThrow(/respond does not accept --image/);
+  expect(() => parseCommand("respond", [...base, "--profile", "coder"])).toThrow(
+    /respond does not accept --profile/,
+  );
+  expect(() => parseCommand("respond", [...base, "--task", "TASK.md"])).toThrow(/respond does not accept --task/);
+  expect(() => parseCommand("respond", [...base, "--state-root", "/s"])).toThrow(
+    /respond does not accept --state-root/,
+  );
+  expect(() => parseCommand("respond", [...base, "--daemon-state-root", "/s"])).toThrow(
+    /respond does not accept --daemon-state-root/,
+  );
+  expect(() => parseCommand("respond", [...base, "--target", "ship"])).toThrow(/unknown argument: --target/);
+  expect(() => parseCommand("respond", [...base, "--request-digest", "a"])).toThrow(/unknown argument/);
+  expect(() => parseCommand("respond", [...base, "--response-digest", "a"])).toThrow(/unknown argument/);
+  expect(() => parseCommand("respond", [...base, "positional"])).toThrow(/unknown argument: positional/);
+});
+
+test("usage documents the production pipeline v2 respond command", () => {
+  const text = usage();
+  expect(text).toContain("'orchestrator respond'");
+  expect(text).toContain("respond flags (production pipeline v2 wait response):");
+  expect(text).toContain("--wait-index N");
+  expect(text).toContain("the pipeline is NOT continued");
+});
+
 test("usage documents the production pipeline v2 resume command", () => {
   const text = usage();
   expect(text).toContain("'orchestrator resume'");

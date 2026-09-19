@@ -15,6 +15,12 @@
  *   configuration root are the only user inputs; the pipeline, the project
  *   copy, the input snapshot and the accepted outputs come only from the
  *   durable state and the run-owned layout.
+ * - `respond` — the production wait-response command: it resolves only the
+ *   state-root projection (the same resolver; deliberately no helper
+ *   configuration, no auth, no subprocess and no signal registration) and
+ *   invokes `respondPipelineV2Wait` exactly once. The run id, the wait
+ *   index and the action id are the only user inputs; the routing target
+ *   comes only from the durable wait request.
  *
  * The dispatcher is testable through per-call dependency injection
  * (`runCli(argv, io)`); no module-global mutable state exists.
@@ -41,6 +47,10 @@ import {
   type PipelineV2RunOutcome,
   type PipelineV2RunnerDeps,
 } from "./pipeline_v2_runner.ts";
+import {
+  respondPipelineV2Wait,
+  type PipelineV2WaitResponseOutcome,
+} from "./pipeline_v2_wait_respond.ts";
 
 /**
  * The per-call seam of the dispatcher. The production default builds one
@@ -57,6 +67,7 @@ export interface CliIo {
   resolveStateRootProjection: typeof resolvePipelineV2StateRootProjection;
   runPipelineV2: typeof runPipelineV2;
   resumePipelineV2: typeof resumePipelineV2;
+  respondPipelineV2Wait: typeof respondPipelineV2Wait;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
   /** One raw write to the real stdout; the caller adds the trailing newline. */
@@ -78,6 +89,7 @@ function productionCliIo(): CliIo {
     resolveStateRootProjection: resolvePipelineV2StateRootProjection,
     runPipelineV2,
     resumePipelineV2,
+    respondPipelineV2Wait,
     runSmoke,
     runAgentSmoke,
     writeStdout: (text) => process.stdout.write(text),
@@ -109,7 +121,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -118,7 +130,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "smoke" &&
     command !== "agent-smoke" &&
     command !== "run" &&
-    command !== "resume"
+    command !== "resume" &&
+    command !== "respond"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -149,6 +162,13 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // CLI-configuration boundary and per-call dependency assembly, then
     // exactly one `resumePipelineV2` invocation.
     return await runPipelineV2ResumeCommand(parsed, io);
+  }
+  if (parsed.kind === "respond") {
+    // The production pipeline v2 wait-response command: it resolves only
+    // the state-root projection (no helper configuration, no auth, no
+    // subprocess, no signal registration) and invokes the response
+    // production API exactly once.
+    return await runPipelineV2RespondCommand(parsed, io);
   }
 
   const config = io.resolveHelperConfig(io.baseEnv);
@@ -308,6 +328,58 @@ async function runPipelineV2ResumeCommand(
   );
 
   return reportPipelineV2Outcome("resume", parsed.json, outcome, io);
+}
+
+/**
+ * The production pipeline v2 wait-response command: parse already done.
+ * Only the state-root projection is resolved inside the protected
+ * CLI-configuration boundary (the same env resolver `run` and `resume`
+ * use); the helper configuration is deliberately NOT resolved because the
+ * response command carries no Launcher credential, no Docker Helper
+ * transport and no signal lifecycle. Any resolution failure is exit 2
+ * with the usage text and the production API never called.
+ */
+async function runPipelineV2RespondCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "respond" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2WaitResponseOutcome = await io.respondPipelineV2Wait(
+    {
+      runId: parsed.runId,
+      waitIndex: parsed.waitIndex,
+      actionId: parsed.actionId,
+    },
+    { stateRootProjection },
+  );
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: respond ok (run ${outcome.runId}, wait ${outcome.waitIndex}, action ${outcome.actionId}, to ${outcome.actionTo}, state ${outcome.runRoot}/state.json)`,
+    );
+  } else if (outcome.runRoot !== null) {
+    io.writeError(
+      `orchestrator: respond failed (run ${outcome.runId}, reason ${outcome.reason}, state ${outcome.runRoot}/state.json)`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: respond failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
 }
 
 function reportPipelineV2Outcome(

@@ -3,6 +3,7 @@ import { runCli, type CliIo } from "../src/main.ts";
 import type { CliResult, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
 import { resolveHelperConfig } from "../src/launcher.ts";
 import type { PipelineV2RunOutcome } from "../src/pipeline_v2_runner.ts";
+import type { PipelineV2WaitResponseOutcome } from "../src/pipeline_v2_wait_respond.ts";
 
 const CANARY_SECRET = "CANARY-SECRET-dhsec9f1";
 
@@ -43,6 +44,9 @@ function makeIo(): Recorder {
     resumePipelineV2: (async () => {
       throw new Error("fake resumePipelineV2 not configured");
     }) as unknown as CliIo["resumePipelineV2"],
+    respondPipelineV2Wait: (async () => {
+      throw new Error("fake respondPipelineV2Wait not configured");
+    }) as unknown as CliIo["respondPipelineV2Wait"],
     runSmoke: (async () => {
       throw new Error("fake runSmoke not configured");
     }) as unknown as CliIo["runSmoke"],
@@ -590,6 +594,205 @@ test("resume exit codes 0/1/130/143 pass through unchanged", async () => {
     const exit = await runCli(RESUME_ARGS, io);
     expect(exit).toBe(code);
   }
+});
+
+// --- respond dispatcher ---------------------------------------------------------
+
+const RESPOND_ARGS = ["respond", "--run-id", "rid-1", "--wait-index", "1", "--action", "continue_stage", "--json"];
+
+function respondOutcome(overrides: Record<string, unknown>): PipelineV2WaitResponseOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    runId: "rid-1",
+    runRoot: "/state/root/pipeline-runs/rid-1",
+    waitIndex: 1,
+    actionId: "continue_stage",
+    actionTo: "ship",
+    requestSha256: "a".repeat(64),
+    responseSha256: "b".repeat(64),
+    state: null,
+    ...overrides,
+  } as unknown as PipelineV2WaitResponseOutcome;
+}
+
+test("respond dispatches exactly once to respondPipelineV2Wait with the exact options mapping", async () => {
+  const { io, err } = makeIo();
+  const calls: Array<{ options: unknown; deps: unknown }> = [];
+  io.respondPipelineV2Wait = (async (options: unknown, deps: unknown) => {
+    calls.push({ options, deps });
+    return respondOutcome({});
+  }) as unknown as CliIo["respondPipelineV2Wait"];
+  io.runPipelineV2 = (async () => {
+    throw new Error("runPipelineV2 must not run");
+  }) as unknown as CliIo["runPipelineV2"];
+  io.resumePipelineV2 = (async () => {
+    throw new Error("resumePipelineV2 must not run");
+  }) as unknown as CliIo["resumePipelineV2"];
+
+  const exit = await runCli(RESPOND_ARGS, io);
+  expect(exit).toBe(0);
+  expect(calls.length).toBe(1);
+  const { options, deps } = calls[0]!;
+  expect(options).toEqual({ runId: "rid-1", waitIndex: 1, actionId: "continue_stage" });
+  expect(deps).toEqual({ stateRootProjection: { localRoot: "/state/root", daemonRoot: "/daemon/root" } });
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+});
+
+test("respond parse failures return exit 2 before any resolver, runner or subprocess call", async () => {
+  for (const argv of [
+    ["respond"],
+    ["respond", "--run-id", "rid"],
+    ["respond", "--run-id", "rid", "--wait-index", "1"],
+    ["respond", "--wait-index", "1", "--action", "a"],
+    ["respond", "--run-id", "bad/id", "--wait-index", "1", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "0", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "01", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "+1", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "1.5", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "1e3", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "1 ", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "99999999999999999999", "--action", "a"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "bad id"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--config-root", "/c"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--launcher-id", "dhl_x"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--pipeline-root", "/p"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--project", "/p"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--input", "a=/p"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--workspace", "/w"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--image", "x:1"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--profile", "coder"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--state-root", "/s"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--target", "ship"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "positional"],
+    ["respond", "--run-id", "rid", "--wait-index", "1", "--action", "a", "--unknown"],
+  ]) {
+    const { io, err } = makeIo();
+    let resolverCalls = 0;
+    let runnerCalls = 0;
+    let respondCalls = 0;
+    io.resolveStateRootProjection = () => {
+      resolverCalls += 1;
+      return { localRoot: "/state", daemonRoot: "/state" };
+    };
+    io.resolveHelperConfig = () => {
+      resolverCalls += 1;
+      return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+    };
+    io.runner.run = () => {
+      runnerCalls += 1;
+      return Promise.resolve({ code: 0 });
+    };
+    io.respondPipelineV2Wait = (async () => {
+      respondCalls += 1;
+      return respondOutcome({});
+    }) as unknown as CliIo["respondPipelineV2Wait"];
+    const exit = await runCli(argv, io);
+    expect(exit).toBe(2);
+    expect(resolverCalls).toBe(0);
+    expect(runnerCalls).toBe(0);
+    expect(respondCalls).toBe(0);
+    expect(err.join("\n")).not.toContain(CANARY_SECRET);
+  }
+});
+
+test("respond state-root resolution failure is a CLI configuration error (exit 2, no API call)", async () => {
+  const { io, err } = makeIo();
+  let respondCalls = 0;
+  io.respondPipelineV2Wait = (async () => {
+    respondCalls += 1;
+    return respondOutcome({});
+  }) as unknown as CliIo["respondPipelineV2Wait"];
+  io.resolveStateRootProjection = () => {
+    throw new Error("cannot build the orchestrator state root: set ORCHESTRATOR_STATE_ROOT (or XDG_STATE_HOME or HOME)");
+  };
+  const exit = await runCli(RESPOND_ARGS, io);
+  expect(exit).toBe(2);
+  expect(respondCalls).toBe(0);
+  expect(err.join("\n")).toContain("cannot build the orchestrator state root");
+});
+
+test("respond never resolves the helper configuration, runs no subprocess and registers no signal", async () => {
+  const { io, err, runnerCalls } = makeIo();
+  io.respondPipelineV2Wait = (async (_options: unknown, deps: unknown) => {
+    // the deps carry only the projection: no helper config, no cli, no auth
+    expect(deps).toEqual({ stateRootProjection: { localRoot: "/state/root", daemonRoot: "/daemon/root" } });
+    return respondOutcome({});
+  }) as unknown as CliIo["respondPipelineV2Wait"];
+  io.resolveHelperConfig = () => {
+    throw new Error("the helper configuration resolver must not be called by respond");
+  };
+  const exit = await runCli(RESPOND_ARGS, io);
+  expect(exit).toBe(0);
+  expect(runnerCalls).toEqual([]);
+  expect(err.join("\n")).not.toContain("must not be called by respond");
+});
+
+test("respond human mode prints the content-free summary lines", async () => {
+  const humanArgs = ["respond", "--run-id", "rid-1", "--wait-index", "1", "--action", "continue_stage"];
+  const { io, err, out } = makeIo();
+  io.respondPipelineV2Wait = (async () => respondOutcome({})) as unknown as CliIo["respondPipelineV2Wait"];
+  const exit = await runCli(humanArgs, io);
+  expect(exit).toBe(0);
+  expect(out).toEqual([]);
+  expect(err).toEqual([
+    "orchestrator: respond ok (run rid-1, wait 1, action continue_stage, to ship, state /state/root/pipeline-runs/rid-1/state.json)",
+  ]);
+
+  const { io: io2, err: err2 } = makeIo();
+  io2.respondPipelineV2Wait = (async () =>
+    respondOutcome({ ok: false, exitCode: 1, state: null, reason: "wait_conflict" })) as unknown as CliIo["respondPipelineV2Wait"];
+  const exit2 = await runCli(humanArgs, io2);
+  expect(exit2).toBe(1);
+  expect(err2).toEqual([
+    "orchestrator: respond failed (run rid-1, reason wait_conflict, state /state/root/pipeline-runs/rid-1/state.json)",
+  ]);
+
+  // a pre-layout refusal carries no run root and still prints one line
+  const { io: io3, err: err3 } = makeIo();
+  io3.respondPipelineV2Wait = (async () =>
+    respondOutcome({ ok: false, exitCode: 1, state: null, runRoot: null, reason: "run_layout_invalid" })) as unknown as CliIo["respondPipelineV2Wait"];
+  const exit3 = await runCli(humanArgs, io3);
+  expect(exit3).toBe(1);
+  expect(err3).toEqual([
+    "orchestrator: respond failed (run rid-1, reason run_layout_invalid)",
+  ]);
+});
+
+test("respond JSON mode prints exactly one outcome document on stdout", async () => {
+  const { io, out, err } = makeIo();
+  const result = respondOutcome({ ok: false, exitCode: 1, state: null, reason: "state_persist_failed" });
+  io.respondPipelineV2Wait = (async () => {
+    io.writeError("orchestrator: pipeline v2 wait response failed: state_persist_failed");
+    return result;
+  }) as unknown as CliIo["respondPipelineV2Wait"];
+  const exit = await runCli(RESPOND_ARGS, io);
+  expect(exit).toBe(1);
+  expect(out).toEqual([`${JSON.stringify(result)}\n`]);
+  expect(err).toContain("orchestrator: pipeline v2 wait response failed: state_persist_failed");
+  expect(out.join("")).not.toContain(CANARY_SECRET);
+  const document = JSON.parse(out[0]!) as Record<string, unknown>;
+  expect(Object.keys(document).sort()).toEqual(
+    ["actionId", "actionTo", "exitCode", "ok", "reason", "requestSha256", "responseSha256", "runId", "runRoot", "state", "waitIndex"].sort(),
+  );
+  expect(document.reason).toBe("state_persist_failed");
+});
+
+test("respond exit codes 0 and 1 pass through unchanged", async () => {
+  for (const code of [0, 1]) {
+    const { io } = makeIo();
+    io.respondPipelineV2Wait = (async () =>
+      respondOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["respondPipelineV2Wait"];
+    const exit = await runCli(RESPOND_ARGS, io);
+    expect(exit).toBe(code);
+  }
+});
+
+test("the respond command appears in the command list and unknown commands are still rejected", async () => {
+  const { io, err } = makeIo();
+  const exit = await runCli(["deploy"], io);
+  expect(exit).toBe(2);
+  expect(err.join("\n")).toContain("'orchestrator respond'");
 });
 
 test("resume deps.cli is wired to the single runner instance", async () => {

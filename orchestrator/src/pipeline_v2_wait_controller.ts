@@ -1,4 +1,5 @@
 import { basename } from "node:path";
+import { canonicalJson } from "./canonical_json.ts";
 import { isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import {
   PipelineV2StateError,
@@ -70,20 +71,30 @@ import {
  * authoritative snapshot is verified to carry exactly the same digest and
  * payload.
  *
- * Response flow (`recordPipelineV2WaitResponse`): the caller supplies only
- * the `waitIndex` and the raw response document. The controller requires
- * the durable wait record, reconstructs the request manifest exclusively
- * from the durable record, verifies or restores the canonical request file
- * (its digest must equal the durable `request_sha256`), accepts the raw
- * response through the manifest module against that request, and only then
- * publishes the response manifest and dispatches `wait_response_recorded`
- * with the digests and action id taken from the accepted manifests. The
- * routing target is never accepted from the caller; it is the accepted
- * response's `action_to`. A wait that already carries a durable response
- * accepts only the identical response (same action id and response
- * digest), verifies or restores both filesystem manifests, dispatches
- * nothing, and returns success — this works across restarts through the
- * durable record, not through object identity.
+ * Response flows: both public entrypoints converge into one internal
+ * chain before any filesystem publication or durable dispatch — the raw
+ * path `recordPipelineV2WaitResponse({runRoot, sink, waitIndex, raw})`
+ * accepts the caller's raw response document, and the structured path
+ * `recordPipelineV2WaitAction({runRoot, sink, waitIndex, actionId})`
+ * accepts only an action id and synthesizes the response manifest
+ * exclusively from the reconstructed request (the response fields
+ * `run_id`, `wait_index` and `request_sha256` come from the request; the
+ * serialization is the one shared canonical JSON serializer; the manifest
+ * module's own acceptance chain remains the only validator and digest
+ * builder). The chain requires the durable wait record, reconstructs the
+ * request manifest exclusively from the durable record, verifies or
+ * restores the canonical request file (its digest must equal the durable
+ * `request_sha256`), accepts the response through the manifest module
+ * against that request, and only then publishes the response manifest and
+ * dispatches `wait_response_recorded` with the digests and action id taken
+ * from the accepted manifests. The routing target is never accepted from
+ * the caller; it is the accepted response's `action_to`. A wait that
+ * already carries a durable response accepts only the identical response
+ * (same action id and response digest), verifies or restores both
+ * filesystem manifests, dispatches nothing, and returns success — this
+ * works across restarts through the durable record, not through object
+ * identity. A repeated response with a different action id is a typed
+ * conflict that writes nothing.
  *
  * Durability semantics: a wait-store failure before the dispatch leaves
  * the state untouched and dispatches nothing (`not_published` failures are
@@ -120,11 +131,15 @@ import {
  * content-free: no manifest bodies, action values, response documents,
  * facts, credentials or parser fragments.
  *
- * Not implemented (stays unwired): the coordinator, the production runner
- * and the CLI never call this module yet; the user response is supplied as
- * a raw string, never read from a file; resume, P01 validation, TASK
- * revision, iteration budgets, model-profile replacements, API/T3 and
- * migrations are later increments.
+ * Not implemented (stays unwired): the automatic continuation after a
+ * recorded response (continuation is the separate `orchestrator resume`
+ * command), the production mechanism that enters a wait, P01 validation,
+ * TASK revision, iteration budgets, model-profile replacements, API/T3 and
+ * migrations are later increments. There is no multi-process locking: two
+ * concurrent responders race under the wait store's exclusive-link
+ * idempotency (one wins, the loser conflicts) and under the sink's
+ * in-process dispatch serialization; cross-process coordination remains a
+ * documented limitation.
  */
 
 export interface PipelineV2WaitControllerSink {
@@ -190,6 +205,24 @@ export interface RecordPipelineV2WaitResponseOptions {
   readonly waitIndex: number;
   readonly raw: string;
 }
+
+export interface RecordPipelineV2WaitActionOptions {
+  readonly runRoot: string;
+  readonly sink: PipelineV2WaitControllerSink;
+  readonly waitIndex: number;
+  /** The declared action id; the routing target is never caller-supplied. */
+  readonly actionId: string;
+}
+
+/**
+ * The two public response sources converge into one internal chain before
+ * any filesystem publication or durable dispatch. The structured source
+ * carries only the caller's action id; the response document is
+ * synthesized exclusively from the reconstructed request.
+ */
+type ResponseSource =
+  | { readonly kind: "raw"; readonly raw: string }
+  | { readonly kind: "action"; readonly actionId: string };
 
 interface CapturedSink {
   readonly runRoot: string;
@@ -682,12 +715,47 @@ async function reenterOpenWait(
   });
 }
 
+/**
+ * The raw response path: the caller supplies the whole response document.
+ * It converges into the shared internal chain before any publication or
+ * dispatch, exactly like the structured action path.
+ */
 export async function recordPipelineV2WaitResponse(
   options: RecordPipelineV2WaitResponseOptions,
 ): Promise<RecordedPipelineV2WaitResponse> {
+  return await recordWaitResponseChain(options, { kind: "raw", raw: options.raw });
+}
+
+/**
+ * The structured action path: the caller supplies only the action id.
+ * The response manifest is synthesized exclusively from the reconstructed
+ * request — the fields `run_id`, `wait_index` and `request_sha256` come
+ * from the request, the serialization is the one shared canonical JSON
+ * serializer, and the manifest module's acceptance chain remains the only
+ * validator and digest builder. The routing target is derived only from
+ * the request's own action declaration; an undeclared action id is
+ * rejected by the same acceptance chain with zero filesystem writes.
+ */
+export async function recordPipelineV2WaitAction(
+  options: RecordPipelineV2WaitActionOptions,
+): Promise<RecordedPipelineV2WaitResponse> {
+  return await recordWaitResponseChain(options, { kind: "action", actionId: options.actionId });
+}
+
+/**
+ * The single internal response chain shared by the raw and structured
+ * public paths: capture boundary, wait-index/record checks, durable
+ * request verification or restoration, response acceptance through the
+ * manifest module, then the filesystem publication and the durable
+ * dispatch.
+ */
+async function recordWaitResponseChain(
+  options: unknown,
+  source: ResponseSource,
+): Promise<RecordedPipelineV2WaitResponse> {
   const ctx = captureBoundary(options, "record_response");
-  const runOptions = options as RecordPipelineV2WaitResponseOptions;
-  if (!isPositiveSafeInteger(runOptions.waitIndex)) {
+  const waitIndex = (options as { waitIndex?: unknown }).waitIndex;
+  if (!isPositiveSafeInteger(waitIndex)) {
     throw controllerError(
       "invalid_response",
       "record_response",
@@ -695,16 +763,25 @@ export async function recordPipelineV2WaitResponse(
       ctx.snapshot,
     );
   }
-  if (typeof runOptions.raw !== "string") {
+  if (source.kind === "raw") {
+    if (typeof source.raw !== "string") {
+      throw controllerError(
+        "invalid_response",
+        "record_response",
+        "the wait response must be a raw JSON document string",
+        ctx.snapshot,
+      );
+    }
+  } else if (typeof source.actionId !== "string" || source.actionId === "") {
     throw controllerError(
       "invalid_response",
       "record_response",
-      "the wait response must be a raw JSON document string",
+      "the wait response requires a non-empty action id",
       ctx.snapshot,
     );
   }
   const state = ctx.snapshot;
-  const record = state.waits.find((candidate) => candidate.index === runOptions.waitIndex);
+  const record = state.waits.find((candidate) => candidate.index === waitIndex);
   if (record === undefined) {
     throw controllerError(
       "invalid_response",
@@ -723,20 +800,30 @@ export async function recordPipelineV2WaitResponse(
     );
   }
   // The request manifest is reconstructed exclusively from the durable
-  // wait record; its canonical file is verified or restored first.
-  await verifyDurableRequestPublication(
+  // wait record; its canonical file is verified or restored first, and the
+  // returned prepared request is the one object every later step consumes.
+  const preparedRequest = await verifyDurableRequestPublication(
     ctx.runRoot,
     state,
     record,
     "record_response",
     currentSnapshot(ctx.sink),
   );
+  let raw: string;
+  if (source.kind === "raw") {
+    raw = source.raw;
+  } else {
+    raw = canonicalJson({
+      schema_version: 1,
+      run_id: preparedRequest.manifest.run_id,
+      wait_index: preparedRequest.manifest.wait_index,
+      request_sha256: preparedRequest.sha256,
+      action_id: source.actionId,
+    });
+  }
   let accepted: AcceptedPipelineV2WaitResponse;
   try {
-    accepted = acceptPipelineV2WaitResponse(
-      preparePipelineV2WaitRequest(waitManifestValue(state, record)),
-      runOptions.raw,
-    );
+    accepted = acceptPipelineV2WaitResponse(preparedRequest, raw);
   } catch (cause) {
     if (cause instanceof PipelineV2WaitManifestError) {
       throw controllerError(
@@ -749,9 +836,9 @@ export async function recordPipelineV2WaitResponse(
     throw cause;
   }
   if (record.response !== undefined) {
-    return await retryDurableResponse(ctx, runOptions, record, accepted);
+    return await retryDurableResponse(ctx, waitIndex, raw, record, accepted);
   }
-  return await recordFreshResponse(ctx, runOptions, record, accepted);
+  return await recordFreshResponse(ctx, waitIndex, raw, record, accepted);
 }
 
 /**
@@ -761,7 +848,8 @@ export async function recordPipelineV2WaitResponse(
  */
 async function retryDurableResponse(
   ctx: CapturedSink,
-  options: RecordPipelineV2WaitResponseOptions,
+  waitIndex: number,
+  raw: string,
   record: PipelineV2WaitRecord,
   accepted: AcceptedPipelineV2WaitResponse,
 ): Promise<RecordedPipelineV2WaitResponse> {
@@ -781,7 +869,7 @@ async function retryDurableResponse(
   }
   let published: Awaited<ReturnType<typeof publishPipelineV2WaitResponse>>;
   try {
-    published = await publishPipelineV2WaitResponse(ctx.runRoot, options.waitIndex, options.raw);
+    published = await publishPipelineV2WaitResponse(ctx.runRoot, waitIndex, raw);
   } catch (cause) {
     if (cause instanceof PipelineV2WaitStoreError) {
       throw waitStoreFailure(
@@ -818,13 +906,14 @@ async function retryDurableResponse(
  */
 async function recordFreshResponse(
   ctx: CapturedSink,
-  options: RecordPipelineV2WaitResponseOptions,
+  waitIndex: number,
+  raw: string,
   record: PipelineV2WaitRecord,
   accepted: AcceptedPipelineV2WaitResponse,
 ): Promise<RecordedPipelineV2WaitResponse> {
   let published: Awaited<ReturnType<typeof publishPipelineV2WaitResponse>>;
   try {
-    published = await publishPipelineV2WaitResponse(ctx.runRoot, options.waitIndex, options.raw);
+    published = await publishPipelineV2WaitResponse(ctx.runRoot, waitIndex, raw);
   } catch (cause) {
     if (cause instanceof PipelineV2WaitStoreError) {
       throw waitStoreFailure(
@@ -846,7 +935,7 @@ async function recordFreshResponse(
   }
   const command: PipelineV2RunCommand = {
     kind: "wait_response_recorded",
-    waitIndex: options.waitIndex,
+    waitIndex,
     expectedRequestSha256: record.request_sha256,
     actionId: accepted.manifest.action_id,
     responseSha256: accepted.sha256,
@@ -856,9 +945,9 @@ async function recordFreshResponse(
   } catch (cause) {
     if (cause instanceof PipelineV2StateError) {
       const after = currentSnapshot(ctx.sink);
-      if (after !== null && responseRecordMatches(after, options.waitIndex, accepted)) {
+      if (after !== null && responseRecordMatches(after, waitIndex, accepted)) {
         return deepFreeze({
-          wait_index: options.waitIndex,
+          wait_index: waitIndex,
           request_sha256: record.request_sha256,
           response_sha256: accepted.sha256,
           action_id: accepted.manifest.action_id,
@@ -892,7 +981,7 @@ async function recordFreshResponse(
     throw cause;
   }
   const after = currentSnapshot(ctx.sink);
-  if (after === null || !responseRecordMatches(after, options.waitIndex, accepted)) {
+  if (after === null || !responseRecordMatches(after, waitIndex, accepted)) {
     throw controllerError(
       "invalid_state",
       "record_response",
@@ -901,7 +990,7 @@ async function recordFreshResponse(
     );
   }
   return deepFreeze({
-    wait_index: options.waitIndex,
+    wait_index: waitIndex,
     request_sha256: record.request_sha256,
     response_sha256: accepted.sha256,
     action_id: accepted.manifest.action_id,
