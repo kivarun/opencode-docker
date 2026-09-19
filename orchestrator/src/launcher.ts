@@ -172,7 +172,10 @@ export async function deleteChildSession(
   sessionId: string,
   env: Record<string, string> = {},
 ): Promise<void> {
-  const args = [...operatorArgs(["delete"], config), "--id", sessionId];
+  // docker-helper 2.2.0-rc.10 grammar: the session id is the one required
+  // positional operand of `session delete` (the legacy `--id` flag is not
+  // part of the RC10 CLI surface).
+  const args = [...operatorArgs(["delete"], config), sessionId];
   const result = await cli(args, env, "capture");
   if (result.code !== 0) {
     throw new DockerHelperError(

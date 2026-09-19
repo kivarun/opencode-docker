@@ -274,7 +274,7 @@ function makeFakeCli(
       };
     }
     if (args[0] === "session" && args[1] === "delete") {
-      const id = args[args.indexOf("--id") + 1] ?? "";
+      const id = args[args.length - 1] ?? "";
       return {
         code: options.deleteCode ?? 0,
         stderr: options.deleteStderr,
@@ -521,7 +521,6 @@ test("6. a launcher ownership mismatch deletes the known session and throws", as
       "--endpoint",
       SOCKET,
       "--json",
-      "--id",
       "dhs_1",
     ]);
 
@@ -551,7 +550,6 @@ test("6. a launcher ownership mismatch deletes the known session and throws", as
       "--endpoint",
       SOCKET,
       "--json",
-      "--id",
       "dhs_2",
     ]);
     await execution2.cleanup();
@@ -594,7 +592,6 @@ test("6a. an Execution session mismatch with a failing delete surfaces cli_failu
       "--endpoint",
       SOCKET,
       "--json",
-      "--id",
       "dhs_1",
     ]);
   } finally {
@@ -639,7 +636,6 @@ test("6b. a Tool session mismatch with a failing delete surfaces cli_failure and
       "--endpoint",
       SOCKET,
       "--json",
-      "--id",
       "dhs_2",
     ]);
     // the fake fails every delete, so the deferred Execution cleanup also

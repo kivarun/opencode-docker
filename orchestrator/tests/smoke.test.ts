@@ -324,7 +324,7 @@ test("1. success: worker runs, artifact verified, session cleaned up, exit 0", a
 
     const deleteCalls = calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete");
     expect(deleteCalls.length).toBe(1);
-    expect(deleteCalls[0]?.args[deleteCalls[0].args.indexOf("--id") + 1] ?? "").toBe(CHILD_SESSION_ID);
+    expect(deleteCalls[0]?.args[deleteCalls[0].args.length - 1] ?? "").toBe(CHILD_SESSION_ID);
     operatorEnvClean(deleteCalls[0]!.env);
 
     const pull = calls.find((c) => c.args[0] === "pull")!;

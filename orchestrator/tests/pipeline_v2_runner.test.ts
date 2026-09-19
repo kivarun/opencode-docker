@@ -329,7 +329,7 @@ function makeFakeCli(runRootOf: () => string, script: CliScript): FakeTransport 
     }
     if (args[0] === "session" && args[1] === "delete") {
       deleteIndex += 1;
-      const id = args[args.indexOf("--id") + 1] ?? "";
+      const id = args[args.length - 1] ?? "";
       await script.onDelete?.(deleteIndex);
       return {
         code: script.deleteCode ?? 0,
@@ -382,7 +382,7 @@ function createCount(fake: FakeTransport): number {
 function deleteIds(fake: FakeTransport): string[] {
   return fake.calls
     .filter((call) => call.args[0] === "session" && call.args[1] === "delete")
-    .map((call) => call.args[call.args.indexOf("--id") + 1] ?? "");
+    .map((call) => call.args[call.args.length - 1] ?? "");
 }
 
 interface Captured {
@@ -466,7 +466,7 @@ async function runScript(
     }
     if (args[0] === "session" && args[1] === "delete") {
       deleteIndex += 1;
-      const id = args[args.indexOf("--id") + 1] ?? "";
+      const id = args[args.length - 1] ?? "";
       await script.onDelete?.(deleteIndex);
       return {
         code: script.deleteCode ?? 0,
@@ -1437,7 +1437,7 @@ test("F1f. the onSignal getter is read exactly once and the full run still succe
       };
     }
     if (args[0] === "session" && args[1] === "delete") {
-      const id = args[args.indexOf("--id") + 1] ?? "";
+      const id = args[args.length - 1] ?? "";
       return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id }) };
     }
     if (args[0] === "pull") {
