@@ -186,6 +186,21 @@ export interface GraphExecutionResult {
   trace: TransitionStep[];
 }
 
+/**
+ * The trusted resume seed of a pipeline v2 graph continuation: the durable
+ * cursor of an existing run. `current_state` must name a declared state of
+ * the compiled graph and `transition_count` must be a non-negative safe
+ * integer within the pipeline's transition budget — the budget is shared,
+ * so the seeded count plus the transitions of this invocation must fit it.
+ * The seed is captured (both fields are primitives) and validated before
+ * the first callback; mutating the caller's seed object afterwards cannot
+ * influence the run.
+ */
+export interface PipelineV2GraphResumeSeed {
+  readonly current_state: string;
+  readonly transition_count: number;
+}
+
 interface CompiledTransition {
   outcome: string;
   to: string;
@@ -739,14 +754,26 @@ function findTransition(
  * view, and the loop reads transitions, the transition budget, and terminal
  * results only from the engine-owned snapshot. Both v1 and v2 graphs run
  * through this one loop — there is no second execution machine.
+ *
+ * An optional resume seed continues an existing run from its durable
+ * cursor: `cursor` is the starting state (which must already have been
+ * validated against the compiled graph by the caller) and `transitionCount`
+ * is the number of transitions already applied durably — the loop's budget
+ * check is shared, so the seeded count plus this invocation's transitions
+ * must fit `maxTransitions`. A seeded terminal cursor is returned
+ * immediately without any callback; a seeded executable cursor at the
+ * budget boundary is rejected before the callback. The commit hook runs
+ * only for transitions of this invocation, the trace carries only this
+ * invocation's suffix, and the final `transitionCount` is the total.
  */
 async function runCompiledGraph(
   graph: CompiledGraph,
   onTransitionCommit: TransitionCommitHook | undefined,
+  resume?: { readonly cursor: string; readonly transitionCount: number },
 ): Promise<GraphExecutionResult> {
   const trace: TransitionStep[] = [];
-  let cursor: string = graph.entryState;
-  let transitionCount = 0;
+  let cursor: string = resume === undefined ? graph.entryState : resume.cursor;
+  let transitionCount: number = resume === undefined ? 0 : resume.transitionCount;
 
   while (true) {
     const current = graph.states.get(cursor);
@@ -847,4 +874,89 @@ export async function executePipelineV2Graph(
   const captured = captureV2Executors(executors);
   const graph = compileV2Graph(pipeline, captured);
   return runCompiledGraph(graph, options.onTransitionCommit);
+}
+
+/**
+ * Captures and validates the resume seed before the first callback: both
+ * fields are read exactly once (a throwing getter is a graph inconsistency,
+ * never propagated), the cursor must be a non-empty string naming a
+ * declared state of the compiled graph, and `transition_count` must be a
+ * non-negative safe integer within the pipeline's transition budget. The
+ * captured value carries only the two primitives, so mutating the caller's
+ * seed object during the run cannot influence the execution. Validation
+ * failures fail closed as `invalid_graph` (seed shape/budget) or
+ * `missing_state` (an unknown cursor state) — never as a callback failure.
+ */
+function captureResumeSeed(
+  graph: CompiledGraph,
+  seed: PipelineV2GraphResumeSeed,
+): { readonly cursor: string; readonly transitionCount: number } {
+  let currentState: unknown;
+  let transitionCount: unknown;
+  try {
+    currentState = seed.current_state;
+    transitionCount = seed.transition_count;
+  } catch {
+    throw contradiction("the resume seed is not readable as a plain cursor object");
+  }
+  if (typeof currentState !== "string" || currentState === "") {
+    throw contradiction(
+      `the resume seed current_state must be a non-empty string, got ${JSON.stringify(currentState)}`,
+    );
+  }
+  if (
+    typeof transitionCount !== "number" ||
+    !Number.isSafeInteger(transitionCount) ||
+    transitionCount < 0
+  ) {
+    throw contradiction(
+      `the resume seed transition_count must be a non-negative safe integer, got ${JSON.stringify(transitionCount)}`,
+    );
+  }
+  if (transitionCount > graph.maxTransitions) {
+    throw contradiction(
+      `the resume seed transition_count ${transitionCount} exceeds the pipeline transition budget ${graph.maxTransitions}`,
+    );
+  }
+  if (!graph.states.has(currentState)) {
+    throw new PipelineExecutionError(
+      "missing_state",
+      `resume cursor ${JSON.stringify(currentState)} does not name a declared state`,
+    );
+  }
+  return { cursor: currentState, transitionCount };
+}
+
+/**
+ * Continues a loaded pipeline v2 graph from an existing run's durable
+ * cursor through the same single execution loop as
+ * `executePipelineV2Graph` — there is no second execution machine. The
+ * trusted `ResolvedPipelineV2` snapshot is provenance-checked first and
+ * both executor functions are captured exactly once, exactly like the
+ * fresh entry point; then the resume seed is captured and validated before
+ * the first callback: `current_state` must name a declared state of the
+ * compiled graph and `transition_count` must be a non-negative safe
+ * integer within the pipeline's transition budget. The transition budget
+ * is shared between the durable prefix and this invocation: an executable
+ * state seeded at `transition_count === max_transitions` fails
+ * `transition_budget_exhausted` before its callback, while a terminal
+ * cursor at the same boundary is returned immediately. The commit hook
+ * runs only for transitions of this invocation, the returned trace
+ * contains only this invocation's suffix, and
+ * `GraphExecutionResult.transitionCount` is the final total count
+ * (durable prefix plus this invocation). Mutating the caller's seed or
+ * executors objects during the run cannot influence the dispatch. The v1
+ * entry point and its observable behavior are unchanged.
+ */
+export async function executePipelineV2GraphResume(
+  pipeline: ResolvedPipelineV2,
+  executors: PipelineV2GraphExecutors,
+  seed: PipelineV2GraphResumeSeed,
+  options: GraphExecutionOptions = {},
+): Promise<GraphExecutionResult> {
+  requireResolvedPipelineV2Provenance(pipeline, "executePipelineV2GraphResume");
+  const captured = captureV2Executors(executors);
+  const graph = compileV2Graph(pipeline, captured);
+  const resume = captureResumeSeed(graph, seed);
+  return runCompiledGraph(graph, options.onTransitionCommit, resume);
 }

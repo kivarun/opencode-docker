@@ -12,7 +12,7 @@ import type { PipelineStateIo } from "./run_snapshot_store.ts";
 
 /**
  * Durable run state sink for pipeline schema version 2 (`pipeline_v2_state.ts`,
- * state schema version 5). The sink owns no vocabulary of its own: every mutation
+ * state schema version 6). The sink owns no vocabulary of its own: every mutation
  * goes through the existing `PipelineV2RunCommand` union via
  * `dispatch(command)`, which always runs
  *
@@ -41,6 +41,12 @@ import type { PipelineStateIo } from "./run_snapshot_store.ts";
  * terminal policy and performs no automatic finalize. The run state never
  * records credentials, environment values, prompt/input bodies, decision
  * facts, result summaries, or raw worker output.
+ *
+ * Opening an already durable run is the explicit async factory
+ * `PipelineV2RunStateSink.open(...)`: it loads exclusively through the
+ * existing store `load()` and its single state validator, refuses a missing
+ * state or a foreign run id with a typed store error, installs the exact
+ * normalized loaded snapshot, and performs no filesystem mutation at all.
  */
 
 export interface PipelineV2RunStateSinkParams {
@@ -63,6 +69,40 @@ export class PipelineV2RunStateSink {
     this.runId = params.runId;
     this.clockSource = params.now;
     this.store = new PipelineV2RunStateStore(params);
+  }
+
+  /**
+   * Opens an already existing run: the single way to continue a durable
+   * pipeline v2 run after a process restart. The state document is loaded
+   * exclusively through the existing `PipelineV2RunStateStore.load()` and
+   * its single state-schema-v6 parser/validator — no second validator, no
+   * `create_run`, no rewriting, chmodding, repairing or any other
+   * filesystem mutation happens during the open (the load creates
+   * nothing). A missing state document is an explicit typed refusal
+   * (`PipelineV2RunStateStoreError`), never a fresh sink; a document
+   * belonging to another run is refused the same way. On success the
+   * initial snapshot is the exact normalized loaded snapshot and the next
+   * `dispatch` performs an ordinary commit from its current revision.
+   * Reducer, store protocol and `durability_unknown` poisoning are not
+   * duplicated; multi-process locking stays out of scope. The factory
+   * returns only a fully initialized sink — a partially initialized one
+   * cannot be observed.
+   */
+  static async open(params: PipelineV2RunStateSinkParams): Promise<PipelineV2RunStateSink> {
+    const sink = new PipelineV2RunStateSink(params);
+    const loaded = await sink.store.load();
+    if (loaded === null) {
+      throw new PipelineV2RunStateStoreError(
+        `no durable pipeline v2 run state exists for run ${JSON.stringify(sink.runId)}; resuming requires an existing run`,
+      );
+    }
+    if (loaded.run_id !== sink.runId) {
+      throw new PipelineV2RunStateStoreError(
+        `the durable pipeline v2 run state belongs to run ${JSON.stringify(loaded.run_id)}, but this sink owns run ${JSON.stringify(sink.runId)}`,
+      );
+    }
+    sink.current = loaded;
+    return sink;
   }
 
   /** Path of the durable state document (diagnostics and tests only). */

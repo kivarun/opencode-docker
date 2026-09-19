@@ -93,17 +93,39 @@
  * already determined and cannot be rewritten by a signal. No checkpoint
  * runs between a settled execution and its `transition_committed` write.
  *
- * Resume is not supported: the coordinator accepts only a fresh sink with
- * `snapshot === null` and no poisoning. This module is wired through the
- * production runner (`pipeline_v2_runner.ts`); `agent-smoke`, the CLI and
- * the default pipeline keep executing v1.
+ * Continuation from an existing run shares the exact same implementations
+ * through one internal continuation chain (`continuePipelineV2Coordination`):
+ * fresh coordination performs its own pre-run phases (project copy → input
+ * snapshot → `create_run`) and then enters the chain with the entry state
+ * and an empty history; `resumePipelineV2Run` opens an already durable
+ * run — the sink must be a non-poisoned sink holding an existing snapshot
+ * bound to the same run id and the run must sit on the clean active
+ * boundary — restores the runtime context through the read-only
+ * `restorePipelineV2RuntimeContext` (which revalidates the durable state,
+ * the pipeline identity, the run layout, the run-input snapshot and the
+ * full accepted-output history without reading any original user binding)
+ * and enters the same chain with the restored cursor, the restored input
+ * snapshot, the restored accepted history and the restored next execution
+ * index. The chain owns the single engine invocation, the single
+ * transition-commit hook, the single failure finalizer, the single
+ * terminal publisher and the single signal cutoff; there is no second
+ * coordinator execution loop, no second budget model and no re-reading of
+ * user sources. Every pre-resume refusal (poisoned or missing sink
+ * snapshot, run-id mismatch, a non-active boundary, waiting runs, and
+ * every typed restore failure) returns before any durable write, Session
+ * or engine callback and leaves the state file untouched — a damaged or
+ * incompatible run is not a new execution fact. This module is wired
+ * through the production runner (`pipeline_v2_runner.ts`); `agent-smoke`,
+ * the CLI and the default pipeline keep executing v1.
  */
 import { isAbsolute } from "node:path";
 import { validateSafeId } from "./pipeline.ts";
 import {
   executePipelineV2Graph,
+  executePipelineV2GraphResume,
   PipelineExecutionError,
   type PipelineV2GraphExecutors,
+  type PipelineV2GraphResumeSeed,
   type TransitionStep,
   type V2AgentExecutionView,
   type V2DecisionExecutionView,
@@ -124,6 +146,11 @@ import {
   type RunOutputSnapshotEntry,
 } from "./pipeline_v2_runtime.ts";
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
+import {
+  PipelineV2RuntimeContextRestoreError,
+  restorePipelineV2RuntimeContext,
+  type RestoredPipelineV2RuntimeContext,
+} from "./pipeline_v2_resume_context.ts";
 import {
   PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
   PIPELINE_V2_TERMINAL_FAILURE_REASON,
@@ -228,6 +255,75 @@ export interface PipelineV2CoordinatorParams {
   readonly sink: PipelineV2CoordinatorStateSink;
   readonly runtime: PipelineV2AgentRuntime;
 }
+
+/**
+ * Parameters of the production-neutral resume entrypoint
+ * (`resumePipelineV2Run`). The resume takes no project source, no input
+ * bindings, no caller-built snapshot or accepted history, no new run id
+ * and no caller-supplied cursor or execution index: everything it
+ * continues is derived from the opened existing sink snapshot and the
+ * trusted pipeline alone. The sink must be an opened existing sink (a
+ * non-poisoned sink whose snapshot is the durable state of this run).
+ */
+export interface PipelineV2CoordinatorResumeParams {
+  /** The exact deep-frozen snapshot a successful `loadPipelineV2` returned. */
+  readonly pipeline: ResolvedPipelineV2;
+  /** The run id the opened sink already owns (must match the durable state). */
+  readonly runId: string;
+  /** The canonical orchestrator-owned run root (same run as the sink). */
+  readonly runRoot: string;
+  readonly sink: PipelineV2CoordinatorStateSink;
+  readonly runtime: PipelineV2AgentRuntime;
+}
+
+/**
+ * The closed refusal vocabulary of a pre-resume rejection. Every member is
+ * typed by structure and class, never by message text. The restore failure
+ * reasons are the existing typed `PipelineV2RuntimeContextRestoreError`
+ * reasons; `missing_state`, `run_input_modified`, `accepted_output_modified`
+ * and `internal_error` coincide with existing v6 failure-reason strings;
+ * `sink_poisoned`, `run_id_mismatch`, `invalid_state`, `pipeline_mismatch`
+ * and `run_layout_invalid` name the remaining structural refusals of this
+ * entrypoint. None of these labels is ever written to the durable state as
+ * a failure reason: a pre-resume refusal is not a new execution fact.
+ */
+export type PipelineV2ResumeRefusalReason =
+  | "missing_state"
+  | "sink_poisoned"
+  | "run_id_mismatch"
+  | "invalid_state"
+  | "pipeline_mismatch"
+  | "run_layout_invalid"
+  | "run_input_modified"
+  | "accepted_output_modified"
+  | "internal_error";
+
+/**
+ * Result of `resumePipelineV2Run`. A refusal (`refused: true`) happened
+ * strictly before the successful restore: zero durable writes, zero
+ * Sessions, zero engine callbacks and no signal cutoff — the returned
+ * state (when available, the sink's authoritative snapshot) was not
+ * modified, and a damaged or incompatible run is never finalized as
+ * failed by a resume attempt. After a successful restore the ordinary
+ * coordination result applies: execution failures carry their existing
+ * durable semantics.
+ */
+export type PipelineV2ResumeCoordinationResult =
+  | {
+      readonly ok: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly refused: true;
+      readonly reason: PipelineV2ResumeRefusalReason;
+      readonly state: PipelineV2RunState | null;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: PipelineV2FailureReason;
+      readonly state: PipelineV2RunState | null;
+    };
 
 /**
  * Production-neutral synchronous signal control boundary of the
@@ -846,13 +942,91 @@ export async function coordinatePipelineV2Run(
     return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: null });
   }
 
+  // Fresh and resume meet here: the single internal continuation chain
+  // owns the engine invocation, the transition hook, the failure
+  // finalizer, the terminal publisher and the signal cutoff for both
+  // entrypoints. Fresh enters with the entry state, an empty accepted
+  // history and no expected execution index.
+  return await continuePipelineV2Coordination({
+    pipeline,
+    sink,
+    runInputs,
+    acceptedInitial: [],
+    seed: null,
+    expectedNextExecutionIndex: null,
+    checkSignal,
+    takeCutoff,
+    createExecutionSession: capturedCreateExecutionSession,
+    createToolSession: capturedCreateToolSession,
+  });
+}
+
+/**
+ * The shared continuation chain of fresh coordination and resume. It owns
+ * exactly one of everything the two entrypoints must not duplicate: the
+ * engine invocation through the single graph loop (`executePipelineV2Graph`
+ * for a fresh run, `executePipelineV2GraphResume` with the restored cursor
+ * for a resumed one), the transition-commit hook, the failure finalizer,
+ * the session cleanups, the terminal phase (record → collect → publish →
+ * final status) and the memoized signal cutoff. A fresh run passes
+ * `seed: null` and starts with an empty accepted history; a resumed run
+ * passes the restored cursor seed, the provenance-restored input snapshot,
+ * the restored accepted-output history and the restored next execution
+ * index, which every execution callback must confirm exactly before it
+ * starts. There is no second coordinator execution loop, no second budget
+ * model and no re-read of any original user source.
+ */
+interface PipelineV2ContinuationSetup {
+  readonly pipeline: ResolvedPipelineV2;
+  readonly sink: PipelineV2CoordinatorStateSink;
+  /** Fresh: the coordinator-built snapshot; resume: the restored one. */
+  readonly runInputs: RunInputsSnapshot;
+  /** Fresh: empty; resume: the restored accepted-output history. */
+  readonly acceptedInitial: readonly AcceptedStateOutput[];
+  /** Fresh: null (engine starts at the entry state); resume: the restored cursor. */
+  readonly seed: PipelineV2GraphResumeSeed | null;
+  /** Fresh: null; resume: the restored next global execution index. */
+  readonly expectedNextExecutionIndex: number | null;
+  readonly checkSignal: () => void;
+  readonly takeCutoff: () => "SIGINT" | "SIGTERM" | null;
+  readonly createExecutionSession: CapturedCreateExecutionSession;
+  readonly createToolSession: CapturedCreateToolSession;
+}
+
+async function continuePipelineV2Coordination(
+  setup: PipelineV2ContinuationSetup,
+): Promise<PipelineV2CoordinationResult> {
+  const { pipeline, sink } = setup;
+  const runInputs = setup.runInputs;
+  const checkSignal = setup.checkSignal;
+  const takeCutoff = setup.takeCutoff;
+
   // --- shared coordination state -----------------------------------------
 
   let stateAbandoned = false;
   let finalized = false;
   let failureReason: PipelineV2FailureReason | undefined;
   const tracking: ExecutionTracking = { kind: null, unfinished: false, session: null };
-  const accepted: AcceptedStateOutput[] = [];
+  const accepted: AcceptedStateOutput[] = [...setup.acceptedInitial];
+
+  /**
+   * The restored next execution index of a resumed run: the first execution
+   * callback must derive exactly this index from the durable snapshot, and
+   * every later callback the previous index plus one. Fresh runs start with
+   * no expectation and establish the chain at their first execution. The
+   * check is a defensive coherence invariant over the shared durable
+   * snapshot — the coordinator never accepts a caller-supplied execution
+   * index.
+   */
+  let nextExpectedExecutionIndex: number | null = setup.expectedNextExecutionIndex;
+  const assertExecutionIndexChain = (index: number): void => {
+    if (nextExpectedExecutionIndex !== null && index !== nextExpectedExecutionIndex) {
+      throw new Error(
+        `the pipeline v2 execution index ${index} does not match the restored next execution index ${nextExpectedExecutionIndex}`,
+      );
+    }
+    nextExpectedExecutionIndex = index + 1;
+  };
 
   const dispatchState = async (command: PipelineV2RunCommand): Promise<void> => {
     try {
@@ -868,7 +1042,7 @@ export async function coordinatePipelineV2Run(
   const requireSnapshot = (): PipelineV2RunState => {
     const state = sink.snapshot;
     if (state === null) {
-      throw new Error("the pipeline v2 run state snapshot disappeared after create_run");
+      throw new Error("the pipeline v2 run state snapshot disappeared");
     }
     return state;
   };
@@ -1097,8 +1271,11 @@ export async function coordinatePipelineV2Run(
       await dispatchState({ kind: "start_agent_execution", stateId: view.id, profile: view.profile });
       tracking.unfinished = true;
 
-      // 2. the committed execution index comes from the durable snapshot
+      // 2. the committed execution index comes from the durable snapshot —
+      //    for a resumed run it must be exactly the restored next execution
+      //    index (the first callback) or the previous index plus one
       const executionIndex = requireLastExecutionIndex();
+      assertExecutionIndexChain(executionIndex);
 
       // 3. prepare the activation data through the existing data plane
       //    (it re-verifies the protected inputs and the accepted outputs)
@@ -1119,7 +1296,7 @@ export async function coordinatePipelineV2Run(
       //    synchronously before the create call: a signal accepted up to
       //    this point never creates a Session.
       checkSignal();
-      const executionSession = await capturedCreateExecutionSession(view, activation);
+      const executionSession = await setup.createExecutionSession(view, activation);
       let executionCleanup: () => Promise<void>;
       try {
         executionCleanup = captureSessionFunction(executionSession, "cleanup") as () => Promise<void>;
@@ -1149,7 +1326,7 @@ export async function coordinatePipelineV2Run(
       //    only after the Execution Session is durably recorded. The
       //    signal checkpoint sits synchronously before the create call.
       checkSignal();
-      const toolSession = await capturedCreateToolSession(view, activation);
+      const toolSession = await setup.createToolSession(view, activation);
       let toolCleanup: () => Promise<void>;
       try {
         toolCleanup = captureSessionFunction(toolSession, "cleanup") as () => Promise<void>;
@@ -1233,8 +1410,11 @@ export async function coordinatePipelineV2Run(
       tracking.unfinished = false;
       tracking.session = null;
 
-      // 1. the next global execution index
+      // 1. the next global execution index — for a resumed run exactly the
+      //    restored next execution index (the first callback), afterwards
+      //    the previous index plus one
       const executionIndex = requireSnapshot().executions.length + 1;
+      assertExecutionIndexChain(executionIndex);
 
       // 2. prepare the decision data (the input is read exactly once)
       const prepared = await prepareDecisionStateData(pipeline, runInputs, accepted, view.id, executionIndex);
@@ -1276,12 +1456,19 @@ export async function coordinatePipelineV2Run(
   };
 
   try {
-    // Checkpoint after create_run: the run state document exists from here
-    // on, so a signal accepted now finalizes durably (`run_failed` with
-    // the signal reason) instead of leaving the state absent.
+    // Checkpoint before the engine: fresh this is after `create_run` (the
+    // run state document exists from here on, so a signal accepted now
+    // finalizes durably); resume it is after the successful restore. Every
+    // execution is settled and its transition is durable in both cases.
     checkSignal();
 
-    const engineResult = await executePipelineV2Graph(pipeline, executors, { onTransitionCommit });
+    // The single engine invocation of the chain: a fresh run enters the
+    // loop at the entry state with transition count 0; a resumed run
+    // continues from the restored durable cursor with the shared budget.
+    // Both call sites compile through the same single `runCompiledGraph`.
+    const engineResult = setup.seed === null
+      ? await executePipelineV2Graph(pipeline, executors, { onTransitionCommit })
+      : await executePipelineV2GraphResume(pipeline, executors, setup.seed, { onTransitionCommit });
 
     // Checkpoint after the engine, before the terminal record and the run
     // output publication: a signal accepted while the engine ran stops the
@@ -1349,4 +1536,183 @@ export async function coordinatePipelineV2Run(
     const reason = failureReason ?? classifyCause(cause);
     return deepFreeze({ ok: false as const, reason, state: sink.snapshot });
   }
+}
+
+/**
+ * The exact typed refusal result of one pre-resume rejection: it carries
+ * the closed refusal reason and the authoritative snapshot the sink
+ * already held (null only when no snapshot existed). A refusal is
+ * content-free and never writes, never creates a Session, never runs an
+ * engine callback and never takes the signal cutoff.
+ */
+function resumeRefusal(
+  reason: PipelineV2ResumeRefusalReason,
+  state: PipelineV2RunState | null,
+): PipelineV2ResumeCoordinationResult {
+  return deepFreeze({ ok: false as const, refused: true as const, reason, state });
+}
+
+/**
+ * Continues an already durable pipeline v2 run from its clean active
+ * boundary through the same single continuation chain fresh coordination
+ * uses. The resume is strictly production-neutral: it is not wired into
+ * the runner or the CLI, and it never re-reads any original user source —
+ * the project source, the input bindings, the original cursor and the
+ * execution indexes are all derived from the durable state alone.
+ *
+ * Exact ordering (fail-closed, every refusal before any side effect):
+ *
+ *   1. the pipeline provenance gate is the very first action — the sink,
+ *      the runtime, the control and the filesystem are not touched before
+ *      it (a forged pipeline causes no getter or trap invocation);
+ *   2. the runtime and control contract functions are captured exactly
+ *      once, per the existing rules, before any side effect;
+ *   3. the sink contract: the sink must be a non-poisoned sink holding an
+ *      existing snapshot (an opened existing run — `PipelineV2RunStateSink.open`);
+ *   4. the run id/root binding: the parameters must name the run the
+ *      durable state belongs to;
+ *   5. the active-boundary precheck on the validated durable snapshot:
+ *      only `status: "active"` with `phase: "running"` may continue — an
+ *      open waiting run (whose only owner of `wait_response_recorded` is
+ *      the wait controller), a publishing phase, a final status or a
+ *      reached terminal is refused here, before any filesystem read;
+ *   6. `restorePipelineV2RuntimeContext(pipeline, snapshot, runRoot)` —
+ *      the read-only restoration revalidates the durable state, the exact
+ *      pipeline identity, the run-root layout, the provenance-restored
+ *      input snapshot and the full accepted-output history (including
+ *      every old non-winning record) before the context is returned;
+ *   7. only after the full restore succeeds does the shared continuation
+ *      chain run: durable writes, Sessions and engine callbacks become
+ *      possible. The engine starts from the restored cursor and shared
+ *      transition budget, the first execution index must be exactly the
+ *      restored next global index, the accepted history starts from the
+ *      restored records and is extended by new ones, and the restored
+ *      run-input snapshot is used without re-reading any original user
+ *      binding.
+ *
+ * Terminal handling, output collection, session cleanup, the signal
+ * cutoff and the failure finalization are the same implementations fresh
+ * coordination uses. Unexpected errors during the pre-resume phase are
+ * refusals (`internal_error`), never durable failures: a damaged or
+ * incompatible run is not a new execution fact, so the state file is not
+ * finalized before the restore succeeded.
+ */
+export async function resumePipelineV2Run(
+  params: PipelineV2CoordinatorResumeParams,
+  control: PipelineV2CoordinatorControl,
+): Promise<PipelineV2ResumeCoordinationResult> {
+  // 1. The provenance gate is the very first action: no sink read, no
+  //    runtime or control read, no filesystem call before it. A forged
+  //    pipeline causes no getter or trap invocation.
+  try {
+    requireResolvedPipelineV2Provenance(params.pipeline, "pipeline v2 resume coordinator");
+  } catch {
+    return resumeRefusal("internal_error", null);
+  }
+
+  const { pipeline, runId, runRoot, sink, runtime } = params;
+
+  // 2. The runtime and control contract functions are captured exactly
+  //    once, per the existing rules, before any side effect. Rebinding or
+  //    replacing them later cannot influence this coordination.
+  let capturedCurrentSignal: () => "SIGINT" | "SIGTERM" | null;
+  let capturedFreezeSignal: () => "SIGINT" | "SIGTERM" | null;
+  let capturedCreateExecutionSession: CapturedCreateExecutionSession;
+  let capturedCreateToolSession: CapturedCreateToolSession;
+  try {
+    capturedCurrentSignal = captureContractFunction(
+      control,
+      "currentSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+    capturedFreezeSignal = captureContractFunction(
+      control,
+      "freezeSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+    capturedCreateExecutionSession = captureCreateExecutionSession(runtime);
+    capturedCreateToolSession = captureCreateToolSession(runtime);
+  } catch {
+    return resumeRefusal("internal_error", null);
+  }
+
+  const checkSignal = (): void => {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      throw new CoordinatorSignalAbort(signal);
+    }
+  };
+  let cutoffTaken = false;
+  let cutoffSignal: "SIGINT" | "SIGTERM" | null = null;
+  const takeCutoff = (): "SIGINT" | "SIGTERM" | null => {
+    if (cutoffTaken) {
+      return cutoffSignal;
+    }
+    cutoffTaken = true;
+    cutoffSignal = capturedFreezeSignal();
+    return cutoffSignal;
+  };
+
+  // 3. The sink contract: a non-poisoned sink holding an existing snapshot.
+  if (sink.poisoned) {
+    return resumeRefusal("sink_poisoned", sink.snapshot);
+  }
+  if (sink.snapshot === null) {
+    return resumeRefusal("missing_state", null);
+  }
+  const durableState: PipelineV2RunState = sink.snapshot;
+
+  // 4. The run id/root binding. The durable state must belong to the run
+  //    the caller named; the run root path must be an absolute path (its
+  //    canonical identity is verified by the restore).
+  try {
+    validateSafeId(runId, "pipeline v2 resume run id");
+  } catch {
+    return resumeRefusal("internal_error", durableState);
+  }
+  if (typeof runRoot !== "string" || runRoot === "" || !isAbsolute(runRoot)) {
+    return resumeRefusal("internal_error", durableState);
+  }
+  if (durableState.run_id !== runId) {
+    return resumeRefusal("run_id_mismatch", durableState);
+  }
+
+  // 5. The active-boundary precheck on the validated durable snapshot:
+  //    only a clean active running boundary may continue. An open waiting
+  //    run is refused here — the wait controller remains the single owner
+  //    of `wait_response_recorded` — and so are a publishing phase, a
+  //    final status and a reached terminal, before any filesystem read.
+  if (durableState.status !== "active" || durableState.phase !== "running") {
+    return resumeRefusal("invalid_state", durableState);
+  }
+
+  // 6. The read-only restoration: durable state coherence, exact pipeline
+  //    identity, run layout, provenance-restored input snapshot and the
+  //    full accepted-output history. The sink's authoritative snapshot is
+  //    passed as the single source of truth; nothing is written.
+  let restored: RestoredPipelineV2RuntimeContext;
+  try {
+    restored = await restorePipelineV2RuntimeContext(pipeline, durableState, runRoot);
+  } catch (cause) {
+    if (cause instanceof PipelineV2RuntimeContextRestoreError) {
+      return resumeRefusal(cause.reason, durableState);
+    }
+    return resumeRefusal("internal_error", durableState);
+  }
+
+  // 7. The shared continuation chain: restored cursor seed, restored input
+  //    snapshot, restored accepted history and restored next execution
+  //    index. From here on the ordinary coordination semantics apply.
+  return await continuePipelineV2Coordination({
+    pipeline,
+    sink,
+    runInputs: restored.run_inputs,
+    acceptedInitial: restored.accepted_outputs,
+    seed: restored.cursor,
+    expectedNextExecutionIndex: restored.next_execution_index,
+    checkSignal,
+    takeCutoff,
+    createExecutionSession: capturedCreateExecutionSession,
+    createToolSession: capturedCreateToolSession,
+  });
 }

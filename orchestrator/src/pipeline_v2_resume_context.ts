@@ -20,11 +20,12 @@ import {
 } from "./pipeline_v2_runtime.ts";
 
 /**
- * Read-only restoration of the pipeline v2 runtime context (unwired).
+ * Read-only restoration of the pipeline v2 runtime context.
  *
  * This module rebuilds, from the trusted resolved pipeline, the durable
  * state schema v6 and the fixed orchestrator-owned `<runRoot>`, exactly
- * the runtime objects a future resume needs to continue execution: a
+ * the runtime objects resuming an existing run needs to continue
+ * execution: a
  * provenance-backed `RunInputsSnapshot`, the full accepted
  * `AcceptedStateOutput[]` history, the durable cursor and the next global
  * execution index. The original user input bindings and the project
@@ -34,8 +35,8 @@ import {
  * The whole API is strictly read-only: nothing is created, written,
  * chmodded, linked, renamed or removed, no activation leaf is reserved or
  * created, no Session is created, no sink is called, wait manifests are
- * not touched. Production resume, the coordinator, the runner and the CLI
- * stay unwired.
+ * not touched. The coordinator's `resumePipelineV2Run` consumes exactly
+ * this context; the production runner and the CLI stay unwired.
  *
  * Trust boundary and order (fail-closed):
  *
