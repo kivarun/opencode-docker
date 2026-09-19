@@ -11,7 +11,7 @@ import {
   type AuthInfo,
   type CliRunner,
 } from "./docker_helper.ts";
-import { isAbsolute } from "node:path";
+import { isCleanAbsolutePath } from "./clean_path.ts";
 
 export interface EnvLike {
   readonly [key: string]: string | undefined;
@@ -22,24 +22,30 @@ export interface HelperConfig {
   credentialFile: string;
 }
 
-export type ChildSessionFilesystemAccess = "read_only" | "read_write";
+export type SessionFilesystemAccess = "read_only" | "read_write";
 
-export interface ChildSessionFilesystemEntry {
-  /** Workspace-relative path (`.` for the workspace root). */
+/**
+ * One issuance-time Session filesystem root in the docker-helper 2.2.0-rc.10
+ * rich-roots grammar: a daemon-visible absolute host path inside the target
+ * Launcher's effective ceiling, narrowed to an explicit access mode. The
+ * daemon owns overlap, canonicalization, normalization and narrowing; this
+ * layer validates only the request's own transport shape.
+ */
+export interface SessionFilesystemRoot {
   readonly path: string;
-  readonly access: ChildSessionFilesystemAccess;
+  readonly access: SessionFilesystemAccess;
 }
 
 export interface CreateChildSessionOptions {
   /**
-   * Issuance-time Session filesystem narrowing, passed as repeatable
-   * `--filesystem-entry PATH=ACCESS` flags after `--workspace` in list
-   * order. Transport-shape only: this layer never re-decides helper
-   * authorization semantics (the daemon narrows, the CLI validates
-   * syntax). An absent or empty list keeps the argv byte-for-byte
+   * Issuance-time Session filesystem roots, passed as repeatable
+   * `--filesystem-root PATH=ACCESS` flags in list order, always before the
+   * positional `WORKSPACE`. Transport-shape only: this layer never
+   * re-decides helper authorization semantics (the daemon narrows, the CLI
+   * validates syntax). An absent or empty list keeps the argv byte-for-byte
    * identical to the no-policy form.
    */
-  readonly filesystemEntries?: readonly ChildSessionFilesystemEntry[];
+  readonly filesystemRoots?: readonly SessionFilesystemRoot[];
 }
 
 export function resolveHelperConfig(env: EnvLike): HelperConfig {
@@ -104,68 +110,52 @@ export async function createChildSession(
   env: Record<string, string> = {},
   options?: CreateChildSessionOptions,
 ): Promise<ChildSession> {
-  const args = [...operatorArgs(["create"], config), "--workspace", workspace];
-  const entries = options?.filesystemEntries;
-  if (entries !== undefined) {
-    if (!Array.isArray(entries)) {
-      throw new Error("docker-helper session create: filesystem entries must be a list");
+  // docker-helper 2.2.0-rc.10 grammar: `session create ... WORKSPACE` — the
+  // workspace is the one required positional operand and is always passed
+  // last; every issuance-time root travels as one repeatable
+  // `--filesystem-root PATH=ACCESS` flag pair.
+  const args = [...operatorArgs(["create"], config)];
+  const roots = options?.filesystemRoots;
+  if (roots !== undefined) {
+    if (!Array.isArray(roots)) {
+      throw new Error("docker-helper session create: filesystem roots must be a list");
     }
     // Transport-shape validation and argv capture happen in one
     // synchronous pass before the first await: the caller-owned list and
-    // entry objects are never frozen or modified, and a later mutation of
+    // root objects are never frozen or modified, and a later mutation of
     // them cannot change the captured argv. Values travel only in argv,
-    // never in env.
-    const seen = new Set<string>();
-    const pairs: string[] = [];
-    for (const entry of entries) {
-      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+    // never in env. Each root serializes as exactly one flag/value pair,
+    // so a path containing "=" stays one argv value (the daemon CLI
+    // splits the flag value at its last "="). Overlap, duplicate
+    // canonical roots and narrowing are daemon decisions and are never
+    // re-implemented here.
+    for (const root of roots) {
+      if (typeof root !== "object" || root === null || Array.isArray(root)) {
         throw new Error(
-          "docker-helper session create: filesystem entry must be an object with path and access",
+          "docker-helper session create: filesystem root must be an object with path and access",
         );
       }
-      const path = (entry as { path?: unknown }).path;
-      const access = (entry as { access?: unknown }).access;
+      const path = (root as { path?: unknown }).path;
+      const access = (root as { access?: unknown }).access;
       if (typeof path !== "string" || path === "") {
         throw new Error(
-          "docker-helper session create: filesystem entry path must be a non-empty string",
+          "docker-helper session create: filesystem root path must be a non-empty string",
         );
       }
-      if (path !== ".") {
-        if (isAbsolute(path)) {
-          throw new Error(
-            `docker-helper session create: filesystem entry path ${JSON.stringify(path)} must be workspace-relative`,
-          );
-        }
-        for (const component of path.split("/")) {
-          if (component === "" || component === "." || component === "..") {
-            throw new Error(
-              `docker-helper session create: filesystem entry path ${JSON.stringify(path)} is not a clean workspace-relative path`,
-            );
-          }
-        }
+      if (!isCleanAbsolutePath(path)) {
+        throw new Error(
+          `docker-helper session create: filesystem root path ${JSON.stringify(path)} must be a clean absolute host path`,
+        );
       }
       if (access !== "read_only" && access !== "read_write") {
         throw new Error(
-          `docker-helper session create: filesystem entry access for path ${JSON.stringify(path)} must be exactly "read_only" or "read_write"`,
+          `docker-helper session create: filesystem root access for path ${JSON.stringify(path)} must be exactly "read_only" or "read_write"`,
         );
       }
-      if (seen.has(path)) {
-        throw new Error(
-          `docker-helper session create: duplicate filesystem entry path ${JSON.stringify(path)}`,
-        );
-      }
-      seen.add(path);
-      pairs.push(`${path}=${access}`);
-    }
-    if (entries.length > 0 && !seen.has(".")) {
-      throw new Error(
-        'docker-helper session create: filesystem entries must include the workspace root "." exactly once',
-      );
-    }
-    for (const pair of pairs) {
-      args.push("--filesystem-entry", pair);
+      args.push("--filesystem-root", `${path}=${access}`);
     }
   }
+  args.push(workspace);
   const result = await cli(args, env, "capture");
   if (result.code !== 0) {
     throw new DockerHelperError(

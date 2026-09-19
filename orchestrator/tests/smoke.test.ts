@@ -317,7 +317,9 @@ test("1. success: worker runs, artifact verified, session cleaned up, exit 0", a
     expect(outcome.status).toBe("success");
 
     const create = calls.find((c) => c.args[0] === "session" && c.args[1] === "create")!;
-    expect(create.args[create.args.indexOf("--workspace") + 1] ?? "").toBe(dirs.workspace);
+    // RC10 grammar: the workspace is the last positional operand
+    expect(create.args[create.args.length - 1]).toBe(dirs.workspace);
+    expect(create.args).not.toContain("--workspace");
     operatorEnvClean(create.env);
 
     const deleteCalls = calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete");

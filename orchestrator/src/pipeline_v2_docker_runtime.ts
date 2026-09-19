@@ -1,5 +1,5 @@
 /**
- * Docker Helper 2.2.0-rc.3 runtime adapter for pipeline schema version 2:
+ * Docker Helper 2.2.0-rc.10 runtime adapter for pipeline schema version 2:
  * a real implementation of the coordinator's two-session
  * `PipelineV2AgentRuntime` boundary on top of the official docker-helper
  * CLI.
@@ -22,20 +22,26 @@
  * object; a Tool Session is created only for an uncleaned Execution
  * Session of the same activation.
  *
- * Issuance-time Session filesystem policy (docker-helper 2.2.0-rc.3
- * `--filesystem-entry`): the Execution Session is narrowed to exactly
- * `.=read_only`, `project=read_write`, `activations/<index>-<state>/data/
- * inputs=read_only`, `activations/<index>-<state>/data/outputs=read_write`
- * (fixed order); the Tool Session is narrowed to exactly `.=read_write`.
- * The narrowing can only constrain what the Launcher ceiling already
- * allows — it never widens, and the daemon rejects a widening or an
- * outside-ceiling entry with `invalid_filesystem_policy`. The entry lists
- * are computed from the provenance-checked prepared activation through
- * the same clean-relative machinery as the worker mount sources, frozen
- * inside the adapter before `createChildSession` is called, and travel
- * only as `--filesystem-entry` argv values (never env, never durable
- * state, never the execution document). The policy is immutable after
- * session creation and no fallback without entries exists.
+ * Issuance-time Session filesystem policy (docker-helper 2.2.0-rc.10
+ * `--filesystem-root PATH=ACCESS`, absolute daemon-visible paths, the
+ * workspace always the last positional operand): the Execution Session
+ * request is exactly the run root `read_only`, the shared run-owned
+ * project `read_write`, and the current activation's outputs
+ * `read_write` (fixed order); the Tool Session request is exactly its
+ * project workspace `read_write`. No separate inputs root is requested:
+ * the read-only run root already covers the activation inputs and the
+ * execution document, and the daemon-normalized immutable snapshot is
+ * not required to echo the request verbatim. The narrowing can only
+ * constrain what the Launcher ceiling already allows — it never widens,
+ * and the daemon rejects a widening or an outside-ceiling root with
+ * `invalid_filesystem_policy`. The roots are computed from the
+ * provenance-checked prepared activation through the same clean-relative
+ * machinery as the worker mount sources, translated into the daemon
+ * namespace through the proven run-root projection, frozen inside the
+ * adapter before `createChildSession` is called, and travel only as
+ * `--filesystem-root` argv values (never env, never durable state, never
+ * the execution document). The policy is immutable after session
+ * creation and no fallback without roots exists.
  *
  * The factory captures every contract input exactly once before the first
  * helper or filesystem side effect: the trusted pipeline snapshot, one
@@ -79,7 +85,7 @@
  * the registry lookup before any field is read and before any helper CLI
  * call — getters and Proxy traps are never invoked.
  *
- * Worker launch follows the fixed CLI 2.2.0-rc.3 contract: `pull` and
+ * Worker launch follows the fixed CLI 2.2.0-rc.10 contract: `pull` and
  * `run` through the Execution Session, `--helper-socket` exactly once,
  * mounts in the fixed order (project RW, activation inputs RO, activation
  * outputs RW) with clean workspace-relative sources verified against the
@@ -125,9 +131,8 @@ import {
 import {
   createChildSession,
   deleteChildSession,
-  type ChildSessionFilesystemAccess,
-  type ChildSessionFilesystemEntry,
   type HelperConfig,
+  type SessionFilesystemRoot,
 } from "./launcher.ts";
 import {
   inspectProjectionObject,
@@ -312,7 +317,8 @@ function cleanRelativeSource(
  * clean-relative machinery as the worker mount sources and is
  * cross-checked against the canonical run layout, so caller values and
  * state ids can never inject argv. Both the issuance-time Session
- * filesystem entries and the worker mount sources are derived from this
+ * filesystem roots (translated into the daemon namespace through the
+ * proven projection) and the worker mount sources are derived from this
  * single computation.
  */
 function activationPolicyPaths(
@@ -366,42 +372,46 @@ function activationPolicyPaths(
 }
 
 /**
- * The immutable Execution Session filesystem snapshot of one activation,
- * in the fixed order: the workspace root read-only, the shared run-owned
- * project writable, and exactly the current activation's inputs
- * (read-only) and outputs (read-write) narrowed explicitly. Everything
- * else in the run root — state.json, waits, other activation trees —
- * stays under the read-only root and gains no writable entry. Built and
- * frozen before `createChildSession` is called.
+ * The immutable Execution Session filesystem request of one activation, in
+ * the fixed order: the daemon-visible run root read-only (this explicit
+ * workspace entry replaces the implicit workspace grant), the shared
+ * run-owned project writable, and exactly the current activation's
+ * outputs writable. No separate inputs root is requested — the read-only
+ * run root already covers the activation inputs and the execution
+ * document, and everything else in the run root (state.json, waits, other
+ * activation trees) stays read-only as well. Every path is a
+ * daemon-visible absolute host path derived from the proven run-root
+ * projection. Built and frozen before `createChildSession` is called.
  */
-function executionFilesystemEntries(paths: {
+function executionFilesystemRoots(paths: {
+  readonly runRoot: string;
   readonly project: string;
-  readonly inputs: string;
   readonly outputs: string;
-}): readonly ChildSessionFilesystemEntry[] {
-  const entries: ChildSessionFilesystemEntry[] = [
-    { path: ".", access: "read_only" },
+}): readonly SessionFilesystemRoot[] {
+  const roots: SessionFilesystemRoot[] = [
+    { path: paths.runRoot, access: "read_only" },
     { path: paths.project, access: "read_write" },
-    { path: paths.inputs, access: "read_only" },
     { path: paths.outputs, access: "read_write" },
   ];
-  return deepFreezeEntries(entries);
+  return deepFreezeRoots(roots);
 }
 
 /**
- * The immutable Tool Session filesystem snapshot: the project workspace
- * root writable and nothing else — the worker's only filesystem
- * authority. Built and frozen before `createChildSession` is called.
+ * The immutable Tool Session filesystem request: the project workspace
+ * writable and nothing else — the worker's only filesystem authority. The
+ * Tool Session receives no run root, no activation inputs, no activation
+ * outputs and no state directory. Built and frozen before
+ * `createChildSession` is called.
  */
-function toolFilesystemEntries(): readonly ChildSessionFilesystemEntry[] {
-  const entries: ChildSessionFilesystemEntry[] = [{ path: ".", access: "read_write" }];
-  return deepFreezeEntries(entries);
+function toolFilesystemRoots(project: string): readonly SessionFilesystemRoot[] {
+  const roots: SessionFilesystemRoot[] = [{ path: project, access: "read_write" }];
+  return deepFreezeRoots(roots);
 }
 
-function deepFreezeEntries(
-  entries: ChildSessionFilesystemEntry[],
-): readonly ChildSessionFilesystemEntry[] {
-  return Object.freeze(entries.map((entry) => Object.freeze({ ...entry })));
+function deepFreezeRoots(
+  roots: SessionFilesystemRoot[],
+): readonly SessionFilesystemRoot[] {
+  return Object.freeze(roots.map((root) => Object.freeze({ ...root })));
 }
 
 function findAgentState(
@@ -748,14 +758,14 @@ export function createDockerHelperPipelineV2Runtime(
     activation: PreparedActivationData,
     executionRecord: SessionRecord | null,
     workspace: string,
-    filesystemEntries: readonly ChildSessionFilesystemEntry[],
+    filesystemRoots: readonly SessionFilesystemRoot[],
   ): Promise<SessionRecord> => {
     const created = await createChildSession(
       cli,
       helperConfig,
       requireNonEmptyString(workspace, "session workspace"),
       { ...operatorEnv },
-      { filesystemEntries },
+      { filesystemRoots },
     );
 
     // Launcher ownership: a known Session whose provenance does not match
@@ -986,24 +996,30 @@ export function createDockerHelperPipelineV2Runtime(
     // correspondence of the canonical run root.
     await requireActivationProjection(activation);
 
-    // The issuance-time filesystem snapshot is computed from the
+    // The issuance-time filesystem request is computed from the
     // provenance-checked prepared activation and frozen before the
-    // session create: the workspace root read-only, the shared run-owned
-    // project writable, and exactly this activation's inputs (read-only)
-    // and outputs (read-write) narrowed explicitly.
+    // session create: the daemon-visible run root read-only (replacing
+    // the implicit workspace grant), the shared run-owned project
+    // writable, and exactly this activation's outputs writable. No
+    // separate inputs root is requested — the read-only run root already
+    // covers the activation inputs and the execution document.
     const policyPaths = activationPolicyPaths(
       activation.run_root,
       activation,
       activation.state_id,
       activation.activation_index,
     );
-    const entries = executionFilesystemEntries(policyPaths);
+    const roots = executionFilesystemRoots({
+      runRoot: projection.daemonRoot,
+      project: daemonPathFor("project root", activation.project_root),
+      outputs: daemonPathFor("outputs root", activation.outputs_root),
+    });
     const record = await createSessionRecord(
       "execution",
       activation,
       null,
       projection.daemonRoot,
-      entries,
+      roots,
     );
     let handle: PipelineV2ExecutionSession | null = null;
     handle = Object.freeze({
@@ -1070,14 +1086,14 @@ export function createDockerHelperPipelineV2Runtime(
     await requireActivationProjection(activation);
 
     // The Tool Session's only filesystem authority is its own project
-    // workspace root, writable; no other entries exist.
-    const entries = toolFilesystemEntries();
+    // workspace root, writable; no other roots exist.
+    const roots = toolFilesystemRoots(daemonPathFor("project root", activation.project_root));
     const record = await createSessionRecord(
       "tool",
       activation,
       executionRecord,
       daemonPathFor("project root", activation.project_root),
-      entries,
+      roots,
     );
     const handle: PipelineV2ToolSession = Object.freeze({
       sessionId: record.sessionId,

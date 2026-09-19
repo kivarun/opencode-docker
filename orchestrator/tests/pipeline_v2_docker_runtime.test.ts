@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isCleanAbsolutePath } from "../src/clean_path.ts";
 import { expect, test } from "bun:test";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
 import {
@@ -424,7 +425,7 @@ test("2. profile snapshots are immune to mutations of the source map and profile
   }
 });
 
-test("3. the Execution Session is created with the daemon-visible run-root workspace and the four-entry policy", async () => {
+test("3. the Execution Session is created with the daemon-visible run-root workspace and the three-root policy", async () => {
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
@@ -438,16 +439,13 @@ test("3. the Execution Session is created with the daemon-visible run-root works
       "--endpoint",
       SOCKET,
       "--json",
-      "--workspace",
+      "--filesystem-root",
+      `${setup_.runRoot}=read_only`,
+      "--filesystem-root",
+      `${setup_.runRoot}/project=read_write`,
+      "--filesystem-root",
+      `${setup_.runRoot}/activations/1-coder/data/outputs=read_write`,
       setup_.runRoot,
-      "--filesystem-entry",
-      ".=read_only",
-      "--filesystem-entry",
-      "project=read_write",
-      "--filesystem-entry",
-      "activations/1-coder/data/inputs=read_only",
-      "--filesystem-entry",
-      "activations/1-coder/data/outputs=read_write",
     ]);
     expect(call.env).toEqual(OPERATOR_ENV);
   } finally {
@@ -455,7 +453,7 @@ test("3. the Execution Session is created with the daemon-visible run-root works
   }
 });
 
-test("4. the Tool Session is created with the daemon-visible project-root workspace and only the root writable", async () => {
+test("4. the Tool Session is created with the daemon-visible project-root workspace and only the project root writable", async () => {
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
@@ -470,10 +468,9 @@ test("4. the Tool Session is created with the daemon-visible project-root worksp
       "--endpoint",
       SOCKET,
       "--json",
-      "--workspace",
+      "--filesystem-root",
+      `${setup_.coderPrepared.project_root}=read_write`,
       setup_.coderPrepared.project_root,
-      "--filesystem-entry",
-      ".=read_write",
     ]);
     expect(toolCreate.env).toEqual(OPERATOR_ENV);
   } finally {
@@ -1586,16 +1583,13 @@ test("41. a revisit agent activation carries its own new global execution index 
       "--endpoint",
       SOCKET,
       "--json",
-      "--workspace",
+      "--filesystem-root",
+      `${setup_.runRoot}=read_only`,
+      "--filesystem-root",
+      `${setup_.runRoot}/project=read_write`,
+      "--filesystem-root",
+      `${setup_.runRoot}/activations/2-coder/data/outputs=read_write`,
       setup_.runRoot,
-      "--filesystem-entry",
-      ".=read_only",
-      "--filesystem-entry",
-      "project=read_write",
-      "--filesystem-entry",
-      "activations/2-coder/data/inputs=read_only",
-      "--filesystem-entry",
-      "activations/2-coder/data/outputs=read_write",
     ]);
     // the Tool policy is index-independent
     expect(fake.calls[1]!.args).toEqual([
@@ -1604,10 +1598,9 @@ test("41. a revisit agent activation carries its own new global execution index 
       "--endpoint",
       SOCKET,
       "--json",
-      "--workspace",
+      "--filesystem-root",
+      `${revisitPrepared.project_root}=read_write`,
       revisitPrepared.project_root,
-      "--filesystem-entry",
-      ".=read_write",
     ]);
     await tool.cleanup();
   } finally {
@@ -1630,11 +1623,13 @@ test("42. mutations of the profile map and the projection object after the facto
     });
     await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const call = fake.calls[0]!;
-    expect(call.args).toContain("activations/1-coder/data/inputs=read_only");
-    expect(call.args).toContain("project=read_write");
+    expect(call.args).toContain(`${setup_.runRoot}/project=read_write`);
+    expect(call.args).toContain(
+      `${setup_.runRoot}/activations/1-coder/data/outputs=read_write`,
+    );
     // the policy comes from the frozen prepared activation, not from any
     // mutable caller object
-    expect(call.args.filter((arg) => arg === "--filesystem-entry").length).toBe(4);
+    expect(call.args.filter((arg) => arg === "--filesystem-root").length).toBe(3);
   } finally {
     await dispose(setup_);
   }
@@ -1646,10 +1641,10 @@ test("43. the state id cannot inject argv: the policy paths are derived from the
     const fake = makeFakeCli();
     const runtime = makeRuntime(setup_, fake.cli);
     // a hostile state id in a hand-built execution view never reaches the
-    // entries: the view must name the activation's own state
+    // roots: the view must name the activation's own state
     const hostileView = {
       type: "agent" as const,
-      id: 'coder\n--filesystem-entry evil=read_write',
+      id: 'coder\n--filesystem-root /evil=read_write',
       profile: "coder",
       promptPath: setup_.coderView.promptPath,
       promptContent: "x",
@@ -1667,46 +1662,58 @@ test("43. the state id cannot inject argv: the policy paths are derived from the
       /the runtime requires the frozen prepared activation data object/,
     );
     expect(fake.calls.length).toBe(0);
-    // the trusted activation yields exactly the canonical safe-id paths
+    // the trusted activation yields exactly the canonical safe-id roots
     await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
-    const entryValues: string[] = [];
+    const rootValues: string[] = [];
     const args = fake.calls[0]!.args;
     for (let index = 0; index < args.length; index += 1) {
-      if (args[index] === "--filesystem-entry") {
-        entryValues.push(args[index + 1] ?? "");
+      if (args[index] === "--filesystem-root") {
+        rootValues.push(args[index + 1] ?? "");
       }
     }
-    expect(entryValues).toEqual([
-      ".=read_only",
-      "project=read_write",
-      "activations/1-coder/data/inputs=read_only",
-      "activations/1-coder/data/outputs=read_write",
+    expect(rootValues).toEqual([
+      `${setup_.runRoot}=read_only`,
+      `${setup_.runRoot}/project=read_write`,
+      `${setup_.runRoot}/activations/1-coder/data/outputs=read_write`,
     ]);
   } finally {
     await dispose(setup_);
   }
 });
 
-test("44. the filesystem-entry values are clean workspace-relative paths and name no host roots", async () => {
+test("44. the filesystem-root values are daemon-visible absolute paths derived from the run-root projection", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
     for (const call of driven.calls.filter((candidate) => candidate.args[0] === "session" && candidate.args[1] === "create")) {
+      const rootValues: string[] = [];
       for (let index = 0; index < call.args.length; index += 1) {
-        if (call.args[index] !== "--filesystem-entry") {
-          continue;
+        if (call.args[index] === "--filesystem-root") {
+          rootValues.push(call.args[index + 1] ?? "");
         }
-        const value = call.args[index + 1] ?? "";
-        const separator = value.indexOf("=");
+      }
+      // the Execution request is exactly the run root, the project and the
+      // current activation outputs; the Tool request is exactly the project
+      if (call.args[call.args.length - 1] === setup_.runRoot) {
+        expect(rootValues).toEqual([
+          `${setup_.runRoot}=read_only`,
+          `${setup_.runRoot}/project=read_write`,
+          `${setup_.runRoot}/activations/1-coder/data/outputs=read_write`,
+        ]);
+      } else {
+        expect(rootValues).toEqual([
+          `${setup_.runRoot}/project=read_write`,
+        ]);
+      }
+      for (const value of rootValues) {
+        const separator = value.lastIndexOf("=");
         const path = value.slice(0, separator);
         const access = value.slice(separator + 1);
         expect(["read_only", "read_write"]).toContain(access);
-        expect(path.startsWith("/")).toBe(false);
-        expect(path.includes(setup_.runRoot)).toBe(false);
-        expect(path.includes(setup_.root)).toBe(false);
-        expect(path.includes(setup_.bundle)).toBe(false);
-        expect(path.split("/")).not.toContain("..");
-        expect(path.split("/")).not.toContain("");
+        expect(path === setup_.runRoot || path.startsWith(`${setup_.runRoot}/`)).toBe(true);
+        expect(isCleanAbsolutePath(path)).toBe(true);
+        // the pair is never split into two argv values
+        expect(call.args).toContain(value);
       }
       // no session argv value ever carries the pipeline bundle root or a
       // user source path
