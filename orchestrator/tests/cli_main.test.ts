@@ -40,6 +40,9 @@ function makeIo(): Recorder {
     runPipelineV2: (async () => {
       throw new Error("fake runPipelineV2 not configured");
     }) as unknown as CliIo["runPipelineV2"],
+    resumePipelineV2: (async () => {
+      throw new Error("fake resumePipelineV2 not configured");
+    }) as unknown as CliIo["resumePipelineV2"],
     runSmoke: (async () => {
       throw new Error("fake runSmoke not configured");
     }) as unknown as CliIo["runSmoke"],
@@ -390,6 +393,216 @@ test("human mode keeps the adapter's inherit plumbing untouched", async () => {
   expect(err).toEqual([
     "orchestrator: run ok (run rid-1, state /state/root/pipeline-runs/rid-1/state.json, outputs /state/root/pipeline-runs/rid-1/outputs)",
   ]);
+});
+
+// --- resume dispatcher ---------------------------------------------------------
+
+const RESUME_ARGS = ["resume", "--run-id", "rid-1", "--config-root", "/abs/config", "--launcher-id", "dhl_l1"];
+
+test("resume dispatches exactly once to resumePipelineV2 with the exact options mapping", async () => {
+  const { io, err } = makeIo();
+  const calls: Array<{ options: unknown; deps: unknown }> = [];
+  io.resumePipelineV2 = (async (options: unknown, deps: unknown) => {
+    calls.push({ options, deps });
+    return runOutcome({});
+  }) as unknown as CliIo["resumePipelineV2"];
+  io.runPipelineV2 = (async () => {
+    throw new Error("runPipelineV2 must not run");
+  }) as unknown as CliIo["runPipelineV2"];
+
+  const exit = await runCli(RESUME_ARGS, io);
+  expect(exit).toBe(0);
+  expect(calls.length).toBe(1);
+  const { options, deps } = calls[0]!;
+  expect(options).toEqual({
+    runId: "rid-1",
+    configRoot: "/abs/config",
+    launcherId: "dhl_l1",
+  });
+  const d = deps as Record<string, unknown>;
+  expect(d.helperConfig).toEqual({ socketPath: "/run/dh.sock", credentialFile: "/creds/token" });
+  expect(d.baseEnv).toEqual(io.baseEnv);
+  expect(d.stateRootProjection).toEqual({ localRoot: "/state/root", daemonRoot: "/daemon/root" });
+  expect(d.fetchAuth).toBe(io.fetchAuth);
+  expect(typeof d.cli).toBe("function");
+  expect(typeof d.onSignal).toBe("function");
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+});
+
+test("resume parse failures return exit 2 before any resolver, runner or subprocess call", async () => {
+  for (const argv of [
+    ["resume"],
+    ["resume", "--run-id", "rid"],
+    ["resume", "--config-root", "/c"],
+    ["resume", "--run-id", "bad/id", "--config-root", "/c"],
+    ["resume", "--run-id", "rid", "--config-root", "rel"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--pipeline-root", "/p"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--project", "/p"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--input", "a=/p"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--workspace", "/w"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--image", "x:1"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--profile", "coder"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--state-root", "/s"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--json", "--json"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "positional"],
+    ["resume", "--run-id", "rid", "--config-root", "/c", "--unknown"],
+  ]) {
+    const { io, err } = makeIo();
+    let resolverCalls = 0;
+    let runnerCalls = 0;
+    let resumeCalls = 0;
+    io.resolveStateRootProjection = () => {
+      resolverCalls += 1;
+      return { localRoot: "/state", daemonRoot: "/state" };
+    };
+    io.resolveHelperConfig = () => {
+      resolverCalls += 1;
+      return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+    };
+    io.runner.run = () => {
+      runnerCalls += 1;
+      return Promise.resolve({ code: 0 });
+    };
+    io.resumePipelineV2 = (async () => {
+      resumeCalls += 1;
+      return runOutcome({});
+    }) as unknown as CliIo["resumePipelineV2"];
+    const exit = await runCli(argv, io);
+    expect(exit).toBe(2);
+    expect(resolverCalls).toBe(0);
+    expect(runnerCalls).toBe(0);
+    expect(resumeCalls).toBe(0);
+    expect(err.join("\n")).not.toContain(CANARY_SECRET);
+  }
+});
+
+test("resume state-root and helper-config resolution failures are CLI configuration errors", async () => {
+  const { io, err } = makeIo();
+  let resumeCalls = 0;
+  io.resumePipelineV2 = (async () => {
+    resumeCalls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["resumePipelineV2"];
+  io.resolveStateRootProjection = () => {
+    throw new Error("cannot build the orchestrator state root: set ORCHESTRATOR_STATE_ROOT (or XDG_STATE_HOME or HOME)");
+  };
+  const exit = await runCli(RESUME_ARGS, io);
+  expect(exit).toBe(2);
+  expect(resumeCalls).toBe(0);
+  expect(err.join("\n")).toContain("cannot build the orchestrator state root");
+
+  const { io: io2, err: err2 } = makeIo();
+  io2.resumePipelineV2 = (async () => {
+    resumeCalls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["resumePipelineV2"];
+  io2.resolveHelperConfig = () => {
+    throw new Error("helper configuration exploded");
+  };
+  const exit2 = await runCli(RESUME_ARGS, io2);
+  expect(exit2).toBe(2);
+  expect(resumeCalls).toBe(0);
+  expect(err2.join("\n")).toContain("helper configuration exploded");
+});
+
+test("resume human mode prints the content-free summary lines", async () => {
+  const { io, err, out } = makeIo();
+  io.resumePipelineV2 = (async () => runOutcome({})) as unknown as CliIo["resumePipelineV2"];
+  const exit = await runCli(RESUME_ARGS, io);
+  expect(exit).toBe(0);
+  expect(out).toEqual([]);
+  expect(err).toEqual([
+    "orchestrator: resume ok (run rid-1, state /state/root/pipeline-runs/rid-1/state.json, outputs /state/root/pipeline-runs/rid-1/outputs)",
+  ]);
+
+  const { io: io2, err: err2 } = makeIo();
+  io2.resumePipelineV2 = (async () =>
+    runOutcome({ ok: false, exitCode: 1, reason: "invalid_state" })) as unknown as CliIo["resumePipelineV2"];
+  const exit2 = await runCli(RESUME_ARGS, io2);
+  expect(exit2).toBe(1);
+  expect(err2).toEqual([
+    "orchestrator: resume failed (run rid-1, reason invalid_state, state /state/root/pipeline-runs/rid-1/state.json)",
+  ]);
+
+  // a pre-run-root refusal prints no summary line (the runner diagnostic
+  // already carries the content-free cause on stderr)
+  const { io: io3, err: err3 } = makeIo();
+  io3.resumePipelineV2 = (async () =>
+    runOutcome({ ok: false, exitCode: 1, runId: "", runRoot: null })) as unknown as CliIo["resumePipelineV2"];
+  const exit3 = await runCli(RESUME_ARGS, io3);
+  expect(exit3).toBe(1);
+  expect(err3).toEqual([]);
+});
+
+test("resume JSON mode prints exactly one outcome document on stdout", async () => {
+  const { io, out, err } = makeIo();
+  const result = runOutcome({ ok: false, exitCode: 1, reason: "run_input_modified" });
+  io.resumePipelineV2 = (async () => {
+    io.writeError("orchestrator: launcher credential ok (launcher dhl_l1)");
+    return result;
+  }) as unknown as CliIo["resumePipelineV2"];
+  const exit = await runCli([...RESUME_ARGS, "--json"], io);
+  expect(exit).toBe(1);
+  expect(out).toEqual([`${JSON.stringify(result)}\n`]);
+  expect(err).toContain("orchestrator: launcher credential ok (launcher dhl_l1)");
+  expect(out.join("")).not.toContain(CANARY_SECRET);
+  const document = JSON.parse(out[0]!) as Record<string, unknown>;
+  expect(Object.keys(document).sort()).toEqual(
+    ["exitCode", "ok", "runId", "runRoot", "reason", "state"].sort(),
+  );
+  expect(document.reason).toBe("run_input_modified");
+});
+
+test("resume JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
+  const { io, out, runnerCalls } = makeIo();
+  io.resumePipelineV2 = (async (_options: unknown, deps: unknown) => {
+    const cli = (deps as Record<string, unknown>).cli as (
+      args: string[],
+      env: Record<string, string>,
+      stdio: CliStdio,
+      opts?: CliRunOptions,
+    ) => Promise<CliResult>;
+    await cli(["pull", "--endpoint", "/sock", "img:1"], {}, "inherit");
+    await cli(["run", "--format", "json"], {}, "inherit", { signalOnAbort: true, timeoutSeconds: 60 });
+    await cli(["session", "create"], {}, "capture");
+    await cli(["session", "delete"], {}, "capture");
+    return runOutcome({});
+  }) as unknown as CliIo["resumePipelineV2"];
+  await runCli([...RESUME_ARGS, "--json"], io);
+  const inheritCalls = runnerCalls.filter((call) => call.args[0] === "pull" || call.args[0] === "run");
+  expect(inheritCalls.length).toBe(2);
+  for (const call of inheritCalls) {
+    expect(call.stdio).toBe("stderr");
+  }
+  const captureCalls = runnerCalls.filter((call) => call.args[0] === "session");
+  expect(captureCalls.length).toBe(2);
+  for (const call of captureCalls) {
+    expect(call.stdio).toBe("capture");
+  }
+  expect(out).toEqual([`${JSON.stringify(runOutcome({}))}\n`]);
+});
+
+test("resume exit codes 0/1/130/143 pass through unchanged", async () => {
+  for (const code of [0, 1, 130, 143]) {
+    const { io } = makeIo();
+    io.resumePipelineV2 = (async () =>
+      runOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["resumePipelineV2"];
+    const exit = await runCli(RESUME_ARGS, io);
+    expect(exit).toBe(code);
+  }
+});
+
+test("resume deps.cli is wired to the single runner instance", async () => {
+  const { io, runnerCalls } = makeIo();
+  let capturedCli: unknown;
+  io.resumePipelineV2 = (async (_options: unknown, deps: unknown) => {
+    capturedCli = (deps as Record<string, unknown>).cli;
+    return runOutcome({});
+  }) as unknown as CliIo["resumePipelineV2"];
+  await runCli(RESUME_ARGS, io);
+  const cli = capturedCli as (args: string[], env: Record<string, string>, stdio: CliStdio) => Promise<CliResult>;
+  await cli(["session", "list"], {}, "capture");
+  expect(runnerCalls).toEqual([{ args: ["session", "list"], env: {}, stdio: "capture", opts: undefined }]);
 });
 
 test("smoke and agent-smoke keep routing to their own runner functions", async () => {

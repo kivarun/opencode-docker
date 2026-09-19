@@ -211,6 +211,70 @@ orchestrator run \
   and the lifecycle records a user abort only when the signal may still be
   classified as one. There is no second `RunCauseGate` in the CLI.
 
+## The production pipeline v2 continuation CLI (`orchestrator resume`)
+
+`orchestrator resume` continues an already durable pipeline v2 run from its
+clean active boundary. The CLI parses the arguments, resolves the same
+trusted state-root projection through the same protected configuration
+boundary as `run`, and invokes the single production runner entrypoint
+`resumePipelineV2` exactly once; there is no second restore, no second state
+validator, and no second coordinator.
+
+```
+orchestrator resume \
+  --run-id SAFE_ID \
+  --config-root /absolute/operator-config \
+  [--launcher-id dhl_...] \
+  [--json]
+```
+
+- `--run-id` (validated against the shared pipeline v2 safe-id grammar) and
+  `--config-root` (absolute) are required; singleton flags reject repeats;
+  `--json` takes no value. Every fresh-run flag — `--pipeline-root`,
+  `--project`, `--input`, `--workspace`, `--image`, `--profile`, `--task`,
+  and the state-root flags — is rejected for `resume`, as is every unknown
+  flag or positional argument: the pipeline comes only from the validated
+  durable `state.pipeline.bundle_root`, and the project, inputs, and
+  accepted outputs come only from the run-owned snapshot/layout. Parse and
+  configuration failures exit 2 before any authentication, subprocess, or
+  filesystem mutation.
+- The preflight order is fixed and read-only up to the continuation: shape
+  validation of the options and dependencies, exactly one `onSignal` read
+  and capture, the single `RunCauseGate`, the resolved state-root
+  projection, read-only verification of the existing state roots, the fixed
+  `<state-root>/pipeline-runs/<run-id>` layout and its local/daemon
+  projection (never created, never chmodded — a missing or unsafe layout is
+  a refusal, never a repair), the read-only
+  `PipelineV2RunStateSink.open`, the durable snapshot, the pipeline loaded
+  only from the durable bundle root, one profile load per unique
+  agent-state profile name in declaration order from the explicitly passed
+  configuration root, the single Launcher authority check, one Docker
+  runtime adapter, and finally the coordinator resume entrypoint.
+- `resume` continues only a clean active run: `status active`, `phase
+  running`, every execution settled and bound to its committed transition,
+  and the last wait (if any) already answered. A terminal cursor is valid
+  and finalizes without any agent or decision callback. Waiting, in-flight,
+  settled-but-unbound, publishing, terminal, and final states are refused
+  with zero durable dispatches, zero Sessions, zero callbacks, and an
+  untouched state document; the outcome carries the structured refusal
+  reason.
+- Honest profile boundary: the pipeline execution identity is verified by
+  the durable digest, the run-owned inputs/project/accepted outputs by the
+  restore context, and profile definitions remain trusted operator
+  configuration reloaded at resume from the explicitly passed
+  configuration root. Durable profile epochs or replacements are not
+  implemented.
+- Signals and failures reuse the fresh-run policy: first signal wins, one
+  memoized cutoff per post-restore path, `session_cleanup_failed` above
+  signals above typed failures, durability-unknown adopts the visible
+  candidate and stops every further operation, no automatic retry, and the
+  Session cleanup stays Tool before Execution, exactly once.
+- Human mode prints one content-free summary line (`orchestrator: resume
+  ok|failed (...)`, none before the verified run root); `--json` writes
+  exactly one JSON `PipelineV2RunOutcome` plus a newline to stdout with
+  helper output streamed to stderr; the exit code is the outcome's exit
+  code.
+
 ## Pipelines (schema version 1: loader, validator, multi-state execution plan)
 
 `orchestrator/src/pipeline.ts` implements the declarative pipeline contract:

@@ -71,6 +71,31 @@
  * The result is deep-frozen and content-free: no bearer, no environment
  * value, no prompt or input body, no worker output and no raw decision
  * facts ever appear on it.
+ *
+ * Resume (`resumePipelineV2`) continues an already durable run from its
+ * clean active boundary through the single coordinator resume entrypoint.
+ * Its preflight order is fixed and read-only up to the coordinator: the
+ * options/deps shape validation (the run id against the shared v6 safe-id
+ * grammar), exactly one `onSignal` read and capture, the single
+ * `RunCauseGate`, the state-root projection received resolved from the CLI
+ * (the same env resolver `run` uses), read-only verification of the
+ * existing local/daemon state roots, the fixed
+ * `<state-root>/pipeline-runs/<run-id>` layout and its local/daemon
+ * projection (never created, never chmodded — an unsafe or missing run
+ * root is a refusal, not a repair), then the read-only
+ * `PipelineV2RunStateSink.open`, the normalized durable snapshot, the
+ * pipeline loaded only from `state.pipeline.bundle_root`, one profile load
+ * per unique agent-state profile name in declaration order from the
+ * explicitly passed `configRoot`, the single Launcher authority check, one
+ * Docker runtime adapter and finally `resumePipelineV2Run`. Nothing is
+ * created and no durable dispatch, Session or engine callback happens on
+ * any refusal path; from the verified run root on, every outcome carries
+ * the actual run id, the canonical run root and the last authoritative
+ * state. Profile definitions are trusted operator configuration, reloaded
+ * at resume from the explicitly passed configuration root: the pipeline
+ * execution identity is verified by the durable digest, the run-owned
+ * inputs/project/accepted outputs by the restore context, and durable
+ * profile epochs are not implemented.
  */
 import { lstat, mkdir } from "node:fs/promises";
 import { isCleanAbsolutePath } from "./clean_path.ts";
@@ -92,7 +117,9 @@ import { loadPipelineV2, type ResolvedPipelineV2 } from "./pipeline_v2.ts";
 import { PipelineV2RunStateSink } from "./pipeline_v2_state_sink.ts";
 import {
   coordinatePipelineV2Run,
+  resumePipelineV2Run,
   type PipelineV2CoordinatorControl,
+  type PipelineV2ResumeRefusalReason,
 } from "./pipeline_v2_coordinator.ts";
 import {
   createDockerHelperPipelineV2Runtime,
@@ -143,11 +170,13 @@ export interface PipelineV2RunOutcome {
   readonly runRoot: string | null;
   readonly state: PipelineV2RunState | null;
   /**
-   * The durable failure reason; omitted for preflight failures (no state
-   * document exists whose failure reason could be reported) and for
-   * confirmed success.
+   * The durable failure reason, or the structured pre-resume refusal
+   * reason of `resumePipelineV2` (a refusal is not a durable failure: the
+   * state document is untouched). Omitted for preflight failures that
+   * happen before any state document could exist and for confirmed
+   * success.
    */
-  readonly reason?: PipelineV2FailureReason;
+  readonly reason?: PipelineV2FailureReason | PipelineV2ResumeRefusalReason;
 }
 
 function isNonEmptyAbsolutePath(value: unknown): value is string {
@@ -691,6 +720,424 @@ export async function runPipelineV2(
         : 1;
   if (reason !== "terminal_failed") {
     console.error(`orchestrator: pipeline v2 run failed: ${reason}`);
+  }
+  return deepFreeze({
+    ok: false,
+    exitCode,
+    runId,
+    runRoot: runRoot.localRunRoot,
+    state: result.state,
+    reason,
+  });
+}
+
+// --- resume ----------------------------------------------------------------
+
+export interface PipelineV2ResumeOptions {
+  /** The run id of the already durable run (safe-id validated). */
+  readonly runId: string;
+  /**
+   * The operator-controlled configuration root the used profiles are
+   * loaded from again at resume (trusted operator configuration; the
+   * durable pipeline identity and the run-owned data are verified by the
+   * restore context, not by the profiles).
+   */
+  readonly configRoot: string;
+  readonly launcherId?: string;
+}
+
+/**
+ * Shape-only validation of the resume contract. It reads no secret value:
+ * the run id is validated with the shared pipeline v2 safe-id grammar
+ * (before any path is built from it), the configuration root must be a
+ * non-empty absolute path, and the deps must carry the same trusted
+ * runtime configuration as the fresh runner. The state-root projection
+ * arrives already resolved by the CLI (the same env resolver `run` uses);
+ * the runner never reads the environment itself.
+ */
+function validateResumeContract(
+  options: PipelineV2ResumeOptions,
+  deps: PipelineV2RunnerDeps,
+): void {
+  if (!isRecord(options)) {
+    throw new Error("pipeline v2 resume options must be an object");
+  }
+  expectSafeId(options.runId, "pipeline v2 resume run id");
+  if (!isNonEmptyAbsolutePath(options.configRoot)) {
+    throw new Error("pipeline v2 resume options.configRoot must be a non-empty absolute path");
+  }
+  if (options.launcherId !== undefined && !options.launcherId.startsWith("dhl_")) {
+    throw new Error("pipeline v2 resume options.launcherId must be a launcher ID (dhl_...)");
+  }
+  if (!isRecord(deps)) {
+    throw new Error("pipeline v2 resume deps must be an object");
+  }
+  if (typeof deps.cli !== "function") {
+    throw new Error("pipeline v2 resume deps.cli must be a function");
+  }
+  if (typeof deps.fetchAuth !== "function") {
+    throw new Error("pipeline v2 resume deps.fetchAuth must be a function");
+  }
+  if (!isRecord(deps.helperConfig)) {
+    throw new Error("pipeline v2 resume deps.helperConfig must be an object");
+  }
+  if (!isNonEmptyAbsolutePath(deps.helperConfig.socketPath)) {
+    throw new Error("pipeline v2 resume deps.helperConfig.socketPath must be a non-empty absolute path");
+  }
+  if (!isNonEmptyAbsolutePath(deps.helperConfig.credentialFile)) {
+    throw new Error("pipeline v2 resume deps.helperConfig.credentialFile must be a non-empty absolute path");
+  }
+  if (!isRecord(deps.baseEnv)) {
+    throw new Error("pipeline v2 resume deps.baseEnv must be an object");
+  }
+  if (!isRecord(deps.stateRootProjection)) {
+    throw new Error("pipeline v2 resume deps.stateRootProjection must be an object");
+  }
+  for (const field of ["localRoot", "daemonRoot"] as const) {
+    if (!isCleanAbsolutePath(deps.stateRootProjection[field])) {
+      throw new Error(
+        `pipeline v2 resume deps.stateRootProjection.${field} must be an absolute clean path`,
+      );
+    }
+  }
+  if (deps.now !== undefined && typeof deps.now !== "function") {
+    throw new Error("pipeline v2 resume deps.now must be a function");
+  }
+  if (deps.randomId !== undefined && typeof deps.randomId !== "function") {
+    throw new Error("pipeline v2 resume deps.randomId must be a function");
+  }
+}
+
+/**
+ * Read-only verification of the existing run-root layout
+ * `<state-root>/pipeline-runs/<run-id>` and its daemon-visible projection.
+ * Nothing is created, chmodded, repaired or removed: both state roots must
+ * be real non-symlink directories that are the same object (dev/ino),
+ * `pipeline-runs` must exist as a real non-symlink directory with exactly
+ * mode 0700 on both sides, and the run root must exist as a real
+ * non-symlink directory with exactly mode 0700 that the daemon sees as the
+ * same canonical object. A missing, unsafe or mismatched layout is a
+ * refusal — never a repair.
+ */
+async function verifyExistingRunRoot(
+  stateRootProjection: PipelineV2StateRootProjection,
+  runId: string,
+): Promise<PreparedRunRoot> {
+  const localStateRoot = stateRootProjection.localRoot;
+  const daemonStateRoot = stateRootProjection.daemonRoot;
+
+  const localRootInfo = await inspectProjectionObject(localStateRoot, "directory");
+  if (localRootInfo.failure !== null || localRootInfo.identity === null) {
+    throw new Error(
+      `pipeline v2 resume: the local state root ${JSON.stringify(localStateRoot)} is not a real non-symlink directory`,
+    );
+  }
+  const daemonRootInfo = await inspectProjectionObject(daemonStateRoot, "directory");
+  if (daemonRootInfo.failure !== null || daemonRootInfo.identity === null) {
+    throw new Error(
+      `pipeline v2 resume: the daemon state root ${JSON.stringify(daemonStateRoot)} is not a real non-symlink directory`,
+    );
+  }
+  if (!sameProjectionIdentity(localRootInfo.identity, daemonRootInfo.identity)) {
+    throw new Error(
+      "pipeline v2 resume: the local and daemon state roots are not the same directory object (dev/ino differ)",
+    );
+  }
+
+  const pipelineRunsLocal = `${localStateRoot.replace(/\/+$/, "")}/pipeline-runs`;
+  const pipelineRunsDaemon = `${daemonStateRoot.replace(/\/+$/, "")}/pipeline-runs`;
+  const existing = await inspectProjectionObject(pipelineRunsLocal, "directory");
+  if (existing.failure !== null) {
+    throw new Error(
+      `pipeline v2 resume: ${JSON.stringify(pipelineRunsLocal)} is not a real non-symlink directory`,
+    );
+  }
+  await assertExactDirectoryMode0700(pipelineRunsLocal, "pipeline-runs");
+  const runsFailure = await verifyPair(pipelineRunsLocal, pipelineRunsDaemon, "pipeline-runs");
+  if (runsFailure !== null) {
+    throw runsFailure;
+  }
+
+  const localRunRoot = `${pipelineRunsLocal}/${runId}`;
+  const runRootInfo = await inspectProjectionObject(localRunRoot, "directory");
+  if (runRootInfo.failure === "missing") {
+    throw new Error(
+      `pipeline v2 resume: no existing run root at ${JSON.stringify(localRunRoot)}`,
+    );
+  }
+  if (runRootInfo.failure !== null || runRootInfo.identity === null) {
+    throw new Error(
+      `pipeline v2 resume: ${JSON.stringify(localRunRoot)} is not a real non-symlink directory`,
+    );
+  }
+  await assertExactDirectoryMode0700(localRunRoot, "run directory");
+  const translation = translateProjectionPath(localStateRoot, daemonStateRoot, localRunRoot);
+  if (!translation.ok) {
+    throw new Error(
+      `pipeline v2 resume: the run root ${JSON.stringify(localRunRoot)} has no clean projection suffix under the state root`,
+    );
+  }
+  const daemonRunRoot = translation.daemonPath;
+  const runRootFailure = await verifyPair(localRunRoot, daemonRunRoot, "run directory");
+  if (runRootFailure !== null) {
+    throw runRootFailure;
+  }
+  const runRootIdentity = runRootInfo.identity;
+  const daemonRunRootInfo = await inspectProjectionObject(daemonRunRoot, "directory");
+  if (
+    daemonRunRootInfo.failure !== null ||
+    daemonRunRootInfo.identity === null ||
+    !sameProjectionIdentity(runRootIdentity, daemonRunRootInfo.identity)
+  ) {
+    throw new Error(
+      `pipeline v2 resume: the daemon-side run root ${JSON.stringify(daemonRunRoot)} is not the same real object as ${JSON.stringify(localRunRoot)} (dev/ino differ)`,
+    );
+  }
+  return { localRunRoot, daemonRunRoot };
+}
+
+/**
+ * Continues one already durable pipeline v2 production run end to end.
+ * See the module documentation for the pinned read-only preflight order,
+ * the verified existing run-root layout and the signal semantics shared
+ * with `runPipelineV2`.
+ */
+export async function resumePipelineV2(
+  options: PipelineV2ResumeOptions,
+  deps: PipelineV2RunnerDeps,
+): Promise<PipelineV2RunOutcome> {
+  // --- protected preflight gate ------------------------------------------
+  //
+  // The same protected region as the fresh runner: the shape validation
+  // and the single `onSignal` read/capture happen first, and the
+  // `RunCauseGate` is constructed only after both succeeded. A hostile
+  // contract neither escapes as a rejected promise nor registers a
+  // handler before its type is confirmed.
+  const preflightFailure = (cause: unknown): PipelineV2RunOutcome => {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    console.error(`orchestrator: pipeline v2 resume failed: ${message}`);
+    return deepFreeze({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
+  };
+
+  let gate: RunCauseGate;
+  try {
+    validateResumeContract(options, deps);
+    const capturedOnSignal = deps.onSignal;
+    if (capturedOnSignal !== undefined && typeof capturedOnSignal !== "function") {
+      throw new Error("pipeline v2 resume deps.onSignal must be a function");
+    }
+    gate = new RunCauseGate(capturedOnSignal);
+  } catch (cause) {
+    return preflightFailure(cause);
+  }
+  const recordedSignal = (): SignalAbort | null => gate.recordedSignal;
+
+  const signalOutcomeBeforeRunRoot = (): PipelineV2RunOutcome => {
+    const abort = recordedSignal();
+    if (abort === null) {
+      throw new Error("no signal was recorded");
+    }
+    return deepFreeze({
+      ok: false,
+      exitCode: signalExitCode(abort.signal),
+      runId: "",
+      runRoot: null,
+      state: null,
+      reason: signalReasonOf(abort.signal),
+    });
+  };
+
+  // --- the existing run root, verified read-only --------------------------
+  //
+  // The layout is never created or repaired; a signal or a verification
+  // failure before the run root is confirmed exists yields the generic
+  // preflight shape. From the confirmed run root on, every outcome carries
+  // the actual run id, the canonical run root and the last authoritative
+  // state.
+  const runId = options.runId;
+  let runRoot: PreparedRunRoot;
+  try {
+    runRoot = await verifyExistingRunRoot(deps.stateRootProjection, runId);
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return signalOutcomeBeforeRunRoot();
+    }
+    return preflightFailure(cause);
+  }
+  if (recordedSignal() !== null) {
+    return signalOutcomeBeforeRunRoot();
+  }
+
+  const postRunRootSignalOutcome = (state: PipelineV2RunState | null): PipelineV2RunOutcome => {
+    const abort = recordedSignal();
+    if (abort === null) {
+      throw new Error("no signal was recorded");
+    }
+    return deepFreeze({
+      ok: false,
+      exitCode: signalExitCode(abort.signal),
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state,
+      reason: signalReasonOf(abort.signal),
+    });
+  };
+
+  const postRunRootFailure = (
+    cause: unknown,
+    state: PipelineV2RunState | null,
+  ): PipelineV2RunOutcome => {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    console.error(`orchestrator: pipeline v2 resume failed: ${message}`);
+    return deepFreeze({ ok: false, exitCode: 1, runId, runRoot: runRoot.localRunRoot, state });
+  };
+
+  // --- sink open (read-only), then the durable snapshot --------------------
+
+  let sinkOrNull: PipelineV2RunStateSink | null = null;
+  try {
+    sinkOrNull = await PipelineV2RunStateSink.open({
+      stateRoot: deps.stateRootProjection.localRoot,
+      runId,
+      now: deps.now,
+    });
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(null);
+    }
+    return postRunRootFailure(cause, null);
+  }
+  const sink = sinkOrNull;
+  if (recordedSignal() !== null) {
+    return postRunRootSignalOutcome(sink.snapshot);
+  }
+
+  // --- pipeline, profiles, Launcher authority, runtime adapter -------------
+  //
+  // The pipeline is loaded only from the validated durable
+  // `state.pipeline.bundle_root`; the profiles are loaded again from the
+  // explicitly passed configuration root, once per unique agent-state
+  // profile name in declaration order (trusted operator configuration;
+  // durable profile epochs are not implemented).
+
+  let pipeline: ResolvedPipelineV2;
+  const profiles = new Map<string, ResolvedProfile>();
+  try {
+    pipeline = await loadPipelineV2(sink.snapshot!.pipeline.bundle_root);
+    for (const profileName of uniqueProfileNames(pipeline)) {
+      profiles.set(profileName, await loadProfile(options.configRoot, profileName, deps.baseEnv));
+    }
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(sink.snapshot);
+    }
+    return postRunRootFailure(cause, sink.snapshot);
+  }
+  if (recordedSignal() !== null) {
+    return postRunRootSignalOutcome(sink.snapshot);
+  }
+
+  let authority: Awaited<ReturnType<typeof lifecycleAuthority>>;
+  try {
+    authority = await lifecycleAuthority(
+      { cli: deps.cli, fetchAuth: deps.fetchAuth, config: deps.helperConfig, baseEnv: deps.baseEnv },
+      { launcherId: options.launcherId },
+    );
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(sink.snapshot);
+    }
+    return postRunRootFailure(cause, sink.snapshot);
+  }
+  if (recordedSignal() !== null) {
+    return postRunRootSignalOutcome(sink.snapshot);
+  }
+
+  let runtime: ReturnType<typeof createDockerHelperPipelineV2Runtime>;
+  try {
+    runtime = createDockerHelperPipelineV2Runtime({
+      pipeline,
+      profiles,
+      cli: deps.cli,
+      helperConfig: deps.helperConfig,
+      operatorEnv: authority.baseOperatorEnv,
+      expectedLauncherId: authority.auth.launcher_id,
+      runRootProjection: { localRoot: runRoot.localRunRoot, daemonRoot: runRoot.daemonRunRoot },
+    });
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(sink.snapshot);
+    }
+    return postRunRootFailure(cause, sink.snapshot);
+  }
+  if (recordedSignal() !== null) {
+    return postRunRootSignalOutcome(sink.snapshot);
+  }
+
+  const control: PipelineV2CoordinatorControl = {
+    currentSignal: () => gate.recordedSignal?.signal ?? null,
+    freezeSignal: () => gate.freezeSignalAcceptance()?.signal ?? null,
+  };
+
+  let result;
+  try {
+    result = await resumePipelineV2Run(
+      {
+        pipeline,
+        runId,
+        runRoot: runRoot.localRunRoot,
+        sink,
+        runtime,
+      },
+      control,
+    );
+  } catch (cause) {
+    const state = sink.snapshot;
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(state);
+    }
+    console.error(
+      `orchestrator: pipeline v2 resume failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state,
+    });
+  }
+
+  if (result.ok) {
+    return deepFreeze({
+      ok: true,
+      exitCode: 0,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: result.state,
+    });
+  }
+  if ("refused" in result && result.refused) {
+    // A pre-resume refusal is not a durable failure: no dispatch, no
+    // Session, no callback happened, and the state document is untouched.
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: result.state,
+      reason: result.reason,
+    });
+  }
+  const reason = result.reason;
+  const exitCode =
+    reason === "signal_sigint"
+      ? 130
+      : reason === "signal_sigterm"
+        ? 143
+        : 1;
+  if (reason !== "terminal_failed") {
+    console.error(`orchestrator: pipeline v2 resume failed: ${reason}`);
   }
   return deepFreeze({
     ok: false,

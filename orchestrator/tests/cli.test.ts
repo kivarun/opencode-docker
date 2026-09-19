@@ -199,6 +199,102 @@ test("run rejects unknown flags and relative required paths", () => {
   expectRunError(["--pipeline-root=/p", "--config-root=/c", "--project", "relative"], "--project must be an absolute path");
 });
 
+// --- resume parsing -----------------------------------------------------------
+
+test("resume parses the exact grammar with both flag forms", () => {
+  const parsed = parseCommand("resume", [
+    "--run-id", "run-1.2_abc",
+    "--config-root", "/abs/config",
+    "--launcher-id", "dhl_l1",
+    "--json",
+  ]);
+  if (parsed.kind !== "resume") {
+    throw new Error("expected resume");
+  }
+  expect(parsed.runId).toBe("run-1.2_abc");
+  expect(parsed.configRoot).toBe("/abs/config");
+  expect(parsed.launcherId).toBe("dhl_l1");
+  expect(parsed.json).toBe(true);
+
+  const minimal = parseCommand("resume", ["--run-id=rid_x", "--config-root=/cfg"]);
+  if (minimal.kind !== "resume") {
+    throw new Error("expected resume");
+  }
+  expect(minimal.runId).toBe("rid_x");
+  expect(minimal.configRoot).toBe("/cfg");
+  expect(minimal.launcherId).toBeUndefined();
+  expect(minimal.json).toBe(false);
+});
+
+test("resume rejects missing, duplicate, unsafe and value-less required flags", () => {
+  expect(() => parseCommand("resume", [])).toThrow(/--run-id SAFE_ID is required/);
+  expect(() => parseCommand("resume", ["--run-id", "rid"])).toThrow(/--config-root ABSOLUTE_PATH is required/);
+  expect(() => parseCommand("resume", ["--config-root", "/c"])).toThrow(/--run-id SAFE_ID is required/);
+  expect(() => parseCommand("resume", ["--run-id", "a", "--run-id", "b", "--config-root", "/c"])).toThrow(
+    /--run-id may be given at most once/,
+  );
+  expect(() => parseCommand("resume", ["--run-id", "rid", "--config-root", "/c", "--config-root=/d"])).toThrow(
+    /--config-root may be given at most once/,
+  );
+  expect(() => parseCommand("resume", ["--run-id", "a/b", "--config-root", "/c"])).toThrow(
+    /--run-id must be a safe identifier/,
+  );
+  expect(() => parseCommand("resume", ["--run-id", "rid", "--config-root", "rel"])).toThrow(
+    /--config-root must be an absolute path/,
+  );
+  expect(() => parseCommand("resume", ["--run-id"])).toThrow(/--run-id requires a value/);
+  expect(() => parseCommand("resume", ["--run-id=", "--config-root", "/c"])).toThrow(/--run-id requires a value/);
+  expect(() => parseCommand("resume", ["--run-id", "rid", "--config-root", "/c", "--launcher-id", "x"])).toThrow(
+    /--launcher-id must be a launcher ID/,
+  );
+  expect(() => parseCommand("resume", ["--run-id", "rid", "--config-root", "/c", "--json", "--json"])).toThrow(
+    /--json may be given at most once/,
+  );
+  expect(() => parseCommand("resume", ["--run-id", "rid", "--config-root", "/c", "--json=x"])).toThrow(
+    /--json does not take a value/,
+  );
+});
+
+test("resume rejects every fresh-run flag, unknown flags and positional arguments", () => {
+  const base = ["--run-id", "rid", "--config-root", "/c"];
+  expect(() => parseCommand("resume", [...base, "--pipeline-root", "/p"])).toThrow(
+    /resume does not accept --pipeline-root; the pipeline comes only from the durable state/,
+  );
+  expect(() => parseCommand("resume", [...base, "--project", "/p"])).toThrow(
+    /resume does not accept --project; the run-owned project copy already exists/,
+  );
+  expect(() => parseCommand("resume", [...base, "--input", "a=/p"])).toThrow(
+    /resume does not accept --input; the run-owned input snapshot already exists/,
+  );
+  expect(() => parseCommand("resume", [...base, "--workspace", "/w"])).toThrow(
+    /resume does not accept --workspace; the run-owned project copy is mounted from the run root/,
+  );
+  expect(() => parseCommand("resume", [...base, "--image", "x:1"])).toThrow(
+    /resume does not accept --image; the worker image comes only from the selected profile/,
+  );
+  expect(() => parseCommand("resume", [...base, "--profile", "coder"])).toThrow(
+    /resume does not accept --profile; the execution profiles are selected/,
+  );
+  expect(() => parseCommand("resume", [...base, "--task", "TASK.md"])).toThrow(/resume does not accept --task/);
+  expect(() => parseCommand("resume", [...base, "--state-root", "/s"])).toThrow(
+    /resume does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT/,
+  );
+  expect(() => parseCommand("resume", [...base, "--daemon-state-root", "/s"])).toThrow(
+    /resume does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT/,
+  );
+  expect(() => parseCommand("resume", [...base, "--flag"])).toThrow(/unknown argument: --flag/);
+  expect(() => parseCommand("resume", [...base, "positional"])).toThrow(/unknown argument: positional/);
+});
+
+test("usage documents the production pipeline v2 resume command", () => {
+  const text = usage();
+  expect(text).toContain("'orchestrator resume'");
+  expect(text).toContain("--run-id SAFE_ID");
+  expect(text).toContain("resume flags (production pipeline v2 continuation):");
+  expect(text).toContain("resume continues only a clean active run");
+  expect(text).toContain("the pipeline comes");
+});
+
 test("smoke and agent-smoke parsing is unchanged", () => {
   expect(parseCommand("smoke", []).kind).toBe("smoke");
   expect(parseCommand("agent-smoke", ["--config-root=/c"]).kind).toBe("agent-smoke");

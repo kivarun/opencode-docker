@@ -9,6 +9,12 @@
  *   pipeline/profile/auth/run-root/sink/runtime/coordinator decision lives
  *   inside the runner; the CLI creates no second gate, no Sessions, no
  *   mounts and no Docker Helper argv of its own.
+ * - `resume` — the production continuation of an already durable v2 run:
+ *   the same protected CLI-configuration boundary and per-call dependency
+ *   assembly, invoking `resumePipelineV2` exactly once. The run id and the
+ *   configuration root are the only user inputs; the pipeline, the project
+ *   copy, the input snapshot and the accepted outputs come only from the
+ *   durable state and the run-owned layout.
  *
  * The dispatcher is testable through per-call dependency injection
  * (`runCli(argv, io)`); no module-global mutable state exists.
@@ -30,6 +36,7 @@ import {
   resolvePipelineV2StateRootProjection,
 } from "./pipeline_v2_state_root.ts";
 import {
+  resumePipelineV2,
   runPipelineV2,
   type PipelineV2RunOutcome,
   type PipelineV2RunnerDeps,
@@ -49,6 +56,7 @@ export interface CliIo {
   resolveHelperConfig: (env: Readonly<Record<string, string | undefined>>) => HelperConfig;
   resolveStateRootProjection: typeof resolvePipelineV2StateRootProjection;
   runPipelineV2: typeof runPipelineV2;
+  resumePipelineV2: typeof resumePipelineV2;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
   /** One raw write to the real stdout; the caller adds the trailing newline. */
@@ -69,6 +77,7 @@ function productionCliIo(): CliIo {
     resolveHelperConfig: resolveHelperConfig,
     resolveStateRootProjection: resolvePipelineV2StateRootProjection,
     runPipelineV2,
+    resumePipelineV2,
     runSmoke,
     runAgentSmoke,
     writeStdout: (text) => process.stdout.write(text),
@@ -100,12 +109,17 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
 
-  if (command !== "smoke" && command !== "agent-smoke" && command !== "run") {
+  if (
+    command !== "smoke" &&
+    command !== "agent-smoke" &&
+    command !== "run" &&
+    command !== "resume"
+  ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
     io.writeError(`error: expected ${expected}${suffix}`);
@@ -129,6 +143,12 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // resolution below runs only for the v1 commands, whose observable
     // behavior stays unchanged.
     return await runPipelineV2Command(parsed, io);
+  }
+  if (parsed.kind === "resume") {
+    // The production pipeline v2 resume command: the same protected
+    // CLI-configuration boundary and per-call dependency assembly, then
+    // exactly one `resumePipelineV2` invocation.
+    return await runPipelineV2ResumeCommand(parsed, io);
   }
 
   const config = io.resolveHelperConfig(io.baseEnv);
@@ -186,44 +206,72 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
  * are assembled over the single runner instance and the v1 signal wiring;
  * `runPipelineV2` is invoked exactly once and its outcome reported.
  */
-async function runPipelineV2Command(
-  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "run" }>,
+/**
+ * The shared CLI-configuration boundary of the production pipeline v2
+ * commands: the state-root projection is resolved first (the same env
+ * resolver both commands use), then the helper configuration; any failure
+ * (including a helper-configuration failure with no usable HOME/
+ * XDG_CONFIG_HOME) is a CLI configuration error: exit 2 with the usage
+ * text, the runner never called, no auth, no filesystem, no runner
+ * subprocess, no signal registration, and `runCli` never rejects.
+ */
+async function resolvePipelineV2CliConfiguration(
   io: CliIo,
-): Promise<number> {
-  let stateRootProjection;
-  let config: HelperConfig;
+): Promise<{ stateRootProjection: Awaited<ReturnType<typeof resolvePipelineV2StateRootProjection>>; config: HelperConfig } | null> {
   try {
-    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
-    config = io.resolveHelperConfig(io.baseEnv);
+    const stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+    const config = io.resolveHelperConfig(io.baseEnv);
+    return { stateRootProjection, config };
   } catch (cause) {
     io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
     io.writeError(usage());
-    return 2;
+    return null;
   }
+}
 
-  // In JSON mode the stdout must carry exactly one JSON document, so only
-  // the calls the Docker Helper runtime asks to inherit (image pull,
-  // worker run) are switched to the streaming stderr mode: the child's
-  // stdout and stderr flow directly onto the parent's stderr with no
-  // buffering and no post-hoc forwarding. argv, env, options and every
-  // runtime decision stay untouched; `capture` calls (structured session
-  // answers) stay captured, and in human mode the adapter's own
-  // inheritance is kept.
-  const cli: CliRunner = parsed.json
+/**
+ * In JSON mode the stdout must carry exactly one JSON document, so only
+ * the calls the Docker Helper runtime asks to inherit (image pull, worker
+ * run) are switched to the streaming stderr mode: the child's stdout and
+ * stderr flow directly onto the parent's stderr with no buffering and no
+ * post-hoc forwarding. argv, env, options and every runtime decision stay
+ * untouched; `capture` calls (structured session answers) stay captured,
+ * and in human mode the adapter's own inheritance is kept.
+ */
+function pipelineV2CommandCli(parsedJson: boolean, io: CliIo): CliRunner {
+  return parsedJson
     ? (args, env, stdio: CliStdio, opts?: CliRunOptions) =>
         io.runner.run(args, env, stdio === "inherit" ? "stderr" : stdio, opts)
     : (args, env, stdio: CliStdio, opts?: CliRunOptions) => io.runner.run(args, env, stdio, opts);
+}
 
-  const deps: PipelineV2RunnerDeps = {
-    cli,
+function pipelineV2CommandDeps(
+  parsedJson: boolean,
+  configuration: { stateRootProjection: PipelineV2RunnerDeps["stateRootProjection"]; config: HelperConfig },
+  io: CliIo,
+): PipelineV2RunnerDeps {
+  return {
+    cli: pipelineV2CommandCli(parsedJson, io),
     fetchAuth: io.fetchAuth,
-    helperConfig: config,
+    helperConfig: configuration.config,
     baseEnv: io.baseEnv,
-    stateRootProjection,
+    stateRootProjection: configuration.stateRootProjection,
     onSignal: (handler) => {
       v1SignalRegistration(io, handler);
     },
   };
+}
+
+async function runPipelineV2Command(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "run" }>,
+  io: CliIo,
+): Promise<number> {
+  const configuration = await resolvePipelineV2CliConfiguration(io);
+  if (configuration === null) {
+    return 2;
+  }
+
+  const deps = pipelineV2CommandDeps(parsed.json, configuration, io);
 
   const outcome: PipelineV2RunOutcome = await io.runPipelineV2(
     {
@@ -236,19 +284,51 @@ async function runPipelineV2Command(
     deps,
   );
 
-  if (parsed.json) {
+  return reportPipelineV2Outcome("run", parsed.json, outcome, io);
+}
+
+async function runPipelineV2ResumeCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "resume" }>,
+  io: CliIo,
+): Promise<number> {
+  const configuration = await resolvePipelineV2CliConfiguration(io);
+  if (configuration === null) {
+    return 2;
+  }
+
+  const deps = pipelineV2CommandDeps(parsed.json, configuration, io);
+
+  const outcome: PipelineV2RunOutcome = await io.resumePipelineV2(
+    {
+      runId: parsed.runId,
+      configRoot: parsed.configRoot,
+      launcherId: parsed.launcherId,
+    },
+    deps,
+  );
+
+  return reportPipelineV2Outcome("resume", parsed.json, outcome, io);
+}
+
+function reportPipelineV2Outcome(
+  command: "run" | "resume",
+  json: boolean,
+  outcome: PipelineV2RunOutcome,
+  io: CliIo,
+): number {
+  if (json) {
     io.writeStdout(`${JSON.stringify(outcome)}\n`);
     return outcome.exitCode;
   }
 
   if (outcome.ok) {
     io.writeError(
-      `orchestrator: run ok (run ${outcome.runId}, state ${outcome.runRoot}/state.json, outputs ${outcome.runRoot}/outputs)`,
+      `orchestrator: ${command} ok (run ${outcome.runId}, state ${outcome.runRoot}/state.json, outputs ${outcome.runRoot}/outputs)`,
     );
   } else if (outcome.runRoot !== null) {
     const reasonPart = outcome.reason !== undefined ? ` reason ${outcome.reason},` : "";
     io.writeError(
-      `orchestrator: run failed (run ${outcome.runId},${reasonPart} state ${outcome.runRoot}/state.json)`,
+      `orchestrator: ${command} failed (run ${outcome.runId},${reasonPart} state ${outcome.runRoot}/state.json)`,
     );
   }
   // A failure before the run root was created needs no summary line: the

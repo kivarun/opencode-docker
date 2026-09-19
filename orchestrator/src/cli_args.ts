@@ -30,7 +30,19 @@ export interface ParsedPipelineRunArgs {
   readonly json: boolean;
 }
 
-export type ParsedCommand = ParsedSmokeArgs | ParsedAgentSmokeArgs | ParsedPipelineRunArgs;
+export interface ParsedPipelineResumeArgs {
+  readonly kind: "resume";
+  readonly runId: string;
+  readonly configRoot: string;
+  readonly launcherId?: string;
+  readonly json: boolean;
+}
+
+export type ParsedCommand =
+  | ParsedSmokeArgs
+  | ParsedAgentSmokeArgs
+  | ParsedPipelineRunArgs
+  | ParsedPipelineResumeArgs;
 
 export function usage(): string {
   return [
@@ -49,6 +61,10 @@ export function usage(): string {
     "               pipeline bundle -> profiles -> launcher credential -> run root ->",
     "               durable state -> agent/decision activations -> decision routing ->",
     "               terminal -> published run outputs",
+    "  resume       production pipeline v2 continuation of an already durable run",
+    "               from its clean active boundary: existing run root -> durable state ->",
+    "               restored runtime context -> agent/decision activations -> terminal ->",
+    "               published run outputs",
     "",
     "common flags:",
     "  --workspace PATH        workspace passed to 'docker-helper session create'; must exist",
@@ -84,6 +100,30 @@ export function usage(): string {
     "                          (no progress lines); worker and image-pull output is forwarded",
     "                          to stderr; the exit code is the outcome's exit code.",
     "",
+    "resume flags (production pipeline v2 continuation):",
+    "  --run-id SAFE_ID        the run id of the already durable run; required; a safe",
+    "                          identifier (letters, digits, '_', '.', '-', at most 128",
+    "                          characters). The pipeline, the project copy, the input",
+    "                          snapshot and the accepted outputs come only from the",
+    "                          durable state and the run-owned layout.",
+    "  --config-root PATH      operator-controlled configuration root holding",
+    "                          profiles/<name>.yaml and the OpenCode configurations;",
+    "                          required; absolute path. Profiles are trusted operator",
+    "                          configuration and are loaded again at resume; the pipeline",
+    "                          execution identity is verified by the durable digest.",
+    "  --launcher-id DHL_ID    fail unless the installed credential belongs to this launcher",
+    "  --json                  print exactly one JSON PipelineV2RunOutcome document on stdout",
+    "                          (no progress lines); worker and image-pull output is forwarded",
+    "                          to stderr; the exit code is the outcome's exit code.",
+    "",
+    "  resume continues only a clean active run (status active, phase running, every",
+    "  execution settled and bound to its committed transition, the last wait already",
+    "  answered). Waiting, in-flight, publishing, terminal and final states are refused",
+    "  without any durable write, Session or callback; the run root and state.json are",
+    "  never modified by a refusal. resume accepts no --pipeline-root, --project,",
+    "  --input, --workspace, --image, --profile or state-root flags: the pipeline comes",
+    "  only from the durable state and the data only from the run-owned layout.",
+    "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
     "    <state-root>/pipeline-runs/<run-id>/state.json",
@@ -97,7 +137,9 @@ export function usage(): string {
     "                                     daemon sees; defaults to the local root (host mode)",
     "  Both variables must be non-empty absolute clean paths; nothing is created by",
     "  the resolver, and the runner itself verifies kind, canonical form, identity",
-    "  and mode 0700.",
+    "  and mode 0700. The same resolution applies to 'resume', which additionally",
+    "  requires the existing run root <state-root>/pipeline-runs/<run-id> to exist",
+    "  unchanged (it is never created or chmodded by resume).",
     "",
     "run profiles and worker configuration:",
     "  The pipeline's agent states select the profiles; the worker image, the",
@@ -128,7 +170,9 @@ export function usage(): string {
     "Launcher authentication and before any child Session is created.",
     "",
     "agent-smoke is the v1 diagnostic command; the production pipeline v2 path is",
-    "'orchestrator run'.",
+    "'orchestrator run', and 'orchestrator resume' continues an already durable run",
+    "from its clean active boundary (the run id and the configuration root are the",
+    "only user inputs of a resume).",
     "",
     "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
     "input path come only from the pipeline's agent state, the worker image comes",
@@ -201,9 +245,15 @@ function parseValue(argv: string[], i: number, flag: string): { value: string; n
   throw new Error(`unknown argument: ${arg}`);
 }
 
-export function parseCommand(kind: "smoke" | "agent-smoke" | "run", argv: string[]): ParsedCommand {
+export function parseCommand(
+  kind: "smoke" | "agent-smoke" | "run" | "resume",
+  argv: string[],
+): ParsedCommand {
   if (kind === "run") {
     return parseRunArgs(argv);
+  }
+  if (kind === "resume") {
+    return parseResumeArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;
@@ -429,6 +479,119 @@ function parseRunArgs(argv: string[]): ParsedPipelineRunArgs {
     configRoot,
     projectSourcePath,
     inputBindings,
+    launcherId,
+    json,
+  };
+}
+
+/**
+ * Parses the production pipeline v2 resume command. The user-facing
+ * contract: `--run-id` (safe-id validated) and `--config-root` (absolute)
+ * are required; `--launcher-id` and `--json` are optional singletons;
+ * `--json` takes no value. Every fresh-run flag — `--pipeline-root`,
+ * `--project`, `--input`, `--workspace`, `--image`, `--profile`, `--task`
+ * and the state-root flags — is rejected for `resume`, as is every unknown
+ * flag or positional argument: the pipeline comes only from the durable
+ * state, and the project and inputs only from the run-owned layout.
+ */
+function parseResumeArgs(argv: string[]): ParsedPipelineResumeArgs {
+  let runId: string | null = null;
+  let configRoot: string | null = null;
+  let launcherId: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      if (runId !== null) {
+        throw new Error("--run-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      if (configRoot !== null) {
+        throw new Error("--config-root may be given at most once");
+      }
+      if (!value.startsWith("/")) {
+        throw new Error("--config-root must be an absolute path");
+      }
+      configRoot = value;
+      i = next;
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      const { value, next } = parseValue(argv, i, "--launcher-id");
+      if (!value.startsWith("dhl_")) {
+        throw new Error("--launcher-id must be a launcher ID (dhl_...)");
+      }
+      if (launcherId !== undefined) {
+        throw new Error("--launcher-id may be given at most once");
+      }
+      launcherId = value;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "resume does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error(
+        "resume does not accept --project; the run-owned project copy already exists in the run root",
+      );
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error(
+        "resume does not accept --input; the run-owned input snapshot already exists in the run root",
+      );
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error(
+        "resume does not accept --workspace; the run-owned project copy is mounted from the run root",
+      );
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error(
+        "resume does not accept --image; the worker image comes only from the selected profile",
+      );
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error(
+        "resume does not accept --profile; the execution profiles are selected by the pipeline's agent states",
+      );
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("resume does not accept --task; there is no task input on a resumed run");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "resume does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "resume does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for resume");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABSOLUTE_PATH is required for resume");
+  }
+  return {
+    kind: "resume",
+    runId,
+    configRoot,
     launcherId,
     json,
   };
