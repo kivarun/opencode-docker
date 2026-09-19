@@ -61,12 +61,13 @@ export function runArgs(
   spec: WorkerSpec,
   socketPath: string,
 ): string[] {
+  // docker-helper 2.2.0-rc.10 grammar: the image is the one required
+  // positional operand of `run` (`run [flags] IMAGE [--] [COMMAND...]`);
+  // the legacy `--image` flag is not part of the RC10 CLI surface.
   const args = [
     "run",
     "--endpoint",
     socketPath,
-    "--image",
-    spec.image,
   ];
   if (spec.entrypoint !== undefined) {
     args.push("--entrypoint", spec.entrypoint);
@@ -81,6 +82,7 @@ export function runArgs(
   for (const key of Object.keys(spec.containerEnv).sort()) {
     args.push("--env", `${key}=${spec.containerEnv[key]}`);
   }
+  args.push(spec.image);
   args.push("--");
   args.push(...spec.command);
   return args;

@@ -676,14 +676,15 @@ test("1. default one-state pipeline: one session, v2 result identity, durable v2
     expect(run.args[0]).toBe("run");
     expect(run.args[1]).toBe("--endpoint");
     expect(run.args[2]).toBe(SOCKET);
-    expect(run.args[3]).toBe("--image");
-    expect(run.args[4]).toBe(PROFILE_IMAGE);
-    expect(run.args[5]).toBe("--entrypoint");
-    expect(run.args[6]).toBe("opencode");
-    expect(run.args[7]).toBe("--workdir");
-    expect(run.args[8]).toBe("/workspace");
-    expect(run.args[9]).toBe("--mount");
-    expect(run.args[10]).toBe(".:/workspace");
+    expect(run.args).not.toContain("--image");
+    expect(run.args[3]).toBe("--entrypoint");
+    expect(run.args[4]).toBe("opencode");
+    expect(run.args[5]).toBe("--workdir");
+    expect(run.args[6]).toBe("/workspace");
+    expect(run.args[7]).toBe("--mount");
+    expect(run.args[8]).toBe(".:/workspace");
+    // RC10: the image is the last value before the "--" separator
+    expect(run.args[run.args.indexOf("--") - 1]).toBe(PROFILE_IMAGE);
     const envPairs = runEnvPairs(run.args);
     expect(envPairs).toEqual([
       `AGENT_SMOKE_ACTIVATION_INDEX=1`,
@@ -863,13 +864,13 @@ test("2. two sequential agent-states: two different sessions in create/run/delet
     const firstRun = runCall(calls, 0);
     expect(envPairValue(firstRun.args, "AGENT_SMOKE_STATE_ID")).toBe("first");
     expect(envPairValue(firstRun.args, "AGENT_SMOKE_ACTIVATION_INDEX")).toBe("1");
-    expect(firstRun.args[4]).toBe(PROFILE_IMAGE);
+    expect(firstRun.args[firstRun.args.indexOf("--") - 1]).toBe(PROFILE_IMAGE);
     expect(firstRun.timeoutSeconds).toBe(3600);
     expect(envPairValue(firstRun.args, "AGENT_SMOKE_INPUT_task")).toBe("/workspace/TASK.md");
     const secondRun = runCall(calls, 1);
     expect(envPairValue(secondRun.args, "AGENT_SMOKE_STATE_ID")).toBe("second");
     expect(envPairValue(secondRun.args, "AGENT_SMOKE_ACTIVATION_INDEX")).toBe("2");
-    expect(secondRun.args[4]).toBe(ALT_IMAGE);
+    expect(secondRun.args[secondRun.args.indexOf("--") - 1]).toBe(ALT_IMAGE);
     expect(secondRun.timeoutSeconds).toBe(30);
     expect(envPairValue(secondRun.args, "AGENT_SMOKE_INPUT_notes")).toBe("/workspace/NOTES.md");
     expect(envPairValue(secondRun.args, "AGENT_SMOKE_INPUT_task")).toBe("");
@@ -2626,13 +2627,17 @@ test("extra: agent worker spec argv, entrypoint and env", () => {
     "run",
     "--endpoint",
     SOCKET,
-    "--image",
-    "base:latest",
     "--entrypoint",
     "opencode",
     "--workdir",
     "/workspace",
+    "--mount",
+    ".:/workspace",
   ]);
+  expect(args).not.toContain("--image");
+  // RC10: the image is the last value before the "--" separator
+  expect(args[args.indexOf("--") - 1]).toBe("base:latest");
+  expect(args).not.toContain("--image");
   const envPairs = args.filter((a, i) => args[i - 1] === "--env");
   expect(envPairs).toEqual([
     `AGENT_SMOKE_ACTIVATION_INDEX=3`,

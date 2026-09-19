@@ -658,7 +658,8 @@ test("1. happy path: agent -> decision -> success through the real sink, runtime
   expect(runCall).toBeDefined();
   const args = runCall?.args ?? [];
   expect(args.filter((arg) => arg === "--helper-socket").length).toBe(1);
-  expect(args[args.indexOf("--image") + 1]).toBe("ghcr.io/example/worker:1");
+  // RC10 grammar: the image is the last value before the "--" separator
+  expect(args[args.indexOf("--") - 1]).toBe("ghcr.io/example/worker:1");
   const mounts = args
     .map((arg, index) => (index > 0 && args[index - 1] === "--mount" ? arg : null))
     .filter((spec): spec is string => spec !== null)

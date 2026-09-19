@@ -908,16 +908,12 @@ export function createDockerHelperPipelineV2Runtime(
     const inputsSource = policyPaths.inputs;
     const outputsSource = policyPaths.outputs;
 
-    // No secret value in argv: the Tool bearer, the OpenCode config
-    // content and every profile env value travel only through --env-from
-    // from deterministic private source variables of the run subprocess
-    // environment.
+    // docker-helper 2.2.0-rc.10 grammar: the image is the one required
+    // positional operand of `run` (`run [flags] IMAGE [--] [COMMAND...]`).
     const args: string[] = [
       "run",
       "--endpoint",
       helperConfig.socketPath,
-      "--image",
-      profileData.image,
       "--entrypoint",
       WORKER_ENTRYPOINT,
       "--workdir",
@@ -937,6 +933,7 @@ export function createDockerHelperPipelineV2Runtime(
     for (const entry of profileData.envEntries) {
       args.push("--env-from", `${entry.destination}=${profileSourceName(entry.destination)}`);
     }
+    args.push(profileData.image);
     args.push(
       "--",
       "run",

@@ -958,14 +958,15 @@ test("extra: worker spec and CLI args", () => {
   expect(args[0]).toBe("run");
   expect(args[1]).toBe("--endpoint");
   expect(args[2]).toBe(SOCKET);
-  expect(args[3]).toBe("--image");
-  expect(args[4]).toBe("alpine:3.22");
+  expect(args).not.toContain("--image");
+  const separatorIndex = args.indexOf("--");
+  // RC10: the image is the last argv value before the "--" separator
+  expect(args[separatorIndex - 1]).toBe("alpine:3.22");
   const envPairs = args.filter((a, i) => args[i - 1] === "--env");
   expect(envPairs).toEqual([
     `DOCKER_HELPER_SESSION_TOKEN=${CHILD_TOKEN}`,
     "SMOKE_RUN_ID=run-1",
   ]);
-  const separatorIndex = args.indexOf("--");
   expect(args.slice(separatorIndex + 1)).toEqual(spec.command);
 
   const complexSpec = smokeWorkerSpec("r", CHILD_TOKEN, "img");
@@ -984,6 +985,8 @@ test("extra: worker spec and CLI args", () => {
   for (const value of complexPairs) {
     expect(typeof value).toBe("string");
   }
+  // RC10: the image is the last value before the "--" separator
+  expect(complexArgs[complexArgs.indexOf("--") - 1]).toBe("img");
 
   expect(resolveSocketPath(undefined)).toBe("/run/docker-helper/docker-helper.sock");
   expect(resolveSocketPath("/tmp/custom.sock")).toBe("/tmp/custom.sock");
