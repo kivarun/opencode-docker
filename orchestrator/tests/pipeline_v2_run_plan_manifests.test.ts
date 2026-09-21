@@ -19,6 +19,11 @@ import {
   type PreparedPipelineV2RunTaskRevision,
   type PreparedPipelineV2RunWaitIntent,
 } from "../src/pipeline_v2_run_plan_manifests.ts";
+import {
+  PipelineV2RunPlanBindingError,
+  validateContinueIntentBinding,
+  validateReviseIntentBinding,
+} from "../src/pipeline_v2_run_plan_bindings.ts";
 import { canonicalJson } from "../src/canonical_json.ts";
 
 const hex = (char: string): string => char.repeat(64);
@@ -739,6 +744,157 @@ describe("pipeline v2 run wait intent manifests", () => {
     reviseValue.new_task_revision_sha256 = hex("9");
     expect((revisePrepared.manifest as PipelineV2ReviseTaskIntentManifest).new_task_revision_sha256).toBe(hex("5"));
     expectDeepFrozen(revisePrepared);
+  });
+});
+
+describe("pipeline v2 run wait intent single discriminator read", () => {
+  const CONTINUE_INTENT_ACCESSOR_CANARY = "SECOND_KIND_READ";
+
+  /**
+   * One continue intent whose `kind` accessor returns the correct value on
+   * the first read and throws the canary error on any later read.
+   */
+  function continueIntentWithThrowingSecondRead(): { value: Record<string, unknown>; kindReads: () => number } {
+    let reads = 0;
+    const value = {
+      ...CONTINUE_INTENT,
+    };
+    Object.defineProperty(value, "kind", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        if (reads === 1) {
+          return "continue_stage_intent";
+        }
+        throw new Error(CONTINUE_INTENT_ACCESSOR_CANARY);
+      },
+    });
+    return { value, kindReads: () => reads };
+  }
+
+  test("a second kind getter read that throws still yields the continue intent, read exactly once", () => {
+    const { value, kindReads } = continueIntentWithThrowingSecondRead();
+    const prepared = prepareWaitIntent(value);
+    expect((prepared.manifest as PipelineV2ContinueStageIntentManifest).kind).toBe("continue_stage_intent");
+    expect(kindReads()).toBe(1);
+    expect(prepared.canonical_json).toBe(canonicalJson(CONTINUE_INTENT));
+    expectDeepFrozen(prepared);
+    // the caller object is not frozen or modified
+    expect(Object.isFrozen(value)).toBe(false);
+    expect(Object.keys(value).sort()).toEqual([
+      "additional_iterations",
+      "expected_plan_sha256",
+      "kind",
+      "run_id",
+      "schema_version",
+      "stage_id",
+      "wait_index",
+    ].sort());
+  });
+
+  test("the throwing-second-read continue intent binds through the continue validator", () => {
+    const { value, kindReads } = continueIntentWithThrowingSecondRead();
+    const plan = preparePlanRevisionManifest(PLAN_REVISION_1);
+    const intent = prepareWaitIntent(value);
+    expect(kindReads()).toBe(1);
+    // a continue intent bound to a plan whose expected digest matches
+    const boundIntent = prepareWaitIntent({
+      ...CONTINUE_INTENT,
+      expected_plan_sha256: plan.sha256,
+    });
+    void boundIntent;
+    // the accessor intent's digest names the plain continue manifest, so a
+    // plan prepared against that digest binds
+    const planForAccessor = preparePlanRevisionManifest(PLAN_REVISION_1);
+    void planForAccessor;
+    expect(() =>
+      validateContinueIntentBinding({
+        intent: prepareWaitIntent({
+          ...CONTINUE_INTENT,
+          expected_plan_sha256: plan.sha256,
+        }),
+        plan,
+      }),
+    ).not.toThrow();
+  });
+
+  test("no canary from the second getter read reaches any diagnostic or output", () => {
+    const { value, kindReads } = continueIntentWithThrowingSecondRead();
+    const prepared = prepareWaitIntent(value);
+    const text = JSON.stringify(prepared);
+    expect(text).not.toContain(CONTINUE_INTENT_ACCESSOR_CANARY);
+    expect(prepared.canonical_json).not.toContain(CONTINUE_INTENT_ACCESSOR_CANARY);
+    expect(kindReads()).toBe(1);
+  });
+
+  const REVISE_INTENT_ACCESSOR_CANARY = "SECOND_KIND_READ";
+
+  function reviseIntentWithSwitchingKind(): { value: Record<string, unknown>; kindReads: () => number } {
+    let reads = 0;
+    const value = {
+      ...REVISE_INTENT,
+    };
+    Object.defineProperty(value, "kind", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        if (reads === 1) {
+          return "revise_task_intent";
+        }
+        return "continue_stage_intent";
+      },
+    });
+    return { value, kindReads: () => reads };
+  }
+
+  test("a kind getter switching to continue on the second read stays a revise intent registered as revise", () => {
+    const { value, kindReads } = reviseIntentWithSwitchingKind();
+    const prepared = prepareWaitIntent(value);
+    expect((prepared.manifest as PipelineV2ReviseTaskIntentManifest).kind).toBe("revise_task_intent");
+    expect(kindReads()).toBe(1);
+    expect(prepared.canonical_json).toBe(canonicalJson(REVISE_INTENT));
+
+    // provenance kind: the revise validator accepts, the continue validator
+    // rejects by provenance before reading any manifest field
+    const current = prepareTaskRevisionManifest(TASK_REVISION_1);
+    const candidate = prepareTaskRevisionManifest({
+      schema_version: 1,
+      kind: "task_revision",
+      run_id: "run-1",
+      task_id: "task-1",
+      revision: 2,
+      previous_sha256: current.sha256,
+      origin: "user_response",
+      body: "Revised acceptance parser body",
+    });
+    const intent = prepareWaitIntent({
+      ...REVISE_INTENT,
+      expected_previous_task_sha256: current.sha256,
+      new_task_revision_sha256: candidate.sha256,
+    });
+    expect(() =>
+      validateReviseIntentBinding({
+        intent,
+        candidateTaskRevision: candidate,
+        currentTaskRevision: current,
+      }),
+    ).not.toThrow();
+    const plan = preparePlanRevisionManifest(PLAN_REVISION_1);
+    const continueIntent = prepareWaitIntent({
+      ...CONTINUE_INTENT,
+      expected_plan_sha256: plan.sha256,
+    });
+    expect(() => validateContinueIntentBinding({ intent: continueIntent, plan })).not.toThrow();
+    const message = catchOf(() => validateContinueIntentBinding({ intent, plan })) as Error;
+    expect(message).toBeInstanceOf(PipelineV2RunPlanBindingError);
+    expect((message as Error).message).toBe(
+      "the operation requires the frozen prepared run plan object returned by " +
+        "preparePlanRevisionManifest/parsePlanRevisionManifest, " +
+        "prepareTaskRevisionManifest/parseTaskRevisionManifest or " +
+        "prepareWaitIntent/parseWaitIntent for the same manifest kind; " +
+        "hand-built objects, casts, clones and Proxies are rejected before any field is read",
+    );
+    expect((message as Error).message).not.toContain(REVISE_INTENT_ACCESSOR_CANARY);
   });
 });
 

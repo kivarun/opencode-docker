@@ -688,11 +688,10 @@ export function parseTaskRevisionManifest(raw: string): PreparedPipelineV2RunTas
  * domain; the two kinds differ in their canonical payload).
  */
 export function prepareWaitIntent(value: unknown): PreparedPipelineV2RunWaitIntent {
+  const manifest = normalizeWaitIntent(value);
   return freezePreparedManifest(
-    normalizeWaitIntent(value),
-    (value as { kind?: unknown } | null | undefined)?.kind === "revise_task_intent"
-      ? "revise_task_intent"
-      : "continue_stage_intent",
+    manifest,
+    manifest.kind === "revise_task_intent" ? "revise_task_intent" : "continue_stage_intent",
     WAIT_INTENT_DIGEST_DOMAIN,
   ) as PreparedPipelineV2RunWaitIntent;
 }
