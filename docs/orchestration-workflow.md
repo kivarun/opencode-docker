@@ -1645,6 +1645,77 @@ content-free. Coordinator, runner and CLI wiring, reading the user
 response from a file, resume, P01 validation, and migrations stay out
 of scope.
 
+### Run plan manifests (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_run_plan_manifests.ts` fixes the canonical
+content-free format of the three manifest kinds the user-intervention
+layer will exchange: the **plan revision** (the full immutable plan
+snapshot — `schema_version` 1, `run_id`, `revision`, `previous_sha256`
+`null` for revision 1 and a lowercase SHA-256 from revision 2, the
+protected `root_task {input_id: "task", sha256}` binding, a positive
+`origin_execution`, and one or more sequentially ordered `stages`, each
+carrying a `template` reference and at least one flat task pointer
+`{id, revision, sha256, depends_on}`), the **task revision** (the only
+place a task `body` exists; `origin` is the content-free class
+`planning_proposal|user_response` — revision 1 is only ever
+`planning_proposal`, revisions above 1 only `user_response`), and the
+two **wait intents** (`continue_stage_intent` with `additional_iterations
+> 0` and no upper limit baked into the parser; `revise_task_intent`
+carrying the current and candidate task digests, never a task body).
+Normalization semantics: the stage array order is semantic (sequential
+execution; reordering stages changes the digest), while task pointers
+inside a stage and every `depends_on` list are sorted by the preparer —
+permuting equivalent tasks or dependencies never changes the canonical
+JSON or the digest, and the only task-order semantics is `depends_on`.
+Stage ids are plan-unique, task ids are globally plan-unique, and
+dependencies reference tasks of the same stage only (no self, duplicate
+or unknown edges, no cycles). Moving to the next already declared stage
+never requires a new plan revision — a revision appears only when the
+plan itself changes. Digests are
+`SHA-256("pipeline-v2-plan-revision\0" + canonicalJson(manifest))`,
+`SHA-256("pipeline-v2-task-revision\0" + ...)` and
+`SHA-256("pipeline-v2-wait-intent\0" + ...)` (both intent kinds share
+the intent domain and differ in their canonical payload) — three new
+domains separated from each other and from every existing pipeline v2
+domain, built on the one shared canonical serializer and the shared
+scalar predicates. Every manifest type is validated by exactly one
+chain (`parse*` runs the same chain after `JSON.parse`), results are
+deep-frozen `{manifest, canonical_json, sha256}` snapshots registered in
+the shared module-private provenance registry
+(`pipeline_v2_run_plan_provenance.ts`), and diagnostics are content-free
+(no raw JSON, bodies, unknown property names or values are echoed).
+
+`orchestrator/src/pipeline_v2_run_plan_bindings.ts` adds the pure
+cross-manifest consistency layer: `validatePlanTaskBindings` (exactly
+one prepared task revision per plan task pointer — missing, extra and
+duplicate revisions rejected — plus `task_id`/`revision`/`sha256`
+identity equality and run-id equality), `validatePlanRevisionChain`
+(revision 1 with no predecessor; a successor with the same run,
+`revision === previous.revision + 1`,
+`previous_sha256 === previous.sha256`, and the unchanged protected
+root-task binding — stage and task content may change),
+`validateRootTaskBinding` (exact equality of the plan's root task digest
+with a caller-computed protected-input digest; the TASK object or body
+is never received), `validateContinueIntentBinding` (same run,
+`expected_plan_sha256 === plan.sha256`, the declared stage exists; a
+template-specific maximum iteration grant is future policy, not
+binding) and `validateReviseIntentBinding` (same run and task, the
+candidate the exact successor of the current accepted revision, both
+intent digests naming the current and candidate digests exactly, and the
+candidate origin `user_response`). Every validator gates on the shared
+provenance registry before any field is read — hand-built, spread,
+`structuredClone`d and proxied look-alikes are rejected with zero getter
+or trap hits — and caller objects are never frozen or modified.
+
+Both modules are pure substrate: no filesystem or store, no state schema
+v7, no reducer commands, no engine/coordinator/runner/CLI wiring, no
+pipeline schema or stage templates, no P01, and no wait-controller
+integration. Two structural questions stay deliberately unresolved: how
+a pure reducer derives the task ledger from `{revision, sha256}` pairs
+(initial task revisions need separate durable commands or content-free
+refs), and where the crash-safe boundaries `plan acceptance ↔
+transition` and `stage_iteration_opened ↔ start_agent_execution` lie.
+
 ### Read-only runtime context restoration for a future resume (implemented, not wired)
 
 `orchestrator/src/pipeline_v2_resume_context.ts` adds the read-only
