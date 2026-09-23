@@ -1587,8 +1587,9 @@ under the fixed flat layout
 `<runRoot>/waits/<waitIndex>.request.json` and
 `<runRoot>/waits/<waitIndex>.response.json`: `waits/` is a 0700 real
 non-symlink directory (exclusive creation, identity fixation,
-chmod-enforced 0700, canonical verification, and one run-root fsync on
-first creation), and manifest files are 0600 regular files whose bytes
+chmod-enforced 0700, canonical verification, and one run-root fsync
+before every successful ensure — created here or adopted), and manifest
+files are 0600 regular files whose bytes
 are exactly the manifest's canonical JSON without a trailing newline.
 The public API is `publishPipelineV2WaitRequest(runRoot, value)` and
 `publishPipelineV2WaitResponse(runRoot, waitIndex, raw)`; the response
@@ -1631,7 +1632,8 @@ existing plan/task revision manifest substrate under the fixed layout
 
 `run-plan`, `plans`, `tasks` and `<task-id>` are 0700 real non-symlink
 directory components (exclusive creation, identity fixation,
-chmod-enforced 0700, canonical verification, parent fsync on creation);
+chmod-enforced 0700, canonical verification, parent fsync before every
+successful ensure — created here or adopted);
 manifest files are 0600 regular files whose bytes are exactly the
 manifest's canonical JSON without a trailing newline. The run root is
 never created, chmodded or removed and its basename must equal the

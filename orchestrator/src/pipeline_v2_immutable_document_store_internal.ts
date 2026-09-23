@@ -27,8 +27,12 @@ import { isErrnoException, isInsideRoot } from "./fs_checks.ts";
  *   2. store-owned directory components (exclusive `mkdir`, immediate
  *      `dev`/`ino` identity fixation, chmod enforcement of mode 0700 —
  *      never trusted to the umask — canonical identity verification, and
- *      one parent fsync on first creation; an existing object that is not
- *      a real directory, or a directory with the wrong mode, fails closed);
+ *      one parent fsync before every successful return; only the
+ *      directory this call created is chmodded and ownership-checked-
+ *      removed on a chmod failure, while a concurrently created
+ *      (`EEXIST`) or pre-existing directory is verified and adopted
+ *      without modification; an existing object that is not a real
+ *      directory, or a directory with the wrong mode, fails closed);
  *   3. the immutable file publication: exclusive temp file
  *      (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600) in the final parent, full
  *      write-all loop (partial writes advance the position; a
@@ -196,7 +200,7 @@ export interface ImmutableDocumentIo {
   readonly link: (existingPath: string, newPath: string) => Promise<void>;
   /** Unlink of an owned temp file (the caller checks identity first). */
   readonly unlink: (path: string) => Promise<void>;
-  /** rmdir of the just-created empty directory on chmod failure. */
+  /** rmdir of the empty directory this call created, on chmod failure. */
   readonly rmdir: (path: string) => Promise<void>;
 }
 
@@ -468,13 +472,22 @@ async function removeOwnedTempFile(
 
 /**
  * Ensure one store-owned directory component inside a canonical parent:
- * exclusive creation (a concurrent creator loses into the same
- * verification), immediate identity fixation, chmod enforcement of mode
- * 0700 (never trusted to the umask), canonical identity verification, and
- * — on first creation — one fsync of the parent before any document file
- * is published into it. An existing object that is not a real directory,
- * or a directory with the wrong mode, fails closed as an invalid layout;
- * the mode is verified, never silently fixed by adoption.
+ * exclusive creation with immediate identity fixation. Only a directory
+ * that `mkdir` created in this very call is owned by the call: it is
+ * chmod-enforced to mode 0700 (never trusted to the umask) and, on a
+ * chmod failure, ownership-checked-removed. A directory created
+ * concurrently by someone else (`mkdir` `EEXIST`) or found pre-existing
+ * is adopted for verification only — real non-symlink directory, mode
+ * 0700, canonical identity — and is never chmodded or removed. An
+ * existing object that is not a real directory, or a directory with the
+ * wrong mode, fails closed as an invalid layout; the mode is verified,
+ * never silently fixed by adoption. Before every successful return the
+ * parent directory is fsynced — whether the component was created here or
+ * adopted — so the directory entry's crash durability is confirmed on
+ * every accepted ensure; a parent fsync failure is a pre-publication
+ * (not published) io failure and may leave the directory behind, which
+ * the next call adopts without chmod and re-syncs before any document
+ * file is published into it.
  */
 export async function ensureImmutableDirectory(
   io: ImmutableDocumentIo,
@@ -485,10 +498,11 @@ export async function ensureImmutableDirectory(
 ): Promise<string> {
   const dirPath = `${parentCanonical}/${dirName}`;
   let info = await inspectOrNull(io, dirPath, `the ${dirNoun}`);
-  let created = false;
+  let mkdirSucceededHere = false;
   if (info === null) {
     try {
       await io.mkdirExclusive(dirPath);
+      mkdirSucceededHere = true;
     } catch (cause) {
       if (!isErrnoException(cause, "EEXIST")) {
         throw immutableDocumentIoFailure(`the ${dirNoun} could not be created`, cause);
@@ -498,16 +512,18 @@ export async function ensureImmutableDirectory(
     if (createdInfo === null || createdInfo.isSymbolicLink() || !createdInfo.isDirectory()) {
       throw immutableDocumentIoFailure(`the ${dirNoun} is not a real directory after creation`);
     }
-    created = true;
-    try {
-      await io.chmod(dirPath, 0o700);
-    } catch (cause) {
-      await removeOwnedEmptyDirectory(io, dirPath, createdInfo, parentCanonical);
-      throw immutableDocumentIoFailure(`the ${dirNoun} could not be created`, cause);
-    }
-    info = await inspectOrNull(io, dirPath, `the ${dirNoun}`);
-    if (info === null || info.isSymbolicLink() || !info.isDirectory()) {
-      throw immutableDocumentIoFailure(`the ${dirNoun} is not a real directory after creation`);
+    info = createdInfo;
+    if (mkdirSucceededHere) {
+      try {
+        await io.chmod(dirPath, 0o700);
+      } catch (cause) {
+        await removeOwnedEmptyDirectory(io, dirPath, createdInfo, parentCanonical);
+        throw immutableDocumentIoFailure(`the ${dirNoun} could not be created`, cause);
+      }
+      info = await inspectOrNull(io, dirPath, `the ${dirNoun}`);
+      if (info === null || info.isSymbolicLink() || !info.isDirectory()) {
+        throw immutableDocumentIoFailure(`the ${dirNoun} is not a real directory after creation`);
+      }
     }
   } else if (info.isSymbolicLink() || !info.isDirectory()) {
     throw immutableDocumentInvalidLayout(`the ${dirNoun} exists but is ${describeImmutableObject(info)}`);
@@ -524,22 +540,20 @@ export async function ensureImmutableDirectory(
   if (canonical !== dirPath) {
     throw immutableDocumentInvalidLayout(`the ${dirNoun} does not resolve to its canonical path`);
   }
-  if (created) {
-    try {
-      await fsyncImmutableDirectory(io, parentCanonical);
-    } catch (cause) {
-      throw immutableDocumentIoFailure(`the ${parentNoun} could not be synced`, cause);
-    }
+  try {
+    await fsyncImmutableDirectory(io, parentCanonical);
+  } catch (cause) {
+    throw immutableDocumentIoFailure(`the ${parentNoun} could not be synced`, cause);
   }
   return dirPath;
 }
 
 /**
- * Best-effort removal of the just-created empty store-owned directory
- * after a chmod failure. The removal runs only with the recorded ownership
- * proof (same real non-symlink directory, same `dev`/`ino`, canonically
- * inside the parent); every failure is swallowed and never replaces the
- * original failure.
+ * Best-effort removal of the empty store-owned directory this call
+ * created, after a chmod failure. The removal runs only with the recorded
+ * ownership proof (same real non-symlink directory, same `dev`/`ino`,
+ * canonically inside the parent); every failure is swallowed and never
+ * replaces the original failure.
  */
 async function removeOwnedEmptyDirectory(
   io: ImmutableDocumentIo,

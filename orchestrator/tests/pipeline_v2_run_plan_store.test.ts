@@ -771,17 +771,31 @@ test("23. post-link fault matrix: temp unlink and parent durability become durab
   try {
     const cases: [string, StoreIo, string][] = [
       ["temp_unlink", ioFaulting("unlink", injectedFailure("EACCES")), "could not be removed"],
-      ["dir_open", ioFaulting("openDir", injectedFailure("EACCES")), "could not be synced"],
+      [
+        "dir_open",
+        ioReplacing("openDir", async (path: string) => {
+          // Fault only the post-link durability fsync of the task
+          // directory: the ensure-phase parent fsyncs open the ancestors.
+          if (path === join(fixture.tasks, "task-2")) {
+            throw injectedFailure("EACCES");
+          }
+          return realRunPlanStoreIo.openDir(path);
+        }),
+        "could not be synced",
+      ],
       [
         "dir_fsync",
         ioReplacing("openDir", async (path: string) => {
           const real = await realRunPlanStoreIo.openDir(path);
-          return Object.freeze({
-            sync: async () => {
-              throw injectedFailure("EIO");
-            },
-            close: real.close.bind(real),
-          });
+          if (path === join(fixture.tasks, "task-2")) {
+            return Object.freeze({
+              sync: async () => {
+                throw injectedFailure("EIO");
+              },
+              close: real.close.bind(real),
+            });
+          }
+          return real;
         }),
         "could not be synced",
       ],
@@ -789,17 +803,20 @@ test("23. post-link fault matrix: temp unlink and parent durability become durab
         "dir_close",
         ioReplacing("openDir", async (path: string) => {
           const real = await realRunPlanStoreIo.openDir(path);
-          return Object.freeze({
-            sync: real.sync.bind(real),
-            close: async () => {
-              try {
-                await real.close();
-              } catch {
-                // best effort
-              }
-              throw injectedFailure("EIO");
-            },
-          });
+          if (path === join(fixture.tasks, "task-2")) {
+            return Object.freeze({
+              sync: real.sync.bind(real),
+              close: async () => {
+                try {
+                  await real.close();
+                } catch {
+                  // best effort
+                }
+                throw injectedFailure("EIO");
+              },
+            });
+          }
+          return real;
         }),
         "could not be synced",
       ],
@@ -1141,6 +1158,180 @@ test("33. publication never modifies anything outside <runRoot>/run-plan", async
     ).catch((error) => error);
     expectStoreError(conflictCause, "not_published", "conflict");
     expect(await Promise.all(paths.map((path) => readFile(path)))).toEqual(before);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+// --- 34-38. concurrent directory adoption and parent durability ---------------
+
+test("34. a concurrently created correct task directory is adopted without chmod or rmdir", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.tasks, { mode: 0o700, recursive: true });
+    const taskDir = join(fixture.tasks, "task-1");
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    let concurrentIno = -1;
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      mkdirExclusive: async (path: string) => {
+        if (path === taskDir) {
+          // The concurrent creator wins the race: it creates the
+          // directory first, so the publisher's own exclusive mkdir
+          // fails with EEXIST and the call must adopt the directory.
+          await realRunPlanStoreIo.mkdirExclusive(taskDir);
+          await realRunPlanStoreIo.chmod(taskDir, 0o700);
+          concurrentIno = (await lstat(taskDir)).ino;
+        }
+        return await realRunPlanStoreIo.mkdirExclusive(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realRunPlanStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realRunPlanStoreIo.rmdir(path);
+      },
+    }) as unknown as StoreIo;
+    const published = await publishPipelineV2TaskRevisionWithIo(io, fixture.runRoot, taskValue());
+    expect(published.task_path).toBe(join(taskDir, "1.json"));
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    const info = await lstat(taskDir);
+    expect(info.ino).toBe(concurrentIno);
+    expect(info.mode & 0o777).toBe(0o700);
+    expect(await readFile(published.task_path, "utf8")).toBe(published.task.canonical_json);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("35. a concurrently created wrong-mode task directory fails closed without repair", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.tasks, { mode: 0o700, recursive: true });
+    const taskDir = join(fixture.tasks, "task-1");
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      mkdirExclusive: async (path: string) => {
+        if (path === taskDir) {
+          await realRunPlanStoreIo.mkdirExclusive(taskDir);
+          await realRunPlanStoreIo.chmod(taskDir, 0o755);
+          await writeFile(join(taskDir, ".sentinel"), "sentinel\n", { mode: 0o600 });
+        }
+        return await realRunPlanStoreIo.mkdirExclusive(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realRunPlanStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realRunPlanStoreIo.rmdir(path);
+      },
+    }) as unknown as StoreIo;
+    const cause = await publishPipelineV2TaskRevisionWithIo(io, fixture.runRoot, taskValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(cause, "not_published", "invalid_layout", "mode 0700");
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    const info = await lstat(taskDir);
+    expect(info.mode & 0o777).toBe(0o755);
+    expect(await readFile(join(taskDir, ".sentinel"), "utf8")).toBe("sentinel\n");
+    expect((await readdir(taskDir)).filter((name) => name.endsWith(".json"))).toEqual([]);
+    expect(await tempFileNames(taskDir)).toEqual([]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("36. a chmod failure on a directory created by this call still removes it", async () => {
+  const fixture = await setup();
+  try {
+    const rmdirPaths: string[] = [];
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      chmod: async () => {
+        throw injectedFailure("EACCES");
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realRunPlanStoreIo.rmdir(path);
+      },
+    }) as unknown as StoreIo;
+    const cause = await publishPipelineV2TaskRevisionWithIo(io, fixture.runRoot, taskValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(cause, "not_published", "io_failure", "could not be created");
+    expect(rmdirPaths).toEqual([fixture.runPlan]);
+    expect(await readdir(fixture.runRoot)).toEqual([]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("37. a parent fsync failure after creating the directory keeps not_published and may leave it", async () => {
+  const fixture = await setup();
+  try {
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      openDir: async (path: string) => {
+        if (path === fixture.runRoot) {
+          throw injectedFailure("EIO");
+        }
+        return realRunPlanStoreIo.openDir(path);
+      },
+    }) as unknown as StoreIo;
+    const cause = await publishPipelineV2TaskRevisionWithIo(io, fixture.runRoot, taskValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(cause, "not_published", "io_failure", "could not be synced");
+    expect(await readdir(fixture.runRoot)).toEqual(["run-plan"]);
+    expect(await readdir(fixture.runPlan)).toEqual([]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("38. an exact retry after a parent fsync failure adopts the directory, re-syncs the parent and publishes", async () => {
+  const fixture = await setup();
+  try {
+    const faulted = Object.freeze({
+      ...realRunPlanStoreIo,
+      openDir: async (path: string) => {
+        if (path === fixture.runRoot) {
+          throw injectedFailure("EIO");
+        }
+        return realRunPlanStoreIo.openDir(path);
+      },
+    }) as unknown as StoreIo;
+    const cause = await publishPipelineV2TaskRevisionWithIo(faulted, fixture.runRoot, taskValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(cause, "not_published", "io_failure", "could not be synced");
+    const openDirPaths: string[] = [];
+    const chmodPaths: string[] = [];
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      openDir: async (path: string) => {
+        openDirPaths.push(path);
+        return realRunPlanStoreIo.openDir(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realRunPlanStoreIo.chmod(path, mode);
+      },
+    }) as unknown as StoreIo;
+    const retry = await publishPipelineV2TaskRevisionWithIo(io, fixture.runRoot, taskValue());
+    expect(retry.task_path).toBe(join(fixture.tasks, "task-1", "1.json"));
+    expect(openDirPaths).toContain(fixture.runRoot);
+    expect(chmodPaths).not.toContain(fixture.runPlan);
+    expect(await readFile(retry.task_path, "utf8")).toBe(retry.task.canonical_json);
   } finally {
     await dispose(fixture);
   }

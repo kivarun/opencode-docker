@@ -833,17 +833,31 @@ test("24. post-link fault matrix: temp unlink and directory durability become du
   try {
     const cases: [string, WaitStoreIo, string][] = [
       ["temp_unlink", ioFaulting("unlink", injectedFailure("EACCES")), "could not be removed"],
-      ["dir_open", ioFaulting("openDir", injectedFailure("EACCES")), "could not be synced"],
+      [
+        "dir_open",
+        ioReplacing("openDir", async (path: string) => {
+          // Fault only the post-link durability fsync of the waits
+          // directory: the ensure-phase parent fsync opens the run root.
+          if (path === fixture.waits) {
+            throw injectedFailure("EACCES");
+          }
+          return realWaitStoreIo.openDir(path);
+        }),
+        "could not be synced",
+      ],
       [
         "dir_fsync",
         ioReplacing("openDir", async (path: string) => {
           const real = await realWaitStoreIo.openDir(path);
-          return Object.freeze({
-            sync: async () => {
-              throw injectedFailure("EIO");
-            },
-            close: real.close.bind(real),
-          });
+          if (path === fixture.waits) {
+            return Object.freeze({
+              sync: async () => {
+                throw injectedFailure("EIO");
+              },
+              close: real.close.bind(real),
+            });
+          }
+          return real;
         }),
         "could not be synced",
       ],
@@ -851,19 +865,22 @@ test("24. post-link fault matrix: temp unlink and directory durability become du
         "dir_close",
         ioReplacing("openDir", async (path: string) => {
           const real = await realWaitStoreIo.openDir(path);
-          return Object.freeze({
-            sync: real.sync.bind(real),
-            close: async () => {
-              // Close the real handle first so no descriptor leaks; the
-              // fault is still observed by the caller as a failed close.
-              try {
-                await real.close();
-              } catch {
-                // best effort
-              }
-              throw injectedFailure("EIO");
-            },
-          });
+          if (path === fixture.waits) {
+            return Object.freeze({
+              sync: real.sync.bind(real),
+              close: async () => {
+                // Close the real handle first so no descriptor leaks; the
+                // fault is still observed by the caller as a failed close.
+                try {
+                  await real.close();
+                } catch {
+                  // best effort
+                }
+                throw injectedFailure("EIO");
+              },
+            });
+          }
+          return real;
         }),
         "could not be synced",
       ],
@@ -916,7 +933,14 @@ test("26. an idempotent repeat still fsyncs the waits directory before returning
   try {
     await publishPipelineV2WaitRequest(fixture.runRoot, requestValue());
     const cause = await publishWaitRequestWithIo(
-      ioFaulting("openDir", injectedFailure("EACCES")),
+      ioReplacing("openDir", async (path: string) => {
+        // Fault only the adoption fsync of the waits directory; the
+        // ensure-phase parent fsync opens the run root.
+        if (path === fixture.waits) {
+          throw injectedFailure("EACCES");
+        }
+        return realWaitStoreIo.openDir(path);
+      }),
       fixture.runRoot,
       requestValue(),
     ).catch((error) => error);
@@ -1059,4 +1083,144 @@ test("31. the public export surface carries no test seam", async () => {
     "publishPipelineV2WaitRequest",
     "publishPipelineV2WaitResponse",
   ]);
+});
+
+// --- 32-35. concurrent directory adoption and parent durability ---------------
+
+test("32. a concurrently created correct waits directory is adopted without chmod or rmdir", async () => {
+  const fixture = await setup();
+  try {
+    const openDirPaths: string[] = [];
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    let concurrentIno = -1;
+    const io = Object.freeze({
+      ...realWaitStoreIo,
+      mkdirExclusive: async (path: string) => {
+        if (path === fixture.waits) {
+          // The concurrent creator wins the race: it creates the
+          // directory first, so the publisher's own exclusive mkdir
+          // fails with EEXIST and the call must adopt the directory.
+          await realWaitStoreIo.mkdirExclusive(fixture.waits);
+          await realWaitStoreIo.chmod(fixture.waits, 0o700);
+          concurrentIno = (await lstat(fixture.waits)).ino;
+        }
+        return await realWaitStoreIo.mkdirExclusive(path);
+      },
+      openDir: async (path: string) => {
+        openDirPaths.push(path);
+        return realWaitStoreIo.openDir(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realWaitStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realWaitStoreIo.rmdir(path);
+      },
+    }) as unknown as WaitStoreIo;
+    const published = await publishWaitRequestWithIo(io, fixture.runRoot, requestValue());
+    expect(published.request_path).toBe(join(fixture.waits, "1.request.json"));
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    const info = await lstat(fixture.waits);
+    expect(info.ino).toBe(concurrentIno);
+    expect(info.mode & 0o777).toBe(0o700);
+    expect(await readFile(published.request_path, "utf8")).toBe(published.request.canonical_json);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("33. a concurrently created wrong-mode waits directory fails closed without repair", async () => {
+  const fixture = await setup();
+  try {
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    const io = Object.freeze({
+      ...realWaitStoreIo,
+      mkdirExclusive: async (path: string) => {
+        if (path === fixture.waits) {
+          await realWaitStoreIo.mkdirExclusive(fixture.waits);
+          await realWaitStoreIo.chmod(fixture.waits, 0o755);
+          await writeFile(join(fixture.waits, ".sentinel"), "sentinel\n", { mode: 0o600 });
+        }
+        return await realWaitStoreIo.mkdirExclusive(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realWaitStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realWaitStoreIo.rmdir(path);
+      },
+    }) as unknown as WaitStoreIo;
+    const cause = await publishWaitRequestWithIo(io, fixture.runRoot, requestValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(cause, "not_published", "invalid_layout", "mode 0700");
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    const info = await lstat(fixture.waits);
+    expect(info.mode & 0o777).toBe(0o755);
+    expect(await readFile(join(fixture.waits, ".sentinel"), "utf8")).toBe("sentinel\n");
+    expect((await readdir(fixture.waits)).filter((name) => name.endsWith(".json"))).toEqual([]);
+    expect(await tempFileNames(fixture.waits)).toEqual([]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("34. publishing into a pre-existing waits directory syncs the run root before the link", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.waits, { mode: 0o700 });
+    const events: string[] = [];
+    const io = Object.freeze({
+      ...realWaitStoreIo,
+      openDir: async (path: string) => {
+        events.push(`dir-sync:${path}`);
+        return realWaitStoreIo.openDir(path);
+      },
+      link: async (from: string, to: string) => {
+        events.push("link");
+        return realWaitStoreIo.link(from, to);
+      },
+    }) as unknown as WaitStoreIo;
+    const published = await publishWaitRequestWithIo(io, fixture.runRoot, requestValue());
+    expect(published.request_path).toBe(join(fixture.waits, "1.request.json"));
+    expect(await readFile(published.request_path, "utf8")).toBe(published.request.canonical_json);
+    const runRootSync = events.indexOf(`dir-sync:${fixture.runRoot}`);
+    expect(runRootSync).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("link")).toBeGreaterThan(runRootSync);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("35. a parent fsync failure on an adopted waits directory fails before the link", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.waits, { mode: 0o700 });
+    const io = Object.freeze({
+      ...realWaitStoreIo,
+      openDir: async (path: string) => {
+        if (path === fixture.runRoot) {
+          throw injectedFailure("EIO");
+        }
+        return realWaitStoreIo.openDir(path);
+      },
+    }) as unknown as WaitStoreIo;
+    const cause = await publishWaitRequestWithIo(io, fixture.runRoot, requestValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(cause, "not_published", "io_failure", "could not be synced");
+    expect((await readdir(fixture.waits)).filter((name) => name.endsWith(".json"))).toEqual([]);
+    expect(await tempFileNames(fixture.waits)).toEqual([]);
+    expect((await readdir(fixture.runRoot)).includes("waits")).toBe(true);
+  } finally {
+    await dispose(fixture);
+  }
 });
