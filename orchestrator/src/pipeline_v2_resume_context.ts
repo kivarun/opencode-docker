@@ -3,6 +3,7 @@ import { lstat, realpath } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { isErrnoException } from "./fs_checks.ts";
 import { PipelineError } from "./pipeline.ts";
+import { compiledTransitionFor, PipelineExecutionError } from "./pipeline_engine.ts";
 import { requireResolvedPipelineV2Provenance, type ResolvedPipelineV2 } from "./pipeline_v2.ts";
 import {
   PipelineV2StateError,
@@ -53,14 +54,20 @@ import {
  *      canonical bundle root, execution snapshot digest, entry state,
  *      transition budget) plus the run-id binding
  *      `basename(runRoot) === state.run_id`;
- *   5. the run-root layout: `<runRoot>` absolute, canonical, real
+ *   5. the compiled-history verification: every durable transition must
+ *      equal the exact step `compiledTransitionFor` (the single resolver
+ *      the engine itself uses) produces for the walked cursor state and
+ *      the recorded outcome, ending at the durable cursor — a structurally
+ *      coherent but compiled-incompatible journal is rejected
+ *      `pipeline_mismatch` before any filesystem access;
+ *   6. the run-root layout: `<runRoot>` absolute, canonical, real
  *      non-symlink directory; `project`, `data` and `data/inputs` real
  *      non-symlink directories canonically resolving to their declared
  *      paths inside the canonical run root, with `data` and
  *      `data/inputs` keeping the orchestrator-owned mode 0700 (`project`
  *      is worker-writable, so its content and mode are never fixed and
  *      never repaired);
- *   6. the run-input snapshot restoration: the durable inputs must match
+ *   7. the run-input snapshot restoration: the durable inputs must match
  *      the declared pipeline inputs exactly (count, declaration order,
  *      id, type, protected flag, digest), every fixed object
  *      `<runRoot>/data/inputs/<id>` is verified with the data-plane
@@ -72,7 +79,7 @@ import {
  *      provenance registry `snapshotRunInputs` uses (no second registry;
  *      hand-built, cloned, spread, `structuredClone`d or proxied
  *      look-alikes keep failing the existing runtime gates);
- *   7. the accepted-history reconstruction from `state.executions` only:
+ *   8. the accepted-history reconstruction from `state.executions` only:
  *      for every agent execution with durable outputs the record set must
  *      exactly equal the declared output ports of that state in
  *      declaration order (decision executions add nothing); every record
@@ -81,7 +88,7 @@ import {
  *      canonical containment, the exact `pipeline-v2-output` digest
  *      framing, and full JSON re-parse plus revalidation against the
  *      declaring output port's compiled schema);
- *   8. only after the full success the deep-frozen context is returned.
+ *   9. only after the full success the deep-frozen context is returned.
  *
  * Resumable boundaries of this increment (clean boundaries without
  * unfinished work only):
@@ -112,12 +119,13 @@ import {
  * by message text): `PipelineV2RuntimeContextRestoreError` carries the
  * immutable `reason` — `invalid_state` (schema v6 validation or a
  * non-resumable boundary), `pipeline_mismatch` (durable pipeline/input/
- * output declaration metadata or run-id binding mismatch),
- * `run_layout_invalid` (run root/project/data/inputs structure),
- * `run_input_modified` (a fixed input object, kind, digest, JSON or
- * schema) or `accepted_output_modified` (a fixed accepted output object,
- * kind, digest, JSON or schema). Unexpected programmer errors propagate
- * unchanged and are never masked. Diagnostics are content-free: no file
+ * output declaration metadata, run-id binding or compiled-transition
+ * history mismatch), `run_layout_invalid` (run root/project/data/inputs
+ * structure), `run_input_modified` (a fixed input object, kind, digest,
+ * JSON or schema) or `accepted_output_modified` (a fixed accepted output
+ * object, kind, digest, JSON or schema). Unexpected programmer errors
+ * propagate unchanged and are never masked. Diagnostics are content-free:
+ * no file
  * or JSON bodies, no facts, prompts, env values or credentials, no
  * original user paths, and no malformed-JSON parser fragments.
  */
@@ -391,6 +399,65 @@ function reconstructAcceptedRecords(
 }
 
 /**
+ * The compiled-history verification: every durable transition of the
+ * already validated state must equal the exact step the compiled pipeline
+ * produces for the walked cursor state and the recorded outcome — resolved
+ * through the single `compiledTransitionFor` the engine itself uses, so
+ * execution and verification share one `outcome -> {to, transition_index}`
+ * implementation. A structurally coherent journal that names an outcome
+ * with a different target or transition index (or an undeclared outcome)
+ * is incompatible with the trusted pipeline and is rejected before any
+ * filesystem access. Diagnostics carry only the transition ordinal and the
+ * already validated safe identifiers, never raw objects or bodies.
+ */
+function verifyCompiledTransitionHistory(
+  pipeline: ResolvedPipelineV2,
+  state: PipelineV2RunState,
+): void {
+  const mismatch = (what: string): PipelineV2RuntimeContextRestoreError =>
+    restoreError(
+      "pipeline_mismatch",
+      `the durable transition history is incompatible with the compiled pipeline: ${what}`,
+    );
+  let cursor = pipeline.entry_state;
+  for (let ordinal = 0; ordinal < state.transitions.length; ordinal++) {
+    const transition = state.transitions[ordinal]!;
+    let expected;
+    try {
+      expected = compiledTransitionFor(pipeline, cursor, transition.outcome);
+    } catch (cause) {
+      if (cause instanceof PipelineExecutionError) {
+        throw mismatch(
+          `transition ${ordinal + 1} from ${JSON.stringify(cursor)} carries outcome ${JSON.stringify(transition.outcome)}, which the compiled pipeline does not resolve`,
+        );
+      }
+      throw cause;
+    }
+    if (
+      transition.from !== expected.from ||
+      transition.outcome !== expected.outcome ||
+      transition.to !== expected.to ||
+      transition.index !== expected.transition_index
+    ) {
+      throw mismatch(
+        `transition ${ordinal + 1} from ${JSON.stringify(transition.from)} with outcome ${JSON.stringify(transition.outcome)} does not match the compiled transition to ${JSON.stringify(expected.to)}`,
+      );
+    }
+    cursor = expected.to;
+  }
+  if (cursor !== state.cursor.current_state) {
+    throw mismatch(
+      `the replayed cursor ${JSON.stringify(cursor)} does not match the durable cursor ${JSON.stringify(state.cursor.current_state)}`,
+    );
+  }
+  if (state.cursor.transition_count !== state.transitions.length) {
+    throw mismatch(
+      `the durable transition count ${state.cursor.transition_count} does not match ${state.transitions.length} recorded transitions`,
+    );
+  }
+}
+
+/**
  * Validate the durable inputs against the declared pipeline inputs and
  * build the exact restoration expectations, carrying each declaring
  * input's compiled schema for the JSON revalidation.
@@ -474,7 +541,12 @@ export async function restorePipelineV2RuntimeContext(
   checkResumableBoundary(validated);
   // 4. The exact pipeline identity plus the run-id binding.
   checkPipelineIdentity(pipeline, validated, runRoot);
-  // 5. The run-root layout, strictly read-only.
+  // 5. The compiled-history verification: every durable transition must
+  //    equal the step the compiled pipeline itself produces — strictly
+  //    before any filesystem access, so a structurally valid but
+  //    compiled-incompatible journal never touches the run root.
+  verifyCompiledTransitionHistory(pipeline, validated);
+  // 6. The run-root layout, strictly read-only.
   if (typeof runRoot !== "string" || !isAbsolute(runRoot)) {
     throw restoreError("run_layout_invalid", "the run root must be an absolute path");
   }
@@ -487,7 +559,7 @@ export async function restorePipelineV2RuntimeContext(
   await requireRestoreDirectory(dataRoot, "the run data directory", 0o700);
   const inputsRoot = `${dataRoot}/inputs`;
   await requireRestoreDirectory(inputsRoot, "the run inputs directory", 0o700);
-  // 6. The provenance-backed run-input snapshot restoration.
+  // 7. The provenance-backed run-input snapshot restoration.
   let runInputs: RunInputsSnapshot;
   try {
     runInputs = await mintRestoredRunInputsSnapshot(
@@ -505,7 +577,7 @@ export async function restorePipelineV2RuntimeContext(
     }
     throw cause;
   }
-  // 7.+8. The accepted-history reconstruction and its full validation
+  // 8.+9. The accepted-history reconstruction and its full validation
   //    through the single existing chain — fixed paths, kinds, digests and
   //    JSON schemas of every record, including old non-winning ones.
   const acceptedOutputs = reconstructAcceptedRecords(pipeline, validated);

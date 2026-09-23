@@ -7,6 +7,7 @@ import { PipelineError } from "../src/pipeline.ts";
 import { loadPipelineV2, type ResolvedPipelineV2 } from "../src/pipeline_v2.ts";
 import {
   reducePipelineV2RunCommand,
+  validatePipelineV2RunState,
   type PipelineV2RunCommand,
   type PipelineV2RunState,
 } from "../src/pipeline_v2_state.ts";
@@ -318,7 +319,7 @@ function runDecisionActivation(
       from: stateId,
       outcome,
       to: outcome === "alpha" ? "ship" : "coder",
-      transition_index: 0,
+      transition_index: outcome === "alpha" ? 0 : 1,
     },
     executionIndex,
   });
@@ -1222,3 +1223,264 @@ test("35. the public export surface carries no registry, minter or test seams", 
     "restorePipelineV2RuntimeContext",
   ]);
 });
+
+// --- 36-44. compiled-history verification (the engine-compatible journal) ----
+
+/**
+ * Clone a durable state document, mutate one committed transition of the
+ * journal, and drive it back through the reducer's own loader contract:
+ * the mutation must remain structurally valid (the loader accepts it) so
+ * the compiled-history verifier is the only layer that rejects it. A
+ * changed target therefore also moves the durable cursor — the loader's
+ * joint replay follows recorded targets, while the compiled verifier walks
+ * the pipeline's own compiled steps.
+ */
+function withMutatedTransition(
+  state: PipelineV2RunState,
+  ordinal: number,
+  mutate: (transition: Record<string, unknown>) => void,
+): PipelineV2RunState {
+  const clone = JSON.parse(JSON.stringify(state)) as Record<string, unknown>;
+  const transitions = clone["transitions"] as Record<string, unknown>[];
+  const transition = transitions[ordinal]!;
+  mutate(transition);
+  // Keep the journal loader-coherent after a target change: the cursor
+  // becomes the replayed end of the mutated chain.
+  rewriteCursorFromTargets(clone);
+  return clone as unknown as PipelineV2RunState;
+}
+
+/** Replays the recorded transition targets and rewrites the durable cursor accordingly. */
+function rewriteCursorFromTargets(clone: Record<string, unknown>): void {
+  const pipelineEntry = "coder";
+  let cursor = pipelineEntry;
+  for (const transition of clone["transitions"] as Record<string, unknown>[]) {
+    cursor = transition["to"] as string;
+  }
+  (clone["cursor"] as Record<string, unknown>)["current_state"] = cursor;
+}
+
+test("36. a valid agent->decision->terminal history restores", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    runDecisionActivation(base, base.drive, "check", "alpha");
+    await runAgentActivation(base, base.drive, "ship", "unused");
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+    expect(context.state.transitions.map((transition) => `${transition.from}--${transition.outcome}-->${transition.to}`)).toEqual([
+      "coder--completed-->check",
+      "check--alpha-->ship",
+      "ship--completed-->done",
+    ]);
+    expect(context.cursor).toEqual({ current_state: "done", transition_count: 3 });
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("37. a valid cycle/repeated-state history restores", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    runDecisionActivation(base, base.drive, "check", "beta");
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: false, f2: true }));
+    runDecisionActivation(base, base.drive, "check", "alpha");
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "ship", transition_count: 4 });
+    expect(context.state.transitions[1]?.outcome).toBe("beta");
+    expect(context.state.transitions[1]?.to).toBe("coder");
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("38. a structurally valid wrong target passes the loader but fails restore as pipeline_mismatch", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    runDecisionActivation(base, base.drive, "check", "alpha");
+    // Structurally coherent journal: same state, outcome, index — but the
+    // target names a different declared state. The loader accepts it.
+    const mutated = withMutatedTransition(base.drive.state!, 1, (transition) => {
+      transition["to"] = "done";
+    });
+    expect(() => validatePipelineV2RunState(mutated)).not.toThrow();
+    expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, mutated, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("39. a structurally valid wrong transition_index passes the loader but fails restore", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    runDecisionActivation(base, base.drive, "check", "alpha");
+    // alpha's declared index is 0; claim 1. Structurally valid, compiled-invalid.
+    const mutated = withMutatedTransition(base.drive.state!, 1, (transition) => {
+      transition["index"] = 1;
+    });
+    expect(() => validatePipelineV2RunState(mutated)).not.toThrow();
+    const cause = expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, mutated, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+    expect(cause.message).toContain("transition 2");
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("40. a declared outcome routed to another target with a foreign index is rejected", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    // beta's declared step is (coder, index 1); record it as (done, index 0).
+    runDecisionActivationWithStep(base, base.drive, "check", "beta", "done", 0);
+    const cause = expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+    expect(cause.message).toContain("does not match the compiled transition");
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("41. an outcome the compiled pipeline does not declare is rejected", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    // The decision record claims a selected outcome the compiled model
+    // neither declares as a decision id nor reserves; the transition
+    // (structurally valid, loader-accepted) names it with a coherent
+    // target. Only the compiled verifier rejects it.
+    const executionIndex = (base.drive.state as PipelineV2RunState).executions.length + 1;
+    dispatchClock(base.drive, base.clock, { kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    dispatchClock(base.drive, base.clock, {
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "mystery", decision: "mystery", rule_id: "R1", active_constraint_ids: [] },
+    });
+    dispatchClock(base.drive, base.clock, {
+      kind: "transition_committed",
+      step: { from: "check", outcome: "mystery", to: "done", transition_index: 0 },
+      executionIndex,
+    });
+    const cause = expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+    expect(cause.message).toContain("which the compiled pipeline does not resolve");
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("42. damage in an old non-last transition is also detected", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    runDecisionActivation(base, base.drive, "check", "beta");
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: false, f2: true }));
+    runDecisionActivation(base, base.drive, "check", "alpha");
+    await runAgentActivation(base, base.drive, "ship", "unused");
+    // Corrupt the first transition (coder -> check): claim the wrong
+    // transition index. The recorded targets stay coherent, so the loader
+    // accepts the journal; the compiled verifier rejects the index.
+    const mutated = withMutatedTransition(base.drive.state!, 0, (transition) => {
+      transition["index"] = 7;
+    });
+    expect(() => validatePipelineV2RunState(mutated)).not.toThrow();
+    expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, mutated, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("43. a compiled mismatch happens before any filesystem access", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    runDecisionActivation(base, base.drive, "check", "alpha");
+    const mutated = withMutatedTransition(base.drive.state!, 1, (transition) => {
+      transition["to"] = "done";
+    });
+    const before = await fingerprint(base.root);
+    const cause = await restorePipelineV2RuntimeContext(base.pipeline, mutated, base.runRoot).catch(
+      (error) => error,
+    );
+    expectRestoreError(cause, "pipeline_mismatch");
+    expect(await fingerprint(base.root)).toBe(before);
+    // Stronger proof of ordering: strip the entire run tree (the layout
+    // checks would fail as run_layout_invalid if they ran first) and
+    // observe that the compiled mismatch still wins.
+    await rm(join(base.runRoot, "project"), { recursive: true, force: true });
+    await rm(join(base.runRoot, "data"), { recursive: true, force: true });
+    const layout = await restorePipelineV2RuntimeContext(base.pipeline, mutated, base.runRoot).catch(
+      (error) => error,
+    );
+    expectRestoreError(layout, "pipeline_mismatch");
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("44. compiled-mismatch diagnostics are content-free", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    runDecisionActivation(base, base.drive, "check", "alpha");
+    const mutated = withMutatedTransition(base.drive.state!, 1, (transition) => {
+      transition["to"] = "done";
+    });
+    const cause = expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, mutated, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+    expect(cause.message).not.toContain(CANARY_BODY);
+    expect(cause.message).not.toContain("TASK-BODY");
+    expect(cause.message).not.toContain("f1");
+    expect(cause.message).not.toContain("activations");
+    expect(cause.message).not.toContain("cause");
+    // input state and pipeline remain untouched by the verification
+    const pipelineSnapshot = JSON.parse(JSON.stringify(base.pipeline));
+    await restorePipelineV2RuntimeContext(base.pipeline, mutated, base.runRoot).catch(() => undefined);
+    expect(JSON.parse(JSON.stringify(base.pipeline))).toEqual(pipelineSnapshot);
+  } finally {
+    await dispose(base);
+  }
+});
+
+/**
+ * Decision activation with an explicitly forged committed step: still
+ * structurally valid for the reducer (which verifies outcome/decision
+ * equality and cursor linkage, not compiled targets), but compiled-invalid.
+ */
+function runDecisionActivationWithStep(
+  base: Base,
+  drive: Drive,
+  stateId: string,
+  outcome: "alpha" | "beta" | "uncovered",
+  to: string,
+  transitionIndex: number,
+): void {
+  const executionIndex = (drive.state as PipelineV2RunState).executions.length + 1;
+  dispatchClock(drive, base.clock, { kind: "start_decision_execution", stateId, inputDigest: hex("e") });
+  dispatchClock(drive, base.clock, {
+    kind: "decision_evaluated",
+    result: outcome === "uncovered"
+      ? { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] }
+      : { status: "selected", outcome, decision: outcome, rule_id: "R1", active_constraint_ids: [] },
+  });
+  dispatchClock(drive, base.clock, {
+    kind: "transition_committed",
+    step: { from: stateId, outcome, to, transition_index: transitionIndex },
+    executionIndex,
+  });
+}

@@ -735,16 +735,69 @@ function compileV2Graph(
   return finishCompiledGraph(states, pipeline.entry_state, pipeline.max_transitions);
 }
 
-function findTransition(
-  state: CompiledExecutableState,
+/**
+ * The small immutable transition record shared by the normalized pipeline
+ * topology and the engine-owned compiled snapshot: both representations
+ * declare `outcome`/`to`, and the transition index is the position in the
+ * declared order — the public lookup reads the normalized list, the
+ * execution loop reads the compiled list, one resolver serves both.
+ */
+interface TransitionRecord {
+  readonly outcome: string;
+  readonly to: string;
+}
+
+interface CompiledTransition extends TransitionRecord {
+  index: number;
+}
+
+/**
+ * The single transition resolution of the project, shared by engine
+ * execution and restore verification: it finds the transition of one
+ * transition-bearing state by outcome over the state's own transition list
+ * and returns the exact `{from, outcome, to, transition_index}` step,
+ * deep-frozen; a missing outcome yields `undefined` for the caller's exact
+ * engine message (the agent/decision label of the message is caller
+ * knowledge, never executor knowledge). The loop of `runCompiledGraph`
+ * resolves every fresh and resumed step over the compiled state's
+ * transitions, and the public v2 lookup and the restore verifier resolve
+ * over the normalized pipeline state's transitions — there is no second
+ * `outcome -> {to, transition_index}` implementation anywhere, no executor
+ * parameter, no graph compilation and no filesystem I/O.
+ */
+function resolveCompiledTransition(
+  stateId: string,
+  transitions: readonly TransitionRecord[],
   outcome: string,
-): CompiledTransition | undefined {
-  for (const transition of state.transitions) {
+): TransitionStep | undefined {
+  for (let index = 0; index < transitions.length; index++) {
+    const transition = transitions[index]!;
     if (transition.outcome === outcome) {
-      return transition;
+      return Object.freeze({
+        from: stateId,
+        outcome,
+        to: transition.to,
+        transition_index: index,
+      });
     }
   }
   return undefined;
+}
+
+/**
+ * The one exact `unknown_outcome` error of the project: the engine loop
+ * builds it from the compiled state's kind, the public v2 lookup from the
+ * normalized state's type — same helper, byte-identical messages.
+ */
+function unknownOutcomeError(
+  kind: "agent" | "decision",
+  stateId: string,
+  outcome: string,
+): PipelineExecutionError {
+  return new PipelineExecutionError(
+    "unknown_outcome",
+    `${kind === "decision" ? "decision" : "agent"} result outcome ${JSON.stringify(outcome)} does not match any transition outcome of state ${JSON.stringify(stateId)}`,
+  );
 }
 
 /**
@@ -805,21 +858,13 @@ async function runCompiledGraph(
         `${stateKindLabel(current.kind)} ${JSON.stringify(current.id)} produced an invalid outcome ${JSON.stringify(outcome)}; the ${current.kind} reports an outcome and never selects the next state`,
       );
     }
-    const match = findTransition(current, outcome);
-    if (match === undefined) {
-      throw new PipelineExecutionError(
-        "unknown_outcome",
-        `${current.kind === "decision" ? "decision" : "agent"} result outcome ${JSON.stringify(outcome)} does not match any transition outcome of state ${JSON.stringify(current.id)}`,
-      );
+    // The step is resolved and frozen by the single shared resolver from
+    // the engine's own snapshot: the callback selected only the outcome,
+    // never the target.
+    const step = resolveCompiledTransition(current.id, current.transitions, outcome);
+    if (step === undefined) {
+      throw unknownOutcomeError(current.kind, current.id, outcome);
     }
-    // The step is built and frozen by the engine from its own snapshot: the
-    // callback selected only the outcome, never the target.
-    const step: TransitionStep = Object.freeze({
-      from: current.id,
-      outcome,
-      to: match.to,
-      transition_index: match.index,
-    });
     if (onTransitionCommit !== undefined) {
       await onTransitionCommit(step);
     }
@@ -959,4 +1004,42 @@ export async function executePipelineV2GraphResume(
   const graph = compileV2Graph(pipeline, captured);
   const resume = captureResumeSeed(graph, seed);
   return runCompiledGraph(graph, options.onTransitionCommit, resume);
+}
+
+/**
+ * The authoritative compiled-transition resolution for pipeline v2. It
+ * accepts only the provenance-valid deep-frozen snapshot a successful
+ * `loadPipelineV2` returned and resolves one declared transition of one
+ * state by its outcome through the same single resolver the engine loop
+ * uses for every fresh and resumed run. The lookup reads the normalized
+ * pipeline state directly: the named state is found in
+ * `pipeline.states`, and its already normalized transitions feed the
+ * resolver — no graph compilation, no executor bridge, no callbacks, no
+ * filesystem I/O.
+ *
+ * Errors keep the engine contract: an unknown state id (or a terminal
+ * state, which bears no transitions) fails `missing_state` and an unknown
+ * outcome fails `unknown_outcome` — both as the existing typed
+ * `PipelineExecutionError` with the exact engine messages. The result is
+ * deep-frozen; the pipeline, its transitions and the arguments are never
+ * mutated.
+ */
+export function compiledTransitionFor(
+  pipeline: ResolvedPipelineV2,
+  stateId: string,
+  outcome: string,
+): TransitionStep {
+  requireResolvedPipelineV2Provenance(pipeline, "pipeline v2 compiled transition resolution");
+  const state = pipeline.states.find((declared) => declared.id === stateId);
+  if (state === undefined || state.type === "terminal") {
+    throw new PipelineExecutionError(
+      "missing_state",
+      `pipeline cursor ${JSON.stringify(stateId)} does not name a declared state`,
+    );
+  }
+  const step = resolveCompiledTransition(stateId, state.transitions, outcome);
+  if (step === undefined) {
+    throw unknownOutcomeError(state.type, stateId, outcome);
+  }
+  return step;
 }

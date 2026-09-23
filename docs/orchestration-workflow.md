@@ -494,7 +494,16 @@ selection.
 Production `agent-smoke` runs every step through this engine (it
 is the single owner of the outcome → transition → next-state mapping; no
 parallel hand-written mapping exists), restricted by
-`planMultiStateExecution`. The orchestrator registers a transition-commit hook
+`planMultiStateExecution`. The mapping is one private resolver shared by execution and the v2 restore
+verifier: the exported `compiledTransitionFor(pipeline, stateId, outcome)`
+reads the named state's normalized transitions directly from the
+already loaded pipeline (no graph compilation, no executors) and resolves
+the declared transition to its exact frozen step
+(`from`/`outcome`/`to`/original `transition_index`); the engine loop
+resolves over the same resolver on the compiled snapshot, and the restore
+verifier replays the whole durable transition history through it — there
+is no second `outcome → {to, transition_index}` implementation. The
+orchestrator registers a transition-commit hook
 with the engine: after the callback's outcome is validated and before the
 cursor moves, the engine calls the hook with a frozen transition step; the
 hook records the committed transition and, on terminal arrival, the terminal
