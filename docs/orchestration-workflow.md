@@ -1593,7 +1593,7 @@ are exactly the manifest's canonical JSON without a trailing newline.
 The public API is `publishPipelineV2WaitRequest(runRoot, value)` and
 `publishPipelineV2WaitResponse(runRoot, waitIndex, raw)`; the response
 publisher reads and verifies the stored request file itself
-(`O_NOFOLLOW`, mode 0600, bytes equal to its own canonical JSON, run id
+(no-follow read, mode 0600, bytes equal to its own canonical JSON, run id
 equal to the run root's basename, wait index match) and the caller never
 passes a prepared request. Publication is atomic — exclusive temp file
 inside `waits/`, full write-all loop, file fsync, close, exclusive
@@ -1611,11 +1611,48 @@ durability-unknown outcomes); manifest validation failures keep their
 own error class, and diagnostics are content-free. The core lives in an
 explicitly internal module with a per-call IO capability and a single
 frozen production IO; the public export surface carries no test seam.
+The filesystem protocol itself is owned exactly once by the neutral
+internal substrate `pipeline_v2_immutable_document_store_internal.ts`,
+which both the wait store and the run-plan store below use as thin
+adapters.
 Semantic boundary for the future coordinator (not wired here): publish
 request → dispatch `run_waiting(request_sha256)`; publish response →
 dispatch `wait_response_recorded(response_sha256)`. A manifest file
 published without the corresponding durable commit is an orphan, not
 part of the history, and an exact retry safely reuses it.
+
+#### Run-plan manifest filesystem store (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_run_plan_store.ts` publishes and loads the
+existing plan/task revision manifest substrate under the fixed layout
+
+  <runRoot>/run-plan/plans/<revision>.json
+  <runRoot>/run-plan/tasks/<task-id>/<revision>.json
+
+`run-plan`, `plans`, `tasks` and `<task-id>` are 0700 real non-symlink
+directory components (exclusive creation, identity fixation,
+chmod-enforced 0700, canonical verification, parent fsync on creation);
+manifest files are 0600 regular files whose bytes are exactly the
+manifest's canonical JSON without a trailing newline. The run root is
+never created, chmodded or removed and its basename must equal the
+manifest `run_id`. The public API is `publishPipelineV2TaskRevision`,
+`loadPipelineV2TaskRevision`, `publishPipelineV2PlanRevision`,
+`loadPipelineV2PlanRevision` and the `PipelineV2RunPlanStoreError`
+class; path components come only from the normalized manifest
+(publication) or the validated trusted scalars (load: safe id plus a
+positive safe integer). Load is strictly read-only and returns `null`
+when the artifact or its store-owned parent tree is absent; a stored
+manifest is accepted only when its bytes equal its own canonical JSON
+and `run_id`/`task_id`/`revision` match the binding; malformed JSON
+keeps the manifest module's error class; wrong kind, wrong mode or
+noncanonical bytes fail as typed conflicts. The wait-store failure and
+durability model applies unchanged (`not_published` before the link,
+including conflicts; `durability_unknown` after the link, with a
+content-free candidate), and concurrency is the same link-barrier
+idempotency. Store responsibility ends at the immutable canonical
+artifacts — plan↔task linkage, revision chains and durable-state
+acceptance are the future controller's responsibility (no schema v7,
+no reducer commands, no production wiring here).
 
 The production-neutral wait controller
 (`orchestrator/src/pipeline_v2_wait_controller.ts`) assembles these

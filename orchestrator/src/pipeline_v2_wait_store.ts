@@ -21,10 +21,10 @@ import {
  *
  * as 0600 regular files whose content is exactly the manifest's canonical
  * JSON (no trailing newline), inside a 0700 real non-symlink `waits/`
- * directory of the canonical run root. Publication is atomic (temp file
- * with `O_CREAT|O_EXCL|O_NOFOLLOW`, full write-all, file fsync, close,
- * exclusive `link()` — never a replace-capable `rename()` — then
- * ownership-checked temp removal and a waits-directory fsync) and
+ * directory of the canonical run root. Publication is atomic (exclusive
+ * temp file, full write-all, file fsync, close, exclusive `link()` —
+ * never a replace-capable `rename()` — then ownership-checked temp
+ * removal and a waits-directory fsync) and
  * idempotent: a repeat with the same canonical bytes adopts the existing
  * file without touching its inode, mode, mtime or content and re-fsyncs
  * the directory, so a retry after a former durability-unknown outcome
