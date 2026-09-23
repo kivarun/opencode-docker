@@ -1215,6 +1215,7 @@ test("35. a concurrently created wrong-mode task directory fails closed without 
     const taskDir = join(fixture.tasks, "task-1");
     const chmodPaths: string[] = [];
     const rmdirPaths: string[] = [];
+    let concurrentIno = -1;
     const io = Object.freeze({
       ...realRunPlanStoreIo,
       mkdirExclusive: async (path: string) => {
@@ -1222,6 +1223,7 @@ test("35. a concurrently created wrong-mode task directory fails closed without 
           await realRunPlanStoreIo.mkdirExclusive(taskDir);
           await realRunPlanStoreIo.chmod(taskDir, 0o755);
           await writeFile(join(taskDir, ".sentinel"), "sentinel\n", { mode: 0o600 });
+          concurrentIno = (await lstat(taskDir)).ino;
         }
         return await realRunPlanStoreIo.mkdirExclusive(path);
       },
@@ -1241,6 +1243,7 @@ test("35. a concurrently created wrong-mode task directory fails closed without 
     expect(chmodPaths).toEqual([]);
     expect(rmdirPaths).toEqual([]);
     const info = await lstat(taskDir);
+    expect(info.ino).toBe(concurrentIno);
     expect(info.mode & 0o777).toBe(0o755);
     expect(await readFile(join(taskDir, ".sentinel"), "utf8")).toBe("sentinel\n");
     expect((await readdir(taskDir)).filter((name) => name.endsWith(".json"))).toEqual([]);
@@ -1332,6 +1335,70 @@ test("38. an exact retry after a parent fsync failure adopts the directory, re-s
     expect(openDirPaths).toContain(fixture.runRoot);
     expect(chmodPaths).not.toContain(fixture.runPlan);
     expect(await readFile(retry.task_path, "utf8")).toBe(retry.task.canonical_json);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("39. a concurrently created regular file at a directory component fails as invalid layout", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.tasks, { mode: 0o700, recursive: true });
+    const taskDir = join(fixture.tasks, "task-1");
+    const FILE_CANARY = "CANARY_concurrent_file_body";
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    let linkCalls = 0;
+    let concurrentDev = -1;
+    let concurrentIno = -1;
+    let concurrentMode = -1;
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      mkdirExclusive: async (path: string) => {
+        if (path === taskDir) {
+          await writeFile(taskDir, `${FILE_CANARY}\n`, { mode: 0o600 });
+          const info = await lstat(taskDir);
+          concurrentDev = info.dev;
+          concurrentIno = info.ino;
+          concurrentMode = info.mode & 0o777;
+        }
+        return await realRunPlanStoreIo.mkdirExclusive(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realRunPlanStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realRunPlanStoreIo.rmdir(path);
+      },
+      link: async (from: string, to: string) => {
+        linkCalls += 1;
+        return realRunPlanStoreIo.link(from, to);
+      },
+    }) as unknown as StoreIo;
+    const cause = await publishPipelineV2TaskRevisionWithIo(io, fixture.runRoot, taskValue()).catch(
+      (error) => error,
+    );
+    const error = expectStoreError(
+      cause,
+      "not_published",
+      "invalid_layout",
+      "exists but is a regular file",
+    );
+    expect(error.message).not.toContain(FILE_CANARY);
+    expect(error.message).not.toContain(taskDir);
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    expect(linkCalls).toBe(0);
+    const after = await fileIdentity(taskDir);
+    expect(after.dev).toBe(concurrentDev);
+    expect(after.ino).toBe(concurrentIno);
+    expect(after.mode).toBe(concurrentMode);
+    expect(await readFile(taskDir, "utf8")).toBe(`${FILE_CANARY}\n`);
+    expect((await readdir(fixture.tasks)).filter((name) => name.endsWith(".json"))).toEqual([]);
+    expect(await tempFileNames(fixture.tasks)).toEqual([]);
+    expect((await readdir(fixture.runRoot)).sort()).toEqual(["run-plan"]);
   } finally {
     await dispose(fixture);
   }

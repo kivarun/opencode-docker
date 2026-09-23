@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  readlink,
   rm,
   symlink,
   unlink,
@@ -1138,6 +1139,7 @@ test("33. a concurrently created wrong-mode waits directory fails closed without
   try {
     const chmodPaths: string[] = [];
     const rmdirPaths: string[] = [];
+    let concurrentIno = -1;
     const io = Object.freeze({
       ...realWaitStoreIo,
       mkdirExclusive: async (path: string) => {
@@ -1145,6 +1147,7 @@ test("33. a concurrently created wrong-mode waits directory fails closed without
           await realWaitStoreIo.mkdirExclusive(fixture.waits);
           await realWaitStoreIo.chmod(fixture.waits, 0o755);
           await writeFile(join(fixture.waits, ".sentinel"), "sentinel\n", { mode: 0o600 });
+          concurrentIno = (await lstat(fixture.waits)).ino;
         }
         return await realWaitStoreIo.mkdirExclusive(path);
       },
@@ -1164,6 +1167,7 @@ test("33. a concurrently created wrong-mode waits directory fails closed without
     expect(chmodPaths).toEqual([]);
     expect(rmdirPaths).toEqual([]);
     const info = await lstat(fixture.waits);
+    expect(info.ino).toBe(concurrentIno);
     expect(info.mode & 0o777).toBe(0o755);
     expect(await readFile(join(fixture.waits, ".sentinel"), "utf8")).toBe("sentinel\n");
     expect((await readdir(fixture.waits)).filter((name) => name.endsWith(".json"))).toEqual([]);
@@ -1220,6 +1224,64 @@ test("35. a parent fsync failure on an adopted waits directory fails before the 
     expect((await readdir(fixture.waits)).filter((name) => name.endsWith(".json"))).toEqual([]);
     expect(await tempFileNames(fixture.waits)).toEqual([]);
     expect((await readdir(fixture.runRoot)).includes("waits")).toBe(true);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("36. a concurrently created symlink at the waits component fails as invalid layout", async () => {
+  const fixture = await setup();
+  try {
+    const externalDir = join(fixture.root, "external");
+    await mkdir(externalDir, { mode: 0o700 });
+    await writeFile(join(externalDir, "sentinel"), "sentinel\n", { mode: 0o600 });
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    let linkCalls = 0;
+    let concurrentIno = -1;
+    const io = Object.freeze({
+      ...realWaitStoreIo,
+      mkdirExclusive: async (path: string) => {
+        if (path === fixture.waits) {
+          await symlink(externalDir, fixture.waits);
+          concurrentIno = (await lstat(fixture.waits)).ino;
+        }
+        return await realWaitStoreIo.mkdirExclusive(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realWaitStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realWaitStoreIo.rmdir(path);
+      },
+      link: async (from: string, to: string) => {
+        linkCalls += 1;
+        return realWaitStoreIo.link(from, to);
+      },
+    }) as unknown as WaitStoreIo;
+    const cause = await publishWaitRequestWithIo(io, fixture.runRoot, requestValue()).catch(
+      (error) => error,
+    );
+    const error = expectStoreError(
+      cause,
+      "not_published",
+      "invalid_layout",
+      "exists but is a symbolic link",
+    );
+    expect(error.message).not.toContain(externalDir);
+    expect(error.message).not.toContain(fixture.root);
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    expect(linkCalls).toBe(0);
+    const after = await lstat(fixture.waits);
+    expect(after.isSymbolicLink()).toBe(true);
+    expect(after.ino).toBe(concurrentIno);
+    expect(await readlink(fixture.waits)).toBe(externalDir);
+    expect(await readFile(join(externalDir, "sentinel"), "utf8")).toBe("sentinel\n");
+    expect((await readdir(fixture.waits)).filter((name) => name.endsWith(".json"))).toEqual([]);
+    expect(await tempFileNames(fixture.waits)).toEqual([]);
   } finally {
     await dispose(fixture);
   }

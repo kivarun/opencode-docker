@@ -509,8 +509,16 @@ export async function ensureImmutableDirectory(
       }
     }
     const createdInfo = await inspectOrNull(io, dirPath, `the ${dirNoun}`);
-    if (createdInfo === null || createdInfo.isSymbolicLink() || !createdInfo.isDirectory()) {
+    if (createdInfo === null) {
       throw immutableDocumentIoFailure(`the ${dirNoun} is not a real directory after creation`);
+    }
+    if (createdInfo.isSymbolicLink() || !createdInfo.isDirectory()) {
+      if (mkdirSucceededHere) {
+        throw immutableDocumentIoFailure(`the ${dirNoun} is not a real directory after creation`);
+      }
+      throw immutableDocumentInvalidLayout(
+        `the ${dirNoun} exists but is ${describeImmutableObject(createdInfo)}`,
+      );
     }
     info = createdInfo;
     if (mkdirSucceededHere) {
