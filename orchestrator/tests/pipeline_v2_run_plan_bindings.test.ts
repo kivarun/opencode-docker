@@ -17,6 +17,7 @@ import {
   validatePlanTaskBindings,
   validateReviseIntentBinding,
   validateRootTaskBinding,
+  validateTaskRevisionChain,
 } from "../src/pipeline_v2_run_plan_bindings.ts";
 
 const hex = (char: string): string => char.repeat(64);
@@ -30,11 +31,12 @@ function taskRevisionValue(
   previousSha256: string | null,
   origin: string,
   body: string,
+  runId = "run-1",
 ): Record<string, unknown> {
   return {
     schema_version: 1,
     kind: "task_revision",
-    run_id: "run-1",
+    run_id: runId,
     task_id: taskId,
     revision,
     previous_sha256: previousSha256,
@@ -307,6 +309,133 @@ describe("pipeline v2 run plan binding: root task binding", () => {
     expect(() =>
       validateRootTaskBinding({ plan: PLAN_1, protectedInputDigest: "a".repeat(64) }),
     ).toThrow(PipelineV2RunPlanBindingError);
+  });
+});
+
+describe("pipeline v2 run plan binding: task revision chain", () => {
+  test("revision 1 requires no predecessor, revision 1 and a null previous digest", () => {
+    expect(() => validateTaskRevisionChain({ previous: null, current: TASK_1_PREPARED })).not.toThrow();
+    const revision2 = prepareTaskRevisionManifest(
+      taskRevisionValue("task-1", 2, TASK_1_PREPARED.sha256, "user_response", "Revised body"),
+    );
+    expectBindingMessage(
+      catchOf(() => validateTaskRevisionChain({ previous: null, current: revision2 })),
+      "validateTaskRevisionChain requires revision 1 when no predecessor is passed",
+    );
+    // a revision-1 manifest with a non-null previous digest cannot even be
+    // prepared (the manifest chain enforces the digest) — the binding
+    // layer only sees validly prepared objects
+    let caught1: unknown = null;
+    try {
+      prepareTaskRevisionManifest(taskRevisionValue("task-1", 1, hex("7"), "planning_proposal", TASK_REVISION_BODY_1));
+    } catch (cause) {
+      caught1 = cause;
+    }
+    expect(caught1).toBeInstanceOf(PipelineV2RunPlanManifestError);
+  });
+
+  test("a valid successor binds; wrong run, task, gap or digest is rejected", () => {
+    const revision2 = prepareTaskRevisionManifest(
+      taskRevisionValue("task-1", 2, TASK_1_PREPARED.sha256, "user_response", "Revised body"),
+    );
+    expect(() => validateTaskRevisionChain({ previous: TASK_1_PREPARED, current: revision2 })).not.toThrow();
+    const foreignRun = prepareTaskRevisionManifest(
+      taskRevisionValue("task-1", 2, TASK_1_PREPARED.sha256, "user_response", "Revised body", "run-2"),
+    );
+    expectBindingMessage(
+      catchOf(() => validateTaskRevisionChain({ previous: TASK_1_PREPARED, current: foreignRun })),
+      "validateTaskRevisionChain covers two different runs",
+    );
+    const otherTask = prepareTaskRevisionManifest(
+      taskRevisionValue("task-2", 2, TASK_1_PREPARED.sha256, "user_response", "Other task body"),
+    );
+    expectBindingMessage(
+      catchOf(() => validateTaskRevisionChain({ previous: TASK_1_PREPARED, current: otherTask })),
+      "validateTaskRevisionChain task ids do not agree",
+    );
+    const revision3 = prepareTaskRevisionManifest(
+      taskRevisionValue("task-1", 3, TASK_1_PREPARED.sha256, "user_response", "Third body"),
+    );
+    expectBindingMessage(
+      catchOf(() => validateTaskRevisionChain({ previous: TASK_1_PREPARED, current: revision3 })),
+      "validateTaskRevisionChain revision numbers are not consecutive",
+    );
+    const wrongDigest = prepareTaskRevisionManifest(
+      taskRevisionValue("task-1", 2, hex("f"), "user_response", "Revised body"),
+    );
+    expectBindingMessage(
+      catchOf(() => validateTaskRevisionChain({ previous: TASK_1_PREPARED, current: wrongDigest })),
+      "validateTaskRevisionChain previous_sha256 does not name the predecessor digest",
+    );
+  });
+
+  test("provenance gate: forged and proxied task revisions are rejected with zero trap hits", () => {
+    const revision2 = prepareTaskRevisionManifest(
+      taskRevisionValue("task-1", 2, TASK_1_PREPARED.sha256, "user_response", "Revised body"),
+    );
+    const untrusted =
+      "the operation requires the frozen prepared run plan object returned by " +
+      "preparePlanRevisionManifest/parsePlanRevisionManifest, " +
+      "prepareTaskRevisionManifest/parseTaskRevisionManifest or " +
+      "prepareWaitIntent/parseWaitIntent for the same manifest kind; " +
+      "hand-built objects, casts, clones and Proxies are rejected before any field is read";
+    expectBindingMessage(
+      catchOf(() =>
+        validateTaskRevisionChain({
+          previous: null,
+          current: { ...TASK_1_PREPARED } as unknown as PreparedPipelineV2RunTaskRevision,
+        }),
+      ),
+      untrusted,
+    );
+    expectBindingMessage(
+      catchOf(() =>
+        validateTaskRevisionChain({
+          previous: structuredClone(TASK_1_PREPARED) as unknown as PreparedPipelineV2RunTaskRevision,
+          current: revision2,
+        }),
+      ),
+      untrusted,
+    );
+    expectBindingMessage(
+      catchOf(() =>
+        validateTaskRevisionChain({
+          previous: PLAN_1 as unknown as PreparedPipelineV2RunTaskRevision,
+          current: revision2,
+        }),
+      ),
+      untrusted,
+    );
+    let trapCount = 0;
+    const proxyTask = new Proxy(revision2, {
+      get(target, property, receiver) {
+        trapCount += 1;
+        return Reflect.get(target, property, receiver);
+      },
+      has(target, property) {
+        trapCount += 1;
+        return Reflect.has(target, property);
+      },
+    });
+    expectBindingMessage(
+      catchOf(() =>
+        validateTaskRevisionChain({
+          previous: null,
+          current: proxyTask as unknown as PreparedPipelineV2RunTaskRevision,
+        }),
+      ),
+      untrusted,
+    );
+    expectBindingMessage(
+      catchOf(() =>
+        validateTaskRevisionChain({
+          previous: proxyTask as unknown as PreparedPipelineV2RunTaskRevision,
+          current: revision2,
+        }),
+      ),
+      untrusted,
+    );
+    expect(trapCount).toBe(0);
   });
 });
 
@@ -677,7 +806,7 @@ describe("pipeline v2 run plan binding: provenance boundary", () => {
 });
 
 describe("pipeline v2 run plan binding export surface and diagnostics", () => {
-  test("the public export surface is exactly the error class and five validators", async () => {
+  test("the public export surface is exactly the error class and six validators", async () => {
     const namespace = (await import("../src/pipeline_v2_run_plan_bindings.ts")) as Record<
       string,
       unknown
@@ -689,6 +818,7 @@ describe("pipeline v2 run plan binding export surface and diagnostics", () => {
       "validatePlanTaskBindings",
       "validateReviseIntentBinding",
       "validateRootTaskBinding",
+      "validateTaskRevisionChain",
     ]);
   });
 

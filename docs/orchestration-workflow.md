@@ -1652,9 +1652,11 @@ durability model applies unchanged (`not_published` before the link,
 including conflicts; `durability_unknown` after the link, with a
 content-free candidate), and concurrency is the same link-barrier
 idempotency. Store responsibility ends at the immutable canonical
-artifacts — plan↔task linkage, revision chains and durable-state
-acceptance are the future controller's responsibility (no schema v7,
-no reducer commands, no production wiring here).
+artifacts; the candidate layer above assembles them into one coherent
+plan+task unit (task revisions published first, the plan revision as
+the filesystem commit marker, exact-retry adoption), and durable-state
+acceptance remains the future controller's responsibility (no schema
+v7, no reducer commands, no production wiring here).
 
 The production-neutral wait controller
 (`orchestrator/src/pipeline_v2_wait_controller.ts`) assembles these
@@ -1747,22 +1749,56 @@ with a caller-computed protected-input digest; the TASK object or body
 is never received), `validateContinueIntentBinding` (same run,
 `expected_plan_sha256 === plan.sha256`, the declared stage exists; a
 template-specific maximum iteration grant is future policy, not
-binding) and `validateReviseIntentBinding` (same run and task, the
+binding), `validateReviseIntentBinding` (same run and task, the
 candidate the exact successor of the current accepted revision, both
 intent digests naming the current and candidate digests exactly, and the
-candidate origin `user_response`). Every validator gates on the shared
-provenance registry before any field is read — hand-built, spread,
-`structuredClone`d and proxied look-alikes are rejected with zero getter
-or trap hits — and caller objects are never frozen or modified.
+candidate origin `user_response`) and `validateTaskRevisionChain` (the
+same chain for two prepared task revisions: revision 1 with no
+predecessor and a null previous digest; a successor with the same run
+and task id, the exact revision increment and the predecessor's digest;
+the content-free origin class stays owned by the manifest chain). Every
+validator gates on the shared provenance registry before any field is
+read — hand-built, spread, `structuredClone`d and proxied look-alikes
+are rejected with zero getter or trap hits — and caller objects are
+never frozen or modified.
 
-Both modules are pure substrate: no filesystem or store, no state schema
-v7, no reducer commands, no engine/coordinator/runner/CLI wiring, no
-pipeline schema or stage templates, no P01, and no wait-controller
-integration. Two structural questions stay deliberately unresolved: how
-a pure reducer derives the task ledger from `{revision, sha256}` pairs
-(initial task revisions need separate durable commands or content-free
-refs), and where the crash-safe boundaries `plan acceptance ↔
-transition` and `stage_iteration_opened ↔ start_agent_execution` lie.
+The run plan candidate layer
+(`orchestrator/src/pipeline_v2_run_plan_candidate.ts` plus the internal
+core `pipeline_v2_run_plan_candidate_internal.ts`) assembles one
+coherent publication unit from the prepared manifests:
+`preparePipelineV2RunPlanCandidate` validates — before any filesystem
+side effect — the provenance of every manifest argument, the protected
+TASK input digest, the plan revision chain, the plan↔task bindings and
+every task revision chain (the predecessor set: previous entries are
+keyed by task id, a revision above 1 requires exactly one predecessor,
+a predecessor for a revision 1 task or an undeclared task is rejected,
+and sparse/undefined entries fail the gates), then returns a deep-frozen
+candidate `{plan, task_revisions}` whose task revisions are the exact
+prepared objects in the plan's deterministic order (stage declaration
+order, then the plan's normalized task order — the caller's array order
+is never semantic). Options are captured exactly once; later mutations
+of the options object or the passed arrays cannot influence the result.
+`publishPipelineV2RunPlanCandidate` publishes through the run-plan
+store: every task revision first, strictly sequentially in candidate
+order, then the plan revision — the plan artifact is the filesystem
+commit marker of the whole candidate, never durable acceptance. Store
+errors pass through unchanged (`not_published` before the link,
+`durability_unknown` after it); a partial failure leaves immutable
+orphan task artifacts that nothing removes, an exact retry safely
+reuses them through the store's idempotent adoption, and the candidate
+layer never reads state, never dispatches a reducer command and never
+declares a candidate accepted. A hostile store result (injected ops)
+fails as a typed failed publication, detected by structure, never by
+message text.
+
+Both layers remain pure substrate: no durable state, no reducer
+commands, no engine/coordinator/runner/CLI wiring, no pipeline schema
+or stage templates, no P01, and no wait-controller integration. Two
+structural questions stay deliberately unresolved: how a pure reducer
+derives the task ledger from `{revision, sha256}` pairs (initial task
+revisions need separate durable commands or content-free refs), and
+where the crash-safe boundaries `plan acceptance ↔ transition` and
+`stage_iteration_opened ↔ start_agent_execution` lie.
 
 ### Read-only runtime context restoration for a future resume (implemented, not wired)
 

@@ -13,6 +13,9 @@
  *   prepared plan revisions (first revision, exact revision number
  *   increment, digest chaining and the unchanged protected root-task
  *   binding — stage/task content may change freely between revisions);
+ * - `validateTaskRevisionChain`: the successor relationship between two
+ *   prepared task revisions (first revision, exact revision number
+ *   increment, digest chaining, same run id and same task id);
  * - `validateRootTaskBinding`: exact equality of the plan's root task
  *   digest with a digest of the protected input the caller already
  *   computed (the input object or its body is never received);
@@ -207,6 +210,49 @@ export function validateRootTaskBinding({
   expectSha256Digest(protectedInputDigest, "validateRootTaskBinding protectedInputDigest");
   if (plan.manifest.root_task.sha256 !== protectedInputDigest) {
     raise("validateRootTaskBinding the plan root task does not bind the protected input digest");
+  }
+}
+
+/**
+ * Validates the chain relationship between two prepared task revisions.
+ * For revision 1 the predecessor must be `null`, the revision number must
+ * be exactly 1 and `previous_sha256` must be `null`; for a successor the
+ * run ids and task ids must match, the revision number must be exactly
+ * `previous.revision + 1`, and `previous_sha256` must be the predecessor's
+ * digest. The body and the content-free `origin` class are owned by the
+ * manifest chain (revision 1 is only ever `planning_proposal`, revisions
+ * above 1 only `user_response`) — no second origin validator exists here.
+ */
+export function validateTaskRevisionChain({
+  previous,
+  current,
+}: {
+  readonly previous: PreparedPipelineV2RunTaskRevision | null;
+  readonly current: PreparedPipelineV2RunTaskRevision;
+}): void {
+  if (previous === null) {
+    requireProvenance(current, "task_revision");
+    if (current.manifest.revision !== 1) {
+      raise("validateTaskRevisionChain requires revision 1 when no predecessor is passed");
+    }
+    if (current.manifest.previous_sha256 !== null) {
+      raise("validateTaskRevisionChain requires previous_sha256 null for revision 1");
+    }
+    return;
+  }
+  requireProvenance(previous, "task_revision");
+  requireProvenance(current, "task_revision");
+  if (previous.manifest.run_id !== current.manifest.run_id) {
+    raise("validateTaskRevisionChain covers two different runs");
+  }
+  if (previous.manifest.task_id !== current.manifest.task_id) {
+    raise("validateTaskRevisionChain task ids do not agree");
+  }
+  if (current.manifest.revision !== previous.manifest.revision + 1) {
+    raise("validateTaskRevisionChain revision numbers are not consecutive");
+  }
+  if (current.manifest.previous_sha256 !== previous.sha256) {
+    raise("validateTaskRevisionChain previous_sha256 does not name the predecessor digest");
   }
 }
 
