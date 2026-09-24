@@ -14,7 +14,7 @@ result identity, run state schema version 2). Pipeline schema v2 has its
 own production entrypoint now: `orchestrator run` (see the "The production
 pipeline v2 CLI" section) drives the assembled pipeline v2 stack —
 graph execution, the run-owned project copy, the data plane, decision
-states, the Docker Helper runtime adapter, the durable state schema v6,
+states, the Docker Helper runtime adapter, the durable state schema v7,
 and output publication — through the single production runner
 `runPipelineV2`. `agent-smoke` remains the v1 diagnostic command with its
 own schema version 1 loader; the bundled default pipeline has not been
@@ -186,7 +186,7 @@ orchestrator run \
   activations. The source directory is never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 6), and the published run outputs stay at the fixed
+  (state schema version 7), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
@@ -802,7 +802,7 @@ without echoing an invalid value, and returns the exact frozen stage.
 Task bodies, canonical JSON, filesystem paths and prepared-object
 references never enter the projection; `origin_execution` is transferred as
 a normalized number only — its durable verification is the future
-controller's. Nothing here is wired into production: state schema v7,
+controller's. Nothing here is wired into production: the stage lifecycle state (schema v7),
 execution roles in durable executions, lifecycle journals, controller/
 coordinator/runner/CLI wiring, filesystem publication, wait/replanning
 wiring, grants and effective budget remain later increments.
@@ -1550,10 +1550,10 @@ Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
 them.
 
-### Pipeline v2 run state (state schema version 6, the production run state of pipeline v2)
+### Pipeline v2 run state (state schema version 7, the production run state of pipeline v2)
 
 `orchestrator/src/pipeline_v2_state.ts` already defines the durable run state
-for pipeline schema v2 as a pure substrate (state schema version 6, with the
+for pipeline schema v2 as a pure substrate (state schema version 7, with the
 nested pipeline identity carrying `schema_version: 2`): logical run inputs
 (id, port type, protected flag, snapshot digest), a shared contiguous
 execution index covering both agent and decision executions (agent
@@ -1581,7 +1581,7 @@ reducer itself records no user intent payload. No response body, evidence,
 TASK/PLAN content, facts, paths, environment values, profiles or
 credentials ever enter the document.
 
-The 20-command union keeps the v5 successor rules and adds the explicit
+The command union keeps the v5/v6 successor rules and adds the explicit
 user-response successor: `run_waiting {stateId, reason, requestSha256,
 actions}` appends a new open wait record on a clean boundary (active
 `running` run at the cursor, no terminal/outputs/failure, every execution
@@ -1594,7 +1594,10 @@ that record with the response, returns the run to `active`/`running`, and
 moves `cursor.current_state` to the declared action target without touching
 `cursor.transition_count`, `pipeline.max_transitions`, executions,
 transitions or any prior history (no execution, transition or session is
-created). After the response ordinary commands apply again under the
+created); the durable intervention of a stage iteration (the accepted
+intent, the task revision or the grant, and the iteration closure) must be
+recorded before the response — `wait_response_recorded` is rejected while
+an iteration is open. After the response ordinary commands apply again under the
 existing successor rules; a new execution receives the next global index,
 identities are never reused, and repeated wait/response cycles — including
 several waits at one `transition_count` — are valid. The loader restores
@@ -1610,6 +1613,37 @@ transition budget. The triple biconditional
 exists and is open) is enforced in both directions; waiting forbids
 terminal/run_outputs/failure, and a final state with an open wait is
 rejected.
+
+Schema v7 adds the plan-driven stage lifecycle on top of the wait journal.
+Every agent and decision execution carries the mandatory `execution_role`
+(`planning | control | stage`) fixed at start from the compiled
+orchestration metadata (no defaults, no inference, never rewritten), and a
+stage execution records exactly the open iteration it runs in
+(`iteration_index`). Top-level append-only ledgers hold the stage
+lifecycle: `generations[]` binds one plan stage (`stage_id`,
+`stage_position`, `template_id`) to one accepted plan revision
+(`plan_sha256`) with the immutable `initial_budget` and the
+`opened_transition_count` anchor; iterations live inside their generation
+as an append-only list with open/close anchors; `task_revisions[]` records
+accepted task revisions (revision 1 in the planning flow without wait
+links, revisions above 1 in the revise flow with the wait and intent
+links); `plan_revisions[]` records accepted plan revisions with their
+`origin_execution` — the settled-but-unbound planning execution the plan
+was produced by; `grants[]` records iteration grants bound to the open
+wait and its accepted intent. The accepted wait intent itself is recorded
+inside the open wait record (`waits[].intent`); an exact digest repeat is a
+reducer no-op, a different digest is rejected. The effective iteration
+budget is derived, never stored: `initial_budget + Σ grants` of the
+generation; a grant extends the budget only from its wait onward. The
+eight new commands (`stage_generation_opened`, `stage_iteration_opened`,
+`stage_iteration_closed`, `stage_generation_closed`,
+`plan_intent_accepted`, `task_revision_accepted`,
+`plan_revision_accepted`, `iteration_grant_recorded`) enforce the full
+successor table at write time, and the loader re-derives everything by a
+single positional joint replay over the recorded anchors. The coordinator
+resolves every start's role exclusively through `compiledExecutionRoleFor`
+plus the durable open iteration, and never dispatches the eight lifecycle
+commands itself — the policy/controller layer owns them.
 
 One agent execution records two independent, durable, non-secret session
 ids following the two-session capability model: `execution_session_id`
@@ -1639,9 +1673,12 @@ same invariants from those records in both directions. There is no
 `events[]` by design: `executions`, `transitions`, `waits`, `terminal`, and
 `run_outputs` are the single authoritative journal, so a later
 audit/observation layer must never duplicate them as a second source of
-truth. State schema versions 1, 2, 3, 4, and 5 are explicitly rejected (no
-migration); the schema v2 document stays the production state of pipeline
-v1, and production v2 resume is still not implemented.
+truth. State schema versions 1–6 are explicitly rejected (no migration in
+either direction); the schema v2 document stays the production state of
+pipeline v1. The pure queries `pipelineV2OpenStageIteration` (current
+snapshot) and `pipelineV2StageIterationAt` (interval query over the
+anchors) are the single shared open-iteration resolvers the coordinator
+and the restore verifier consume.
 
 P01 boundary: this increment implements only the generic durable
 request/response pair and the routing to a pre-declared action. It does
@@ -1918,7 +1955,7 @@ where the crash-safe boundaries `plan acceptance ↔ transition` and
 `orchestrator/src/pipeline_v2_resume_context.ts` adds the read-only
 substrate a future resume needs: `restorePipelineV2RuntimeContext(pipeline,
 state, runRoot)` rebuilds the runtime objects of an existing run from the
-trusted resolved pipeline, the durable state schema v6 and the fixed
+trusted resolved pipeline, the durable state schema v7 and the fixed
 orchestrator-owned run root — a provenance-backed `RunInputsSnapshot`, the
 full accepted `AcceptedStateOutput[]` history, the durable cursor and the
 next global execution index. The API is strictly read-only (no mkdir,
