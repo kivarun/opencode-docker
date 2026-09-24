@@ -548,13 +548,16 @@ function sortById<T>(entries: readonly T[], key: (entry: T) => string): T[] {
 /**
  * Parse the optional `orchestration` section: the single, complete and
  * trusted source of compiled execution roles and stage templates. Exact
- * fields at every level; safe ids from the shared v2 grammar; both lists
- * non-empty; template ids, template entry states and role state ids
- * unique. Declaration order is not semantic, so the parsed result is
- * normalized (templates sorted by id, roles sorted by state_id); the
- * parsed input object is never mutated. Role semantics (which state may
- * carry which role) and template topology are checked later, once the
- * states are known.
+ * fields at every level; safe ids from the shared v2 grammar; template ids,
+ * template entry states and role state ids unique. Either list may be empty
+ * (a pipeline without agent or decision states — e.g. a terminal-only
+ * pipeline — carries no roles, and one without stage templates carries no
+ * templates; the non-emptiness of a section's lists is a property of the
+ * pipeline's states, checked once the states are known). Declaration order
+ * is not semantic, so the parsed result is normalized (templates sorted by
+ * id, roles sorted by state_id); the parsed input object is never mutated.
+ * Role semantics (which state may carry which role) and template topology
+ * are checked later, once the states are known.
  */
 function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
   const obj = expectObject(raw, "pipeline orchestration");

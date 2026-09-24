@@ -1655,7 +1655,7 @@ Global session-id uniqueness spans both fields of every execution, so an
 id can never be reused — not even once as an Execution and once as a Tool
 session. Bearers, endpoints, and credentials never enter the document.
 
-The pure reducer applies the 20 commands and enforces the same shape as the
+The pure reducer applies the 28 commands and enforces the same shape as the
 v1 state (execution only at the cursor, one in-flight execution, a new
 execution only after the previous transition commit, two-slot session-id
 uniqueness, the phase successor chain `started` → `data_prepared` →

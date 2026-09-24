@@ -1670,6 +1670,9 @@ function validateStageGeneration(value: unknown, what: string): PipelineV2StageG
         `${what} is closed while its last iteration is still open`,
       );
     }
+    if (lastIteration === undefined) {
+      throw new PipelineV2StateError(`${what} is closed without any recorded iteration`);
+    }
     const closedAnchor = expectSafeNonNegativeInteger(
       closed.closed_transition_count,
       `${what}.closed.closed_transition_count`,
@@ -1896,12 +1899,28 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   const generations = obj.generations.map((generation, index) =>
     validateStageGeneration(generation, `pipeline v2 run state generations[${index}]`),
   );
+  for (let position = 0; position < generations.length; position++) {
+    const generation = generations[position]!;
+    if (generation.index !== position + 1) {
+      throw new PipelineV2StateError(
+        `generation at position ${position} declares index ${generation.index}; generation indexes must be contiguous from 1`,
+      );
+    }
+  }
   if (!Array.isArray(obj.task_revisions)) {
     throw new PipelineV2StateError("pipeline v2 run state task_revisions must be an array");
   }
   const taskRevisions = obj.task_revisions.map((task, index) =>
     validateTaskRevision(task, `pipeline v2 run state task_revisions[${index}]`),
   );
+  for (let position = 0; position < taskRevisions.length; position++) {
+    const task = taskRevisions[position]!;
+    if (task.index !== position + 1) {
+      throw new PipelineV2StateError(
+        `task revision at position ${position} declares index ${task.index}; task revision indexes must be contiguous from 1`,
+      );
+    }
+  }
   if (!Array.isArray(obj.plan_revisions)) {
     throw new PipelineV2StateError("pipeline v2 run state plan_revisions must be an array");
   }
@@ -1914,6 +1933,14 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   const grants = obj.grants.map((grant, index) =>
     validateIterationGrant(grant, `pipeline v2 run state grants[${index}]`),
   );
+  for (let position = 0; position < grants.length; position++) {
+    const grant = grants[position]!;
+    if (grant.index !== position + 1) {
+      throw new PipelineV2StateError(
+        `grant record at position ${position} declares index ${grant.index}; grant record indexes must be contiguous from 1`,
+      );
+    }
+  }
   // The accepted plan revisions form one chain: revision and index are
   // contiguous from 1 and every record's previous digest is exactly the
   // previous ledger record's digest (the reducer derives it there; the
@@ -2105,127 +2132,176 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   // transitions, the wait journal, the stage generations and their
   // iterations, the iteration grants, the accepted task revisions, and the
   // accepted plan revisions. The replay cursor starts at the entry state;
-  // before every graph transition with the next ordinal N + 1 it applies,
-  // in anchor order, every record bound to the boundary
-  // `transition_count === N`: the wait records (whose responses move the
-  // replay cursor to the declared action target), the grants and the
-  // user-response task revisions of the waits being processed, the
-  // iteration closures bound to those waits, then the active-bound
-  // lifecycle closures, the execution starts (the global execution index
-  // k starts at committed transition count k - 1), the generation and
-  // iteration openings, and the plan revisions (whose acceptance position
-  // is derived from their settled-but-unbound planning origin). Within one
-  // boundary the deterministic order is: the wait records with their
-  // waiting-bound intervention records and responses, the active-bound
-  // iteration and generation closures, the execution starts, the
-  // generation and iteration openings, the plan revisions, then the
-  // transition itself. The replay fails closed on every structural
-  // contradiction — an event before its precondition, an anchor outside
-  // the journal, a reference to a generation or iteration that is not
-  // open, or an execution whose recorded role contradicts the lifecycle
-  // timeline. A response never consumes graph budget, and the persisted
-  // cursor must equal the replayed cursor after the full replay.
+  // every record is anchored at the committed transition count at which the
+  // reducer durably recorded it (the record's own `transition_count` /
+  // `opened_transition_count` / `closed_transition_count`, the wait's count,
+  // the plan origin minus one), and the ordinal loop visits those boundaries
+  // in order, applying transitions[ordinal] at the end of each non-final
+  // boundary. Records that share one boundary form a partial order given by
+  // the reducer's successor rules — a planning or control execution starts
+  // before the generation and iteration opened at its own boundary (the
+  // stage-boundary hook: settled unbound, then the generation, then the
+  // iteration, then the transition), a stage iteration closes after the
+  // last execution it contains and before its generation closes, a
+  // generation closes before the next one opens, and a wait is entered
+  // after the lifecycle records of its boundary and answered only after
+  // the durable intervention closed an open iteration. The replay resolves
+  // that intra-boundary order with one worklist: every round applies the
+  // anchored records whose preconditions hold — the plan revisions (whose
+  // acceptance position is derived from their settled-but-unbound planning
+  // origin), the active-bound iteration closures, the generation closures,
+  // the generation openings, the iteration openings, the wait entries, the
+  // grants and wait-bound iteration closures bound to the entered wait by
+  // its exact wait index, and the responses — repeating until nothing
+  // applies. A record that never becomes applicable fails closed with its
+  // specific diagnostic; there is no second cursor, no second journal and
+  // no event stream. The execution starts are checked interval-wise after
+  // the worklist settles: a stage execution must name an iteration that
+  // was open at its start (opened at or before the start boundary, closed
+  // at or after it — a same-boundary closure follows the execution it
+  // contains), and a planning/control execution must not start inside an
+  // iteration that was unambiguously open before its boundary (an
+  // iteration opened at exactly the start boundary opened after a
+  // planning/control start — the stage-boundary hook — and an iteration
+  // closed at exactly the start boundary closed before it). A response
+  // never consumes graph budget, and the persisted cursor must equal the
+  // replayed cursor after the full replay.
   let replayCursor = pipeline.entry_state;
   let waitPosition = 0;
-  let grantPosition = 0;
   let planPosition = 0;
   const iterationPositions = generations.map(() => 0);
   const grantSums = new Map<number, number>();
   /** The consumed iteration closes, keyed `${generation.index}:${iteration.index}`. */
   const closedCloses = new Set<string>();
+  /** The generation indexes whose opening the replay consumed. */
+  const openedGenerations = new Set<number>();
+  /** The generation indexes whose closure the replay consumed. */
+  const closedGenerations = new Set<number>();
+  /** The grant ledger indexes whose intervention the replay consumed. */
+  const processedGrants = new Set<number>();
   let openGenerationIndex: number | null = null;
   let openIterationGeneration: number | null = null;
   let openIterationIndex: number | null = null;
-  let openWaitBoundary = false;
+  /** The entered but not yet answered wait record (at most one), by journal index. */
+  let enteredWaitIndex: number | null = null;
 
-  const grantOrdinal = (grant: PipelineV2IterationGrantState): number => {
+  const grantWaitOf = (grant: PipelineV2IterationGrantState): PipelineV2WaitRecord => {
     const wait = waits[grant.wait_index - 1];
     if (wait === undefined) {
       throw new PipelineV2StateError(
         `grant record ${grant.index} references wait ${grant.wait_index}, which does not exist`,
       );
     }
-    return wait.transition_count;
+    return wait;
   };
-  const taskRevisionOrdinal = (task: PipelineV2TaskRevisionState): number => {
+  const taskWaitOf = (task: PipelineV2TaskRevisionState): PipelineV2WaitRecord => {
     const wait = task.wait_index === undefined ? undefined : waits[task.wait_index - 1];
     if (task.wait_index === undefined || wait === undefined) {
       throw new PipelineV2StateError(
         `task revision record ${task.index} references wait ${JSON.stringify(task.wait_index)}, which does not exist`,
       );
     }
-    return wait.transition_count;
+    return wait;
+  };
+  /**
+   * The iterations unambiguously open at a boundary: opened strictly before
+   * it and closed after it (or never). An iteration opened or closed at
+   * exactly the checked boundary shares that boundary with the checked
+   * event; the role-specific rules of the caller resolve which side of the
+   * event it fell on.
+   */
+  const unambiguouslyOpenAt = (
+    boundary: number,
+  ): { generation: PipelineV2StageGenerationRecord; iteration: PipelineV2StageIterationRecord }[] => {
+    const open: { generation: PipelineV2StageGenerationRecord; iteration: PipelineV2StageIterationRecord }[] = [];
+    for (const generation of generations) {
+      for (const iteration of generation.iterations) {
+        if (
+          iteration.opened_transition_count < boundary &&
+          (iteration.closed === undefined || iteration.closed.closed_transition_count > boundary)
+        ) {
+          open.push({ generation, iteration });
+        }
+      }
+    }
+    return open;
   };
 
+  // The records that anchor into the wait journal by wait index are checked
+  // before the replay: a grant or a user-response task revision naming a
+  // wait outside the journal can never become applicable at any boundary.
+  for (const grant of grants) {
+    grantWaitOf(grant);
+  }
+  for (const task of taskRevisions) {
+    if (task.revision !== 1) {
+      taskWaitOf(task);
+    }
+  }
+
   for (let ordinal = 0; ordinal <= transitions.length; ordinal++) {
-    openWaitBoundary = false;
-    while (waitPosition < waits.length) {
-      const wait = waits[waitPosition]!;
-      if (wait.transition_count < ordinal) {
-        throw new PipelineV2StateError(
-          `wait record ${wait.index} declares transition_count ${wait.transition_count}, below the replay boundary ${ordinal} already consumed by earlier wait records; wait records must be ordered by transition_count`,
-        );
-      }
-      if (wait.transition_count > ordinal) {
-        break;
-      }
-      if (wait.state_id !== replayCursor) {
-        throw new PipelineV2StateError(
-          `wait record ${wait.index} names state ${JSON.stringify(wait.state_id)}, which does not match the replay cursor ${JSON.stringify(replayCursor)}`,
-        );
-      }
-      // The waiting-bound intervention records of this wait, in their
-      // durable append order: the grants, the user-response task
-      // revisions, and the wait-bound iteration closures. They are
-      // processed whether this wait record is still open (the last
-      // journal record of a waiting run) or already closed.
-      while (grantPosition < grants.length && grantOrdinal(grants[grantPosition]!) === ordinal) {
-        const grant = grants[grantPosition]!;
-        const generation = generations[grant.generation_index - 1];
-        if (generation === undefined) {
+    // ---- the intra-boundary worklist ----
+    for (;;) {
+      let progress = false;
+
+      // (1) The plan revisions accepted at this boundary: the acceptance
+      // position is derived from the settled-but-unbound planning execution
+      // the plan names — the origin execution starts at committed transition
+      // count origin - 1 and must be exactly the last execution started
+      // there, settled, and carried the planning role. An iteration is open
+      // at the acceptance only when it opened strictly before this boundary
+      // and closes after it; an iteration opened or closed at exactly this
+      // boundary shares the reducer's one-boundary order with the
+      // acceptance (the plan precedes the iteration opening) and cannot
+      // reject it.
+      while (
+        planPosition < planRevisions.length &&
+        planRevisions[planPosition]!.origin_execution - 1 === ordinal
+      ) {
+        const plan = planRevisions[planPosition]!;
+        if (plan.origin_execution !== ordinal + 1) {
           throw new PipelineV2StateError(
-            `grant record ${grant.index} references generation ${grant.generation_index}, which does not exist`,
+            `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which is not the last execution started at committed transition count ${ordinal}`,
           );
         }
-        if (openGenerationIndex !== grant.generation_index) {
+        const origin = executions[plan.origin_execution - 1];
+        if (origin === undefined) {
           throw new PipelineV2StateError(
-            `grant record ${grant.index} references generation ${grant.generation_index}, which is not open at committed transition count ${ordinal}`,
+            `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which does not exist`,
           );
         }
-        if (wait.intent === undefined || wait.intent.intent_sha256 !== grant.intent_sha256) {
+        if (origin.execution_role !== "planning") {
           throw new PipelineV2StateError(
-            `grant record ${grant.index} references an intent that wait record ${wait.index} has not accepted`,
+            `plan revision record ${plan.index} names origin execution ${plan.origin_execution} with the ${JSON.stringify(origin.execution_role)} role; plan acceptance requires a planning execution`,
           );
         }
-        grantSums.set(
-          grant.generation_index,
-          (grantSums.get(grant.generation_index) ?? 0) + grant.additional_iterations,
-        );
-        grantPosition += 1;
+        if (!isSettledExecution(origin)) {
+          throw new PipelineV2StateError(
+            `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which has phase ${JSON.stringify(origin.phase)}; plan acceptance requires a settled execution`,
+          );
+        }
+        const openAtAcceptance = unambiguouslyOpenAt(ordinal);
+        if (openAtAcceptance.length > 0) {
+          const open = openAtAcceptance[0]!;
+          throw new PipelineV2StateError(
+            `plan revision record ${plan.index} is accepted while iteration ${open.iteration.index} of generation ${open.generation.index} is open`,
+          );
+        }
+        planPosition += 1;
+        progress = true;
       }
-      // The user-response task revisions of this wait, in ledger order:
-      // every revision-above-1 record names exactly this wait's ordinal
-      // and carries the intent the wait accepted. The ledger order within
-      // one wait is free (tasks and grants interleave), so the scan is
-      // per-wait, not cursor-based.
-      for (const task of taskRevisions) {
-        if (task.revision === 1 || task.wait_index !== wait.index) {
-          continue;
-        }
-        if (taskRevisionOrdinal(task) !== ordinal) {
-          continue;
-        }
-        if (wait.intent === undefined || wait.intent.intent_sha256 !== task.intent_sha256) {
-          throw new PipelineV2StateError(
-            `task revision record ${task.index} references an intent that wait record ${wait.index} has not accepted`,
-          );
-        }
-      }
+      // (2) The active-bound iteration closures (normal_close / exhausted)
+      // anchored at this boundary: the closure follows the last execution
+      // the iteration contains and precedes the generation closure. This
+      // block also runs on the final boundary (ordinal ===
+      // transitions.length): a run may end its journal with a just-closed
+      // iteration, an open iteration, a just-opened generation, or a
+      // settled-but-unbound planning execution whose plan revision was
+      // accepted — every one of those records must still be
+      // replay-verified. Only the transition application below is skipped
+      // on the final boundary.
       for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
         const generation = generations[generationIndex]!;
-        // The wait-bound closure binds to the open iteration: the replay
-        // resolves it through the open-iteration tracking (the record the
-        // reducer closed), not through the open-consumption position.
         if (openIterationGeneration !== generation.index) {
           continue;
         }
@@ -2233,158 +2309,317 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         const closed = iteration.closed;
         if (
           closed === undefined ||
-          !(closed.by === "grant" || closed.by === "replanned") ||
-          closed.wait_index !== wait.index ||
+          !(closed.by === "normal_close" || closed.by === "exhausted") ||
           closed.closed_transition_count !== ordinal
         ) {
           continue;
         }
-        if (wait.intent === undefined) {
-          throw new PipelineV2StateError(
-            `wait record ${wait.index} closes an iteration with ${JSON.stringify(closed.by)} but carries no accepted intent`,
-          );
-        }
-        if (closed.by === "grant") {
-          const grant = grants.find(
-            (candidate) =>
-              candidate.generation_index === generation.index &&
-              candidate.wait_index === wait.index &&
-              candidate.intent_sha256 === wait.intent!.intent_sha256,
-          );
-          if (grant === undefined) {
-            throw new PipelineV2StateError(
-              `iteration ${iteration.index} of generation ${generation.index} closed with ${JSON.stringify("grant")} without a recorded grant for wait ${wait.index}`,
-            );
-          }
-        } else {
-          const task = taskRevisions.some((candidate) => candidate.wait_index === wait.index);
-          if (!task) {
-            throw new PipelineV2StateError(
-              `iteration ${iteration.index} of generation ${generation.index} closed with ${JSON.stringify("replanned")} without an accepted task revision for wait ${wait.index}`,
-            );
-          }
-        }
         closedCloses.add(`${generation.index}:${iteration.index}`);
         openIterationGeneration = null;
         openIterationIndex = null;
+        progress = true;
       }
-      if (wait.response === undefined) {
-        if (waitPosition !== waits.length - 1) {
-          throw new PipelineV2StateError(
-            `wait record ${wait.index} is open but is not the last wait record; an open wait record may only end the wait journal`,
-          );
-        }
-        if (ordinal !== transitions.length) {
-          throw new PipelineV2StateError(
-            `wait record ${wait.index} is open but ${transitions.length - ordinal} committed transitions follow it; no transition may follow an open wait record`,
-          );
-        }
-        openWaitBoundary = true;
-        if (executions.length !== transitions.length) {
-          throw new PipelineV2StateError(
-            `wait record ${wait.index} is open while execution ${transitions.length + 1} has no committed transition; an open wait record requires a fully settled and committed history`,
-          );
-        }
-        waitPosition += 1;
-        break;
-      }
-      const action = wait.actions.find((candidate) => candidate.id === wait.response!.action_id);
-      if (action === undefined) {
-        throw new PipelineV2StateError(
-          `wait record ${wait.index} records response action ${JSON.stringify(wait.response.action_id)}, which it does not declare`,
-        );
-      }
-      replayCursor = action.to;
-      waitPosition += 1;
-    }
-    // Active-bound iteration closures (normal_close / exhausted) at this
-    // boundary, before the execution starts. This block also runs on the
-    // final boundary (ordinal === transitions.length): a run may end its
-    // journal with a just-closed iteration, an open iteration, a just-opened
-    // generation, or a settled-but-unbound planning execution whose plan
-    // revision was accepted — every one of those records must still be
-    // replay-verified. Only the transition application below is skipped on
-    // the final boundary.
-    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
-      const generation = generations[generationIndex]!;
-      if (openIterationGeneration !== generation.index) {
-        continue;
-      }
-      const iteration = generation.iterations[openIterationIndex! - 1]!;
-      const closed = iteration.closed;
-      if (
-        closed === undefined ||
-        !(closed.by === "normal_close" || closed.by === "exhausted") ||
-        closed.closed_transition_count !== ordinal
-      ) {
-        continue;
-      }
-      if (openWaitBoundary) {
-        throw new PipelineV2StateError(
-          `iteration ${iteration.index} of generation ${generation.index} closes on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; the ordinary closures run only on an active boundary`,
-        );
-      }
-      closedCloses.add(`${generation.index}:${iteration.index}`);
-      openIterationGeneration = null;
-      openIterationIndex = null;
-    }
-    // Generation closures at this boundary.
-    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
-      const generation = generations[generationIndex]!;
-      if (
-        generation.closed !== undefined &&
-        generation.closed.closed_transition_count === ordinal &&
-        iterationPositions[generationIndex] === generation.iterations.length
-      ) {
-        if (openWaitBoundary) {
-          throw new PipelineV2StateError(
-            `generation ${generation.index} closes on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; a stage generation cannot close while the run is waiting`,
-          );
+      // (3) The generation closures anchored at this boundary.
+      for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+        const generation = generations[generationIndex]!;
+        if (generation.closed === undefined || generation.closed.closed_transition_count !== ordinal) {
+          continue;
         }
         if (openGenerationIndex !== generation.index) {
-          throw new PipelineV2StateError(
-            `generation ${generation.index} closes at committed transition count ${ordinal}, but it is not the open generation there`,
-          );
+          continue;
         }
         if (openIterationGeneration !== null) {
+          continue;
+        }
+        if (iterationPositions[generationIndex] !== generation.iterations.length) {
+          continue;
+        }
+        closedGenerations.add(generation.index);
+        openGenerationIndex = null;
+        progress = true;
+      }
+      // (4) The generation openings anchored at this boundary, bound to the
+      // last plan revision accepted at or before this boundary (the plans
+      // of this very boundary ran first in the same worklist).
+      for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+        const generation = generations[generationIndex]!;
+        if (generation.opened_transition_count !== ordinal || openedGenerations.has(generation.index)) {
+          continue;
+        }
+        if (openGenerationIndex !== null || enteredWaitIndex !== null) {
+          continue;
+        }
+        const acceptedPlan = planPosition > 0 ? planRevisions[planPosition - 1] : undefined;
+        if (acceptedPlan === undefined || acceptedPlan.sha256 !== generation.plan_sha256) {
+          continue;
+        }
+        openedGenerations.add(generation.index);
+        openGenerationIndex = generation.index;
+        progress = true;
+      }
+      // (5) The iteration openings anchored at this boundary, with the
+      // effective-budget check: the immutable initial budget plus the
+      // generation's grants whose wait boundary is at or before this
+      // boundary. The openings are processed before the wait entries of the
+      // same boundary because a stage execution starts inside the iteration
+      // the boundary opened.
+      for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+        const generation = generations[generationIndex]!;
+        const position = iterationPositions[generationIndex]!;
+        if (position >= generation.iterations.length) {
+          continue;
+        }
+        const iteration = generation.iterations[position]!;
+        if (iteration.opened_transition_count !== ordinal) {
+          continue;
+        }
+        if (openGenerationIndex !== generation.index || openIterationGeneration !== null || enteredWaitIndex !== null) {
+          continue;
+        }
+        let grantsSum = 0;
+        for (const grant of grants) {
+          if (grant.generation_index !== generation.index || !processedGrants.has(grant.index)) {
+            continue;
+          }
+          grantsSum += grant.additional_iterations;
+        }
+        const effectiveBudget = generation.initial_budget + grantsSum;
+        if (iteration.index > effectiveBudget) {
           throw new PipelineV2StateError(
-            `generation ${generation.index} closes while an iteration is still open`,
+            `iteration ${iteration.index} of generation ${generation.index} exceeds the effective iteration budget ${effectiveBudget} (initial budget ${generation.initial_budget} plus recorded grants)`,
           );
         }
-        openGenerationIndex = null;
+        openIterationGeneration = generation.index;
+        openIterationIndex = iteration.index;
+        iterationPositions[generationIndex] = position + 1;
+        progress = true;
+      }
+      // (6) The wait entries: the next wait in journal order, entered when
+      // its boundary and the replay cursor match and no other wait is open.
+      if (waitPosition < waits.length) {
+        const wait = waits[waitPosition]!;
+        if (wait.transition_count < ordinal) {
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} declares transition_count ${wait.transition_count}, below the replay boundary ${ordinal} already consumed by earlier wait records; wait records must be ordered by transition_count`,
+          );
+        }
+        if (wait.transition_count === ordinal && wait.state_id === replayCursor && enteredWaitIndex === null) {
+          if (wait.response === undefined) {
+            if (waitPosition !== waits.length - 1) {
+              throw new PipelineV2StateError(
+                `wait record ${wait.index} is open but is not the last wait record; an open wait record may only end the wait journal`,
+              );
+            }
+            if (ordinal !== transitions.length) {
+              throw new PipelineV2StateError(
+                `wait record ${wait.index} is open but ${transitions.length - ordinal} committed transitions follow it; no transition may follow an open wait record`,
+              );
+            }
+            if (executions.length !== transitions.length) {
+              throw new PipelineV2StateError(
+                `wait record ${wait.index} is open while execution ${transitions.length + 1} has no committed transition; an open wait record requires a fully settled and committed history`,
+              );
+            }
+          }
+          // The user-response task revisions of this wait, in ledger order:
+          // every revision-above-1 record names exactly this wait and
+          // carries the intent the wait accepted.
+          for (const task of taskRevisions) {
+            if (task.revision === 1 || task.wait_index !== wait.index) {
+              continue;
+            }
+            if (wait.intent === undefined || wait.intent.intent_sha256 !== task.intent_sha256) {
+              throw new PipelineV2StateError(
+                `task revision record ${task.index} references an intent that wait record ${wait.index} has not accepted`,
+              );
+            }
+          }
+          waitPosition += 1;
+          enteredWaitIndex = wait.index;
+          progress = true;
+        }
+      }
+      // (7) The grants of the entered wait, bound by the exact wait index:
+      // the grant references the generation that is open at this boundary
+      // and the intent this wait accepted.
+      if (enteredWaitIndex !== null) {
+        const wait = waits[enteredWaitIndex - 1]!;
+        for (const grant of grants) {
+          if (grant.wait_index !== wait.index || processedGrants.has(grant.index)) {
+            continue;
+          }
+          const generation = generations[grant.generation_index - 1];
+          if (generation === undefined) {
+            throw new PipelineV2StateError(
+              `grant record ${grant.index} references generation ${grant.generation_index}, which does not exist`,
+            );
+          }
+          if (openGenerationIndex !== grant.generation_index) {
+            throw new PipelineV2StateError(
+              `grant record ${grant.index} references generation ${grant.generation_index}, which is not open at committed transition count ${ordinal}`,
+            );
+          }
+          if (wait.intent === undefined || wait.intent.intent_sha256 !== grant.intent_sha256) {
+            throw new PipelineV2StateError(
+              `grant record ${grant.index} references an intent that wait record ${wait.index} has not accepted`,
+            );
+          }
+          grantSums.set(
+            grant.generation_index,
+            (grantSums.get(grant.generation_index) ?? 0) + grant.additional_iterations,
+          );
+          processedGrants.add(grant.index);
+          progress = true;
+        }
+      }
+      // (8) The wait-bound iteration closures of the entered wait: the
+      // closure binds to the currently open iteration, the wait's accepted
+      // intent and its recorded intervention.
+      if (enteredWaitIndex !== null) {
+        const wait = waits[enteredWaitIndex - 1]!;
+        for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+          const generation = generations[generationIndex]!;
+          if (openIterationGeneration !== generation.index) {
+            continue;
+          }
+          const iteration = generation.iterations[openIterationIndex! - 1]!;
+          const closed = iteration.closed;
+          if (
+            closed === undefined ||
+            !(closed.by === "grant" || closed.by === "replanned") ||
+            closed.wait_index !== wait.index ||
+            closed.closed_transition_count !== ordinal
+          ) {
+            continue;
+          }
+          if (wait.intent === undefined) {
+            throw new PipelineV2StateError(
+              `wait record ${wait.index} closes an iteration with ${JSON.stringify(closed.by)} but carries no accepted intent`,
+            );
+          }
+          if (closed.by === "grant") {
+            const grant = grants.find(
+              (candidate) =>
+                candidate.generation_index === generation.index &&
+                candidate.wait_index === wait.index &&
+                candidate.intent_sha256 === wait.intent!.intent_sha256,
+            );
+            if (grant === undefined) {
+              throw new PipelineV2StateError(
+                `iteration ${iteration.index} of generation ${generation.index} closed with ${JSON.stringify("grant")} without a recorded grant for wait ${wait.index}`,
+              );
+            }
+          } else {
+            const task = taskRevisions.some((candidate) => candidate.wait_index === wait.index);
+            if (!task) {
+              throw new PipelineV2StateError(
+                `iteration ${iteration.index} of generation ${generation.index} closed with ${JSON.stringify("replanned")} without an accepted task revision for wait ${wait.index}`,
+              );
+            }
+          }
+          closedCloses.add(`${generation.index}:${iteration.index}`);
+          openIterationGeneration = null;
+          openIterationIndex = null;
+          progress = true;
+        }
+      }
+      // (9) The response of the entered wait: applied only after the
+      // durable intervention records of the wait were consumed and no
+      // iteration is open.
+      if (enteredWaitIndex !== null) {
+        const wait = waits[enteredWaitIndex - 1]!;
+        if (wait.response !== undefined) {
+          const grantsDone = grants.every(
+            (grant) => grant.wait_index !== wait.index || processedGrants.has(grant.index),
+          );
+          const closuresDone = generations.every((generation) =>
+            generation.iterations.every(
+              (iteration) =>
+                iteration.closed === undefined ||
+                iteration.closed.wait_index !== wait.index ||
+                iteration.closed.closed_transition_count !== ordinal ||
+                closedCloses.has(`${generation.index}:${iteration.index}`),
+            ),
+          );
+          if (!grantsDone || !closuresDone || openIterationGeneration !== null) {
+            continue;
+          }
+          const action = wait.actions.find((candidate) => candidate.id === wait.response!.action_id);
+          if (action === undefined) {
+            throw new PipelineV2StateError(
+              `wait record ${wait.index} records response action ${JSON.stringify(wait.response.action_id)}, which it does not declare`,
+            );
+          }
+          replayCursor = action.to;
+          enteredWaitIndex = null;
+          progress = true;
+        }
+      }
+
+      if (!progress) {
+        break;
       }
     }
-    // Generation openings at this boundary.
+
+    // The pending-record pass: every record anchored at this boundary must
+    // have been consumed by the worklist. Scan in the records' own order
+    // and fail closed on the first pending record with its specific
+    // diagnostic.
+    if (waitPosition < waits.length && waits[waitPosition]!.transition_count === ordinal) {
+      const wait = waits[waitPosition]!;
+      if (wait.state_id !== replayCursor) {
+        throw new PipelineV2StateError(
+          `wait record ${wait.index} names state ${JSON.stringify(wait.state_id)}, which does not match the replay cursor ${JSON.stringify(replayCursor)}`,
+        );
+      }
+      if (enteredWaitIndex !== null && wait.response !== undefined) {
+        const open = unambiguouslyOpenAt(ordinal).concat(
+          openIterationGeneration === null
+            ? []
+            : (() => {
+                const generation = generations.find((candidate) => candidate.index === openIterationGeneration)!;
+                const iteration = generation.iterations[openIterationIndex! - 1]!;
+                return [{ generation, iteration }];
+              })(),
+        );
+        const distinct = open.filter(
+          (candidate, index) =>
+            open.findIndex(
+              (other) =>
+                other.generation.index === candidate.generation.index &&
+                other.iteration.index === candidate.iteration.index,
+            ) === index,
+        );
+        if (distinct.length > 0) {
+          const openIteration = distinct[0]!;
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} is answered while iteration ${openIteration.iteration.index} of generation ${openIteration.generation.index} is still open`,
+          );
+        }
+      }
+    }
     for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
       const generation = generations[generationIndex]!;
-      if (generation.opened_transition_count !== ordinal) {
+      if (generation.opened_transition_count !== ordinal || openedGenerations.has(generation.index)) {
         continue;
-      }
-      if (openWaitBoundary) {
-        throw new PipelineV2StateError(
-          `generation ${generation.index} opens on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; no stage generation may open while the run is waiting`,
-        );
       }
       if (openGenerationIndex !== null) {
         throw new PipelineV2StateError(
           `generation ${generation.index} opens while generation ${openGenerationIndex} is still open; at most one generation may be open`,
         );
       }
-      const acceptedPlan = planRevisions[planPosition - 1];
+      if (enteredWaitIndex !== null) {
+        throw new PipelineV2StateError(
+          `generation ${generation.index} opens on the boundary of the open wait record ${enteredWaitIndex}; no stage generation may open while the run is waiting`,
+        );
+      }
+      const acceptedPlan = planPosition > 0 ? planRevisions[planPosition - 1] : undefined;
       if (acceptedPlan === undefined || acceptedPlan.sha256 !== generation.plan_sha256) {
         throw new PipelineV2StateError(
           `generation ${generation.index} binds plan digest ${JSON.stringify(generation.plan_sha256)}, which is not the last accepted plan revision at committed transition count ${ordinal}`,
         );
       }
-      openGenerationIndex = generation.index;
     }
-    // Iteration openings at this boundary, with the effective-budget
-    // check: the immutable initial budget plus the generation's grants
-    // recorded up to this boundary. The sum is computed with an overflow
-    // guard so an unrepresentable budget fails closed. The openings are
-    // processed before the execution starts because the reducer opens the
-    // iteration at the very cursor boundary the first stage execution of
-    // the iteration starts at.
     for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
       const generation = generations[generationIndex]!;
       const position = iterationPositions[generationIndex]!;
@@ -2394,11 +2629,6 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       const iteration = generation.iterations[position]!;
       if (iteration.opened_transition_count !== ordinal) {
         continue;
-      }
-      if (openWaitBoundary) {
-        throw new PipelineV2StateError(
-          `iteration ${iteration.index} of generation ${generation.index} opens on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; no stage iteration may open while the run is waiting`,
-        );
       }
       if (openGenerationIndex !== generation.index) {
         throw new PipelineV2StateError(
@@ -2410,92 +2640,150 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
           `iteration ${iteration.index} of generation ${generation.index} opens while the iteration of generation ${openIterationGeneration} is still open; at most one iteration may be open`,
         );
       }
-      let grantsSum: number;
-      try {
-        grantsSum = additionSafe(
-          generation.initial_budget,
-          grantSums.get(generation.index) ?? 0,
-          `generation ${generation.index}`,
-        );
-      } catch (cause) {
-        if (cause instanceof PipelineV2StateError) {
-          throw new PipelineV2StateError(
-            `iteration ${iteration.index} of ${cause.message} has an unrepresentable effective iteration budget`,
-          );
-        }
-        throw cause;
-      }
-      if (position + 1 > grantsSum) {
+      if (enteredWaitIndex !== null) {
         throw new PipelineV2StateError(
-          `iteration ${iteration.index} of generation ${generation.index} exceeds the effective iteration budget ${grantsSum} (initial budget ${generation.initial_budget} plus recorded grants)`,
-        );
-      }
-      openIterationGeneration = generation.index;
-      openIterationIndex = iteration.index;
-      iterationPositions[generationIndex] = position + 1;
-    }
-    // The execution starts: the global execution index k starts at
-    // committed transition count k - 1. A stage execution must reference
-    // the open iteration; a planning or control execution must start
-    // outside any open iteration.
-    const startingExecution = executions[ordinal];
-    if (startingExecution !== undefined) {
-      if (startingExecution.execution_role === "stage") {
-        if (openIterationGeneration === null || openIterationIndex === null) {
-          throw new PipelineV2StateError(
-            `execution ${startingExecution.index} has the "stage" role but no iteration is open at committed transition count ${ordinal}`,
-          );
-        }
-        if (startingExecution.iteration_index !== openIterationIndex) {
-          throw new PipelineV2StateError(
-            `execution ${startingExecution.index} references iteration ${startingExecution.iteration_index}, which is not the open iteration ${openIterationIndex} at committed transition count ${ordinal}`,
-          );
-        }
-      } else if (openIterationGeneration !== null) {
-        throw new PipelineV2StateError(
-          `execution ${startingExecution.index} has the ${JSON.stringify(startingExecution.execution_role)} role but starts inside the open iteration of generation ${openIterationGeneration}`,
+          `iteration ${iteration.index} of generation ${generation.index} opens on the boundary of the open wait record ${enteredWaitIndex}; no stage iteration may open while the run is waiting`,
         );
       }
     }
-    // The plan revisions at this boundary: the acceptance position is
-    // derived from the settled-but-unbound planning execution the plan
-    // names — the origin execution starts at committed transition count
-    // origin - 1 and must be exactly the last execution started there
-    // (the unbound one), settled, and carried the planning role.
-    while (planPosition < planRevisions.length && planRevisions[planPosition]!.origin_execution - 1 === ordinal) {
-      const plan = planRevisions[planPosition]!;
-      if (openWaitBoundary) {
+    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+      const generation = generations[generationIndex]!;
+      if (openIterationGeneration !== generation.index) {
+        continue;
+      }
+      const iteration = generation.iterations[openIterationIndex! - 1]!;
+      const closed = iteration.closed;
+      if (
+        closed !== undefined &&
+        (closed.by === "normal_close" || closed.by === "exhausted") &&
+        closed.closed_transition_count === ordinal &&
+        !closedCloses.has(`${generation.index}:${iteration.index}`)
+      ) {
         throw new PipelineV2StateError(
-          `plan revision record ${plan.index} is accepted on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; a plan revision cannot be accepted while the run is waiting`,
+          `iteration ${iteration.index} of generation ${generation.index} records a close that never matched the open iteration at its anchor`,
+        );
+      }
+    }
+    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+      const generation = generations[generationIndex]!;
+      if (generation.closed === undefined || generation.closed.closed_transition_count !== ordinal) {
+        continue;
+      }
+      if (closedGenerations.has(generation.index)) {
+        continue;
+      }
+      if (openGenerationIndex !== generation.index) {
+        throw new PipelineV2StateError(
+          `generation ${generation.index} closes at committed transition count ${ordinal}, but it is not the open generation there`,
         );
       }
       if (openIterationGeneration !== null) {
         throw new PipelineV2StateError(
-          `plan revision record ${plan.index} is accepted while iteration ${openIterationIndex} of generation ${openIterationGeneration} is open`,
+          `generation ${generation.index} closes while an iteration is still open`,
         );
       }
-      if (plan.origin_execution !== ordinal + 1) {
+      if (iterationPositions[generationIndex] !== generation.iterations.length) {
         throw new PipelineV2StateError(
-          `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which is not the last execution started at committed transition count ${ordinal}`,
+          `generation ${generation.index} closes at committed transition count ${ordinal} but not all of its iterations were opened`,
         );
       }
-      const origin = executions[plan.origin_execution - 1];
-      if (origin === undefined) {
+    }
+    if (enteredWaitIndex !== null) {
+      const wait = waits[enteredWaitIndex - 1]!;
+      for (const grant of grants) {
+        if (grant.wait_index !== wait.index || processedGrants.has(grant.index)) {
+          continue;
+        }
+        const generation = generations[grant.generation_index - 1];
+        if (generation === undefined) {
+          throw new PipelineV2StateError(
+            `grant record ${grant.index} references generation ${grant.generation_index}, which does not exist`,
+          );
+        }
+        if (openGenerationIndex !== grant.generation_index) {
+          throw new PipelineV2StateError(
+            `grant record ${grant.index} references generation ${grant.generation_index}, which is not open at committed transition count ${ordinal}`,
+          );
+        }
         throw new PipelineV2StateError(
-          `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which does not exist`,
+          `grant record ${grant.index} references an intent that wait record ${wait.index} has not accepted`,
         );
       }
-      if (origin.execution_role !== "planning") {
-        throw new PipelineV2StateError(
-          `plan revision record ${plan.index} names origin execution ${plan.origin_execution} with the ${JSON.stringify(origin.execution_role)} role; plan acceptance requires a planning execution`,
-        );
+      for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+        const generation = generations[generationIndex]!;
+        if (openIterationGeneration !== generation.index) {
+          continue;
+        }
+        const iteration = generation.iterations[openIterationIndex! - 1]!;
+        const closed = iteration.closed;
+        if (
+          closed !== undefined &&
+          (closed.by === "grant" || closed.by === "replanned") &&
+          closed.wait_index === wait.index &&
+          closed.closed_transition_count === ordinal &&
+          !closedCloses.has(`${generation.index}:${iteration.index}`)
+        ) {
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} closes an iteration with ${JSON.stringify(closed.by)} but carries no accepted intent`,
+          );
+        }
       }
-      if (!isSettledExecution(origin)) {
-        throw new PipelineV2StateError(
-          `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which has phase ${JSON.stringify(origin.phase)}; plan acceptance requires a settled execution`,
-        );
+    }
+
+    // The execution starts: the global execution index k starts at
+    // committed transition count k - 1. A stage execution must reference
+    // the iteration that was open at its start; a planning or control
+    // execution must start outside any iteration that was unambiguously
+    // open before its boundary.
+    const startingExecution = executions[ordinal];
+    if (startingExecution !== undefined) {
+      if (startingExecution.execution_role === "stage") {
+        // The referenced iteration was open at the start: opened at or
+        // before the start boundary, and closed at or after it — a
+        // closure anchored at the start boundary follows the execution
+        // it contains (the closure comes after the last contained
+        // execution settled). An iteration closed at this boundary by a
+        // wait-bound intervention is the exception: the wait cycle
+        // (closure, then response, then the moved cursor) precedes every
+        // start of this boundary, so such an iteration is already closed
+        // at every start.
+        const referencedIndex = startingExecution.iteration_index!;
+        const candidates: { generation: PipelineV2StageGenerationRecord; iteration: PipelineV2StageIterationRecord }[] = [];
+        for (const generation of generations) {
+          for (const iteration of generation.iterations) {
+            const closed = iteration.closed;
+            if (
+              iteration.opened_transition_count > ordinal ||
+              (closed !== undefined && closed.closed_transition_count < ordinal) ||
+              (closed !== undefined &&
+                closed.closed_transition_count === ordinal &&
+                (closed.by === "grant" || closed.by === "replanned"))
+            ) {
+              continue;
+            }
+            candidates.push({ generation, iteration });
+          }
+        }
+        if (candidates.length === 0) {
+          throw new PipelineV2StateError(
+            `execution ${startingExecution.index} has the "stage" role but no iteration is open at committed transition count ${ordinal}`,
+          );
+        }
+        if (!candidates.some((candidate) => candidate.iteration.index === referencedIndex)) {
+          const open = candidates[candidates.length - 1]!;
+          throw new PipelineV2StateError(
+            `execution ${startingExecution.index} references iteration ${referencedIndex}, which is not the open iteration ${open.iteration.index} at committed transition count ${ordinal}`,
+          );
+        }
+      } else {
+        const unambiguous = unambiguouslyOpenAt(ordinal);
+        if (unambiguous.length > 0) {
+          const open = unambiguous[0]!;
+          throw new PipelineV2StateError(
+            `execution ${startingExecution.index} has the ${JSON.stringify(startingExecution.execution_role)} role but starts inside the open iteration of generation ${open.generation.index}`,
+          );
+        }
       }
-      planPosition += 1;
     }
     if (ordinal === transitions.length) {
       break;
@@ -2514,10 +2802,17 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       `wait record ${wait.index} declares transition_count ${wait.transition_count}, which exceeds the ${transitions.length} committed transitions`,
     );
   }
-  if (grantPosition !== grants.length) {
-    const grant = grants[grantPosition]!;
+  // Every iteration grant was bound to its wait during the replay; a grant
+  // was processed exactly when its wait was entered and the grant's
+  // generation was open at that boundary. A grant that was never processed
+  // can only name a wait outside the journal.
+  for (const grant of grants) {
+    if (processedGrants.has(grant.index)) {
+      continue;
+    }
+    grantWaitOf(grant);
     throw new PipelineV2StateError(
-      `grant record ${grant.index} declares a wait whose transition count exceeds the ${transitions.length} committed transitions`,
+      `grant record ${grant.index} was not applied at the boundary of the wait record ${grant.wait_index}`,
     );
   }
   // Every user-response task revision names a wait whose anchor must be
@@ -2527,7 +2822,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     if (task.revision === 1) {
       continue;
     }
-    const ordinal = taskRevisionOrdinal(task);
+    const ordinal = taskWaitOf(task).transition_count;
     if (ordinal > transitions.length) {
       throw new PipelineV2StateError(
         `task revision record ${task.index} declares a wait whose transition count exceeds the ${transitions.length} committed transitions`,
@@ -4347,6 +4642,12 @@ export function reducePipelineV2RunCommand(
       }
       if (openIterationOf(current) !== undefined) {
         fail(current, `generation ${openGeneration.index} still has an open iteration; close it first`);
+      }
+      if (openGeneration.iterations.length === 0) {
+        fail(
+          current,
+          `generation ${openGeneration.index} has no iterations to close; open and close one iteration first`,
+        );
       }
       const generation = next.generations[openGeneration.index - 1] as PipelineV2StageGenerationRecord;
       const updated: PipelineV2StageGenerationRecord = {

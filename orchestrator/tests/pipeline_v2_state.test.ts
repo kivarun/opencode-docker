@@ -4230,14 +4230,17 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     lifecycleOpenPrefix(driver);
     stageAgent(driver, "dev_entry", 1, 3);
     commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
     const base = JSON.stringify(driver.current);
     expectInvalid(JSON.parse(base), (draft) => {
-      draft.executions[2].iteration_index = 9;
-    }, 'references iteration 9, which is not the open iteration 1 at committed transition count 2');
-    // a planning execution inside the open iteration
+      draft.executions[3].iteration_index = 9;
+    }, 'references iteration 9, which is not the open iteration 1 at committed transition count 3');
+    // a planning execution starting while an iteration that opened strictly
+    // before its boundary is still open
     expectInvalid(JSON.parse(base), (draft) => {
-      draft.executions[2].execution_role = "planning";
-      delete draft.executions[2].iteration_index;
+      draft.executions[3].execution_role = "planning";
+      delete draft.executions[3].iteration_index;
     }, 'has the "planning" role but starts inside the open iteration of generation 1');
     // a stage execution without any open iteration at all
     expectInvalid(JSON.parse(base), (draft) => {
@@ -4245,6 +4248,17 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
       delete draft.generations[0].open_iteration;
       draft.generations[0].iteration_count = 0;
     }, 'has the "stage" role but no iteration is open at committed transition count 2');
+    // the stage-boundary hook order (the execution settles unbound, then
+    // the generation and iteration open at the same boundary, then the
+    // transition commits) is indistinguishable from a same-anchor forgery
+    // by the durable anchors alone, so a planning or control start whose
+    // boundary opened its own iteration is not rejected by the loader; the
+    // compiled-role correspondence is the restore verifier's check
+    const hookDriver = createDriver(STAGE_IDENTITY, []);
+    dispatchedPrefix(hookDriver);
+    hookDriver.apply(genOpened({ transitionCount: 1 }));
+    hookDriver.apply(iterOpened({ transitionCount: 1 }));
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(hookDriver.current)));
   });
 
   test("the loader rejects positionally impossible ledgers and budget history", () => {
@@ -4374,6 +4388,200 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
       iterationIndex: 1,
     });
     expect(state.executions[5]).toMatchObject({ state_id: "coder", execution_role: "stage", iteration_index: 1 });
+  });
+
+  test("the contract-order stage boundary is loader-coherent: settled execution, generation, iteration, transition", () => {
+    // The contract hook order at one boundary: the control execution
+    // settles unbound, then the generation and the iteration open at the
+    // same anchor, then the transition commits.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    dispatchedPrefix(driver);
+    driver.apply(genOpened({ transitionCount: 1 }));
+    driver.apply(iterOpened({ transitionCount: 1 }));
+    driver.apply({ kind: "transition_committed", step: { from: "dispatch", outcome: "d_next_stage", to: "dev_entry", transition_index: 0 }, executionIndex: 2 });
+    // the stage execution starts inside the iteration at the next boundary
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+  });
+
+  test("the contract-order closure boundary is loader-coherent: settled gate, iteration close, generation close, transition", () => {
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "gate", 3);
+    // the gate (stage decision) settles unbound, then the iteration and
+    // the generation close at the same boundary, then the transition
+    driver.apply({ kind: "start_decision_execution", stateId: "gate", inputDigest: hex("a"), executionRole: "stage", iterationIndex: 1 });
+    driver.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_close_stage", decision: "d_close_stage", rule_id: "R1", active_constraint_ids: [] } });
+    driver.apply(iterClosed({ by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed({ by: "next_stage" }));
+    commitTransition(driver, "gate", "d_close_stage", "dispatch", 4);
+  });
+
+  test("same-boundary lifecycle records are loader-coherent at one anchor", () => {
+    // the planning execution settles, the plan is accepted and the first
+    // generation opens at one boundary (anchor 0)
+    const planGen = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    planningPrefix(planGen);
+    planGen.apply(planAccepted());
+    planGen.apply(genOpened({ transitionCount: 0 }));
+    // the iteration opens and closes without any execution inside, the
+    // generation closes, and the next generation and iteration open at
+    // the same anchor
+    const openClose = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    dispatchedPrefix(openClose);
+    commitTransition(openClose, "dispatch", "d_next_stage", "dev_entry", 2);
+    openClose.apply(genOpened());
+    openClose.apply(iterOpened());
+    openClose.apply(iterClosed({ by: "normal_close", waitIndex: undefined }));
+    openClose.apply(genClosed({ by: "next_stage" }));
+    openClose.apply({ kind: "stage_generation_opened", stageId: "testing", stagePosition: 2, templateId: "testing", planSha256: PLAN_R1, initialBudget: 2, transitionCount: 2 });
+    openClose.apply({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 2 });
+  });
+
+  test("two waits at one transition_count interleave with the iteration lifecycle", () => {
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] } });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "gate", 3);
+    runGateDecision(driver, "d_rework", 4);
+    stageAgent(driver, "coder", 1, 5);
+    commitTransition(driver, "coder", "completed", "gate", 5);
+    runGateDecision(driver, "d_rework", 6);
+    // the iteration budget (2) is exhausted: wait 1 at count 6
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded({ additionalIterations: 2 }));
+    driver.apply(iterClosed({ iterationIndex: 1 }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    // iteration 2 opens at the same count 6; the budget is exhausted again:
+    // wait 2 at the same count 6
+    driver.apply({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 6 });
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("9"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted({ waitIndex: 2 }));
+    driver.apply(grantRecorded({ waitIndex: 2, additionalIterations: 1 }));
+    driver.apply(iterClosed({ iterationIndex: 2, waitIndex: 2 }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 2, expectedRequestSha256: hex("9"), actionId: "continue_stage", responseSha256: hex("a") });
+    driver.apply({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 3, transitionCount: 6 });
+    stageAgent(driver, "coder", 3, 7);
+    commitTransition(driver, "coder", "completed", "gate", 7);
+    const state = driver.current as PipelineV2RunState;
+    expect(state.waits).toHaveLength(2);
+    expect(state.waits[0]?.transition_count).toBe(6);
+    expect(state.waits[1]?.transition_count).toBe(6);
+    expect(state.grants).toHaveLength(2);
+    expect(state.cursor).toEqual({ current_state: "gate", transition_count: 7 });
+  });
+
+  test("the loader rejects ledger indexes that do not match their ledger position", () => {
+    // generations: the first index is not 1, a gap, a duplicate and an
+    // out-of-order pair on a two-generation base
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    playStageRun(driver);
+    const raw = JSON.stringify(driver.current);
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.generations[0].index = 2;
+    }, "generation at position 0 declares index 2; generation indexes must be contiguous from 1");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.generations[1].index = 3;
+    }, "generation at position 1 declares index 3; generation indexes must be contiguous from 1");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.generations[1].index = 1;
+    }, "generation at position 1 declares index 1; generation indexes must be contiguous from 1");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.generations[0].index = 2;
+      draft.generations[1].index = 1;
+    }, "generation at position 0 declares index 2; generation indexes must be contiguous from 1");
+    // grants: the first index is not 1 and a gap on a two-grant base
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.grants[0].index = 2;
+    }, "grant record at position 0 declares index 2; grant record indexes must be contiguous from 1");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.grants.push({
+        index: 3,
+        generation_index: 1,
+        wait_index: 1,
+        intent_sha256: INTENT_GRANT,
+        additional_iterations: 1,
+      });
+    }, "grant record at position 1 declares index 3; grant record indexes must be contiguous from 1");
+    // task revisions: the first index is not 1, a gap, a duplicate and an
+    // out-of-order pair on pushed revision-1 records
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.task_revisions.push({ index: 5, task_id: "coder_task", revision: 1, sha256: hex("c"), previous_sha256: null });
+    }, "task revision at position 0 declares index 5; task revision indexes must be contiguous from 1");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.task_revisions.push({ index: 1, task_id: "coder_task", revision: 1, sha256: hex("c"), previous_sha256: null });
+      draft.task_revisions.push({ index: 3, task_id: "gate_task", revision: 1, sha256: hex("d"), previous_sha256: null });
+    }, "task revision at position 1 declares index 3; task revision indexes must be contiguous from 1");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.task_revisions.push({ index: 1, task_id: "coder_task", revision: 1, sha256: hex("c"), previous_sha256: null });
+      draft.task_revisions.push({ index: 1, task_id: "gate_task", revision: 1, sha256: hex("d"), previous_sha256: null });
+    }, "task revision at position 1 declares index 1; task revision indexes must be contiguous from 1");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.task_revisions.push({ index: 2, task_id: "coder_task", revision: 1, sha256: hex("c"), previous_sha256: null });
+      draft.task_revisions.push({ index: 1, task_id: "gate_task", revision: 1, sha256: hex("d"), previous_sha256: null });
+    }, "task revision at position 0 declares index 2; task revision indexes must be contiguous from 1");
+  });
+
+  test("a stage generation cannot close without any recorded iteration", () => {
+    // the reducer rejects the closure of a generation with zero iterations
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    driver.apply(genOpened({ transitionCount: 0 }));
+    driver.reject({ kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" }, "generation 1 has no iterations to close; open and close one iteration first");
+    // the same-anchor form: the generation opens and would close at one
+    // anchor with zero iterations
+    const anchorDriver = createDriver(STAGE_IDENTITY, []);
+    dispatchedPrefix(anchorDriver);
+    commitTransition(anchorDriver, "dispatch", "d_next_stage", "dev_entry", 2);
+    anchorDriver.apply(genOpened());
+    anchorDriver.reject({ kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" }, "generation 1 has no iterations to close; open and close one iteration first");
+    // the loader rejects a closed generation without iterations: the
+    // plain form on a loadable two-generation success state
+    const success = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    playStageRun(success);
+    const raw = JSON.stringify(success.current);
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.generations[1].iterations = [];
+      draft.generations[1].iteration_count = 0;
+    }, "pipeline v2 run state generations[1] is closed without any recorded iteration");
+    // the same-anchor form on the loader side: a forged closed record on
+    // an open zero-iteration generation
+    const anchorDriver2 = createDriver(STAGE_IDENTITY, []);
+    dispatchedPrefix(anchorDriver2);
+    commitTransition(anchorDriver2, "dispatch", "d_next_stage", "dev_entry", 2);
+    anchorDriver2.apply(genOpened());
+    const anchorRaw = JSON.stringify(anchorDriver2.current);
+    expectInvalid(JSON.parse(anchorRaw), (draft) => {
+      draft.generations[0].closed = { by: "next_stage", closed_transition_count: 2 };
+    }, "pipeline v2 run state generations[0] is closed without any recorded iteration");
   });
 
   test("a waiting run never carries lifecycle mutations and the response demands the closed iteration", () => {
