@@ -773,6 +773,40 @@ Durable state, the coordinator, the runner and the production dispatch are
 untouched; a future controller will require this metadata before any
 schema-v7 dispatch.
 
+### Compiled run-plan projection over the orchestration metadata (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_run_plan_compiled.ts` binds one prepared run
+plan candidate to the trusted compiled orchestration metadata of a resolved
+v2 pipeline — the single prepared projection a future controller will
+consume. Provenance order is fixed: the pipeline gate first
+(`requireResolvedPipelineV2Provenance`), then the candidate gate through the
+existing boolean `hasPreparedRunPlanCandidateProvenance` (a registry
+lookup; the candidate's getters and Proxy traps never fire), both before any
+manifest field is read. The projection is content-free and deep-frozen:
+`{run_id, plan_revision, plan_sha256, origin_execution, stages}` where each
+stage keeps the plan manifest's semantic declaration order, carries the
+template's compiled `entry_state` and full `state_ids` resolved exclusively
+through `compiledStageTemplateFor` (template reuse is allowed and cached per
+compile), and lists the manifest's normalized task pointers
+(`{id, revision, sha256, depends_on}` in the manifest's normalized order).
+Errors stay with their owners: pipeline provenance failures remain the
+stable `PipelineError` of the pipeline gate; missing orchestration metadata
+and unknown templates propagate unchanged as `PipelineV2OrchestrationError`
+(never masked or re-classified by message text); only this layer's own
+failures are `PipelineV2CompiledRunPlanError` with the closed reason set
+`invalid_candidate | invalid_plan | invalid_stage_id | stage_not_found`.
+The compiled plan is registered in a module-private registry;
+`compiledPipelineV2RunPlanStageFor` gates on that registry before any field
+is read, validates the stage id against the shared safe-id predicate
+without echoing an invalid value, and returns the exact frozen stage.
+Task bodies, canonical JSON, filesystem paths and prepared-object
+references never enter the projection; `origin_execution` is transferred as
+a normalized number only — its durable verification is the future
+controller's. Nothing here is wired into production: state schema v7,
+execution roles in durable executions, lifecycle journals, controller/
+coordinator/runner/CLI wiring, filesystem publication, wait/replanning
+wiring, grants and effective budget remain later increments.
+
 ### v2 run-input snapshots and host-side activation data layout (used by the production runner through the coordinator)
 
 `orchestrator/src/pipeline_v2_runtime.ts` materializes the v2 data plane on
