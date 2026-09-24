@@ -984,3 +984,407 @@ test("YAML whitespace and mapping key order do not change the digest", async () 
   expect(after.json).toBe(before.json);
   expect(after.digest).toBe(before.digest);
 });
+
+const ORCHESTRATION_BLOCK = `orchestration:
+  stage_templates:
+    - id: development
+      entry_state: development_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: stage_dispatch
+      role: control
+    - state_id: development_entry
+      role: stage
+      stage_template: development
+    - state_id: coder
+      role: stage
+      stage_template: development
+    - state_id: stage_review
+      role: stage
+      stage_template: development
+    - state_id: iteration_gate
+      role: stage
+      stage_template: development
+
+`;
+
+const ORCHESTRATED_DIGEST_PIPELINE_YAML = `schema_version: 2
+entry_state: architect
+max_transitions: 20
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+  - id: facts_seed
+    type: json
+    protected: false
+    schema: schemas/facts.schema.json
+
+outputs:
+  - id: final_report
+    required: true
+    source:
+      state_output:
+        state: coder
+        output: report
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: development_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: stage_dispatch
+      role: control
+    - state_id: development_entry
+      role: stage
+      stage_template: development
+    - state_id: coder
+      role: stage
+      stage_template: development
+    - state_id: stage_review
+      role: stage
+      stage_template: development
+    - state_id: iteration_gate
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: plan
+        type: file
+    timeout_seconds: 1800
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: stage_dispatch
+
+  - id: stage_dispatch
+    type: decision
+    model: decisions/dispatch.yaml
+    inputs:
+      - id: facts
+        source:
+          pipeline_input: facts_seed
+    transitions:
+      - outcome: d_next_stage
+        to: development_entry
+      - outcome: d_plan_complete
+        to: done
+      - outcome: uncovered
+        to: rejected
+      - outcome: inconsistent_facts
+        to: rejected
+      - outcome: invalid_facts
+        to: rejected
+
+  - id: development_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: draft
+        type: file
+    timeout_seconds: 1800
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: coder
+
+  - id: coder
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: report
+        type: file
+    timeout_seconds: 1800
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: stage_review
+
+  - id: stage_review
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs:
+      - id: report
+        source:
+          state_output:
+            state: coder
+            output: report
+    outputs:
+      - id: facts
+        type: json
+        schema: schemas/facts.schema.json
+      - id: report
+        type: file
+    timeout_seconds: 1800
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: iteration_gate
+
+  - id: iteration_gate
+    type: decision
+    model: decisions/gate.yaml
+    inputs:
+      - id: facts
+        source:
+          pipeline_input: facts_seed
+    transitions:
+      - outcome: d_rework
+        to: coder
+      - outcome: d_close_stage
+        to: stage_dispatch
+      - outcome: uncovered
+        to: rejected
+      - outcome: inconsistent_facts
+        to: rejected
+      - outcome: invalid_facts
+        to: rejected
+
+  - id: done
+    type: terminal
+    result: success
+  - id: rejected
+    type: terminal
+    result: failed
+`;
+
+const DISPATCH_DIGEST_MODEL_YAML = `schema_version: 1
+facts:
+  - id: f1
+decisions:
+  - id: d_next_stage
+  - id: d_plan_complete
+relations: []
+constraints: []
+rules:
+  - id: r_next
+    when:
+      fact: f1
+      equals: true
+    decision: d_next_stage
+  - id: r_done
+    when:
+      fact: f1
+      equals: false
+    decision: d_plan_complete
+`;
+
+const GATE_DIGEST_MODEL_YAML = `schema_version: 1
+facts:
+  - id: g1
+decisions:
+  - id: d_rework
+  - id: d_close_stage
+relations: []
+constraints: []
+rules:
+  - id: r_rework
+    when:
+      fact: g1
+      equals: true
+    decision: d_rework
+  - id: r_close
+    when:
+      fact: g1
+      equals: false
+    decision: d_close_stage
+`;
+
+async function writeOrchestratedDigestBundle(
+  bundle: string,
+  pipelineYaml: string = ORCHESTRATED_DIGEST_PIPELINE_YAML,
+): Promise<void> {
+  await mkdir(join(bundle, "prompts"), { recursive: true });
+  await mkdir(join(bundle, "schemas"), { recursive: true });
+  await mkdir(join(bundle, "decisions"), { recursive: true });
+  await writeFile(join(bundle, "pipeline.yaml"), pipelineYaml);
+  await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
+  await writeFile(join(bundle, "prompts", "architect.md"), "review the implementation\n");
+  await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+  await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_DIGEST_MODEL_YAML);
+  await writeFile(join(bundle, "decisions", "gate.yaml"), GATE_DIGEST_MODEL_YAML);
+}
+
+async function orchestratedDigestAfterMutation(
+  mutate: (bundle: string) => Promise<void>,
+): Promise<{ before: DigestBundle; after: DigestBundle }> {
+  return await withTempResult(async (root) => {
+    const bundle = join(root, "bundle");
+    await writeOrchestratedDigestBundle(bundle);
+    const before = await loadDigestBundle(bundle);
+    await mutate(bundle);
+    const after = await loadDigestBundle(bundle);
+    return { before, after };
+  });
+}
+
+test("an orchestrated bundle contributes the normalized orchestration to the snapshot", async () => {
+  await withTemp(async (root) => {
+    const bundle = join(root, "bundle");
+    await writeOrchestratedDigestBundle(bundle);
+    const pipeline = await loadPipelineV2(bundle);
+    const snapshot = pipelineV2ExecutionSnapshot(pipeline) as Record<string, unknown>;
+    expect(sortedKeys(snapshot)).toEqual([
+      "entry_state",
+      "inputs",
+      "max_transitions",
+      "orchestration",
+      "outputs",
+      "schema_version",
+      "states",
+    ]);
+    expect(snapshot.orchestration).toEqual({
+      stage_templates: [{ id: "development", entry_state: "development_entry" }],
+      execution_roles: [
+        { state_id: "architect", role: "planning" },
+        { state_id: "coder", role: "stage", stage_template: "development" },
+        { state_id: "development_entry", role: "stage", stage_template: "development" },
+        { state_id: "iteration_gate", role: "stage", stage_template: "development" },
+        { state_id: "stage_dispatch", role: "control" },
+        { state_id: "stage_review", role: "stage", stage_template: "development" },
+      ],
+    });
+    // the orchestration part is id-only: no path separators anywhere
+    const orchestrationJson = JSON.stringify(snapshot.orchestration);
+    expect(orchestrationJson).not.toContain("/");
+    // and the identity keeps its exact durable form without new fields
+    expect(sortedKeys(pipelineV2RunPipelineIdentity(pipeline))).toEqual([
+      "bundle_root",
+      "entry_state",
+      "execution_snapshot_sha256",
+      "max_transitions",
+      "schema_version",
+    ]);
+  });
+});
+
+test("a bundle without orchestration keeps the snapshot free of the orchestration key", async () => {
+  await withTemp(async (root) => {
+    const bundle = join(root, "bundle");
+    await writeDigestBundle(bundle);
+    const pipeline = await loadPipelineV2(bundle);
+    const snapshot = pipelineV2ExecutionSnapshot(pipeline) as Record<string, unknown>;
+    expect("orchestration" in snapshot).toBe(false);
+    expect(pipeline.orchestration).toBeUndefined();
+  });
+});
+
+test("orchestration declaration-order permutation does not change the snapshot or digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const permuted = raw.replace(ORCHESTRATION_BLOCK, `orchestration:
+  execution_roles:
+    - state_id: iteration_gate
+      role: stage
+      stage_template: development
+    - state_id: stage_review
+      role: stage
+      stage_template: development
+    - state_id: architect
+      role: planning
+    - state_id: coder
+      role: stage
+      stage_template: development
+    - state_id: stage_dispatch
+      role: control
+    - state_id: development_entry
+      role: stage
+      stage_template: development
+  stage_templates:
+    - id: development
+      entry_state: development_entry
+`);
+    if (permuted === raw) {
+      throw new Error("the orchestration permutation replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), permuted);
+  });
+  expect(after.json).toBe(before.json);
+  expect(after.digest).toBe(before.digest);
+});
+
+test("changing a stage role (and its membership) changes the digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const changed = raw
+      .replace(
+        `    - state_id: iteration_gate
+      role: stage
+      stage_template: development
+`,
+        `    - state_id: iteration_gate
+      role: control
+`,
+      )
+      // the gate leaves the template, so its rework edge may no longer
+      // target a non-entry stage state: route it to the template entry
+      .replace(
+        `      - outcome: d_rework
+        to: coder
+      - outcome: d_close_stage`,
+        `      - outcome: d_rework
+        to: development_entry
+      - outcome: d_close_stage`,
+      );
+    if (changed === raw) {
+      throw new Error("the role mutation replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), changed);
+  });
+  expect(after.json).not.toBe(before.json);
+  expect(after.digest).not.toBe(before.digest);
+});
+
+test("changing a template entry state changes the digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const changed = raw
+      .replace(
+        `    - id: development
+      entry_state: development_entry
+`,
+        `    - id: development
+      entry_state: coder
+`,
+      )
+      .replace(
+        `    - state_id: development_entry
+      role: stage
+      stage_template: development
+`,
+        `    - state_id: development_entry
+      role: planning
+`,
+      );
+    if (changed === raw) {
+      throw new Error("the entry mutation replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), changed);
+  });
+  expect(after.json).not.toBe(before.json);
+  expect(after.digest).not.toBe(before.digest);
+});

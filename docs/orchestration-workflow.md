@@ -738,6 +738,41 @@ production rejection before auth/session. The decision evaluator, durable
 state, lifecycle, signal handling, helper transport, and the default bundle
 are untouched; wiring v2 execution into `agent-smoke` is a later increment.
 
+### Pipeline schema v2 compiled orchestration metadata (implemented, pure)
+
+A v2 pipeline may declare an optional top-level `orchestration` section —
+the single, complete and trusted compiled source for the execution role of
+every agent/decision state (`planning`, `control`, `stage`) and for stage
+templates (`stage_templates[]` with `id` and `entry_state`; `execution_roles[]`
+mapping each agent/decision state to its role, where the stage role carries
+exactly one `stage_template`). There is no default classification and no
+inference from profiles, state names, prompts, model paths or any other
+content; terminal states never carry a role. Every agent/decision state must
+be listed exactly once; template ids, template entry states and role state
+ids are unique; each template owns at least one stage state whose entry
+state exists and carries that template's stage role. Each template is one
+statically verified compiled subgraph, checked once at trusted load: every
+of its stage states is reachable from its entry state along transitions
+staying inside the template, transitions between stage states of different
+templates are forbidden, and a transition from a state outside a template
+into a stage state is allowed only into that template's entry state, while
+exits to planning/control/terminal states are allowed. Declaration order of
+the section's entries is not semantic: the resolved metadata is normalized
+(stage templates sorted by id, execution roles sorted by state_id), so
+permuting equivalent entries yields the identical execution snapshot and
+digest, while changing a role, membership or template entry moves the
+digest. The resolved snapshot carries the metadata as the optional
+deep-frozen `orchestration` field; bundles without the section compile
+exactly as before (the snapshot has no `orchestration` key). The pure
+read-only resolvers live in `orchestrator/src/pipeline_v2_orchestration.ts`
+(`compiledExecutionRoleFor`, `compiledStageTemplateFor`, typed
+`PipelineV2OrchestrationError`; provenance-gated before any content read).
+No role or template registry is added to the durable pipeline identity —
+the existing `execution_snapshot_sha256` stays the single durable anchor.
+Durable state, the coordinator, the runner and the production dispatch are
+untouched; a future controller will require this metadata before any
+schema-v7 dispatch.
+
 ### v2 run-input snapshots and host-side activation data layout (used by the production runner through the coordinator)
 
 `orchestrator/src/pipeline_v2_runtime.ts` materializes the v2 data plane on

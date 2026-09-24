@@ -37,6 +37,12 @@ import type { PipelineV2RunPipelineIdentity } from "./pipeline_v2_state.ts";
  * values, run ids, timestamps, mutable state — is never part of the
  * snapshot; profile names are (profile content and secrets are not).
  *
+ * A pipeline that declares an `orchestration` section contributes its
+ * normalized compiled metadata (execution roles, stage templates and their
+ * entry states — id-only, path-free) to the snapshot, so role/template
+ * changes move the digest; a bundle without the section keeps the exact
+ * pre-orchestration snapshot shape.
+ *
  * The snapshot JSON itself is an internal execution artifact: durable
  * state and diagnostics carry only its lowercase SHA-256 digest (domain
  * separated as `pipeline-v2-execution-snapshot\0` over the canonical JSON
@@ -243,7 +249,7 @@ function buildExecutionSnapshot(
       `pipeline bundle root ${pipeline.bundleRoot} must be an absolute canonical path`,
     );
   }
-  return {
+  const snapshot: Record<string, unknown> = {
     schema_version: pipeline.schema_version,
     entry_state: pipeline.entry_state,
     max_transitions: pipeline.max_transitions,
@@ -251,6 +257,14 @@ function buildExecutionSnapshot(
     outputs: pipeline.outputs.map((output) => snapshotRunOutput(output)),
     states: pipeline.states.map((state) => snapshotState(pipeline.bundleRoot, state)),
   };
+  // Compiled orchestration metadata joins the snapshot in its already
+  // normalized (sorted, path-free, id-only) form; a bundle without the
+  // section keeps the snapshot byte-identical to the pre-orchestration
+  // shape (the key is absent, never null or empty).
+  if (pipeline.orchestration !== undefined) {
+    snapshot.orchestration = pipeline.orchestration;
+  }
+  return snapshot;
 }
 
 /**

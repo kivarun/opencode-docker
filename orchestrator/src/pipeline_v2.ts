@@ -67,6 +67,23 @@ import {
  * assignment to a frozen result; filesystem input resolution and production
  * execution are later increments.
  *
+ * An optional `orchestration` section makes the compiled execution roles and
+ * stage templates explicit and trusted. When it is present, it is the single,
+ * complete and exact source for the role (`planning`, `control`, `stage`) of
+ * every agent/decision state and for stage-template membership and template
+ * entry states; there is no default classification and no inference from
+ * profiles, state names, prompts, model paths or any other content. Each
+ * template is one statically verified compiled subgraph (internal
+ * reachability from its entry state, no cross-template transitions, and
+ * external transitions into the template land only on its entry state).
+ * Declaration order of the section's entries is not semantic, so the
+ * resolved metadata is normalized (templates sorted by id, roles sorted by
+ * state_id); permuting equivalent entries yields the identical snapshot and
+ * digest. Bundles without the section compile exactly as before. The pure
+ * read-only resolvers for the compiled metadata live in
+ * `pipeline_v2_orchestration.ts`; durable state, the coordinator and the
+ * production dispatch are untouched by this metadata.
+ *
  * The activation completion envelope for v2 is orchestrator-owned; work
  * products are defined only by the declared outputs — there is no
  * free-form artifact path list.
@@ -241,6 +258,37 @@ export interface PipelineV2Spec {
   inputs: PipelineV2InputSpec[];
   outputs: PipelineV2OutputSpec[];
   states: PipelineV2StateSpec[];
+  /** Trusted, explicit compiled orchestration metadata; absent when undeclared. */
+  orchestration?: PipelineV2OrchestrationSpec;
+}
+
+/**
+ * The exact compiled execution roles of schema v2 pipelines that declare an
+ * `orchestration` section. The section is the single, complete and trusted
+ * source for the role of every agent/decision state and for stage-template
+ * membership; there is no default classification and no inference from
+ * profiles, state names, prompts, model paths or any other content.
+ */
+export type PipelineV2ExecutionRoleName = "planning" | "control" | "stage";
+
+export const PIPELINE_V2_EXECUTION_ROLE_NAMES: readonly PipelineV2ExecutionRoleName[] = [
+  "planning",
+  "control",
+  "stage",
+];
+
+export type PipelineV2ExecutionRoleSpec =
+  | { readonly state_id: string; readonly role: "planning" | "control" }
+  | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
+
+export interface PipelineV2StageTemplateSpec {
+  readonly id: string;
+  readonly entry_state: string;
+}
+
+export interface PipelineV2OrchestrationSpec {
+  stage_templates: PipelineV2StageTemplateSpec[];
+  execution_roles: PipelineV2ExecutionRoleSpec[];
 }
 
 export interface ResolvedV2RunInput {
@@ -326,6 +374,27 @@ export type ResolvedV2State =
   | ResolvedV2DecisionState
   | TerminalStateSpec;
 
+/**
+ * Orchestration metadata as resolved: the exact, normalized compiled source
+ * of execution roles and stage templates. Declaration order is not
+ * semantic, so both lists are sorted (stage templates by `id`, execution
+ * roles by `state_id`); permuting equivalent entries yields the identical
+ * resolved metadata, execution snapshot and digest.
+ */
+export interface ResolvedPipelineV2StageTemplate {
+  readonly id: string;
+  readonly entry_state: string;
+}
+
+export type ResolvedPipelineV2ExecutionRole =
+  | { readonly state_id: string; readonly role: "planning" | "control" }
+  | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
+
+export interface ResolvedPipelineV2Orchestration {
+  readonly stage_templates: readonly ResolvedPipelineV2StageTemplate[];
+  readonly execution_roles: readonly ResolvedPipelineV2ExecutionRole[];
+}
+
 export interface ResolvedPipelineV2 {
   readonly schema_version: 2;
   readonly bundleRoot: string;
@@ -334,6 +403,8 @@ export interface ResolvedPipelineV2 {
   readonly inputs: readonly ResolvedV2RunInput[];
   readonly outputs: readonly ResolvedV2RunOutput[];
   readonly states: readonly ResolvedV2State[];
+  /** Present exactly when the bundle declares the orchestration section. */
+  readonly orchestration?: ResolvedPipelineV2Orchestration;
 }
 
 function deepFreeze<T>(value: T): T {
@@ -463,6 +534,284 @@ function parseV2Output(raw: unknown, index: number): PipelineV2OutputSpecDraft {
     required: entry.required,
     source: parsePortSource(entry.source, `pipeline output ${JSON.stringify(id)}`),
   };
+}
+
+/** Code-unit string sort; declaration order of orchestration entries is not semantic. */
+function sortById<T>(entries: readonly T[], key: (entry: T) => string): T[] {
+  return [...entries].sort((left, right) => {
+    const a = key(left);
+    const b = key(right);
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+}
+
+/**
+ * Parse the optional `orchestration` section: the single, complete and
+ * trusted source of compiled execution roles and stage templates. Exact
+ * fields at every level; safe ids from the shared v2 grammar; both lists
+ * non-empty; template ids, template entry states and role state ids
+ * unique. Declaration order is not semantic, so the parsed result is
+ * normalized (templates sorted by id, roles sorted by state_id); the
+ * parsed input object is never mutated. Role semantics (which state may
+ * carry which role) and template topology are checked later, once the
+ * states are known.
+ */
+function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
+  const obj = expectObject(raw, "pipeline orchestration");
+  expectExactKeys(obj, ["stage_templates", "execution_roles"], "pipeline orchestration");
+
+  const templatesRaw = expectArray(obj.stage_templates, "pipeline orchestration stage_templates");
+  if (templatesRaw.length === 0) {
+    throw new PipelineError("pipeline orchestration stage_templates must not be empty");
+  }
+  const templates: PipelineV2StageTemplateSpec[] = [];
+  const templateIds = new Set<string>();
+  const templateEntries = new Set<string>();
+  for (let index = 0; index < templatesRaw.length; index++) {
+    const what = `pipeline orchestration stage_templates ${index}`;
+    const template = expectObject(templatesRaw[index], what);
+    expectExactKeys(template, ["id", "entry_state"], what);
+    const id = validateSafeId(template.id, `${what} id`);
+    if (templateIds.has(id)) {
+      throw new PipelineError(
+        `pipeline orchestration declares stage template ${JSON.stringify(id)} more than once`,
+      );
+    }
+    templateIds.add(id);
+    const templateEntry = validateSafeId(template.entry_state, `${what} entry_state`);
+    if (templateEntries.has(templateEntry)) {
+      throw new PipelineError(
+        `pipeline orchestration declares stage template entry_state ${JSON.stringify(templateEntry)} more than once`,
+      );
+    }
+    templateEntries.add(templateEntry);
+    templates.push({ id, entry_state: templateEntry });
+  }
+
+  const rolesRaw = expectArray(obj.execution_roles, "pipeline orchestration execution_roles");
+  if (rolesRaw.length === 0) {
+    throw new PipelineError("pipeline orchestration execution_roles must not be empty");
+  }
+  const roles: PipelineV2ExecutionRoleSpec[] = [];
+  const roleStateIds = new Set<string>();
+  for (let index = 0; index < rolesRaw.length; index++) {
+    const what = `pipeline orchestration execution_roles ${index}`;
+    const entry = expectObject(rolesRaw[index], what);
+    if (
+      typeof entry.role !== "string" ||
+      !(PIPELINE_V2_EXECUTION_ROLE_NAMES as readonly string[]).includes(entry.role)
+    ) {
+      throw new PipelineError(
+        `${what} role must be one of ${JSON.stringify(PIPELINE_V2_EXECUTION_ROLE_NAMES)}, got ${JSON.stringify(entry.role)}`,
+      );
+    }
+    const role = entry.role as PipelineV2ExecutionRoleName;
+    expectExactKeys(
+      entry,
+      role === "stage" ? ["state_id", "role", "stage_template"] : ["state_id", "role"],
+      what,
+    );
+    const stateId = validateSafeId(entry.state_id, `${what} state_id`);
+    if (roleStateIds.has(stateId)) {
+      throw new PipelineError(
+        `pipeline orchestration declares an execution role for state ${JSON.stringify(stateId)} more than once`,
+      );
+    }
+    roleStateIds.add(stateId);
+    roles.push(
+      role === "stage"
+        ? {
+            state_id: stateId,
+            role,
+            stage_template: validateSafeId(entry.stage_template, `${what} stage_template`),
+          }
+        : { state_id: stateId, role },
+    );
+  }
+  return {
+    stage_templates: sortById(templates, (entry) => entry.id),
+    execution_roles: sortById(roles, (entry) => entry.state_id),
+  };
+}
+
+/**
+ * Structural orchestration invariants, checked once at trusted compile time
+ * against the parsed states: every role names a declared non-terminal state
+ * of a matching kind, every agent/decision state is listed exactly once,
+ * every declared template owns at least one stage state, and every template
+ * entry state exists, carries the stage role of exactly that template.
+ * Compiled-state compatibility beyond these rules is not classified here.
+ */
+function checkOrchestrationStructure(
+  states: readonly { id: string; type: string }[],
+  orchestration: PipelineV2OrchestrationSpec,
+): void {
+  const stateTypes = new Map<string, string>();
+  for (const state of states) {
+    stateTypes.set(state.id, state.type);
+  }
+  const roleOfState = new Map<string, PipelineV2ExecutionRoleSpec>();
+  for (const role of orchestration.execution_roles) {
+    const stateType = stateTypes.get(role.state_id);
+    if (stateType === undefined) {
+      throw new PipelineError(
+        `pipeline orchestration declares an execution role for unknown state ${JSON.stringify(role.state_id)}`,
+      );
+    }
+    if (stateType === "terminal") {
+      throw new PipelineError(
+        `pipeline orchestration declares an execution role for terminal state ${JSON.stringify(role.state_id)}; terminal states carry no execution role`,
+      );
+    }
+    if (role.role === "planning" && stateType !== "agent") {
+      throw new PipelineError(
+        `pipeline orchestration declares role "planning" for ${stateType} state ${JSON.stringify(role.state_id)}; planning is an agent-state role`,
+      );
+    }
+    if (role.role === "control" && stateType !== "decision") {
+      throw new PipelineError(
+        `pipeline orchestration declares role "control" for ${stateType} state ${JSON.stringify(role.state_id)}; control is a decision-state role`,
+      );
+    }
+    roleOfState.set(role.state_id, role);
+  }
+  for (const state of states) {
+    if ((state.type === "agent" || state.type === "decision") && !roleOfState.has(state.id)) {
+      throw new PipelineError(
+        `pipeline orchestration does not declare an execution role for ${state.type} state ${JSON.stringify(state.id)}`,
+      );
+    }
+  }
+  const templateIds = new Set(orchestration.stage_templates.map((template) => template.id));
+  const stageCountByTemplate = new Map<string, number>();
+  for (const role of orchestration.execution_roles) {
+    if (role.role === "stage" && !templateIds.has(role.stage_template)) {
+      throw new PipelineError(
+        `pipeline orchestration declares stage role for state ${JSON.stringify(role.state_id)} with unknown stage template ${JSON.stringify(role.stage_template)}`,
+      );
+    }
+    if (role.role === "stage") {
+      stageCountByTemplate.set(role.stage_template, (stageCountByTemplate.get(role.stage_template) ?? 0) + 1);
+    }
+  }
+  for (const template of orchestration.stage_templates) {
+    if ((stageCountByTemplate.get(template.id) ?? 0) === 0) {
+      throw new PipelineError(
+        `stage template ${JSON.stringify(template.id)} declares no stage states`,
+      );
+    }
+    if (!stateTypes.has(template.entry_state)) {
+      throw new PipelineError(
+        `stage template ${JSON.stringify(template.id)} entry_state ${JSON.stringify(template.entry_state)} does not name a declared state`,
+      );
+    }
+    const entryRole = roleOfState.get(template.entry_state);
+    if (entryRole === undefined) {
+      throw new PipelineError(
+        `stage template ${JSON.stringify(template.id)} entry_state ${JSON.stringify(template.entry_state)} has no declared execution role`,
+      );
+    }
+    if (entryRole.role !== "stage") {
+      throw new PipelineError(
+        `stage template ${JSON.stringify(template.id)} entry_state ${JSON.stringify(template.entry_state)} must carry the stage role, got ${JSON.stringify(entryRole.role)}`,
+      );
+    }
+    if (entryRole.stage_template !== template.id) {
+      throw new PipelineError(
+        `stage template ${JSON.stringify(template.id)} entry_state ${JSON.stringify(template.entry_state)} belongs to stage template ${JSON.stringify(entryRole.stage_template)}`,
+      );
+    }
+  }
+}
+
+/**
+ * Static template topology, checked once at trusted compile time. Each
+ * template is one statically verified compiled subgraph: every of its stage
+ * states is reachable from its entry state along transitions that stay
+ * inside the template; a transition between stage states of different
+ * templates is forbidden; a transition from a state outside the template
+ * into a stage state is allowed only into that template's entry state; and
+ * a transition out of a template into a planning/control/terminal state is
+ * allowed. The rules govern graph transitions; the run's initial cursor
+ * position and general reachability stay governed by `checkGraphShape`.
+ */
+function checkOrchestrationTopology(
+  states: readonly { id: string; type: string; transitions: readonly { outcome: string; to: string }[] }[],
+  orchestration: PipelineV2OrchestrationSpec,
+): void {
+  const stageTemplateOf = new Map<string, string>();
+  for (const role of orchestration.execution_roles) {
+    if (role.role === "stage") {
+      stageTemplateOf.set(role.state_id, role.stage_template);
+    }
+  }
+  const stageStatesByTemplate = new Map<string, Set<string>>();
+  for (const template of orchestration.stage_templates) {
+    stageStatesByTemplate.set(template.id, new Set());
+  }
+  for (const [stateId, templateId] of stageTemplateOf) {
+    stageStatesByTemplate.get(templateId)?.add(stateId);
+  }
+
+  // A transition between stage states of different templates is forbidden;
+  // internal transitions stay; exits to planning/control/terminal states are
+  // allowed.
+  for (const state of states) {
+    const fromTemplate = stageTemplateOf.get(state.id);
+    for (const transition of state.transitions) {
+      const toTemplate = stageTemplateOf.get(transition.to);
+      if (fromTemplate === undefined && toTemplate === undefined) {
+        continue;
+      }
+      if (fromTemplate === undefined) {
+        const entryState = orchestration.stage_templates.find(
+          (template) => template.id === toTemplate,
+        )?.entry_state;
+        if (transition.to !== entryState) {
+          throw new PipelineError(
+            `transition of non-stage state ${JSON.stringify(state.id)} targets stage state ${JSON.stringify(transition.to)}, which is not the entry state of stage template ${JSON.stringify(toTemplate)}`,
+          );
+        }
+        continue;
+      }
+      if (toTemplate !== undefined && toTemplate !== fromTemplate) {
+        throw new PipelineError(
+          `transition of stage state ${JSON.stringify(state.id)} (stage template ${JSON.stringify(fromTemplate)}) targets stage state ${JSON.stringify(transition.to)} of foreign stage template ${JSON.stringify(toTemplate)}`,
+        );
+      }
+    }
+  }
+
+  // Every stage state of a template is reachable from its entry state along
+  // transitions that remain inside the template.
+  for (const template of orchestration.stage_templates) {
+    const stageStates = stageStatesByTemplate.get(template.id);
+    if (stageStates === undefined || stageStates.size === 0) {
+      continue;
+    }
+    const reachable = new Set<string>([template.entry_state]);
+    const queue: string[] = [template.entry_state];
+    while (queue.length > 0) {
+      const current = queue.pop() ?? "";
+      const state = states.find((entry) => entry.id === current);
+      if (state === undefined) {
+        continue;
+      }
+      for (const transition of state.transitions) {
+        if (stageTemplateOf.get(transition.to) === template.id && !reachable.has(transition.to)) {
+          reachable.add(transition.to);
+          queue.push(transition.to);
+        }
+      }
+    }
+    for (const stageState of stageStates) {
+      if (!reachable.has(stageState)) {
+        throw new PipelineError(
+          `stage state ${JSON.stringify(stageState)} is not reachable from the entry state ${JSON.stringify(template.entry_state)} of stage template ${JSON.stringify(template.id)}`,
+        );
+      }
+    }
+  }
 }
 
 /**
@@ -623,9 +972,12 @@ function parseV2DecisionState(raw: Record<string, unknown>): PipelineV2DecisionS
  */
 export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
   const obj = expectObject(parsed, "pipeline");
+  const hasOrchestration = "orchestration" in obj;
   expectExactKeys(
     obj,
-    ["schema_version", "entry_state", "max_transitions", "inputs", "outputs", "states"],
+    hasOrchestration
+      ? ["schema_version", "entry_state", "max_transitions", "inputs", "outputs", "states", "orchestration"]
+      : ["schema_version", "entry_state", "max_transitions", "inputs", "outputs", "states"],
     "pipeline",
   );
   if (obj.schema_version !== PIPELINE_SCHEMA_VERSION_V2) {
@@ -635,6 +987,7 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
   }
   const entryState = validateSafeId(obj.entry_state, "pipeline entry_state");
   const maxTransitions = expectPositiveSafeInteger(obj.max_transitions, "pipeline max_transitions");
+  const orchestration = hasOrchestration ? parseOrchestration(obj.orchestration) : undefined;
 
   const inputsRaw = expectArray(obj.inputs, "pipeline inputs");
   const inputs: PipelineV2InputSpec[] = [];
@@ -693,6 +1046,10 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
     transitions: state.type === "terminal" ? [] : state.transitions,
   }));
   checkGraphShape(entryState, graphStates);
+  if (orchestration !== undefined) {
+    checkOrchestrationStructure(states, orchestration);
+    checkOrchestrationTopology(graphStates, orchestration);
+  }
 
   // Reference resolution and contract derivation. Pipeline inputs and agent
   // outputs are the only places that declare a type or a JSON schema; agent
@@ -810,6 +1167,7 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
     inputs,
     outputs: resolvedOutputs,
     states: resolvedStates,
+    ...(orchestration !== undefined ? { orchestration } : {}),
   };
 }
 
@@ -1209,6 +1567,9 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
     inputs: Object.freeze(inputs),
     outputs: Object.freeze(outputs),
     states: Object.freeze(resolvedStates),
+    ...(spec.orchestration !== undefined
+      ? { orchestration: deepFreeze(spec.orchestration) as ResolvedPipelineV2Orchestration }
+      : {}),
   });
   resolvedV2SnapshotProvenance.add(snapshot);
   return snapshot;
