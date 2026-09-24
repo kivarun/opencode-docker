@@ -496,6 +496,10 @@ function rejectCompile(yaml: string, message: RegExp | string): void {
   expect(() => compilePipelineV2Spec(Bun.YAML.parse(yaml))).toThrow(message);
 }
 
+function acceptCompile(yaml: string): void {
+  expect(() => compilePipelineV2Spec(Bun.YAML.parse(yaml))).not.toThrow();
+}
+
 const NORMALIZED_ORCHESTRATION: ResolvedPipelineV2Orchestration = {
   stage_templates: [{ id: "development", entry_state: "development_entry" }],
   execution_roles: [
@@ -823,8 +827,25 @@ test("6. exact-field rejection at every new level", () => {
   );
 });
 
-test("7. empty arrays are rejected", () => {
-  rejectCompile(
+test("7. empty stage_templates with planning/control-only roles compile; empty roles fail coverage", () => {
+  acceptCompile(`${CANONICAL_HEADER}${CANONICAL_STATES}`
+    .replace("states:", `orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: stage_dispatch
+      role: control
+    - state_id: development_entry
+      role: planning
+    - state_id: coder
+      role: planning
+    - state_id: stage_review
+      role: planning
+    - state_id: iteration_gate
+      role: control
+states:`));
+  acceptCompile(
     withOrchestrationSection(`orchestration:
   stage_templates: []
   execution_roles:
@@ -833,28 +854,21 @@ test("7. empty arrays are rejected", () => {
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
-      role: stage
-      stage_template: development
+      role: planning
     - state_id: coder
-      role: stage
-      stage_template: development
+      role: planning
     - state_id: stage_review
-      role: stage
-      stage_template: development
+      role: planning
     - state_id: iteration_gate
-      role: stage
-      stage_template: development
+      role: control
 `),
-    /pipeline orchestration stage_templates must not be empty/,
   );
   rejectCompile(
     withOrchestrationSection(`orchestration:
-  stage_templates:
-    - id: development
-      entry_state: development_entry
+  stage_templates: []
   execution_roles: []
 `),
-    /pipeline orchestration execution_roles must not be empty/,
+    /pipeline orchestration does not declare an execution role for agent state "architect"/,
   );
 });
 

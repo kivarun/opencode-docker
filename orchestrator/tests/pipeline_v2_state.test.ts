@@ -119,7 +119,7 @@ function startAgent(
   stateId: string,
   sessions?: { execution?: string; tool?: string } | "none",
 ): void {
-  driver.apply({ kind: "start_agent_execution", stateId, profile: "coder" });
+  driver.apply({ kind: "start_agent_execution", stateId, profile: "coder", executionRole: "planning" });
   driver.apply({ kind: "agent_data_prepared" });
   if (sessions === "none") {
     return;
@@ -167,7 +167,7 @@ function playSuccessRun(driver: Driver): void {
   startAgent(driver, "implement", { execution: "sess-1" });
   acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
   commitTransition(driver, "implement", "completed", "check", 1);
-  driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+  driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
   driver.apply({
     kind: "decision_evaluated",
     result: {
@@ -199,7 +199,7 @@ function playUpToTerminal(driver: Driver): void {
   startAgent(driver, "implement", { execution: "sess-1" });
   acceptOutputs(driver, [{ id: "plan", digest: hex("d") }]);
   commitTransition(driver, "implement", "completed", "check", 1);
-  driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+  driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
   driver.apply({
     kind: "decision_evaluated",
     result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
@@ -293,7 +293,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver();
     playSuccessRun(driver);
     const state = driver.current as PipelineV2RunState;
-    expect(state.schema_version).toBe(6);
+    expect(state.schema_version).toBe(7);
     expect(state.revision).toBe(23);
     expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
@@ -314,7 +314,7 @@ describe("pipeline v2 run state schema v6", () => {
       { index: 0, from: "check", outcome: "approved", to: "ship", execution_index: 2 },
       { index: 0, from: "ship", outcome: "completed", to: "done", execution_index: 3 },
     ]);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(6);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(7);
   });
 
   test("every accepted command grows the revision by exactly one and refreshes updated_at", () => {
@@ -326,7 +326,7 @@ describe("pipeline v2 run state schema v6", () => {
     expect(state.updated_at).toBe(tick(0).toISOString());
     expect(state.started_at).toBe(tick(0).toISOString());
     revision += 1;
-    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     expect((driver.current as PipelineV2RunState).revision).toBe(revision);
     expect((driver.current as PipelineV2RunState).updated_at).toBe(tick(1).toISOString());
     revision += 1;
@@ -474,7 +474,7 @@ describe("pipeline v2 run state schema v6", () => {
     for (const { result, outcome } of cases) {
       const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
       driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
-      driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+      driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
       driver.apply({ kind: "decision_evaluated", result });
       driver.apply({
         kind: "transition_committed",
@@ -497,7 +497,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("rejects a decision transition whose outcome does not match the recorded result", () => {
     const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
     driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({
       kind: "decision_evaluated",
       result: {
@@ -556,7 +556,7 @@ describe("pipeline v2 run state schema v6", () => {
       "transition_committed step.transition_index must be a non-negative safe integer",
     );
     commitTransition(driver, "implement", "completed", "check", 1);
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({
       kind: "decision_evaluated",
       result: {
@@ -590,7 +590,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("a selected decision record must carry outcome equal to decision", () => {
     const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
     driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.reject(
       {
         kind: "decision_evaluated",
@@ -633,7 +633,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("the loader rejects a persisted selected record whose outcome differs from its decision", () => {
     const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
     driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({
       kind: "decision_evaluated",
       result: {
@@ -673,7 +673,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("rejects a transition before the decision result is recorded", () => {
     const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
     driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.reject(
       {
         kind: "transition_committed",
@@ -698,7 +698,7 @@ describe("pipeline v2 run state schema v6", () => {
       'committing a transition requires the agent execution to be cleaned up, execution 1 has phase "failed"',
     );
     driver.reject(
-      { kind: "start_agent_execution", stateId: "implement", profile: "coder" },
+      { kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" },
       "a new execution requires the previous execution's transition to be committed",
     );
     driver.apply({ kind: "run_failed", reason: "worker_failed" });
@@ -711,10 +711,10 @@ describe("pipeline v2 run state schema v6", () => {
     const identity = { ...IDENTITY, entry_state: "check", max_transitions: 2 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({ kind: "decision_failed", reason: "decision_input_invalid" });
     driver.reject(
-      { kind: "start_agent_execution", stateId: "check", profile: "coder" },
+      { kind: "start_agent_execution", stateId: "check", profile: "coder", executionRole: "planning" },
       "a new execution requires the previous execution's transition to be committed",
     );
     driver.apply({ kind: "run_failed", reason: "decision_input_invalid" });
@@ -762,14 +762,14 @@ describe("pipeline v2 run state schema v6", () => {
     startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({
       kind: "decision_evaluated",
       result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
     });
     commitTransition(driver, "check", "uncovered", "ship", 2);
     driver.reject(
-      { kind: "start_agent_execution", stateId: "ship", profile: "coder" },
+      { kind: "start_agent_execution", stateId: "ship", profile: "coder", executionRole: "planning" },
       "starting execution 3 would exceed the pipeline transition budget 2 (2 transitions already committed)",
     );
     driver.reject(
@@ -808,7 +808,7 @@ describe("pipeline v2 run state schema v6", () => {
     startAgent(awaitingCommit, "implement", { execution: "sess-1" });
     acceptOutputs(awaitingCommit, []);
     commitTransition(awaitingCommit, "implement", "completed", "check", 1);
-    awaitingCommit.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    awaitingCommit.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     awaitingCommit.apply({
       kind: "decision_evaluated",
       result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
@@ -924,7 +924,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("rejects forbidden fields in every agent execution phase", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     const started = driver.current as PipelineV2RunState;
     driver.apply({ kind: "agent_data_prepared" });
     const dataPrepared = driver.current as PipelineV2RunState;
@@ -1061,7 +1061,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("rejects forbidden fields in every decision execution phase", () => {
     const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
     driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     const evaluating = driver.current as PipelineV2RunState;
     driver.apply({
       kind: "decision_evaluated",
@@ -1112,7 +1112,7 @@ describe("pipeline v2 run state schema v6", () => {
     startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({
       kind: "decision_evaluated",
       result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
@@ -1219,7 +1219,7 @@ describe("pipeline v2 run state schema v6", () => {
     // slots are not_required and the failure reason stays a normal one.
     const noSessionDriver = createDriver(identity, []);
     noSessionDriver.apply(createRun(identity, []));
-    noSessionDriver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    noSessionDriver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     noSessionDriver.apply({ kind: "agent_data_prepared" });
     noSessionDriver.apply({
       kind: "agent_failed",
@@ -1362,34 +1362,34 @@ describe("pipeline v2 run state schema v6", () => {
 
   test("parse rejects schema versions 1, 2, 3, 4 and 5 without any migration", () => {
     expect(() => parsePipelineV2RunState('{"schema_version":1}')).toThrow(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v1 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":2}')).toThrow(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 6 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 2 })).toThrow(
-      "not a pipeline v2 run state (schema version 6 is the supported contract; no v2 migration exists)",
+      "not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":3}')).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 3 })).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":4}')).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 4 })).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":5}')).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 5 })).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
     );
-    expect(() => parsePipelineV2RunState('{"schema_version":7}')).toThrow(
-      "pipeline v2 run state has schema_version 7, expected 6",
+    expect(() => parsePipelineV2RunState('{"schema_version":8}')).toThrow(
+      "pipeline v2 run state has schema_version 8, expected 7",
     );
   });
 
@@ -1415,6 +1415,7 @@ describe("pipeline v2 run state schema v6", () => {
           state_id: "implement",
           attempt: 1,
           profile: "coder",
+          execution_role: "planning",
           phase: "session_created",
           session_id: "sess-1",
         },
@@ -1423,7 +1424,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v3Document);
     expect(() => parsePipelineV2RunState(v3Document)).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v3Document);
     await rm(root, { recursive: true, force: true });
@@ -1449,7 +1450,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v4Document);
     expect(() => parsePipelineV2RunState(v4Document)).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v4Document);
     await rm(root, { recursive: true, force: true });
@@ -1482,7 +1483,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v5Document);
     expect(() => parsePipelineV2RunState(v5Document)).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v5Document);
     await rm(root, { recursive: true, force: true });
@@ -1557,6 +1558,7 @@ describe("pipeline v2 run state schema v6", () => {
       kind: "start_decision_execution",
       stateId: "check",
       inputDigest: hex("e"),
+      executionRole: "control",
     };
     const commandSnapshot = JSON.parse(JSON.stringify(command));
     const next = reducePipelineV2RunCommand(writable as unknown as PipelineV2RunState, command, tick(40));
@@ -1618,7 +1620,7 @@ describe("pipeline v2 run state schema v6", () => {
     const empty = createDriver();
     empty.reject({ kind: "agent_data_prepared" }, "no pipeline v2 run state exists yet");
     empty.reject(
-      { kind: "start_agent_execution", stateId: "implement", profile: "coder" },
+      { kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" },
       "no pipeline v2 run state exists yet",
     );
   });
@@ -1630,7 +1632,7 @@ describe("pipeline v2 run state schema v6", () => {
     startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.reject(
       { kind: "agent_data_prepared" },
       "agent_data_prepared applies to an agent execution, but execution 2 is a decision execution",
@@ -1646,7 +1648,7 @@ describe("pipeline v2 run state schema v6", () => {
 
     const agentDriver = createDriver();
     agentDriver.apply(createRun());
-    agentDriver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    agentDriver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     agentDriver.apply({ kind: "agent_data_prepared" });
     agentDriver.reject(
       { kind: "decision_evaluated", result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] } },
@@ -1665,7 +1667,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("rejects execution failure reasons that cannot happen to that execution type", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     driver.apply({ kind: "agent_data_prepared" });
     driver.reject(
       { kind: "agent_failed", reason: "decision_input_invalid", sessionCleanup: { execution: "not_required", tool: "not_required" } },
@@ -1683,7 +1685,7 @@ describe("pipeline v2 run state schema v6", () => {
     const identity = { ...IDENTITY, entry_state: "check", max_transitions: 1 };
     const decisionDriver = createDriver(identity, []);
     decisionDriver.apply(createRun(identity, []));
-    decisionDriver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    decisionDriver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     decisionDriver.reject(
       { kind: "decision_failed", reason: "worker_failed" },
       "decision_failed reason must be one of",
@@ -1719,7 +1721,7 @@ describe("pipeline v2 run state schema v6", () => {
     startAgent(driver, "implement", { execution: "sess-1" });
     acceptOutputs(driver, []);
     commitTransition(driver, "implement", "completed", "check", 1);
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({
       kind: "decision_evaluated",
       result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
@@ -1734,7 +1736,7 @@ describe("pipeline v2 run state schema v6", () => {
   test("validates decision record shapes fail-closed", () => {
     const driver = createDriver(DECISION_ENTRY_IDENTITY, []);
     driver.apply(createRun(DECISION_ENTRY_IDENTITY, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.reject(
       {
         kind: "decision_evaluated",
@@ -1870,7 +1872,7 @@ describe("pipeline v2 run state schema v6", () => {
     );
 
     driver.apply(createRun());
-    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     driver.apply({ kind: "agent_data_prepared" });
     driver.apply({ kind: "agent_execution_session_created", sessionId: "sess-1" });
     driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-1" });
@@ -2128,7 +2130,7 @@ describe("pipeline v2 run state loader: the unbound execution is bound to the re
     driver.apply(createRun(identity, []));
     driver.apply(runWaiting());
     driver.apply(waitResponded());
-    driver.apply({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" });
     const state = driver.current as PipelineV2RunState;
     expect(state.status).toBe("active");
     expect(state.cursor).toEqual({ current_state: "coder", transition_count: 0 });
@@ -2144,7 +2146,7 @@ describe("pipeline v2 run state loader: the unbound execution is bound to the re
     driver.apply(createRun(identity, []));
     driver.apply(runWaiting());
     driver.apply(waitResponded());
-    driver.apply({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" });
     const state = driver.current as PipelineV2RunState;
     const { draft, snapshot } = forgeUnboundStateId(state, "elsewhere");
     let message = "";
@@ -2165,7 +2167,7 @@ describe("pipeline v2 run state loader: the unbound execution is bound to the re
   test("a forged unbound agent state id is rejected without any wait (entry cursor)", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     const state = driver.current as PipelineV2RunState;
     const { draft } = forgeUnboundStateId(state, "elsewhere");
     let message = "";
@@ -2184,7 +2186,7 @@ describe("pipeline v2 run state loader: the unbound execution is bound to the re
     const identity = { ...IDENTITY, entry_state: "check", max_transitions: 1 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     const state = driver.current as PipelineV2RunState;
     const { draft } = forgeUnboundStateId(state, "elsewhere");
     let message = "";
@@ -2227,7 +2229,7 @@ describe("pipeline v2 run state loader: the unbound execution is bound to the re
     // in-flight
     const inFlight = createDriver();
     inFlight.apply(createRun());
-    inFlight.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    inFlight.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     requireLoadableSnapshot(inFlight.current as PipelineV2RunState);
 
     // settled but unbound (cleanup recorded, transition not committed yet)
@@ -2386,7 +2388,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
     const identity = { ...IDENTITY, entry_state: "check", max_transitions: 2 };
     const driver = loadableDriver(createDriver(identity, []));
     driver.apply(createRun(identity, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.apply({
       kind: "decision_evaluated",
       result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
@@ -2709,7 +2711,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
   test("run_waiting rejects an unfinished agent execution in every in-flight phase", () => {
     const driver = createDriver();
     driver.apply(createRun());
-    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder" });
+    driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     driver.reject(
       runWaiting({ stateId: "implement" }),
       'entering the wait requires execution 1 to be finished, it has phase "started"',
@@ -2740,7 +2742,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
     const identity = { ...IDENTITY, entry_state: "check", max_transitions: 2 };
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
-    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     driver.reject(
       runWaiting({ stateId: "check" }),
       'entering the wait requires execution 1 to be finished, it has phase "evaluating"',
@@ -2802,15 +2804,15 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
     );
   });
 
-  test("while waiting only wait_response_recorded advances the run; every other command is rejected", () => {
+  test("while waiting only the wait response and the durable intervention records advance the run; every other command is rejected", () => {
     const driver = createDriver(WAIT_IDENTITY, []);
     driver.apply(createRun(WAIT_IDENTITY, []));
     driver.apply(runWaiting());
     const waitingMessage =
-      "the run is waiting for an explicit user response; only wait_response_recorded advances a waiting run";
+      "the run is waiting for an explicit user response; only the wait response and the durable intervention records advance a waiting run";
     driver.reject(runWaiting(), waitingMessage);
-    driver.reject({ kind: "start_agent_execution", stateId: "architect", profile: "coder" }, waitingMessage);
-    driver.reject({ kind: "start_decision_execution", stateId: "architect", inputDigest: hex("e") }, waitingMessage);
+    driver.reject({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" }, waitingMessage);
+    driver.reject({ kind: "start_decision_execution", stateId: "architect", inputDigest: hex("e"), executionRole: "control" }, waitingMessage);
     driver.reject({ kind: "agent_data_prepared" }, waitingMessage);
     driver.reject(
       {
@@ -3138,6 +3140,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
         state_id: "architect",
         attempt: 1,
         profile: "coder",
+        execution_role: "planning",
         phase: "cleanup_completed",
         execution_session_id: "sess-2",
         tool_session_id: "tool-2",
@@ -3253,6 +3256,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
         state_id: "architect",
         attempt: 1,
         profile: "coder",
+        execution_role: "planning",
         phase: "cleanup_completed",
         execution_session_id: "sess-1",
         tool_session_id: "tool-1",
@@ -3327,6 +3331,1127 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
     const respondedText = JSON.stringify(responded);
     for (const canary of ["user answer text", '{"intent":"revise_task"}', "TASK.md"]) {
       expect(respondedText).not.toContain(canary);
+    }
+  });
+});
+
+describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and ledgers", () => {
+  const STAGE_IDENTITY: PipelineV2RunPipelineIdentity = {
+    ...IDENTITY,
+    entry_state: "architect",
+    max_transitions: 12,
+  };
+  const PLAN_R1 = hex("1");
+  const PLAN_R2 = hex("2");
+  const INTENT_GRANT = hex("3");
+  const INTENT_REVISE = hex("4");
+
+  function planAccepted(
+    overrides: Partial<{ planRevision: number; planSha256: string; originExecution: number }> = {},
+  ): PipelineV2RunCommand {
+    return { kind: "plan_revision_accepted", planRevision: 1, planSha256: PLAN_R1, originExecution: 1, ...overrides };
+  }
+
+  function genOpened(
+    overrides: Partial<{
+      stageId: string;
+      stagePosition: number;
+      templateId: string;
+      planSha256: string;
+      initialBudget: number;
+      transitionCount: number;
+    }> = {},
+  ): PipelineV2RunCommand {
+    return {
+      kind: "stage_generation_opened",
+      stageId: "development",
+      stagePosition: 1,
+      templateId: "development",
+      planSha256: PLAN_R1,
+      initialBudget: 2,
+      transitionCount: 2,
+      ...overrides,
+    };
+  }
+
+  function iterOpened(
+    overrides: Partial<{ generationIndex: number; iterationIndex: number; transitionCount: number }> = {},
+  ): PipelineV2RunCommand {
+    return {
+      kind: "stage_iteration_opened",
+      generationIndex: 1,
+      iterationIndex: 1,
+      transitionCount: 2,
+      ...overrides,
+    };
+  }
+
+  function iterClosed(
+    overrides: Partial<{
+      generationIndex: number;
+      iterationIndex: number;
+      by: "grant" | "replanned" | "normal_close" | "exhausted";
+      waitIndex: number | undefined;
+    }> = {},
+  ): PipelineV2RunCommand {
+    return {
+      kind: "stage_iteration_closed",
+      generationIndex: 1,
+      iterationIndex: 1,
+      by: "grant",
+      waitIndex: 1,
+      ...overrides,
+    };
+  }
+
+  function genClosed(
+    overrides: Partial<{ generationIndex: number; by: "next_stage" | "final_stage" | "replanned" }> = {},
+  ): PipelineV2RunCommand {
+    return { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage", ...overrides };
+  }
+
+  function grantRecorded(
+    overrides: Partial<{
+      generationIndex: number;
+      waitIndex: number;
+      intentSha256: string;
+      additionalIterations: number;
+    }> = {},
+  ): PipelineV2RunCommand {
+    return {
+      kind: "iteration_grant_recorded",
+      generationIndex: 1,
+      waitIndex: 1,
+      intentSha256: INTENT_GRANT,
+      additionalIterations: 1,
+      ...overrides,
+    };
+  }
+
+  function intentAccepted(
+    overrides: Partial<{ waitIndex: number; intentSha256: string }> = {},
+  ): PipelineV2RunCommand {
+    return { kind: "plan_intent_accepted", waitIndex: 1, intentSha256: INTENT_GRANT, ...overrides };
+  }
+
+  function taskAccepted(
+    overrides: Partial<{
+      taskId: string;
+      revision: number;
+      taskSha256: string;
+      waitIndex: number | undefined;
+      intentSha256: string | undefined;
+    }> = {},
+  ): PipelineV2RunCommand {
+    return {
+      kind: "task_revision_accepted",
+      taskId: "coder_task",
+      revision: 1,
+      taskSha256: hex("c"),
+      ...overrides,
+    };
+  }
+
+  /** The planning prefix: the architect settles settled-but-unbound (W1). */
+  function planningPrefix(driver: Driver): void {
+    driver.apply(createRun(STAGE_IDENTITY, []));
+    startAgent(driver, "architect", { execution: "sess-1", tool: "tool-1" });
+    acceptOutputs(driver, []);
+  }
+
+  /** The dispatched prefix: plan r1 accepted, architect bound, dispatcher settled. */
+  function dispatchedPrefix(driver: Driver): void {
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+  }
+
+  /** The lifecycle-open prefix: the dispatcher bound, generation 1 and iteration 1 open at anchor 2. */
+  function lifecycleOpenPrefix(driver: Driver): void {
+    dispatchedPrefix(driver);
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+  }
+
+  /** A stage-role decision execution inside the iteration (the gate). */
+  function runGateDecision(
+    driver: Driver,
+    outcome: "d_rework" | "d_close_stage",
+    executionIndex: number,
+    iterationIndex = 1,
+  ): void {
+    driver.apply({
+      kind: "start_decision_execution",
+      stateId: "gate",
+      inputDigest: hex("a"),
+      executionRole: "stage",
+      iterationIndex,
+    });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome, decision: outcome, rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "gate", outcome, outcome === "d_rework" ? "coder" : "dispatch", executionIndex);
+  }
+
+  function stageAgent(driver: Driver, stateId: string, iterationIndex: number, executionIndex: number): void {
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId,
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex,
+    });
+    driver.apply({ kind: "agent_data_prepared" });
+    const number = driver.nextSessionNumber();
+    driver.apply({ kind: "agent_execution_session_created", sessionId: `exec-${number}` });
+    driver.apply({ kind: "agent_tool_session_created", sessionId: `tool-${number}` });
+    driver.apply({ kind: "agent_running" });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
+    driver.apply({ kind: "agent_cleanup_completed" });
+  }
+
+  /**
+   * The full stage lifecycle through success: two generations, three
+   * iterations in the first one (one grant), the dispatcher outside the
+   * iterations, the planning flow before the first generation and the
+   * second stage bound to plan r1 as well.
+   */
+  function playStageRun(driver: Driver): void {
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    runGateDecision(driver, "d_rework", 5);
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 5 });
+    stageAgent(driver, "coder", 2, 6);
+    commitTransition(driver, "coder", "completed", "gate", 6);
+    runGateDecision(driver, "d_rework", 7, 2);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    driver.apply(iterClosed({ iterationIndex: 2 }));
+    driver.apply({
+      kind: "wait_response_recorded",
+      waitIndex: 1,
+      expectedRequestSha256: hex("7"),
+      actionId: "continue_stage",
+      responseSha256: hex("8"),
+    });
+    driver.apply({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 3, transitionCount: 7 });
+    stageAgent(driver, "coder", 3, 8);
+    commitTransition(driver, "coder", "completed", "gate", 8);
+    runGateDecision(driver, "d_close_stage", 9, 3);
+    driver.apply(iterClosed({ iterationIndex: 3, by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed({ by: "next_stage" }));
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev2_entry", 10);
+    driver.apply({
+      kind: "stage_generation_opened",
+      stageId: "testing",
+      stagePosition: 2,
+      templateId: "testing",
+      planSha256: PLAN_R1,
+      initialBudget: 2,
+      transitionCount: 10,
+    });
+    driver.apply({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 10 });
+    stageAgent(driver, "dev2_entry", 1, 11);
+    commitTransition(driver, "dev2_entry", "completed", "done", 11);
+    driver.apply(iterClosed({ generationIndex: 2, iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed({ generationIndex: 2, by: "final_stage" }));
+    driver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
+    driver.apply({ kind: "run_outputs_published", outputs: [] });
+    driver.apply({ kind: "run_succeeded" });
+  }
+
+  test("the full stage lifecycle drives to success; every snapshot is loader-coherent", () => {
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    playStageRun(driver);
+    const state = driver.current as PipelineV2RunState;
+    expect(state.status).toBe("success");
+    expect(state.executions).toHaveLength(11);
+    expect(state.executions.map((execution) => execution.execution_role)).toEqual([
+      "planning",
+      "control",
+      "stage",
+      "stage",
+      "stage",
+      "stage",
+      "stage",
+      "stage",
+      "stage",
+      "control",
+      "stage",
+    ]);
+    expect(state.generations).toHaveLength(2);
+    expect(state.generations[0]).toMatchObject({
+      index: 1,
+      stage_id: "development",
+      stage_position: 1,
+      template_id: "development",
+      plan_sha256: PLAN_R1,
+      initial_budget: 2,
+      iteration_count: 3,
+      closed: { by: "next_stage", closed_transition_count: 9 },
+    });
+    expect(state.generations[0]?.open_iteration).toBeUndefined();
+    expect(state.generations[1]).toMatchObject({
+      index: 2,
+      stage_id: "testing",
+      stage_position: 2,
+      template_id: "testing",
+      initial_budget: 2,
+      iteration_count: 1,
+      closed: { by: "final_stage", closed_transition_count: 11 },
+    });
+    expect(state.grants).toEqual([
+      { index: 1, generation_index: 1, wait_index: 1, intent_sha256: INTENT_GRANT, additional_iterations: 1 },
+    ]);
+    expect(state.task_revisions).toEqual([]);
+    expect(state.plan_revisions).toEqual([
+      { index: 1, revision: 1, sha256: PLAN_R1, previous_sha256: null, origin_execution: 1 },
+    ]);
+    expect(state.waits[0]?.intent).toEqual({ intent_sha256: INTENT_GRANT });
+    expect(state.waits[0]?.response).toEqual({ action_id: "continue_stage", response_sha256: hex("8") });
+  });
+
+  test("every intermediate v7 snapshot round-trips through the loader and stays deep-frozen", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    const checkpoints: PipelineV2RunState[] = [];
+    planningPrefix(driver);
+    checkpoints.push(driver.current as PipelineV2RunState);
+    driver.apply(planAccepted());
+    checkpoints.push(driver.current as PipelineV2RunState);
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    checkpoints.push(driver.current as PipelineV2RunState);
+    stageAgent(driver, "dev_entry", 1, 3);
+    checkpoints.push(driver.current as PipelineV2RunState);
+    for (const state of checkpoints) {
+      const loaded = validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+      expect(loaded).toEqual(JSON.parse(JSON.stringify(state)));
+      expectDeepFrozen(loaded);
+    }
+  });
+
+  test("the state document carries the exact schema v7 field set at every level", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    playStageRun(driver);
+    const state = driver.current as PipelineV2RunState;
+    const keys = new Set<string>();
+    collectKeys(state, keys);
+    for (const required of ["generations", "task_revisions", "plan_revisions", "grants", "execution_role", "iteration_index"]) {
+      expect(keys.has(required), `the state must carry ${required}`).toBe(true);
+    }
+    const generation = state.generations[0]!;
+    expect(Object.keys(generation).sort()).toEqual([
+      "closed",
+      "index",
+      "initial_budget",
+      "iteration_count",
+      "iterations",
+      "opened_transition_count",
+      "plan_sha256",
+      "stage_id",
+      "stage_position",
+      "template_id",
+    ]);
+    expect(Object.keys(generation.iterations[0]!).sort()).toEqual(["closed", "index", "opened_transition_count"]);
+    expect(Object.keys(generation.iterations[0]!.closed!)).toEqual(["by", "closed_transition_count"]);
+    expect(Object.keys(state.grants[0]!).sort()).toEqual([
+      "additional_iterations",
+      "generation_index",
+      "index",
+      "intent_sha256",
+      "wait_index",
+    ]);
+    expect(Object.keys(state.waits[0]!.intent!)).toEqual(["intent_sha256"]);
+  });
+
+
+  test("the start commands carry the exact role/iteration contract", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    // a stage start before the iteration opens fails on the lifecycle
+    driver.reject(
+      {
+        kind: "start_agent_execution",
+        stateId: "dev_entry",
+        profile: "coder",
+        executionRole: "stage",
+        iterationIndex: 1,
+      },
+      'with the "stage" role requires an open stage generation with an open iteration',
+    );
+    driver.apply(iterOpened());
+    // a stage start without the iteration index is a command-shape error
+    driver.reject(
+      { kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage" },
+      'start_agent_execution with the "stage" role requires the open iteration index',
+    );
+    // a planning start with an iteration index is a command-shape error
+    driver.reject(
+      {
+        kind: "start_agent_execution",
+        stateId: "dev_entry",
+        profile: "coder",
+        executionRole: "planning",
+        iterationIndex: 1,
+      },
+      'start_agent_execution with the "planning" role must not carry an iteration index',
+    );
+    // a control decision start with an iteration index is a command-shape error
+    driver.reject(
+      {
+        kind: "start_decision_execution",
+        stateId: "dev_entry",
+        inputDigest: hex("e"),
+        executionRole: "control",
+        iterationIndex: 1,
+      },
+      'start_decision_execution with the "control" role must not carry an iteration index',
+    );
+    // a wrong iteration index fails on the open-iteration identity
+    driver.reject(
+      {
+        kind: "start_agent_execution",
+        stateId: "dev_entry",
+        profile: "coder",
+        executionRole: "stage",
+        iterationIndex: 9,
+      },
+      'start_agent_execution names iteration 9, but the open iteration of generation 1 is 1',
+    );
+    // a planning start inside the open iteration fails on the lifecycle
+    driver.reject(
+      {
+        kind: "start_agent_execution",
+        stateId: "dev_entry",
+        profile: "coder",
+        executionRole: "planning",
+      },
+      'with the "planning" role cannot start inside the open iteration of generation 1',
+    );
+    driver.reject(
+      {
+        kind: "start_decision_execution",
+        stateId: "dev_entry",
+        inputDigest: hex("e"),
+        executionRole: "control",
+      },
+      'with the "control" role cannot start inside the open iteration of generation 1',
+    );
+    // the exact open iteration index is accepted
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    expect((driver.current as PipelineV2RunState).executions[2]).toMatchObject({
+      execution_role: "stage",
+      iteration_index: 1,
+    });
+  });
+
+  test("stage_generation_opened enforces the clean active boundary and the plan binding", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    // the anchor must match the cursor
+    driver.reject(genOpened(), "the generation anchor 2 does not match the cursor transition count 0");
+    // no plan revision accepted yet
+    driver.reject(genOpened({ transitionCount: 0 }), "which is not the last accepted plan revision");
+    driver.apply(planAccepted());
+    driver.apply(genOpened({ transitionCount: 0 }));
+    driver.apply(iterOpened({ transitionCount: 0 }));
+    // a second generation while one is open
+    driver.reject(genOpened({ transitionCount: 0 }), "generation 1 is still open; a new stage generation requires it to be closed first");
+    // a plan digest different from the last accepted plan revision
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed());
+    driver.reject(genOpened({ transitionCount: 0, planSha256: PLAN_R2 }), "which is not the last accepted plan revision");
+    // shape errors
+    driver.reject(genOpened({ stagePosition: 0 }), "stage_generation_opened requires a positive stage position");
+    driver.reject(genOpened({ initialBudget: 0 }), "stage_generation_opened requires a positive initial budget");
+    driver.reject(genOpened({ transitionCount: -1 }), "stage_generation_opened requires a non-negative transition anchor");
+  });
+
+  test("stage_iteration_opened enforces the open generation, the next index and the budget", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    // no open generation
+    driver.reject(iterOpened(), "opening a stage iteration requires an open generation");
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    // wrong generation index
+    driver.reject(iterOpened({ generationIndex: 2 }), "stage_iteration_opened names generation 2, but the open generation is 1");
+    // an iteration is already open
+    driver.reject(iterOpened({ iterationIndex: 2 }), "generation 1 already has an open iteration; close it before opening the next one");
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    // wrong next index
+    driver.reject(iterOpened({ iterationIndex: 5 }), "the iteration index 5 must be exactly the next iteration of generation 1 (2)");
+    // anchor mismatch
+    driver.reject(iterOpened({ iterationIndex: 2, transitionCount: 3 }), "the iteration anchor 3 does not match the cursor transition count 2");
+    // the budget is exhausted: iteration 2 with the initial budget 2 fits...
+    driver.apply(iterOpened({ iterationIndex: 2 }));
+    driver.apply(iterClosed({ iterationIndex: 2, by: "normal_close", waitIndex: undefined }));
+    // ...but iteration 3 exceeds the effective budget 2 with no grant
+    driver.reject(iterOpened({ iterationIndex: 3 }), "opening iteration 3 of generation 1 exceeds its effective iteration budget 2 (initial budget 2 plus recorded grants)");
+    // a grant extends the budget positionally; the next iteration opens after the response
+    driver.apply({ kind: "run_waiting", stateId: "dev_entry", reason: "stage_iteration_limit_exhausted", requestSha256: hex("7"), actions: [{ id: "continue_stage", to: "dev_entry" }] });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded({ additionalIterations: 1 }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    driver.apply(iterOpened({ iterationIndex: 3, transitionCount: 2 }));
+    expect((driver.current as PipelineV2RunState).generations[0]?.iteration_count).toBe(3);
+    // an unrepresentable effective budget fails closed
+    driver.apply(iterClosed({ iterationIndex: 3, by: "normal_close", waitIndex: undefined }));
+    driver.apply({ kind: "run_waiting", stateId: "dev_entry", reason: "stage_iteration_limit_exhausted", requestSha256: hex("9"), actions: [{ id: "continue_stage", to: "dev_entry" }] });
+    driver.apply(intentAccepted({ waitIndex: 2, intentSha256: hex("9") }));
+    driver.apply(grantRecorded({ waitIndex: 2, intentSha256: hex("9"), additionalIterations: Number.MAX_SAFE_INTEGER }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 2, expectedRequestSha256: hex("9"), actionId: "continue_stage", responseSha256: hex("a") });
+    driver.reject(iterOpened({ iterationIndex: 4, transitionCount: 2 }), "unrepresentable");
+  });
+
+  test("stage_iteration_closed enforces the open iteration, the intent and the intervention records", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    // nothing to close twice
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.reject(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }), "closing a stage iteration requires an open iteration");
+    driver.apply(iterOpened({ iterationIndex: 2 }));
+    // wrong generation (ordinary closure: the phase checks pass on running)
+    driver.reject(
+      iterClosed({ generationIndex: 2, by: "normal_close", waitIndex: undefined }),
+      "stage_iteration_closed names generation 2, but the open iteration belongs to generation 1",
+    );
+    // wrong iteration
+    driver.reject(
+      iterClosed({ iterationIndex: 5, by: "normal_close", waitIndex: undefined }),
+      "stage_iteration_closed names iteration 5, but the open iteration is 2",
+    );
+    // a wait-bound closure on the active boundary
+    driver.reject(iterClosed({}), 'a wait-bound iteration closure requires phase "waiting", got "running"');
+    // an ordinary closure while waiting
+    driver.apply({ kind: "run_waiting", stateId: "dev_entry", reason: "stage_iteration_limit_exhausted", requestSha256: hex("7"), actions: [{ id: "continue_stage", to: "dev_entry" }] });
+    driver.reject(
+      iterClosed({ iterationIndex: 2, by: "normal_close", waitIndex: undefined }),
+      'closing a stage iteration requires phase "running", got "waiting"',
+    );
+    // a grant closure without an accepted intent
+    driver.reject(iterClosed({ iterationIndex: 2 }), "carries no accepted intent; the closure requires one");
+    driver.apply(intentAccepted());
+    // a grant closure without the recorded grant
+    driver.reject(iterClosed({ iterationIndex: 2 }), 'the iteration closure with "grant" requires the recorded grant of wait 1');
+    // a replanned closure without an accepted task revision
+    driver.reject(iterClosed({ iterationIndex: 2, by: "replanned" }), 'the iteration closure with "replanned" requires an accepted task revision of wait 1');
+    driver.apply(grantRecorded());
+    driver.apply(iterClosed({ iterationIndex: 2 }));
+  });
+
+  test("stage_generation_closed enforces the open generation and no open iteration", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    // the iteration must close first
+    driver.reject(genClosed(), "generation 1 still has an open iteration; close it first");
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    // wrong generation index
+    driver.reject(genClosed({ generationIndex: 2 }), "stage_generation_closed names generation 2, but the open generation is 1");
+    // closing while waiting is rejected by the waiting gate
+    driver.apply({ kind: "run_waiting", stateId: "dev_entry", reason: "stage_iteration_limit_exhausted", requestSha256: hex("7"), actions: [{ id: "continue_stage", to: "dev_entry" }] });
+    driver.reject(genClosed(), "only the wait response and the durable intervention records advance a waiting run");
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    driver.apply(genClosed());
+    driver.reject(genClosed(), "stage_generation_closed names generation 1, but the open generation is none");
+  });
+
+  test("plan_intent_accepted: the exact repeat is a no-op, a different digest is rejected", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    runGateDecision(driver, "d_rework", 5);
+    // on the active boundary the intent is rejected
+    driver.reject(intentAccepted(), "accepting a wait intent requires a waiting run");
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted());
+    const before = driver.current as PipelineV2RunState;
+    const revision = before.revision;
+    // the exact repeat returns the same snapshot without growing the revision
+    const repeated = driver.apply(intentAccepted());
+    expect(repeated).toBe(before);
+    expect((driver.current as PipelineV2RunState).revision).toBe(revision);
+    // a different digest is rejected
+    driver.reject(intentAccepted({ intentSha256: hex("5") }), "already accepted a different intent; one intent belongs to one wait");
+    // a wrong wait index is rejected
+    driver.reject(intentAccepted({ waitIndex: 2 }), "plan_intent_accepted targets wait index 2, but the open wait record is 1");
+  });
+
+  test("the grant ledger is append-only, bound to the open wait intent and unique per (generation, wait)", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    runGateDecision(driver, "d_rework", 5);
+    // on the active boundary the grant is rejected
+    driver.reject(grantRecorded(), "recording an iteration grant requires a waiting run");
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    // without an accepted intent the grant is rejected
+    driver.reject(grantRecorded(), "the grant references an intent that open wait record 1 has not accepted");
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    // a wrong generation index is rejected
+    driver.reject(grantRecorded({ generationIndex: 2 }), "iteration_grant_recorded names generation 2, but the open generation is 1");
+    // a repeat for the same (generation, wait) is rejected
+    driver.reject(grantRecorded({ additionalIterations: 2 }), "wait 1 already carries a recorded grant for generation 1");
+    // a different intent is rejected by the intent binding first
+    driver.reject(grantRecorded({ intentSha256: hex("9"), additionalIterations: 2 }), "the grant references an intent that open wait record 1 has not accepted");
+    // shape errors
+    driver.reject(grantRecorded({ additionalIterations: 0 }), "iteration_grant_recorded requires a positive additional iteration count");
+    driver.apply(iterClosed({ iterationIndex: 1 }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    // after the response the grant is rejected again
+    driver.reject(grantRecorded(), "recording an iteration grant requires a waiting run");
+  });
+
+  test("the task revision ledger: revision 1 in the planning flow, revisions above 1 in the revise flow", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    // revision 1 on the active boundary without wait links
+    driver.apply(taskAccepted());
+    expect((driver.current as PipelineV2RunState).task_revisions[0]).toMatchObject({
+      index: 1,
+      task_id: "coder_task",
+      revision: 1,
+      previous_sha256: null,
+    });
+    // a duplicate revision 1
+    driver.reject(taskAccepted(), 'task revision 1 of "coder_task" already exists (revision 1 is recorded)');
+    // revision 1 must not carry the wait links
+    driver.reject(taskAccepted({ waitIndex: 1, intentSha256: INTENT_GRANT }), "must not carry the wait and intent links");
+    // revision 2 without the links
+    driver.reject(taskAccepted({ revision: 2, taskSha256: hex("d") }), "task_revision_accepted of revision 2 requires the wait and intent links");
+    // revision 2 with no recorded predecessor
+    driver.apply(planAccepted({ originExecution: 1 }));
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    runGateDecision(driver, "d_rework", 5);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted({ intentSha256: INTENT_REVISE }));
+    // a foreign task has no recorded predecessor
+    driver.reject(taskAccepted({ taskId: "other_task", revision: 2, taskSha256: hex("d"), waitIndex: 1, intentSha256: INTENT_REVISE }), 'task revision 2 of "other_task" has no recorded predecessor');
+    // the intent must match the accepted one
+    driver.reject(
+      taskAccepted({ revision: 2, taskSha256: hex("d"), waitIndex: 1, intentSha256: INTENT_GRANT }),
+      "the task revision references an intent that open wait record 1 has not accepted",
+    );
+    driver.apply(taskAccepted({ revision: 2, taskSha256: hex("d"), waitIndex: 1, intentSha256: INTENT_REVISE }));
+    expect((driver.current as PipelineV2RunState).task_revisions[1]).toMatchObject({
+      index: 2,
+      task_id: "coder_task",
+      revision: 2,
+      previous_sha256: hex("c"),
+      wait_index: 1,
+      intent_sha256: INTENT_REVISE,
+    });
+    // revision 3 follows 2
+    driver.apply(taskAccepted({ revision: 3, taskSha256: hex("e"), waitIndex: 1, intentSha256: INTENT_REVISE }));
+    expect((driver.current as PipelineV2RunState).task_revisions[2]?.previous_sha256).toBe(hex("d"));
+    // a gap is rejected
+    driver.reject(taskAccepted({ revision: 5, taskSha256: hex("f"), waitIndex: 1, intentSha256: INTENT_REVISE }), "must follow revision 4");
+  });
+
+  test("the revise flow: intent, task revision, iteration closure, response, planning execution, plan acceptance", () => {
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    // the plan's initial task revision is accepted in the planning flow
+    driver.apply(taskAccepted());
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    runGateDecision(driver, "d_rework", 5);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted({ intentSha256: INTENT_REVISE }));
+    driver.apply(taskAccepted({ revision: 2, taskSha256: hex("d"), waitIndex: 1, intentSha256: INTENT_REVISE }));
+    driver.apply(iterClosed({ iterationIndex: 1, by: "replanned", waitIndex: 1 }));
+    driver.apply({
+      kind: "wait_response_recorded",
+      waitIndex: 1,
+      expectedRequestSha256: hex("7"),
+      actionId: "revise_task",
+      responseSha256: hex("8"),
+    });
+    expect((driver.current as PipelineV2RunState).cursor).toEqual({ current_state: "architect", transition_count: 5 });
+    // the planning execution restarts outside the closed iteration
+    driver.apply({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
+    driver.apply({ kind: "agent_data_prepared" });
+    driver.apply({ kind: "agent_execution_session_created", sessionId: "exec-9" });
+    driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-9" });
+    driver.apply({ kind: "agent_running" });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
+    driver.apply({ kind: "agent_cleanup_completed" });
+    // the plan revision is accepted on the active boundary (Design A)
+    driver.apply(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 6 }));
+    expect((driver.current as PipelineV2RunState).plan_revisions).toEqual([
+      { index: 1, revision: 1, sha256: PLAN_R1, previous_sha256: null, origin_execution: 1 },
+      { index: 2, revision: 2, sha256: PLAN_R2, previous_sha256: PLAN_R1, origin_execution: 6 },
+    ]);
+    commitTransition(driver, "architect", "completed", "dispatch", 6);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 7);
+    // the hook closes the replanned generation and opens the next one under plan r2
+    driver.apply(genClosed({ by: "replanned" }));
+    driver.apply(genOpened({ transitionCount: 7, planSha256: PLAN_R2 }));
+    driver.apply(iterOpened({ generationIndex: 2, transitionCount: 7 }));
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    expect((driver.current as PipelineV2RunState).generations).toHaveLength(2);
+    expect((driver.current as PipelineV2RunState).generations[0]?.closed).toEqual({ by: "replanned", closed_transition_count: 7 });
+    expect((driver.current as PipelineV2RunState).generations[1]).toMatchObject({
+      plan_sha256: PLAN_R2,
+      open_iteration: { index: 1, opened_transition_count: 7 },
+    });
+  });
+
+  test("plan_revision_accepted enforces the settled-but-unbound planning origin and the ledger", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(driver);
+    // the planning execution is settled but unbound: accepted
+    driver.apply(planAccepted());
+    // the next revision must be exactly 2
+    driver.reject(planAccepted(), "the plan revision 1 must be exactly the next revision of the ledger (2)");
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    // the executions are bound now
+    driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 2 }), "plan acceptance requires exactly one settled-but-unbound execution");
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    // a control origin is rejected
+    driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 2 }), 'carries the "control" role; plan acceptance requires the "planning" role');
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    // a plan cannot be accepted while an iteration is open
+    driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 2 }), "a plan revision cannot be accepted while a stage iteration is open");
+    driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 2 }), "a plan revision cannot be accepted while a stage iteration is open");
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed());
+    // an in-flight origin is rejected (the planning execution is exec 3)
+    driver.apply({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "planning" });
+    driver.apply({ kind: "agent_data_prepared" });
+    driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 3 }), 'has phase "data_prepared"; plan acceptance requires the settled phase "cleanup_completed"');
+    driver.apply({ kind: "agent_execution_session_created", sessionId: "exec-2" });
+    driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-2" });
+    driver.apply({ kind: "agent_running" });
+    driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 3 }), 'has phase "running"; plan acceptance requires the settled phase "cleanup_completed"');
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
+    driver.apply({ kind: "agent_cleanup_completed" });
+    // the origin is the last execution: accepted
+    driver.apply(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 3 }));
+    expect((driver.current as PipelineV2RunState).plan_revisions[1]?.previous_sha256).toBe(PLAN_R1);
+  });
+
+  test("the loader rejects legacy schema versions with their exact migration messages", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    playStageRun(driver);
+    const raw = JSON.stringify(driver.current);
+    const exact = {
+      1: "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v1 migration exists)",
+      2: "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
+      3: "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
+      4: "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
+      5: "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
+      6: "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v6 migration exists)",
+    };
+    for (const [version, message] of Object.entries(exact)) {
+      const draft = JSON.parse(raw) as Record<string, unknown>;
+      draft.schema_version = Number(version);
+      expect(() => validatePipelineV2RunState(draft)).toThrow(message);
+    }
+  });
+
+  test("the loader rejects unknown fields at every new record level", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    playStageRun(driver);
+    const raw = JSON.stringify(driver.current);
+    const mutate = (mutator: (draft: any) => void): unknown => {
+      const draft = JSON.parse(raw);
+      mutator(draft);
+      return draft;
+    };
+    expect(() => validatePipelineV2RunState(mutate((draft) => { draft.generations[0].extra = 1; }))).toThrow('pipeline v2 run state generations[0] has unknown field "extra"');
+    expect(() => validatePipelineV2RunState(mutate((draft) => { draft.generations[0].iterations[0].extra = 1; }))).toThrow('has unknown field "extra"');
+    expect(() => validatePipelineV2RunState(mutate((draft) => { draft.generations[0].iterations[1].closed.extra = 1; }))).toThrow('has unknown field "extra"');
+    expect(() => validatePipelineV2RunState(mutate((draft) => { draft.task_revisions.push({ index: 1, task_id: "t", revision: 1, sha256: PLAN_R1, previous_sha256: null, extra: 1 }); }))).toThrow('has unknown field "extra"');
+    expect(() => validatePipelineV2RunState(mutate((draft) => { draft.plan_revisions[0].extra = 1; }))).toThrow('has unknown field "extra"');
+    expect(() => validatePipelineV2RunState(mutate((draft) => { draft.grants[0].extra = 1; }))).toThrow('has unknown field "extra"');
+    expect(() => validatePipelineV2RunState(mutate((draft) => { draft.waits[0].intent.extra = 1; }))).toThrow('has unknown field "extra"');
+  });
+
+  test("the loader rejects a stage execution whose recorded iteration contradicts the lifecycle timeline", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    const base = JSON.stringify(driver.current);
+    expectInvalid(JSON.parse(base), (draft) => {
+      draft.executions[2].iteration_index = 9;
+    }, 'references iteration 9, which is not the open iteration 1 at committed transition count 2');
+    // a planning execution inside the open iteration
+    expectInvalid(JSON.parse(base), (draft) => {
+      draft.executions[2].execution_role = "planning";
+      delete draft.executions[2].iteration_index;
+    }, 'has the "planning" role but starts inside the open iteration of generation 1');
+    // a stage execution without any open iteration at all
+    expectInvalid(JSON.parse(base), (draft) => {
+      draft.generations[0].iterations = [];
+      delete draft.generations[0].open_iteration;
+      draft.generations[0].iteration_count = 0;
+    }, 'has the "stage" role but no iteration is open at committed transition count 2');
+  });
+
+  test("the loader rejects positionally impossible ledgers and budget history", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    playStageRun(driver);
+    const raw = JSON.stringify(driver.current);
+    // a plan revision whose origin execution does not exist at its boundary:
+    // the acceptance is delayed past the generation that binds its digest
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.plan_revisions[0].origin_execution = 5;
+    }, "generation 1 binds plan digest");
+    // a generation binding a plan digest that was not the last accepted
+    // plan at its open anchor: a second plan revision shares the origin of
+    // the first (the reducer is permissive there), so the last accepted
+    // plan at the generation's open anchor is plan 2 while the generation
+    // still binds plan 1
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.plan_revisions.push({ index: 2, revision: 2, sha256: PLAN_R2, previous_sha256: PLAN_R1, origin_execution: 1 });
+    }, "generation 1 binds plan digest");
+    // a grant whose wait carries no accepted intent
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.waits[0].intent = undefined;
+      draft.executions[6].iteration_index = 2;
+    }, "grant record 1 references an intent that wait record 1 has not accepted");
+    // an iteration opened before the grant's wait makes the budget history invalid
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.grants[0].wait_index = 2;
+    }, "grant record 1 references wait 2, which does not exist");
+    // the positional budget: a forged initial budget of 1 makes the
+    // iteration 3 opening at its anchor exceed the effective budget 2
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.generations[0].initial_budget = 1;
+    }, "exceeds the effective iteration budget");
+  });
+
+  test("the loader rejects incoherent plan and task ledger chains and duplicate grants", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    playStageRun(driver);
+    const raw = JSON.stringify(driver.current);
+    // a plan revision chain break
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.plan_revisions[0].previous_sha256 = hex("9");
+    }, "declares revision 1 with previous_sha256 set");
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.plan_revisions[0].revision = 3;
+    }, "plan_revisions[0] declares revision 3 with previous_sha256 null; revision 1 must carry a null previous digest");
+    // a task revision chain break: a revision-above-1 record without its predecessor
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.task_revisions.push({
+        index: 1,
+        task_id: "coder_task",
+        revision: 2,
+        sha256: hex("d"),
+        previous_sha256: hex("c"),
+        wait_index: 1,
+        intent_sha256: INTENT_GRANT,
+      });
+    }, 'task revision record 1 has no recorded predecessor for "coder_task"');
+    // a wrong previous digest inside one task chain
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.task_revisions.push({ index: 1, task_id: "coder_task", revision: 1, sha256: hex("c"), previous_sha256: null });
+      draft.task_revisions.push({ index: 2, task_id: "coder_task", revision: 2, sha256: hex("d"), previous_sha256: hex("9"), wait_index: 1, intent_sha256: INTENT_GRANT });
+    }, 'declares a previous digest that does not match the previous record of "coder_task"');
+    // a duplicate grant pair
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.grants.push({ index: 2, generation_index: 1, wait_index: 1, intent_sha256: INTENT_GRANT, additional_iterations: 5 });
+    }, "grant record 2 repeats the grant of generation 1 for wait 1");
+  });
+
+  test("the crash windows W1, W2, W3 and P1 are loader-coherent and reducer-continuable", () => {
+    // W1: the planning execution settled without its plan revision
+    const w1 = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(w1);
+    let state = w1.current as PipelineV2RunState;
+    expect(state.executions).toHaveLength(1);
+    expect(state.transitions).toHaveLength(0);
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    state = w1.apply(planAccepted());
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    // W1c: the control execution settled without its transition
+    const w1c = createDriver(STAGE_IDENTITY, []);
+    planningPrefix(w1c);
+    w1c.apply(planAccepted());
+    commitTransition(w1c, "architect", "completed", "dispatch", 1);
+    w1c.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    w1c.apply({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+    });
+    state = w1c.current as PipelineV2RunState;
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    state = w1c.apply({ kind: "transition_committed", step: { from: "dispatch", outcome: "d_next_stage", to: "dev_entry", transition_index: 0 }, executionIndex: 2 });
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    // W2: the generation opened without its first iteration
+    const w2 = createDriver(STAGE_IDENTITY, []);
+    dispatchedPrefix(w2);
+    commitTransition(w2, "dispatch", "d_next_stage", "dev_entry", 2);
+    w2.apply(genOpened());
+    state = w2.current as PipelineV2RunState;
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    state = w2.apply(iterOpened());
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    // W3: the generation and iteration are open without the stage execution
+    const w3 = createDriver(STAGE_IDENTITY, []);
+    lifecycleOpenPrefix(w3);
+    state = w3.current as PipelineV2RunState;
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    // P1: the committed cursor with the open iteration and no stage execution:
+    // the rework transition committed and the iteration is still open
+    const p1 = createDriver(STAGE_IDENTITY, []);
+    lifecycleOpenPrefix(p1);
+    stageAgent(p1, "dev_entry", 1, 3);
+    commitTransition(p1, "dev_entry", "completed", "coder", 3);
+    stageAgent(p1, "coder", 1, 4);
+    commitTransition(p1, "coder", "completed", "gate", 4);
+    runGateDecision(p1, "d_rework", 5);
+    state = p1.current as PipelineV2RunState;
+    expect(state.generations[0]?.open_iteration).toEqual({ index: 1, opened_transition_count: 2 });
+    expect(state.cursor).toEqual({ current_state: "coder", transition_count: 5 });
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    // the reducer continues the P1 boundary with the stage execution
+    state = p1.apply({
+      kind: "start_agent_execution",
+      stateId: "coder",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    expect(state.executions[5]).toMatchObject({ state_id: "coder", execution_role: "stage", iteration_index: 1 });
+  });
+
+  test("a waiting run never carries lifecycle mutations and the response demands the closed iteration", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    runGateDecision(driver, "d_rework", 5);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    // the response is forbidden while the iteration is still open
+    driver.reject(
+      { kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") },
+      "the open iteration 1 of generation 1 is not closed; the durable intervention must close it before the response is recorded",
+    );
+    // ordinary lifecycle commands are forbidden while waiting
+    driver.reject(
+      { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 5 },
+      "only the wait response and the durable intervention records advance a waiting run",
+    );
+    driver.reject(
+      genOpened(),
+      "only the wait response and the durable intervention records advance a waiting run",
+    );
+    driver.reject(
+      { kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" },
+      "only the wait response and the durable intervention records advance a waiting run",
+    );
+    driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 6 }), "only the wait response and the durable intervention records advance a waiting run");
+    driver.reject(genClosed(), "only the wait response and the durable intervention records advance a waiting run");
+    driver.reject(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }), 'closing a stage iteration requires phase "running", got "waiting"');
+    // the durable records close the iteration before the response
+    driver.apply(intentAccepted({ intentSha256: INTENT_GRANT }));
+    driver.apply(grantRecorded());
+    driver.apply(iterClosed({ iterationIndex: 1 }));
+    driver.apply({
+      kind: "wait_response_recorded",
+      waitIndex: 1,
+      expectedRequestSha256: hex("7"),
+      actionId: "continue_stage",
+      responseSha256: hex("8"),
+    });
+    // after the response the ordinary commands apply again
+    driver.apply({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 5 });
+  });
+
+  test("the negative content scan of the full stage lifecycle state", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    playStageRun(driver);
+    const text = JSON.stringify(driver.current);
+    const canaries = [
+      '{"intent":"continue_stage","additional_iterations":2}',
+      "unmet acceptance criteria: acceptance test 7 fails",
+      "TASK.md revision 2: rewrite the parser",
+      "PLAN: stage 3 of 5",
+      "development entry: implement the parser module",
+      "/var/lib/orchestrator/runs/run-1/plan-revision-1.json",
+      "dht_session_bearer_token",
+      "OPENCODE_CONFIG_CONTENT",
+      "ORCHESTRATOR_V2_TOOL_SESSION_TOKEN",
+    ];
+    for (const canary of canaries) {
+      expect(text).not.toContain(canary);
+    }
+    const keys = new Set<string>();
+    collectKeys(driver.current, keys);
+    for (const banned of ["evidence", "manifest", "request", "user_response", "task_body", "plan_body", "profile_bindings", "endpoint", "token", "bearer", "prompt", "summary"]) {
+      expect(keys.has(banned), `the state must not carry a ${banned} field`).toBe(false);
     }
   });
 });

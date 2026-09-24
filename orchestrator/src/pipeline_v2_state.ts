@@ -1,5 +1,5 @@
 /**
- * Durable run state for pipeline schema v2 (state schema version 6).
+ * Durable run state for pipeline schema v2 (state schema version 7).
  *
  * Pure substrate: a versioned state document, an exact-field loader, and a
  * pure command reducer. Nothing here touches the filesystem, docker-helper,
@@ -7,6 +7,33 @@
  * production run-state contract of pipeline schema v1 and is not wired to
  * any of this. There are no migrations between state versions in either
  * direction.
+ *
+ * Schema version 7 adds the plan-driven stage lifecycle on top of the v6
+ * wait journal: every agent and decision execution carries a mandatory
+ * `execution_role` (`planning | control | stage`, fixed at start and never
+ * rewritten) with the role contract for `iteration_index` (present exactly
+ * for stage executions, referencing the open iteration at the start).
+ * Generations (`generations[]`) are separate durable records binding a plan
+ * stage (`stage_id`, `stage_position`, `template_id`, `plan_sha256`) to an
+ * immutable `initial_budget`; iterations live inside their generation as an
+ * append-only `iterations[]` list with open/close anchors. The accepted
+ * plan revisions (`plan_revisions[]`), task revisions (`task_revisions[]`)
+ * and iteration grants (`grants[]`) are top-level append-only ledgers of
+ * content-free refs; the accepted wait intent is recorded inside the open
+ * wait record itself (`waits[].intent`). The effective iteration budget of
+ * a generation is derived — never stored — as
+ * `initial_budget + sum of that generation's grant.additional_iterations`,
+ * so a grant can never retroactively make already-invalidated history
+ * valid. The reducer and the loader enforce the identical successor rules
+ * from their two sides: the reducer at write time, the loader by a single
+ * positional replay that orders generations, iterations, grants, task and
+ * plan revisions, executions and the joint transition+wait cursor
+ * replay by their recorded anchors. There are no event journals, no second
+ * cursor, no second transition journal, no durable registry of templates
+ * or roles; the execution snapshot digest stays the single durable anchor
+ * of the compiled pipeline, and matching a durable role to a concrete
+ * compiled state is the job of the coordinator/controller and the restore
+ * verifier — never of this module.
  *
  * Schema version 6 adds the durable user-response successor for the user
  * wait. The single optional top-level `wait` record of schema v5 is
@@ -68,7 +95,36 @@ import {
   isPositiveSafeInteger,
 } from "./pipeline_v2_scalar.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 6;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 7;
+
+/** The closed execution-role vocabulary fixed on every execution at start. */
+export const PIPELINE_V2_EXECUTION_ROLES = ["planning", "control", "stage"] as const;
+export type PipelineV2ExecutionRole = (typeof PIPELINE_V2_EXECUTION_ROLES)[number];
+
+/** The closed close-reason vocabulary of one stage iteration. */
+export const PIPELINE_V2_STAGE_ITERATION_CLOSE_REASONS = [
+  "grant",
+  "replanned",
+  "normal_close",
+  "exhausted",
+] as const;
+export type PipelineV2StageIterationCloseReason =
+  (typeof PIPELINE_V2_STAGE_ITERATION_CLOSE_REASONS)[number];
+
+/** The close reasons that bind the iteration closure to an open user wait. */
+const WAIT_BOUND_ITERATION_CLOSE_REASONS: readonly PipelineV2StageIterationCloseReason[] = [
+  "grant",
+  "replanned",
+];
+
+/** The closed close-reason vocabulary of one stage generation. */
+export const PIPELINE_V2_STAGE_GENERATION_CLOSE_REASONS = [
+  "next_stage",
+  "final_stage",
+  "replanned",
+] as const;
+export type PipelineV2StageGenerationCloseReason =
+  (typeof PIPELINE_V2_STAGE_GENERATION_CLOSE_REASONS)[number];
 
 export const PIPELINE_V2_RUN_STATUSES = [
   "active",
@@ -236,6 +292,10 @@ export interface PipelineV2AgentExecutionState {
   state_id: string;
   attempt: number;
   profile: string;
+  /** The compiled execution role, fixed at start and never rewritten. */
+  execution_role: PipelineV2ExecutionRole;
+  /** The open iteration a stage execution runs in; absent for planning/control. */
+  iteration_index?: number;
   phase: PipelineV2AgentExecutionPhase;
   /** Durable id of the orchestrator-owned Execution Session (run-root scope). */
   execution_session_id?: string;
@@ -251,6 +311,10 @@ export interface PipelineV2DecisionExecutionState {
   index: number;
   type: "decision";
   state_id: string;
+  /** The compiled execution role, fixed at start and never rewritten. */
+  execution_role: PipelineV2ExecutionRole;
+  /** The open iteration a stage execution runs in; absent for planning/control. */
+  iteration_index?: number;
   phase: PipelineV2DecisionExecutionPhase;
   input_digest: string;
   result?: PipelineDecisionStateRecord;
@@ -330,7 +394,127 @@ export interface PipelineV2WaitRecord {
   readonly reason: string;
   readonly request_sha256: string;
   readonly actions: readonly PipelineV2WaitAction[];
+  /** The accepted wait intent, recorded inside the open wait record (schema v7). */
+  readonly intent?: PipelineV2WaitIntentRecord;
   readonly response?: PipelineV2WaitResponseRecord;
+}
+
+/**
+ * Content-free durable record of one accepted user wait intent (schema
+ * v7): the SHA-256 of the orchestrator-owned intent manifest, published on
+ * the data plane before the durable acceptance. The reducer accepts the
+ * digest but never interprets the intent kind (continue vs revise); the
+ * controller owns the meaning. One intent per wait: an exact digest repeat
+ * is a no-op, a different digest is rejected. No intent body, evidence,
+ * TASK/PLAN content, facts, paths, env values, profiles or credentials
+ * ever enter the record.
+ */
+export interface PipelineV2WaitIntentRecord {
+  readonly intent_sha256: string;
+}
+
+/**
+ * Content-free record of one closed stage iteration (schema v7), inside
+ * its generation's append-only `iterations[]`. The `by` reason is the
+ * closed close vocabulary; `wait_index` is present exactly for the
+ * wait-bound closures (`grant`, `replanned`) and names the open wait the
+ * intervention ran in; `closed_transition_count` is the committed
+ * transition count at the moment the reducer closed the iteration (the
+ * anchor the loader's positional replay orders the closure by).
+ */
+export interface PipelineV2StageIterationRecord {
+  readonly index: number;
+  readonly opened_transition_count: number;
+  readonly closed?: {
+    readonly by: PipelineV2StageIterationCloseReason;
+    readonly wait_index?: number;
+    readonly closed_transition_count: number;
+  };
+}
+
+/**
+ * Content-free durable record of one stage generation (schema v7): the
+ * binding of one plan stage (`stage_id`, its 1-based semantic
+ * `stage_position`) to one compiled stage template (`template_id`) under
+ * one accepted plan revision (`plan_sha256`), with the immutable
+ * `initial_budget` and the transition anchor of the opening. The record is
+ * append-only: `iterations[]` grows, `iteration_count` mirrors
+ * `iterations.length`, and the open/closed projections (`open_iteration`,
+ * `closed`) describe only the current lifecycle state; closed
+ * generations and their historical iterations are never rewritten. The
+ * effective iteration budget is derived (`initial_budget` plus the
+ * generation's recorded grants) and never stored on the record.
+ */
+export interface PipelineV2StageGenerationRecord {
+  readonly index: number;
+  readonly stage_id: string;
+  readonly stage_position: number;
+  readonly template_id: string;
+  readonly plan_sha256: string;
+  readonly initial_budget: number;
+  readonly opened_transition_count: number;
+  readonly iteration_count: number;
+  readonly open_iteration?: {
+    readonly index: number;
+    readonly opened_transition_count: number;
+  };
+  readonly closed?: {
+    readonly by: PipelineV2StageGenerationCloseReason;
+    readonly closed_transition_count: number;
+  };
+  readonly iterations: readonly PipelineV2StageIterationRecord[];
+}
+
+/**
+ * Content-free durable record of one accepted task revision (schema v7).
+ * Revision 1 tasks are accepted by separate commands during the planning
+ * flow (no wait link); revisions above 1 are accepted in the revise flow
+ * and carry the `wait_index`/`intent_sha256` links of the open wait whose
+ * revise intent delivered them. The per-task revision chain
+ * (`revision = previous + 1`, `previous_sha256` = the previous record's
+ * digest) is enforced by reducer and loader; the task body itself lives
+ * only in the filesystem manifest.
+ */
+export interface PipelineV2TaskRevisionState {
+  readonly index: number;
+  readonly task_id: string;
+  readonly revision: number;
+  readonly sha256: string;
+  readonly previous_sha256: string | null;
+  readonly wait_index?: number;
+  readonly intent_sha256?: string;
+}
+
+/**
+ * Content-free durable record of one accepted plan revision (schema v7).
+ * The record carries only the revision chain and the digest links plus the
+ * `origin_execution` — the index of the settled-but-unbound planning
+ * execution the plan was produced by; the plan body (stages, tasks,
+ * templates) lives only in the filesystem manifest. An accepted plan
+ * revision is never rewritten.
+ */
+export interface PipelineV2PlanRevisionState {
+  readonly index: number;
+  readonly revision: number;
+  readonly sha256: string;
+  readonly previous_sha256: string | null;
+  readonly origin_execution: number;
+}
+
+/**
+ * Content-free durable record of one iteration grant (schema v7),
+ * append-only. The grant references the exact open generation, the open
+ * wait and the accepted intent of that wait; `additional_iterations`
+ * extends the generation's effective budget from the moment of the grant
+ * onward. The generation record is never rewritten; historical
+ * generation/iteration records stay untouched.
+ */
+export interface PipelineV2IterationGrantState {
+  readonly index: number;
+  readonly generation_index: number;
+  readonly wait_index: number;
+  readonly intent_sha256: string;
+  readonly additional_iterations: number;
 }
 
 /**
@@ -362,7 +546,7 @@ export type PipelineDecisionStateRecord =
     };
 
 export interface PipelineV2RunState {
-  schema_version: 6;
+  schema_version: 7;
   revision: number;
   run_id: string;
   status: PipelineV2RunStatus;
@@ -374,6 +558,17 @@ export interface PipelineV2RunState {
   cursor: PipelineV2RunCursorState;
   executions: PipelineV2ExecutionState[];
   transitions: PipelineV2CommittedTransitionState[];
+  /**
+   * The append-only stage-generation journal (schema v7). At most the last
+   * generation may be open; an open iteration (if any) belongs to it.
+   */
+  generations: PipelineV2StageGenerationRecord[];
+  /** The append-only accepted task revision ledger (schema v7). */
+  task_revisions: PipelineV2TaskRevisionState[];
+  /** The append-only accepted plan revision ledger (schema v7). */
+  plan_revisions: PipelineV2PlanRevisionState[];
+  /** The append-only iteration grant ledger (schema v7). */
+  grants: PipelineV2IterationGrantState[];
   terminal?: PipelineV2TerminalState;
   run_outputs?: PipelineV2RunOutputState[];
   failure?: PipelineV2FailureState;
@@ -392,7 +587,15 @@ export type PipelineV2RunCommand =
       pipeline: PipelineV2RunPipelineIdentity;
       inputs: readonly PipelineV2RunInputState[];
     }
-  | { kind: "start_agent_execution"; stateId: string; profile: string }
+  | {
+      kind: "start_agent_execution";
+      stateId: string;
+      profile: string;
+      /** The exact compiled execution role; mandatory, no default. */
+      executionRole: PipelineV2ExecutionRole;
+      /** The open iteration index; mandatory exactly for the stage role. */
+      iterationIndex?: number;
+    }
   | { kind: "agent_data_prepared" }
   | { kind: "agent_execution_session_created"; sessionId: string }
   | { kind: "agent_tool_session_created"; sessionId: string }
@@ -404,7 +607,15 @@ export type PipelineV2RunCommand =
       reason: PipelineV2FailureReason;
       sessionCleanup: PipelineV2SessionCleanupPair;
     }
-  | { kind: "start_decision_execution"; stateId: string; inputDigest: string }
+  | {
+      kind: "start_decision_execution";
+      stateId: string;
+      inputDigest: string;
+      /** The exact compiled execution role; mandatory, no default. */
+      executionRole: PipelineV2ExecutionRole;
+      /** The open iteration index; mandatory exactly for the stage role. */
+      iterationIndex?: number;
+    }
   | { kind: "decision_evaluated"; result: PipelineDecisionStateRecord }
   | { kind: "decision_failed"; reason: PipelineV2FailureReason }
   | { kind: "transition_committed"; step: TransitionStep; executionIndex: number }
@@ -431,7 +642,62 @@ export type PipelineV2RunCommand =
   | { kind: "run_outputs_published"; outputs: readonly PipelineV2RunOutputState[] }
   | { kind: "run_succeeded" }
   | { kind: "run_failed"; reason: PipelineV2FailureReason }
-  | { kind: "run_cleanup_failed" };
+  | { kind: "run_cleanup_failed" }
+  | {
+      kind: "stage_generation_opened";
+      stageId: string;
+      stagePosition: number;
+      templateId: string;
+      planSha256: string;
+      initialBudget: number;
+      transitionCount: number;
+    }
+  | {
+      kind: "stage_iteration_opened";
+      generationIndex: number;
+      iterationIndex: number;
+      transitionCount: number;
+    }
+  | {
+      kind: "stage_iteration_closed";
+      generationIndex: number;
+      iterationIndex: number;
+      by: PipelineV2StageIterationCloseReason;
+      /** The open wait; mandatory exactly for the wait-bound closures. */
+      waitIndex?: number;
+    }
+  | {
+      kind: "stage_generation_closed";
+      generationIndex: number;
+      by: PipelineV2StageGenerationCloseReason;
+    }
+  | {
+      kind: "plan_intent_accepted";
+      waitIndex: number;
+      intentSha256: string;
+    }
+  | {
+      kind: "task_revision_accepted";
+      taskId: string;
+      revision: number;
+      taskSha256: string;
+      /** The open wait; mandatory exactly for user-response revisions. */
+      waitIndex?: number;
+      intentSha256?: string;
+    }
+  | {
+      kind: "plan_revision_accepted";
+      planRevision: number;
+      planSha256: string;
+      originExecution: number;
+    }
+  | {
+      kind: "iteration_grant_recorded";
+      generationIndex: number;
+      waitIndex: number;
+      intentSha256: string;
+      additionalIterations: number;
+    };
 
 export class PipelineV2StateError extends Error {
   constructor(message: string) {
@@ -460,6 +726,22 @@ const DECISION_FACT_VALIDATION_REASONS: readonly DecisionFactValidationReason[] 
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value !== "";
+}
+
+/**
+ * Adds two non-negative safe integers and rejects an unrepresentable
+ * result, so an effective budget can never silently wrap. The diagnostic
+ * carries the `what` label only.
+ */
+function additionSafe(a: number, b: number, what: string): number {
+  if (!isNonNegativeSafeInteger(a) || !isNonNegativeSafeInteger(b)) {
+    throw new PipelineV2StateError(`${what} carries a non-integer budget component`);
+  }
+  const sum = a + b;
+  if (!Number.isSafeInteger(sum)) {
+    throw new PipelineV2StateError(`${what} has an unrepresentable effective budget sum`);
+  }
+  return sum;
 }
 
 function isIsoTimestamp(value: unknown): value is string {
@@ -589,27 +871,32 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 6 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
     );
   }
   if (version === 3) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
     );
   }
   if (version === 4) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
     );
   }
   if (version === 5) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 6 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
+    );
+  }
+  if (version === 6) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v6 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -682,8 +969,8 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
   const obj = expectExactObject(
     value,
     what,
-    ["index", "type", "state_id", "attempt", "profile", "phase"],
-    ["execution_session_id", "tool_session_id", "session_cleanup", "outputs", "failure_reason"],
+    ["index", "type", "state_id", "attempt", "profile", "phase", "execution_role"],
+    ["iteration_index", "execution_session_id", "tool_session_id", "session_cleanup", "outputs", "failure_reason"],
   );
   if (obj.type !== "agent") {
     throw new PipelineV2StateError(`${what}.type must be "agent", got ${JSON.stringify(obj.type)}`);
@@ -695,6 +982,11 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
     state_id: expectSafeId(obj.state_id, `${what}.state_id`),
     attempt: expectSafePositiveInteger(obj.attempt, `${what}.attempt`),
     profile: expectNonEmptyString(obj.profile, `${what}.profile`),
+    execution_role: expectEnum(
+      obj.execution_role,
+      PIPELINE_V2_EXECUTION_ROLES,
+      `${what}.execution_role`,
+    ),
     phase,
   };
   if (execution.attempt !== 1) {
@@ -748,6 +1040,25 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
       obj.failure_reason,
       PIPELINE_V2_AGENT_EXECUTION_FAILURE_REASONS,
       `${what}.failure_reason`,
+    );
+  }
+
+  // The role/iteration biconditional: a stage execution carries exactly
+  // the open iteration index it runs in; planning and control executions
+  // never carry one.
+  if (execution.execution_role === "stage") {
+    if (obj.iteration_index === undefined) {
+      throw new PipelineV2StateError(
+        `${what} has the "stage" execution role but records no iteration index`,
+      );
+    }
+    execution.iteration_index = expectSafePositiveInteger(
+      obj.iteration_index,
+      `${what}.iteration_index`,
+    );
+  } else if (obj.iteration_index !== undefined) {
+    throw new PipelineV2StateError(
+      `${what} has the ${JSON.stringify(execution.execution_role)} execution role but records an iteration index`,
     );
   }
 
@@ -977,8 +1288,8 @@ function validateDecisionExecution(value: unknown, what: string): PipelineV2Deci
   const obj = expectExactObject(
     value,
     what,
-    ["index", "type", "state_id", "phase", "input_digest"],
-    ["result", "failure_reason"],
+    ["index", "type", "state_id", "phase", "input_digest", "execution_role"],
+    ["iteration_index", "result", "failure_reason"],
   );
   if (obj.type !== "decision") {
     throw new PipelineV2StateError(`${what}.type must be "decision", got ${JSON.stringify(obj.type)}`);
@@ -988,9 +1299,29 @@ function validateDecisionExecution(value: unknown, what: string): PipelineV2Deci
     index: expectSafePositiveInteger(obj.index, `${what}.index`),
     type: "decision",
     state_id: expectSafeId(obj.state_id, `${what}.state_id`),
+    execution_role: expectEnum(
+      obj.execution_role,
+      PIPELINE_V2_EXECUTION_ROLES,
+      `${what}.execution_role`,
+    ),
     phase,
     input_digest: expectSha256(obj.input_digest, `${what}.input_digest`),
   };
+  if (execution.execution_role === "stage") {
+    if (obj.iteration_index === undefined) {
+      throw new PipelineV2StateError(
+        `${what} has the "stage" execution role but records no iteration index`,
+      );
+    }
+    execution.iteration_index = expectSafePositiveInteger(
+      obj.iteration_index,
+      `${what}.iteration_index`,
+    );
+  } else if (obj.iteration_index !== undefined) {
+    throw new PipelineV2StateError(
+      `${what} has the ${JSON.stringify(execution.execution_role)} execution role but records an iteration index`,
+    );
+  }
   if (obj.result !== undefined) {
     execution.result = validateDecisionRecord(obj.result, `${what}.result`);
   }
@@ -1129,7 +1460,7 @@ function validateWaitRecord(value: unknown, what: string): PipelineV2WaitRecord 
     value,
     what,
     ["index", "transition_count", "state_id", "reason", "request_sha256", "actions"],
-    ["response"],
+    ["intent", "response"],
   );
   if (!Array.isArray(obj.actions)) {
     throw new PipelineV2StateError(`${what}.actions must be an array`);
@@ -1156,10 +1487,305 @@ function validateWaitRecord(value: unknown, what: string): PipelineV2WaitRecord 
     request_sha256: expectSha256(obj.request_sha256, `${what}.request_sha256`),
     actions,
   };
-  if (obj.response !== undefined) {
-    return { ...record, response: validateWaitResponse(obj.response, `${what}.response`) };
+  const intent = obj.intent !== undefined ? validateWaitIntent(obj.intent, `${what}.intent`) : undefined;
+  const response = obj.response !== undefined ? validateWaitResponse(obj.response, `${what}.response`) : undefined;
+  if (intent !== undefined || response !== undefined) {
+    return {
+      ...record,
+      ...(intent !== undefined ? { intent } : {}),
+      ...(response !== undefined ? { response } : {}),
+    };
   }
   return record;
+}
+
+function validateWaitIntent(value: unknown, what: string): PipelineV2WaitIntentRecord {
+  const obj = expectExactObject(value, what, ["intent_sha256"]);
+  return { intent_sha256: expectSha256(obj.intent_sha256, `${what}.intent_sha256`) };
+}
+
+/** Exact-field validation of one closed stage iteration record. */
+function validateStageIteration(value: unknown, what: string): PipelineV2StageIterationRecord {
+  const obj = expectExactObject(
+    value,
+    what,
+    ["index", "opened_transition_count"],
+    ["closed"],
+  );
+  const record: PipelineV2StageIterationRecord = {
+    index: expectSafePositiveInteger(obj.index, `${what}.index`),
+    opened_transition_count: expectSafeNonNegativeInteger(
+      obj.opened_transition_count,
+      `${what}.opened_transition_count`,
+    ),
+  };
+  if (obj.closed !== undefined) {
+    const closed = expectExactObject(
+      obj.closed,
+      `${what}.closed`,
+      ["by", "closed_transition_count"],
+      ["wait_index"],
+    );
+    const by = expectEnum(
+      closed.by,
+      PIPELINE_V2_STAGE_ITERATION_CLOSE_REASONS,
+      `${what}.closed.by`,
+    );
+    const closedTransitionCount = expectSafeNonNegativeInteger(
+      closed.closed_transition_count,
+      `${what}.closed.closed_transition_count`,
+    );
+    const waitIndex = closed.wait_index === undefined
+      ? undefined
+      : expectSafePositiveInteger(closed.wait_index, `${what}.closed.wait_index`);
+    const iteration: PipelineV2StageIterationRecord = {
+      index: record.index,
+      opened_transition_count: record.opened_transition_count,
+      closed: {
+        by,
+        closed_transition_count: closedTransitionCount,
+        ...(waitIndex !== undefined ? { wait_index: waitIndex } : {}),
+      },
+    };
+    if (by === "grant" || by === "replanned") {
+      if (iteration.closed?.wait_index === undefined) {
+        throw new PipelineV2StateError(
+          `${what} closed with ${JSON.stringify(by)} must name the wait it was closed in`,
+        );
+      }
+    } else if (iteration.closed?.wait_index !== undefined) {
+      throw new PipelineV2StateError(
+        `${what} closed with ${JSON.stringify(by)} must not carry a wait index`,
+      );
+    }
+    if (iteration.closed !== undefined && iteration.closed.closed_transition_count < record.opened_transition_count) {
+      throw new PipelineV2StateError(
+        `${what} records a closed transition count below its opened transition count`,
+      );
+    }
+    return iteration;
+  }
+  return record;
+}
+
+/** Exact-field validation of one stage generation record. */
+function validateStageGeneration(value: unknown, what: string): PipelineV2StageGenerationRecord {
+  const obj = expectExactObject(
+    value,
+    what,
+    [
+      "index",
+      "stage_id",
+      "stage_position",
+      "template_id",
+      "plan_sha256",
+      "initial_budget",
+      "opened_transition_count",
+      "iteration_count",
+      "iterations",
+    ],
+    ["open_iteration", "closed"],
+  );
+  if (!Array.isArray(obj.iterations)) {
+    throw new PipelineV2StateError(`${what}.iterations must be an array`);
+  }
+  const generation: PipelineV2StageGenerationRecord = {
+    index: expectSafePositiveInteger(obj.index, `${what}.index`),
+    stage_id: expectSafeId(obj.stage_id, `${what}.stage_id`),
+    stage_position: expectSafePositiveInteger(obj.stage_position, `${what}.stage_position`),
+    template_id: expectSafeId(obj.template_id, `${what}.template_id`),
+    plan_sha256: expectSha256(obj.plan_sha256, `${what}.plan_sha256`),
+    initial_budget: expectSafePositiveInteger(obj.initial_budget, `${what}.initial_budget`),
+    opened_transition_count: expectSafeNonNegativeInteger(
+      obj.opened_transition_count,
+      `${what}.opened_transition_count`,
+    ),
+    iteration_count: expectSafeNonNegativeInteger(obj.iteration_count, `${what}.iteration_count`),
+    iterations: obj.iterations.map((entry, index) =>
+      validateStageIteration(entry, `${what}.iterations[${index}]`),
+    ),
+  };
+  if (generation.iteration_count !== generation.iterations.length) {
+    throw new PipelineV2StateError(
+      `${what} declares iteration_count ${generation.iteration_count}, but records ${generation.iterations.length} iterations`,
+    );
+  }
+  for (let position = 0; position < generation.iterations.length; position++) {
+    const iteration = generation.iterations[position]!;
+    if (iteration.index !== position + 1) {
+      throw new PipelineV2StateError(
+        `${what} iteration at position ${position} declares index ${iteration.index}; iteration indexes must be contiguous from 1`,
+      );
+    }
+    if (iteration.opened_transition_count < generation.opened_transition_count) {
+      throw new PipelineV2StateError(
+        `${what} iteration ${iteration.index} opened before its generation`,
+      );
+    }
+  }
+  const lastIteration = generation.iterations[generation.iterations.length - 1];
+  const lastIterationOpen = lastIteration !== undefined && lastIteration.closed === undefined;
+  if (obj.open_iteration !== undefined) {
+    const open = expectExactObject(
+      obj.open_iteration,
+      `${what}.open_iteration`,
+      ["index", "opened_transition_count"],
+    );
+    if (!lastIterationOpen) {
+      throw new PipelineV2StateError(
+        `${what} records an open iteration while its last iteration is closed`,
+      );
+    }
+    if (
+      open.index !== lastIteration.index ||
+      open.opened_transition_count !== lastIteration.opened_transition_count
+    ) {
+      throw new PipelineV2StateError(
+        `${what}.open_iteration does not match its last open iteration record`,
+      );
+    }
+    return {
+      ...generation,
+      open_iteration: { index: open.index, opened_transition_count: open.opened_transition_count },
+    };
+  }
+  if (lastIterationOpen) {
+    throw new PipelineV2StateError(
+      `${what} records an open iteration without its open_iteration projection`,
+    );
+  }
+  if (obj.closed !== undefined) {
+    const closed = expectExactObject(
+      obj.closed,
+      `${what}.closed`,
+      ["by", "closed_transition_count"],
+    );
+    const by = expectEnum(
+      closed.by,
+      PIPELINE_V2_STAGE_GENERATION_CLOSE_REASONS,
+      `${what}.closed.by`,
+    );
+    if (lastIterationOpen) {
+      throw new PipelineV2StateError(
+        `${what} is closed while its last iteration is still open`,
+      );
+    }
+    const closedAnchor = expectSafeNonNegativeInteger(
+      closed.closed_transition_count,
+      `${what}.closed.closed_transition_count`,
+    );
+    if (closedAnchor < generation.opened_transition_count) {
+      throw new PipelineV2StateError(
+        `${what} records a closed transition count below its opened transition count`,
+      );
+    }
+    const lastClosedAnchor =
+      lastIteration?.closed?.closed_transition_count ?? generation.opened_transition_count;
+    if (lastIteration !== undefined && closedAnchor < lastClosedAnchor) {
+      throw new PipelineV2StateError(
+        `${what} closed before its last iteration`,
+      );
+    }
+    return {
+      ...generation,
+      closed: { by, closed_transition_count: closedAnchor },
+    };
+  }
+  return generation;
+}
+
+/** Exact-field validation of one accepted task revision ledger record. */
+function validateTaskRevision(value: unknown, what: string): PipelineV2TaskRevisionState {
+  const obj = expectExactObject(
+    value,
+    what,
+    ["index", "task_id", "revision", "sha256", "previous_sha256"],
+    ["wait_index", "intent_sha256"],
+  );
+  const revision = expectSafePositiveInteger(obj.revision, `${what}.revision`);
+  const previous = obj.previous_sha256 === null ? null : expectSha256(
+    obj.previous_sha256,
+    `${what}.previous_sha256`,
+  );
+  const record: PipelineV2TaskRevisionState = {
+    index: expectSafePositiveInteger(obj.index, `${what}.index`),
+    task_id: expectSafeId(obj.task_id, `${what}.task_id`),
+    revision,
+    sha256: expectSha256(obj.sha256, `${what}.sha256`),
+    previous_sha256: previous,
+  };
+  if ((revision === 1) !== (previous === null)) {
+    throw new PipelineV2StateError(
+      `${what} declares revision ${revision} with previous_sha256 ${previous === null ? "null" : "set"}; revision 1 must carry a null previous digest and every later revision a digest`,
+    );
+  }
+  if (revision === 1) {
+    if (obj.wait_index !== undefined || obj.intent_sha256 !== undefined) {
+      throw new PipelineV2StateError(
+        `${what} accepts a revision-1 task revision outside the user wait; revision 1 carries no wait links`,
+      );
+    }
+  } else {
+    if (obj.wait_index === undefined || obj.intent_sha256 === undefined) {
+      throw new PipelineV2StateError(
+        `${what} accepts a user-response task revision without its wait and intent links`,
+      );
+    }
+    return {
+      ...record,
+      wait_index: expectSafePositiveInteger(obj.wait_index, `${what}.wait_index`),
+      intent_sha256: expectSha256(obj.intent_sha256, `${what}.intent_sha256`),
+    };
+  }
+  return record;
+}
+
+/** Exact-field validation of one accepted plan revision ledger record. */
+function validatePlanRevision(value: unknown, what: string): PipelineV2PlanRevisionState {
+  const obj = expectExactObject(value, what, [
+    "index",
+    "revision",
+    "sha256",
+    "previous_sha256",
+    "origin_execution",
+  ]);
+  const revision = expectSafePositiveInteger(obj.revision, `${what}.revision`);
+  const previous = obj.previous_sha256 === null
+    ? null
+    : expectSha256(obj.previous_sha256, `${what}.previous_sha256`);
+  if ((revision === 1) !== (previous === null)) {
+    throw new PipelineV2StateError(
+      `${what} declares revision ${revision} with previous_sha256 ${previous === null ? "null" : "set"}; revision 1 must carry a null previous digest and every later revision a digest`,
+    );
+  }
+  return {
+    index: expectSafePositiveInteger(obj.index, `${what}.index`),
+    revision,
+    sha256: expectSha256(obj.sha256, `${what}.sha256`),
+    previous_sha256: previous,
+    origin_execution: expectSafePositiveInteger(obj.origin_execution, `${what}.origin_execution`),
+  };
+}
+
+/** Exact-field validation of one iteration grant ledger record. */
+function validateIterationGrant(value: unknown, what: string): PipelineV2IterationGrantState {
+  const obj = expectExactObject(value, what, [
+    "index",
+    "generation_index",
+    "wait_index",
+    "intent_sha256",
+    "additional_iterations",
+  ]);
+  return {
+    index: expectSafePositiveInteger(obj.index, `${what}.index`),
+    generation_index: expectSafePositiveInteger(obj.generation_index, `${what}.generation_index`),
+    wait_index: expectSafePositiveInteger(obj.wait_index, `${what}.wait_index`),
+    intent_sha256: expectSha256(obj.intent_sha256, `${what}.intent_sha256`),
+    additional_iterations: expectSafePositiveInteger(
+      obj.additional_iterations,
+      `${what}.additional_iterations`,
+    ),
+  };
 }
 
 /**
@@ -1187,6 +1813,10 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       "cursor",
       "executions",
       "transitions",
+      "generations",
+      "task_revisions",
+      "plan_revisions",
+      "grants",
       "waits",
     ],
     ["terminal", "run_outputs", "failure"],
@@ -1260,6 +1890,97 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   const waits = obj.waits.map((wait, index) =>
     validateWaitRecord(wait, `pipeline v2 run state waits[${index}]`),
   );
+  if (!Array.isArray(obj.generations)) {
+    throw new PipelineV2StateError("pipeline v2 run state generations must be an array");
+  }
+  const generations = obj.generations.map((generation, index) =>
+    validateStageGeneration(generation, `pipeline v2 run state generations[${index}]`),
+  );
+  if (!Array.isArray(obj.task_revisions)) {
+    throw new PipelineV2StateError("pipeline v2 run state task_revisions must be an array");
+  }
+  const taskRevisions = obj.task_revisions.map((task, index) =>
+    validateTaskRevision(task, `pipeline v2 run state task_revisions[${index}]`),
+  );
+  if (!Array.isArray(obj.plan_revisions)) {
+    throw new PipelineV2StateError("pipeline v2 run state plan_revisions must be an array");
+  }
+  const planRevisions = obj.plan_revisions.map((plan, index) =>
+    validatePlanRevision(plan, `pipeline v2 run state plan_revisions[${index}]`),
+  );
+  if (!Array.isArray(obj.grants)) {
+    throw new PipelineV2StateError("pipeline v2 run state grants must be an array");
+  }
+  const grants = obj.grants.map((grant, index) =>
+    validateIterationGrant(grant, `pipeline v2 run state grants[${index}]`),
+  );
+  // The accepted plan revisions form one chain: revision and index are
+  // contiguous from 1 and every record's previous digest is exactly the
+  // previous ledger record's digest (the reducer derives it there; the
+  // loader re-derives it from the records alone).
+  for (let position = 0; position < planRevisions.length; position++) {
+    const plan = planRevisions[position]!;
+    if (plan.index !== position + 1 || plan.revision !== position + 1) {
+      throw new PipelineV2StateError(
+        `plan revision at position ${position} declares index ${plan.index} and revision ${plan.revision}; plan revisions must be contiguous from 1 and match their ledger position`,
+      );
+    }
+    const expectedPrevious = position === 0 ? null : planRevisions[position - 1]!.sha256;
+    if (plan.previous_sha256 !== expectedPrevious) {
+      throw new PipelineV2StateError(
+        `plan revision record ${plan.index} declares a previous digest that does not match the previous ledger record`,
+      );
+    }
+  }
+  // The accepted task revisions form one chain per task: the records of
+  // one task appear in ledger order with revisions contiguous from 1 and
+  // each record's previous digest naming exactly its predecessor.
+  {
+    const lastPerTask = new Map<string, PipelineV2TaskRevisionState>();
+    for (let position = 0; position < taskRevisions.length; position++) {
+      const task = taskRevisions[position]!;
+      const last = lastPerTask.get(task.task_id);
+      if (task.revision === 1) {
+        if (last !== undefined) {
+          throw new PipelineV2StateError(
+            `task revision record ${task.index} accepts revision 1 of ${JSON.stringify(task.task_id)}, which is already recorded at revision ${last.revision}`,
+          );
+        }
+      } else {
+        if (last === undefined) {
+          throw new PipelineV2StateError(
+            `task revision record ${task.index} has no recorded predecessor for ${JSON.stringify(task.task_id)}`,
+          );
+        }
+        if (last.revision !== task.revision - 1) {
+          throw new PipelineV2StateError(
+            `task revision record ${task.index} must follow revision ${last.revision + 1} of ${JSON.stringify(task.task_id)}`,
+          );
+        }
+        if (task.previous_sha256 !== last.sha256) {
+          throw new PipelineV2StateError(
+            `task revision record ${task.index} declares a previous digest that does not match the previous record of ${JSON.stringify(task.task_id)}`,
+          );
+        }
+      }
+      lastPerTask.set(task.task_id, task);
+    }
+  }
+  // One grant belongs to exactly one (generation, wait) pair: a repeated
+  // grant for the same pair is rejected before the replay consumes the
+  // ledger (the reducer rejects the repeat at write time).
+  {
+    const grantPairs = new Set<string>();
+    for (const grant of grants) {
+      const pair = `${grant.generation_index}:${grant.wait_index}`;
+      if (grantPairs.has(pair)) {
+        throw new PipelineV2StateError(
+          `grant record ${grant.index} repeats the grant of generation ${grant.generation_index} for wait ${grant.wait_index}`,
+        );
+      }
+      grantPairs.add(pair);
+    }
+  }
   // Wait record indexes are contiguous from 1: gaps and duplicates are
   // rejected before the joint replay consumes the journal.
   for (let position = 0; position < waits.length; position++) {
@@ -1380,20 +2101,64 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     );
   }
 
-  // Joint replay of the two authoritative record streams: the committed
-  // graph transitions and the wait journal. The replay cursor starts at
-  // the entry state; before every graph transition with the next ordinal
-  // N + 1 it applies, in journal order, every wait record bound to the
-  // boundary `transition_count === N`. A wait record must name the replay
-  // cursor; a response moves the replay cursor to the declared action
-  // target; an open record may only end the journal (no later waits, no
-  // later executions or transitions, a fully settled and committed
-  // history) and pins the replay cursor at its own state. A response
-  // never consumes graph budget, and the persisted cursor must equal the
-  // replayed cursor after the full replay.
+  // Joint replay of the authoritative record streams: the committed graph
+  // transitions, the wait journal, the stage generations and their
+  // iterations, the iteration grants, the accepted task revisions, and the
+  // accepted plan revisions. The replay cursor starts at the entry state;
+  // before every graph transition with the next ordinal N + 1 it applies,
+  // in anchor order, every record bound to the boundary
+  // `transition_count === N`: the wait records (whose responses move the
+  // replay cursor to the declared action target), the grants and the
+  // user-response task revisions of the waits being processed, the
+  // iteration closures bound to those waits, then the active-bound
+  // lifecycle closures, the execution starts (the global execution index
+  // k starts at committed transition count k - 1), the generation and
+  // iteration openings, and the plan revisions (whose acceptance position
+  // is derived from their settled-but-unbound planning origin). Within one
+  // boundary the deterministic order is: the wait records with their
+  // waiting-bound intervention records and responses, the active-bound
+  // iteration and generation closures, the execution starts, the
+  // generation and iteration openings, the plan revisions, then the
+  // transition itself. The replay fails closed on every structural
+  // contradiction — an event before its precondition, an anchor outside
+  // the journal, a reference to a generation or iteration that is not
+  // open, or an execution whose recorded role contradicts the lifecycle
+  // timeline. A response never consumes graph budget, and the persisted
+  // cursor must equal the replayed cursor after the full replay.
   let replayCursor = pipeline.entry_state;
   let waitPosition = 0;
+  let grantPosition = 0;
+  let planPosition = 0;
+  const iterationPositions = generations.map(() => 0);
+  const grantSums = new Map<number, number>();
+  /** The consumed iteration closes, keyed `${generation.index}:${iteration.index}`. */
+  const closedCloses = new Set<string>();
+  let openGenerationIndex: number | null = null;
+  let openIterationGeneration: number | null = null;
+  let openIterationIndex: number | null = null;
+  let openWaitBoundary = false;
+
+  const grantOrdinal = (grant: PipelineV2IterationGrantState): number => {
+    const wait = waits[grant.wait_index - 1];
+    if (wait === undefined) {
+      throw new PipelineV2StateError(
+        `grant record ${grant.index} references wait ${grant.wait_index}, which does not exist`,
+      );
+    }
+    return wait.transition_count;
+  };
+  const taskRevisionOrdinal = (task: PipelineV2TaskRevisionState): number => {
+    const wait = task.wait_index === undefined ? undefined : waits[task.wait_index - 1];
+    if (task.wait_index === undefined || wait === undefined) {
+      throw new PipelineV2StateError(
+        `task revision record ${task.index} references wait ${JSON.stringify(task.wait_index)}, which does not exist`,
+      );
+    }
+    return wait.transition_count;
+  };
+
   for (let ordinal = 0; ordinal <= transitions.length; ordinal++) {
+    openWaitBoundary = false;
     while (waitPosition < waits.length) {
       const wait = waits[waitPosition]!;
       if (wait.transition_count < ordinal) {
@@ -1409,6 +2174,100 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
           `wait record ${wait.index} names state ${JSON.stringify(wait.state_id)}, which does not match the replay cursor ${JSON.stringify(replayCursor)}`,
         );
       }
+      // The waiting-bound intervention records of this wait, in their
+      // durable append order: the grants, the user-response task
+      // revisions, and the wait-bound iteration closures. They are
+      // processed whether this wait record is still open (the last
+      // journal record of a waiting run) or already closed.
+      while (grantPosition < grants.length && grantOrdinal(grants[grantPosition]!) === ordinal) {
+        const grant = grants[grantPosition]!;
+        const generation = generations[grant.generation_index - 1];
+        if (generation === undefined) {
+          throw new PipelineV2StateError(
+            `grant record ${grant.index} references generation ${grant.generation_index}, which does not exist`,
+          );
+        }
+        if (openGenerationIndex !== grant.generation_index) {
+          throw new PipelineV2StateError(
+            `grant record ${grant.index} references generation ${grant.generation_index}, which is not open at committed transition count ${ordinal}`,
+          );
+        }
+        if (wait.intent === undefined || wait.intent.intent_sha256 !== grant.intent_sha256) {
+          throw new PipelineV2StateError(
+            `grant record ${grant.index} references an intent that wait record ${wait.index} has not accepted`,
+          );
+        }
+        grantSums.set(
+          grant.generation_index,
+          (grantSums.get(grant.generation_index) ?? 0) + grant.additional_iterations,
+        );
+        grantPosition += 1;
+      }
+      // The user-response task revisions of this wait, in ledger order:
+      // every revision-above-1 record names exactly this wait's ordinal
+      // and carries the intent the wait accepted. The ledger order within
+      // one wait is free (tasks and grants interleave), so the scan is
+      // per-wait, not cursor-based.
+      for (const task of taskRevisions) {
+        if (task.revision === 1 || task.wait_index !== wait.index) {
+          continue;
+        }
+        if (taskRevisionOrdinal(task) !== ordinal) {
+          continue;
+        }
+        if (wait.intent === undefined || wait.intent.intent_sha256 !== task.intent_sha256) {
+          throw new PipelineV2StateError(
+            `task revision record ${task.index} references an intent that wait record ${wait.index} has not accepted`,
+          );
+        }
+      }
+      for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+        const generation = generations[generationIndex]!;
+        // The wait-bound closure binds to the open iteration: the replay
+        // resolves it through the open-iteration tracking (the record the
+        // reducer closed), not through the open-consumption position.
+        if (openIterationGeneration !== generation.index) {
+          continue;
+        }
+        const iteration = generation.iterations[openIterationIndex! - 1]!;
+        const closed = iteration.closed;
+        if (
+          closed === undefined ||
+          !(closed.by === "grant" || closed.by === "replanned") ||
+          closed.wait_index !== wait.index ||
+          closed.closed_transition_count !== ordinal
+        ) {
+          continue;
+        }
+        if (wait.intent === undefined) {
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} closes an iteration with ${JSON.stringify(closed.by)} but carries no accepted intent`,
+          );
+        }
+        if (closed.by === "grant") {
+          const grant = grants.find(
+            (candidate) =>
+              candidate.generation_index === generation.index &&
+              candidate.wait_index === wait.index &&
+              candidate.intent_sha256 === wait.intent!.intent_sha256,
+          );
+          if (grant === undefined) {
+            throw new PipelineV2StateError(
+              `iteration ${iteration.index} of generation ${generation.index} closed with ${JSON.stringify("grant")} without a recorded grant for wait ${wait.index}`,
+            );
+          }
+        } else {
+          const task = taskRevisions.some((candidate) => candidate.wait_index === wait.index);
+          if (!task) {
+            throw new PipelineV2StateError(
+              `iteration ${iteration.index} of generation ${generation.index} closed with ${JSON.stringify("replanned")} without an accepted task revision for wait ${wait.index}`,
+            );
+          }
+        }
+        closedCloses.add(`${generation.index}:${iteration.index}`);
+        openIterationGeneration = null;
+        openIterationIndex = null;
+      }
       if (wait.response === undefined) {
         if (waitPosition !== waits.length - 1) {
           throw new PipelineV2StateError(
@@ -1420,6 +2279,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
             `wait record ${wait.index} is open but ${transitions.length - ordinal} committed transitions follow it; no transition may follow an open wait record`,
           );
         }
+        openWaitBoundary = true;
         if (executions.length !== transitions.length) {
           throw new PipelineV2StateError(
             `wait record ${wait.index} is open while execution ${transitions.length + 1} has no committed transition; an open wait record requires a fully settled and committed history`,
@@ -1437,6 +2297,206 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       replayCursor = action.to;
       waitPosition += 1;
     }
+    // Active-bound iteration closures (normal_close / exhausted) at this
+    // boundary, before the execution starts. This block also runs on the
+    // final boundary (ordinal === transitions.length): a run may end its
+    // journal with a just-closed iteration, an open iteration, a just-opened
+    // generation, or a settled-but-unbound planning execution whose plan
+    // revision was accepted — every one of those records must still be
+    // replay-verified. Only the transition application below is skipped on
+    // the final boundary.
+    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+      const generation = generations[generationIndex]!;
+      if (openIterationGeneration !== generation.index) {
+        continue;
+      }
+      const iteration = generation.iterations[openIterationIndex! - 1]!;
+      const closed = iteration.closed;
+      if (
+        closed === undefined ||
+        !(closed.by === "normal_close" || closed.by === "exhausted") ||
+        closed.closed_transition_count !== ordinal
+      ) {
+        continue;
+      }
+      if (openWaitBoundary) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} closes on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; the ordinary closures run only on an active boundary`,
+        );
+      }
+      closedCloses.add(`${generation.index}:${iteration.index}`);
+      openIterationGeneration = null;
+      openIterationIndex = null;
+    }
+    // Generation closures at this boundary.
+    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+      const generation = generations[generationIndex]!;
+      if (
+        generation.closed !== undefined &&
+        generation.closed.closed_transition_count === ordinal &&
+        iterationPositions[generationIndex] === generation.iterations.length
+      ) {
+        if (openWaitBoundary) {
+          throw new PipelineV2StateError(
+            `generation ${generation.index} closes on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; a stage generation cannot close while the run is waiting`,
+          );
+        }
+        if (openGenerationIndex !== generation.index) {
+          throw new PipelineV2StateError(
+            `generation ${generation.index} closes at committed transition count ${ordinal}, but it is not the open generation there`,
+          );
+        }
+        if (openIterationGeneration !== null) {
+          throw new PipelineV2StateError(
+            `generation ${generation.index} closes while an iteration is still open`,
+          );
+        }
+        openGenerationIndex = null;
+      }
+    }
+    // Generation openings at this boundary.
+    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+      const generation = generations[generationIndex]!;
+      if (generation.opened_transition_count !== ordinal) {
+        continue;
+      }
+      if (openWaitBoundary) {
+        throw new PipelineV2StateError(
+          `generation ${generation.index} opens on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; no stage generation may open while the run is waiting`,
+        );
+      }
+      if (openGenerationIndex !== null) {
+        throw new PipelineV2StateError(
+          `generation ${generation.index} opens while generation ${openGenerationIndex} is still open; at most one generation may be open`,
+        );
+      }
+      const acceptedPlan = planRevisions[planPosition - 1];
+      if (acceptedPlan === undefined || acceptedPlan.sha256 !== generation.plan_sha256) {
+        throw new PipelineV2StateError(
+          `generation ${generation.index} binds plan digest ${JSON.stringify(generation.plan_sha256)}, which is not the last accepted plan revision at committed transition count ${ordinal}`,
+        );
+      }
+      openGenerationIndex = generation.index;
+    }
+    // Iteration openings at this boundary, with the effective-budget
+    // check: the immutable initial budget plus the generation's grants
+    // recorded up to this boundary. The sum is computed with an overflow
+    // guard so an unrepresentable budget fails closed. The openings are
+    // processed before the execution starts because the reducer opens the
+    // iteration at the very cursor boundary the first stage execution of
+    // the iteration starts at.
+    for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+      const generation = generations[generationIndex]!;
+      const position = iterationPositions[generationIndex]!;
+      if (position >= generation.iterations.length) {
+        continue;
+      }
+      const iteration = generation.iterations[position]!;
+      if (iteration.opened_transition_count !== ordinal) {
+        continue;
+      }
+      if (openWaitBoundary) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} opens on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; no stage iteration may open while the run is waiting`,
+        );
+      }
+      if (openGenerationIndex !== generation.index) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} opens while that generation is not the open generation`,
+        );
+      }
+      if (openIterationGeneration !== null) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} opens while the iteration of generation ${openIterationGeneration} is still open; at most one iteration may be open`,
+        );
+      }
+      let grantsSum: number;
+      try {
+        grantsSum = additionSafe(
+          generation.initial_budget,
+          grantSums.get(generation.index) ?? 0,
+          `generation ${generation.index}`,
+        );
+      } catch (cause) {
+        if (cause instanceof PipelineV2StateError) {
+          throw new PipelineV2StateError(
+            `iteration ${iteration.index} of ${cause.message} has an unrepresentable effective iteration budget`,
+          );
+        }
+        throw cause;
+      }
+      if (position + 1 > grantsSum) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} exceeds the effective iteration budget ${grantsSum} (initial budget ${generation.initial_budget} plus recorded grants)`,
+        );
+      }
+      openIterationGeneration = generation.index;
+      openIterationIndex = iteration.index;
+      iterationPositions[generationIndex] = position + 1;
+    }
+    // The execution starts: the global execution index k starts at
+    // committed transition count k - 1. A stage execution must reference
+    // the open iteration; a planning or control execution must start
+    // outside any open iteration.
+    const startingExecution = executions[ordinal];
+    if (startingExecution !== undefined) {
+      if (startingExecution.execution_role === "stage") {
+        if (openIterationGeneration === null || openIterationIndex === null) {
+          throw new PipelineV2StateError(
+            `execution ${startingExecution.index} has the "stage" role but no iteration is open at committed transition count ${ordinal}`,
+          );
+        }
+        if (startingExecution.iteration_index !== openIterationIndex) {
+          throw new PipelineV2StateError(
+            `execution ${startingExecution.index} references iteration ${startingExecution.iteration_index}, which is not the open iteration ${openIterationIndex} at committed transition count ${ordinal}`,
+          );
+        }
+      } else if (openIterationGeneration !== null) {
+        throw new PipelineV2StateError(
+          `execution ${startingExecution.index} has the ${JSON.stringify(startingExecution.execution_role)} role but starts inside the open iteration of generation ${openIterationGeneration}`,
+        );
+      }
+    }
+    // The plan revisions at this boundary: the acceptance position is
+    // derived from the settled-but-unbound planning execution the plan
+    // names — the origin execution starts at committed transition count
+    // origin - 1 and must be exactly the last execution started there
+    // (the unbound one), settled, and carried the planning role.
+    while (planPosition < planRevisions.length && planRevisions[planPosition]!.origin_execution - 1 === ordinal) {
+      const plan = planRevisions[planPosition]!;
+      if (openWaitBoundary) {
+        throw new PipelineV2StateError(
+          `plan revision record ${plan.index} is accepted on the boundary of the open wait record ${waits[waitPosition - 1]?.index ?? "?"}; a plan revision cannot be accepted while the run is waiting`,
+        );
+      }
+      if (openIterationGeneration !== null) {
+        throw new PipelineV2StateError(
+          `plan revision record ${plan.index} is accepted while iteration ${openIterationIndex} of generation ${openIterationGeneration} is open`,
+        );
+      }
+      if (plan.origin_execution !== ordinal + 1) {
+        throw new PipelineV2StateError(
+          `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which is not the last execution started at committed transition count ${ordinal}`,
+        );
+      }
+      const origin = executions[plan.origin_execution - 1];
+      if (origin === undefined) {
+        throw new PipelineV2StateError(
+          `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which does not exist`,
+        );
+      }
+      if (origin.execution_role !== "planning") {
+        throw new PipelineV2StateError(
+          `plan revision record ${plan.index} names origin execution ${plan.origin_execution} with the ${JSON.stringify(origin.execution_role)} role; plan acceptance requires a planning execution`,
+        );
+      }
+      if (!isSettledExecution(origin)) {
+        throw new PipelineV2StateError(
+          `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which has phase ${JSON.stringify(origin.phase)}; plan acceptance requires a settled execution`,
+        );
+      }
+      planPosition += 1;
+    }
     if (ordinal === transitions.length) {
       break;
     }
@@ -1453,6 +2513,47 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     throw new PipelineV2StateError(
       `wait record ${wait.index} declares transition_count ${wait.transition_count}, which exceeds the ${transitions.length} committed transitions`,
     );
+  }
+  if (grantPosition !== grants.length) {
+    const grant = grants[grantPosition]!;
+    throw new PipelineV2StateError(
+      `grant record ${grant.index} declares a wait whose transition count exceeds the ${transitions.length} committed transitions`,
+    );
+  }
+  // Every user-response task revision names a wait whose anchor must be
+  // within the committed transition count; revision-1 records are
+  // position-free (the planning flow accepts them on any active boundary).
+  for (const task of taskRevisions) {
+    if (task.revision === 1) {
+      continue;
+    }
+    const ordinal = taskRevisionOrdinal(task);
+    if (ordinal > transitions.length) {
+      throw new PipelineV2StateError(
+        `task revision record ${task.index} declares a wait whose transition count exceeds the ${transitions.length} committed transitions`,
+      );
+    }
+  }
+  if (planPosition !== planRevisions.length) {
+    const plan = planRevisions[planPosition]!;
+    throw new PipelineV2StateError(
+      `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, whose start exceeds the ${transitions.length} committed transitions`,
+    );
+  }
+  for (let generationIndex = 0; generationIndex < generations.length; generationIndex++) {
+    const generation = generations[generationIndex]!;
+    if (iterationPositions[generationIndex] !== generation.iterations.length) {
+      throw new PipelineV2StateError(
+        `generation ${generation.index} records iterations whose anchors exceed the ${transitions.length} committed transitions`,
+      );
+    }
+    for (const iteration of generation.iterations) {
+      if (iteration.closed !== undefined && !closedCloses.has(`${generation.index}:${iteration.index}`)) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} records a close that never matched the open iteration at its anchor`,
+        );
+      }
+    }
   }
   if (cursor.current_state !== replayCursor) {
     throw new PipelineV2StateError(
@@ -1650,6 +2751,10 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     cursor,
     executions,
     transitions,
+    generations,
+    task_revisions: taskRevisions,
+    plan_revisions: planRevisions,
+    grants,
     waits,
   };
   if (terminal !== undefined) {
@@ -1662,6 +2767,78 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     state.failure = failure;
   }
   return deepFreeze(state);
+}
+
+/**
+ * The single open stage iteration of a validated run state, if any: the
+ * open generation (the last record without a `closed` projection) whose
+ * last iteration entry is still open. The coordinator resolves the exact
+ * durable `iteration_index` of a stage start from it; the restore
+ * verifier uses the same shape for its compiled projection checks. There
+ * is no second registry and no replay here — the loader has already
+ * proven the document's coherence.
+ */
+export function pipelineV2OpenStageIteration(
+  state: PipelineV2RunState,
+): {
+  readonly generation_index: number;
+  readonly template_id: string;
+  readonly stage_id: string;
+  readonly iteration_index: number;
+} | null {
+  const last = state.generations[state.generations.length - 1];
+  if (last === undefined || last.closed !== undefined) {
+    return null;
+  }
+  const iteration = last.iterations[last.iterations.length - 1];
+  if (iteration === undefined || iteration.closed !== undefined) {
+    return null;
+  }
+  return Object.freeze({
+    generation_index: last.index,
+    template_id: last.template_id,
+    stage_id: last.stage_id,
+    iteration_index: iteration.index,
+  });
+}
+
+/**
+ * The stage generation an execution's `iteration_index` references. The
+ * loader's positional replay proves the referenced iteration was open at
+ * the execution's start; this pure query is the read-only resolution the
+ * restore verifier and the coordinator share, so the two sides cannot
+ * drift apart.
+ */
+export function pipelineV2StageIterationAt(
+  state: PipelineV2RunState,
+  transitionCount: number,
+): {
+  readonly generation_index: number;
+  readonly template_id: string;
+  readonly stage_id: string;
+  readonly iteration_index: number;
+} | null {
+  for (const generation of state.generations) {
+    for (const iteration of generation.iterations) {
+      // The loader's replay orders the iteration opens before the
+      // execution starts of the same boundary and the iteration closes
+      // before them, so an iteration is open at a start exactly when it
+      // was opened at or before that boundary and closed strictly after
+      // it: the first stage execution of an iteration starts at the very
+      // count the iteration was opened at, while an iteration closed at
+      // the queried count is already closed there.
+      const closed = iteration.closed?.closed_transition_count ?? Number.MAX_SAFE_INTEGER;
+      if (iteration.opened_transition_count <= transitionCount && transitionCount < closed) {
+        return Object.freeze({
+          generation_index: generation.index,
+          template_id: generation.template_id,
+          stage_id: generation.stage_id,
+          iteration_index: iteration.index,
+        });
+      }
+    }
+  }
+  return null;
 }
 
 export function parsePipelineV2RunState(raw: string): PipelineV2RunState {
@@ -1764,6 +2941,8 @@ function cloneWaitRecord(record: PipelineV2WaitRecord): PipelineV2WaitRecord {
           action_id: record.response.action_id,
           response_sha256: record.response.response_sha256,
         };
+  const intent =
+    record.intent === undefined ? undefined : { intent_sha256: record.intent.intent_sha256 };
   return {
     index: record.index,
     transition_count: record.transition_count,
@@ -1771,8 +2950,90 @@ function cloneWaitRecord(record: PipelineV2WaitRecord): PipelineV2WaitRecord {
     reason: record.reason,
     request_sha256: record.request_sha256,
     actions: record.actions.map((action) => ({ id: action.id, to: action.to })),
+    ...(intent !== undefined ? { intent } : {}),
     ...(response !== undefined ? { response } : {}),
   };
+}
+
+function cloneStageIteration(iteration: PipelineV2StageIterationRecord): PipelineV2StageIterationRecord {
+  if (iteration.closed === undefined) {
+    return { index: iteration.index, opened_transition_count: iteration.opened_transition_count };
+  }
+  const closed: PipelineV2StageIterationRecord["closed"] = {
+    by: iteration.closed.by,
+    closed_transition_count: iteration.closed.closed_transition_count,
+  };
+  if (iteration.closed.wait_index !== undefined) {
+    return {
+      index: iteration.index,
+      opened_transition_count: iteration.opened_transition_count,
+      closed: { ...closed, wait_index: iteration.closed.wait_index },
+    };
+  }
+  return {
+    index: iteration.index,
+    opened_transition_count: iteration.opened_transition_count,
+    closed,
+  };
+}
+
+function cloneStageGeneration(
+  generation: PipelineV2StageGenerationRecord,
+): PipelineV2StageGenerationRecord {
+  const open =
+    generation.open_iteration === undefined
+      ? {}
+      : {
+          open_iteration: {
+            index: generation.open_iteration.index,
+            opened_transition_count: generation.open_iteration.opened_transition_count,
+          },
+        };
+  const closed =
+    generation.closed === undefined
+      ? {}
+      : {
+          closed: {
+            by: generation.closed.by,
+            closed_transition_count: generation.closed.closed_transition_count,
+          },
+        };
+  return {
+    index: generation.index,
+    stage_id: generation.stage_id,
+    stage_position: generation.stage_position,
+    template_id: generation.template_id,
+    plan_sha256: generation.plan_sha256,
+    initial_budget: generation.initial_budget,
+    opened_transition_count: generation.opened_transition_count,
+    iteration_count: generation.iteration_count,
+    iterations: generation.iterations.map(cloneStageIteration),
+    ...open,
+    ...closed,
+  };
+}
+
+function cloneTaskRevision(task: PipelineV2TaskRevisionState): PipelineV2TaskRevisionState {
+  const waitLinks =
+    task.wait_index === undefined || task.intent_sha256 === undefined
+      ? {}
+      : { wait_index: task.wait_index, intent_sha256: task.intent_sha256 };
+  return {
+    index: task.index,
+    task_id: task.task_id,
+    revision: task.revision,
+    sha256: task.sha256,
+    previous_sha256: task.previous_sha256,
+    ...waitLinks,
+  };
+}
+
+function clonePlanRevision(plan: PipelineV2PlanRevisionState): PipelineV2PlanRevisionState {
+  return { ...plan };
+}
+
+function cloneIterationGrant(grant: PipelineV2IterationGrantState): PipelineV2IterationGrantState {
+  return { ...grant };
 }
 
 function cloneState(state: PipelineV2RunState): PipelineV2RunState {
@@ -1789,6 +3050,10 @@ function cloneState(state: PipelineV2RunState): PipelineV2RunState {
     cursor: { ...state.cursor },
     executions: state.executions.map(cloneExecution),
     transitions: state.transitions.map(cloneTransition),
+    generations: state.generations.map(cloneStageGeneration),
+    task_revisions: state.task_revisions.map(cloneTaskRevision),
+    plan_revisions: state.plan_revisions.map(clonePlanRevision),
+    grants: state.grants.map(cloneIterationGrant),
     waits: state.waits.map(cloneWaitRecord),
   };
   if (state.terminal !== undefined) {
@@ -1893,6 +3158,83 @@ function expectTransitionStep(step: unknown, what: string): TransitionStep {
     to: expectSafeId(obj.to, `${what}.to`),
     transition_index: expectSafeNonNegativeInteger(obj.transition_index, `${what}.transition_index`),
   };
+}
+
+/**
+ * The single open stage generation of a run state (the last generation
+ * record without a `closed` projection), if any. The loader proves there
+ * is at most one; the reducer mirrors that rule at write time.
+ */
+function openGenerationOf(
+  current: PipelineV2RunState,
+): PipelineV2StageGenerationRecord | undefined {
+  const last = current.generations[current.generations.length - 1];
+  return last !== undefined && last.closed === undefined ? last : undefined;
+}
+
+/**
+ * The open iteration of the open generation, if any. At most one
+ * iteration is open at a time and it belongs to the open generation.
+ */
+function openIterationOf(current: PipelineV2RunState): {
+  readonly generation: PipelineV2StageGenerationRecord;
+  readonly index: number;
+} | undefined {
+  const generation = openGenerationOf(current);
+  const iteration = generation?.iterations[generation.iterations.length - 1];
+  if (generation === undefined || iteration === undefined || iteration.closed !== undefined) {
+    return undefined;
+  }
+  return { generation, index: iteration.index };
+}
+
+/**
+ * The role contract of the start commands: a stage execution must name
+ * exactly the open iteration of the open generation; a planning or
+ * control execution must start outside any open iteration and carry no
+ * iteration index. Returns the durable iteration index for a stage role.
+ */
+function requireIterationForRole(
+  current: PipelineV2RunState,
+  role: PipelineV2ExecutionRole,
+  commandIterationIndex: number | undefined,
+  what: string,
+): number | undefined {
+  const open = openIterationOf(current);
+  if (role === "stage") {
+    if (open === undefined) {
+      fail(current, `${what} with the "stage" role requires an open stage generation with an open iteration`);
+    }
+    if (commandIterationIndex === undefined) {
+      throw new PipelineV2StateError(
+        `${what} with the "stage" role requires the open iteration index`,
+      );
+    }
+    if (!isPositiveSafeInteger(commandIterationIndex)) {
+      throw new PipelineV2StateError(
+        `${what} iteration index must be a positive safe integer, got ${JSON.stringify(commandIterationIndex)}`,
+      );
+    }
+    if (commandIterationIndex !== open.index) {
+      fail(
+        current,
+        `${what} names iteration ${JSON.stringify(commandIterationIndex)}, but the open iteration of generation ${open.generation.index} is ${open.index}`,
+      );
+    }
+    return open.index;
+  }
+  if (commandIterationIndex !== undefined) {
+    throw new PipelineV2StateError(
+      `${what} with the ${JSON.stringify(role)} role must not carry an iteration index`,
+    );
+  }
+  if (open !== undefined) {
+    fail(
+      current,
+      `${what} with the ${JSON.stringify(role)} role cannot start inside the open iteration of generation ${open.generation.index}`,
+    );
+  }
+  return undefined;
 }
 
 /** Guards shared by both start commands: cursor match, previous commit, budget. */
@@ -2000,6 +3342,10 @@ export function reducePipelineV2RunCommand(
       cursor: { current_state: pipeline.entry_state, transition_count: 0 },
       executions: [],
       transitions: [],
+      generations: [],
+      task_revisions: [],
+      plan_revisions: [],
+      grants: [],
       waits: [],
     };
     return deepFreeze(state);
@@ -2008,17 +3354,31 @@ export function reducePipelineV2RunCommand(
   if (current === null) {
     throw new PipelineV2StateError(`command ${command.kind} rejected: no pipeline v2 run state exists yet`);
   }
+  // The commands a waiting run still accepts: the user-response successor
+  // and the schema v7 intervention records that must be durable before
+  // the response. Everything else waits for the response or is rejected
+  // on a finalized run.
+  const waitingAllowed = new Set<string>([
+    "wait_response_recorded",
+    "plan_intent_accepted",
+    "task_revision_accepted",
+    "iteration_grant_recorded",
+    "stage_iteration_closed",
+  ]);
   if (command.kind !== "wait_response_recorded" && current.status !== "active") {
     if (current.status === "waiting") {
+      if (!waitingAllowed.has(command.kind)) {
+        fail(
+          current,
+          "the run is waiting for an explicit user response; only the wait response and the durable intervention records advance a waiting run",
+        );
+      }
+    } else {
       fail(
         current,
-        "the run is waiting for an explicit user response; only wait_response_recorded advances a waiting run",
+        `the run is already finalized with status ${JSON.stringify(current.status)}; the terminal run status is immutable`,
       );
     }
-    fail(
-      current,
-      `the run is already finalized with status ${JSON.stringify(current.status)}; the terminal run status is immutable`,
-    );
   }
 
   const next = cloneState(current);
@@ -2036,14 +3396,22 @@ export function reducePipelineV2RunCommand(
       if (!isNonEmptyString(command.profile)) {
         throw new PipelineV2StateError("start_agent_execution requires a non-empty profile name");
       }
+      const role = expectEnum(
+        command.executionRole,
+        PIPELINE_V2_EXECUTION_ROLES,
+        "start_agent_execution executionRole",
+      );
       requireStartableCursor(current, command.stateId);
+      const iterationIndex = requireIterationForRole(current, role, command.iterationIndex, "start_agent_execution");
       const execution: PipelineV2AgentExecutionState = {
         index: current.executions.length + 1,
         type: "agent",
         state_id: command.stateId,
         attempt: 1,
         profile: command.profile,
+        execution_role: role,
         phase: "started",
+        ...(iterationIndex !== undefined ? { iteration_index: iterationIndex } : {}),
       };
       next.executions = [...next.executions, execution];
       break;
@@ -2215,13 +3583,21 @@ export function reducePipelineV2RunCommand(
           `start_decision_execution requires a lowercase hex input digest, got ${JSON.stringify(command.inputDigest)}`,
         );
       }
+      const role = expectEnum(
+        command.executionRole,
+        PIPELINE_V2_EXECUTION_ROLES,
+        "start_decision_execution executionRole",
+      );
       requireStartableCursor(current, command.stateId);
+      const iterationIndex = requireIterationForRole(current, role, command.iterationIndex, "start_decision_execution");
       const execution: PipelineV2DecisionExecutionState = {
         index: current.executions.length + 1,
         type: "decision",
         state_id: command.stateId,
+        execution_role: role,
         phase: "evaluating",
         input_digest: command.inputDigest,
+        ...(iterationIndex !== undefined ? { iteration_index: iterationIndex } : {}),
       };
       next.executions = [...next.executions, execution];
       break;
@@ -2476,6 +3852,19 @@ export function reducePipelineV2RunCommand(
       if (current.failure !== undefined) {
         fail(current, "a waiting run must not carry a failure reason");
       }
+      // Schema v7: the durable intervention of a stage iteration must be
+      // complete before the run leaves the wait. A stage iteration that
+      // was open when the run entered the wait is closed by the
+      // intervention (grant or replanning) — a response while it is still
+      // open would route the cursor to a state whose next execution
+      // cannot legally start.
+      const openIteration = openIterationOf(current);
+      if (openIteration !== undefined) {
+        fail(
+          current,
+          `the open iteration ${openIteration.index} of generation ${openIteration.generation.index} is not closed; the durable intervention must close it before the response is recorded`,
+        );
+      }
       next.waits = [
         ...next.waits.slice(0, -1),
         {
@@ -2485,6 +3874,7 @@ export function reducePipelineV2RunCommand(
           reason: last.reason,
           request_sha256: last.request_sha256,
           actions: last.actions.map((entry) => ({ id: entry.id, to: entry.to })),
+          ...(last.intent !== undefined ? { intent: { intent_sha256: last.intent.intent_sha256 } } : {}),
           response: { action_id: actionId, response_sha256: responseSha256 },
         },
       ];
@@ -2639,6 +4029,607 @@ export function reducePipelineV2RunCommand(
       next.status = "cleanup_failed";
       next.phase = "finished";
       next.failure = { reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON };
+      break;
+    }
+    case "stage_generation_opened": {
+      // Opens one stage generation (schema v7). The reducer checks the
+      // self-sufficient structural form only: the clean active boundary,
+      // no open generation, the cursor anchor, and the binding to the
+      // last accepted plan revision digest. The compiled correspondence
+      // of the stage/template pair is the controller's and the restore
+      // verifier's responsibility — never this module's.
+      const stageId = expectSafeId(command.stageId, "stage_generation_opened stage id");
+      const templateId = expectSafeId(command.templateId, "stage_generation_opened template id");
+      const planSha256 = expectSha256(command.planSha256, "stage_generation_opened plan digest");
+      if (!isPositiveSafeInteger(command.stagePosition)) {
+        throw new PipelineV2StateError(
+          `stage_generation_opened requires a positive stage position, got ${JSON.stringify(command.stagePosition)}`,
+        );
+      }
+      if (!isPositiveSafeInteger(command.initialBudget)) {
+        throw new PipelineV2StateError(
+          `stage_generation_opened requires a positive initial budget, got ${JSON.stringify(command.initialBudget)}`,
+        );
+      }
+      if (!isNonNegativeSafeInteger(command.transitionCount)) {
+        throw new PipelineV2StateError(
+          `stage_generation_opened requires a non-negative transition anchor, got ${JSON.stringify(command.transitionCount)}`,
+        );
+      }
+      if (current.phase !== "running") {
+        fail(current, `opening a stage generation requires phase "running", got ${JSON.stringify(current.phase)}`);
+      }
+      if (current.terminal !== undefined) {
+        fail(current, "the terminal state is already reached; a stage generation cannot be opened");
+      }
+      if (current.run_outputs !== undefined) {
+        fail(current, "run outputs are already published; a stage generation cannot be opened");
+      }
+      if (current.failure !== undefined) {
+        fail(current, "the run already carries a failure reason; a stage generation cannot be opened");
+      }
+      const lastWait = current.waits[current.waits.length - 1];
+      if (lastWait !== undefined && lastWait.response === undefined) {
+        fail(current, `wait record ${lastWait.index} is still open; a stage generation cannot be opened`);
+      }
+      const openGeneration = openGenerationOf(current);
+      if (openGeneration !== undefined) {
+        fail(current, `generation ${openGeneration.index} is still open; a new stage generation requires it to be closed first`);
+      }
+      if (command.transitionCount !== current.cursor.transition_count) {
+        fail(
+          current,
+          `the generation anchor ${command.transitionCount} does not match the cursor transition count ${current.cursor.transition_count}`,
+        );
+      }
+      const lastPlan = current.plan_revisions[current.plan_revisions.length - 1];
+      if (lastPlan === undefined || lastPlan.sha256 !== planSha256) {
+        fail(current, `the generation binds plan digest ${JSON.stringify(planSha256)}, which is not the last accepted plan revision`);
+      }
+      next.generations = [
+        ...next.generations,
+        {
+          index: current.generations.length + 1,
+          stage_id: stageId,
+          stage_position: command.stagePosition,
+          template_id: templateId,
+          plan_sha256: planSha256,
+          initial_budget: command.initialBudget,
+          opened_transition_count: command.transitionCount,
+          iteration_count: 0,
+          iterations: [],
+        },
+      ];
+      break;
+    }
+    case "stage_iteration_opened": {
+      // Opens one iteration inside the open stage generation. The
+      // effective iteration budget is derived here from the immutable
+      // initial budget plus the generation's recorded grants, with an
+      // overflow guard; a grant can never retroactively make an already
+      // rejected iteration valid.
+      if (!isPositiveSafeInteger(command.generationIndex)) {
+        throw new PipelineV2StateError(
+          `stage_iteration_opened requires a positive generation index, got ${JSON.stringify(command.generationIndex)}`,
+        );
+      }
+      if (!isPositiveSafeInteger(command.iterationIndex)) {
+        throw new PipelineV2StateError(
+          `stage_iteration_opened requires a positive iteration index, got ${JSON.stringify(command.iterationIndex)}`,
+        );
+      }
+      if (!isNonNegativeSafeInteger(command.transitionCount)) {
+        throw new PipelineV2StateError(
+          `stage_iteration_opened requires a non-negative transition anchor, got ${JSON.stringify(command.transitionCount)}`,
+        );
+      }
+      if (current.phase !== "running") {
+        fail(current, `opening a stage iteration requires phase "running", got ${JSON.stringify(current.phase)}`);
+      }
+      if (current.terminal !== undefined) {
+        fail(current, "the terminal state is already reached; a stage iteration cannot be opened");
+      }
+      if (current.run_outputs !== undefined) {
+        fail(current, "run outputs are already published; a stage iteration cannot be opened");
+      }
+      if (current.failure !== undefined) {
+        fail(current, "the run already carries a failure reason; a stage iteration cannot be opened");
+      }
+      const lastWait = current.waits[current.waits.length - 1];
+      if (lastWait !== undefined && lastWait.response === undefined) {
+        fail(current, `wait record ${lastWait.index} is still open; a stage iteration cannot be opened`);
+      }
+      const openGeneration = openGenerationOf(current);
+      if (openGeneration === undefined) {
+        fail(current, "opening a stage iteration requires an open generation");
+      }
+      if (openGeneration !== undefined && openGeneration.index !== command.generationIndex) {
+        fail(
+          current,
+          `stage_iteration_opened names generation ${command.generationIndex}, but the open generation is ${openGeneration.index}`,
+        );
+      }
+      const generation = next.generations[command.generationIndex - 1] as PipelineV2StageGenerationRecord;
+      if (generation.open_iteration !== undefined) {
+        fail(
+          current,
+          `generation ${generation.index} already has an open iteration; close it before opening the next one`,
+        );
+      }
+      if (command.iterationIndex !== generation.iteration_count + 1) {
+        fail(
+          current,
+          `the iteration index ${command.iterationIndex} must be exactly the next iteration of generation ${generation.index} (${generation.iteration_count + 1})`,
+        );
+      }
+      if (command.transitionCount !== current.cursor.transition_count) {
+        fail(
+          current,
+          `the iteration anchor ${command.transitionCount} does not match the cursor transition count ${current.cursor.transition_count}`,
+        );
+      }
+      let grantsSum = 0;
+      for (const grant of current.grants) {
+        if (grant.generation_index === generation.index) {
+          grantsSum += grant.additional_iterations;
+          if (!Number.isSafeInteger(grantsSum)) {
+            fail(
+              current,
+              `the effective iteration budget of generation ${generation.index} is unrepresentable`,
+            );
+          }
+        }
+      }
+      const effectiveBudget = generation.initial_budget + grantsSum;
+      if (!Number.isSafeInteger(effectiveBudget)) {
+        fail(current, `the effective iteration budget of generation ${generation.index} is unrepresentable`);
+      }
+      if (generation.iteration_count + 1 > effectiveBudget) {
+        fail(
+          current,
+          `opening iteration ${command.iterationIndex} of generation ${generation.index} exceeds its effective iteration budget ${effectiveBudget} (initial budget ${generation.initial_budget} plus recorded grants)`,
+        );
+      }
+      const iteration: PipelineV2StageIterationRecord = {
+        index: command.iterationIndex,
+        opened_transition_count: command.transitionCount,
+      };
+      const updated: PipelineV2StageGenerationRecord = {
+        ...generation,
+        iteration_count: generation.iteration_count + 1,
+        iterations: [...generation.iterations, iteration],
+        open_iteration: { index: iteration.index, opened_transition_count: iteration.opened_transition_count },
+      };
+      next.generations = [
+        ...next.generations.slice(0, -1),
+        updated,
+      ];
+      break;
+    }
+    case "stage_iteration_closed": {
+      // Closes the open iteration of the open generation. The wait-bound
+      // closures (grant, replanned) run inside the open wait and require
+      // its accepted intent plus the matching durable intervention record;
+      // the ordinary closures run on the active boundary without a wait.
+      if (!isPositiveSafeInteger(command.generationIndex)) {
+        throw new PipelineV2StateError(
+          `stage_iteration_closed requires a positive generation index, got ${JSON.stringify(command.generationIndex)}`,
+        );
+      }
+      if (!isPositiveSafeInteger(command.iterationIndex)) {
+        throw new PipelineV2StateError(
+          `stage_iteration_closed requires a positive iteration index, got ${JSON.stringify(command.iterationIndex)}`,
+        );
+      }
+      const by = expectEnum(
+        command.by,
+        PIPELINE_V2_STAGE_ITERATION_CLOSE_REASONS,
+        "stage_iteration_closed by",
+      );
+      const waitBound = by === "grant" || by === "replanned";
+      if (waitBound !== (command.waitIndex !== undefined)) {
+        throw new PipelineV2StateError(
+          `stage_iteration_closed with ${JSON.stringify(by)} ${waitBound ? "requires" : "must not carry"} a wait index`,
+        );
+      }
+      if (waitBound) {
+        if (current.phase !== "waiting") {
+          fail(current, `a wait-bound iteration closure requires phase "waiting", got ${JSON.stringify(current.phase)}`);
+        }
+      } else if (current.phase !== "running") {
+        fail(current, `closing a stage iteration requires phase "running", got ${JSON.stringify(current.phase)}`);
+      }
+      if (current.terminal !== undefined) {
+        fail(current, "the terminal state is already reached; a stage iteration cannot be closed");
+      }
+      const openIteration = openIterationOf(current);
+      if (openIteration === undefined) {
+        fail(current, "closing a stage iteration requires an open iteration");
+      }
+      if (openIteration.generation.index !== command.generationIndex) {
+        fail(
+          current,
+          `stage_iteration_closed names generation ${command.generationIndex}, but the open iteration belongs to generation ${openIteration.generation.index}`,
+        );
+      }
+      if (openIteration.index !== command.iterationIndex) {
+        fail(
+          current,
+          `stage_iteration_closed names iteration ${command.iterationIndex}, but the open iteration is ${openIteration.index}`,
+        );
+      }
+      const waitIndex = command.waitIndex;
+      let waitIntentSha256: string | undefined;
+      if (waitBound && waitIndex !== undefined) {
+        if (current.status !== "waiting") {
+          fail(current, "a wait-bound iteration closure requires a waiting run");
+        }
+        const wait = current.waits[current.waits.length - 1];
+        if (wait === undefined || wait.response !== undefined) {
+          fail(current, "a wait-bound iteration closure requires the open wait record");
+        }
+        if (waitIndex !== wait.index) {
+          fail(
+            current,
+            `stage_iteration_closed targets wait index ${waitIndex}, but the open wait record is ${wait.index}`,
+          );
+        }
+        if (wait.intent === undefined) {
+          fail(current, `wait record ${wait.index} carries no accepted intent; the closure requires one`);
+        } else {
+          waitIntentSha256 = wait.intent.intent_sha256;
+        }
+        if (by === "grant") {
+          const grant = current.grants.find(
+            (candidate) =>
+              candidate.generation_index === openIteration.generation.index &&
+              candidate.wait_index === wait.index &&
+              (waitIntentSha256 === undefined || candidate.intent_sha256 === waitIntentSha256),
+          );
+          if (grant === undefined) {
+            fail(
+              current,
+              `the iteration closure with ${JSON.stringify(by)} requires the recorded grant of wait ${wait.index}`,
+            );
+          }
+        } else {
+          const task = current.task_revisions.some((candidate) => candidate.wait_index === wait.index);
+          if (!task) {
+            fail(
+              current,
+              `the iteration closure with ${JSON.stringify(by)} requires an accepted task revision of wait ${wait.index}`,
+            );
+          }
+        }
+      }
+      const generation = next.generations[openIteration.generation.index - 1] as PipelineV2StageGenerationRecord;
+      const lastIteration = generation.iterations[generation.iterations.length - 1]!;
+      const closedRecord: PipelineV2StageIterationRecord = {
+        index: openIteration.index,
+        opened_transition_count: lastIteration.opened_transition_count,
+        closed: {
+          by,
+          closed_transition_count: current.cursor.transition_count,
+          ...(waitIndex !== undefined ? { wait_index: waitIndex } : {}),
+        },
+      };
+      const iterations = [...generation.iterations.slice(0, -1), closedRecord];
+      const { open_iteration: _closedProjection, ...rest } = generation;
+      const updated: PipelineV2StageGenerationRecord = { ...rest, iterations };
+      next.generations = [...next.generations.slice(0, -1), updated];
+      break;
+    }
+    case "stage_generation_closed": {
+      // Closes the open stage generation. Requires no open iteration; the
+      // closed generation is never rewritten.
+      if (!isPositiveSafeInteger(command.generationIndex)) {
+        throw new PipelineV2StateError(
+          `stage_generation_closed requires a positive generation index, got ${JSON.stringify(command.generationIndex)}`,
+        );
+      }
+      const by = expectEnum(
+        command.by,
+        PIPELINE_V2_STAGE_GENERATION_CLOSE_REASONS,
+        "stage_generation_closed by",
+      );
+      if (current.phase !== "running") {
+        fail(current, `closing a stage generation requires phase "running", got ${JSON.stringify(current.phase)}`);
+      }
+      if (current.terminal !== undefined) {
+        fail(current, "the terminal state is already reached; a stage generation cannot be closed");
+      }
+      const openGeneration = openGenerationOf(current);
+      if (openGeneration === undefined || openGeneration.index !== command.generationIndex) {
+        fail(
+          current,
+          `stage_generation_closed names generation ${command.generationIndex}, but the open generation is ${openGeneration?.index ?? "none"}`,
+        );
+      }
+      if (openIterationOf(current) !== undefined) {
+        fail(current, `generation ${openGeneration.index} still has an open iteration; close it first`);
+      }
+      const generation = next.generations[openGeneration.index - 1] as PipelineV2StageGenerationRecord;
+      const updated: PipelineV2StageGenerationRecord = {
+        ...generation,
+        closed: { by, closed_transition_count: current.cursor.transition_count },
+      };
+      next.generations = [...next.generations.slice(0, -1), updated];
+      break;
+    }
+    case "plan_intent_accepted": {
+      // Records one accepted user wait intent inside the open wait
+      // record. The reducer accepts the digest but never interprets the
+      // intent kind; the controller owns the meaning. One intent per
+      // wait: an exact digest repeat is a no-op that grows no revision,
+      // a different digest is rejected.
+      const waitIndex = expectSafePositiveInteger(command.waitIndex, "plan_intent_accepted wait index");
+      const intentSha256 = expectSha256(command.intentSha256, "plan_intent_accepted intent digest");
+      if (current.status !== "waiting") {
+        fail(current, "accepting a wait intent requires a waiting run");
+      }
+      const wait = current.waits[current.waits.length - 1];
+      if (wait === undefined || wait.response !== undefined) {
+        fail(current, "accepting a wait intent requires the open wait record");
+      }
+      if (waitIndex !== wait.index) {
+        fail(
+          current,
+          `plan_intent_accepted targets wait index ${waitIndex}, but the open wait record is ${wait.index}`,
+        );
+      }
+      if (wait.intent !== undefined) {
+        if (wait.intent.intent_sha256 !== intentSha256) {
+          fail(
+            current,
+            `wait record ${wait.index} already accepted a different intent; one intent belongs to one wait`,
+          );
+        }
+        return current;
+      }
+      next.waits = [
+        ...next.waits.slice(0, -1),
+        {
+          ...wait,
+          actions: wait.actions.map((entry) => ({ id: entry.id, to: entry.to })),
+          intent: { intent_sha256: intentSha256 },
+        },
+      ];
+      break;
+    }
+    case "task_revision_accepted": {
+      // Records one accepted task revision in the append-only ledger.
+      // Revision 1 tasks are accepted during the planning flow on the
+      // active boundary without wait links; revisions above 1 are
+      // accepted inside the open wait and carry its intent link. The
+      // per-task revision chain is enforced against the durable records.
+      const taskId = expectSafeId(command.taskId, "task_revision_accepted task id");
+      if (!isPositiveSafeInteger(command.revision)) {
+        throw new PipelineV2StateError(
+          `task_revision_accepted requires a positive revision, got ${JSON.stringify(command.revision)}`,
+        );
+      }
+      const taskSha256 = expectSha256(command.taskSha256, "task_revision_accepted task digest");
+      const revision = command.revision;
+      const waitBound = revision > 1;
+      if (waitBound !== (command.waitIndex !== undefined)) {
+        throw new PipelineV2StateError(
+          `task_revision_accepted of revision ${revision} ${waitBound ? "requires" : "must not carry"} the wait and intent links`,
+        );
+      }
+      const previousRecord = [...current.task_revisions]
+        .reverse()
+        .find((candidate) => candidate.task_id === taskId);
+      if (revision === 1) {
+        if (previousRecord !== undefined) {
+          fail(
+            current,
+            `task revision 1 of ${JSON.stringify(taskId)} already exists (revision ${previousRecord.revision} is recorded)`,
+          );
+        }
+        if (current.phase !== "running") {
+          fail(current, `accepting a revision-1 task revision requires phase "running", got ${JSON.stringify(current.phase)}`);
+        }
+        if (current.terminal !== undefined) {
+          fail(current, "the terminal state is already reached; a task revision cannot be accepted");
+        }
+        if (current.run_outputs !== undefined) {
+          fail(current, "run outputs are already published; a task revision cannot be accepted");
+        }
+        if (current.failure !== undefined) {
+          fail(current, "the run already carries a failure reason; a task revision cannot be accepted");
+        }
+        const lastWait = current.waits[current.waits.length - 1];
+        if (lastWait !== undefined && lastWait.response === undefined) {
+          fail(current, `wait record ${lastWait.index} is still open; a task revision cannot be accepted`);
+        }
+      } else {
+        if (current.status !== "waiting") {
+          fail(current, "accepting a user-response task revision requires a waiting run");
+        }
+        const wait = current.waits[current.waits.length - 1];
+        if (wait === undefined || wait.response !== undefined) {
+          fail(current, "accepting a user-response task revision requires the open wait record");
+        }
+        if (command.waitIndex !== wait.index) {
+          fail(
+            current,
+            `task_revision_accepted targets wait index ${command.waitIndex}, but the open wait record is ${wait.index}`,
+          );
+        }
+        if (wait.intent === undefined || wait.intent.intent_sha256 !== command.intentSha256) {
+          fail(current, `the task revision references an intent that open wait record ${wait.index} has not accepted`);
+        }
+        if (previousRecord === undefined) {
+          fail(
+            current,
+            `task revision ${revision} of ${JSON.stringify(taskId)} has no recorded predecessor`,
+          );
+        } else if (previousRecord.revision !== revision - 1) {
+          fail(
+            current,
+            `task revision ${revision} of ${JSON.stringify(taskId)} must follow revision ${previousRecord.revision + 1}`,
+          );
+        }
+      }
+      const record: PipelineV2TaskRevisionState = {
+        index: current.task_revisions.length + 1,
+        task_id: taskId,
+        revision,
+        sha256: taskSha256,
+        previous_sha256: previousRecord === undefined ? null : previousRecord.sha256,
+        ...(waitBound && command.waitIndex !== undefined && command.intentSha256 !== undefined
+          ? { wait_index: command.waitIndex, intent_sha256: command.intentSha256 }
+          : {}),
+      };
+      next.task_revisions = [...next.task_revisions, record];
+      break;
+    }
+    case "plan_revision_accepted": {
+      // Records one accepted plan revision in the append-only ledger. The
+      // acceptance runs on the active boundary and names, as its origin,
+      // exactly the last settled-but-unbound execution, which must carry
+      // the planning role; the plan body lives in the filesystem manifest
+      // and is never recorded here. The revision chain is enforced
+      // against the durable ledger.
+      if (!isPositiveSafeInteger(command.planRevision)) {
+        throw new PipelineV2StateError(
+          `plan_revision_accepted requires a positive plan revision, got ${JSON.stringify(command.planRevision)}`,
+        );
+      }
+      const planSha256 = expectSha256(command.planSha256, "plan_revision_accepted plan digest");
+      if (!isPositiveSafeInteger(command.originExecution)) {
+        throw new PipelineV2StateError(
+          `plan_revision_accepted requires a positive origin execution index, got ${JSON.stringify(command.originExecution)}`,
+        );
+      }
+      if (current.phase !== "running") {
+        fail(current, `accepting a plan revision requires phase "running", got ${JSON.stringify(current.phase)}`);
+      }
+      if (current.terminal !== undefined) {
+        fail(current, "the terminal state is already reached; a plan revision cannot be accepted");
+      }
+      if (current.run_outputs !== undefined) {
+        fail(current, "run outputs are already published; a plan revision cannot be accepted");
+      }
+      if (current.failure !== undefined) {
+        fail(current, "the run already carries a failure reason; a plan revision cannot be accepted");
+      }
+      const lastWait = current.waits[current.waits.length - 1];
+      if (lastWait !== undefined && lastWait.response === undefined) {
+        fail(current, `wait record ${lastWait.index} is still open; a plan revision cannot be accepted`);
+      }
+      if (openIterationOf(current) !== undefined) {
+        fail(current, "a plan revision cannot be accepted while a stage iteration is open");
+      }
+      if (current.executions.length !== current.transitions.length + 1) {
+        fail(
+          current,
+          `plan acceptance requires exactly one settled-but-unbound execution, got ${current.executions.length} executions and ${current.transitions.length} committed transitions`,
+        );
+      }
+      const origin = current.executions[current.executions.length - 1];
+      if (origin === undefined || origin.index !== command.originExecution) {
+        fail(
+          current,
+          `the plan's origin execution ${command.originExecution} is not the last execution of the run`,
+        );
+      }
+      if (origin.execution_role !== "planning") {
+        fail(
+          current,
+          `the plan's origin execution ${origin.index} carries the ${JSON.stringify(origin.execution_role)} role; plan acceptance requires the "planning" role`,
+        );
+      }
+      if (origin.type !== "agent" || origin.phase !== "cleanup_completed") {
+        fail(
+          current,
+          `the plan's origin execution ${origin.index} has phase ${JSON.stringify(origin.phase)}; plan acceptance requires the settled phase "cleanup_completed"`,
+        );
+      }
+      if (command.planRevision !== current.plan_revisions.length + 1) {
+        fail(
+          current,
+          `the plan revision ${command.planRevision} must be exactly the next revision of the ledger (${current.plan_revisions.length + 1})`,
+        );
+      }
+      const previousRecord = current.plan_revisions[current.plan_revisions.length - 1];
+      next.plan_revisions = [
+        ...next.plan_revisions,
+        {
+          index: current.plan_revisions.length + 1,
+          revision: command.planRevision,
+          sha256: planSha256,
+          previous_sha256: previousRecord === undefined ? null : previousRecord.sha256,
+          origin_execution: command.originExecution,
+        },
+      ];
+      break;
+    }
+    case "iteration_grant_recorded": {
+      // Appends one iteration grant to the append-only ledger. The grant
+      // references the exact open generation, the open wait and its
+      // accepted intent; it never rewrites the generation record. A
+      // repeated grant for the same wait and intent is rejected — the
+      // controller recognizes an already durable grant from the snapshot
+      // and does not re-dispatch.
+      if (!isPositiveSafeInteger(command.generationIndex)) {
+        throw new PipelineV2StateError(
+          `iteration_grant_recorded requires a positive generation index, got ${JSON.stringify(command.generationIndex)}`,
+        );
+      }
+      if (!isPositiveSafeInteger(command.waitIndex)) {
+        throw new PipelineV2StateError(
+          `iteration_grant_recorded requires a positive wait index, got ${JSON.stringify(command.waitIndex)}`,
+        );
+      }
+      const intentSha256 = expectSha256(command.intentSha256, "iteration_grant_recorded intent digest");
+      if (!isPositiveSafeInteger(command.additionalIterations)) {
+        throw new PipelineV2StateError(
+          `iteration_grant_recorded requires a positive additional iteration count, got ${JSON.stringify(command.additionalIterations)}`,
+        );
+      }
+      if (current.status !== "waiting") {
+        fail(current, "recording an iteration grant requires a waiting run");
+      }
+      const wait = current.waits[current.waits.length - 1];
+      if (wait === undefined || wait.response !== undefined) {
+        fail(current, "recording an iteration grant requires the open wait record");
+      }
+      if (command.waitIndex !== wait.index) {
+        fail(
+          current,
+          `iteration_grant_recorded targets wait index ${command.waitIndex}, but the open wait record is ${wait.index}`,
+        );
+      }
+      if (wait.intent === undefined || wait.intent.intent_sha256 !== intentSha256) {
+        fail(current, `the grant references an intent that open wait record ${wait.index} has not accepted`);
+      }
+      const openGeneration = openGenerationOf(current);
+      if (openGeneration === undefined || openGeneration.index !== command.generationIndex) {
+        fail(
+          current,
+          `iteration_grant_recorded names generation ${command.generationIndex}, but the open generation is ${openGeneration?.index ?? "none"}`,
+        );
+      }
+      const existing = current.grants.find(
+        (candidate) => candidate.generation_index === openGeneration.index && candidate.wait_index === wait.index,
+      );
+      if (existing !== undefined) {
+        fail(
+          current,
+          `wait ${wait.index} already carries a recorded grant for generation ${openGeneration.index}`,
+        );
+      }
+      next.grants = [
+        ...next.grants,
+        {
+          index: current.grants.length + 1,
+          generation_index: openGeneration.index,
+          wait_index: wait.index,
+          intent_sha256: intentSha256,
+          additional_iterations: command.additionalIterations,
+        },
+      ];
       break;
     }
     default: {

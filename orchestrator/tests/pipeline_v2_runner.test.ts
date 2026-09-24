@@ -97,6 +97,13 @@ outputs:
         state: coder
         output: report
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
 states:
   - id: coder
     type: agent
@@ -148,6 +155,13 @@ outputs:
         state: first
         output: report
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: first
+      role: planning
+    - state_id: second
+      role: planning
 states:
   - id: first
     type: agent

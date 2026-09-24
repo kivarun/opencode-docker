@@ -561,9 +561,6 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
   expectExactKeys(obj, ["stage_templates", "execution_roles"], "pipeline orchestration");
 
   const templatesRaw = expectArray(obj.stage_templates, "pipeline orchestration stage_templates");
-  if (templatesRaw.length === 0) {
-    throw new PipelineError("pipeline orchestration stage_templates must not be empty");
-  }
   const templates: PipelineV2StageTemplateSpec[] = [];
   const templateIds = new Set<string>();
   const templateEntries = new Set<string>();
@@ -589,9 +586,6 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
   }
 
   const rolesRaw = expectArray(obj.execution_roles, "pipeline orchestration execution_roles");
-  if (rolesRaw.length === 0) {
-    throw new PipelineError("pipeline orchestration execution_roles must not be empty");
-  }
   const roles: PipelineV2ExecutionRoleSpec[] = [];
   const roleStateIds = new Set<string>();
   for (let index = 0; index < rolesRaw.length; index++) {

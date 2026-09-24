@@ -615,7 +615,7 @@ describe("pipeline v2 wait manifests in durable state v6 (pure round-trip proof)
     expectDeepFrozen(loaded);
 
     // ordinary execution rules resume at the response target
-    state = reduce(state, { kind: "start_agent_execution", stateId: "coder", profile: "coder" }, 3);
+    state = reduce(state, { kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" }, 3);
     expect(state.executions[0]).toMatchObject({ index: 1, state_id: "coder" });
     const finalLoaded = validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
     expect(finalLoaded).toEqual(state);

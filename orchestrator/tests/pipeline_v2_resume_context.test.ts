@@ -22,6 +22,7 @@ import {
   type AcceptedStateOutput,
   type RunInputsSnapshot,
 } from "../src/pipeline_v2_runtime.ts";
+import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 import {
   PipelineV2RuntimeContextRestoreError,
   restorePipelineV2RuntimeContext,
@@ -84,6 +85,15 @@ inputs:
 
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
+    - state_id: ship
+      role: planning
 states:
   - id: coder
     type: agent
@@ -260,7 +270,7 @@ async function runAgentActivation(
   planBytes: string,
 ): Promise<void> {
   const executionIndex = (drive.state as PipelineV2RunState).executions.length + 1;
-  dispatchClock(drive, base.clock, { kind: "start_agent_execution", stateId, profile: "coder" });
+  dispatchClock(drive, base.clock, { kind: "start_agent_execution", stateId, profile: "coder", ...startRoleArgs(base.pipeline, stateId, (drive.state as PipelineV2RunState)) });
   for (const command of AGENT_PHASE_COMMANDS(`sess-${executionIndex}`, `tool-${executionIndex}`)) {
     dispatchClock(drive, base.clock, command);
   }
@@ -302,7 +312,7 @@ function runDecisionActivation(
   outcome: "alpha" | "beta",
 ): void {
   const executionIndex = (drive.state as PipelineV2RunState).executions.length + 1;
-  dispatchClock(drive, base.clock, { kind: "start_decision_execution", stateId, inputDigest: hex("e") });
+  dispatchClock(drive, base.clock, { kind: "start_decision_execution", stateId, inputDigest: hex("e"), ...startRoleArgs(base.pipeline, stateId, (drive.state as PipelineV2RunState)) });
   dispatchClock(drive, base.clock, {
     kind: "decision_evaluated",
     result: {
@@ -1045,7 +1055,7 @@ test("27. in-flight agent executions are rejected", async () => {
   const base = await setupBase();
   try {
     for (const command of [
-      { kind: "start_agent_execution", stateId: "coder", profile: "coder" },
+      { kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" },
       { kind: "agent_data_prepared" },
       { kind: "agent_execution_session_created", sessionId: "sess-1" },
       { kind: "agent_tool_session_created", sessionId: "tool-1" },
@@ -1067,7 +1077,7 @@ test("28. in-flight decisions and settled-but-unbound executions are rejected", 
   const base = await setupBase();
   try {
     await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
-    dispatchClock(base.drive, base.clock, { kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    dispatchClock(base.drive, base.clock, { kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     expectRestoreError(
       await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot).catch((error) => error),
       "invalid_state",
@@ -1132,7 +1142,7 @@ test("29. terminal, publishing, success, failed and cleanup-failed states are re
   }
   const cleanup = await setupBase();
   try {
-    dispatchClock(cleanup.drive, cleanup.clock, { kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+    dispatchClock(cleanup.drive, cleanup.clock, { kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" });
     dispatchClock(cleanup.drive, cleanup.clock, { kind: "agent_data_prepared" });
     dispatchClock(cleanup.drive, cleanup.clock, { kind: "agent_execution_session_created", sessionId: "sess-1" });
     dispatchClock(cleanup.drive, cleanup.clock, { kind: "agent_tool_session_created", sessionId: "tool-1" });
@@ -1389,7 +1399,7 @@ test("41. an outcome the compiled pipeline does not declare is rejected", async 
     // (structurally valid, loader-accepted) names it with a coherent
     // target. Only the compiled verifier rejects it.
     const executionIndex = (base.drive.state as PipelineV2RunState).executions.length + 1;
-    dispatchClock(base.drive, base.clock, { kind: "start_decision_execution", stateId: "check", inputDigest: hex("e") });
+    dispatchClock(base.drive, base.clock, { kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
     dispatchClock(base.drive, base.clock, {
       kind: "decision_evaluated",
       result: { status: "selected", outcome: "mystery", decision: "mystery", rule_id: "R1", active_constraint_ids: [] },
@@ -1501,7 +1511,7 @@ function runDecisionActivationWithStep(
   transitionIndex: number,
 ): void {
   const executionIndex = (drive.state as PipelineV2RunState).executions.length + 1;
-  dispatchClock(drive, base.clock, { kind: "start_decision_execution", stateId, inputDigest: hex("e") });
+  dispatchClock(drive, base.clock, { kind: "start_decision_execution", stateId, inputDigest: hex("e"), ...startRoleArgs(base.pipeline, stateId, (drive.state as PipelineV2RunState)) });
   dispatchClock(drive, base.clock, {
     kind: "decision_evaluated",
     result: outcome === "uncovered"
@@ -1514,3 +1524,77 @@ function runDecisionActivationWithStep(
     executionIndex,
   });
 }
+
+test("42. a durable execution role that differs from the compiled role is a pipeline mismatch", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    const raw = JSON.stringify(base.drive.state);
+    // the compiled orchestration assigns planning to coder; a forged
+    // control role is loader-valid but compiled-incompatible
+    const rawParsed = JSON.parse(raw) as { executions: [Record<string, unknown>] };
+    expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, JSON.parse(JSON.stringify({
+        ...(rawParsed as object),
+        executions: [{ ...rawParsed.executions[0], execution_role: "control" }],
+      })), base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+    // a forged stage role without an open iteration is rejected by the
+    // loader itself (the lifecycle biconditional fires first)
+    expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, JSON.parse(JSON.stringify({
+        ...(rawParsed as object),
+        executions: [{ ...rawParsed.executions[0], execution_role: "stage", iteration_index: 1 }],
+      })), base.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+test("43. a generation bound to a template the compiled pipeline does not declare is a pipeline mismatch", async () => {
+  const base = await setupBase();
+  try {
+    // runAgentActivation binds the planning execution itself (it commits
+    // the transition), so the generation can open after its plan
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    const draft = JSON.parse(JSON.stringify(base.drive.state)) as Record<string, unknown> & {
+      plan_revisions: unknown[];
+      generations: unknown[];
+    };
+    // a loader-valid plan revision accepted by the settled planning
+    // execution, plus a generation bound to an undeclared template
+    draft.plan_revisions = [
+      { index: 1, revision: 1, sha256: "a".repeat(64), previous_sha256: null, origin_execution: 1 },
+    ];
+    draft.generations = [
+      {
+        index: 1,
+        stage_id: "development",
+        stage_position: 1,
+        template_id: "ghost",
+        plan_sha256: "a".repeat(64),
+        initial_budget: 2,
+        opened_transition_count: 1,
+        iteration_count: 0,
+        iterations: [],
+      },
+    ];
+    expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, draft, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+    // a generation whose plan digest was never accepted is rejected by the
+    // loader's plan binding first
+    const boundDraft = JSON.parse(JSON.stringify(draft)) as typeof draft;
+    (boundDraft.generations[0] as Record<string, unknown>).plan_sha256 = "9".repeat(64);
+    expectRestoreError(
+      await restorePipelineV2RuntimeContext(base.pipeline, boundDraft, base.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});

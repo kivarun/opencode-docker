@@ -7,9 +7,15 @@ import { compiledTransitionFor, PipelineExecutionError } from "./pipeline_engine
 import { requireResolvedPipelineV2Provenance, type ResolvedPipelineV2 } from "./pipeline_v2.ts";
 import {
   PipelineV2StateError,
+  pipelineV2StageIterationAt,
   validatePipelineV2RunState,
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
+import {
+  PipelineV2OrchestrationError,
+  compiledExecutionRoleFor,
+  compiledStageTemplateFor,
+} from "./pipeline_v2_orchestration.ts";
 import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
 import {
   comparePipelineV2RunIdentity,
@@ -28,7 +34,7 @@ import {
  * Read-only restoration of the pipeline v2 runtime context.
  *
  * This module rebuilds, from the trusted resolved pipeline, the durable
- * state schema v6 and the fixed orchestrator-owned `<runRoot>`, exactly
+ * state schema v7 and the fixed orchestrator-owned `<runRoot>`, exactly
  * the runtime objects resuming an existing run needs to continue
  * execution: a
  * provenance-backed `RunInputsSnapshot`, the full accepted
@@ -121,7 +127,7 @@ import {
  *
  * Failure contract (closed, typed, classified by validation phase — never
  * by message text): `PipelineV2RuntimeContextRestoreError` carries the
- * immutable `reason` — `invalid_state` (schema v6 validation or a
+ * immutable `reason` — `invalid_state` (schema v7 validation or a
  * non-resumable boundary), `pipeline_mismatch` (durable pipeline/input/
  * output declaration metadata, run-id binding or compiled-transition
  * history mismatch), `run_layout_invalid` (run root/project/data/inputs
@@ -463,6 +469,81 @@ function verifyCompiledTransitionHistory(
 }
 
 /**
+ * The compiled execution-role verification: every durable execution's
+ * recorded role must be exactly the role the trusted pipeline's compiled
+ * orchestration metadata assigns to its state (no inference, no default),
+ * and a stage execution's iteration projection must be exactly the open
+ * stage iteration the loader-proven lifecycle kept open at its start.
+ * Every stage generation's template binding must name a declared compiled
+ * stage template. Runs strictly after the compiled-transition
+ * verification and before any filesystem access, so a structurally valid
+ * but compiled-incompatible role/iteration projection never touches the
+ * run root. There is no second cursor replay here: the loader already
+ * proved the lifecycle timeline positionally; this check adds only the
+ * correspondence to the compiled orchestration metadata, resolved through
+ * the single shared role/template resolvers and the shared open-iteration
+ * query.
+ */
+function verifyCompiledExecutionRoles(
+  pipeline: ResolvedPipelineV2,
+  state: PipelineV2RunState,
+): void {
+  const mismatch = (what: string): PipelineV2RuntimeContextRestoreError =>
+    restoreError(
+      "pipeline_mismatch",
+      `the durable execution roles are incompatible with the compiled pipeline: ${what}`,
+    );
+  for (const execution of state.executions) {
+    let compiled;
+    try {
+      compiled = compiledExecutionRoleFor(pipeline, execution.state_id);
+    } catch (cause) {
+      if (cause instanceof PipelineV2OrchestrationError) {
+        throw mismatch(
+          `execution ${execution.index} runs state ${JSON.stringify(execution.state_id)}, for which the compiled orchestration declares no execution role`,
+        );
+      }
+      throw cause;
+    }
+    if (compiled.role !== execution.execution_role) {
+      throw mismatch(
+        `execution ${execution.index} records the ${JSON.stringify(execution.execution_role)} role, but the compiled orchestration assigns the ${JSON.stringify(compiled.role)} role to ${JSON.stringify(execution.state_id)}`,
+      );
+    }
+    if (compiled.role === "stage") {
+      const open = pipelineV2StageIterationAt(state, execution.index - 1);
+      if (open === null) {
+        throw mismatch(
+          `execution ${execution.index} records iteration ${execution.iteration_index}, but no stage iteration is open at its start boundary`,
+        );
+      }
+      if (open.template_id !== compiled.stage_template) {
+        throw mismatch(
+          `execution ${execution.index} runs in generation ${open.generation_index} bound to stage template ${JSON.stringify(open.template_id)}, but the compiled orchestration assigns stage template ${JSON.stringify(compiled.stage_template)} to ${JSON.stringify(execution.state_id)}`,
+        );
+      }
+      if (open.iteration_index !== execution.iteration_index) {
+        throw mismatch(
+          `execution ${execution.index} records iteration ${execution.iteration_index}, but the open iteration at its start boundary is ${open.iteration_index}`,
+        );
+      }
+    }
+  }
+  for (const generation of state.generations) {
+    try {
+      compiledStageTemplateFor(pipeline, generation.template_id);
+    } catch (cause) {
+      if (cause instanceof PipelineV2OrchestrationError) {
+        throw mismatch(
+          `generation ${generation.index} binds stage template ${JSON.stringify(generation.template_id)}, which the compiled pipeline does not declare`,
+        );
+      }
+      throw cause;
+    }
+  }
+}
+
+/**
  * Validate the durable inputs against the declared pipeline inputs and
  * build the exact restoration expectations, carrying each declaring
  * input's compiled schema for the JSON revalidation.
@@ -538,7 +619,7 @@ export async function restorePipelineV2RuntimeContext(
     validated = validatePipelineV2RunState(state);
   } catch (cause) {
     if (cause instanceof PipelineV2StateError) {
-      throw restoreError("invalid_state", "the durable run state is not a valid state schema v6 document");
+      throw restoreError("invalid_state", "the durable run state is not a valid state schema v7 document");
     }
     throw cause;
   }
@@ -551,6 +632,7 @@ export async function restorePipelineV2RuntimeContext(
   //    before any filesystem access, so a structurally valid but
   //    compiled-incompatible journal never touches the run root.
   verifyCompiledTransitionHistory(pipeline, validated);
+  verifyCompiledExecutionRoles(pipeline, validated);
   // 6. The run-root layout, strictly read-only.
   if (typeof runRoot !== "string" || !isAbsolute(runRoot)) {
     throw restoreError("run_layout_invalid", "the run root must be an absolute path");

@@ -131,6 +131,8 @@ import {
   type V2DecisionExecutionView,
 } from "./pipeline_engine.ts";
 import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
+import { compiledExecutionRoleFor } from "./pipeline_v2_orchestration.ts";
+import { pipelineV2OpenStageIteration } from "./pipeline_v2_state.ts";
 import {
   acceptActivationOutputs,
   collectRunOutputs,
@@ -772,6 +774,15 @@ export async function coordinatePipelineV2Run(
 
   const { pipeline, runId, runRoot, sink, runtime } = params;
 
+  // Production v2 dispatch requires the compiled orchestration metadata:
+  // every start command carries the exact compiled execution role, and a
+  // pipeline without it has no role source. The gate runs before any
+  // side effect — before the sink is read, before the project copy, any
+  // state document, and any Session.
+  if (pipeline.orchestration === undefined) {
+    return deepFreeze({ ok: false as const, reason: "invalid_graph" as const, state: null });
+  }
+
   // Caller contract: a fresh sink for a new run; resume is not supported.
   if (sink.poisoned || sink.snapshot !== null) {
     return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
@@ -1251,6 +1262,44 @@ async function continuePipelineV2Coordination(
 
   // --- the single execution flow through the engine -----------------------
 
+  /**
+   * The compiled execution role of one state, resolved only through the
+   * trusted orchestration resolver, plus the durable open iteration a
+   * stage start must name. A stage start requires the open generation's
+   * open iteration and the matching compiled stage template; a planning
+   * or control start requires no open iteration. Every violation refuses
+   * before the start command, so no execution record, no Session and no
+   * worker run is ever created from a mismatched lifecycle.
+   */
+  const resolveExecutionStart = (
+    stateId: string,
+  ): { readonly executionRole: "planning" | "control" | "stage"; readonly iterationIndex?: number } => {
+    const role = compiledExecutionRoleFor(pipeline, stateId);
+    const open = pipelineV2OpenStageIteration(requireSnapshot());
+    if (role.role === "stage") {
+      if (open === null) {
+        throw new PipelineExecutionError(
+          "invalid_graph",
+          `the stage execution for state ${JSON.stringify(stateId)} requires an open stage generation with an open iteration`,
+        );
+      }
+      if (open.template_id !== role.stage_template) {
+        throw new PipelineExecutionError(
+          "invalid_graph",
+          `the stage execution for state ${JSON.stringify(stateId)} belongs to stage template ${JSON.stringify(role.stage_template)}, but the open generation carries template ${JSON.stringify(open.template_id)}`,
+        );
+      }
+      return { executionRole: "stage", iterationIndex: open.iteration_index };
+    }
+    if (open !== null) {
+      throw new PipelineExecutionError(
+        "invalid_graph",
+        `the ${JSON.stringify(role.role)} execution for state ${JSON.stringify(stateId)} cannot start inside the open iteration of generation ${open.generation_index}`,
+      );
+    }
+    return { executionRole: role.role };
+  };
+
   const executors: PipelineV2GraphExecutors = {
     executeAgent: async (view: V2AgentExecutionView): Promise<void> => {
       // Execution-start checkpoint: a signal accepted between states stops
@@ -1267,8 +1316,16 @@ async function continuePipelineV2Coordination(
       };
       tracking.session = sessionTracking;
 
-      // 1. start_agent_execution
-      await dispatchState({ kind: "start_agent_execution", stateId: view.id, profile: view.profile });
+      // 1. start_agent_execution with the exact compiled execution role
+      //    (and, for a stage execution, exactly the open iteration)
+      const start = resolveExecutionStart(view.id);
+      await dispatchState({
+        kind: "start_agent_execution",
+        stateId: view.id,
+        profile: view.profile,
+        executionRole: start.executionRole,
+        ...(start.iterationIndex !== undefined ? { iterationIndex: start.iterationIndex } : {}),
+      });
       tracking.unfinished = true;
 
       // 2. the committed execution index comes from the durable snapshot —
@@ -1419,11 +1476,15 @@ async function continuePipelineV2Coordination(
       // 2. prepare the decision data (the input is read exactly once)
       const prepared = await prepareDecisionStateData(pipeline, runInputs, accepted, view.id, executionIndex);
 
-      // 3. start_decision_execution with the prepared input digest
+      // 3. start_decision_execution with the prepared input digest and
+      //    the exact compiled execution role
+      const start = resolveExecutionStart(view.id);
       await dispatchState({
         kind: "start_decision_execution",
         stateId: view.id,
         inputDigest: prepared.input_digest,
+        executionRole: start.executionRole,
+        ...(start.iterationIndex !== undefined ? { iterationIndex: start.iterationIndex } : {}),
       });
       tracking.unfinished = true;
 
@@ -1611,6 +1672,13 @@ export async function resumePipelineV2Run(
   }
 
   const { pipeline, runId, runRoot, sink, runtime } = params;
+
+  // Production v2 dispatch requires the compiled orchestration metadata.
+  // The gate runs before the runtime and control captures (no getter is
+  // read), before the sink is read and before any filesystem access.
+  if (pipeline.orchestration === undefined) {
+    return resumeRefusal("pipeline_mismatch", null);
+  }
 
   // 2. The runtime and control contract functions are captured exactly
   //    once, per the existing rules, before any side effect. Rebinding or

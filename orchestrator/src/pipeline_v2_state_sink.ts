@@ -12,7 +12,7 @@ import type { PipelineStateIo } from "./run_snapshot_store.ts";
 
 /**
  * Durable run state sink for pipeline schema version 2 (`pipeline_v2_state.ts`,
- * state schema version 6). The sink owns no vocabulary of its own: every mutation
+ * state schema version 7). The sink owns no vocabulary of its own: every mutation
  * goes through the existing `PipelineV2RunCommand` union via
  * `dispatch(command)`, which always runs
  *
@@ -75,7 +75,7 @@ export class PipelineV2RunStateSink {
    * Opens an already existing run: the single way to continue a durable
    * pipeline v2 run after a process restart. The state document is loaded
    * exclusively through the existing `PipelineV2RunStateStore.load()` and
-   * its single state-schema-v6 parser/validator — no second validator, no
+   * its single state-schema-v7 parser/validator — no second validator, no
    * `create_run`, no rewriting, chmodding, repairing or any other
    * filesystem mutation happens during the open (the load creates
    * nothing). A missing state document is an explicit typed refusal
@@ -148,6 +148,13 @@ export class PipelineV2RunStateSink {
       );
     }
     const candidate = reducePipelineV2RunCommand(this.current, command, this.clock());
+    // The reducer's explicit no-op (the exact repeat of an already
+    // accepted wait intent) returns the same snapshot without growing the
+    // revision: the state document is already durable, so nothing is
+    // written and no commit protocol runs.
+    if (candidate === this.current) {
+      return;
+    }
     try {
       if (this.current === null) {
         await this.store.create(candidate);

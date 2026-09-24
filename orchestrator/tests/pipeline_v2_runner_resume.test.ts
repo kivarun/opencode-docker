@@ -28,6 +28,7 @@ import { parsePipelineV2RunState, type PipelineDecisionStateRecord, type Pipelin
 import { pipelineV2RunStatePath } from "../src/pipeline_v2_state_store.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { createHash } from "node:crypto";
+import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
 /**
  * Production runner resume tests for pipeline schema version 2:
@@ -104,6 +105,13 @@ outputs:
         state: coder
         output: report
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
 states:
   - id: coder
     type: agent
@@ -146,6 +154,15 @@ inputs: []
 
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
+    - state_id: probe
+      role: planning
 states:
   - id: coder
     type: agent
@@ -217,6 +234,13 @@ inputs: []
 
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: coder2
+      role: planning
 states:
   - id: coder
     type: agent
@@ -411,7 +435,7 @@ async function prefixAgentStep(
     stateId,
     executionIndex,
   );
-  await prefix.sink.dispatch({ kind: "start_agent_execution", stateId, profile: state.profile });
+  await prefix.sink.dispatch({ kind: "start_agent_execution", stateId, profile: state.profile, ...startRoleArgs(prefix.pipeline, stateId, prefix.sink.snapshot) });
   await prefix.sink.dispatch({ kind: "agent_data_prepared" });
   await prefix.sink.dispatch({ kind: "agent_execution_session_created", sessionId: sessionIds.execution });
   await prefix.sink.dispatch({ kind: "agent_tool_session_created", sessionId: sessionIds.tool });
@@ -473,7 +497,12 @@ async function prefixDecisionStep(
     stateId,
     executionIndex,
   );
-  await prefix.sink.dispatch({ kind: "start_decision_execution", stateId, inputDigest: prepared.input_digest });
+  await prefix.sink.dispatch({
+    kind: "start_decision_execution",
+    stateId,
+    inputDigest: prepared.input_digest,
+    ...startRoleArgs(prefix.pipeline, stateId, prefix.sink.snapshot),
+  });
   const result = evaluatePreparedDecisionState(prefix.pipeline, prepared);
   await prefix.sink.dispatch({ kind: "decision_evaluated", result: toSelectedRecord(result) });
   const index = state.transitions.findIndex((transition) => transition.outcome === result.outcome);
@@ -958,7 +987,7 @@ test("8. waiting, in-flight, publishing and final states refuse without mutation
   const pipelineI = await loadPipelineV2(inFlight.bundle);
   const runIdI = "resume-i";
   const prefixI = await buildPrefix(inFlight, pipelineI, runIdI);
-  await prefixI.sink.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+  await prefixI.sink.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" });
   const fpInFlight = await fingerprint(inFlight.stateRoot);
   const capturedInFlight = await runResume(inFlight, runIdI);
   expectRefused(capturedInFlight, "invalid_state");
@@ -971,7 +1000,7 @@ test("8. waiting, in-flight, publishing and final states refuse without mutation
   const runIdU = "resume-u";
   const prefixU = await buildPrefix(unbound, pipelineU, runIdU);
   const activation = await prepareActivationData(prefixU.pipeline, prefixU.runInputs, [], "coder", 1);
-  await prefixU.sink.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+  await prefixU.sink.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" });
   await prefixU.sink.dispatch({ kind: "agent_data_prepared" });
   await prefixU.sink.dispatch({ kind: "agent_execution_session_created", sessionId: "pfx-exec-1" });
   await prefixU.sink.dispatch({ kind: "agent_tool_session_created", sessionId: "pfx-tool-1" });

@@ -603,7 +603,7 @@ function twoStageCandidate(originExecution: number): PreparedPipelineV2RunPlanCa
 }
 
 const WAITING_COMMANDS: PipelineV2RunCommand[] = [
-  { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
   ...agentRun("architect-waiting"),
   {
     kind: "transition_committed",
@@ -620,14 +620,14 @@ const WAITING_COMMANDS: PipelineV2RunCommand[] = [
 ];
 
 const PUBLISHING_COMMANDS: PipelineV2RunCommand[] = [
-  { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
   ...agentRun("architect-publishing"),
   {
     kind: "transition_committed",
     step: { from: "architect", outcome: "completed", to: "stage_dispatch", transition_index: 0 },
     executionIndex: 1,
   },
-  { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e") },
+  { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e"), executionRole: "control" },
   decisionSelected("d_plan_complete"),
   {
     kind: "transition_committed",
@@ -651,7 +651,7 @@ const SUCCESS_COMMANDS: PipelineV2RunCommand[] = [
 ];
 
 const FAILED_COMMANDS: PipelineV2RunCommand[] = [
-  { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
   ...agentRun("architect-failed").slice(0, 3),
   {
     kind: "agent_failed",
@@ -663,7 +663,7 @@ const FAILED_COMMANDS: PipelineV2RunCommand[] = [
 
 /** Commands up to an unbound settled agent execution on the planning state. */
 const HAPPY_COMMANDS: PipelineV2RunCommand[] = [
-  { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
   ...agentRun("architect-happy"),
 ];
 
@@ -676,7 +676,7 @@ function agentPhaseStates(identity: PipelineV2RunPipelineIdentity, runId: string
     states.push(
       drive(identity, runId, [
         { kind: "create_run", runId, pipeline: identity, inputs: [{ id: "task", type: "file", protected: true, digest: hex("b") }] },
-        { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+        { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
         ...AGENT_PHASE_COMMANDS.slice(0, stop),
       ]),
     );
@@ -686,28 +686,28 @@ function agentPhaseStates(identity: PipelineV2RunPipelineIdentity, runId: string
 
 /** Commands up to an unbound settled agent execution on the stage state `coder`. */
 const STAGE_ROLE_COMMANDS: PipelineV2RunCommand[] = [
-  { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
   ...agentRun("architect-chain"),
   {
     kind: "transition_committed",
     step: { from: "architect", outcome: "completed", to: "stage_dispatch", transition_index: 0 },
     executionIndex: 1,
   },
-  { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e") },
+  { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e"), executionRole: "control" },
   decisionSelected("d_next_stage"),
   {
     kind: "transition_committed",
     step: { from: "stage_dispatch", outcome: "d_next_stage", to: "development_entry", transition_index: 0 },
     executionIndex: 2,
   },
-  { kind: "start_agent_execution", stateId: "development_entry", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "development_entry", profile: "coder", executionRole: "planning" },
   ...agentRun("development-entry-chain"),
   {
     kind: "transition_committed",
     step: { from: "development_entry", outcome: "completed", to: "coder", transition_index: 0 },
     executionIndex: 3,
   },
-  { kind: "start_agent_execution", stateId: "coder", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" },
   ...agentRun("coder-chain"),
 ];
 
@@ -715,7 +715,7 @@ const STAGE_ROLE_COMMANDS: PipelineV2RunCommand[] = [
 const SECOND_AGENT_COMMANDS: PipelineV2RunCommand[] = STAGE_ROLE_COMMANDS.slice(0, STAGE_ROLE_COMMANDS.length - 8);
 
 const DECISION_BOUND_PRELUDE: PipelineV2RunCommand[] = [
-  { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
   ...agentRun("architect-decision"),
   {
     kind: "transition_committed",
@@ -726,12 +726,12 @@ const DECISION_BOUND_PRELUDE: PipelineV2RunCommand[] = [
 
 const DECISION_UNBOUND_COMMANDS: PipelineV2RunCommand[] = [
   ...DECISION_BOUND_PRELUDE,
-  { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e") },
+  { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e"), executionRole: "control" },
   decisionSelected("d_next_stage"),
 ];
 
 const BOUND_COMMANDS: PipelineV2RunCommand[] = [
-  { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+  { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
   ...agentRun("architect-bound"),
   {
     kind: "transition_committed",
@@ -944,7 +944,7 @@ test("10. a failed agent execution is rejected", async () => {
   await withPipeline(async (pipeline) => {
     const identity = pipelineV2RunPipelineIdentity(pipeline);
     const failedAgent = createState(identity, "run-1", [
-      { kind: "start_agent_execution", stateId: "architect", profile: "coder" },
+      { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
       ...agentRun("architect-failed").slice(0, 3),
       {
         kind: "agent_failed",
@@ -972,7 +972,7 @@ test("11. a decision execution is rejected", async () => {
       pipeline,
       createState(identity, "run-1", [
         ...DECISION_BOUND_PRELUDE,
-        { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e") },
+        { kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e"), executionRole: "control" },
       ]),
       candidate,
     );

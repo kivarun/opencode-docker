@@ -38,6 +38,7 @@ import {
 } from "../src/pipeline_v2_state_store.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
+import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 import type { PipelineStateIo } from "../src/pipeline_state_store.ts";
 
 /**
@@ -110,6 +111,13 @@ inputs:
 
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
 states:
   - id: coder
     type: agent
@@ -149,6 +157,15 @@ inputs: []
 
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
+    - state_id: probe
+      role: planning
 states:
   - id: coder
     type: agent
@@ -220,6 +237,13 @@ inputs: []
 
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: coder2
+      role: planning
 states:
   - id: coder
     type: agent
@@ -536,7 +560,12 @@ async function prefixAgentStep(
 ): Promise<PreparedActivationData> {
   const { profile } = stateOf(harness.pipeline, stateId);
   const activation = await prepareActivationData(harness.pipeline, runInputs, accepted, stateId, executionIndex);
-  await harness.recording.dispatch({ kind: "start_agent_execution", stateId, profile });
+  await harness.recording.dispatch({
+    kind: "start_agent_execution",
+    stateId,
+    profile,
+    ...startRoleArgs(harness.pipeline, stateId, harness.recording.snapshot),
+  });
   await harness.recording.dispatch({ kind: "agent_data_prepared" });
   await harness.recording.dispatch({ kind: "agent_execution_session_created", sessionId: sessionIds.execution });
   await harness.recording.dispatch({ kind: "agent_tool_session_created", sessionId: sessionIds.tool });
@@ -586,6 +615,7 @@ async function prefixDecisionStep(
     kind: "start_decision_execution",
     stateId,
     inputDigest: prepared.input_digest,
+    ...startRoleArgs(harness.pipeline, stateId, harness.recording.snapshot),
   });
   const result = evaluatePreparedDecisionState(harness.pipeline, prepared);
   await harness.recording.dispatch({ kind: "decision_evaluated", result: toSelectedRecord(result) });
@@ -1514,7 +1544,7 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
   // 17a: an in-flight agent execution
   const inFlight = await setupHarness(PIPELINE_DECISION_INPUT);
   await prefixCreateRun(inFlight);
-  await inFlight.recording.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+  await inFlight.recording.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" });
   const fpInFlight = await fingerprint(inFlight.dirs.runRoot);
   const reopenedInFlight = await reopenHarness(inFlight);
   const fakeInFlight = fakeRuntime([{}]);
@@ -1535,7 +1565,7 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
   const unbound2 = await setupHarness(PIPELINE_DECISION_INPUT);
   const runInputs2 = await prefixCreateRun(unbound2);
   const activation = await prepareActivationData(unbound2.pipeline, runInputs2, [], "coder", 1);
-  await unbound2.recording.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder" });
+  await unbound2.recording.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" });
   await unbound2.recording.dispatch({ kind: "agent_data_prepared" });
   await unbound2.recording.dispatch({ kind: "agent_execution_session_created", sessionId: "exec-1" });
   await unbound2.recording.dispatch({ kind: "agent_tool_session_created", sessionId: "tool-1" });
@@ -1693,7 +1723,7 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
     })),
   });
   const poisonError = await poisonedRecording
-    .dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder" })
+    .dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" })
     .catch((cause: unknown) => cause);
   expect(poisonError).toBeInstanceOf(PipelineV2RunStateDurabilityError);
   expect(poisonedFresh.poisoned).toBe(true);
@@ -1893,7 +1923,7 @@ test("the reducer's state schema stays v6 and resume never dispatches create_run
   expect(allCommands.filter((command) => command.kind === "create_run")).toHaveLength(1);
   expect(allCommands.filter((command) => String(command.kind).startsWith("wait_"))).toHaveLength(0);
   const durable = await readDurableState(harness);
-  expect(durable.schema_version).toBe(6);
+  expect(durable.schema_version).toBe(7);
 });
 
 test("a malformed durable state document refuses the reopen without side effects", async () => {
@@ -2057,4 +2087,201 @@ test("a durably failed session cleanup after resume finalizes run_cleanup_failed
   expect(state.failure).toEqual({ reason: "session_cleanup_failed" });
   expect(state.transitions).toHaveLength(0);
   expect(fake.pairs[0]?.execution.cleanupCount).toBe(1);
+});
+
+/** A minimal pipeline without orchestration metadata: no role source for the resume gate. */
+const PIPELINE_RESUME_NO_ORCH = `
+schema_version: 2
+entry_state: coder
+max_transitions: 20
+
+inputs: []
+
+outputs: []
+
+states:
+  - id: coder
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+  - id: done
+    type: terminal
+    result: success
+`;
+
+/** architect (planning) -> dispatch (control) -> stage template development (dev_entry stage). */
+const PIPELINE_RESUME_STAGE = `
+schema_version: 2
+entry_state: architect
+max_transitions: 20
+
+inputs:
+  - id: facts_seed
+    type: json
+    protected: false
+    schema: schemas/loose.schema.json
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: dispatch
+      role: control
+    - state_id: dev_entry
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dispatch
+  - id: dispatch
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: facts
+        source:
+          pipeline_input: facts_seed
+    transitions:
+${DECISION_END_TRANSITIONS.replace(/to: done/g, "to: dev_entry").replace(/to: failed_end/g, "to: failed_end")}
+  - id: dev_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+  - id: done
+    type: terminal
+    result: success
+  - id: failed_end
+    type: terminal
+    result: failed
+`;
+
+test("a pipeline without orchestration metadata refuses the resume before any effect", async () => {
+  const harness = await setupHarness(PIPELINE_RESUME_NO_ORCH);
+  await prefixCreateRun(harness);
+  const fingerprintBefore = await fingerprint(harness.dirs.stateRoot);
+  const reopened = await reopenHarness(harness);
+  const fake = fakeRuntime([{}]);
+  const result = await resumePipelineV2Run({
+    pipeline: harness.pipeline,
+    runId: harness.runId,
+    runRoot: harness.dirs.runRoot,
+    sink: reopened,
+    runtime: fake.runtime,
+  }, NEUTRAL_CONTROL);
+  const state = expectRefused(result, "pipeline_mismatch");
+  expect(state).toBeNull();
+  expect(fake.createCalls).toHaveLength(0);
+  expect(reopened.commands).toHaveLength(0);
+  expect(await fingerprint(harness.dirs.stateRoot)).toBe(fingerprintBefore);
+});
+
+test("the resumed stage execution carries the compiled role and the open iteration", async () => {
+  const harness = await setupHarness(PIPELINE_RESUME_STAGE);
+  const runInputs = await prefixCreateRun(harness);
+  const accepted: AcceptedStateOutput[] = [];
+  // the planning execution settles UNBOUND; the plan revision is accepted
+  // while the architect's transition is not yet committed
+  const { profile } = stateOf(harness.pipeline, "architect");
+  const architectActivation = await prepareActivationData(harness.pipeline, runInputs, [], "architect", 1);
+  await harness.recording.dispatch({
+    kind: "start_agent_execution",
+    stateId: "architect",
+    profile,
+    ...startRoleArgs(harness.pipeline, "architect", harness.recording.snapshot),
+  });
+  await harness.recording.dispatch({ kind: "agent_data_prepared" });
+  await harness.recording.dispatch({ kind: "agent_execution_session_created", sessionId: "exec-1" });
+  await harness.recording.dispatch({ kind: "agent_tool_session_created", sessionId: "tool-1" });
+  await harness.recording.dispatch({ kind: "agent_running" });
+  const architectRecords = await acceptActivationOutputs(harness.pipeline, architectActivation);
+  accepted.push(...architectRecords);
+  await harness.recording.dispatch({
+    kind: "agent_outputs_accepted",
+    outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })),
+  });
+  await harness.recording.dispatch({ kind: "agent_cleanup_completed" });
+  await harness.recording.dispatch({
+    kind: "plan_revision_accepted",
+    planRevision: 1,
+    planSha256: "b".repeat(64),
+    originExecution: 1,
+  });
+  const architectTarget = transitionTarget(harness.pipeline, "architect", "completed");
+  await harness.recording.dispatch({
+    kind: "transition_committed",
+    step: { from: "architect", outcome: "completed", to: architectTarget.to, transition_index: architectTarget.index },
+    executionIndex: 1,
+  });
+  await prefixDecisionStep(harness, runInputs, accepted, "dispatch", 2);
+  // the controller hook lifecycle: generation 1 and iteration 1 open at anchor 2
+  await harness.recording.dispatch({
+    kind: "stage_generation_opened",
+    stageId: "development",
+    stagePosition: 1,
+    templateId: "development",
+    planSha256: "b".repeat(64),
+    initialBudget: 2,
+    transitionCount: 2,
+  });
+  await harness.recording.dispatch({
+    kind: "stage_iteration_opened",
+    generationIndex: 1,
+    iterationIndex: 1,
+    transitionCount: 2,
+  });
+  const reopened = await reopenHarness(harness);
+  const fake = fakeRuntime([{ executionId: "res-exec-1", toolId: "res-tool-1" }]);
+  const result = await resumePipelineV2Run({
+    pipeline: harness.pipeline,
+    runId: harness.runId,
+    runRoot: harness.dirs.runRoot,
+    sink: reopened,
+    runtime: fake.runtime,
+  }, NEUTRAL_CONTROL);
+  const state = expectResumeOk(result);
+  expect(state.status).toBe("success");
+  // the stage start carried the exact compiled role and open iteration
+  const start = reopened.commands.find((command) => command.kind === "start_agent_execution");
+  expect(start).toMatchObject({ stateId: "dev_entry", executionRole: "stage", iterationIndex: 1 });
+  expect(state.executions[2]).toMatchObject({
+    state_id: "dev_entry",
+    execution_role: "stage",
+    iteration_index: 1,
+  });
+  expect(state.generations).toHaveLength(1);
+  expect(state.generations[0]).toMatchObject({
+    template_id: "development",
+    open_iteration: { index: 1, opened_transition_count: 2 },
+  });
+  expect(fake.pairs).toHaveLength(1);
+  expect(fake.pairs[0]?.execution.cleanupCount).toBe(1);
+  expect(fake.pairs[0]?.tool.cleanupCount).toBe(1);
 });

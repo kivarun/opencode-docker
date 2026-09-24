@@ -112,6 +112,13 @@ outputs:
         state: coder
         output: report
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
 states:
   - id: coder
     type: agent
@@ -163,6 +170,13 @@ outputs:
         state: first
         output: report
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: first
+      role: planning
+    - state_id: second
+      role: planning
 states:
   - id: first
     type: agent
@@ -211,6 +225,9 @@ outputs:
     source:
       pipeline_input: facts_seed
 
+orchestration:
+  stage_templates: []
+  execution_roles: []
 states:
   - id: done
     type: terminal
@@ -235,6 +252,9 @@ outputs:
     source:
       pipeline_input: facts_seed
 
+orchestration:
+  stage_templates: []
+  execution_roles: []
 states:
   - id: failed_end
     type: terminal
@@ -250,6 +270,11 @@ max_transitions: 20
 inputs: []
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
 states:
   - id: coder
     type: agent
@@ -276,6 +301,13 @@ max_transitions: 2
 inputs: []
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: coder2
+      role: planning
 states:
   - id: coder
     type: agent
@@ -314,6 +346,13 @@ inputs: []
 
 outputs: []
 
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+    - state_id: check
+      role: control
 states:
   - id: coder
     type: agent
@@ -2941,3 +2980,175 @@ async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null
     return null;
   }
 }
+
+/** The same agent -> decision graph without orchestration metadata. */
+const PIPELINE_NO_ORCHESTRATION = `
+schema_version: 2
+entry_state: coder
+max_transitions: 20
+
+inputs:
+  - id: facts_seed
+    type: json
+    protected: false
+    schema: schemas/loose.schema.json
+  - id: source
+    type: file
+    protected: true
+
+outputs:
+  - id: report
+    required: true
+    source:
+      state_output:
+        state: coder
+        output: report
+
+states:
+  - id: coder
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs:
+      - id: report
+        type: json
+        schema: schemas/loose.schema.json
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: check
+  - id: check
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: facts
+        source:
+          pipeline_input: facts_seed
+    transitions:
+${DECISION_TRANSITIONS}
+  - id: done
+    type: terminal
+    result: success
+  - id: failed_end
+    type: terminal
+    result: failed
+`;
+
+/** architect (planning) -> dispatch (control) -> stage template development (dev_entry stage). */
+const PIPELINE_STAGE = `
+schema_version: 2
+entry_state: architect
+max_transitions: 20
+
+inputs:
+  - id: facts_seed
+    type: json
+    protected: false
+    schema: schemas/loose.schema.json
+  - id: source
+    type: file
+    protected: true
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: dispatch
+      role: control
+    - state_id: dev_entry
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dispatch
+  - id: dispatch
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: facts
+        source:
+          pipeline_input: facts_seed
+    transitions:
+      - outcome: alpha
+        to: dev_entry
+      - outcome: beta
+        to: failed_end
+      - outcome: uncovered
+        to: failed_end
+      - outcome: inconsistent_facts
+        to: failed_end
+      - outcome: invalid_facts
+        to: failed_end
+  - id: dev_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+  - id: done
+    type: terminal
+    result: success
+  - id: failed_end
+    type: terminal
+    result: failed
+`;
+
+test("31. a pipeline without orchestration metadata refuses the fresh run before any effect", async () => {
+  const harness = await setupHarness(PIPELINE_NO_ORCHESTRATION);
+  const fake = fakeRuntime([{}]);
+  const result = await coordinate(harness, fake.runtime);
+  expect(result.ok).toBe(false);
+  if (result.ok) {
+    throw new Error("expected the orchestration gate refusal");
+  }
+  expect(result.reason).toBe("invalid_graph");
+  expect(result.state).toBeNull();
+  expect(harness.recording.commands).toHaveLength(0);
+  expect(fake.createCalls).toHaveLength(0);
+  expect(harness.ioCounts.renames).toBe(0);
+  expect(harness.ioCounts.tempOpens).toBe(0);
+  // no durable state document was ever created
+  expect((await lstatOrNull(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"))) === null).toBe(true);
+});
+
+test("32. a stage execution without an open lifecycle fails the run as invalid_graph before any Session", async () => {
+  const harness = await setupHarness(PIPELINE_STAGE);
+  const fake = fakeRuntime([{}, {}]);
+  const result = await coordinate(harness, fake.runtime);
+  // the planning and control executions run; the stage start has no open
+  // generation with an open iteration and refuses before the Session
+  const state = expectFailedState(result, "invalid_graph");
+  expect(state.executions.map((execution) => [execution.state_id, execution.execution_role])).toEqual([
+    ["architect", "planning"],
+    ["dispatch", "control"],
+  ]);
+  expect(state.executions.some((execution) => execution.execution_role === "stage")).toBe(false);
+  // only the planning agent created a session pair (execution + tool)
+  expect(fake.createCalls).toHaveLength(2);
+  expect(fake.pairs).toHaveLength(1);
+  expect(fake.pairs[0]?.execution.cleanupCount).toBe(1);
+  expect(fake.pairs[0]?.tool.cleanupCount).toBe(1);
+  expect(state.failure).toEqual({ reason: "invalid_graph" });
+});
