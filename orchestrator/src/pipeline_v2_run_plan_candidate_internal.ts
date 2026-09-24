@@ -132,18 +132,22 @@ function requirePreparedCandidate(value: unknown): void {
  * filesystem side effect (there are none here) and returns the
  * deep-frozen candidate in the plan's deterministic task order.
  *
- * Fixed order: provenance gates (plan → both task values are arrays →
- * each array materialized exactly once into a snapshot → every current
- * snapshot entry → previous plan → every previous snapshot entry) →
- * `validateRootTaskBinding` → `validatePlanRevisionChain` →
- * `validatePlanTaskBindings` → the task predecessor set → the canonical
- * task order → deep-freeze → registration → return.
+ * Fixed order: plan provenance gate → both task values checked with
+ * `Array.isArray` → `taskRevisions` materialized exactly once into a
+ * snapshot → the current snapshot entries' provenance gates → the
+ * previous plan provenance gate → `previousTaskRevisions` materialized
+ * exactly once into a snapshot → the previous snapshot entries'
+ * provenance gates → `validateRootTaskBinding` →
+ * `validatePlanRevisionChain` → `validatePlanTaskBindings` → the task
+ * predecessor set → the canonical task order → deep-freeze →
+ * registration → return.
  *
- * Single-snapshot boundary: after the `Array.isArray` checks each caller
- * array is materialized exactly once (`Array.from`, one `Symbol.iterator`
- * read) and everything below — the provenance gates, the binding
- * validators, the predecessor maps and the deterministic ordering —
- * operates only on the snapshots; the original arrays are never read
+ * Single-snapshot boundary: the current array is snapshotted before its
+ * entries are gated and the previous array only after the previous plan
+ * gate; after its single materialization (one `Symbol.iterator` read)
+ * each snapshot is the only thing every later step — the provenance
+ * gates, the binding validators, the predecessor maps and the
+ * deterministic ordering — reads; the original arrays are never read
  * again. A later iterator read (e.g. a mutating Proxy array) can
  * therefore never feed different objects into different passes, and
  * sparse slots become `undefined` values that the gates reject. The
