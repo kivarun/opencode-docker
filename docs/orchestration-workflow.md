@@ -807,6 +807,41 @@ execution roles in durable executions, lifecycle journals, controller/
 coordinator/runner/CLI wiring, filesystem publication, wait/replanning
 wiring, grants and effective budget remain later increments.
 
+### Compiled run-plan acceptance boundary (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_run_plan_acceptance.ts` adds the
+controller-owned compiled validation that decides whether a prepared run
+plan candidate is ready for the future durable acceptance. The invariant:
+the candidate's `plan.origin_execution` names the last successful
+settled-but-unbound agent execution of the current run, and the compiled
+execution role of that state — resolved only through
+`compiledExecutionRoleFor`, never inferred from execution type, profile,
+state name, prompt or graph position — is `planning`. Fixed gate order:
+pipeline provenance first (before the state or candidate are read), then
+`compilePipelineV2RunPlanCandidate` (candidate provenance and template
+resolution — forged candidates and template failures fire before the state
+is touched), then `validatePipelineV2RunState` as the single state
+validator, the exact durable pipeline identity through the single shared
+structural comparator (`pipeline_v2_identity_compare.ts`, the same
+comparator the resume verifier uses — no second comparator), the
+acceptance boundary (active+running, no terminal/run outputs/failure/open
+wait, `executions.length === transitions.length + 1`, the LAST execution
+the single settled-but-unbound agent execution in `cleanup_completed`; no
+own cursor replay — the loader already proved cursor coherence), the
+candidate/run binding, the origin binding (origin = the last array
+element only, never a searched older execution), and the compiled role
+(only `planning`). Errors: state/boundary violations → `invalid_state`,
+identity mismatch → `pipeline_mismatch`, foreign run → `candidate_mismatch`,
+missing/non-last/non-succeeding origin → `origin_execution_mismatch`,
+non-planning role → `origin_role_mismatch`; pipeline provenance,
+compiled-plan and orchestration errors are never masked, and
+classification is by operation context, never by message text. Success
+returns the exact provenance-backed compiled plan object from the
+verifier's single internal compile call. The loader and reducer are not
+strengthened, schema v7 is not started, and nothing is wired into
+production: controller/coordinator/runner/CLI, filesystem, wait/
+replanning, grants and migrations remain later increments.
+
 ### v2 run-input snapshots and host-side activation data layout (used by the production runner through the coordinator)
 
 `orchestrator/src/pipeline_v2_runtime.ts` materializes the v2 data plane on

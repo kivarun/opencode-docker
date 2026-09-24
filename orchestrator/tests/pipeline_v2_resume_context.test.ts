@@ -589,7 +589,37 @@ test("11. every pipeline identity field mismatch is rejected as pipeline_mismatc
         (error) => error,
       );
       expectRestoreError(cause, "pipeline_mismatch");
+      // the diagnostic text stays byte-identical after the identity
+      // comparison moved into the shared comparator module
+      expect((cause as Error).message).toMatch(
+        /the durable run state was created for a different pipeline: /,
+      );
     }
+    // exact per-field diagnostics (byte-identical)
+    const bundleRootShifted = JSON.parse(JSON.stringify(base.drive.state)) as Record<string, unknown>;
+    (bundleRootShifted["pipeline"] as Record<string, unknown>)["bundle_root"] = "/opt/other-bundle";
+    const bundleCause = await restorePipelineV2RuntimeContext(base.pipeline, bundleRootShifted, base.runRoot).catch(
+      (error) => error,
+    );
+    expect((bundleCause as Error).message).toBe(
+      "the durable run state was created for a different pipeline: the canonical bundle root differs",
+    );
+    const digestShifted = JSON.parse(JSON.stringify(base.drive.state)) as Record<string, unknown>;
+    (digestShifted["pipeline"] as Record<string, unknown>)["execution_snapshot_sha256"] = hex("9");
+    const digestCause = await restorePipelineV2RuntimeContext(base.pipeline, digestShifted, base.runRoot).catch(
+      (error) => error,
+    );
+    expect((digestCause as Error).message).toBe(
+      "the durable run state was created for a different pipeline: the execution snapshot digest differs",
+    );
+    const budgetShifted = JSON.parse(JSON.stringify(base.drive.state)) as Record<string, unknown>;
+    (budgetShifted["pipeline"] as Record<string, unknown>)["max_transitions"] = 21;
+    const budgetCause = await restorePipelineV2RuntimeContext(base.pipeline, budgetShifted, base.runRoot).catch(
+      (error) => error,
+    );
+    expect((budgetCause as Error).message).toBe(
+      "the durable run state was created for a different pipeline: the transition budget differs",
+    );
     // An entry-state mismatch is caught by the state loader's cursor replay
     // before the identity comparison: the durable state is incoherent.
     const shiftedEntry = JSON.parse(JSON.stringify(base.drive.state)) as Record<string, unknown>;

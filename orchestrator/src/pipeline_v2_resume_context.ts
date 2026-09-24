@@ -11,6 +11,10 @@ import {
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
 import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
+import {
+  comparePipelineV2RunIdentity,
+  type PipelineV2RunIdentityField,
+} from "./pipeline_v2_identity_compare.ts";
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
 import {
   mintRestoredRunInputsSnapshot,
@@ -289,8 +293,20 @@ function checkResumableBoundary(state: PipelineV2RunState): void {
 /**
  * The exact pipeline identity and run-id binding: every identity field
  * must match `pipelineV2RunPipelineIdentity` and the run root's basename
- * must be the durable run id.
+ * must be the durable run id. The five identity fields are compared by
+ * the single shared structural comparator (`pipeline_v2_identity_compare.ts`)
+ * — the same comparator the compiled run-plan acceptance verifier uses —
+ * with this module's field messages kept byte-identical and in the same
+ * fixed field order.
  */
+const IDENTITY_FIELD_MESSAGES: Record<PipelineV2RunIdentityField, string> = {
+  schema_version: "the pipeline schema version differs",
+  bundle_root: "the canonical bundle root differs",
+  execution_snapshot_sha256: "the execution snapshot digest differs",
+  entry_state: "the entry state differs",
+  max_transitions: "the transition budget differs",
+};
+
 function checkPipelineIdentity(
   pipeline: ResolvedPipelineV2,
   state: PipelineV2RunState,
@@ -300,20 +316,9 @@ function checkPipelineIdentity(
   const actual = state.pipeline;
   const mismatch = (what: string): PipelineV2RuntimeContextRestoreError =>
     restoreError("pipeline_mismatch", `the durable run state was created for a different pipeline: ${what}`);
-  if (actual.schema_version !== expected.schema_version) {
-    throw mismatch("the pipeline schema version differs");
-  }
-  if (actual.bundle_root !== expected.bundle_root) {
-    throw mismatch("the canonical bundle root differs");
-  }
-  if (actual.execution_snapshot_sha256 !== expected.execution_snapshot_sha256) {
-    throw mismatch("the execution snapshot digest differs");
-  }
-  if (actual.entry_state !== expected.entry_state) {
-    throw mismatch("the entry state differs");
-  }
-  if (actual.max_transitions !== expected.max_transitions) {
-    throw mismatch("the transition budget differs");
+  const comparison = comparePipelineV2RunIdentity(expected, actual);
+  if (comparison.kind === "mismatch") {
+    throw mismatch(IDENTITY_FIELD_MESSAGES[comparison.field]);
   }
   if (basename(runRoot) !== state.run_id) {
     throw restoreError(
