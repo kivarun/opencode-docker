@@ -1322,3 +1322,164 @@ test("45. source scan: single-owner layer with no forbidden imports or seams", a
     expect(key.toLowerCase()).not.toContain("setops");
   }
 });
+
+test("46. single-snapshot current array: a mutating Proxy array cannot swap the bound task", () => {
+  const goodTask = preparedTask("task-d", 1, null, "planning_proposal", "Good body");
+  const rogueTask = preparedTask("task-d", 1, null, "planning_proposal", "Rogue body");
+  expect(goodTask.sha256).not.toBe(rogueTask.sha256);
+  const plan = preparedPlan([
+    { id: "stage-1", template: "development", tasks: [
+      { id: "task-d", revision: 1, sha256: goodTask.sha256, depends_on: [] },
+    ] },
+  ]);
+  const backing = [goodTask];
+  let iteratorReads = 0;
+  const rogueArray = new Proxy(backing, {
+    get(target: PreparedPipelineV2RunTaskRevision[], property: string | symbol, receiver: unknown): unknown {
+      if (property === Symbol.iterator) {
+        iteratorReads += 1;
+        const values = iteratorReads === 1 ? target : [rogueTask];
+        return function* (): Generator<PreparedPipelineV2RunTaskRevision> {
+          yield* values;
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  }) as unknown as PreparedPipelineV2RunTaskRevision[];
+  const candidate = preparePipelineV2RunPlanCandidate(candidateOptions(plan, rogueArray));
+  // pre-fix regression (99182c1): the array was re-read after validation —
+  // the first iterator read fed [goodTask] to the provenance gate and the
+  // index reads of validatePlanTaskBindings, while the map-building loop's
+  // second iterator read received [rogueTask]; every read was a provenance-
+  // valid prepared object, so the candidate was accepted with
+  // candidate.task_revisions[0] === rogueTask and a plan pointer naming
+  // goodTask.sha256 — an internally inconsistent filesystem commit marker.
+  // After the single-snapshot fix each caller array is materialized exactly
+  // once and every later step uses only that snapshot.
+  expect(iteratorReads).toBe(1);
+  expect(candidate.task_revisions[0]).toBe(goodTask);
+  const pointer = candidate.plan.manifest.stages[0]?.tasks[0];
+  expect(pointer?.sha256).toBe(goodTask.sha256);
+  expect(candidate.task_revisions[0]?.sha256).toBe(pointer?.sha256);
+  // the caller's backing array is untouched
+  expect(backing[0]).toBe(goodTask);
+  expect(Object.isFrozen(backing)).toBe(false);
+});
+
+test("47. single-snapshot previous array: exactly one iterator read", () => {
+  const backing = [A1, B1];
+  let iteratorReads = 0;
+  const previousArray = new Proxy(backing, {
+    get(target: PreparedPipelineV2RunTaskRevision[], property: string | symbol, receiver: unknown): unknown {
+      if (property === Symbol.iterator) {
+        iteratorReads += 1;
+        if (iteratorReads > 1) {
+          throw new Error("SECOND_PREVIOUS_ITERATOR_READ");
+        }
+        return function* (): Generator<PreparedPipelineV2RunTaskRevision> {
+          yield* target;
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  }) as unknown as PreparedPipelineV2RunTaskRevision[];
+  // pre-fix regression (99182c1): the previous array was read twice (the
+  // provenance gate loop, then the predecessor-map loop), so preparation
+  // aborted with the second read's sentinel error. After the single-
+  // snapshot fix the array is materialized exactly once and the second
+  // read never happens.
+  const candidate = preparePipelineV2RunPlanCandidate(
+    candidateOptions(PLAN_AB_2, [A2, B2], PLAN_AB_1, previousArray),
+  );
+  expect(iteratorReads).toBe(1);
+  expect(candidate.task_revisions[0]?.manifest.previous_sha256).toBe(A1.sha256);
+  expect(candidate.task_revisions[1]?.manifest.previous_sha256).toBe(B1.sha256);
+  // the caller's backing array is untouched
+  expect(backing[0]).toBe(A1);
+  expect(backing[1]).toBe(B1);
+  expect(Object.isFrozen(backing)).toBe(false);
+});
+
+test("48. publication ops getters are read exactly once, in order", async () => {
+  const fixture = await setup();
+  try {
+    const candidate = preparePipelineV2RunPlanCandidate(candidateOptions(PLAN_AB_1, [A1, B1]));
+    const calls: string[] = [];
+    let taskGetterReads = 0;
+    let planGetterReads = 0;
+    const ops = {
+      get publishTaskRevision() {
+        taskGetterReads += 1;
+        if (taskGetterReads > 1) {
+          throw new Error("SECOND_TASK_OP_READ");
+        }
+        return async (runRoot: string, value: unknown) => {
+          calls.push(`task:${(value as PipelineV2RunTaskRevisionManifest).task_id}`);
+          return await publishPipelineV2TaskRevision(runRoot, value);
+        };
+      },
+      get publishPlanRevision() {
+        planGetterReads += 1;
+        if (planGetterReads > 1) {
+          throw new Error("SECOND_PLAN_OP_READ");
+        }
+        return async (runRoot: string, value: unknown) => {
+          calls.push(`plan:${(value as PipelineV2RunPlanRevisionManifest).revision}`);
+          return await publishPipelineV2PlanRevision(runRoot, value);
+        };
+      },
+    };
+    const result = await publishPipelineV2RunPlanCandidateWithOps(
+      ops as unknown as PipelineV2RunPlanCandidatePublicationOps,
+      fixture.runRoot,
+      candidate,
+    );
+    expect(result).toBe(candidate);
+    expect(taskGetterReads).toBe(1);
+    expect(planGetterReads).toBe(1);
+    expect(calls).toEqual(["task:task-a", "task:task-b", "plan:1"]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("49. a throwing first ops getter propagates unchanged with zero store calls", async () => {
+  const fixture = await setup();
+  try {
+    const candidate = preparePipelineV2RunPlanCandidate(candidateOptions(PLAN_AB_1, [A1, B1]));
+    const boom = new Error("first task op read");
+    let planGetterReads = 0;
+    let planCalls = 0;
+    const ops = {
+      get publishTaskRevision(): PipelineV2RunPlanCandidatePublicationOps["publishTaskRevision"] {
+        throw boom;
+      },
+      get publishPlanRevision() {
+        planGetterReads += 1;
+        return async (runRoot: string, value: unknown) => {
+          planCalls += 1;
+          return await publishPipelineV2PlanRevision(runRoot, value);
+        };
+      },
+    };
+    const caught = await catchAsyncOf(() =>
+      publishPipelineV2RunPlanCandidateWithOps(
+        ops as unknown as PipelineV2RunPlanCandidatePublicationOps,
+        fixture.runRoot,
+        candidate,
+      ),
+    );
+    expect(caught).toBe(boom);
+    expect(planGetterReads).toBe(0);
+    expect(planCalls).toBe(0);
+    // candidate fields are not mutated
+    expect(candidate.plan).toBe(PLAN_AB_1);
+    expect(Object.isFrozen(candidate)).toBe(true);
+    // no task artifact was published
+    expect(
+      await readFile(taskFilePath(fixture, "task-a", 1), "utf8").then(() => true).catch(() => false),
+    ).toBe(false);
+  } finally {
+    await dispose(fixture);
+  }
+});

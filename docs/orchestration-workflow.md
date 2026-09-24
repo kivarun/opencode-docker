@@ -1776,12 +1776,21 @@ and sparse/undefined entries fail the gates), then returns a deep-frozen
 candidate `{plan, task_revisions}` whose task revisions are the exact
 prepared objects in the plan's deterministic order (stage declaration
 order, then the plan's normalized task order — the caller's array order
-is never semantic). Options are captured exactly once; later mutations
-of the options object or the passed arrays cannot influence the result.
+is never semantic). Options are captured exactly once; each caller task
+array is then materialized exactly once into a snapshot (one
+`Symbol.iterator` read) that every later step — the provenance gates,
+the binding validators, the predecessor maps and the deterministic
+ordering — uses exclusively, so a mutating Proxy array can never swap
+the bound objects between passes; later mutations of the options object
+or the passed arrays cannot influence the result.
 `publishPipelineV2RunPlanCandidate` publishes through the run-plan
 store: every task revision first, strictly sequentially in candidate
 order, then the plan revision — the plan artifact is the filesystem
-commit marker of the whole candidate, never durable acceptance. Store
+commit marker of the whole candidate, never durable acceptance. Each
+publication ops method is read exactly once into a captured local
+before its type check and the caller's ops object is never read again
+(a getter that throws on a second read never fires, and mid-run method
+reassignment cannot change dispatch). Store
 errors pass through unchanged (`not_published` before the link,
 `durability_unknown` after it); a partial failure leaves immutable
 orphan task artifacts that nothing removes, an exact retry safely

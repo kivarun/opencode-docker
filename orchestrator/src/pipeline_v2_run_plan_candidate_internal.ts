@@ -132,11 +132,23 @@ function requirePreparedCandidate(value: unknown): void {
  * filesystem side effect (there are none here) and returns the
  * deep-frozen candidate in the plan's deterministic task order.
  *
- * Fixed order: provenance gates (plan → both task arrays are arrays →
- * every current task revision → previous plan → every previous task
- * revision) → `validateRootTaskBinding` → `validatePlanRevisionChain` →
+ * Fixed order: provenance gates (plan → both task values are arrays →
+ * each array materialized exactly once into a snapshot → every current
+ * snapshot entry → previous plan → every previous snapshot entry) →
+ * `validateRootTaskBinding` → `validatePlanRevisionChain` →
  * `validatePlanTaskBindings` → the task predecessor set → the canonical
  * task order → deep-freeze → registration → return.
+ *
+ * Single-snapshot boundary: after the `Array.isArray` checks each caller
+ * array is materialized exactly once (`Array.from`, one `Symbol.iterator`
+ * read) and everything below — the provenance gates, the binding
+ * validators, the predecessor maps and the deterministic ordering —
+ * operates only on the snapshots; the original arrays are never read
+ * again. A later iterator read (e.g. a mutating Proxy array) can
+ * therefore never feed different objects into different passes, and
+ * sparse slots become `undefined` values that the gates reject. The
+ * caller arrays are never frozen or modified, and the result receives a
+ * new deterministic ordered array, never a snapshot reference.
  */
 export function preparePipelineV2RunPlanCandidateCore(
   plan: PreparedPipelineV2RunPlanRevision,
@@ -156,24 +168,26 @@ export function preparePipelineV2RunPlanCandidateCore(
       "preparePipelineV2RunPlanCandidate requires an array of prepared previous task revisions",
     );
   }
-  for (const task of taskRevisions) {
+  const taskRevisionSnapshot = Array.from(taskRevisions);
+  for (const task of taskRevisionSnapshot) {
     requireManifestProvenance(task, "task_revision");
   }
   if (previousPlan !== null) {
     requireManifestProvenance(previousPlan, "plan_revision");
   }
-  for (const previous of previousTaskRevisions) {
+  const previousTaskRevisionSnapshot = Array.from(previousTaskRevisions);
+  for (const previous of previousTaskRevisionSnapshot) {
     requireManifestProvenance(previous, "task_revision");
   }
   validateRootTaskBinding({ plan, protectedInputDigest });
   validatePlanRevisionChain({ previous: previousPlan, current: plan });
-  validatePlanTaskBindings({ plan, taskRevisions });
+  validatePlanTaskBindings({ plan, taskRevisions: taskRevisionSnapshot });
   const currentByTaskId = new Map<string, PreparedPipelineV2RunTaskRevision>();
-  for (const task of taskRevisions) {
+  for (const task of taskRevisionSnapshot) {
     currentByTaskId.set(task.manifest.task_id, task);
   }
   const previousByTaskId = new Map<string, PreparedPipelineV2RunTaskRevision>();
-  for (const previous of previousTaskRevisions) {
+  for (const previous of previousTaskRevisionSnapshot) {
     const taskId = previous.manifest.task_id;
     if (previousByTaskId.has(taskId)) {
       throw new PipelineV2RunPlanBindingError(
@@ -303,6 +317,13 @@ function publishedPlanMatchesCandidate(
  * rollback, no durable dispatch). The original store errors pass through
  * unchanged; a structurally inconsistent store result (hostile injected
  * ops) is a failed publication.
+ *
+ * Single-read ops capture: after the object shape check each method is
+ * read exactly once into a local constant (`publishTaskRevision` first,
+ * then `publishPlanRevision`), the captured values are type-checked, and
+ * the caller's `ops` object is never read again — a getter that throws on
+ * a second read never fires, and method reassignment during pending
+ * publication calls cannot change dispatch.
  */
 export async function publishPipelineV2RunPlanCandidateWithOps(
   ops: PipelineV2RunPlanCandidatePublicationOps,
@@ -310,18 +331,22 @@ export async function publishPipelineV2RunPlanCandidateWithOps(
   candidate: PreparedPipelineV2RunPlanCandidate,
 ): Promise<PreparedPipelineV2RunPlanCandidate> {
   requirePreparedCandidate(candidate);
-  if (
-    typeof ops !== "object" ||
-    ops === null ||
-    typeof (ops as { publishTaskRevision?: unknown }).publishTaskRevision !== "function" ||
-    typeof (ops as { publishPlanRevision?: unknown }).publishPlanRevision !== "function"
-  ) {
+  if (typeof ops !== "object" || ops === null) {
     throw new TypeError(
       "the run plan candidate publication requires publishTaskRevision and publishPlanRevision functions",
     );
   }
-  const publishTaskRevision = ops.publishTaskRevision;
-  const publishPlanRevision = ops.publishPlanRevision;
+  const publishTaskRevision = (ops as { publishTaskRevision?: unknown }).publishTaskRevision as
+    | typeof publishPipelineV2TaskRevision
+    | undefined;
+  const publishPlanRevision = (ops as { publishPlanRevision?: unknown }).publishPlanRevision as
+    | typeof publishPipelineV2PlanRevision
+    | undefined;
+  if (typeof publishTaskRevision !== "function" || typeof publishPlanRevision !== "function") {
+    throw new TypeError(
+      "the run plan candidate publication requires publishTaskRevision and publishPlanRevision functions",
+    );
+  }
   const plan = candidate.plan;
   const taskRevisions = candidate.task_revisions;
   for (const task of taskRevisions) {
