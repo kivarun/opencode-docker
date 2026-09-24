@@ -8,6 +8,7 @@ import {
   PIPELINE_V2_TERMINAL_FAILURE_REASON,
   PipelineV2StateError,
   parsePipelineV2RunState,
+  pipelineV2StageIterationAt,
   reducePipelineV2RunCommand,
   validatePipelineV2RunState,
   type PipelineDecisionStateRecord,
@@ -4582,6 +4583,261 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     expectInvalid(JSON.parse(anchorRaw), (draft) => {
       draft.generations[0].closed = { by: "next_stage", closed_transition_count: 2 };
     }, "pipeline v2 run state generations[0] is closed without any recorded iteration");
+  });
+
+  test("the loader terminates on an answered wait whose iteration was never closed and fails closed typed", () => {
+    // The reducer-valid base: the wait answered, the iteration closed by
+    // its grant. Deleting the closure record (and restoring the open
+    // iteration projection) forges a shape-valid document with an answered
+    // wait over an open iteration — a state the reducer can never produce.
+    // The response must never be applied over an open iteration; the
+    // loader must terminate with a typed diagnostic.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    planningPrefix(driver);
+    driver.apply(planAccepted());
+    commitTransition(driver, "architect", "completed", "dispatch", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] } });
+    commitTransition(driver, "dispatch", "d_next_stage", "dev_entry", 2);
+    driver.apply(genOpened());
+    driver.apply(iterOpened());
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    driver.apply(iterClosed({ iterationIndex: 1 }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    const raw = JSON.stringify(driver.current);
+    expectInvalid(JSON.parse(raw), (draft) => {
+      delete draft.generations[0].iterations[0].closed;
+      draft.generations[0].open_iteration = { index: 1, opened_transition_count: 2 };
+    }, "wait record 1 is answered while iteration 1 of generation 1 is still open");
+  });
+
+  test("the effective iteration budget rejects unrepresentable sums exactly like the reducer", () => {
+    // The reducer records a grant of MAX_SAFE_INTEGER without a sum check,
+    // closes the iteration by that grant and answers the wait — all legal.
+    // The next iteration opening is what the reducer rejects
+    // (unrepresentable budget); the forged iteration-2 record must be
+    // rejected by the loader with the same diagnostic family.
+    const grantOverflow = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    planningPrefix(grantOverflow);
+    grantOverflow.apply(planAccepted());
+    commitTransition(grantOverflow, "architect", "completed", "dispatch", 1);
+    grantOverflow.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    grantOverflow.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] } });
+    commitTransition(grantOverflow, "dispatch", "d_next_stage", "dev_entry", 2);
+    grantOverflow.apply(genOpened({ initialBudget: 1 }));
+    grantOverflow.apply(iterOpened());
+    stageAgent(grantOverflow, "dev_entry", 1, 3);
+    commitTransition(grantOverflow, "dev_entry", "completed", "coder", 3);
+    grantOverflow.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    grantOverflow.apply(intentAccepted());
+    grantOverflow.apply(grantRecorded({ additionalIterations: Number.MAX_SAFE_INTEGER }));
+    grantOverflow.apply(iterClosed({ iterationIndex: 1 }));
+    grantOverflow.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    const overflowRaw = JSON.stringify(grantOverflow.current);
+    expectInvalid(JSON.parse(overflowRaw), (draft) => {
+      draft.generations[0].iteration_count = 2;
+      draft.generations[0].iterations.push({ index: 2, opened_transition_count: 3 });
+      draft.generations[0].open_iteration = { index: 2, opened_transition_count: 3 };
+    }, "the effective iteration budget of generation 1 is unrepresentable");
+    // the sum itself overflowing across two grants: the second wait's
+    // grant pushes the accumulated sum past the safe range
+    const sumOverflow = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    planningPrefix(sumOverflow);
+    sumOverflow.apply(planAccepted());
+    commitTransition(sumOverflow, "architect", "completed", "dispatch", 1);
+    sumOverflow.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    sumOverflow.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] } });
+    commitTransition(sumOverflow, "dispatch", "d_next_stage", "dev_entry", 2);
+    sumOverflow.apply(genOpened({ initialBudget: 1 }));
+    sumOverflow.apply(iterOpened());
+    stageAgent(sumOverflow, "dev_entry", 1, 3);
+    commitTransition(sumOverflow, "dev_entry", "completed", "coder", 3);
+    sumOverflow.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    sumOverflow.apply(intentAccepted());
+    sumOverflow.apply(grantRecorded({ additionalIterations: Number.MAX_SAFE_INTEGER }));
+    sumOverflow.apply(iterClosed({ iterationIndex: 1 }));
+    sumOverflow.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    sumOverflow.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("9"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    sumOverflow.apply(intentAccepted({ waitIndex: 2, intentSha256: INTENT_GRANT }));
+    sumOverflow.apply(grantRecorded({ waitIndex: 2, additionalIterations: 1 }));
+    sumOverflow.apply({ kind: "wait_response_recorded", waitIndex: 2, expectedRequestSha256: hex("9"), actionId: "continue_stage", responseSha256: hex("a") });
+    const sumRaw = JSON.stringify(sumOverflow.current);
+    expectInvalid(JSON.parse(sumRaw), (draft) => {
+      draft.generations[0].iteration_count = 2;
+      draft.generations[0].iterations.push({ index: 2, opened_transition_count: 3 });
+      draft.generations[0].open_iteration = { index: 2, opened_transition_count: 3 };
+    }, "the effective iteration budget of generation 1 is unrepresentable");
+    // the boundary: an effective budget of exactly MAX_SAFE_INTEGER is
+    // representable and the reducer builds the whole state (the loader
+    // round-trips it)
+    const boundary = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    planningPrefix(boundary);
+    boundary.apply(planAccepted());
+    commitTransition(boundary, "architect", "completed", "dispatch", 1);
+    boundary.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    boundary.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] } });
+    commitTransition(boundary, "dispatch", "d_next_stage", "dev_entry", 2);
+    boundary.apply(genOpened({ initialBudget: 1 }));
+    boundary.apply(iterOpened());
+    stageAgent(boundary, "dev_entry", 1, 3);
+    commitTransition(boundary, "dev_entry", "completed", "coder", 3);
+    boundary.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    boundary.apply(intentAccepted());
+    boundary.apply(grantRecorded({ additionalIterations: Number.MAX_SAFE_INTEGER - 1 }));
+    boundary.apply(iterClosed({ iterationIndex: 1 }));
+    boundary.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    boundary.apply({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 3 });
+    // the reducer-valid base without the forged opening round-trips too
+    const plain = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    planningPrefix(plain);
+    plain.apply(planAccepted());
+    commitTransition(plain, "architect", "completed", "dispatch", 1);
+    plain.apply({ kind: "start_decision_execution", stateId: "dispatch", inputDigest: hex("e"), executionRole: "control" });
+    plain.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] } });
+    commitTransition(plain, "dispatch", "d_next_stage", "dev_entry", 2);
+    plain.apply(genOpened({ initialBudget: 1 }));
+    plain.apply(iterOpened());
+    stageAgent(plain, "dev_entry", 1, 3);
+    commitTransition(plain, "dev_entry", "completed", "coder", 3);
+    plain.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    plain.apply(intentAccepted());
+    plain.apply(grantRecorded({ additionalIterations: Number.MAX_SAFE_INTEGER }));
+  });
+
+  test("the loader rejects generation lifecycle anchors that name a future boundary", () => {
+    // a future opening anchor: generation 1 open with no iterations yet,
+    // its opening reforged past the committed transitions
+    const w2 = createDriver(STAGE_IDENTITY, []);
+    dispatchedPrefix(w2);
+    commitTransition(w2, "dispatch", "d_next_stage", "dev_entry", 2);
+    w2.apply(genOpened());
+    const w2Raw = JSON.stringify(w2.current);
+    expectInvalid(JSON.parse(w2Raw), (draft) => {
+      draft.generations[0].opened_transition_count = 99;
+    }, "generation 1 opens at committed transition count 99, which exceeds the 2 committed transitions");
+    // a future closure anchor: generation 1 closed at anchor 2, reforged
+    // to 99; the iteration closes stay anchored at 2 and remain consumed
+    const closed = createDriver(STAGE_IDENTITY, []);
+    dispatchedPrefix(closed);
+    commitTransition(closed, "dispatch", "d_next_stage", "dev_entry", 2);
+    closed.apply(genOpened());
+    closed.apply(iterOpened());
+    closed.apply(iterClosed({ by: "normal_close", waitIndex: undefined }));
+    closed.apply(genClosed({ by: "next_stage" }));
+    const closedRaw = JSON.stringify(closed.current);
+    expectInvalid(JSON.parse(closedRaw), (draft) => {
+      draft.generations[0].closed.closed_transition_count = 99;
+    }, "generation 1 closes at committed transition count 99, which exceeds the 2 committed transitions");
+  });
+
+  test("a wait-bound same-boundary closure is never the open iteration for the next execution", () => {
+    // the reducer-built base: the gate settles, its transition commits,
+    // the wait closes the iteration by grant and is answered
+    const driver = createDriver(STAGE_IDENTITY, []);
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "gate", 3);
+    driver.apply({ kind: "start_decision_execution", stateId: "gate", inputDigest: hex("a"), executionRole: "stage", iterationIndex: 1 });
+    driver.apply({ kind: "decision_evaluated", result: { status: "selected", outcome: "d_rework", decision: "d_rework", rule_id: "R1", active_constraint_ids: [] } });
+    commitTransition(driver, "gate", "d_rework", "coder", 4);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    driver.apply(iterClosed({ iterationIndex: 1 }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    const raw = JSON.stringify(driver.current);
+    // a forged next stage execution referencing the wait-closed iteration:
+    // with no reopened iteration there is nothing open at all
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.executions.push({
+        index: 5,
+        type: "agent",
+        state_id: "coder",
+        attempt: 1,
+        profile: "coder",
+        execution_role: "stage",
+        phase: "started",
+        iteration_index: 1,
+      });
+    }, 'execution 5 has the "stage" role but no iteration is open at committed transition count 4');
+    // with the reopened iteration 2 the wait-closed iteration 1 is still
+    // not the open iteration at the start
+    expectInvalid(JSON.parse(raw), (draft) => {
+      draft.generations[0].iteration_count = 2;
+      draft.generations[0].iterations.push({ index: 2, opened_transition_count: 4 });
+      draft.generations[0].open_iteration = { index: 2, opened_transition_count: 4 };
+      draft.executions.push({
+        index: 5,
+        type: "agent",
+        state_id: "coder",
+        attempt: 1,
+        profile: "coder",
+        execution_role: "stage",
+        phase: "started",
+        iteration_index: 1,
+      });
+    }, "execution 5 references iteration 1, which is not the open iteration 2 at committed transition count 4");
+    // the shared query resolves the same boundary the same way: the
+    // wait-closed iteration is not open at the start boundary, the
+    // reopened one is
+    const reopenedDraft = JSON.parse(raw) as any;
+    reopenedDraft.generations[0].iteration_count = 2;
+    reopenedDraft.generations[0].iterations.push({ index: 2, opened_transition_count: 4 });
+    reopenedDraft.generations[0].open_iteration = { index: 2, opened_transition_count: 4 };
+    const reopenedState = JSON.parse(JSON.stringify(reopenedDraft)) as PipelineV2RunState;
+    expect(pipelineV2StageIterationAt(reopenedState, 4, 2)).toMatchObject({ iteration_index: 2, generation_index: 1 });
+    // the unambiguous single candidate does not depend on the recorded
+    // reference; the restore verifier's own comparison reports the mismatch
+    expect(pipelineV2StageIterationAt(reopenedState, 4, 1)).toMatchObject({ iteration_index: 2 });
   });
 
   test("a waiting run never carries lifecycle mutations and the response demands the closed iteration", () => {

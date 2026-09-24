@@ -511,7 +511,7 @@ function verifyCompiledExecutionRoles(
       );
     }
     if (compiled.role === "stage") {
-      const open = pipelineV2StageIterationAt(state, execution.index - 1);
+      const open = pipelineV2StageIterationAt(state, execution.index - 1, execution.iteration_index);
       if (open === null) {
         throw mismatch(
           `execution ${execution.index} records iteration ${execution.iteration_index}, but no stage iteration is open at its start boundary`,

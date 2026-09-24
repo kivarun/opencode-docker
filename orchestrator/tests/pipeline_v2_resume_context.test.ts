@@ -1598,3 +1598,326 @@ test("43. a generation bound to a template the compiled pipeline does not declar
     await rm(base.root, { recursive: true, force: true });
   }
 });
+
+const STAGE_MODEL_YAML = `
+schema_version: 1
+facts:
+  - id: f1
+decisions:
+  - id: d_next_stage
+  - id: d_close_stage
+relations: []
+constraints: []
+rules:
+  - id: rule-next
+    when: {fact: f1, equals: true}
+    decision: d_next_stage
+  - id: rule-close
+    when: {fact: f1, equals: false}
+    decision: d_close_stage
+`;
+
+const STAGE_PIPELINE = `
+schema_version: 2
+entry_state: architect
+max_transitions: 12
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+  - id: facts
+    type: json
+    protected: false
+    schema: schemas/facts.schema.json
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: dispatch
+      role: control
+    - state_id: dev
+      role: stage
+      stage_template: development
+    - state_id: gate
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: coder
+    prompt: prompts/architect.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dispatch
+  - id: dispatch
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: dispatch_facts
+        source:
+          pipeline_input: facts
+    transitions:
+      - outcome: d_next_stage
+        to: dev
+      - outcome: d_close_stage
+        to: halt
+      - outcome: uncovered
+        to: halt
+      - outcome: inconsistent_facts
+        to: halt
+      - outcome: invalid_facts
+        to: halt
+  - id: dev
+    type: agent
+    profile: coder
+    prompt: prompts/dev.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: gate
+  - id: gate
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: gate_facts
+        source:
+          pipeline_input: facts
+    transitions:
+      - outcome: d_next_stage
+        to: dev
+      - outcome: d_close_stage
+        to: done
+      - outcome: uncovered
+        to: halt
+      - outcome: inconsistent_facts
+        to: halt
+      - outcome: invalid_facts
+        to: halt
+  - id: done
+    type: terminal
+    result: success
+  - id: halt
+    type: terminal
+    result: failed
+`;
+
+interface StageBase {
+  root: string;
+  pipeline: ResolvedPipelineV2;
+  runRoot: string;
+  runInputs: RunInputsSnapshot;
+  clock: { value: number };
+  drive: Drive;
+}
+
+async function setupStageBase(): Promise<StageBase> {
+  const root = await mkdtemp(join(tmpdir(), "pipeline-v2-resume-stage-"));
+  const bundle = join(root, "bundle");
+  await mkdir(join(bundle, "prompts"), { recursive: true });
+  await mkdir(join(bundle, "schemas"), { recursive: true });
+  await mkdir(join(bundle, "decisions"), { recursive: true });
+  await writeFile(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+  await writeFile(join(bundle, "prompts", "architect.md"), "plan the task\n");
+  await writeFile(join(bundle, "prompts", "dev.md"), "implement the stage\n");
+  await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+  await writeFile(join(bundle, "decisions", "model.yaml"), STAGE_MODEL_YAML);
+  const pipeline = await loadPipelineV2(bundle);
+
+  const sources = join(root, "userdata");
+  await mkdir(sources, { recursive: true });
+  await writeFile(join(sources, "task.md"), "TASK-BODY\n");
+  await writeFile(join(sources, "facts.json"), JSON.stringify({ f1: true, f2: false }));
+
+  const runRoot = join(root, "runs", RUN_ID);
+  await mkdir(join(runRoot, "project"), { mode: 0o700, recursive: true });
+  const runInputs = await snapshotRunInputs(pipeline, [
+    { id: "task", path: join(sources, "task.md") },
+    { id: "facts", path: join(sources, "facts.json") },
+  ], runRoot);
+
+  const clock = { value: 0 };
+  const drive: Drive = { state: null, records: [] };
+  dispatchClock(drive, clock, {
+    kind: "create_run",
+    runId: RUN_ID,
+    pipeline: pipelineV2RunPipelineIdentity(pipeline),
+    inputs: runInputs.inputs.map((entry) => ({
+      id: entry.id,
+      type: entry.type,
+      protected: entry.protected,
+      digest: entry.digest,
+    })),
+  });
+  return { root, pipeline, runRoot, runInputs, clock, drive };
+}
+
+function dispatchStage(base: StageBase, command: PipelineV2RunCommand): void {
+  dispatchClock(base.drive, base.clock, command);
+}
+
+function runStageAgentPhases(base: StageBase, stateId: string): number {
+  const executionIndex = (base.drive.state as PipelineV2RunState).executions.length + 1;
+  dispatchStage(base, {
+    kind: "start_agent_execution",
+    stateId,
+    profile: "coder",
+    ...startRoleArgs(base.pipeline, stateId, base.drive.state as PipelineV2RunState),
+  });
+  for (const command of AGENT_PHASE_COMMANDS(`sess-${executionIndex}`, `tool-${executionIndex}`)) {
+    dispatchStage(base, command);
+  }
+  dispatchStage(base, { kind: "agent_outputs_accepted", outputs: [] });
+  dispatchStage(base, { kind: "agent_cleanup_completed" });
+  return executionIndex;
+}
+
+function runStageDecision(
+  base: StageBase,
+  stateId: "dispatch" | "gate",
+  outcome: "d_next_stage" | "d_close_stage",
+): void {
+  dispatchStage(base, { kind: "start_decision_execution", stateId, inputDigest: hex("e"), ...startRoleArgs(base.pipeline, stateId, base.drive.state as PipelineV2RunState) });
+  dispatchStage(base, {
+    kind: "decision_evaluated",
+    result: { status: "selected", outcome, decision: outcome, rule_id: "R1", active_constraint_ids: [] },
+  });
+}
+
+function commitStageTransition(
+  base: StageBase,
+  from: string,
+  outcome: string,
+  to: string,
+  executionIndex: number,
+  declaredIndex: number,
+): void {
+  dispatchStage(base, {
+    kind: "transition_committed",
+    step: { from, outcome, to, transition_index: declaredIndex },
+    executionIndex,
+  });
+}
+
+/**
+ * The contract hook order at both stage boundaries: the control execution
+ * settles unbound, then the generation and iteration open at its own
+ * boundary, then the transition; the stage decision settles unbound, then
+ * the iteration and the generation close at its own boundary, then the
+ * transition. The run stops at the clean resumable boundary right after
+ * the final transition.
+ */
+function driveStageClosureBoundary(base: StageBase, closeBy: "normal_close" | "exhausted"): void {
+  runStageAgentPhases(base, "architect");
+  dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
+  commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
+  runStageDecision(base, "dispatch", "d_next_stage");
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
+  commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
+  runStageAgentPhases(base, "dev");
+  commitStageTransition(base, "dev", "completed", "gate", 3, 0);
+  runStageDecision(base, "gate", "d_close_stage");
+  dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: closeBy });
+  dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+  commitStageTransition(base, "gate", "d_close_stage", "done", 4, 1);
+}
+
+/**
+ * The same-boundary touching combination at the dev execution's start
+ * boundary: one iteration closes and another opens at the same count.
+ * `closedFirst` starts the dev execution inside the closed iteration
+ * (before its closure); otherwise the closure and reopening happen before
+ * the dev execution starts inside the reopened iteration.
+ */
+function driveStageTouching(base: StageBase, closedFirst: boolean): void {
+  runStageAgentPhases(base, "architect");
+  dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
+  commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
+  runStageDecision(base, "dispatch", "d_next_stage");
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
+  commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
+  if (!closedFirst) {
+    dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+    dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 2 });
+  }
+  runStageAgentPhases(base, "dev");
+  if (closedFirst) {
+    dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+    dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 2 });
+  }
+  commitStageTransition(base, "dev", "completed", "gate", 3, 0);
+  runStageDecision(base, "gate", "d_close_stage");
+  dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 2, by: "normal_close" });
+  dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+  commitStageTransition(base, "gate", "d_close_stage", "done", 4, 1);
+}
+
+test("44. the contract-order closure boundary with a same-boundary normal_close passes the loader and the real restore verifier", async () => {
+  const base = await setupStageBase();
+  try {
+    driveStageClosureBoundary(base, "normal_close");
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "done", transition_count: 4 });
+    expect(context.next_execution_index).toBe(5);
+    expect(context.accepted_outputs).toEqual([]);
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+test("45. the same-boundary exhausted closure is restorable the same way", async () => {
+  const base = await setupStageBase();
+  try {
+    driveStageClosureBoundary(base, "exhausted");
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "done", transition_count: 4 });
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+test("46. the touching same-boundary pair resolves to the iteration the execution started in (closed first)", async () => {
+  const base = await setupStageBase();
+  try {
+    driveStageTouching(base, true);
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "done", transition_count: 4 });
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+test("47. the touching same-boundary pair resolves to the reopened iteration when the execution started in it", async () => {
+  const base = await setupStageBase();
+  try {
+    driveStageTouching(base, false);
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "done", transition_count: 4 });
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});

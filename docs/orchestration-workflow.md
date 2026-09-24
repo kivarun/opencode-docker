@@ -1634,13 +1634,19 @@ wait and its accepted intent. The accepted wait intent itself is recorded
 inside the open wait record (`waits[].intent`); an exact digest repeat is a
 reducer no-op, a different digest is rejected. The effective iteration
 budget is derived, never stored: `initial_budget + Σ grants` of the
-generation; a grant extends the budget only from its wait onward. The
-eight new commands (`stage_generation_opened`, `stage_iteration_opened`,
+generation, with the accumulated grant sum and the effective budget both
+required to stay representable (reducer and loader alike); a grant extends
+the budget only from its wait onward. The eight new commands
+(`stage_generation_opened`, `stage_iteration_opened`,
 `stage_iteration_closed`, `stage_generation_closed`,
 `plan_intent_accepted`, `task_revision_accepted`,
 `plan_revision_accepted`, `iteration_grant_recorded`) enforce the full
 successor table at write time, and the loader re-derives everything by a
-single positional joint replay over the recorded anchors. The coordinator
+single positional joint replay over the recorded anchors — per boundary a
+worklist of the anchored records whose preconditions hold, applied in
+rounds until nothing applies, with execution starts resolved interval-wise
+afterwards and every generation lifecycle record proven consumed. The
+coordinator
 resolves every start's role exclusively through `compiledExecutionRoleFor`
 plus the durable open iteration, and never dispatches the eight lifecycle
 commands itself — the policy/controller layer owns them.
@@ -1676,9 +1682,15 @@ audit/observation layer must never duplicate them as a second source of
 truth. State schema versions 1–6 are explicitly rejected (no migration in
 either direction); the schema v2 document stays the production state of
 pipeline v1. The pure queries `pipelineV2OpenStageIteration` (current
-snapshot) and `pipelineV2StageIterationAt` (interval query over the
-anchors) are the single shared open-iteration resolvers the coordinator
-and the restore verifier consume.
+snapshot) and `pipelineV2StageIterationAt` (the unified positional interval
+over the anchors — a stage iteration is open at an execution start exactly
+when it opened at or before the start boundary and is not closed strictly
+before it; a closure anchored at that boundary follows the execution it
+contains, while a wait-bound closure at the same boundary precedes every
+start of that boundary; the recorded iteration index resolves the
+indistinguishable same-boundary touching combination) are the single shared
+open-iteration resolvers, consumed by the restore verifier (the current
+snapshot query also by the coordinator).
 
 P01 boundary: this increment implements only the generic durable
 request/response pair and the routing to a pre-declared action. It does
