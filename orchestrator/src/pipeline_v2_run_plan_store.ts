@@ -16,8 +16,8 @@ import {
 } from "./pipeline_v2_run_plan_store_internal.ts";
 
 /**
- * Immutable filesystem publication and load of the pipeline v2 run plan
- * and task revision manifests (unwired, production-neutral).
+ * Immutable filesystem publication and load of the pipeline v2 plan,
+ * task revision and wait intent manifests (unwired, production-neutral).
  *
  * This module publishes the orchestrator-owned canonical manifests of the
  * pure `pipeline_v2_run_plan_manifests.ts` substrate under the fixed
@@ -51,7 +51,14 @@ import {
  * Errors are a closed typed contract (`PipelineV2RunPlanStoreError` with
  * `outcome` `not_published`|`durability_unknown`, `reason`
  * `invalid_layout`|`conflict`|`io_failure`, and an immutable content-free
- * candidate on durability-unknown outcomes). Diagnostics are content-free.
+ * candidate on durability-unknown outcomes — the exact discriminated
+ * union branch per manifest kind). Diagnostics are content-free.
+ *
+ * The final error boundary sanitizes unexpected causes: only this
+ * module's own store errors and the manifest module's error class pass
+ * unchanged, and every other thrown cause becomes a `not_published`
+ * `io_failure` with the fixed content-free fallback message — the
+ * original cause is never re-thrown or echoed.
  *
  * Store responsibility ends at the immutable canonical artifacts:
  * plan↔task linkage, revision chains and the acceptance of published
@@ -61,7 +68,8 @@ import {
  * lifecycle controller, reducer wiring and production runner are later
  * increments.
  *
- * The wait intent intents (`continue_stage_intent`, `revise_task_intent`)
+ * The wait intent manifests (`continue_stage_intent`,
+ * `revise_task_intent`)
  * are published under one flat, kind-independent layout:
  * `<runRoot>/run-plan/intents/<wait-index>.json` — one wait index owns
  * exactly one immutable intent file, so a different intent published for

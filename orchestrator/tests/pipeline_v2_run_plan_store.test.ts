@@ -829,13 +829,15 @@ test("23. post-link fault matrix: temp unlink and parent durability become durab
       );
       const error = expectStoreError(cause, "durability_unknown", "io_failure", fragment);
       const finalPath = join(fixture.tasks, "task-2", "2.json");
-      expect(error.candidate?.kind).toBe("task");
-      expect(error.candidate?.run_id).toBe(RUN_ID);
-      expect(error.candidate?.task_id).toBe("task-2");
-      expect(error.candidate?.revision).toBe(2);
-      expect(error.candidate?.sha256).toBe(prepared.sha256);
-      expect(error.candidate?.final_path).toBe(finalPath);
-      expect(Object.isFrozen(error.candidate)).toBe(true);
+      const candidate = error.candidate;
+      if (candidate?.kind !== "task") throw new Error("unreachable");
+      expect(candidate.run_id).toBe(RUN_ID);
+      expect(candidate.task_id).toBe("task-2");
+      expect(candidate.revision).toBe(2);
+      expect(candidate.sha256).toBe(prepared.sha256);
+      expect(candidate.final_path).toBe(finalPath);
+      expect(Object.isFrozen(candidate)).toBe(true);
+      expect(Object.keys(candidate).sort()).toEqual(["final_path", "kind", "revision", "run_id", "sha256", "task_id"]);
       expect(await readFile(finalPath, "utf8")).toBe(prepared.canonical_json);
       // exact retry confirms the artifact and completes as success
       const retry = await publishPipelineV2TaskRevision(fixture.runRoot, value);
@@ -852,11 +854,13 @@ test("23. post-link fault matrix: temp unlink and parent durability become durab
       planValue2,
     ).catch((error) => error);
     const planError = expectStoreError(planCause, "durability_unknown", "io_failure");
-    expect(planError.candidate?.kind).toBe("plan");
-    expect(planError.candidate?.run_id).toBe(RUN_ID);
-    expect(planError.candidate?.revision).toBe(3);
-    expect(planError.candidate?.sha256).toBe(preparedPlan.sha256);
-    expect("task_id" in (planError.candidate as object)).toBe(false);
+    const planCandidate = planError.candidate;
+    if (planCandidate?.kind !== "plan") throw new Error("unreachable");
+    expect(planCandidate.run_id).toBe(RUN_ID);
+    expect(planCandidate.revision).toBe(3);
+    expect(planCandidate.sha256).toBe(preparedPlan.sha256);
+    expect(Object.keys(planCandidate).sort()).toEqual(["final_path", "kind", "revision", "run_id", "sha256"]);
+    expect("task_id" in planCandidate).toBe(false);
     const planRetry = await publishPipelineV2PlanRevision(fixture.runRoot, planValue2);
     expect(planRetry.plan.sha256).toBe(preparedPlan.sha256);
   } finally {
@@ -1725,14 +1729,16 @@ test("49. pre-link fault keeps not_published; post-link fault is durability_unkn
       (error) => error,
     );
     const durableError = expectStoreError(durableCause, "durability_unknown", "io_failure");
-    expect(durableError.candidate?.kind).toBe("wait_intent");
-    expect(durableError.candidate?.run_id).toBe(RUN_ID);
-    expect(durableError.candidate?.wait_index).toBe(1);
-    expect(durableError.candidate?.sha256).toBe(prepared.sha256);
-    expect(durableError.candidate?.final_path).toBe(join(intentsPath(fixture), "1.json"));
-    expect(Object.isFrozen(durableError.candidate)).toBe(true);
-    expect("revision" in (durableError.candidate as object)).toBe(false);
-    expect("task_id" in (durableError.candidate as object)).toBe(false);
+    const durableCandidate = durableError.candidate;
+    if (durableCandidate?.kind !== "wait_intent") throw new Error("unreachable");
+    expect(durableCandidate.run_id).toBe(RUN_ID);
+    expect(durableCandidate.wait_index).toBe(1);
+    expect(durableCandidate.sha256).toBe(prepared.sha256);
+    expect(durableCandidate.final_path).toBe(join(intentsPath(fixture), "1.json"));
+    expect(Object.isFrozen(durableCandidate)).toBe(true);
+    expect(Object.keys(durableCandidate).sort()).toEqual(["final_path", "kind", "run_id", "sha256", "wait_index"]);
+    expect("revision" in durableCandidate).toBe(false);
+    expect("task_id" in durableCandidate).toBe(false);
     expect(await readFile(join(intentsPath(fixture), "1.json"), "utf8")).toBe(prepared.canonical_json);
     // the exact retry adopts the published file and completes as success
     const retry = await publishPipelineV2WaitIntent(fixture.runRoot, value);
@@ -1955,4 +1961,29 @@ test("55. the wait intent layer uses the immutable substrate exactly once and ow
   expect(source.split("parseWaitIntent(").length - 1).toBe(1);
   expect(source.includes("prepareTaskRevisionManifest(")).toBe(true);
   expect(source.includes("preparePlanRevisionManifest(")).toBe(true);
+});
+
+test("56. an unexpected cause is sanitized to the fixed not-published io failure fallback", async () => {
+  const fixture = await setup();
+  try {
+    const canary = "CANARY_secret_io_body";
+    const secretPath = "/tmp/secret/io/path";
+    const injected = Object.assign(new Error(`${canary} ${secretPath}`), { code: "EIO" });
+    const cause = await publishPipelineV2WaitIntent(fixture.runRoot, {
+      get kind(): string {
+        throw injected;
+      },
+      schema_version: 1,
+    }).catch((error) => error);
+    const error = expectStoreError(cause, "not_published", "io_failure");
+    expect(error.message).toBe("the wait intent manifest publication failed");
+    expect(cause).not.toBe(injected);
+    expect(error.message).not.toContain(canary);
+    expect(error.message).not.toContain(secretPath);
+    expect(error.candidate).toBeUndefined();
+    // the target was never published
+    expect(await readdir(fixture.runRoot)).toEqual([]);
+  } finally {
+    await dispose(fixture);
+  }
 });

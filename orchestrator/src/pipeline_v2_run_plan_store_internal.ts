@@ -97,8 +97,9 @@ import {
  * component or wrong mode fails closed), and returns `null` when the
  * artifact or its store-owned parent tree is absent — nothing is created,
  * chmodded, linked, renamed or removed. A stored manifest is accepted only
- * when its bytes equal its own canonical JSON and its `run_id`, `task_id`
- * and `revision` equal the requested binding; malformed JSON keeps the
+ * when its bytes equal its own canonical JSON and its `run_id`,
+ * `task_id`/`revision` (task) or `revision` (plan) or `wait_index` (wait
+ * intent) equal the requested binding; malformed JSON keeps the
  * manifest module's `PipelineV2RunPlanManifestError` class.
  *
  * Errors are a closed typed contract (`PipelineV2RunPlanStoreError` with
@@ -108,8 +109,14 @@ import {
  * keep their `PipelineV2RunPlanManifestError` class. Diagnostics are
  * content-free: no manifest body, task body, raw JSON, caller path, env
  * value or credential — only operation classes, safe ids, revisions and
- * the getter-safe errno suffix. Unexpected programmer errors propagate
- * unchanged; classification is never by message text.
+ * the getter-safe errno suffix. The final boundary sanitizes unexpected
+ * causes: only this module's own store errors and the manifest module's
+ * error class pass unchanged, neutral substrate errors are re-tagged by
+ * typed fields, and every other thrown cause (a programmer error from an
+ * injected or future callback) becomes a `not_published` `io_failure`
+ * carrying only the wording's fixed content-free fallback message — the
+ * original cause is never re-thrown and never echoed. Classification is
+ * never by message text.
  */
 
 export { realImmutableDocumentIo as realRunPlanStoreIo };
@@ -120,19 +127,37 @@ export type PipelineV2RunPlanStoreOutcome = "not_published" | "durability_unknow
 
 /**
  * The published candidate of a durability-unknown outcome: content-free
- * (kind, run id, task id for tasks, revision, digest); the canonical
- * target path appears only as an internal candidate field, never in a
- * diagnostic message. An exact retry re-verifies and re-fsyncs the file.
+ * (kind, run id, task id for tasks, wait index for wait intents, revision
+ * for tasks and plans, digest); the canonical target path appears only as
+ * an internal candidate field, never in a diagnostic message. The exact
+ * discriminated union makes every impossible combination (a task without
+ * its task id or revision, a wait intent with a task id or revision, a
+ * plan with a wait index) a compile-time error. An exact retry re-verifies
+ * and re-fsyncs the file.
  */
-export interface PipelineV2RunPlanStoreCandidate {
-  readonly kind: "task" | "plan" | "wait_intent";
-  readonly run_id: string;
-  readonly task_id?: string;
-  readonly wait_index?: number;
-  readonly revision?: number;
-  readonly sha256: string;
-  readonly final_path: string;
-}
+export type PipelineV2RunPlanStoreCandidate =
+  | {
+      readonly kind: "task";
+      readonly run_id: string;
+      readonly task_id: string;
+      readonly revision: number;
+      readonly sha256: string;
+      readonly final_path: string;
+    }
+  | {
+      readonly kind: "plan";
+      readonly run_id: string;
+      readonly revision: number;
+      readonly sha256: string;
+      readonly final_path: string;
+    }
+  | {
+      readonly kind: "wait_intent";
+      readonly run_id: string;
+      readonly wait_index: number;
+      readonly sha256: string;
+      readonly final_path: string;
+    };
 
 export interface PublishedPipelineV2RunTaskRevision {
   readonly task: PreparedPipelineV2RunTaskRevision;
@@ -236,7 +261,11 @@ interface RunPlanCandidateIdentity {
  * Map a neutral substrate error into the run-plan store class by typed
  * fields only: outcome and reason pass through, and the substrate
  * candidate's frozen identity descriptor ({kind, run_id, task_id,
- * revision}) becomes the run-plan candidate's own fields. Identity is
+ * wait_index, revision}) becomes the run-plan candidate's own exact
+ * union branch — a task candidate always carries its task id and
+ * revision, a plan candidate never carries a task id or wait index, a
+ * wait-intent candidate always carries its wait index and never a task
+ * id or revision. Identity is
  * always the descriptor this adapter bound at publication time.
  */
 function runPlanStoreErrorFromSubstrate(
@@ -258,7 +287,7 @@ function runPlanStoreErrorFromSubstrate(
       return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message);
     }
     return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message, {
-      kind,
+      kind: "wait_intent",
       run_id: runId,
       wait_index: waitIndex,
       sha256: substrateCandidate.sha256,
@@ -269,13 +298,13 @@ function runPlanStoreErrorFromSubstrate(
   if ((kind !== "task" && kind !== "plan") || typeof revision !== "number") {
     return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message);
   }
-  const taskId = identity.task_id;
   if (kind === "task") {
+    const taskId = identity.task_id;
     if (typeof taskId !== "string") {
       return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message);
     }
     return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message, {
-      kind,
+      kind: "task",
       run_id: runId,
       task_id: taskId,
       revision,
@@ -284,7 +313,7 @@ function runPlanStoreErrorFromSubstrate(
     });
   }
   return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message, {
-    kind,
+    kind: "plan",
     run_id: runId,
     revision,
     sha256: substrateCandidate.sha256,
