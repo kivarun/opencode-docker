@@ -1054,15 +1054,17 @@ test("30. diagnostics never contain manifest bodies, task bodies, raw JSON or ca
   }
 });
 
-test("31. the public export surface carries exactly the five runtime keys", async () => {
+test("31. the public export surface carries exactly the seven runtime keys", async () => {
   const namespace = (await import("../src/pipeline_v2_run_plan_store.ts")) as Record<string, unknown>;
   const runtimeKeys = Object.keys(namespace).filter((key) => typeof (namespace as Record<string, unknown>)[key] !== "undefined" || true).sort();
   expect(runtimeKeys).toEqual([
     "PipelineV2RunPlanStoreError",
     "loadPipelineV2PlanRevision",
     "loadPipelineV2TaskRevision",
+    "loadPipelineV2WaitIntent",
     "publishPipelineV2PlanRevision",
     "publishPipelineV2TaskRevision",
+    "publishPipelineV2WaitIntent",
   ]);
 });
 
@@ -1402,4 +1404,555 @@ test("39. a concurrently created regular file at a directory component fails as 
   } finally {
     await dispose(fixture);
   }
+});
+
+// --- 40-56. wait intent store -------------------------------------------------
+
+import {
+  loadPipelineV2WaitIntent,
+  publishPipelineV2WaitIntent,
+} from "../src/pipeline_v2_run_plan_store.ts";
+import {
+  loadPipelineV2WaitIntentWithIo,
+  publishPipelineV2WaitIntentWithIo,
+} from "../src/pipeline_v2_run_plan_store_internal.ts";
+import { prepareWaitIntent } from "../src/pipeline_v2_run_plan_manifests.ts";
+
+function continueIntentValue(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    kind: "continue_stage_intent",
+    run_id: RUN_ID,
+    wait_index: 3,
+    stage_id: "implementation",
+    expected_plan_sha256: hex("f"),
+    additional_iterations: 2,
+    ...overrides,
+  };
+}
+
+function reviseIntentValue(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    kind: "revise_task_intent",
+    run_id: RUN_ID,
+    wait_index: 4,
+    task_id: "task-1",
+    expected_previous_task_sha256: hex("e"),
+    new_task_revision_sha256: hex("d"),
+    ...overrides,
+  };
+}
+
+function intentsPath(fixture: Fixture): string {
+  return join(fixture.runPlan, "intents");
+}
+
+test("40. continue intent publish/load round-trip: exact layout, modes and canonical bytes", async () => {
+  const fixture = await setup();
+  try {
+    const value = continueIntentValue();
+    const published = await publishPipelineV2WaitIntent(fixture.runRoot, value);
+    const expectedPath = join(intentsPath(fixture), "3.json");
+    expect(published.intent_path).toBe(expectedPath);
+    expect(published.intent.manifest.kind).toBe("continue_stage_intent");
+    if (published.intent.manifest.kind !== "continue_stage_intent") throw new Error("unreachable");
+    expect(published.intent.manifest.run_id).toBe(RUN_ID);
+    expect(published.intent.manifest.wait_index).toBe(3);
+    expect(published.intent.manifest.stage_id).toBe("implementation");
+    expect(published.intent.manifest.additional_iterations).toBe(2);
+    expect(await dirMode(fixture.runPlan)).toBe(0o700);
+    expect(await dirMode(intentsPath(fixture))).toBe(0o700);
+    expect((await fileIdentity(expectedPath)).mode).toBe(0o600);
+    const stored = await readFile(expectedPath, "utf8");
+    expect(stored).toBe(published.intent.canonical_json);
+    expect(stored.endsWith("\n")).toBe(false);
+    expect(stored).toBe(JSON.stringify(JSON.parse(stored)));
+    const loaded = await loadPipelineV2WaitIntent(fixture.runRoot, 3);
+    expect(loaded?.intent_path).toBe(expectedPath);
+    expect(loaded?.intent.sha256).toBe(published.intent.sha256);
+    expect(loaded?.intent.canonical_json).toBe(published.intent.canonical_json);
+    expect(Object.isFrozen(loaded)).toBe(true);
+    expect(Object.isFrozen(loaded?.intent.manifest)).toBe(true);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("41. revise intent publish/load round-trip with the same exact contract", async () => {
+  const fixture = await setup();
+  try {
+    const value = reviseIntentValue();
+    const published = await publishPipelineV2WaitIntent(fixture.runRoot, value);
+    const expectedPath = join(intentsPath(fixture), "4.json");
+    expect(published.intent_path).toBe(expectedPath);
+    expect(published.intent.manifest.kind).toBe("revise_task_intent");
+    if (published.intent.manifest.kind !== "revise_task_intent") throw new Error("unreachable");
+    expect(published.intent.manifest.wait_index).toBe(4);
+    expect(published.intent.manifest.task_id).toBe("task-1");
+    expect((await fileIdentity(expectedPath)).mode).toBe(0o600);
+    expect(await readFile(expectedPath, "utf8")).toBe(published.intent.canonical_json);
+    const loaded = await loadPipelineV2WaitIntent(fixture.runRoot, 4);
+    expect(loaded?.intent.sha256).toBe(published.intent.sha256);
+    expect(loaded?.intent.manifest.kind).toBe("revise_task_intent");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("42. the run root basename and the wait index bind both publication and load", async () => {
+  const fixture = await setup();
+  try {
+    const foreignRun = join(fixture.root, "run-other");
+    await mkdir(foreignRun, { mode: 0o700 });
+    const publishCause = await publishPipelineV2WaitIntent(foreignRun, continueIntentValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(publishCause, "not_published", "invalid_layout", "does not match the wait intent manifest run identifier");
+    expect(await readdir(foreignRun)).toEqual([]);
+    // the load's wait index is validated before any path is built
+    for (const waitIndex of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN]) {
+      const cause = await loadPipelineV2WaitIntent(fixture.runRoot, waitIndex).catch((error) => error);
+      expectStoreError(cause, "not_published", "invalid_layout", "the wait index must be a positive safe integer");
+    }
+    expect(await loadPipelineV2WaitIntent(fixture.runRoot, 3)).toBeNull();
+    // the file name is bound to the manifest's own wait index only
+    await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue({ wait_index: 5 }));
+    const loaded = await loadPipelineV2WaitIntent(fixture.runRoot, 5);
+    expect(loaded?.intent.manifest.wait_index).toBe(5);
+    expect(await loadPipelineV2WaitIntent(fixture.runRoot, 6)).toBeNull();
+    // a hand-placed foreign wait index under the target name is a conflict
+    await mkdir(intentsPath(fixture), { mode: 0o700, recursive: true });
+    const foreign = prepareWaitIntent(continueIntentValue({ wait_index: 9 }));
+    await writeFile(join(intentsPath(fixture), "10.json"), foreign.canonical_json, { mode: 0o600 });
+    const wrongCause = await loadPipelineV2WaitIntent(fixture.runRoot, 10).catch((error) => error);
+    expectStoreError(wrongCause, "not_published", "conflict", "names another wait index");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("43. exact retry preserves inode, mode, mtime and bytes; a conflict changes nothing", async () => {
+  const fixture = await setup();
+  try {
+    const value = continueIntentValue();
+    const first = await publishPipelineV2WaitIntent(fixture.runRoot, value);
+    const before = await fileIdentity(first.intent_path);
+    const retry = await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue());
+    expect(retry.intent_path).toBe(first.intent_path);
+    expect(await fileIdentity(first.intent_path)).toEqual(before);
+    expect(await readFile(first.intent_path, "utf8")).toBe(first.intent.canonical_json);
+    const conflictCause = await publishPipelineV2WaitIntent(
+      fixture.runRoot,
+      reviseIntentValue({ wait_index: 3 }),
+    ).catch((error) => error);
+    expectStoreError(conflictCause, "not_published", "conflict");
+    expect(await fileIdentity(first.intent_path)).toEqual(before);
+    expect(await readFile(first.intent_path, "utf8")).toBe(first.intent.canonical_json);
+    expect(await tempFileNames(intentsPath(fixture))).toEqual([]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("44. one wait index owns one immutable intent: both kinds conflict in both directions", async () => {
+  const fixture = await setup();
+  try {
+    await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue({ wait_index: 2 }));
+    const firstWinner = await readFile(join(intentsPath(fixture), "2.json"), "utf8");
+    const reviseCause = await publishPipelineV2WaitIntent(
+      fixture.runRoot,
+      reviseIntentValue({ wait_index: 2 }),
+    ).catch((error) => error);
+    expectStoreError(reviseCause, "not_published", "conflict", "carries different canonical bytes");
+    expect((await readdir(intentsPath(fixture))).filter((name) => name.endsWith(".json"))).toEqual(["2.json"]);
+    expect(await readFile(join(intentsPath(fixture), "2.json"), "utf8")).toBe(firstWinner);
+    await rm(join(intentsPath(fixture), "2.json"));
+    await publishPipelineV2WaitIntent(fixture.runRoot, reviseIntentValue({ wait_index: 2 }));
+    const secondWinner = await readFile(join(intentsPath(fixture), "2.json"), "utf8");
+    expect(secondWinner).toBe(prepareWaitIntent(reviseIntentValue({ wait_index: 2 })).canonical_json);
+    const continueCause = await publishPipelineV2WaitIntent(
+      fixture.runRoot,
+      continueIntentValue({ wait_index: 2 }),
+    ).catch((error) => error);
+    expectStoreError(continueCause, "not_published", "conflict", "carries different canonical bytes");
+    expect(await readFile(join(intentsPath(fixture), "2.json"), "utf8")).toBe(secondWinner);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("45. concurrent identical intent publications both succeed; different ones race to one winner", async () => {
+  const fixture = await setup();
+  try {
+    const io = linkBarrierIo();
+    const identical = await Promise.allSettled([
+      publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, continueIntentValue()),
+      publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, continueIntentValue()),
+    ]);
+    expect(identical.map((entry) => entry.status).sort()).toEqual(["fulfilled", "fulfilled"]);
+    const inodes = new Set<number>();
+    for (const entry of identical) {
+      const value = (entry as PromiseFulfilledResult<{ intent_path: string }>).value;
+      inodes.add((await lstat(value.intent_path)).ino);
+    }
+    expect(inodes.size).toBe(1);
+    await rm(fixture.runPlan, { recursive: true, force: true });
+    const different = await Promise.allSettled([
+      publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, continueIntentValue({ wait_index: 3 })),
+      publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, reviseIntentValue({ wait_index: 3 })),
+    ]);
+    expect(different.map((entry) => entry.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const stored = await readFile(join(intentsPath(fixture), "3.json"), "utf8");
+    expect([
+      prepareWaitIntent(continueIntentValue({ wait_index: 3 })).canonical_json,
+      prepareWaitIntent(reviseIntentValue({ wait_index: 3 })).canonical_json,
+    ]).toContain(stored);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("46. load: missing tree and missing target are null; malformed and noncanonical fail closed", async () => {
+  const fixture = await setup();
+  try {
+    expect(await loadPipelineV2WaitIntent(fixture.runRoot, 1)).toBeNull();
+    await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue({ wait_index: 1 }));
+    const target = join(intentsPath(fixture), "1.json");
+    expect(await loadPipelineV2WaitIntent(fixture.runRoot, 1)).not.toBeNull();
+    // malformed JSON keeps the manifest module's error class
+    await rm(target);
+    await writeFile(target, "{not json", { mode: 0o600 });
+    const malformedCause = await loadPipelineV2WaitIntent(fixture.runRoot, 1).catch((error) => error);
+    expect(malformedCause).toBeInstanceOf(PipelineV2RunPlanManifestError);
+    // valid JSON with noncanonical bytes fails as a conflict
+    const prepared = prepareWaitIntent(continueIntentValue({ wait_index: 1 }));
+    await rm(target);
+    await writeFile(target, `${JSON.stringify(JSON.parse(prepared.canonical_json), null, 2)}\n`, { mode: 0o600 });
+    const noncanonicalCause = await loadPipelineV2WaitIntent(fixture.runRoot, 1).catch((error) => error);
+    expectStoreError(noncanonicalCause, "not_published", "conflict", "does not carry its own canonical JSON");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("47. load: wrong mode, symlink, directory and FIFO targets fail closed untouched", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(intentsPath(fixture), { mode: 0o700, recursive: true });
+    const prepared = prepareWaitIntent(continueIntentValue({ wait_index: 1 }));
+    const target = join(intentsPath(fixture), "1.json");
+    await writeFile(target, prepared.canonical_json, { mode: 0o644 });
+    const modeCause = await loadPipelineV2WaitIntent(fixture.runRoot, 1).catch((error) => error);
+    expectStoreError(modeCause, "not_published", "conflict", "does not have the required mode 0600");
+    await chmod(target, 0o600);
+    await rm(target);
+    await symlink(join(intentsPath(fixture), "elsewhere.json"), target);
+    const symlinkCause = await loadPipelineV2WaitIntent(fixture.runRoot, 1).catch((error) => error);
+    expectStoreError(symlinkCause, "not_published", "conflict", "exists but is");
+    expect((await lstat(target)).isSymbolicLink()).toBe(true);
+    await rm(target);
+    await mkdir(target, { mode: 0o700 });
+    const dirCause = await loadPipelineV2WaitIntent(fixture.runRoot, 1).catch((error) => error);
+    expectStoreError(dirCause, "not_published", "conflict", "exists but is a directory");
+    const publishCause = await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue({ wait_index: 1 })).catch(
+      (error) => error,
+    );
+    expectStoreError(publishCause, "not_published", "conflict", "exists but is a directory");
+    await rm(target, { recursive: true });
+    await makeFifo(target);
+    const fifoLoad = await loadPipelineV2WaitIntent(fixture.runRoot, 1).catch((error) => error);
+    expectStoreError(fifoLoad, "not_published", "conflict", "exists but is a FIFO");
+    const fifoPublish = await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue({ wait_index: 1 })).catch(
+      (error) => error,
+    );
+    expectStoreError(fifoPublish, "not_published", "conflict", "exists but is a FIFO");
+    expect((await lstat(target)).isFIFO()).toBe(true);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("48. load: foreign run id and foreign wait index fail as conflicts", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(intentsPath(fixture), { mode: 0o700, recursive: true });
+    const foreignRun = prepareWaitIntent(continueIntentValue({ wait_index: 2, run_id: "run-other" }));
+    await writeFile(join(intentsPath(fixture), "2.json"), foreignRun.canonical_json, { mode: 0o600 });
+    const runCause = await loadPipelineV2WaitIntent(fixture.runRoot, 2).catch((error) => error);
+    expectStoreError(runCause, "not_published", "conflict", "does not belong to this run root");
+    const foreignIndex = prepareWaitIntent(continueIntentValue({ wait_index: 3 }));
+    await writeFile(join(intentsPath(fixture), "2.json"), foreignIndex.canonical_json, { mode: 0o600 });
+    const indexCause = await loadPipelineV2WaitIntent(fixture.runRoot, 2).catch((error) => error);
+    expectStoreError(indexCause, "not_published", "conflict", "names another wait index");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("49. pre-link fault keeps not_published; post-link fault is durability_unknown and the exact retry confirms", async () => {
+  const fixture = await setup();
+  try {
+    // pre-link: the link() call fails, the target stays absent, the temp is cleaned
+    const linkCause = await publishPipelineV2WaitIntentWithIo(
+      ioFaulting("link", injectedFailure("EACCES")),
+      fixture.runRoot,
+      continueIntentValue(),
+    ).catch((error) => error);
+    expectStoreError(linkCause, "not_published", "io_failure", "(errno EACCES)");
+    expect((await readdir(fixture.runRoot)).sort()).toEqual(["run-plan"]);
+    expect(await readdir(fixture.runPlan)).toEqual(["intents"]);
+    expect(await readdir(intentsPath(fixture))).toEqual([]);
+    // post-link: the intents directory's post-link fsync fails
+    const value = continueIntentValue({ wait_index: 1 });
+    const prepared = prepareWaitIntent(value);
+    const faulted = Object.freeze({
+      ...realRunPlanStoreIo,
+      openDir: async (path: string) => {
+        if (path === intentsPath(fixture)) {
+          const real = await realRunPlanStoreIo.openDir(path);
+          return Object.freeze({
+            sync: async () => {
+              throw injectedFailure("EIO");
+            },
+            close: real.close.bind(real),
+          });
+        }
+        return realRunPlanStoreIo.openDir(path);
+      },
+    }) as unknown as StoreIo;
+    const durableCause = await publishPipelineV2WaitIntentWithIo(faulted, fixture.runRoot, value).catch(
+      (error) => error,
+    );
+    const durableError = expectStoreError(durableCause, "durability_unknown", "io_failure");
+    expect(durableError.candidate?.kind).toBe("wait_intent");
+    expect(durableError.candidate?.run_id).toBe(RUN_ID);
+    expect(durableError.candidate?.wait_index).toBe(1);
+    expect(durableError.candidate?.sha256).toBe(prepared.sha256);
+    expect(durableError.candidate?.final_path).toBe(join(intentsPath(fixture), "1.json"));
+    expect(Object.isFrozen(durableError.candidate)).toBe(true);
+    expect("revision" in (durableError.candidate as object)).toBe(false);
+    expect("task_id" in (durableError.candidate as object)).toBe(false);
+    expect(await readFile(join(intentsPath(fixture), "1.json"), "utf8")).toBe(prepared.canonical_json);
+    // the exact retry adopts the published file and completes as success
+    const retry = await publishPipelineV2WaitIntent(fixture.runRoot, value);
+    expect(retry.intent.sha256).toBe(prepared.sha256);
+    expect(await readFile(retry.intent_path, "utf8")).toBe(prepared.canonical_json);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("50. an existing intents directory with the wrong mode or kind fails closed without chmod or rmdir", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.runPlan, { mode: 0o700 });
+    await mkdir(intentsPath(fixture), { mode: 0o755 });
+    await writeFile(join(intentsPath(fixture), ".sentinel"), "sentinel\n", { mode: 0o600 });
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realRunPlanStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realRunPlanStoreIo.rmdir(path);
+      },
+    }) as unknown as StoreIo;
+    const cause = await publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, continueIntentValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(cause, "not_published", "invalid_layout", "mode 0700");
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    expect((await lstat(intentsPath(fixture))).mode & 0o777).toBe(0o755);
+    expect(await readFile(join(intentsPath(fixture), ".sentinel"), "utf8")).toBe("sentinel\n");
+    // a regular file in the intents position fails as invalid layout
+    await rm(intentsPath(fixture), { recursive: true });
+    await writeFile(intentsPath(fixture), "file\n", { mode: 0o600 });
+    const fileCause = await publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, continueIntentValue()).catch(
+      (error) => error,
+    );
+    expectStoreError(fileCause, "not_published", "invalid_layout", "exists but is a regular file");
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("51. a concurrently created correct intents directory is adopted and its parent is fsynced in both creation and adoption", async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.runPlan, { mode: 0o700 });
+    const intents = intentsPath(fixture);
+    let concurrentIno = -1;
+    const chmodPaths: string[] = [];
+    const rmdirPaths: string[] = [];
+    const openDirPaths: string[] = [];
+    const io = Object.freeze({
+      ...realRunPlanStoreIo,
+      mkdirExclusive: async (path: string) => {
+        if (path === intents) {
+          await realRunPlanStoreIo.mkdirExclusive(intents);
+          await realRunPlanStoreIo.chmod(intents, 0o700);
+          concurrentIno = (await lstat(intents)).ino;
+        }
+        return await realRunPlanStoreIo.mkdirExclusive(path);
+      },
+      chmod: async (path: string, mode: number) => {
+        chmodPaths.push(path);
+        return realRunPlanStoreIo.chmod(path, mode);
+      },
+      rmdir: async (path: string) => {
+        rmdirPaths.push(path);
+        return realRunPlanStoreIo.rmdir(path);
+      },
+      openDir: async (path: string) => {
+        openDirPaths.push(path);
+        return realRunPlanStoreIo.openDir(path);
+      },
+    }) as unknown as StoreIo;
+    const published = await publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, continueIntentValue());
+    expect(published.intent_path).toBe(join(intents, "3.json"));
+    expect(chmodPaths).toEqual([]);
+    expect(rmdirPaths).toEqual([]);
+    expect((await lstat(intents)).ino).toBe(concurrentIno);
+    // the adopted directory's parent (run-plan) is fsynced before the link,
+    // and the intents directory itself is fsynced after the link
+    expect(openDirPaths).toContain(fixture.runPlan);
+    expect(openDirPaths).toContain(intents);
+    // a fully created tree keeps the same fsync behavior on a fresh run root
+    await rm(fixture.runPlan, { recursive: true, force: true });
+    openDirPaths.length = 0;
+    const created = await publishPipelineV2WaitIntentWithIo(io, fixture.runRoot, reviseIntentValue());
+    expect(created.intent_path).toBe(join(intents, "4.json"));
+    expect(openDirPaths).toContain(fixture.runPlan);
+    expect(openDirPaths).toContain(intents);
+    expect((await dirMode(intents))).toBe(0o700);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("52. intent publication never modifies anything outside <runRoot>/run-plan/intents", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.runRoot, "state.json"), '{"revision":1}\n', { mode: 0o600 });
+    await mkdir(join(fixture.runRoot, "waits"), { mode: 0o700 });
+    await writeFile(join(fixture.runRoot, "waits", "3.request.json"), "{}\n", { mode: 0o600 });
+    await writeFile(join(fixture.runRoot, "sentinel"), "sentinel\n", { mode: 0o600 });
+    const paths = [
+      join(fixture.runRoot, "state.json"),
+      join(fixture.runRoot, "waits", "3.request.json"),
+      join(fixture.runRoot, "sentinel"),
+    ];
+    const before = await Promise.all(paths.map((path) => readFile(path)));
+    await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue());
+    expect(await Promise.all(paths.map((path) => readFile(path)))).toEqual(before);
+    expect((await readdir(fixture.runRoot)).sort()).toEqual(["run-plan", "sentinel", "state.json", "waits"]);
+    const conflictCause = await publishPipelineV2WaitIntent(
+      fixture.runRoot,
+      reviseIntentValue({ wait_index: 3 }),
+    ).catch((error) => error);
+    expectStoreError(conflictCause, "not_published", "conflict");
+    expect(await Promise.all(paths.map((path) => readFile(path)))).toEqual(before);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("53. the caller value is neither mutated nor frozen and later mutations cannot reach the store", async () => {
+  const fixture = await setup();
+  try {
+    const value = continueIntentValue();
+    const published = await publishPipelineV2WaitIntent(fixture.runRoot, value);
+    expect(Object.isFrozen(value)).toBe(false);
+    expect((value as Record<string, unknown>).additional_iterations).toBe(2);
+    (value as Record<string, unknown>).additional_iterations = 7;
+    (value as Record<string, unknown>).kind = "revise_task_intent";
+    const loaded = await loadPipelineV2WaitIntent(fixture.runRoot, 3);
+    expect(loaded?.intent.canonical_json).toBe(published.intent.canonical_json);
+    if (loaded?.intent.manifest.kind !== "continue_stage_intent") throw new Error("unreachable");
+    expect(loaded.intent.manifest.additional_iterations).toBe(2);
+    expect(loaded.intent.manifest.kind).toBe("continue_stage_intent");
+    expect(Object.isFrozen(published.intent.manifest)).toBe(true);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("54. diagnostics are content-free: no canary, no raw JSON, no caller property names", async () => {
+  const fixture = await setup();
+  try {
+    const hostile = continueIntentValue({ schema_version: 2, extra_field: `${CANARY}_extra` });
+    const manifestCause = await publishPipelineV2WaitIntent(fixture.runRoot, hostile).catch((error) => error);
+    expect(manifestCause).toBeInstanceOf(PipelineV2RunPlanManifestError);
+    expect((manifestCause as Error).message).not.toContain(CANARY);
+    expect((manifestCause as Error).message).not.toContain("extra_field");
+    await publishPipelineV2WaitIntent(fixture.runRoot, continueIntentValue());
+    const conflictCause = await publishPipelineV2WaitIntent(
+      fixture.runRoot,
+      reviseIntentValue({ wait_index: 3 }),
+    ).catch((error) => error);
+    const conflict = expectStoreError(conflictCause, "not_published", "conflict");
+    expect(conflict.message).not.toContain(CANARY);
+    expect(conflict.message).not.toContain(fixture.runRoot);
+    expect(conflict.candidate).toBeUndefined();
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("55. the wait intent layer uses the immutable substrate exactly once and owns no second protocol", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(
+    join(import.meta.dir, "..", "src", "pipeline_v2_run_plan_store_internal.ts"),
+    "utf8",
+  );
+  // the substrate's protocol entry points are used; no raw primitives exist here
+  for (const used of [
+    "publishImmutableDocumentFile(",
+    "ensureImmutableDirectory(",
+    "verifyStoredDirectoryComponent(",
+    "readStoredImmutableDocument(",
+    "inspectStoredDocumentOrNull(",
+    "requireImmutableDocumentRunRoot(",
+  ] as const) {
+    expect(source.includes(used)).toBe(true);
+  }
+  for (const banned of [
+    "O_EXCL",
+    "O_CREAT",
+    "O_NOFOLLOW",
+    ".link(",
+    "fsyncImmutableDirectory(",
+    "readWholeFile(",
+    "mkdirExclusive(",
+    "canonicalJson(",
+    "createHash",
+    "CryptoHasher",
+    "new WeakMap",
+    "new WeakSet",
+    "publishPipelineV2WaitRequest",
+    "acceptPipelineV2WaitResponse",
+    "reducePipelineV2RunCommand",
+    "validatePipelineV2RunState",
+    "from \"./pipeline_v2_state.ts\"",
+    "from \"./pipeline_v2_coordinator.ts\"",
+    "from \"./pipeline_v2_runner.ts\"",
+    "from \"./main.ts\"",
+    "from \"./docker_helper.ts\"",
+    "from \"./launcher.ts\"",
+  ] as const) {
+    expect(source.includes(banned)).toBe(false);
+  }
+  // exactly one validation chain per direction, no second manifest validator
+  expect(source.split("prepareWaitIntent(").length - 1).toBe(1);
+  expect(source.split("parseWaitIntent(").length - 1).toBe(1);
+  expect(source.includes("prepareTaskRevisionManifest(")).toBe(true);
+  expect(source.includes("preparePlanRevisionManifest(")).toBe(true);
 });

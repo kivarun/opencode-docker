@@ -1828,9 +1828,10 @@ existing plan/task revision manifest substrate under the fixed layout
 
   <runRoot>/run-plan/plans/<revision>.json
   <runRoot>/run-plan/tasks/<task-id>/<revision>.json
+  <runRoot>/run-plan/intents/<wait-index>.json
 
-`run-plan`, `plans`, `tasks` and `<task-id>` are 0700 real non-symlink
-directory components (exclusive creation, identity fixation,
+`run-plan`, `plans`, `tasks`, `<task-id>` and `intents` are 0700 real
+non-symlink directory components (exclusive creation, identity fixation,
 chmod-enforced 0700, canonical verification, parent fsync before every
 successful ensure — created here or adopted);
 manifest files are 0600 regular files whose bytes are exactly the
@@ -1838,15 +1839,26 @@ manifest's canonical JSON without a trailing newline. The run root is
 never created, chmodded or removed and its basename must equal the
 manifest `run_id`. The public API is `publishPipelineV2TaskRevision`,
 `loadPipelineV2TaskRevision`, `publishPipelineV2PlanRevision`,
-`loadPipelineV2PlanRevision` and the `PipelineV2RunPlanStoreError`
+`loadPipelineV2PlanRevision`, `publishPipelineV2WaitIntent`,
+`loadPipelineV2WaitIntent` and the `PipelineV2RunPlanStoreError`
 class; path components come only from the normalized manifest
 (publication) or the validated trusted scalars (load: safe id plus a
-positive safe integer). Load is strictly read-only and returns `null`
+positive safe integer, the wait index validated before any path is
+built). Load is strictly read-only and returns `null`
 when the artifact or its store-owned parent tree is absent; a stored
 manifest is accepted only when its bytes equal its own canonical JSON
-and `run_id`/`task_id`/`revision` match the binding; malformed JSON
+and `run_id`/`task_id`/`revision`/`wait_index` match the binding;
+malformed JSON
 keeps the manifest module's error class; wrong kind, wrong mode or
-noncanonical bytes fail as typed conflicts. The wait-store failure and
+noncanonical bytes fail as typed conflicts. The wait intents
+(`continue_stage_intent`/`revise_task_intent`) share one flat,
+kind-independent layout: one wait index owns exactly one immutable
+intent file, so a different intent published for the same wait is a
+typed conflict, never a second file, and the published intent is never
+accepted into the durable run state by this store (`plan_intent_accepted`
+and `iteration_grant_recorded`, the wait-bound stage iteration closure
+and the whole wait/response policy stay later increments). The
+wait-store failure and
 durability model applies unchanged (`not_published` before the link,
 including conflicts; `durability_unknown` after the link, with a
 content-free candidate), and concurrency is the same link-barrier

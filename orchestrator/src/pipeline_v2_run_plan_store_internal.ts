@@ -20,10 +20,13 @@ import {
   PipelineV2RunPlanManifestError,
   parsePlanRevisionManifest,
   parseTaskRevisionManifest,
+  parseWaitIntent,
   preparePlanRevisionManifest,
   prepareTaskRevisionManifest,
+  prepareWaitIntent,
   type PreparedPipelineV2RunPlanRevision,
   type PreparedPipelineV2RunTaskRevision,
+  type PreparedPipelineV2RunWaitIntent,
 } from "./pipeline_v2_run_plan_manifests.ts";
 
 /**
@@ -55,14 +58,25 @@ import {
  *
  *   <runRoot>/run-plan/plans/<revision>.json
  *   <runRoot>/run-plan/tasks/<task-id>/<revision>.json
+ *   <runRoot>/run-plan/intents/<wait-index>.json
  *
  * Manifest files are 0600 regular files whose content is exactly the
  * manifest's canonical JSON (no trailing newline), inside 0700 real
  * non-symlink directory components (`run-plan`, `plans`, `tasks`,
- * `<task-id>`) of the canonical run root. The run root itself is never
+ * `<task-id>`, `intents`) of the canonical run root. The run root itself
+ * is never
  * created, chmodded or removed; its basename must be the manifest's run
  * id. The paths never enter the manifests, and the manifests carry no
  * filesystem provenance.
+ *
+ * The wait intent manifests (`continue_stage_intent`,
+ * `revise_task_intent`) share one flat, kind-independent layout: one wait
+ * index owns exactly one immutable intent file, so a different intent for
+ * the same wait is a typed conflict and never a second file. The store
+ * never accepts a published intent into the durable run state and never
+ * dispatches a reducer command — the acceptance commands, the wait-bound
+ * iteration closure and the whole wait/response policy stay later
+ * increments.
  *
  * Store responsibility ends at the immutable canonical artifacts:
  * plan↔task linkage, revision chains and the acceptance of published
@@ -111,10 +125,11 @@ export type PipelineV2RunPlanStoreOutcome = "not_published" | "durability_unknow
  * diagnostic message. An exact retry re-verifies and re-fsyncs the file.
  */
 export interface PipelineV2RunPlanStoreCandidate {
-  readonly kind: "task" | "plan";
+  readonly kind: "task" | "plan" | "wait_intent";
   readonly run_id: string;
   readonly task_id?: string;
-  readonly revision: number;
+  readonly wait_index?: number;
+  readonly revision?: number;
   readonly sha256: string;
   readonly final_path: string;
 }
@@ -127,6 +142,16 @@ export interface PublishedPipelineV2RunTaskRevision {
 export interface PublishedPipelineV2RunPlanRevision {
   readonly plan: PreparedPipelineV2RunPlanRevision;
   readonly plan_path: string;
+}
+
+/**
+ * The published or loaded wait intent: the exact prepared intent of the
+ * manifest substrate (provenance and deep-freeze semantics unchanged) plus
+ * the fixed publication path; no caller input is carried.
+ */
+export interface PublishedPipelineV2RunWaitIntent {
+  readonly intent: PreparedPipelineV2RunWaitIntent;
+  readonly intent_path: string;
 }
 
 export class PipelineV2RunPlanStoreError extends Error {
@@ -153,6 +178,7 @@ export class PipelineV2RunPlanStoreError extends Error {
 const RUN_PLAN_DIR_NAME = "run-plan";
 const PLANS_DIR_NAME = "plans";
 const TASKS_DIR_NAME = "tasks";
+const INTENTS_DIR_NAME = "intents";
 const TEMP_PREFIX = ".run-plan-publish-";
 
 const TASK_WORDING: ImmutableDocumentWording = Object.freeze({
@@ -163,6 +189,11 @@ const TASK_WORDING: ImmutableDocumentWording = Object.freeze({
 const PLAN_WORDING: ImmutableDocumentWording = Object.freeze({
   document: "plan revision manifest",
   publicationFailed: "the plan revision manifest publication failed",
+});
+
+const INTENT_WORDING: ImmutableDocumentWording = Object.freeze({
+  document: "wait intent manifest",
+  publicationFailed: "the wait intent manifest publication failed",
 });
 
 /**
@@ -197,6 +228,7 @@ interface RunPlanCandidateIdentity {
   readonly kind?: unknown;
   readonly run_id?: unknown;
   readonly task_id?: unknown;
+  readonly wait_index?: unknown;
   readonly revision?: unknown;
 }
 
@@ -217,8 +249,24 @@ function runPlanStoreErrorFromSubstrate(
   const identity = substrateCandidate.identity as RunPlanCandidateIdentity;
   const kind = identity.kind;
   const runId = identity.run_id;
+  if (typeof runId !== "string") {
+    return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message);
+  }
+  if (kind === "wait_intent") {
+    const waitIndex = identity.wait_index;
+    if (typeof waitIndex !== "number") {
+      return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message);
+    }
+    return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message, {
+      kind,
+      run_id: runId,
+      wait_index: waitIndex,
+      sha256: substrateCandidate.sha256,
+      final_path: substrateCandidate.final_path,
+    });
+  }
   const revision = identity.revision;
-  if ((kind !== "task" && kind !== "plan") || typeof runId !== "string" || typeof revision !== "number") {
+  if ((kind !== "task" && kind !== "plan") || typeof revision !== "number") {
     return new PipelineV2RunPlanStoreError(cause.outcome, cause.reason, cause.message);
   }
   const taskId = identity.task_id;
@@ -574,5 +622,130 @@ export async function loadPipelineV2PlanRevisionWithIo(
       throw conflict("the stored plan revision manifest file does not carry its own canonical JSON");
     }
     return deepFreezeValue({ plan: prepared, plan_path: planPath });
+  });
+}
+
+/**
+ * Validate, bind and publish one wait intent manifest under
+ * `<runRoot>/run-plan/intents/<wait_index>.json`. The wait index of the
+ * path comes only from the normalized manifest; the run root must be an
+ * existing absolute canonical real non-symlink directory whose basename is
+ * the manifest's run id; it is never created or removed. One wait index
+ * owns exactly one immutable intent file independent of the intent kind —
+ * a different intent on the same wait is a typed conflict, never a second
+ * file.
+ */
+export async function publishPipelineV2WaitIntentWithIo(
+  io: typeof realImmutableDocumentIo,
+  runRoot: string,
+  value: unknown,
+): Promise<PublishedPipelineV2RunWaitIntent> {
+  return await withRunPlanStoreGuard(INTENT_WORDING, async () => {
+    const prepared = prepareWaitIntent(value);
+    const runRootCanonical = await bindPublicationRunRoot(
+      io,
+      runRoot,
+      prepared.manifest.run_id,
+      INTENT_WORDING,
+    );
+    const runPlanPath = await ensureImmutableDirectory(
+      io,
+      runRootCanonical,
+      RUN_PLAN_DIR_NAME,
+      "run-plan directory",
+      "run root",
+    );
+    const intentsPath = await ensureImmutableDirectory(
+      io,
+      runPlanPath,
+      INTENTS_DIR_NAME,
+      "intents directory",
+      "run-plan directory",
+    );
+    const fileName = `${prepared.manifest.wait_index}.json`;
+    const intentPath = join(intentsPath, fileName);
+    await publishImmutableDocumentFile(
+      io,
+      intentsPath,
+      {
+        fileName,
+        tempPrefix: TEMP_PREFIX,
+        tempStem: `intent-${prepared.manifest.wait_index}`,
+        canonicalJson: prepared.canonical_json,
+        sha256: prepared.sha256,
+        identity: deepFreezeValue({
+          kind: "wait_intent",
+          run_id: prepared.manifest.run_id,
+          wait_index: prepared.manifest.wait_index,
+        }),
+      },
+      INTENT_WORDING,
+      "intents directory",
+    );
+    return deepFreezeValue({ intent: prepared, intent_path: intentPath });
+  });
+}
+
+/**
+ * Load the stored wait intent manifest
+ * `<runRoot>/run-plan/intents/<wait_index>.json` strictly read-only.
+ * Returns `null` when the artifact or its store-owned parent tree is
+ * absent; a damaged, foreign, noncanonical or wrongly-moded artifact fails
+ * closed; malformed JSON keeps the manifest module's error class.
+ */
+export async function loadPipelineV2WaitIntentWithIo(
+  io: typeof realImmutableDocumentIo,
+  runRoot: string,
+  waitIndex: number,
+): Promise<PublishedPipelineV2RunWaitIntent | null> {
+  return await withRunPlanStoreGuard(INTENT_WORDING, async () => {
+    if (!isPositiveSafeInteger(waitIndex)) {
+      throw invalidLayout("the wait index must be a positive safe integer");
+    }
+    const runRootCanonical = await requireImmutableDocumentRunRoot(io, runRoot);
+    const runId = basename(runRootCanonical);
+    const runPlanPath = await requireStoreOwnedDirectoryForLoad(
+      io,
+      runRootCanonical,
+      RUN_PLAN_DIR_NAME,
+      "run-plan directory",
+    );
+    if (runPlanPath === null) {
+      return null;
+    }
+    const intentsPath = await requireStoreOwnedDirectoryForLoad(
+      io,
+      runPlanPath,
+      INTENTS_DIR_NAME,
+      "intents directory",
+    );
+    if (intentsPath === null) {
+      return null;
+    }
+    const intentPath = join(intentsPath, `${waitIndex}.json`);
+    const artifactInfo = await inspectStoredDocumentOrNull(
+      io,
+      intentPath,
+      "stored wait intent manifest file",
+    );
+    if (artifactInfo === null) {
+      return null;
+    }
+    const stored = await readStoredImmutableDocument(
+      io,
+      intentPath,
+      "stored wait intent manifest file",
+      INTENT_WORDING,
+    );
+    const raw = stored.toString("utf8");
+    const prepared = parseWaitIntent(raw);
+    requireLoadedRunId(prepared.manifest.run_id, runId);
+    if (prepared.manifest.wait_index !== waitIndex) {
+      throw conflict("the stored wait intent manifest names another wait index");
+    }
+    if (!stored.equals(Buffer.from(prepared.canonical_json, "utf8"))) {
+      throw conflict("the stored wait intent manifest file does not carry its own canonical JSON");
+    }
+    return deepFreezeValue({ intent: prepared, intent_path: intentPath });
   });
 }
