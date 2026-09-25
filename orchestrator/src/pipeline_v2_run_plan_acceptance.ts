@@ -131,7 +131,7 @@ export class PipelineV2RunPlanAcceptanceError extends Error {
 
 const INVALID_STATE_DIAGNOSTIC =
   "verifyPipelineV2RunPlanCandidateForAcceptance requires a durable pipeline v2 run state document; " +
-  "the argument is not a valid schema version 6 run state";
+  "the argument is not a valid schema version 7 run state";
 
 /**
  * The acceptance boundary on the already normalized state: an active

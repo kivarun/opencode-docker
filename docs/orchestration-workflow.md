@@ -777,8 +777,8 @@ schema-v7 dispatch.
 
 `orchestrator/src/pipeline_v2_run_plan_compiled.ts` binds one prepared run
 plan candidate to the trusted compiled orchestration metadata of a resolved
-v2 pipeline — the single prepared projection a future controller will
-consume. Provenance order is fixed: the pipeline gate first
+v2 pipeline — the single prepared projection the run plan acceptance
+controller consumes. Provenance order is fixed: the pipeline gate first
 (`requireResolvedPipelineV2Provenance`), then the candidate gate through the
 existing boolean `hasPreparedRunPlanCandidateProvenance` (a registry
 lookup; the candidate's getters and Proxy traps never fire), both before any
@@ -1681,28 +1681,31 @@ same invariants from those records in both directions. There is no
 audit/observation layer must never duplicate them as a second source of
 truth. State schema versions 1–6 are explicitly rejected (no migration in
 either direction); the schema v2 document stays the production state of
-pipeline v1. The pure queries `pipelineV2OpenStageIteration` (current
-snapshot) and `pipelineV2StageIterationAt` (the unified positional interval
-over the anchors — a stage iteration is open at an execution start exactly
-when it opened at or before the start boundary and is not closed strictly
-before it; a closure anchored at that boundary follows the execution it
-contains, while a wait-bound closure at the same boundary precedes every
-start of that boundary; the recorded iteration index — which restarts at 1
-in every generation and is not a global identifier — and the compiled stage
-template of the execution's state are filters of one shared internal
-candidate resolver, so a touching boundary between two generations with
-different templates is resolved uniquely by the template; when several
-generations remain indistinguishable (a reused template with the same
-iteration index) the exact lookup claims no generation at all — only a
-unique candidate returns a projection, zero and ambiguous sets resolve to
-`null`, and no first or last member of the ambiguous set is ever selected)
-are the two consumer faces of the same shared resolver: the exact lookup,
-and the exported `pipelineV2StageIterationMembershipAt` membership
-predicate for the restore verifier, which requires only that the execution
-belongs to the admissible candidate set (ambiguity between matching
-generations is not a mismatch; the absence of any matching candidate is)
-and never claims a generation of its own — the current snapshot query is
-also consumed by the coordinator.
+pipeline v1. The pure query `pipelineV2OpenStageIteration` (the
+coordinator's separate current-snapshot query: the open generation's open
+iteration of the validated snapshot, used to resolve a fresh stage start's
+exact durable `iteration_index`) and the two consumer faces of the single
+shared internal interval resolver — the exact lookup
+`pipelineV2StageIterationAt` (the unified positional interval over the
+anchors — a stage iteration is open at an execution start exactly when it
+opened at or before the start boundary and is not closed strictly before
+it; a closure anchored at that boundary follows the execution it contains,
+while a wait-bound closure at the same boundary precedes every start of
+that boundary; the recorded iteration index — which restarts at 1 in every
+generation and is not a global identifier — and the compiled stage template
+of the execution's state are filters of the candidate set, so a touching
+boundary between two generations with different templates is resolved
+uniquely by the template; when several generations remain indistinguishable
+(a reused template with the same iteration index) the exact lookup claims
+no generation at all — only a unique candidate returns a projection, zero
+and ambiguous sets resolve to `null`, and no first or last member of the
+ambiguous set is ever selected) and the exported
+`pipelineV2StageIterationMembershipAt` membership predicate (through which
+the restore verifier checks that a stage execution belongs to the
+admissible candidate set — ambiguity between matching generations is not a
+mismatch; the absence of any matching candidate is; no generation is
+claimed) — resolve stage-iteration membership; the candidate list itself
+stays internal.
 
 P01 boundary: this increment implements only the generic durable
 request/response pair and the routing to a pre-declared action. It does
@@ -1820,8 +1823,8 @@ idempotency. Store responsibility ends at the immutable canonical
 artifacts; the candidate layer above assembles them into one coherent
 plan+task unit (task revisions published first, the plan revision as
 the filesystem commit marker, exact-retry adoption), and durable-state
-acceptance remains the future controller's responsibility (no schema
-v7, no reducer commands, no production wiring here).
+acceptance is the run plan acceptance controller's responsibility (no
+schema v7, no reducer commands, no production wiring here).
 
 The production-neutral wait controller
 (`orchestrator/src/pipeline_v2_wait_controller.ts`) assembles these
@@ -1965,14 +1968,97 @@ declares a candidate accepted. A hostile store result (injected ops)
 fails as a typed failed publication, detected by structure, never by
 message text.
 
-Both layers remain pure substrate: no durable state, no reducer
-commands, no engine/coordinator/runner/CLI wiring, no pipeline schema
-or stage templates, no P01, and no wait-controller integration. Two
-structural questions stay deliberately unresolved: how a pure reducer
-derives the task ledger from `{revision, sha256}` pairs (initial task
-revisions need separate durable commands or content-free refs), and
-where the crash-safe boundaries `plan acceptance ↔ transition` and
-`stage_iteration_opened ↔ start_agent_execution` lie.
+Both layers remain pure substrate: no durable state, no engine/coordinator/
+runner/CLI wiring, no pipeline schema or stage templates, no P01, and no
+wait-controller integration. The task-ledger question is resolved on top of
+them: the durable `task_revisions[]` ledger is derived by the schema v7
+reducer's `task_revision_accepted` commands, which the acceptance
+controller below dispatches only for the records the reconciliation finds
+missing. The crash-safe boundary `plan acceptance ↔ transition` (what
+moves the run from plan acceptance into stage execution) stays a later
+policy/wiring increment.
+
+### Run plan acceptance controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_run_plan_controller.ts` (public, with the
+internal core `pipeline_v2_run_plan_controller_internal.ts`) is the single
+layer that binds the existing run-plan layers into one crash-safe order:
+
+    compiled/state validation (the single acceptance verifier)
+    → reducer pre-check of the whole missing durable sequence (local
+      snapshot, the one reducer, no side effects)
+    → publication of the task manifests (candidate order, strictly
+      sequential through the single candidate publisher)
+    → publication of the plan manifest as the filesystem commit marker
+    → durable task_revision_accepted for the missing task records
+    → durable plan_revision_accepted as the state commit marker
+
+`acceptPipelineV2RunPlanCandidate({pipeline, runRoot, sink, candidate})`
+runs the acceptance verifier
+(`verifyPipelineV2RunPlanCandidateForAcceptance`) as the only acceptance
+authority — pipeline provenance, candidate provenance, the compiled
+template binding, the single state validator, the pipeline identity, the
+acceptance boundary, the candidate/run binding, the origin execution and
+the planning role — then binds `basename(runRoot)` to the durable run id,
+reconciles the candidate's exact task and plan revision chains against
+the durable `task_revisions[]`/`plan_revisions[]` ledgers, pre-checks the
+whole missing sequence against the reducer on a local snapshot, publishes
+the candidate through the single existing publisher
+(`publishPipelineV2RunPlanCandidate` — called exactly once; its store
+errors keep their original typed class), and dispatches only the missing
+durable records through the structural
+`PipelineV2RunPlanControllerSink {snapshot, poisoned, dispatch}` (the
+production `PipelineV2RunStateSink` satisfies it). The plan manifest is
+the filesystem commit marker; the durable plan ledger record is the state
+commit marker.
+
+The reconciliation is structural and fail-closed, before any publication:
+a candidate task revision is already durable exactly when the ledger
+carries the exact `task_id` + `revision` pair with the candidate's digest
+and chain digest (never re-dispatched); the same pair with a different
+digest or chain, the same task id at a different revision, or a missing
+task revision above 1 (a user-response revision cannot be created on the
+active planning boundary) are typed conflicts; missing revision-1 tasks
+are dispatched in candidate order. The durable plan record matching the
+candidate revision, digest, chain digest and origin execution exactly is
+an idempotent durable success (no second plan dispatch) with every
+candidate task required durable; a plan record with different content, a
+ledger that has moved past the candidate revision (a stale candidate), or
+a candidate chain that does not link the durable ledger are conflicts.
+Durable task revisions for tasks outside the current candidate never
+conflict by themselves.
+
+After every dispatch the authoritative sink snapshot is re-read and must
+structurally carry exactly the expected record (identity, digest, chain,
+origin) — a sink that resolves without the expected snapshot change fails
+closed. A reducer rejection after a racing identical dispatch is
+idempotent success only when the authoritative snapshot now carries the
+exact expected record. Durability semantics: a sink `not_committed` keeps
+the previous snapshot authoritative with the published manifests as
+orphans and returns `state_persist_failed` without an automatic second
+dispatch; a `durability_unknown` adopts the visible candidate, poisons
+the sink, stops every further dispatch and returns `state_persist_failed`
+with the adopted state; a fresh retry reuses the published artifacts
+(idempotent adoption), recognizes the already durable prefix and
+dispatches only the still-missing records. Nothing is ever rolled back.
+
+Only this layer's own failures are `PipelineV2RunPlanControllerError`
+with the closed reason set `invalid_state | candidate_conflict |
+state_persist_failed` and the last authoritative `state`; acceptance,
+orchestration, compiled-plan, manifest, binding and publication failures
+keep their original classes, and unexpected errors propagate unchanged.
+Every options field is read exactly once, the sink's `dispatch` is
+captured once and bound to the sink before the first await, caller
+objects are never frozen or modified, and the production path always runs
+through the single frozen ops object (`verifyCandidateForAcceptance`,
+`publishCandidate`) — no mutable module-global seam. The result is
+deep-frozen `{compiled_plan, state}`: the exact provenance-backed
+compiled plan object and the last authoritative state; prepared
+manifests, canonical JSON, task bodies, paths and the caller candidate
+never enter the result or the content-free diagnostics. Not wired:
+coordinator, runner, CLI, the stage generation/iteration lifecycle
+controller, wait/replanning policy, automatic resume and multi-process
+locking.
 
 ### Read-only runtime context restoration for a future resume (implemented, not wired)
 

@@ -1111,7 +1111,7 @@ test("16. a malformed state document is invalid_state", async () => {
     expectAcceptanceError(cause, "invalid_state");
     expect((cause as Error).message).toBe(
       "verifyPipelineV2RunPlanCandidateForAcceptance requires a durable pipeline v2 run state document; " +
-        "the argument is not a valid schema version 6 run state",
+        "the argument is not a valid schema version 7 run state",
     );
     // a PipelineV2StateError is mapped, not propagated
     let mapped = false;
