@@ -2115,6 +2115,68 @@ coordinator, runner, CLI, the stage generation/iteration lifecycle
 controller, wait/replanning policy, automatic resume and multi-process
 locking.
 
+### Continue-stage intent acceptance controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_continue_stage_intent_controller.ts`
+(public, with the internal core
+`pipeline_v2_continue_stage_intent_controller_internal.ts`) is the
+production-neutral controller that durably accepts one
+`continue_stage_intent` user wait intent. It takes one
+provenance-registered prepared intent (strictly the
+`continue_stage_intent` kind), binds it against the durable schema-v7
+state — the waiting run, its open wait record with a declared
+`continue_stage` action (the wait's reason string is never consulted;
+the declared action decides), the same run id and wait index, the last
+open stage generation with its open iteration, the generation's stage id
+and the generation's plan binding to the last durable plan revision, and
+a different already-accepted digest rejected as a typed conflict before
+any filesystem read — loads the authoritative plan revision manifest
+only from the durable ledger through the existing run-plan store
+(`null` is `invalid_state`; the loaded manifest must match the durable
+record exactly on run id, revision, digest, chain digest and origin
+execution), validates the binding through the existing
+`validateContinueIntentBinding`, pre-checks the existing
+`plan_intent_accepted {waitIndex, intentSha256}` command through the
+single reducer on a local snapshot (defense-in-depth; a rejection is
+`invalid_state` before publication), publishes the intent through the
+existing `publishPipelineV2WaitIntent` (a structural result check: kind,
+run id, wait index, canonical JSON and digest — a hostile injected
+result fails closed before any dispatch), and only then dispatches the
+durable command once through the structural
+`PipelineV2ContinueStageIntentControllerSink {snapshot, poisoned,
+dispatch}` seam (the production `PipelineV2RunStateSink` satisfies it
+without an adapter; the dispatch is bound to the sink at capture). After
+every dispatch the authoritative sink snapshot is re-read and must carry
+exactly the accepted intent digest inside the same wait record with its
+binding fields unchanged; a racing identical dispatch is idempotent
+success only on that exact match. Capture order: options shape → each
+options field once (`runRoot` → `sink` → `intent`) → the sink's
+`poisoned`/`dispatch`/initial `snapshot` once as opaque references →
+the fail-closed poison latch → the intent provenance gate (registry
+lookup before any field read; Proxy traps stay at zero) → only then the
+single state validator and the durable bindings. The per-call ops
+(`loadPlanRevision`, `publishWaitIntent`) are read exactly once into
+captured locals with one frozen production ops object; no mutable
+module-global seam and no public export of it. Durability: publication
+failures keep the store's error class with zero dispatch; sink
+`not_committed` leaves the intent file as an orphan with the previous
+snapshot authoritative (an exact retry adopts the file and commits
+once); sink `durability_unknown` adopts the visible candidate, poisons
+the sink and dispatches nothing further (a fresh sink recognizes the
+durable record and restores only the publication); nothing is ever
+rolled back. Runtime export surface is exactly
+`PipelineV2ContinueStageIntentControllerError` (closed reasons
+`invalid_intent | invalid_state | intent_conflict |
+state_persist_failed`, last authoritative `state`) and
+`acceptPipelineV2ContinueStageIntent({runRoot, sink, intent})`; the
+deep-frozen content-free result is `{wait_index, intent_sha256,
+state}`. Not implemented (stays unwired): `iteration_grant_recorded`,
+the wait-bound `stage_iteration_closed {by: "grant"}`, the response
+manifest and `wait_response_recorded`, `revise_task_intent`, task
+revision publication/acceptance, the continue/revise action policy,
+automatic resume, coordinator/runner/CLI wiring, schema changes,
+migrations/API/T3, multi-process locking.
+
 ### Stage generation/iteration controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
