@@ -348,7 +348,10 @@ function stepPresent(state: PipelineV2RunState, step: MissingStep): boolean {
 
 /**
  * The active running boundary with no unfinished execution and no open
- * wait — the boundary the reducer's lifecycle commands require. Every
+ * wait — the boundary the reducer's lifecycle commands require. A failed
+ * execution is not a clean lifecycle boundary (the only successor of a
+ * failure is the run failure finalization), so a settled execution means
+ * agent `cleanup_completed` and decision `evaluated` exactly. Every
  * violation is this layer's `invalid_state` before any dispatch.
  */
 function checkRunBoundary(state: PipelineV2RunState): void {
@@ -370,7 +373,11 @@ function checkRunBoundary(state: PipelineV2RunState): void {
   }
   const lastExecution = state.executions[state.executions.length - 1];
   if (lastExecution !== undefined) {
-    if (lastExecution.type === "agent" && lastExecution.phase !== "cleanup_completed" && lastExecution.phase !== "failed") {
+    // A failed execution is never a clean lifecycle boundary: after the
+    // failure the only durable successor is the run failure finalization,
+    // so no stage generation or iteration may be ensured (including the
+    // zero-dispatch W3 idempotent path).
+    if (lastExecution.type === "agent" && lastExecution.phase !== "cleanup_completed") {
       throw fail();
     }
     if (lastExecution.type === "decision" && lastExecution.phase !== "evaluated") {

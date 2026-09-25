@@ -1589,4 +1589,79 @@ describe("pipeline v2 stage iteration controller", () => {
       }
     });
   });
+
+  test("35. a failed stage execution is not a clean boundary: W3 returns invalid_state with zero dispatch", async () => {
+    await withPipeline(async (pipeline) => {
+      const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+      try {
+        // open generation + iteration, run the stage agent to its failure
+        await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: ctx.sink });
+        await ctx.sink.dispatch({
+          kind: "transition_committed",
+          step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+          executionIndex: 1,
+        });
+        await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+        for (const command of [
+          { kind: "agent_data_prepared" },
+          { kind: "agent_execution_session_created", sessionId: "sess-stage-1" },
+          { kind: "agent_tool_session_created", sessionId: "tool-stage-1" },
+          { kind: "agent_running" },
+        ] as PipelineV2RunCommand[]) {
+          await ctx.sink.dispatch(command);
+        }
+        await ctx.sink.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+        const before = ctx.sink.snapshot as PipelineV2RunState;
+        const recording = recordingSink(ctx.sink, ctx.fixture, false);
+        const cause = await catchEnsure(() =>
+          ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: recording.sink }),
+        );
+        const error = expectControllerError(cause, "invalid_state");
+        expect(error.message).toContain("the run is not on a boundary that accepts a stage generation or iteration");
+        expect(recording.commands).toEqual([]);
+        // the snapshot, the hidden compiled identity and the plan binding are unchanged
+        expect(JSON.stringify(ctx.sink.snapshot)).toBe(JSON.stringify(before));
+        expect(compiledRunPlanOriginIdentity(ctx.compiledPlan)).toEqual(pipelineV2RunPipelineIdentity(pipeline));
+        expect((before.plan_revisions[before.plan_revisions.length - 1])?.sha256).toBe(ctx.compiledPlan.plan_sha256);
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    });
+  });
+
+  test("36. a settled stage execution inside an open iteration is still a clean W3 boundary", async () => {
+    await withPipeline(async (pipeline) => {
+      const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+      try {
+        await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: ctx.sink });
+        await ctx.sink.dispatch({
+          kind: "transition_committed",
+          step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+          executionIndex: 1,
+        });
+        await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+        for (const command of [
+          { kind: "agent_data_prepared" },
+          { kind: "agent_execution_session_created", sessionId: "sess-stage-1" },
+          { kind: "agent_tool_session_created", sessionId: "tool-stage-1" },
+          { kind: "agent_running" },
+          { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+          { kind: "agent_cleanup_completed" },
+        ] as PipelineV2RunCommand[]) {
+          await ctx.sink.dispatch(command);
+        }
+        const recording = recordingSink(ctx.sink, ctx.fixture, true);
+        const result = await ensurePipelineV2StageIteration({
+          compiledPlan: ctx.compiledPlan,
+          stageId: "stage-1",
+          initialBudget: 2,
+          sink: recording.sink,
+        });
+        expect(recording.commands).toEqual([]);
+        expect(result).toMatchObject({ generation_index: 1, iteration_index: 1 });
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    });
+  });
 });

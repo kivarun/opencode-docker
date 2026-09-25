@@ -26,6 +26,28 @@
  * so a grant can never retroactively make already-invalidated history
  * valid. The reducer and the loader enforce the identical successor rules
  * from their two sides: the reducer at write time, the loader by a single
+ * joint replay.
+ *
+ * The post-failure successor contract is unified: once the run's last
+ * execution (agent or decision) has failed, the only durable successor is
+ * the run failure finalization — `run_failed` for the ordinary failure,
+ * `run_cleanup_failed` for the agent failure with an unconfirmed session
+ * cleanup, each decided by its own existing case rules. No lifecycle,
+ * task/plan, wait, execution, transition, terminal or publication command
+ * is accepted after a failed execution, and the stage generation/iteration
+ * openings additionally require the boundary's last execution to be
+ * settled, so a reducer-produced document can never place an opening
+ * before the failure it later carries. The loader verifies only provable
+ * positional coherence for the same rules: a plan revision's planning
+ * origin must be cleanly settled (`cleanup_completed`), a failed stage
+ * execution's referenced iteration must still be genuinely open at its
+ * start boundary, and no generation/iteration opening may share the start
+ * boundary of a failed planning/control execution. Revision-1 task
+ * revisions are position-free records: the reducer forbids adding them
+ * after a failure, and the loader claims no impossible temporal check for
+ * records that carry no anchor.
+ *
+ * The loader is a single
  * positional replay that orders generations, iterations, grants, task and
  * plan revisions, executions and the joint transition+wait cursor
  * replay by their recorded anchors. There are no event journals, no second
@@ -2195,6 +2217,23 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   /** The entered but not yet answered wait record (at most one), by journal index. */
   let enteredWaitIndex: number | null = null;
 
+  /**
+   * The execution starting at a boundary, when it is a planning or control
+   * execution that has failed. In reducer time the generation and
+   * iteration openings of a planning/control execution's own start
+   * boundary follow that execution's clean settlement (the stage-boundary
+   * hook order); a failed execution's only successor is the run failure
+   * finalization, so no opening can follow it. Durable openings anchored
+   * at that boundary are therefore unreachable in reducer time and are
+   * rejected before they replay.
+   */
+  const failedPlanningControlStartAt = (boundary: number): PipelineV2ExecutionState | undefined => {
+    const starting = executions[boundary];
+    return starting !== undefined && starting.phase === "failed" && starting.execution_role !== "stage"
+      ? starting
+      : undefined;
+  };
+
   const grantWaitOf = (grant: PipelineV2IterationGrantState): PipelineV2WaitRecord => {
     const wait = waits[grant.wait_index - 1];
     if (wait === undefined) {
@@ -2317,9 +2356,9 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
             `plan revision record ${plan.index} names origin execution ${plan.origin_execution} with the ${JSON.stringify(origin.execution_role)} role; plan acceptance requires a planning execution`,
           );
         }
-        if (!isSettledExecution(origin)) {
+        if (origin.type !== "agent" || origin.phase !== "cleanup_completed") {
           throw new PipelineV2StateError(
-            `plan revision record ${plan.index} names origin execution ${plan.origin_execution}, which has phase ${JSON.stringify(origin.phase)}; plan acceptance requires a settled execution`,
+            `plan revision record ${plan.index} names origin execution ${plan.origin_execution} with phase ${JSON.stringify(origin.phase)}; plan acceptance requires the planning execution to be cleanly settled ("cleanup_completed")`,
           );
         }
         const openAtAcceptance = unambiguouslyOpenAt(ordinal);
@@ -2395,6 +2434,12 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         if (acceptedPlan === undefined || acceptedPlan.sha256 !== generation.plan_sha256) {
           continue;
         }
+        const failedStart = failedPlanningControlStartAt(ordinal);
+        if (failedStart !== undefined) {
+          throw new PipelineV2StateError(
+            `generation ${generation.index} opens at committed transition count ${ordinal}, where execution ${failedStart.index} has failed with the ${JSON.stringify(failedStart.execution_role)} role; no stage generation may open after a failed planning or control execution`,
+          );
+        }
         openedGenerations.add(generation.index);
         openGenerationIndex = generation.index;
         progress = true;
@@ -2417,6 +2462,12 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         }
         if (openGenerationIndex !== generation.index || openIterationGeneration !== null || enteredWaitIndex !== null) {
           continue;
+        }
+        const failedStart = failedPlanningControlStartAt(ordinal);
+        if (failedStart !== undefined) {
+          throw new PipelineV2StateError(
+            `iteration ${iteration.index} of generation ${generation.index} opens at committed transition count ${ordinal}, where execution ${failedStart.index} has failed with the ${JSON.stringify(failedStart.execution_role)} role; no stage iteration may open after a failed planning or control execution`,
+          );
         }
         // The effective-budget safety checks mirror the reducer's opening
         // rule exactly: the accumulated grant sum and the initial-budget
@@ -2849,6 +2900,21 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
             `execution ${startingExecution.index} references iteration ${referencedIndex}, which is not the open iteration ${open.iteration.index} at committed transition count ${ordinal}`,
           );
         }
+        if (startingExecution.phase === "failed") {
+          // A failed stage execution's only successor is the run failure
+          // finalization, so no iteration closure can follow the failure
+          // at the execution's start boundary: the referenced iteration
+          // must still be genuinely open after the boundary worklist. An
+          // interval candidate that is already closed at this boundary is
+          // not enough, ambiguous candidates are never chosen, and the
+          // replay's single open-iteration projection is the only proof
+          // of membership.
+          if (openIterationGeneration === null || openIterationIndex !== referencedIndex) {
+            throw new PipelineV2StateError(
+              `execution ${startingExecution.index} has failed, so its referenced iteration ${referencedIndex} must still be open at committed transition count ${ordinal}`,
+            );
+          }
+        }
       } else {
         const unambiguous = unambiguouslyOpenAt(ordinal);
         if (unambiguous.length > 0) {
@@ -2896,6 +2962,12 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   // Every user-response task revision names a wait whose anchor must be
   // within the committed transition count; revision-1 records are
   // position-free (the planning flow accepts them on any active boundary).
+  // Honest loader boundary: a revision-1 task record carries no execution
+  // or transition anchor, so the loader cannot prove whether it was
+  // accepted before or after a failed execution — forbidding additions
+  // after a failure is the reducer's unified successor-gate duty, and this
+  // module does not claim an impossible temporal check (nor add a
+  // timestamp, anchor or schema field) for position-free records.
   for (const task of taskRevisions) {
     if (task.revision === 1) {
       continue;
@@ -3622,6 +3694,30 @@ function rejectDurableSessionId(current: PipelineV2RunState, sessionId: string):
 }
 
 /**
+ * The stage lifecycle openings record their durable anchor at the boundary
+ * whose last execution must be settled: the contract hook order is a
+ * settled execution, then the generation and iteration opened at the same
+ * boundary, then the transition. An opening recorded while an execution is
+ * still in flight would let a later failure share its boundary with the
+ * opening in a way no durable anchor can disambiguate, so the opening
+ * cases reject it; the failed-execution case is already excluded by the
+ * unified post-failure successor gate before the switch.
+ */
+function requireNoInFlightExecution(
+  current: PipelineV2RunState,
+  what: string,
+): void {
+  const last = current.executions[current.executions.length - 1];
+  if (last === undefined || isSettledExecution(last)) {
+    return;
+  }
+  fail(
+    current,
+    `${what} requires the run's last execution ${last.index} to be settled, got the in-flight phase ${JSON.stringify(last.phase)}`,
+  );
+}
+
+/**
  * The single TransitionStep contract shared by the reducer and the loader:
  * an engine step obeys the same safe-id and integer rules as the persisted
  * transition record, so an accepted command can never produce a document
@@ -3861,11 +3957,33 @@ export function reducePipelineV2RunCommand(
     }
   }
 
+  // The unified post-failure successor gate. Once the last execution of
+  // the run has failed — agent or decision — the only durable successor is
+  // the run failure finalization: `run_failed` for the ordinary failure,
+  // `run_cleanup_failed` for the agent failure with an unconfirmed session
+  // cleanup; their own case rules decide which of the two is admissible
+  // and reject the wrong one with their existing typed semantics. No
+  // lifecycle, task/plan, wait, execution, transition, terminal or
+  // publication command is accepted after a failed execution. The gate
+  // reads only the command discriminator (never its payload), does not
+  // call the clock, and leaves the revision and the state untouched on
+  // rejection.
+  const lastExecution = current.executions[current.executions.length - 1];
+  if (
+    lastExecution !== undefined &&
+    lastExecution.phase === "failed" &&
+    command.kind !== "run_failed" &&
+    command.kind !== "run_cleanup_failed"
+  ) {
+    throw new PipelineV2StateError(
+      `command ${JSON.stringify(command.kind)} rejected: the run's last execution ${lastExecution.index} has failed; a failed execution allows only the run failure finalization (run_failed or run_cleanup_failed)`,
+    );
+  }
+
   const next = cloneState(current);
   const at = now.toISOString();
   next.updated_at = at;
   next.revision = current.revision + 1;
-
   switch (command.kind) {
     case "start_agent_execution": {
       if (!isPipelineV2SafeId(command.stateId)) {
@@ -4562,6 +4680,7 @@ export function reducePipelineV2RunCommand(
           `the generation anchor ${command.transitionCount} does not match the cursor transition count ${current.cursor.transition_count}`,
         );
       }
+      requireNoInFlightExecution(current, "opening a stage generation");
       const lastPlan = current.plan_revisions[current.plan_revisions.length - 1];
       if (lastPlan === undefined || lastPlan.sha256 !== planSha256) {
         fail(current, `the generation binds plan digest ${JSON.stringify(planSha256)}, which is not the last accepted plan revision`);
@@ -4648,6 +4767,7 @@ export function reducePipelineV2RunCommand(
           `the iteration anchor ${command.transitionCount} does not match the cursor transition count ${current.cursor.transition_count}`,
         );
       }
+      requireNoInFlightExecution(current, "opening a stage iteration");
       let grantsSum = 0;
       for (const grant of current.grants) {
         if (grant.generation_index === generation.index) {

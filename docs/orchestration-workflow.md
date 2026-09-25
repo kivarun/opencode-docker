@@ -1656,6 +1656,32 @@ resolves every start's role exclusively through `compiledExecutionRoleFor`
 plus the durable open iteration, and never dispatches the eight lifecycle
 commands itself — the policy/controller layer owns them.
 
+The post-failure successor is unified and closed: once the run's last
+execution (agent or decision) has failed, the only accepted commands are
+the two run failure finalizers — `run_failed` for the ordinary failure and
+`run_cleanup_failed` for the agent failure with an unconfirmed session
+cleanup, each decided by its own existing case rules; no lifecycle,
+task/plan, wait, execution, transition, terminal or publication command is
+accepted after a failure. The gate runs before the case dispatch, reads
+only the command discriminator, never calls the clock, and leaves the
+revision and state untouched. The stage generation/iteration openings
+additionally require the boundary's last execution to be settled (the
+contract hook order: settled execution → generation → iteration →
+transition), so a reducer-produced document can never place an opening
+before the failure it later carries. The loader verifies the provable
+positional coherence of the same rules inside its single joint replay: a
+plan revision's planning origin must be the agent execution in phase
+exactly `cleanup_completed`; a failed stage execution's referenced
+iteration must still be genuinely open after its start boundary's worklist
+(an interval candidate already closed at that boundary is not enough, and
+ambiguous candidates are never chosen); no generation/iteration opening
+may share the start boundary of a failed planning/control execution; and
+closures that legally precede a planning/control start stay valid.
+Revision-1 task revisions are position-free records with no execution or
+transition anchor: the reducer forbids adding them after a failure, and
+the loader claims no impossible temporal check for records that carry no
+anchor — no timestamp, anchor or schema field is added to invent one.
+
 One agent execution records two independent, durable, non-secret session
 ids following the two-session capability model: `execution_session_id`
 (the orchestrator-owned Execution Session, scope `run_root`, never handed
@@ -2115,8 +2141,11 @@ stage position comes only from the compiled plan's declaration order, the
 transition anchor only from the durable cursor's transition count, the
 generation and iteration indexes only from the durable ledgers. A run
 boundary that is not active/running — a terminal reached, outputs
-published, a failure recorded, an open wait or an in-flight execution —
-is `invalid_state` before any dispatch.
+published, a failure recorded, an open wait, an in-flight execution or a
+FAILED last execution (a failed execution is never a clean lifecycle
+boundary; the only successor of a failure is the run failure
+finalization) — is `invalid_state` before any dispatch, which also closes
+the W3 zero-dispatch idempotent path after a failure.
 
 Reconciliation: with no open generation the controller prepares
 `stage_generation_opened` then `stage_iteration_opened` (iteration 1 of

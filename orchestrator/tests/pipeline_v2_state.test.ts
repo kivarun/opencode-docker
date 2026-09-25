@@ -700,11 +700,11 @@ describe("pipeline v2 run state schema v6", () => {
         step: { from: "implement", outcome: "completed", to: "check", transition_index: 0 },
         executionIndex: 1,
       },
-      'committing a transition requires the agent execution to be cleaned up, execution 1 has phase "failed"',
+      'command "transition_committed" rejected: the run\'s last execution 1 has failed; a failed execution allows only the run failure finalization (run_failed or run_cleanup_failed)',
     );
     driver.reject(
       { kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" },
-      "a new execution requires the previous execution's transition to be committed",
+      'command "start_agent_execution" rejected: the run\'s last execution 1 has failed; a failed execution allows only the run failure finalization (run_failed or run_cleanup_failed)',
     );
     driver.apply({ kind: "run_failed", reason: "worker_failed" });
     const state = driver.current as PipelineV2RunState;
@@ -720,7 +720,7 @@ describe("pipeline v2 run state schema v6", () => {
     driver.apply({ kind: "decision_failed", reason: "decision_input_invalid" });
     driver.reject(
       { kind: "start_agent_execution", stateId: "check", profile: "coder", executionRole: "planning" },
-      "a new execution requires the previous execution's transition to be committed",
+      'command "start_agent_execution" rejected: the run\'s last execution 1 has failed; a failed execution allows only the run failure finalization (run_failed or run_cleanup_failed)',
     );
     driver.apply({ kind: "run_failed", reason: "decision_input_invalid" });
     const state = driver.current as PipelineV2RunState;
