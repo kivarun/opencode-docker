@@ -40,7 +40,10 @@
  *
  * - a candidate task revision is already durable exactly when the ledger
  *   carries the exact `task_id` + `revision` pair with the candidate's
- *   `sha256` and `previous_sha256`; such a record is never re-dispatched;
+ *   `sha256` and `previous_sha256`, AND it is the latest durable revision
+ *   of that task id (an earlier revision exists only as a chain
+ *   predecessor; a durable revision newer than the candidate's is a
+ *   downgrade conflict) — such a record is never re-dispatched;
  * - a durable record for the same pair with a different digest or chain
  *   is a `candidate_conflict` — nothing is written;
  * - a durable record for the same task id at a different revision is a
@@ -52,11 +55,15 @@
  * - a missing revision-1 task is appended to the missing sequence;
  * - the durable plan record matching the candidate revision exactly
  *   (revision, sha256, previous_sha256, origin_execution) is an
- *   idempotent durable success: no second plan dispatch happens, and the
- *   sequence is empty — every candidate task must already be durable;
+ *   idempotent durable success only when it is the last durable plan
+ *   revision — no second plan dispatch happens and the sequence is empty
+ *   (every candidate task must already be durable); a durable ledger that
+ *   has moved past the candidate revision makes the candidate stale
+ *   (`candidate_conflict`);
  * - a durable plan record at the candidate revision with different
- *   content, or a durable ledger that has moved past the candidate
- *   revision, or a candidate chain that does not link the durable ledger
+ *   content, a candidate revision ahead of the durable ledger (ahead/gap:
+ *   the candidate revision is greater than the next expected ledger
+ *   revision), or a candidate chain that does not link the durable ledger
  *   are `candidate_conflict` failures;
  * - durable task revisions for tasks outside the current candidate are
  *   never a conflict by themselves.
@@ -82,13 +89,19 @@
  *
  * Capture boundary: every options field is read exactly once; the sink's
  * `poisoned`/`dispatch`/`snapshot` accessors are each read exactly once
- * in the synchronous prefix, `dispatch` is bound to the sink once before
- * the first await, and caller objects are never frozen or modified. The
- * publication ops are captured exactly once per call (each method read
- * one time, type-checked, then never read again); the single frozen
- * production ops object is bound to the existing public functions and
- * there is no mutable module-global seam, so an injected call can never
- * influence a parallel production call.
+ * in the synchronous prefix as opaque references — the pipeline,
+ * candidate and state documents are not traversed here, so no field of
+ * them is read before the pipeline/candidate provenance gates have run
+ * (the acceptance chain is the first semantic validation: pipeline
+ * provenance, candidate provenance/compile, and only then the state
+ * validation and the identity/boundary checks); `dispatch` is bound to
+ * the sink once before the first await, caller objects are never frozen
+ * or modified, an unexpected error from a sink getter propagates
+ * unchanged, and the publication ops are captured exactly once per call
+ * (each method read one time, type-checked, then never read again); the
+ * single frozen production ops object is bound to the existing public
+ * functions and there is no mutable module-global seam, so an injected
+ * call can never influence a parallel production call.
  *
  * Errors: only this layer's own failures are
  * `PipelineV2RunPlanControllerError` with the closed reason set
@@ -237,11 +250,13 @@ function conflict(message: string, state: PipelineV2RunState): PipelineV2RunPlan
 
 /**
  * The synchronous capture boundary: every options field is read exactly
- * once, the sink accessors (`poisoned`, `dispatch`, `snapshot`) are each
- * read exactly once, `dispatch` is bound to the sink, and the durable
- * state document is checked for the minimal shape the later authoritative
- * reads rely on (the full validation is the acceptance verifier's single
- * `validatePipelineV2RunState` call). No filesystem or sink side effect
+ * once and the sink accessors (`poisoned`, `dispatch`, `snapshot`) are
+ * each read exactly once as opaque references — the pipeline, candidate
+ * and state documents are not traversed here (no field of them is read
+ * before the pipeline/candidate provenance gates have run; the acceptance
+ * chain owns the state validation and reads the document only through its
+ * own gates). `dispatch` is bound to the sink. An unexpected error from a
+ * sink getter propagates unchanged. No filesystem or sink side effect
  * happens here; every rejection is a typed controller failure.
  */
 function captureBoundary(options: unknown): Captured {
@@ -258,12 +273,7 @@ function captureBoundary(options: unknown): Captured {
   if (!isRecord(sink)) {
     throw controllerError("invalid_state", "acceptPipelineV2RunPlanCandidate requires a state sink", null);
   }
-  let poisoned: unknown;
-  try {
-    poisoned = sink["poisoned"];
-  } catch {
-    throw controllerError("invalid_state", "acceptPipelineV2RunPlanCandidate requires a readable state sink", null);
-  }
+  const poisoned: unknown = sink["poisoned"];
   if (poisoned === true) {
     throw controllerError(
       "invalid_state",
@@ -275,19 +285,12 @@ function captureBoundary(options: unknown): Captured {
   if (typeof dispatch !== "function") {
     throw controllerError("invalid_state", "acceptPipelineV2RunPlanCandidate requires a dispatchable state sink", null);
   }
-  let snapshot: unknown;
-  try {
-    snapshot = sink["snapshot"];
-  } catch {
-    throw controllerError("invalid_state", "acceptPipelineV2RunPlanCandidate requires a readable state sink", null);
-  }
-  if (
-    !isRecord(snapshot) ||
-    snapshot["schema_version"] !== 7 ||
-    !isRecord(snapshot["pipeline"]) ||
-    (snapshot["pipeline"] as Record<string, unknown>)["schema_version"] !== 2 ||
-    typeof snapshot["run_id"] !== "string"
-  ) {
+  const snapshot: unknown = sink["snapshot"];
+  // The snapshot is captured as an opaque reference only: its fields are
+  // not read before the pipeline/candidate provenance gates have run (the
+  // acceptance chain owns the state validation and reads the document
+  // only through its own gates).
+  if (!isRecord(snapshot)) {
     throw controllerError(
       "invalid_state",
       "no durable pipeline v2 run state exists yet",
@@ -380,10 +383,20 @@ function reconcileCandidate(
   const missing: MissingRecord[] = [];
   for (const task of candidate.task_revisions) {
     const manifest = task.manifest;
-    const durable = state.task_revisions.find(
-      (record) => record.task_id === manifest.task_id && record.revision === manifest.revision,
+    const durableForTask = state.task_revisions.filter(
+      (record) => record.task_id === manifest.task_id,
     );
+    const durable = durableForTask.find((record) => record.revision === manifest.revision);
     if (durable !== undefined) {
+      // the exact candidate revision must be the latest durable revision of
+      // the task; earlier revisions exist only as chain predecessors
+      const latest = durableForTask[durableForTask.length - 1];
+      if (latest !== undefined && latest.revision > manifest.revision) {
+        throw conflict(
+          `the durable task ledger already records a newer revision ${latest.revision} of ${JSON.stringify(manifest.task_id)} than the candidate's revision ${manifest.revision}`,
+          state,
+        );
+      }
       if (durable.sha256 !== task.sha256 || durable.previous_sha256 !== manifest.previous_sha256) {
         throw conflict(
           `the durable task revision ${manifest.revision} of ${JSON.stringify(manifest.task_id)} does not match the candidate chain`,
@@ -392,7 +405,7 @@ function reconcileCandidate(
       }
       continue;
     }
-    if (state.task_revisions.some((record) => record.task_id === manifest.task_id)) {
+    if (durableForTask.length > 0) {
       throw conflict(
         `the durable task ledger already records a different revision of task ${JSON.stringify(manifest.task_id)} than the candidate declares`,
         state,
@@ -414,6 +427,16 @@ function reconcileCandidate(
   }
   const durablePlan = state.plan_revisions.find((record) => record.revision === compiledPlan.plan_revision);
   if (durablePlan !== undefined) {
+    // the exact candidate revision is an idempotent durable success only
+    // when it is the last durable plan revision; a ledger that has moved
+    // past it makes the candidate stale
+    const latestPlan = state.plan_revisions[state.plan_revisions.length - 1];
+    if (latestPlan !== undefined && latestPlan.revision > compiledPlan.plan_revision) {
+      throw conflict(
+        `the durable plan ledger has moved past the candidate plan revision ${compiledPlan.plan_revision}; the candidate is stale`,
+        state,
+      );
+    }
     if (
       durablePlan.sha256 !== compiledPlan.plan_sha256 ||
       durablePlan.previous_sha256 !== candidate.plan.manifest.previous_sha256 ||
@@ -432,9 +455,9 @@ function reconcileCandidate(
     }
     return missing;
   }
-  if (state.plan_revisions.length + 1 !== compiledPlan.plan_revision) {
+  if (state.plan_revisions.length + 1 < compiledPlan.plan_revision) {
     throw conflict(
-      `the durable plan ledger is past the candidate plan revision ${compiledPlan.plan_revision}; the candidate is stale`,
+      `the candidate plan revision ${compiledPlan.plan_revision} is ahead of the durable plan ledger; the next expected revision is ${state.plan_revisions.length + 1}`,
       state,
     );
   }

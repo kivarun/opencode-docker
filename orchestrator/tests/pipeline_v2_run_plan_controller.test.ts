@@ -1350,7 +1350,7 @@ describe("pipeline v2 run plan acceptance controller", () => {
     });
   });
 
-  test("16. a candidate for a plan revision beyond the durable ledger is a stale conflict", async () => {
+  test("16. a candidate revision ahead of the durable plan ledger is an ahead/gap conflict", async () => {
     await withPipeline(async (pipeline) => {
       const fixture = await setupRun();
       try {
@@ -1369,7 +1369,8 @@ describe("pipeline v2 run plan acceptance controller", () => {
         await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: first });
         // a candidate for plan revision 3 while the durable ledger is at
         // revision 1: the chains are internally coherent (r3 chains a
-        // prepared r2) but the durable ledger is two revisions behind
+        // prepared r2) but the candidate revision is ahead of the ledger
+        // (next expected 2) — an ahead/gap conflict, not a stale one
         const planR2 = preparedPlan(
           [
             {
@@ -1402,7 +1403,8 @@ describe("pipeline v2 run plan acceptance controller", () => {
           acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink: recording.sink, candidate: stale }),
         );
         const error = expectControllerError(cause, "candidate_conflict");
-        expect(error.message).toContain("the durable plan ledger is past the candidate plan revision 3; the candidate is stale");
+        expect(error.message).toContain("the candidate plan revision 3 is ahead of the durable plan ledger; the next expected revision is 2");
+        expect(error.message).not.toContain("past the candidate");
         expect(error.state).toBe(sink.snapshot);
         expect(recording.commands).toEqual([]);
       } finally {
@@ -1848,6 +1850,364 @@ describe("pipeline v2 run plan acceptance controller", () => {
     expect((realPipelineV2RunPlanControllerOps as { verifyCandidateForAcceptance?: unknown }).verifyCandidateForAcceptance).toBe(
       verifyPipelineV2RunPlanCandidateForAcceptance,
     );
+  });
+
+  test("28. a repeated plan candidate r1 after a linked r2 is a stale conflict with zero effects", async () => {
+    await withPipeline(async (pipeline) => {
+      const fixture = await setupRun();
+      try {
+        const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        await playPlanning(sink, pipeline);
+        // plan revision 1 with task-a@1 over the unbound planning execution
+        const first = revisionOneCandidate(
+          [
+            {
+              id: "stage-1",
+              template: "development",
+              tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+            },
+          ],
+          [A1],
+        );
+        await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: first });
+        // a linked plan-only revision 2 over the same unbound planning
+        // execution keeps the acceptance boundary valid
+        const second = revisionTwoCandidate(
+          [
+            {
+              id: "stage-1",
+              template: "development",
+              tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+            },
+          ],
+          [A1],
+          first.plan,
+          [],
+          1,
+        );
+        await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: second });
+        const stateAtR2 = sink.snapshot as PipelineV2RunState;
+        expect(stateAtR2.plan_revisions.map((record) => record.revision)).toEqual([1, 2]);
+        // repeating candidate r1: the exact r1 record exists but is not the
+        // last durable plan revision — a stale candidate, not idempotent success
+        const paths = [
+          planManifestPath(fixture, 1),
+          planManifestPath(fixture, 2),
+          taskManifestPath(fixture, "task-a", 1),
+        ];
+        const identitiesBefore = await Promise.all(paths.map(fileIdentity));
+        const recording = recordingSink(sink, fixture, false);
+        const cause = await catchControllerCall(() =>
+          acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink: recording.sink, candidate: first }),
+        );
+        const error = expectControllerError(cause, "candidate_conflict");
+        expect(error.message).toContain("the durable plan ledger has moved past the candidate plan revision 1; the candidate is stale");
+        expect(error.state).toBe(stateAtR2);
+        expect(recording.commands).toEqual([]);
+        // the authoritative state stays at r2 and nothing was published
+        expect((sink.snapshot as PipelineV2RunState).plan_revisions.map((record) => record.revision)).toEqual([1, 2]);
+        expect(await Promise.all(paths.map(fileIdentity))).toEqual(identitiesBefore);
+      } finally {
+        await disposeRun(fixture);
+      }
+    });
+  });
+
+  test("29. a candidate task revision older than the durable latest is a downgrade conflict", async () => {
+    await withPipeline(async (pipeline) => {
+      const fixture = await setupRun();
+      try {
+        const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        await playPlanning(sink, pipeline);
+        const first = revisionOneCandidate(
+          [
+            {
+              id: "stage-1",
+              template: "development",
+              tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+            },
+          ],
+          [A1],
+        );
+        await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: first });
+        // the user revise flow makes task-a@2 durable and restarts the planner
+        await sink.dispatch({
+          kind: "transition_committed",
+          step: { from: "architect", outcome: "completed", to: "stage_dispatch", transition_index: 0 },
+          executionIndex: 1,
+        });
+        await sink.dispatch({
+          kind: "run_waiting",
+          stateId: "stage_dispatch",
+          reason: "stage_iteration_limit_exhausted",
+          requestSha256: PLAN_WAIT_REQUEST,
+          actions: [{ id: "revise_task", to: "architect" }],
+        });
+        const A2 = preparedTask("task-a", 2, A1.sha256, "user_response", "Body A two");
+        await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: INTENT });
+        await sink.dispatch({
+          kind: "task_revision_accepted",
+          taskId: "task-a",
+          revision: 2,
+          taskSha256: A2.sha256,
+          waitIndex: 1,
+          intentSha256: INTENT,
+        });
+        await sink.dispatch({
+          kind: "wait_response_recorded",
+          waitIndex: 1,
+          expectedRequestSha256: PLAN_WAIT_REQUEST,
+          actionId: "revise_task",
+          responseSha256: PLAN_WAIT_RESPONSE,
+        });
+        await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+        for (const command of agentPhases("replanning")) {
+          await sink.dispatch(command);
+        }
+        // plan revision 2 pointing back at task-a@1 while task-a@2 is durable
+        const downgrade = revisionTwoCandidate(
+          [
+            {
+              id: "stage-1",
+              template: "development",
+              tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+            },
+          ],
+          [A1],
+          first.plan,
+          [],
+          2,
+        );
+        const recording = recordingSink(sink, fixture, false);
+        const cause = await catchControllerCall(() =>
+          acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink: recording.sink, candidate: downgrade }),
+        );
+        const error = expectControllerError(cause, "candidate_conflict");
+        expect(error.message).toContain(
+          'the durable task ledger already records a newer revision 2 of "task-a" than the candidate\'s revision 1',
+        );
+        expect(recording.commands).toEqual([]);
+        // the conflict fired before any publication: no plan-2 manifest exists
+        const paths = await runPlanPaths(fixture.runRoot);
+        expect(paths).toEqual(["plans/", "plans/1.json", "tasks/", "tasks/task-a/", "tasks/task-a/1.json"]);
+      } finally {
+        await disposeRun(fixture);
+      }
+    });
+  });
+
+  test("30. a candidate at the durable latest task revision stays valid beside unrelated records", async () => {
+    await withPipeline(async (pipeline) => {
+      const fixture = await setupRun();
+      try {
+        const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        await playPlanning(sink, pipeline);
+        const first = revisionOneCandidate(
+          [
+            {
+              id: "stage-1",
+              template: "development",
+              tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+            },
+          ],
+          [A1],
+        );
+        await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: first });
+        // the revise flow: task-a@2 durable, then the planner restarts
+        await sink.dispatch({
+          kind: "transition_committed",
+          step: { from: "architect", outcome: "completed", to: "stage_dispatch", transition_index: 0 },
+          executionIndex: 1,
+        });
+        await sink.dispatch({
+          kind: "run_waiting",
+          stateId: "stage_dispatch",
+          reason: "stage_iteration_limit_exhausted",
+          requestSha256: PLAN_WAIT_REQUEST,
+          actions: [{ id: "revise_task", to: "architect" }],
+        });
+        const A2 = preparedTask("task-a", 2, A1.sha256, "user_response", "Body A two");
+        await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: INTENT });
+        await sink.dispatch({
+          kind: "task_revision_accepted",
+          taskId: "task-a",
+          revision: 2,
+          taskSha256: A2.sha256,
+          waitIndex: 1,
+          intentSha256: INTENT,
+        });
+        await sink.dispatch({
+          kind: "wait_response_recorded",
+          waitIndex: 1,
+          expectedRequestSha256: PLAN_WAIT_REQUEST,
+          actionId: "revise_task",
+          responseSha256: PLAN_WAIT_RESPONSE,
+        });
+        await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+        for (const command of agentPhases("replanning")) {
+          await sink.dispatch(command);
+        }
+        // an unrelated durable task record for another task id
+        const Z1 = preparedTask("task-z", 1, null, "planning_proposal", "Body Z one");
+        await sink.dispatch({ kind: "task_revision_accepted", taskId: "task-z", revision: 1, taskSha256: Z1.sha256 });
+        // the candidate points at the durable latest revision of task-a
+        const current = revisionTwoCandidate(
+          [
+            {
+              id: "stage-1",
+              template: "development",
+              tasks: [{ id: "task-a", revision: 2, sha256: A2.sha256, depends_on: [] }],
+            },
+          ],
+          [A2],
+          first.plan,
+          [A1],
+          2,
+        );
+        const recording = recordingSink(sink, fixture, true);
+        const result = await acceptPipelineV2RunPlanCandidate({
+          pipeline,
+          runRoot: fixture.runRoot,
+          sink: recording.sink,
+          candidate: current,
+        });
+        // the unrelated task-z record never conflicted; only the plan moved
+        expect(recording.commands).toEqual([
+          { kind: "plan_revision_accepted", planRevision: 2, planSha256: current.plan.sha256, originExecution: 2 },
+        ]);
+        expect(result.state.task_revisions.map((record) => `${record.task_id}@${record.revision}`)).toEqual([
+          "task-a@1",
+          "task-a@2",
+          "task-z@1",
+        ]);
+        expect(result.state.plan_revisions.map((record) => record.revision)).toEqual([1, 2]);
+      } finally {
+        await disposeRun(fixture);
+      }
+    });
+  });
+
+  test("31. the provenance gates run before any snapshot field read; Proxy traps stay at zero", async () => {
+    await withPipeline(async (pipeline) => {
+      const fixture = await setupRun();
+      try {
+        const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        await playPlanning(sink, pipeline);
+        const candidate = revisionOneCandidate(SINGLE_STAGE, [A1, B1]);
+        let snapshotTraps = 0;
+        const proxySnapshot = new Proxy(sink.snapshot as PipelineV2RunState, {
+          get(target, property, receiver) {
+            snapshotTraps += 1;
+            return Reflect.get(target, property, receiver);
+          },
+        });
+        let candidateTraps = 0;
+        const proxyCandidate = new Proxy(candidate, {
+          get(target, property, receiver) {
+            candidateTraps += 1;
+            return Reflect.get(target, property, receiver);
+          },
+        });
+        const proxiedSink: PipelineV2RunPlanControllerSink = {
+          get snapshot() {
+            return proxySnapshot;
+          },
+          get poisoned() {
+            return sink.poisoned;
+          },
+          dispatch: async (command: PipelineV2RunCommand) => {
+            await sink.dispatch(command);
+          },
+        };
+        // fake, spread and Proxy pipelines are rejected by the pipeline
+        // provenance gate before any snapshot or candidate field is read
+        const fakePipeline = { bundleRoot: "/nowhere" } as unknown as ResolvedPipelineV2;
+        const spreadPipeline = { ...pipeline } as unknown as ResolvedPipelineV2;
+        let pipelineTraps = 0;
+        const proxyPipeline = new Proxy(pipeline, {
+          get(target, property, receiver) {
+            pipelineTraps += 1;
+            return Reflect.get(target, property, receiver);
+          },
+        });
+        for (const [label, brokenPipeline] of [["fake", fakePipeline], ["spread", spreadPipeline], ["proxy", proxyPipeline]] as const) {
+          snapshotTraps = 0;
+          candidateTraps = 0;
+          pipelineTraps = 0;
+          const cause = await catchControllerCall(() =>
+            acceptPipelineV2RunPlanCandidate({
+              pipeline: brokenPipeline,
+              runRoot: fixture.runRoot,
+              sink: proxiedSink,
+              candidate: proxyCandidate,
+            }),
+          );
+          expect(`${label}:${cause instanceof PipelineError}`).toBe(`${label}:true`);
+          expect(snapshotTraps).toBe(0);
+          expect(candidateTraps).toBe(0);
+        }
+        // the real pipeline with a Proxy candidate: the compiled gate fires
+        // before any snapshot field read and with zero candidate traps
+        snapshotTraps = 0;
+        candidateTraps = 0;
+        const candidateCause = await catchControllerCall(() =>
+          acceptPipelineV2RunPlanCandidate({
+            pipeline,
+            runRoot: fixture.runRoot,
+            sink: proxiedSink,
+            candidate: proxyCandidate,
+          }),
+        );
+        expect(candidateCause).toBeInstanceOf(PipelineV2CompiledRunPlanError);
+        expect(snapshotTraps).toBe(0);
+        expect(candidateTraps).toBe(0);
+        await expectNoRunPlan(fixture.runRoot);
+      } finally {
+        await disposeRun(fixture);
+      }
+    });
+  });
+
+  test("32. an unexpected sink getter error propagates unchanged", async () => {
+    await withPipeline(async (pipeline) => {
+      const fixture = await setupRun();
+      try {
+        const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        await playPlanning(sink, pipeline);
+        const candidate = revisionOneCandidate(SINGLE_STAGE, [A1, B1]);
+        const snapshotFailure = new Error("injected snapshot getter failure");
+        const snapshotSink: PipelineV2RunPlanControllerSink = {
+          get snapshot(): PipelineV2RunState {
+            throw snapshotFailure;
+          },
+          get poisoned() {
+            return false;
+          },
+          dispatch: async () => {},
+        };
+        const snapshotCause = await catchControllerCall(() =>
+          acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink: snapshotSink, candidate }),
+        );
+        expect(snapshotCause).toBe(snapshotFailure);
+        expect(snapshotCause).not.toBeInstanceOf(PipelineV2RunPlanControllerError);
+        const poisonedFailure = new Error("injected poisoned getter failure");
+        const poisonedSink: PipelineV2RunPlanControllerSink = {
+          snapshot: null,
+          get poisoned(): boolean {
+            throw poisonedFailure;
+          },
+          dispatch: async () => {},
+        };
+        const poisonedCause = await catchControllerCall(() =>
+          acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink: poisonedSink, candidate }),
+        );
+        expect(poisonedCause).toBe(poisonedFailure);
+        expect(poisonedCause).not.toBeInstanceOf(PipelineV2RunPlanControllerError);
+        await expectNoRunPlan(fixture.runRoot);
+      } finally {
+        await disposeRun(fixture);
+      }
+    });
   });
 
   test("27. source proof: the single layers are reused; no second authority, message parsing, forbidden imports or mutable seam", () => {

@@ -2015,18 +2015,23 @@ commit marker.
 The reconciliation is structural and fail-closed, before any publication:
 a candidate task revision is already durable exactly when the ledger
 carries the exact `task_id` + `revision` pair with the candidate's digest
-and chain digest (never re-dispatched); the same pair with a different
-digest or chain, the same task id at a different revision, or a missing
-task revision above 1 (a user-response revision cannot be created on the
-active planning boundary) are typed conflicts; missing revision-1 tasks
-are dispatched in candidate order. The durable plan record matching the
-candidate revision, digest, chain digest and origin execution exactly is
-an idempotent durable success (no second plan dispatch) with every
+and chain digest AND that pair is the latest durable revision of the task
+id — an earlier revision exists only as a chain predecessor, and a durable
+revision newer than the candidate's is a downgrade conflict (the candidate
+can never point a plan back at a superseded task revision). The same pair
+with a different digest or chain, the same task id at a different
+revision, or a missing task revision above 1 (a user-response revision
+cannot be created on the active planning boundary) are typed conflicts;
+missing revision-1 tasks are dispatched in candidate order. The durable
+plan record matching the candidate revision, digest, chain digest and
+origin execution exactly is an idempotent durable success only when it is
+the last durable plan revision (no second plan dispatch) with every
 candidate task required durable; a plan record with different content, a
-ledger that has moved past the candidate revision (a stale candidate), or
-a candidate chain that does not link the durable ledger are conflicts.
-Durable task revisions for tasks outside the current candidate never
-conflict by themselves.
+durable ledger that has moved past the candidate revision (a stale
+candidate), a candidate revision ahead of the next expected ledger
+revision (ahead/gap), or a candidate chain that does not link the durable
+ledger are conflicts. Durable task revisions for tasks outside the current
+candidate never conflict by themselves.
 
 After every dispatch the authoritative sink snapshot is re-read and must
 structurally carry exactly the expected record (identity, digest, chain,
@@ -2051,7 +2056,13 @@ Every options field is read exactly once, the sink's `dispatch` is
 captured once and bound to the sink before the first await, caller
 objects are never frozen or modified, and the production path always runs
 through the single frozen ops object (`verifyCandidateForAcceptance`,
-`publishCandidate`) — no mutable module-global seam. The result is
+`publishCandidate`) — no mutable module-global seam. The capture boundary
+is opaque: the pipeline, candidate and state documents are not traversed
+before the pipeline/candidate provenance gates have run (the acceptance
+chain is the first semantic validation — pipeline provenance, candidate
+provenance/compile, and only then the state validation and the
+identity/boundary checks), and an unexpected error from a sink getter
+propagates unchanged. The result is
 deep-frozen `{compiled_plan, state}`: the exact provenance-backed
 compiled plan object and the last authoritative state; prepared
 manifests, canonical JSON, task bodies, paths and the caller candidate
