@@ -83,13 +83,64 @@
  * and closed operation classes only — no bodies, canonical JSON, paths,
  * digest values, env values or credentials.
  *
+ * The second public API of the same layer,
+ * `closePipelineV2StageIteration({compiledPlan, stageId,
+ * iterationCloseReason, generationCloseReason?, sink})`, closes the
+ * active stage iteration of the selected compiled stage and — by the
+ * caller's explicit decision — its generation, on the contract hook
+ * boundary `settled stage execution → stage_iteration_closed → optional
+ * stage_generation_closed → transition_committed`. The caller has
+ * already made every policy decision: the iteration close reason
+ * (`normal_close` or `exhausted`), whether the generation closes
+ * (`next_stage` or `final_stage`). The wait-bound closure reasons
+ * (`grant`, `replanned`), the generation `replanned` reason, wait
+ * indexes, caller-supplied indexes, anchors, transition counts, stage
+ * positions, templates, plan digests and target states are not part of
+ * this API — wait-bound closure and replanning stay a later increment.
+ * Before the first dispatch the controller proves the closure boundary:
+ * active/running with no terminal, run outputs, failure or open wait;
+ * exactly one settled-but-unbound execution
+ * (`executions.length === transitions.length + 1`) whose execution role
+ * is exactly `stage` (never inferred from the profile, the executor name
+ * or the state id) in the agent phase `cleanup_completed` or the
+ * decision phase `evaluated` exactly, whose `state_id` is one of the
+ * compiled stage's state ids, and whose recorded `iteration_index`
+ * belongs to the current durable iteration; the last durable generation
+ * must match the trusted compiled stage's id, declaration position,
+ * template and current plan digest. Every index and anchor is derived
+ * from the validated durable state. Reconciliation: with the iteration
+ * open, the sequence `stage_iteration_closed` (no wait index) and — if
+ * the caller asked — `stage_generation_closed` is prepared; with the
+ * iteration already closed at this boundary, an exact match of the
+ * durable close reason and anchor (plus the generation's state for a
+ * requested generation closure) is an idempotent success with zero
+ * dispatch, a requested-but-open generation is completed by the single
+ * `stage_generation_closed` dispatch, and any other close reason, anchor
+ * or a generation closed while the call requested only the iteration
+ * closure is a `lifecycle_conflict` with zero dispatch — no candidate
+ * heuristic, no historical generation guess. The reducer stays the
+ * single successor authority: the whole missing suffix is pre-checked
+ * through `reducePipelineV2RunCommand` on a local snapshot before the
+ * first dispatch (`invalid_state` with zero dispatch on a rejection),
+ * then dispatched strictly iteration close → optional generation close
+ * with per-dispatch authoritative verification (a hostile
+ * resolve-without-change and a conflicting race are
+ * `lifecycle_conflict`; a racing identical dispatch is idempotent
+ * success only on the exact durable record). Durability mapping is the
+ * same as for the ensure API. Both public APIs share one validation
+ * path (single capture, poison latch, compiled-plan gate, state
+ * validator, hidden identity, durable bindings, stage position) and one
+ * pre-check/dispatch machinery inside this module; there is no second
+ * controller, comparator, replay or registry.
+ *
  * Not implemented (stays unwired): stage selection/routing policy, the
- * closure of iterations and generations, the wait/replanning/grant
- * controllers, automatic resume, coordinator/runner/CLI wiring,
- * filesystem work, Docker Helper/Sessions, migrations/API/T3 and
- * multi-process locking are later increments. The self-call of this API
- * means the future policy layer has already chosen to continue the
- * stage.
+ * wait-bound `grant`/`replanned` iteration closure, the plan/task
+ * replanning controller, grant and effective-budget policy, automatic
+ * stage/next-stage selection, transition dispatch, automatic resume,
+ * coordinator/runner/CLI wiring, filesystem work, Docker
+ * Helper/Sessions, migrations/API/T3 and multi-process locking are later
+ * increments. The self-call of these APIs means the future policy layer
+ * has already made the corresponding decision.
  */
 import { isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import {
@@ -184,13 +235,53 @@ export interface EnsuredPipelineV2StageIteration {
   readonly state: PipelineV2RunState;
 }
 
-interface Captured {
+/** The iteration close reasons this controller's active-boundary API accepts. */
+export type PipelineV2ActiveStageIterationCloseReason = "normal_close" | "exhausted";
+
+/** The generation close reasons this controller's active-boundary API accepts. */
+export type PipelineV2ActiveStageGenerationCloseReason = "next_stage" | "final_stage";
+
+export interface ClosePipelineV2StageIterationOptions {
   readonly compiledPlan: CompiledPipelineV2RunPlan;
   readonly stageId: string;
-  readonly initialBudget: number;
+  readonly iterationCloseReason: PipelineV2ActiveStageIterationCloseReason;
+  readonly generationCloseReason?: PipelineV2ActiveStageGenerationCloseReason;
+  readonly sink: PipelineV2StageIterationControllerSink;
+}
+
+export interface ClosedPipelineV2StageIteration {
+  readonly compiled_stage: CompiledPipelineV2RunPlanStage;
+  readonly generation_index: number;
+  readonly iteration_index: number;
+  readonly generation_closed: boolean;
+  readonly state: PipelineV2RunState;
+}
+
+interface CapturedCommon {
+  readonly compiledPlan: CompiledPipelineV2RunPlan;
+  readonly stageId: string;
   readonly sink: PipelineV2StageIterationControllerSink;
   readonly dispatch: (command: PipelineV2RunCommand) => Promise<void>;
   readonly snapshot: PipelineV2RunState;
+}
+
+interface CapturedEnsure extends CapturedCommon {
+  readonly initialBudget: number;
+}
+
+interface CapturedClose extends CapturedCommon {
+  readonly iterationCloseReason: PipelineV2ActiveStageIterationCloseReason;
+  readonly generationCloseReason: PipelineV2ActiveStageGenerationCloseReason | undefined;
+}
+
+interface ValidatedContext {
+  readonly compiledPlan: CompiledPipelineV2RunPlan;
+  readonly compiledStage: CompiledPipelineV2RunPlanStage;
+  readonly stagePosition: number;
+  readonly sink: PipelineV2StageIterationControllerSink;
+  readonly dispatch: (command: PipelineV2RunCommand) => Promise<void>;
+  readonly snapshot: PipelineV2RunState;
+  readonly state: PipelineV2RunState;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -206,24 +297,60 @@ function controllerError(
 }
 
 /**
- * The synchronous capture boundary: every options field and every sink
- * member is read exactly once as an opaque reference. The compiled plan
- * and the state document are not traversed here (their fields are read
- * only after the compiled-plan provenance gate has run); an unexpected
- * error from a sink getter propagates unchanged. No dispatch happens
- * here; every rejection is a typed controller failure.
+ * The capture boundary, shared by both public APIs: every options field
+ * and every sink member is read exactly once as an opaque reference. The
+ * compiled plan and the state document are not traversed here (their
+ * fields are read only after the compiled-plan provenance gate has run);
+ * an unexpected error from a sink getter propagates unchanged. No
+ * dispatch happens here; every rejection is a typed controller failure.
  */
-function captureBoundary(options: unknown): Captured {
+function captureOptionsRecord(options: unknown, api: string): Record<string, unknown> {
   if (!isRecord(options)) {
-    throw controllerError("invalid_options", "ensurePipelineV2StageIteration requires an options object", null);
+    throw controllerError("invalid_options", `${api} requires an options object`, null);
   }
-  const compiledPlan = options["compiledPlan"];
-  const stageId = options["stageId"];
-  const initialBudget = options["initialBudget"];
-  const sink = options["sink"];
+  return options;
+}
+
+function captureSink(
+  record: Record<string, unknown>,
+  api: string,
+  verb: string,
+): { sink: PipelineV2StageIterationControllerSink; dispatch: (command: PipelineV2RunCommand) => Promise<void>; snapshot: PipelineV2RunState } {
+  const sink = record["sink"];
+  if (!isRecord(sink)) {
+    throw controllerError("invalid_options", `${api} requires a state sink`, null);
+  }
+  const poisoned: unknown = sink["poisoned"];
+  if (poisoned === true) {
+    throw controllerError(
+      "invalid_state",
+      `the run state sink is poisoned by a durability-unknown commit; no stage iteration is ${verb} for this run`,
+      null,
+    );
+  }
+  const dispatch = sink["dispatch"];
+  if (typeof dispatch !== "function") {
+    throw controllerError("invalid_options", `${api} requires a dispatchable state sink`, null);
+  }
+  const snapshot: unknown = sink["snapshot"];
+  if (!isRecord(snapshot)) {
+    throw controllerError("invalid_state", "no durable pipeline v2 run state exists yet", null);
+  }
+  return {
+    sink: sink as unknown as PipelineV2StageIterationControllerSink,
+    dispatch: (dispatch as (command: PipelineV2RunCommand) => Promise<void>).bind(sink),
+    snapshot: snapshot as unknown as PipelineV2RunState,
+  };
+}
+
+function captureEnsure(options: unknown): CapturedEnsure {
+  const record = captureOptionsRecord(options, "ensurePipelineV2StageIteration");
+  const compiledPlan = record["compiledPlan"];
+  const stageId = record["stageId"];
   if (typeof stageId !== "string") {
     throw controllerError("invalid_options", "ensurePipelineV2StageIteration requires a string stage id", null);
   }
+  const initialBudget = record["initialBudget"];
   if (!isPositiveSafeInteger(initialBudget)) {
     throw controllerError(
       "invalid_options",
@@ -231,32 +358,49 @@ function captureBoundary(options: unknown): Captured {
       null,
     );
   }
-  if (!isRecord(sink)) {
-    throw controllerError("invalid_options", "ensurePipelineV2StageIteration requires a state sink", null);
-  }
-  const poisoned: unknown = sink["poisoned"];
-  if (poisoned === true) {
-    throw controllerError(
-      "invalid_state",
-      "the run state sink is poisoned by a durability-unknown commit; no stage iteration is ensured for this run",
-      null,
-    );
-  }
-  const dispatch = sink["dispatch"];
-  if (typeof dispatch !== "function") {
-    throw controllerError("invalid_options", "ensurePipelineV2StageIteration requires a dispatchable state sink", null);
-  }
-  const snapshot: unknown = sink["snapshot"];
-  if (!isRecord(snapshot)) {
-    throw controllerError("invalid_state", "no durable pipeline v2 run state exists yet", null);
-  }
+  const captured = captureSink(record, "ensurePipelineV2StageIteration", "ensured");
   return {
     compiledPlan: compiledPlan as CompiledPipelineV2RunPlan,
     stageId,
     initialBudget: initialBudget as number,
-    sink: sink as unknown as PipelineV2StageIterationControllerSink,
-    dispatch: (dispatch as (command: PipelineV2RunCommand) => Promise<void>).bind(sink),
-    snapshot: snapshot as unknown as PipelineV2RunState,
+    ...captured,
+  };
+}
+
+function captureClose(options: unknown): CapturedClose {
+  const record = captureOptionsRecord(options, "closePipelineV2StageIteration");
+  const compiledPlan = record["compiledPlan"];
+  const stageId = record["stageId"];
+  if (typeof stageId !== "string") {
+    throw controllerError("invalid_options", "closePipelineV2StageIteration requires a string stage id", null);
+  }
+  const iterationCloseReason = record["iterationCloseReason"];
+  if (iterationCloseReason !== "normal_close" && iterationCloseReason !== "exhausted") {
+    throw controllerError(
+      "invalid_options",
+      "closePipelineV2StageIteration requires the iteration close reason normal_close or exhausted",
+      null,
+    );
+  }
+  const generationCloseReason = record["generationCloseReason"];
+  if (
+    generationCloseReason !== undefined &&
+    generationCloseReason !== "next_stage" &&
+    generationCloseReason !== "final_stage"
+  ) {
+    throw controllerError(
+      "invalid_options",
+      "closePipelineV2StageIteration requires the generation close reason next_stage or final_stage",
+      null,
+    );
+  }
+  const captured = captureSink(record, "closePipelineV2StageIteration", "closed");
+  return {
+    compiledPlan: compiledPlan as CompiledPipelineV2RunPlan,
+    stageId,
+    iterationCloseReason: iterationCloseReason as PipelineV2ActiveStageIterationCloseReason,
+    generationCloseReason: generationCloseReason as PipelineV2ActiveStageGenerationCloseReason | undefined,
+    ...captured,
   };
 }
 
@@ -354,13 +498,9 @@ function stepPresent(state: PipelineV2RunState, step: MissingStep): boolean {
  * agent `cleanup_completed` and decision `evaluated` exactly. Every
  * violation is this layer's `invalid_state` before any dispatch.
  */
-function checkRunBoundary(state: PipelineV2RunState): void {
+function checkRunBoundary(state: PipelineV2RunState, boundaryWhat: string): void {
   const fail = (): PipelineV2StageIterationControllerError =>
-    controllerError(
-      "invalid_state",
-      "the run is not on a boundary that accepts a stage generation or iteration",
-      state,
-    );
+    controllerError("invalid_state", `the run is not on a boundary that accepts ${boundaryWhat}`, state);
   if (state.status !== "active" || state.phase !== "running") {
     throw fail();
   }
@@ -387,178 +527,68 @@ function checkRunBoundary(state: PipelineV2RunState): void {
 }
 
 /**
- * Guarantees an open generation and iteration for the selected compiled
- * stage: capture → poison latch → the compiled-plan stage lookup → the
- * single state validation → the durable bindings → the reconciliation →
- * the reducer pre-check → the dispatch sequence with per-dispatch
- * authoritative verification.
+ * One pending durable lifecycle step with its exact command and the
+ * structural expectation the post-dispatch verification re-checks.
+ * Shared by both public APIs; the pre-check and the dispatch loop below
+ * are the module's single reducer-pre-check and dispatch machinery.
  */
-export async function ensurePipelineV2StageIteration(
-  options: EnsurePipelineV2StageIterationOptions,
-): Promise<EnsuredPipelineV2StageIteration> {
-  const ctx = captureBoundary(options);
+interface PendingStep {
+  readonly command: PipelineV2RunCommand;
+  readonly present: (state: PipelineV2RunState) => boolean;
+}
 
-  // The compiled-plan provenance gate and stage lookup — the single gate
-  // and lookup; the compiled-layer errors keep their classes. No field of
-  // the compiled plan, the stage id or the state document is read before
-  // this gate.
-  const compiledStage = compiledPipelineV2RunPlanStageFor(ctx.compiledPlan, ctx.stageId);
+function openStep(step: MissingStep): PendingStep {
+  const command = stepCommand(step);
+  return { command, present: (state) => stepPresent(state, step) };
+}
 
-  // The single state validator; the caller's object is not trusted beyond
-  // it.
-  let state: PipelineV2RunState;
-  try {
-    state = validatePipelineV2RunState(ctx.snapshot);
-  } catch (cause) {
-    if (cause instanceof PipelineV2StateError) {
-      throw controllerError(
-        "invalid_state",
-        "ensurePipelineV2StageIteration requires a durable pipeline v2 run state document",
-        null,
-      );
-    }
-    throw cause;
-  }
-
-  // The compiled plan is provenance-bound to the immutable identity
-  // snapshot of its originating pipeline; the durable run must carry
-  // exactly that identity. The comparison runs only through the single
-  // existing structural comparator; a mismatch of any of the five durable
-  // fields is a lifecycle conflict with zero dispatch, and the mismatching
-  // field name is the only diagnostic detail.
-  const comparison = comparePipelineV2RunIdentity(
-    compiledRunPlanOriginIdentity(ctx.compiledPlan),
-    state.pipeline,
-  );
-  if (comparison.kind !== "match") {
-    throw controllerError(
-      "lifecycle_conflict",
-      `the compiled plan's originating pipeline identity does not match the durable run identity (field ${comparison.field})`,
-      ctx.snapshot,
-    );
-  }
-
-  // Durable bindings: the run id and the last durable plan revision must
-  // name exactly the compiled plan. The errors carry the authoritative
-  // captured snapshot (the validator returns an independent clone used
-  // only for the derivation below).
-  if (state.run_id !== ctx.compiledPlan.run_id) {
-    throw controllerError(
-      "lifecycle_conflict",
-      "the durable run does not belong to the compiled plan's run",
-      ctx.snapshot,
-    );
-  }
-  const lastPlan = state.plan_revisions[state.plan_revisions.length - 1];
-  if (
-    lastPlan === undefined ||
-    lastPlan.revision !== ctx.compiledPlan.plan_revision ||
-    lastPlan.sha256 !== ctx.compiledPlan.plan_sha256
-  ) {
-    throw controllerError(
-      "lifecycle_conflict",
-      "the compiled plan is not the last durable plan revision",
-      ctx.snapshot,
-    );
-  }
-
-  // The stage position is derived only from the compiled plan's stage
-  // declaration order.
-  const declarationIndex = ctx.compiledPlan.stages.findIndex((stage) => stage.id === compiledStage.id);
-  if (declarationIndex < 0) {
-    throw new Error("pipeline v2 stage iteration controller invariant violated: the resolved stage is not in the compiled plan");
-  }
-  const stagePosition = declarationIndex + 1;
-
-  // The run boundary check before any reconciliation or dispatch.
-  checkRunBoundary(state);
-
-  // Reconciliation.
-  const cursorCount = state.cursor.transition_count;
-  const open = openGeneration(state);
-  const missing: MissingStep[] = [];
-  if (open === undefined) {
-    const newGenerationIndex = state.generations.length + 1;
-    missing.push({
-      kind: "generation",
-      generationIndex: newGenerationIndex,
-      stageId: compiledStage.id,
-      stagePosition,
-      templateId: compiledStage.template,
-      planSha256: ctx.compiledPlan.plan_sha256,
-      initialBudget: ctx.initialBudget,
-      transitionCount: cursorCount,
-    });
-    missing.push({
-      kind: "iteration",
-      generationIndex: newGenerationIndex,
-      iterationIndex: 1,
-      transitionCount: cursorCount,
-    });
-  } else {
-    if (
-      open.stage_id !== compiledStage.id ||
-      open.stage_position !== stagePosition ||
-      open.template_id !== compiledStage.template ||
-      open.plan_sha256 !== ctx.compiledPlan.plan_sha256 ||
-      open.initial_budget !== ctx.initialBudget
-    ) {
-      throw controllerError(
-        "lifecycle_conflict",
-        `the open stage generation ${open.index} does not match the compiled stage ${JSON.stringify(compiledStage.id)}`,
-        ctx.snapshot,
-      );
-    }
-    if (open.open_iteration !== undefined) {
-      // W3: idempotent success without any dispatch; the authoritative
-      // captured snapshot is the result state.
-      return deepFreezeValue({
-        compiled_stage: compiledStage,
-        generation_index: open.index,
-        iteration_index: open.open_iteration.index,
-        state: ctx.snapshot,
-      });
-    }
-    missing.push({
-      kind: "iteration",
-      generationIndex: open.index,
-      iterationIndex: open.iteration_count + 1,
-      transitionCount: cursorCount,
-    });
-  }
-
-  // Reducer pre-check: the whole missing sequence is applied to a local
-  // snapshot through the single reducer before the first dispatch; the
-  // authoritative state comes exclusively from the sink.
+/**
+ * The reducer pre-check: the whole pending sequence is applied to a
+ * local snapshot through the single reducer before the first dispatch;
+ * the authoritative state comes exclusively from the sink.
+ */
+function precheckSequence(
+  state: PipelineV2RunState,
+  steps: readonly PendingStep[],
+  snapshot: PipelineV2RunState,
+): void {
   let checked = state;
-  for (const step of missing) {
-    const command = stepCommand(step);
+  for (const step of steps) {
     try {
-      checked = reducePipelineV2RunCommand(checked, command, new Date());
+      checked = reducePipelineV2RunCommand(checked, step.command, new Date());
     } catch (cause) {
       if (cause instanceof PipelineV2StateError) {
         throw controllerError(
           "invalid_state",
           "the current run state does not accept the stage lifecycle sequence",
-          ctx.snapshot,
+          snapshot,
         );
       }
       throw cause;
     }
   }
+}
 
-  // Dispatch strictly generation → iteration, with per-dispatch
-  // authoritative verification.
-  let latest = ctx.snapshot;
-  for (const step of missing) {
-    const command = stepCommand(step);
+/**
+ * The dispatch sequence with per-dispatch authoritative verification:
+ * after every dispatch the sink snapshot is re-read and must structurally
+ * carry exactly the expected record; a reducer rejection after a racing
+ * identical dispatch is idempotent success only on that exact match. No
+ * rollback and no automatic second dispatch ever happen.
+ */
+async function dispatchPrecheckedSequence(
+  captured: { sink: PipelineV2StageIterationControllerSink; dispatch: (command: PipelineV2RunCommand) => Promise<void>; snapshot: PipelineV2RunState },
+  steps: readonly PendingStep[],
+): Promise<PipelineV2RunState> {
+  let latest = captured.snapshot;
+  for (const step of steps) {
     let confirmed = false;
     try {
-      await ctx.dispatch(command);
+      await captured.dispatch(step.command);
     } catch (cause) {
       if (cause instanceof PipelineV2StateError) {
-        const after = ctx.sink.snapshot;
-        if (after !== null && stepPresent(after, step)) {
+        const after = captured.sink.snapshot;
+        if (after !== null && step.present(after)) {
           confirmed = true;
           latest = after;
         } else {
@@ -572,21 +602,21 @@ export async function ensurePipelineV2StageIteration(
         throw controllerError(
           "state_persist_failed",
           "the stage lifecycle step could not be confirmed durable",
-          ctx.sink.snapshot,
+          captured.sink.snapshot,
         );
       } else if (cause instanceof PipelineV2RunStateStoreError) {
         throw controllerError(
           "state_persist_failed",
           "the stage lifecycle step could not be committed",
-          ctx.sink.snapshot,
+          captured.sink.snapshot,
         );
       } else {
         throw cause;
       }
     }
     if (!confirmed) {
-      const after = ctx.sink.snapshot;
-      if (after === null || !stepPresent(after, step)) {
+      const after = captured.sink.snapshot;
+      if (after === null || !step.present(after)) {
         throw controllerError(
           "lifecycle_conflict",
           "the committed run state does not carry the expected stage lifecycle record",
@@ -596,6 +626,170 @@ export async function ensurePipelineV2StageIteration(
       latest = after;
     }
   }
+  return latest;
+}
+
+/**
+ * The shared validation path of both public APIs, run after the capture
+ * boundary and before any reconciliation: the compiled-plan provenance
+ * gate and stage lookup (the single gate and lookup; the compiled-layer
+ * errors keep their classes) → the single state validator → the hidden
+ * originating-identity comparison through the single existing
+ * structural comparator → the durable run-id and last-plan-revision
+ * bindings → the stage position derived only from the compiled plan's
+ * declaration order. No field of the compiled plan, the stage id or the
+ * state document is read before this gate.
+ */
+function resolveValidatedContext(
+  captured: { compiledPlan: CompiledPipelineV2RunPlan; stageId: string; sink: PipelineV2StageIterationControllerSink; dispatch: (command: PipelineV2RunCommand) => Promise<void>; snapshot: PipelineV2RunState },
+  api: string,
+): ValidatedContext {
+  const compiledStage = compiledPipelineV2RunPlanStageFor(captured.compiledPlan, captured.stageId);
+
+  // The single state validator; the caller's object is not trusted beyond
+  // it.
+  let state: PipelineV2RunState;
+  try {
+    state = validatePipelineV2RunState(captured.snapshot);
+  } catch (cause) {
+    if (cause instanceof PipelineV2StateError) {
+      throw controllerError(
+        "invalid_state",
+        `${api} requires a durable pipeline v2 run state document`,
+        null,
+      );
+    }
+    throw cause;
+  }
+
+  // The compiled plan is provenance-bound to the immutable identity
+  // snapshot of its originating pipeline; the durable run must carry
+  // exactly that identity. The comparison runs only through the single
+  // existing structural comparator; a mismatch of any of the five durable
+  // fields is a lifecycle conflict with zero dispatch, and the mismatching
+  // field name is the only diagnostic detail.
+  const comparison = comparePipelineV2RunIdentity(
+    compiledRunPlanOriginIdentity(captured.compiledPlan),
+    state.pipeline,
+  );
+  if (comparison.kind !== "match") {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the compiled plan's originating pipeline identity does not match the durable run identity (field ${comparison.field})`,
+      captured.snapshot,
+    );
+  }
+
+  // Durable bindings: the run id and the last durable plan revision must
+  // name exactly the compiled plan. The errors carry the authoritative
+  // captured snapshot (the validator returns an independent clone used
+  // only for the derivation below).
+  if (state.run_id !== captured.compiledPlan.run_id) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the durable run does not belong to the compiled plan's run",
+      captured.snapshot,
+    );
+  }
+  const lastPlan = state.plan_revisions[state.plan_revisions.length - 1];
+  if (
+    lastPlan === undefined ||
+    lastPlan.revision !== captured.compiledPlan.plan_revision ||
+    lastPlan.sha256 !== captured.compiledPlan.plan_sha256
+  ) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the compiled plan is not the last durable plan revision",
+      captured.snapshot,
+    );
+  }
+
+  // The stage position is derived only from the compiled plan's stage
+  // declaration order.
+  const declarationIndex = captured.compiledPlan.stages.findIndex((stage) => stage.id === compiledStage.id);
+  if (declarationIndex < 0) {
+    throw new Error("pipeline v2 stage iteration controller invariant violated: the resolved stage is not in the compiled plan");
+  }
+  return {
+    compiledPlan: captured.compiledPlan,
+    compiledStage,
+    stagePosition: declarationIndex + 1,
+    sink: captured.sink,
+    dispatch: captured.dispatch,
+    snapshot: captured.snapshot,
+    state,
+  };
+}
+
+/**
+ * Guarantees an open generation and iteration for the selected compiled
+ * stage: capture → poison latch → the compiled-plan stage lookup → the
+ * single state validation → the durable bindings → the reconciliation →
+ * the reducer pre-check → the dispatch sequence with per-dispatch
+ * authoritative verification.
+ */
+export async function ensurePipelineV2StageIteration(
+  options: EnsurePipelineV2StageIterationOptions,
+): Promise<EnsuredPipelineV2StageIteration> {
+  const captured = captureEnsure(options);
+  const ctx = resolveValidatedContext(captured, "ensurePipelineV2StageIteration");
+
+  // The run boundary check before any reconciliation or dispatch.
+  checkRunBoundary(ctx.state, "a stage generation or iteration");
+
+  // Reconciliation.
+  const cursorCount = ctx.state.cursor.transition_count;
+  const open = openGeneration(ctx.state);
+  const missing: MissingStep[] = [];
+  if (open === undefined) {
+    const newGenerationIndex = ctx.state.generations.length + 1;
+    missing.push({
+      kind: "generation",
+      generationIndex: newGenerationIndex,
+      stageId: ctx.compiledStage.id,
+      stagePosition: ctx.stagePosition,
+      templateId: ctx.compiledStage.template,
+      planSha256: ctx.compiledPlan.plan_sha256,
+      initialBudget: captured.initialBudget,
+      transitionCount: cursorCount,
+    });
+    missing.push({
+      kind: "iteration",
+      generationIndex: newGenerationIndex,
+      iterationIndex: 1,
+      transitionCount: cursorCount,
+    });
+  } else {
+    if (
+      open.stage_id !== ctx.compiledStage.id ||
+      open.stage_position !== ctx.stagePosition ||
+      open.template_id !== ctx.compiledStage.template ||
+      open.plan_sha256 !== ctx.compiledPlan.plan_sha256 ||
+      open.initial_budget !== captured.initialBudget
+    ) {
+      throw controllerError(
+        "lifecycle_conflict",
+        `the open stage generation ${open.index} does not match the compiled stage ${JSON.stringify(ctx.compiledStage.id)}`,
+        ctx.snapshot,
+      );
+    }
+    if (open.open_iteration !== undefined) {
+      // W3: idempotent success without any dispatch; the authoritative
+      // captured snapshot is the result state.
+      return deepFreezeValue({
+        compiled_stage: ctx.compiledStage,
+        generation_index: open.index,
+        iteration_index: open.open_iteration.index,
+        state: ctx.snapshot,
+      });
+    }
+    missing.push({
+      kind: "iteration",
+      generationIndex: open.index,
+      iterationIndex: open.iteration_count + 1,
+      transitionCount: cursorCount,
+    });
+  }
 
   // The sequence always ends with the iteration step: W1 ends with
   // iteration 1 of the new generation; W2/next-iteration is the single
@@ -604,10 +798,243 @@ export async function ensurePipelineV2StageIteration(
   if (lastStep === undefined || lastStep.kind !== "iteration") {
     throw new Error("pipeline v2 stage iteration controller invariant violated: the missing sequence does not end with an iteration step");
   }
+  // Reducer pre-check of the whole missing sequence, then the dispatch
+  // sequence with per-dispatch authoritative verification.
+  precheckSequence(ctx.state, missing.map(openStep), ctx.snapshot);
+  const latest = await dispatchPrecheckedSequence(captured, missing.map(openStep));
   return deepFreezeValue({
-    compiled_stage: compiledStage,
+    compiled_stage: ctx.compiledStage,
     generation_index: lastStep.generationIndex,
     iteration_index: lastStep.iterationIndex,
+    state: latest,
+  });
+}
+
+/**
+ * Whether the durable state carries exactly the expected iteration
+ * closure record: the generation's iteration record closed with the
+ * exact reason, no wait index and the exact anchor. The generation's
+ * iteration bookkeeping (the open projection and possible later
+ * iterations) is not pinned — a racing identical dispatch may already
+ * have opened the next iteration.
+ */
+function iterationClosePresent(
+  state: PipelineV2RunState,
+  generationIndex: number,
+  iterationIndex: number,
+  by: PipelineV2ActiveStageIterationCloseReason,
+  transitionCount: number,
+): boolean {
+  const generation = state.generations.find((candidate) => candidate.index === generationIndex);
+  if (generation === undefined) {
+    return false;
+  }
+  const iteration = generation.iterations.find((candidate) => candidate.index === iterationIndex);
+  return (
+    iteration !== undefined &&
+    iteration.closed !== undefined &&
+    iteration.closed.by === by &&
+    iteration.closed.wait_index === undefined &&
+    iteration.closed.closed_transition_count === transitionCount
+  );
+}
+
+/** Whether the durable state carries exactly the expected generation closure record. */
+function generationClosePresent(
+  state: PipelineV2RunState,
+  generationIndex: number,
+  by: PipelineV2ActiveStageGenerationCloseReason,
+  transitionCount: number,
+): boolean {
+  const generation = state.generations.find((candidate) => candidate.index === generationIndex);
+  return (
+    generation !== undefined &&
+    generation.closed !== undefined &&
+    generation.closed.by === by &&
+    generation.closed.closed_transition_count === transitionCount
+  );
+}
+
+function iterationCloseStep(
+  generationIndex: number,
+  iterationIndex: number,
+  by: PipelineV2ActiveStageIterationCloseReason,
+  transitionCount: number,
+): PendingStep {
+  return {
+    command: { kind: "stage_iteration_closed", generationIndex, iterationIndex, by },
+    present: (state) => iterationClosePresent(state, generationIndex, iterationIndex, by, transitionCount),
+  };
+}
+
+function generationCloseStep(
+  generationIndex: number,
+  by: PipelineV2ActiveStageGenerationCloseReason,
+  transitionCount: number,
+): PendingStep {
+  return {
+    command: { kind: "stage_generation_closed", generationIndex, by },
+    present: (state) => generationClosePresent(state, generationIndex, by, transitionCount),
+  };
+}
+
+/**
+ * The closure boundary on top of the run boundary: exactly one
+ * settled-but-unbound execution whose durable role is exactly `stage`
+ * (never inferred from the profile, the executor name or the state id)
+ * and whose state belongs to the selected compiled stage. The settled
+ * phase itself (agent `cleanup_completed`, decision `evaluated`) and the
+ * failed/in-flight rejection are `checkRunBoundary`'s. Every violation
+ * is `invalid_state` before any dispatch.
+ */
+function checkClosureBoundary(
+  state: PipelineV2RunState,
+  compiledStage: CompiledPipelineV2RunPlanStage,
+): void {
+  const fail = (): PipelineV2StageIterationControllerError =>
+    controllerError("invalid_state", "the run is not on a boundary that accepts a stage iteration closure", state);
+  if (state.executions.length !== state.transitions.length + 1) {
+    throw fail();
+  }
+  const lastExecution = state.executions[state.executions.length - 1];
+  if (lastExecution === undefined || lastExecution.execution_role !== "stage") {
+    throw fail();
+  }
+  if (!compiledStage.state_ids.includes(lastExecution.state_id)) {
+    throw fail();
+  }
+}
+
+/**
+ * Closes the active stage iteration of the selected compiled stage and —
+ * by the caller's explicit decision — its generation, on the contract
+ * hook boundary `settled stage execution → stage_iteration_closed →
+ * optional stage_generation_closed → transition_committed`. The caller
+ * has already made every policy decision (the iteration close reason,
+ * whether and why the generation closes); the controller derives every
+ * durable binding, index and anchor from the trusted compiled projection
+ * and the authoritative durable state, and accepts no index, anchor,
+ * position, template, plan digest or target state from the caller.
+ */
+export async function closePipelineV2StageIteration(
+  options: ClosePipelineV2StageIterationOptions,
+): Promise<ClosedPipelineV2StageIteration> {
+  const captured = captureClose(options);
+  const ctx = resolveValidatedContext(captured, "closePipelineV2StageIteration");
+
+  // The closure boundary: the run boundary plus the settled-but-unbound
+  // stage execution of this compiled stage.
+  checkRunBoundary(ctx.state, "a stage iteration closure");
+  checkClosureBoundary(ctx.state, ctx.compiledStage);
+  const lastExecution = ctx.state.executions[ctx.state.executions.length - 1]!;
+
+  // Reconciliation against the last durable generation: every index and
+  // anchor comes from the validated durable state, never from the caller.
+  const generation = ctx.state.generations[ctx.state.generations.length - 1];
+  if (generation === undefined) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the settled stage execution ${lastExecution.index} has no durable stage generation`,
+      ctx.snapshot,
+    );
+  }
+  if (
+    generation.stage_id !== ctx.compiledStage.id ||
+    generation.stage_position !== ctx.stagePosition ||
+    generation.template_id !== ctx.compiledStage.template ||
+    generation.plan_sha256 !== ctx.compiledPlan.plan_sha256
+  ) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the last stage generation ${generation.index} does not match the compiled stage ${JSON.stringify(ctx.compiledStage.id)}`,
+      ctx.snapshot,
+    );
+  }
+  const lastIteration = generation.iterations[generation.iterations.length - 1];
+  if (lastIteration === undefined) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the stage generation ${generation.index} carries no iteration record`,
+      ctx.snapshot,
+    );
+  }
+  const executionIterationIndex = lastExecution.iteration_index;
+  if (executionIterationIndex === undefined || lastIteration.index !== executionIterationIndex) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the settled stage execution ${lastExecution.index} does not belong to iteration ${lastIteration.index} of generation ${generation.index}`,
+      ctx.snapshot,
+    );
+  }
+
+  const cursorCount = ctx.state.cursor.transition_count;
+  const steps: PendingStep[] = [];
+  let generationClosed: boolean;
+  if (lastIteration.closed === undefined) {
+    // Open iteration: the iteration close and — if the caller asked — the
+    // generation close, strictly in this order.
+    steps.push(iterationCloseStep(generation.index, lastIteration.index, captured.iterationCloseReason, cursorCount));
+    if (captured.generationCloseReason !== undefined) {
+      steps.push(generationCloseStep(generation.index, captured.generationCloseReason, cursorCount));
+    }
+    generationClosed = captured.generationCloseReason !== undefined;
+  } else {
+    // Partial retry: the iteration is already closed at this boundary.
+    // The durable close reason and anchor must match the call exactly.
+    if (lastIteration.closed.by !== captured.iterationCloseReason) {
+      throw controllerError(
+        "lifecycle_conflict",
+        `the stage iteration ${lastIteration.index} of generation ${generation.index} is already closed with reason ${JSON.stringify(lastIteration.closed.by)}`,
+        ctx.snapshot,
+      );
+    }
+    if (lastIteration.closed.closed_transition_count !== cursorCount) {
+      throw controllerError(
+        "lifecycle_conflict",
+        `the stage iteration ${lastIteration.index} of generation ${generation.index} is closed at transition count ${lastIteration.closed.closed_transition_count}, but the run cursor is ${cursorCount}`,
+        ctx.snapshot,
+      );
+    }
+    if (captured.generationCloseReason === undefined) {
+      if (generation.closed !== undefined) {
+        throw controllerError(
+          "lifecycle_conflict",
+          `the stage generation ${generation.index} is already closed, but the call requested only the iteration closure`,
+          ctx.snapshot,
+        );
+      }
+      generationClosed = false;
+    } else if (generation.closed === undefined) {
+      steps.push(generationCloseStep(generation.index, captured.generationCloseReason, cursorCount));
+      generationClosed = true;
+    } else {
+      if (generation.closed.by !== captured.generationCloseReason) {
+        throw controllerError(
+          "lifecycle_conflict",
+          `the stage generation ${generation.index} is already closed with reason ${JSON.stringify(generation.closed.by)}`,
+          ctx.snapshot,
+        );
+      }
+      if (generation.closed.closed_transition_count !== cursorCount) {
+        throw controllerError(
+          "lifecycle_conflict",
+          `the stage generation ${generation.index} is closed at transition count ${generation.closed.closed_transition_count}, but the run cursor is ${cursorCount}`,
+          ctx.snapshot,
+        );
+      }
+      generationClosed = true;
+    }
+  }
+
+  // Reducer pre-check of the whole missing suffix, then the dispatch
+  // sequence with per-dispatch authoritative verification.
+  precheckSequence(ctx.state, steps, ctx.snapshot);
+  const latest = await dispatchPrecheckedSequence(captured, steps);
+  return deepFreezeValue({
+    compiled_stage: ctx.compiledStage,
+    generation_index: generation.index,
+    iteration_index: lastIteration.index,
+    generation_closed: generationClosed,
     state: latest,
   });
 }

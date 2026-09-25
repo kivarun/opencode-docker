@@ -2115,12 +2115,16 @@ API); the controller derives every durable binding, index and anchor
 itself and accepts none of them from the caller. The runtime export
 surface is exactly `PipelineV2StageIterationControllerError` (closed
 reasons `invalid_options | invalid_state | lifecycle_conflict |
-state_persist_failed`, immutable `reason`, last authoritative `state`)
-and `ensurePipelineV2StageIteration({compiledPlan, stageId,
-initialBudget, sink})` over the structural `PipelineV2StageIterationControllerSink
+state_persist_failed`, immutable `reason`, last authoritative `state`),
+`ensurePipelineV2StageIteration({compiledPlan, stageId, initialBudget,
+sink})` and `closePipelineV2StageIteration({compiledPlan, stageId,
+iterationCloseReason, generationCloseReason?, sink})` over the
+structural `PipelineV2StageIterationControllerSink
 {snapshot, poisoned, dispatch}` seam (the production sink satisfies it);
-the deep-frozen result is `{compiled_stage, generation_index,
-iteration_index, state}` with the exact frozen compiled stage object.
+the deep-frozen results are `{compiled_stage, generation_index,
+iteration_index, state}` and `{compiled_stage, generation_index,
+iteration_index, generation_closed, state}` with the exact frozen
+compiled stage object.
 
 The trusted order is fail-closed: every options field and every sink
 member is captured exactly once as an opaque reference, the sink poison
@@ -2166,10 +2170,46 @@ idempotent success only on that exact match (otherwise
 `lifecycle_conflict`), and there is no rollback and no automatic second
 dispatch. Durability: sink `not_committed`/`durability_unknown` are
 `state_persist_failed` with the last authoritative (adopted) state; a
-fresh retry recognizes the already durable prefix and dispatches only the
-still-missing steps. Diagnostics are content-free. Not wired: stage
-selection/routing policy, iteration/generation closure, the
-wait/replanning/grant controllers, automatic resume,
+fresh retry recognizes the already durable prefix and dispatches only
+the still-missing steps.
+
+The same module adds the production-neutral active-boundary closure API
+`closePipelineV2StageIteration`: the caller has already decided why the
+iteration closes (`normal_close` or `exhausted`) and whether the
+generation closes (`next_stage` or `final_stage`); the wait-bound
+reasons (`grant`/`replanned`), the generation `replanned` reason, wait
+indexes and caller-supplied indexes, anchors, positions, templates,
+digests or targets are not part of the API. Both public APIs share one
+capture/validation path (single capture → sink poison latch →
+compiled-plan gate → state validator → hidden identity → durable
+bindings → stage position) and one pre-check/dispatch machinery inside
+the module — no second controller, comparator, replay or registry. The
+closure boundary is the contract hook order `settled stage execution →
+stage_iteration_closed → optional stage_generation_closed →
+transition_committed`: active/running with no terminal, run outputs,
+failure or open wait; exactly one settled-but-unbound execution
+(`executions.length === transitions.length + 1`) whose durable
+`execution_role` is exactly `stage` (never inferred from the profile,
+the executor name or the state id) in the agent phase
+`cleanup_completed` or the decision phase `evaluated` exactly, whose
+`state_id` is one of the compiled stage's state ids, and whose recorded
+`iteration_index` belongs to the current durable iteration; the last
+durable generation must match the compiled stage's id, declaration
+position, template and current plan digest. Reconciliation: an open
+iteration is closed by `stage_iteration_closed` (no wait index) plus the
+optional `stage_generation_closed`; an iteration already closed at this
+boundary is reconciled by the exact durable close reason and anchor —
+an exact match is an idempotent success with zero dispatch, a
+requested-but-open generation is completed by the single generation
+close dispatch, and any other close reason or anchor, or a generation
+closed while the call requested only the iteration closure, is a
+`lifecycle_conflict` with zero dispatch. The reducer pre-check of the
+whole suffix is `invalid_state` with zero dispatch; the dispatch is
+strictly iteration close → optional generation close with per-dispatch
+authoritative verification; the durability mapping is the same as for
+the ensure API. Diagnostics are content-free. Not wired: stage
+selection/routing policy, the wait-bound `grant`/`replanned` closure and
+replanning, the wait/replanning/grant controllers, automatic resume,
 coordinator/runner/CLI wiring, filesystem, Docker Helper/Sessions,
 migrations/API/T3, multi-process locking.
 

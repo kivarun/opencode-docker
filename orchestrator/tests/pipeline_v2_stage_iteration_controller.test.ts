@@ -40,8 +40,10 @@ import {
   acceptPipelineV2RunPlanCandidate,
 } from "../src/pipeline_v2_run_plan_controller.ts";
 import {
+  closePipelineV2StageIteration,
   ensurePipelineV2StageIteration,
   PipelineV2StageIterationControllerError,
+  type ClosePipelineV2StageIterationOptions,
   type PipelineV2StageIterationControllerSink,
 } from "../src/pipeline_v2_stage_iteration_controller.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
@@ -192,6 +194,92 @@ async function withPipeline(
     await writeFile(join(bundle, "pipeline.yaml"), TWO_TEMPLATES_YAML);
     await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
     await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
+    await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+    await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
+    await fn(await loadPipelineV2(bundle));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+/** Planning agent -> one stage whose only stage state is a decision. */
+const DECISION_STAGE_YAML = `schema_version: 2
+entry_state: architect
+max_transitions: 40
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+  - id: facts_seed
+    type: json
+    protected: false
+    schema: schemas/facts.schema.json
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: gate_stage
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: gate_stage
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: gate_stage
+
+  - id: gate_stage
+    type: decision
+    model: decisions/dispatch.yaml
+    inputs:
+      - id: facts
+        source:
+          pipeline_input: facts_seed
+    transitions:
+      - outcome: d_next_stage
+        to: done
+      - outcome: d_test_stage
+        to: done
+      - outcome: uncovered
+        to: failed
+      - outcome: inconsistent_facts
+        to: failed
+      - outcome: invalid_facts
+        to: failed
+
+  - id: done
+    type: terminal
+    result: success
+  - id: failed
+    type: terminal
+    result: failed
+`;
+
+async function withDecisionStagePipeline(
+  fn: (pipeline: ResolvedPipelineV2) => Promise<void>,
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-decision-"));
+  try {
+    const bundle = join(root, "bundle");
+    await mkdir(join(bundle, "prompts"), { recursive: true });
+    await mkdir(join(bundle, "schemas"), { recursive: true });
+    await mkdir(join(bundle, "decisions"), { recursive: true });
+    await writeFile(join(bundle, "pipeline.yaml"), DECISION_STAGE_YAML);
+    await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
     await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
     await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
     await fn(await loadPipelineV2(bundle));
@@ -1362,10 +1450,11 @@ describe("pipeline v2 stage iteration controller", () => {
     });
   });
 
-  test("29. the runtime export surface is exactly the two keys", async () => {
+  test("29. the runtime export surface is exactly the three keys", async () => {
     const namespace = (await import("../src/pipeline_v2_stage_iteration_controller.ts")) as Record<string, unknown>;
     expect(Object.keys(namespace).sort()).toEqual([
       "PipelineV2StageIterationControllerError",
+      "closePipelineV2StageIteration",
       "ensurePipelineV2StageIteration",
     ]);
   });
@@ -1419,6 +1508,24 @@ describe("pipeline v2 stage iteration controller", () => {
     expect(source).toContain("validatePipelineV2RunState");
     expect(source).toContain("compiledPipelineV2RunPlanStageFor");
     expect(source).toContain("reducePipelineV2RunCommand");
+    // each shared authority is called exactly once: the reducer, the state
+    // validator, the compiled-plan gate/lookup, the hidden identity
+    // resolver and the structural comparator
+    for (const authority of [
+      "validatePipelineV2RunState(",
+      "compiledPipelineV2RunPlanStageFor(",
+      "compiledRunPlanOriginIdentity(",
+      "comparePipelineV2RunIdentity(",
+      "reducePipelineV2RunCommand(",
+    ]) {
+      expect(source.split(authority).length - 1).toBe(1);
+    }
+    // both public flows share one pre-check and one dispatch sequence
+    expect(source.split("precheckSequence(").length - 1).toBe(3);
+    expect(source.split("dispatchPrecheckedSequence(").length - 1).toBe(3);
+    // no second registry lives in this module
+    expect(source.includes("new WeakMap")).toBe(false);
+    expect(source.includes("new WeakSet")).toBe(false);
     for (const banned of [
       "compilePipelineV2RunPlanCandidate(",
       "parsePipelineV2RunState(",
@@ -1662,6 +1769,1103 @@ describe("pipeline v2 stage iteration controller", () => {
       } finally {
         await disposeRun(ctx.fixture);
       }
+    });
+  });
+
+  /**
+   * Drives the run from the accepted-plan boundary to the contract hook
+   * closure boundary: open generation + iteration, the transition into
+   * the stage's entry state, and the settled (cleanup_completed) stage
+   * agent execution — `executions.length === transitions.length + 1`.
+   */
+  async function driveAgentStageBoundary(ctx: StageCtx): Promise<void> {
+    await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+    await ctx.sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+    for (const command of [
+      { kind: "agent_data_prepared" },
+      { kind: "agent_execution_session_created", sessionId: "sess-stage-close" },
+      { kind: "agent_tool_session_created", sessionId: "tool-stage-close" },
+      { kind: "agent_running" },
+      { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+      { kind: "agent_cleanup_completed" },
+    ] as PipelineV2RunCommand[]) {
+      await ctx.sink.dispatch(command);
+    }
+  }
+
+  /** The same boundary with a stage-role decision execution in phase `evaluated`. */
+  async function driveDecisionStageBoundary(ctx: StageCtx): Promise<void> {
+    await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+    await ctx.sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "gate_stage", transition_index: 0 },
+      executionIndex: 1,
+    });
+    await ctx.sink.dispatch({ kind: "start_decision_execution", stateId: "gate_stage", inputDigest: hex("e"), executionRole: "stage", iterationIndex: 1 });
+    await ctx.sink.dispatch({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "r_next", active_constraint_ids: [] },
+    });
+  }
+
+  async function catchClose(fn: () => Promise<unknown>): Promise<unknown> {
+    return catchEnsure(fn);
+  }
+
+  function closeOptions(
+    ctx: StageCtx,
+    overrides: Partial<Omit<ClosePipelineV2StageIterationOptions, "compiledPlan">> = {},
+  ): ClosePipelineV2StageIterationOptions {
+    return {
+      compiledPlan: ctx.compiledPlan,
+      stageId: "stage-1",
+      iterationCloseReason: "normal_close",
+      sink: ctx.sink,
+      ...overrides,
+    };
+  }
+
+  describe("closePipelineV2StageIteration (active-boundary closure)", () => {
+    test("37. normal_close closes the open iteration with the exact command, indexes and anchor", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const recording = recordingSink(ctx.sink, ctx.fixture, true);
+          const result = await closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink }));
+          expect(recording.commands).toEqual([
+            { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" },
+          ]);
+          expect(result.generation_index).toBe(1);
+          expect(result.iteration_index).toBe(1);
+          expect(result.generation_closed).toBe(false);
+          expect(result.state).toBe(recording.sink.snapshot as PipelineV2RunState);
+          const generation = result.state.generations[0];
+          expect(generation?.open_iteration).toBeUndefined();
+          expect(generation?.closed).toBeUndefined();
+          expect(generation?.iterations[0]).toMatchObject({
+            index: 1,
+            opened_transition_count: 0,
+            closed: { by: "normal_close", closed_transition_count: 1 },
+          });
+          // the closed iteration record carries exactly the closed fields
+          const iteration = generation?.iterations[0] as { closed?: Record<string, unknown> };
+          expect(Object.keys(iteration.closed as object).sort()).toEqual(["by", "closed_transition_count"]);
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("38. exhausted closes the open iteration with the caller-selected reason", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const result = await closePipelineV2StageIteration(closeOptions(ctx, { iterationCloseReason: "exhausted" }));
+          const generation = result.state.generations[0];
+          expect(generation?.iterations[0]?.closed).toMatchObject({ by: "exhausted", closed_transition_count: 1 });
+          expect(result.generation_closed).toBe(false);
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("39. normal_close plus generation next_stage dispatches iteration close then generation close, in this order", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const recording = recordingSink(ctx.sink, ctx.fixture, true);
+          const result = await closePipelineV2StageIteration(
+            closeOptions(ctx, { sink: recording.sink, generationCloseReason: "next_stage" }),
+          );
+          expect(recording.commands).toEqual([
+            { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" },
+            { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" },
+          ]);
+          expect(result.generation_closed).toBe(true);
+          const generation = result.state.generations[0];
+          expect(generation?.iterations[0]?.closed).toMatchObject({ by: "normal_close", closed_transition_count: 1 });
+          expect(generation?.closed).toEqual({ by: "next_stage", closed_transition_count: 1 });
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("40. normal_close plus generation final_stage records the final_stage generation closure", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const result = await closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "final_stage" }));
+          const generation = result.state.generations[0];
+          expect(generation?.closed).toEqual({ by: "final_stage", closed_transition_count: 1 });
+          expect(result.generation_closed).toBe(true);
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("41. exhausted plus an explicit generation closure records both closures", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const recording = recordingSink(ctx.sink, ctx.fixture, true);
+          const result = await closePipelineV2StageIteration(
+            closeOptions(ctx, { sink: recording.sink, iterationCloseReason: "exhausted", generationCloseReason: "final_stage" }),
+          );
+          expect(recording.commands.map((command) => command.kind)).toEqual([
+            "stage_iteration_closed",
+            "stage_generation_closed",
+          ]);
+          const generation = result.state.generations[0];
+          expect(generation?.iterations[0]?.closed).toMatchObject({ by: "exhausted" });
+          expect(generation?.closed).toMatchObject({ by: "final_stage" });
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("42. a stage-role decision execution in phase evaluated is a valid closure boundary", async () => {
+      await withDecisionStagePipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveDecisionStageBoundary(ctx);
+          const recording = recordingSink(ctx.sink, ctx.fixture, true);
+          const result = await closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink }));
+          expect(recording.commands).toEqual([
+            { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" },
+          ]);
+          const execution = result.state.executions[result.state.executions.length - 1];
+          expect(execution).toMatchObject({ type: "decision", phase: "evaluated", execution_role: "stage", iteration_index: 1 });
+          expect(result).toMatchObject({ generation_index: 1, iteration_index: 1, generation_closed: false });
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("43. the result carries the exact frozen compiled stage object and is deep-frozen", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const result = await closePipelineV2StageIteration(closeOptions(ctx));
+          expect(Object.isFrozen(result)).toBe(true);
+          expect(Object.isFrozen(result.compiled_stage)).toBe(true);
+          expect(Object.isFrozen(result.state)).toBe(true);
+          expect(Object.isFrozen(result.generation_closed)).toBe(true);
+          const stage = ctx.compiledPlan.stages[0];
+          if (stage === undefined) {
+            throw new Error("missing stage");
+          }
+          expect(result.compiled_stage).toBe(stage);
+          expect(result.state).toBe(ctx.sink.snapshot as PipelineV2RunState);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("44. partial retry: the durable iteration close is completed by the generation close dispatch only", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          // the crash window: the iteration close committed, the generation close not
+          const faulted = await PipelineV2RunStateSink.open({
+            stateRoot: ctx.fixture.stateRoot,
+            runId: RUN_ID,
+            now: nextTick,
+            io: faultIo({ failCommit: 2, failStep: "rename" }),
+          });
+          const recording = recordingSink(faulted, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink, generationCloseReason: "next_stage" })),
+          );
+          expectControllerError(cause, "state_persist_failed");
+          const persisted = JSON.parse(await readFile(ctx.fixture.statePath, "utf8")) as PipelineV2RunState;
+          expect(persisted.generations[0]?.iterations[0]?.closed).toMatchObject({ by: "normal_close" });
+          expect(persisted.generations[0]?.closed).toBeUndefined();
+          // the fresh retry recognizes the durable prefix and dispatches only the generation close
+          const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+          const retryRecording = recordingSink(fresh, ctx.fixture, true);
+          const result = await closePipelineV2StageIteration(
+            closeOptions(ctx, { sink: retryRecording.sink, generationCloseReason: "next_stage" }),
+          );
+          expect(retryRecording.commands).toEqual([
+            { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" },
+          ]);
+          expect(result).toMatchObject({ generation_index: 1, iteration_index: 1, generation_closed: true });
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("45. exact retry after an iteration-only closure is an idempotent success with zero dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const first = await closePipelineV2StageIteration(closeOptions(ctx));
+          const before = JSON.stringify(ctx.sink.snapshot);
+          const recording = recordingSink(ctx.sink, ctx.fixture, true);
+          const second = await closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink }));
+          expect(recording.commands).toEqual([]);
+          expect(second).toMatchObject({
+            generation_index: first.generation_index,
+            iteration_index: first.iteration_index,
+            generation_closed: false,
+          });
+          expect(second.state).toBe(ctx.sink.snapshot as PipelineV2RunState);
+          expect(JSON.stringify(ctx.sink.snapshot)).toBe(before);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("46. exact retry after the full closure is an idempotent success with zero dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const first = await closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "next_stage" }));
+          expect(first.generation_closed).toBe(true);
+          const recording = recordingSink(ctx.sink, ctx.fixture, true);
+          const second = await closePipelineV2StageIteration(
+            closeOptions(ctx, { sink: recording.sink, generationCloseReason: "next_stage" }),
+          );
+          expect(recording.commands).toEqual([]);
+          expect(second).toMatchObject({ generation_index: 1, iteration_index: 1, generation_closed: true });
+          expect(second.state).toBe(ctx.sink.snapshot as PipelineV2RunState);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("47. not_committed on the iteration close: nothing durable; the fresh retry dispatches the iteration close", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const faulted = await PipelineV2RunStateSink.open({
+            stateRoot: ctx.fixture.stateRoot,
+            runId: RUN_ID,
+            now: nextTick,
+            io: faultIo({ failCommit: 1, failStep: "rename" }),
+          });
+          const recording = recordingSink(faulted, ctx.fixture, false);
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+          expectControllerError(cause, "state_persist_failed");
+          const persisted = JSON.parse(await readFile(ctx.fixture.statePath, "utf8")) as PipelineV2RunState;
+          expect(persisted.generations[0]?.iterations[0]?.closed).toBeUndefined();
+          expect(persisted.generations[0]?.open_iteration?.index).toBe(1);
+          const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+          const retryRecording = recordingSink(fresh, ctx.fixture, true);
+          const result = await closePipelineV2StageIteration(closeOptions(ctx, { sink: retryRecording.sink }));
+          expect(retryRecording.commands).toEqual([
+            { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" },
+          ]);
+          expect(result).toMatchObject({ generation_index: 1, iteration_index: 1, generation_closed: false });
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("48. not_committed on the generation close: the fresh reopen completes the partial commit", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const faulted = await PipelineV2RunStateSink.open({
+            stateRoot: ctx.fixture.stateRoot,
+            runId: RUN_ID,
+            now: nextTick,
+            io: faultIo({ failCommit: 2, failStep: "rename" }),
+          });
+          const recording = recordingSink(faulted, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink, generationCloseReason: "final_stage" })),
+          );
+          expectControllerError(cause, "state_persist_failed");
+          const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+          const retryRecording = recordingSink(fresh, ctx.fixture, true);
+          const result = await closePipelineV2StageIteration(
+            closeOptions(ctx, { sink: retryRecording.sink, generationCloseReason: "final_stage" }),
+          );
+          expect(retryRecording.commands).toEqual([
+            { kind: "stage_generation_closed", generationIndex: 1, by: "final_stage" },
+          ]);
+          expect(result.generation_closed).toBe(true);
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("49. durability_unknown on the iteration close adopts the candidate, poisons the sink and dispatches no generation close", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const faulted = await PipelineV2RunStateSink.open({
+            stateRoot: ctx.fixture.stateRoot,
+            runId: RUN_ID,
+            now: nextTick,
+            io: faultIo({ failCommit: 1, failStep: "dirfsync" }),
+          });
+          const recording = recordingSink(faulted, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink, generationCloseReason: "next_stage" })),
+          );
+          const error = expectControllerError(cause, "state_persist_failed");
+          expect(faulted.poisoned).toBe(true);
+          const adopted = faulted.snapshot as PipelineV2RunState;
+          expect(error.state).toBe(adopted);
+          expect(adopted.generations[0]?.iterations[0]?.closed).toMatchObject({ by: "normal_close", closed_transition_count: 1 });
+          expect(recording.commands.map((command) => command.kind)).toEqual(["stage_iteration_closed"]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("50. durability_unknown on the generation close adopts the candidate and poisons the sink", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const faulted = await PipelineV2RunStateSink.open({
+            stateRoot: ctx.fixture.stateRoot,
+            runId: RUN_ID,
+            now: nextTick,
+            io: faultIo({ failCommit: 2, failStep: "dirfsync" }),
+          });
+          const recording = recordingSink(faulted, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink, generationCloseReason: "next_stage" })),
+          );
+          const error = expectControllerError(cause, "state_persist_failed");
+          expect(faulted.poisoned).toBe(true);
+          const adopted = faulted.snapshot as PipelineV2RunState;
+          expect(error.state).toBe(adopted);
+          expect(adopted.generations[0]?.closed).toMatchObject({ by: "next_stage" });
+          expect(recording.commands.map((command) => command.kind)).toEqual(["stage_iteration_closed", "stage_generation_closed"]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("51. identical concurrency closes exactly one iteration (and one generation); both calls succeed", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const settled = await Promise.allSettled([
+            closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "next_stage" })),
+            closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "next_stage" })),
+          ]);
+          for (const entry of settled) {
+            expect(entry.status).toBe("fulfilled");
+          }
+          const state = ctx.sink.snapshot as PipelineV2RunState;
+          const generation = state.generations[0];
+          expect(generation?.iterations[0]?.closed).toMatchObject({ by: "normal_close", closed_transition_count: 1 });
+          expect(generation?.closed).toMatchObject({ by: "next_stage", closed_transition_count: 1 });
+          expect(generation?.iterations).toHaveLength(1);
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("52. different iteration close reasons race: one winner, the loser a typed conflict", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const settled = await Promise.allSettled([
+            closePipelineV2StageIteration(closeOptions(ctx, { iterationCloseReason: "normal_close" })),
+            closePipelineV2StageIteration(closeOptions(ctx, { iterationCloseReason: "exhausted" })),
+          ]);
+          const fulfilled = settled.filter((entry) => entry.status === "fulfilled");
+          const rejected = settled.filter((entry) => entry.status === "rejected");
+          expect(fulfilled).toHaveLength(1);
+          expect(rejected).toHaveLength(1);
+          const loser = (rejected[0] as PromiseRejectedResult).reason;
+          expectControllerError(loser, "lifecycle_conflict");
+          const state = ctx.sink.snapshot as PipelineV2RunState;
+          const winnerReason = (fulfilled[0] as PromiseFulfilledResult<{ state: PipelineV2RunState }>).value.state.generations[0]?.iterations[0]?.closed?.by;
+          expect(state.generations[0]?.iterations[0]?.closed?.by).toBe(winnerReason);
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("53. different generation close reasons race: one winner, the loser a typed conflict", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const settled = await Promise.allSettled([
+            closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "next_stage" })),
+            closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "final_stage" })),
+          ]);
+          const fulfilled = settled.filter((entry) => entry.status === "fulfilled");
+          const rejected = settled.filter((entry) => entry.status === "rejected");
+          expect(fulfilled).toHaveLength(1);
+          expect(rejected).toHaveLength(1);
+          const loser = (rejected[0] as PromiseRejectedResult).reason;
+          expectControllerError(loser, "lifecycle_conflict");
+          const state = ctx.sink.snapshot as PipelineV2RunState;
+          const winnerReason = (fulfilled[0] as PromiseFulfilledResult<{ state: PipelineV2RunState }>).value.state.generations[0]?.closed?.by;
+          expect(state.generations[0]?.closed?.by).toBe(winnerReason);
+          expect(state.generations[0]?.iterations[0]?.closed?.by).toBe("normal_close");
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("54. wait-bound and replanned reasons are invalid_options with zero dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const before = JSON.stringify(ctx.sink.snapshot);
+          for (const iterationCloseReason of ["grant", "replanned", "normal", undefined]) {
+            const cause = await catchClose(() =>
+              closePipelineV2StageIteration(
+                closeOptions(ctx, { iterationCloseReason: iterationCloseReason as never }),
+              ),
+            );
+            const error = expectControllerError(cause, "invalid_options");
+            expect(error.message).toContain("requires the iteration close reason normal_close or exhausted");
+            expect(error.state).toBeNull();
+          }
+          for (const generationCloseReason of ["replanned", "grant"]) {
+            const cause = await catchClose(() =>
+              closePipelineV2StageIteration(
+                closeOptions(ctx, { generationCloseReason: generationCloseReason as never }),
+              ),
+            );
+            const error = expectControllerError(cause, "invalid_options");
+            expect(error.message).toContain("requires the generation close reason next_stage or final_stage");
+            expect(error.state).toBeNull();
+          }
+          expect(JSON.stringify(ctx.sink.snapshot)).toBe(before);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("55. an open wait is rejected before any dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "architect", outcome: "completed", to: "stage_dispatch", transition_index: 0 },
+            executionIndex: 1,
+          });
+          await ctx.sink.dispatch({
+            kind: "run_waiting",
+            stateId: "stage_dispatch",
+            reason: "stage_iteration_limit_exhausted",
+            requestSha256: hex("1"),
+            actions: [{ id: "revise_task", to: "architect" }],
+          });
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+          const error = expectControllerError(cause, "invalid_state");
+          expect(error.message).toContain("the run is not on a boundary that accepts a stage iteration closure");
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("56. in-flight agent and decision executions are rejected before any dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        for (const variant of ["agent", "decision"] as const) {
+          if (variant === "agent") {
+            const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+            try {
+              await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+              await ctx.sink.dispatch({
+                kind: "transition_committed",
+                step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+                executionIndex: 1,
+              });
+              await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+              await ctx.sink.dispatch({ kind: "agent_data_prepared" });
+              await ctx.sink.dispatch({ kind: "agent_execution_session_created", sessionId: "sess-inflight" });
+              await ctx.sink.dispatch({ kind: "agent_tool_session_created", sessionId: "tool-inflight" });
+              await ctx.sink.dispatch({ kind: "agent_running" });
+              const recording = recordingSink(ctx.sink, ctx.fixture, false);
+              const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+              expectControllerError(cause, "invalid_state");
+              expect(recording.commands).toEqual([]);
+            } finally {
+              await disposeRun(ctx.fixture);
+            }
+          } else {
+            const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+            try {
+              await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+              await ctx.sink.dispatch({
+                kind: "transition_committed",
+                step: { from: "architect", outcome: "completed", to: "gate_stage", transition_index: 0 },
+                executionIndex: 1,
+              });
+              await ctx.sink.dispatch({ kind: "start_decision_execution", stateId: "gate_stage", inputDigest: hex("e"), executionRole: "stage", iterationIndex: 1 });
+              const recording = recordingSink(ctx.sink, ctx.fixture, false);
+              const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+              expectControllerError(cause, "invalid_state");
+              expect(recording.commands).toEqual([]);
+            } finally {
+              await disposeRun(ctx.fixture);
+            }
+          }
+        }
+      });
+    });
+
+    test("57. failed agent and decision executions are rejected before any dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        for (const variant of ["agent", "decision"] as const) {
+          const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+          try {
+            if (variant === "agent") {
+              await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+              await ctx.sink.dispatch({
+                kind: "transition_committed",
+                step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+                executionIndex: 1,
+              });
+              await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+              for (const command of [
+                { kind: "agent_data_prepared" },
+                { kind: "agent_execution_session_created", sessionId: "sess-failed" },
+                { kind: "agent_tool_session_created", sessionId: "tool-failed" },
+                { kind: "agent_running" },
+              ] as PipelineV2RunCommand[]) {
+                await ctx.sink.dispatch(command);
+              }
+              await ctx.sink.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+            } else {
+              await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+              await ctx.sink.dispatch({
+                kind: "transition_committed",
+                step: { from: "architect", outcome: "completed", to: "gate_stage", transition_index: 0 },
+                executionIndex: 1,
+              });
+              await ctx.sink.dispatch({ kind: "start_decision_execution", stateId: "gate_stage", inputDigest: hex("e"), executionRole: "stage", iterationIndex: 1 });
+              await ctx.sink.dispatch({ kind: "decision_failed", reason: "decision_input_invalid" });
+            }
+            const recording = recordingSink(ctx.sink, ctx.fixture, false);
+            const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+            expectControllerError(cause, "invalid_state");
+            expect(recording.commands).toEqual([]);
+          } finally {
+            await disposeRun(ctx.fixture);
+          }
+        }
+      });
+    });
+
+    test("58. planning and control executions are rejected as the settled execution of the boundary", async () => {
+      await withPipeline(async (pipeline) => {
+        for (const variant of ["planning", "control"] as const) {
+          const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+          try {
+            if (variant === "planning") {
+              // the stageReady boundary itself: the settled planning execution
+            } else {
+              await ctx.sink.dispatch({
+                kind: "transition_committed",
+                step: { from: "architect", outcome: "completed", to: "stage_dispatch", transition_index: 0 },
+                executionIndex: 1,
+              });
+              await ctx.sink.dispatch({ kind: "start_decision_execution", stateId: "stage_dispatch", inputDigest: hex("e"), executionRole: "control" });
+              await ctx.sink.dispatch({
+                kind: "decision_evaluated",
+                result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "r_next", active_constraint_ids: [] },
+              });
+            }
+            const recording = recordingSink(ctx.sink, ctx.fixture, false);
+            const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+            const error = expectControllerError(cause, "invalid_state");
+            expect(error.message).toContain("the run is not on a boundary that accepts a stage iteration closure");
+            expect(recording.commands).toEqual([]);
+          } finally {
+            await disposeRun(ctx.fixture);
+          }
+        }
+      });
+    });
+
+    test("59. a settled-but-bound execution is rejected before any dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          // bind the settled execution: the cursor advances, the closure opportunity ends
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "dev_entry", outcome: "completed", to: "done", transition_index: 1 },
+            executionIndex: 2,
+          });
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+          const error = expectControllerError(cause, "invalid_state");
+          expect(error.message).toContain("the run is not on a boundary that accepts a stage iteration closure");
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("60. a stage execution of another compiled stage is rejected before any dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(TWO_STAGES, [A1, B1], pipeline);
+        try {
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "architect", outcome: "completed", to: "test_entry", transition_index: 0 },
+            executionIndex: 1,
+          });
+          await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "test_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+          for (const command of [
+            { kind: "agent_data_prepared" },
+            { kind: "agent_execution_session_created", sessionId: "sess-test-entry" },
+            { kind: "agent_tool_session_created", sessionId: "tool-test-entry" },
+            { kind: "agent_running" },
+            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+            { kind: "agent_cleanup_completed" },
+          ] as PipelineV2RunCommand[]) {
+            await ctx.sink.dispatch(command);
+          }
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+          const error = expectControllerError(cause, "invalid_state");
+          expect(error.message).toContain("the run is not on a boundary that accepts a stage iteration closure");
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("61. a settled execution whose recorded iteration index does not match the durable iteration is a conflict", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          // close iteration 1, then open iteration 2 of the same generation
+          // while the settled execution still belongs to iteration 1
+          await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain("does not belong to iteration 2 of generation 1");
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("62. a compiled plan of a foreign pipeline is a conflict for the close API", async () => {
+      const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-close-foreign-"));
+      try {
+        const bundle = join(root, "bundle");
+        await mkdir(join(bundle, "prompts"), { recursive: true });
+        await mkdir(join(bundle, "schemas"), { recursive: true });
+        await mkdir(join(bundle, "decisions"), { recursive: true });
+        await writeFile(join(bundle, "pipeline.yaml"), TWO_TEMPLATES_YAML);
+        await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
+        await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
+        await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+        await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
+        const pipelineB = await loadPipelineV2(bundle);
+        await appendFile(join(bundle, "prompts", "architect.md"), "updated guidance\n");
+        const pipelineA = await loadPipelineV2(bundle);
+        const fixture = await setupRun();
+        try {
+          const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+          await playPlanning(sink, pipelineB);
+          const candidate = revisionOneCandidate(STAGE_ONE_DEV, [A1]);
+          await acceptPipelineV2RunPlanCandidate({ pipeline: pipelineB, runRoot: fixture.runRoot, sink, candidate });
+          const compiledA = compilePipelineV2RunPlanCandidate(pipelineA, candidate);
+          const recording = recordingSink(sink, fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration({ compiledPlan: compiledA, stageId: "stage-1", iterationCloseReason: "normal_close", sink: recording.sink }),
+          );
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain("field execution_snapshot_sha256");
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(fixture);
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    test("63. a stale or non-current plan is a conflict for the close API", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          const second = preparePipelineV2RunPlanCandidate({
+            plan: preparedPlan(STAGE_ONE_DEV, { revision: 2, previousSha256: ctx.compiledPlan.plan_sha256, originExecution: 1 }),
+            taskRevisions: [A1],
+            previousPlan: preparePlanRevisionManifest({
+              schema_version: 1,
+              kind: "plan_revision",
+              run_id: RUN_ID,
+              revision: 1,
+              previous_sha256: null,
+              root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+              origin_execution: 1,
+              stages: STAGE_ONE_DEV,
+            }),
+            previousTaskRevisions: [],
+            protectedInputDigest: PROTECTED_DIGEST,
+          });
+          await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: ctx.fixture.runRoot, sink: ctx.sink, candidate: second });
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain("the compiled plan is not the last durable plan revision");
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("64. a newer generation of the reused template that belongs to another stage is a conflict", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(REUSED_TEMPLATE_STAGES, [A1, B1], pipeline);
+        try {
+          // generation 1 for stage-1: open, run, close iteration + generation
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+            executionIndex: 1,
+          });
+          await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+          for (const command of [
+            { kind: "agent_data_prepared" },
+            { kind: "agent_execution_session_created", sessionId: "sess-gen1" },
+            { kind: "agent_tool_session_created", sessionId: "tool-gen1" },
+            { kind: "agent_running" },
+            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+            { kind: "agent_cleanup_completed" },
+          ] as PipelineV2RunCommand[]) {
+            await ctx.sink.dispatch(command);
+          }
+          await closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "next_stage" }));
+          // bind the execution, then open generation 2 for stage-1 again
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "dev_entry", outcome: "completed", to: "dev_entry", transition_index: 1 },
+            executionIndex: 2,
+          });
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+          for (const command of [
+            { kind: "agent_data_prepared" },
+            { kind: "agent_execution_session_created", sessionId: "sess-gen2" },
+            { kind: "agent_tool_session_created", sessionId: "tool-gen2" },
+            { kind: "agent_running" },
+            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("6") }] },
+            { kind: "agent_cleanup_completed" },
+          ] as PipelineV2RunCommand[]) {
+            await ctx.sink.dispatch(command);
+          }
+          // closing stage-2: the boundary execution belongs to the reused
+          // template's state ids, but the last generation belongs to stage-1
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", iterationCloseReason: "normal_close", sink: recording.sink }),
+          );
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain('the last stage generation 2 does not match the compiled stage "stage-2"');
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("65. an existing iteration close with a different reason is a conflict", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          // the iteration closed with normal_close through the reducer
+          await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink, iterationCloseReason: "exhausted" })),
+          );
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain('the stage iteration 1 of generation 1 is already closed with reason "normal_close"');
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("66. a hostile dispatch that resolves without the expected record fails closed; the pre-check maps reducer rejections to invalid_state with zero dispatch", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          // the reducer pre-check and the race path share the dispatch
+          // machinery; a hostile sink that resolves without committing is
+          // rejected before any durable write
+          let dispatchCalls = 0;
+          const hostileSink: PipelineV2StageIterationControllerSink = {
+            get snapshot() {
+              return ctx.sink.snapshot;
+            },
+            get poisoned() {
+              return false;
+            },
+            dispatch: async () => {
+              dispatchCalls += 1;
+            },
+          };
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: hostileSink })));
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain("the committed run state does not carry the expected stage lifecycle record");
+          expect(dispatchCalls).toBe(1);
+          // the same machinery's pre-check: the ensure API's budget
+          // exhaustion (test 9) exercises the shared precheckSequence with
+          // zero dispatch; for the close API the reconciliation proves the
+          // reducer's close preconditions on every loader-valid state, so
+          // the pre-check is defense-in-depth
+          const persisted = JSON.parse(await readFile(ctx.fixture.statePath, "utf8")) as PipelineV2RunState;
+          expect(persisted.generations[0]?.iterations[0]?.closed).toBeUndefined();
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("67. the pipeline provenance gate runs before any snapshot field read for the close API", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          let snapshotTraps = 0;
+          const proxySnapshot = new Proxy(ctx.sink.snapshot as PipelineV2RunState, {
+            get(target, property, receiver) {
+              snapshotTraps += 1;
+              return Reflect.get(target, property, receiver);
+            },
+          });
+          const proxiedSink: PipelineV2StageIterationControllerSink = {
+            get snapshot() {
+              return proxySnapshot;
+            },
+            get poisoned() {
+              return ctx.sink.poisoned;
+            },
+            dispatch: async (command) => {
+              await ctx.sink.dispatch(command);
+            },
+          };
+          const fakePlan = { run_id: RUN_ID, plan_revision: 1, plan_sha256: hex("c"), origin_execution: 1, stages: [] } as unknown as CompiledPipelineV2RunPlan;
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration({ compiledPlan: fakePlan, stageId: "stage-1", iterationCloseReason: "normal_close", sink: proxiedSink }),
+          );
+          expect(cause).toBeInstanceOf(PipelineV2CompiledRunPlanError);
+          expect(snapshotTraps).toBe(0);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("68. hand-built, spread, cloned and Proxy compiled plans are rejected with zero traps for the close API", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          const compiled = ctx.compiledPlan;
+          const handBuilt = {
+            run_id: compiled.run_id,
+            plan_revision: compiled.plan_revision,
+            plan_sha256: compiled.plan_sha256,
+            origin_execution: compiled.origin_execution,
+            stages: [
+              {
+                id: "stage-1",
+                template: "development",
+                entry_state: "dev_entry",
+                state_ids: ["dev_entry"],
+                tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+              },
+            ],
+          } as unknown as CompiledPipelineV2RunPlan;
+          const spread = { ...compiled } as unknown as CompiledPipelineV2RunPlan;
+          const cloned = JSON.parse(JSON.stringify(compiled)) as CompiledPipelineV2RunPlan;
+          let traps = 0;
+          const proxy = new Proxy(compiled, {
+            get(target, property, receiver) {
+              traps += 1;
+              return Reflect.get(target, property, receiver);
+            },
+          });
+          let dispatchCalls = 0;
+          const countingSink: PipelineV2StageIterationControllerSink = {
+            get snapshot() {
+              return ctx.sink.snapshot;
+            },
+            get poisoned() {
+              return ctx.sink.poisoned;
+            },
+            dispatch: async (command) => {
+              dispatchCalls += 1;
+              await ctx.sink.dispatch(command);
+            },
+          };
+          for (const broken of [handBuilt, spread, cloned, proxy]) {
+            traps = 0;
+            const cause = await catchClose(() =>
+              closePipelineV2StageIteration({ compiledPlan: broken, stageId: "stage-1", iterationCloseReason: "normal_close", sink: countingSink }),
+            );
+            expect(cause).toBeInstanceOf(PipelineV2CompiledRunPlanError);
+            expect(traps).toBe(0);
+          }
+          expect(dispatchCalls).toBe(0);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("69. every options field and the sink members are captured exactly once; unexpected getter errors keep their identity", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const reads: string[] = [];
+          const hostileOptions = new Proxy(
+            closeOptions(ctx),
+            {
+              get(target, property, receiver) {
+                reads.push(String(property));
+                return Reflect.get(target, property, receiver);
+              },
+            },
+          );
+          const result = await closePipelineV2StageIteration(hostileOptions);
+          expect(result.generation_closed).toBe(false);
+          expect(reads.sort()).toEqual(["compiledPlan", "generationCloseReason", "iterationCloseReason", "sink", "stageId"]);
+          // the sink's poisoned and dispatch members are read exactly once
+          let poisonedReads = 0;
+          let dispatchReads = 0;
+          let snapshotReads = 0;
+          const countingSink: PipelineV2StageIterationControllerSink = {
+            get snapshot() {
+              snapshotReads += 1;
+              return ctx.sink.snapshot;
+            },
+            get poisoned() {
+              poisonedReads += 1;
+              return ctx.sink.poisoned;
+            },
+            get dispatch() {
+              dispatchReads += 1;
+              return (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+            },
+          };
+          await closePipelineV2StageIteration(closeOptions(ctx, { sink: countingSink }));
+          expect(poisonedReads).toBe(1);
+          expect(dispatchReads).toBe(1);
+          // unexpected getter errors propagate unchanged
+          const injected = new Error("injected close snapshot getter failure");
+          const brokenSink: PipelineV2StageIterationControllerSink = {
+            get snapshot(): PipelineV2RunState {
+              throw injected;
+            },
+            get poisoned() {
+              return false;
+            },
+            dispatch: async () => {},
+          };
+          const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: brokenSink })));
+          expect(cause).toBe(injected);
+          expect(cause).not.toBeInstanceOf(PipelineV2StageIterationControllerError);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("70. the result and the diagnostics of the close API carry no bodies, paths, digest values or credentials", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          const result = await closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "next_stage" }));
+          const resultText = JSON.stringify(result);
+          for (const banned of [CANARY, "canonical_json", ctx.fixture.runRoot, "dht_session_bearer_token", "OPENCODE_CONFIG_CONTENT"]) {
+            expect(resultText).not.toContain(banned);
+          }
+          expect(Object.keys(result).sort()).toEqual(["compiled_stage", "generation_closed", "generation_index", "iteration_index", "state"]);
+          // the conflict diagnostics name safe ids, indexes and closed enum values only
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration(closeOptions(ctx, { iterationCloseReason: "exhausted" })),
+          );
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          for (const banned of [CANARY, ctx.fixture.runRoot, ctx.compiledPlan.plan_sha256, "dht_session_bearer_token"]) {
+            expect(error.message).not.toContain(banned);
+          }
+          expect(Object.keys(error).sort()).toEqual(["name", "reason", "state"]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
     });
   });
 });

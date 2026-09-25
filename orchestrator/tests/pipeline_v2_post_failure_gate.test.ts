@@ -597,6 +597,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     const controllerModule = (await import("../src/pipeline_v2_stage_iteration_controller.ts")) as Record<string, unknown>;
     expect(Object.keys(controllerModule).sort()).toEqual([
       "PipelineV2StageIterationControllerError",
+      "closePipelineV2StageIteration",
       "ensurePipelineV2StageIteration",
     ]);
   });
