@@ -7,7 +7,7 @@ import { compiledTransitionFor, PipelineExecutionError } from "./pipeline_engine
 import { requireResolvedPipelineV2Provenance, type ResolvedPipelineV2 } from "./pipeline_v2.ts";
 import {
   PipelineV2StateError,
-  pipelineV2StageIterationAt,
+  pipelineV2StageIterationMembershipAt,
   validatePipelineV2RunState,
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
@@ -472,17 +472,22 @@ function verifyCompiledTransitionHistory(
  * The compiled execution-role verification: every durable execution's
  * recorded role must be exactly the role the trusted pipeline's compiled
  * orchestration metadata assigns to its state (no inference, no default),
- * and a stage execution's iteration projection must be exactly the open
- * stage iteration the loader-proven lifecycle kept open at its start.
- * Every stage generation's template binding must name a declared compiled
- * stage template. Runs strictly after the compiled-transition
- * verification and before any filesystem access, so a structurally valid
- * but compiled-incompatible role/iteration projection never touches the
- * run root. There is no second cursor replay here: the loader already
- * proved the lifecycle timeline positionally; this check adds only the
+ * and a stage execution must be a member of the admissible candidate set
+ * the shared open-iteration resolver computes for its start boundary,
+ * recorded iteration index and compiled stage template. Every stage
+ * generation's template binding must name a declared compiled stage
+ * template. Runs strictly after the compiled-transition verification and
+ * before any filesystem access, so a structurally valid but
+ * compiled-incompatible role/iteration projection never touches the run
+ * root. There is no second cursor replay here: the loader already proved
+ * the lifecycle timeline positionally; this check adds only the
  * correspondence to the compiled orchestration metadata, resolved through
- * the single shared role/template resolvers and the shared open-iteration
- * query.
+ * the single shared role/template resolvers and the shared
+ * membership predicate. The verifier claims no generation of its own:
+ * when several generations are indistinguishable at the start boundary
+ * (typically a reused template), membership in the shared candidate set
+ * is the entire check; the absence of any matching candidate is the
+ * `pipeline_mismatch`.
  */
 function verifyCompiledExecutionRoles(
   pipeline: ResolvedPipelineV2,
@@ -512,28 +517,24 @@ function verifyCompiledExecutionRoles(
     }
     if (compiled.role === "stage") {
       // The recorded `iteration_index` restarts at 1 in every generation and
-      // is therefore not a global identifier, so the projection is resolved
-      // as a conjunction over the unified positional interval, the recorded
-      // index and the compiled stage template. When several generations —
-      // typically a reused template — are indistinguishable at the start
-      // boundary, the query resolves the admissible candidate set and the
-      // verifier's checks (template, iteration index) pass exactly when the
-      // execution is a member of that set; no arbitrary generation is
-      // claimed as a distinguished fact.
-      const open = pipelineV2StageIterationAt(state, execution.index - 1, execution.iteration_index, compiled.stage_template);
-      if (open === null) {
+      // is therefore not a global identifier, so the projection is verified
+      // as membership in the shared candidate set computed over the unified
+      // positional interval, the recorded index and the compiled stage
+      // template. When several generations — typically a reused template —
+      // are indistinguishable at the start boundary, membership still holds
+      // and no generation is claimed; the absence of any matching candidate
+      // is the mismatch. A stage execution without a recorded index is
+      // fail-closed (the loader proves it present; the verifier never
+      // silently drops the index filter).
+      const recorded = execution.iteration_index;
+      if (recorded === undefined) {
+        throw mismatch(
+          `execution ${execution.index} runs the stage role without a recorded iteration index`,
+        );
+      }
+      if (!pipelineV2StageIterationMembershipAt(state, execution.index - 1, recorded, compiled.stage_template)) {
         throw mismatch(
           `execution ${execution.index} records iteration ${execution.iteration_index}, but no stage iteration open at its start boundary matches the stage template ${JSON.stringify(compiled.stage_template)}`,
-        );
-      }
-      if (open.template_id !== compiled.stage_template) {
-        throw mismatch(
-          `execution ${execution.index} runs in generation ${open.generation_index} bound to stage template ${JSON.stringify(open.template_id)}, but the compiled orchestration assigns stage template ${JSON.stringify(compiled.stage_template)} to ${JSON.stringify(execution.state_id)}`,
-        );
-      }
-      if (open.iteration_index !== execution.iteration_index) {
-        throw mismatch(
-          `execution ${execution.index} records iteration ${execution.iteration_index}, but the open iteration at its start boundary is ${open.iteration_index}`,
         );
       }
     }

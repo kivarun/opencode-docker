@@ -5,20 +5,34 @@
  * this child process does, with a finite wall-clock timeout enforced by
  * the parent. The child validates one document given by path, reports the
  * outcome on stdout, and always exits: an accepted document prints
- * `ACCEPTED`, a typed rejection prints `REJECTED:<message>`, and an
- * unexpected child failure exits non-zero with the error on stderr.
+ * `ACCEPTED`, a typed `PipelineV2StateError` rejection — the only expected
+ * failure — prints `REJECTED:<message>` and exits 0, and any other error
+ * is never marked as an expected rejection: it is printed to stderr and
+ * the child exits non-zero, so a programmer error or an unexpected runtime
+ * failure can never look like a successful typed-rejection proof. The
+ * reserved `--hang` argument is a test-only mode used by the parent's
+ * bounded-hang regression: the child blocks forever so the parent's
+ * spawnSync timeout must kill only this child and fail the test normally.
  */
-import { validatePipelineV2RunState } from "../src/pipeline_v2_state.ts";
+import { PipelineV2StateError, validatePipelineV2RunState } from "../src/pipeline_v2_state.ts";
 
 const path = process.argv[2];
 if (path === undefined) {
-  console.log("CHILD-ERROR:no document path was passed");
+  console.error("CHILD-ERROR:no document path was passed");
   process.exit(1);
+}
+if (path === "--hang") {
+  await new Promise<never>(() => {});
 }
 try {
   const raw = await Bun.file(path).text();
   validatePipelineV2RunState(JSON.parse(raw));
   console.log("ACCEPTED");
 } catch (cause) {
-  console.log(`REJECTED:${(cause as Error).message}`);
+  if (cause instanceof PipelineV2StateError) {
+    console.log(`REJECTED:${cause.message}`);
+  } else {
+    console.error(cause instanceof Error ? cause.stack ?? cause.message : String(cause));
+    process.exit(1);
+  }
 }

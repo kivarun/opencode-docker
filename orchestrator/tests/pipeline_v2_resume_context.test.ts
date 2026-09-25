@@ -2060,7 +2060,7 @@ test("45. the same-boundary exhausted closure is restorable the same way", async
   }
 });
 
-test("46. the touching same-boundary pair resolves to the iteration the execution started in (closed first)", async () => {
+test("46. the touching same-boundary pair restores by membership in the admissible candidate set (closed first)", async () => {
   const base = await setupStageBase();
   try {
     driveStageTouching(base, true);
@@ -2073,7 +2073,7 @@ test("46. the touching same-boundary pair resolves to the iteration the executio
   }
 });
 
-test("47. the touching same-boundary pair resolves to the reopened iteration when the execution started in it", async () => {
+test("47. the touching same-boundary pair restores by membership when the execution started in the reopened iteration", async () => {
   const base = await setupStageBase();
   try {
     driveStageTouching(base, false);

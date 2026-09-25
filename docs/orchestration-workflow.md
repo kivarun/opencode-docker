@@ -1689,14 +1689,20 @@ before it; a closure anchored at that boundary follows the execution it
 contains, while a wait-bound closure at the same boundary precedes every
 start of that boundary; the recorded iteration index — which restarts at 1
 in every generation and is not a global identifier — and the compiled stage
-template of the execution's state are filters of the candidate
-conjunction, so a touching boundary between two generations is resolved by
-the template; when several generations remain indistinguishable (a reused
-template with the same iteration index) the query returns the admissible
-candidate set's last member in generation order, never a silent arbitrary
-pick) are the single shared
-open-iteration resolvers, consumed by the restore verifier (the current
-snapshot query also by the coordinator).
+template of the execution's state are filters of one shared internal
+candidate resolver, so a touching boundary between two generations with
+different templates is resolved uniquely by the template; when several
+generations remain indistinguishable (a reused template with the same
+iteration index) the exact lookup claims no generation at all — only a
+unique candidate returns a projection, zero and ambiguous sets resolve to
+`null`, and no first or last member of the ambiguous set is ever selected)
+are the two consumer faces of the same shared resolver: the exact lookup,
+and the exported `pipelineV2StageIterationMembershipAt` membership
+predicate for the restore verifier, which requires only that the execution
+belongs to the admissible candidate set (ambiguity between matching
+generations is not a mismatch; the absence of any matching candidate is)
+and never claims a generation of its own — the current snapshot query is
+also consumed by the coordinator.
 
 P01 boundary: this increment implements only the generic durable
 request/response pair and the routing to a pre-declared action. It does

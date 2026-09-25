@@ -3162,10 +3162,11 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
  * The single open stage iteration of a validated run state, if any: the
  * open generation (the last record without a `closed` projection) whose
  * last iteration entry is still open. The coordinator resolves the exact
- * durable `iteration_index` of a stage start from it; the restore
- * verifier uses the same shape for its compiled projection checks. There
- * is no second registry and no replay here — the loader has already
- * proven the document's coherence.
+ * durable `iteration_index` of a stage start from it. There is no second
+ * registry and no replay here — the loader has already proven the
+ * document's coherence; the restore verifier's projection check is the
+ * sibling membership predicate over the shared interval resolver, not
+ * this open-iteration query.
  */
 export function pipelineV2OpenStageIteration(
   state: PipelineV2RunState,
@@ -3222,41 +3223,27 @@ function iterationOpenForStart(iteration: PipelineV2StageIterationRecord, bounda
 }
 
 /**
- * The stage generation an execution's `iteration_index` references. The
- * loader's positional replay proves the referenced iteration was open at
- * the execution's start; this pure query is the read-only resolution the
- * restore verifier uses, resolved with the same unified interval the
- * loader's execution-start check applies, so the two sides cannot drift
- * apart. The optional recorded iteration index narrows the candidate set
- * by the per-generation iteration index (which restarts at 1 in every
- * generation and is therefore not a global identifier), and the optional
- * stage template narrows it further by the compiled template the
- * execution's state belongs to. The one indistinguishable shape that
- * remains after both filters is a same-boundary combination in which
- * several generations — typically a reused template across plan stages —
- * all satisfy the interval and agree on the recorded index and template;
- * the durable data cannot distinguish their generation ordinals, so the
- * query resolves the admissible candidate set and returns its last member
- * in generation order. That member answers every check the restore
- * verifier performs (template, stage, iteration index), and the returned
- * `generation_index` is the admissible projection's member, not a
- * generation the durable data distinguishes. A reference or template
- * outside the candidates resolves to nothing. Without both filters an
- * ambiguous boundary resolves to the last interval candidate rather than
- * to an arbitrary first candidate.
+ * The single shared internal candidate resolver for stage-iteration
+ * projection at an execution start boundary: every generation/iteration
+ * pair whose unified positional interval is open at the boundary,
+ * narrowed by the optional recorded per-generation iteration index and
+ * the optional compiled stage template. Both public consumers — the
+ * exact lookup and the membership predicate — resolve through this one
+ * resolver, so their candidate logic cannot drift apart. The candidate
+ * list itself is never exported.
  */
-export function pipelineV2StageIterationAt(
+interface StageIterationCandidate {
+  readonly generation: PipelineV2StageGenerationRecord;
+  readonly iteration: PipelineV2StageIterationRecord;
+}
+
+function stageIterationCandidatesAt(
   state: PipelineV2RunState,
   transitionCount: number,
   recordedIterationIndex?: number,
   stageTemplate?: string,
-): {
-  readonly generation_index: number;
-  readonly template_id: string;
-  readonly stage_id: string;
-  readonly iteration_index: number;
-} | null {
-  const matches: { generation: PipelineV2StageGenerationRecord; iteration: PipelineV2StageIterationRecord }[] = [];
+): StageIterationCandidate[] {
+  const matches: StageIterationCandidate[] = [];
   for (const generation of state.generations) {
     for (const iteration of generation.iterations) {
       if (iterationOpenForStart(iteration, transitionCount)) {
@@ -3271,16 +3258,67 @@ export function pipelineV2StageIterationAt(
   if (stageTemplate !== undefined) {
     candidates = candidates.filter((match) => match.generation.template_id === stageTemplate);
   }
-  if (candidates.length === 0) {
+  return candidates;
+}
+
+/**
+ * The exact stage-iteration projection at an execution start boundary —
+ * answered only when the durable data proves exactly one candidate. The
+ * unified positional interval, the optional recorded iteration index
+ * (which restarts at 1 in every generation and is therefore not a global
+ * identifier) and the optional stage template are applied as filters by
+ * the single shared internal candidate resolver. A unique candidate is
+ * returned as the frozen projection; zero candidates resolve to `null`
+ * (nothing open at the boundary matches the filters); more than one
+ * candidate — e.g. a reused template with the same iteration index across
+ * touching generations on one boundary — also resolves to `null`: the
+ * durable data cannot distinguish the generation ordinals, so no
+ * generation is claimed and no first or last element of the ambiguous
+ * set is ever selected. A reference or template outside the candidates
+ * resolves to nothing.
+ */
+export function pipelineV2StageIterationAt(
+  state: PipelineV2RunState,
+  transitionCount: number,
+  recordedIterationIndex?: number,
+  stageTemplate?: string,
+): {
+  readonly generation_index: number;
+  readonly template_id: string;
+  readonly stage_id: string;
+  readonly iteration_index: number;
+} | null {
+  const candidates = stageIterationCandidatesAt(state, transitionCount, recordedIterationIndex, stageTemplate);
+  if (candidates.length !== 1) {
     return null;
   }
-  const chosen = candidates[candidates.length - 1]!;
+  const chosen = candidates[0]!;
   return Object.freeze({
     generation_index: chosen.generation.index,
     template_id: chosen.generation.template_id,
     stage_id: chosen.generation.stage_id,
     iteration_index: chosen.iteration.index,
   });
+}
+
+/**
+ * The membership form of the same shared candidate resolver, exported for
+ * the restore verifier in `pipeline_v2_resume_context.ts`: the execution
+ * belongs to the admissible candidate set exactly when at least one
+ * candidate matches the start boundary's interval, the recorded iteration
+ * index and the compiled stage template. Ambiguity between several
+ * matching generations is not a mismatch here — the durable data cannot
+ * distinguish their ordinals and the verifier claims no generation of its
+ * own; the absence of any matching candidate is the mismatch. The
+ * candidate list itself stays internal and is not exported.
+ */
+export function pipelineV2StageIterationMembershipAt(
+  state: PipelineV2RunState,
+  transitionCount: number,
+  recordedIterationIndex: number,
+  stageTemplate: string,
+): boolean {
+  return stageIterationCandidatesAt(state, transitionCount, recordedIterationIndex, stageTemplate).length > 0;
 }
 
 export function parsePipelineV2RunState(raw: string): PipelineV2RunState {

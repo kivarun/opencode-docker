@@ -12,6 +12,7 @@ import {
   parsePipelineV2RunState,
   pipelineV2OpenStageIteration,
   pipelineV2StageIterationAt,
+  pipelineV2StageIterationMembershipAt,
   reducePipelineV2RunCommand,
   validatePipelineV2RunState,
   type PipelineDecisionStateRecord,
@@ -4655,6 +4656,58 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     }
   });
 
+  test("the loader-termination child reports unexpected errors as failures, not as expected rejections", () => {
+    // Only a typed `PipelineV2StateError` is the expected loader rejection
+    // (the bounded-hang test above). Any other error — here a malformed
+    // JSON document raising SyntaxError and a missing document path
+    // raising ENOENT, both natural triggers without a test seam — must
+    // never be marked as an expected `REJECTED:` rejection: the child
+    // prints it to stderr and exits non-zero, so a programmer error or an
+    // unexpected runtime failure cannot masquerade as a successful typed
+    // rejection proof.
+    const childPath = join(import.meta.dir, "loader_termination_child.ts");
+    const dir = mkdtempSync(join(tmpdir(), "loader-term-"));
+    try {
+      const malformedPath = join(dir, "malformed.json");
+      writeFileSync(malformedPath, "{not json");
+      const malformed = spawnSync(process.execPath, [childPath, malformedPath], { timeout: 4000, encoding: "utf8" });
+      if (malformed.status === null) {
+        throw new Error(`the child was killed at the timeout (signal ${String(malformed.signal)})`);
+      }
+      expect(malformed.status).not.toBe(0);
+      const malformedStdout = String(malformed.stdout ?? "").trim();
+      expect(malformedStdout.startsWith("REJECTED:")).toBe(false);
+      expect(malformedStdout).not.toContain("ACCEPTED");
+      expect(String(malformed.stderr ?? "").length).toBeGreaterThan(0);
+
+      const missing = spawnSync(process.execPath, [childPath, join(dir, "absent.json")], { timeout: 4000, encoding: "utf8" });
+      if (missing.status === null) {
+        throw new Error(`the child was killed at the timeout (signal ${String(missing.signal)})`);
+      }
+      expect(missing.status).not.toBe(0);
+      const missingStdout = String(missing.stdout ?? "").trim();
+      expect(missingStdout.startsWith("REJECTED:")).toBe(false);
+      expect(missingStdout).not.toContain("ACCEPTED");
+      expect(String(missing.stderr ?? "").length).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a hung loader-termination child is killed at the finite timeout and the test keeps running", () => {
+    // The documented test-only `--hang` mode blocks the child forever; the
+    // parent's spawnSync timeout must kill only this child (no leftover
+    // process) while the main test process continues to the assertions.
+    const child = spawnSync(
+      process.execPath,
+      [join(import.meta.dir, "loader_termination_child.ts"), "--hang"],
+      { timeout: 2000, encoding: "utf8" },
+    );
+    expect(child.status).toBeNull();
+    expect(child.signal).toBe("SIGTERM");
+    expect(String(child.stdout ?? "")).toBe("");
+  });
+
   test("the loader rejects a transition committed inside an unresolved answered wait", () => {
     // The exact accepted-at-b10678c form: the reducer builds the run through
     // the wait entry, the accepted intent and the grant at count 6 (the
@@ -5057,26 +5110,25 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
       template_id: "testing",
       iteration_index: 1,
     });
-    // without the template filter the candidates are indistinguishable; the
-    // documented resolution is the admissible set's last member, not the
-    // arbitrary first one
-    expect(pipelineV2StageIterationAt(state, 2, 1)).toMatchObject({
-      generation_index: 2,
-      template_id: "testing",
-      iteration_index: 1,
-    });
+    // with only the recorded index the touching generations are
+    // indistinguishable: neither generation is claimed, and neither the
+    // first (generation 1) nor the last (generation 2) member of the
+    // ambiguous set is selected
+    expect(pipelineV2StageIterationAt(state, 2, 1)).toBe(null);
     // a recorded index or template matching no candidate resolves to nothing
     expect(pipelineV2StageIterationAt(state, 2, 5)).toBe(null);
     expect(pipelineV2StageIterationAt(state, 2, 1, "nonexistent")).toBe(null);
   });
 
-  test("a reused template at a touching boundary resolves to the admissible candidate set's member", () => {
+  test("a reused template at a touching boundary is ambiguous for the exact lookup and membership-only for restore", () => {
     // The same stage template is reused by two plan stages: generation 2
     // opens with the same template at the touching boundary. The candidates
     // agree on template and iteration index and differ only in the
     // generation ordinal, which the durable data does not distinguish; the
-    // query returns the admissible set's last member and the restore
-    // verifier's checks pass for any member.
+    // exact lookup claims no generation (the pre-fix behavior fabricated
+    // the currently-open generation 2 although the execution started in
+    // generation 1), while the restore verifier's membership in the shared
+    // candidate set still holds.
     const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
     lifecycleOpenPrefix(driver);
     stageAgent(driver, "dev_entry", 1, 3);
@@ -5088,12 +5140,80 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     const state = driver.current as PipelineV2RunState;
     validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
     expect(pipelineV2OpenStageIteration(state)).toMatchObject({ generation_index: 2, template_id: "development", stage_id: "testing_stage" });
-    expect(pipelineV2StageIterationAt(state, 2, 1, "development")).toMatchObject({
-      generation_index: 2,
+    // the exact lookup never resolves an ambiguous candidate set by array
+    // order: the interval anchors cannot distinguish the touching
+    // generations' ordinals for this boundary, so neither a first-selection
+    // (generation 1) nor a last-selection (the currently-open generation 2)
+    // is claimed — the pre-fix behavior returned generation 2 although the
+    // loader's own containment rule proves the execution started inside
+    // generation 1's iteration 1 (its closure follows the execution it
+    // contains)
+    expect(pipelineV2StageIterationAt(state, 2, 1, "development")).toBe(null);
+    // the restore verifier's membership in the shared candidate set still
+    // holds for the touching boundary: the execution is a member of at
+    // least one admissible candidate
+    expect(pipelineV2StageIterationMembershipAt(state, 2, 1, "development")).toBe(true);
+  });
+
+  test("touching iterations of one generation are disambiguated by the recorded index", () => {
+    // One generation whose iteration 1 closes and iteration 2 opens at the
+    // same boundary where the execution started: the two interval
+    // candidates share the generation and template and differ only in the
+    // per-generation index, so the recorded index is the unique filter.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply(iterOpened({ generationIndex: 1, iterationIndex: 2, transitionCount: 2 }));
+    commitTransition(driver, "dev_entry", "completed", "gate", 3);
+    const state = driver.current as PipelineV2RunState;
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    expect(pipelineV2StageIterationAt(state, 2, 1)).toMatchObject({
+      generation_index: 1,
       template_id: "development",
-      stage_id: "testing_stage",
+      stage_id: "development",
       iteration_index: 1,
     });
+    expect(pipelineV2StageIterationAt(state, 2, 2)).toMatchObject({
+      generation_index: 1,
+      template_id: "development",
+      stage_id: "development",
+      iteration_index: 2,
+    });
+    // without the recorded index the touching pair is ambiguous and no
+    // generation/iteration pair is claimed
+    expect(pipelineV2StageIterationAt(state, 2)).toBe(null);
+    // membership holds for both recorded references of the touching pair
+    expect(pipelineV2StageIterationMembershipAt(state, 2, 1, "development")).toBe(true);
+    expect(pipelineV2StageIterationMembershipAt(state, 2, 2, "development")).toBe(true);
+  });
+
+  test("the membership predicate follows the shared resolver exactly", () => {
+    // Wrong recorded index and wrong template leave no matching candidate
+    // (the restore verifier's pipeline_mismatch); the unique forms of the
+    // touching-generations state above keep their exact answers.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed());
+    driver.apply(genOpened({ stageId: "testing", stagePosition: 2, templateId: "testing", transitionCount: 2 }));
+    driver.apply(iterOpened({ generationIndex: 2, iterationIndex: 1, transitionCount: 2 }));
+    commitTransition(driver, "dev_entry", "completed", "gate", 3);
+    const state = driver.current as PipelineV2RunState;
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    // unique candidates through the template filter keep the exact lookups
+    expect(pipelineV2StageIterationAt(state, 2, 1, "development")).toMatchObject({ generation_index: 1, iteration_index: 1 });
+    expect(pipelineV2StageIterationAt(state, 2, 1, "testing")).toMatchObject({ generation_index: 2, iteration_index: 1 });
+    // membership: any recorded index not in the candidate set is false
+    expect(pipelineV2StageIterationMembershipAt(state, 2, 1, "development")).toBe(true);
+    expect(pipelineV2StageIterationMembershipAt(state, 2, 5, "development")).toBe(false);
+    expect(pipelineV2StageIterationMembershipAt(state, 2, 1, "nonexistent")).toBe(false);
+    // an execution of the testing state matches only the testing template
+    expect(pipelineV2StageIterationMembershipAt(state, 3, 1, "testing")).toBe(true);
+    expect(pipelineV2StageIterationMembershipAt(state, 3, 1, "development")).toBe(false);
+    // a boundary before the lifecycle records resolves to nothing
+    expect(pipelineV2StageIterationMembershipAt(state, 0, 1, "development")).toBe(false);
   });
 
   test("a waiting run never carries lifecycle mutations and the response demands the closed iteration", () => {
@@ -5173,5 +5293,39 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     for (const banned of ["evidence", "manifest", "request", "user_response", "task_body", "plan_body", "profile_bindings", "endpoint", "token", "bearer", "prompt", "summary"]) {
       expect(keys.has(banned), `the state must not carry a ${banned} field`).toBe(false);
     }
+  });
+
+  test("the runtime export surface is exactly the fixed constants, validators, reducers and shared queries", async () => {
+    // Runtime (value) exports only: type-only exports never appear here.
+    // The list pins the shared stage-iteration query surface — the exact
+    // lookup and the membership predicate — and proves no candidate-array
+    // resolver or internal helper leaks from the module.
+    const namespace = (await import("../src/pipeline_v2_state.ts")) as Record<string, unknown>;
+    expect(Object.keys(namespace).sort()).toEqual([
+      "PIPELINE_V2_AGENT_EXECUTION_FAILURE_REASONS",
+      "PIPELINE_V2_AGENT_EXECUTION_PHASES",
+      "PIPELINE_V2_DECISION_EXECUTION_FAILURE_REASONS",
+      "PIPELINE_V2_DECISION_EXECUTION_PHASES",
+      "PIPELINE_V2_EXECUTION_ROLES",
+      "PIPELINE_V2_FAILURE_REASONS",
+      "PIPELINE_V2_PORT_TYPES",
+      "PIPELINE_V2_RUN_PHASES",
+      "PIPELINE_V2_RUN_STATE_SCHEMA_VERSION",
+      "PIPELINE_V2_RUN_STATUSES",
+      "PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON",
+      "PIPELINE_V2_STAGE_GENERATION_CLOSE_REASONS",
+      "PIPELINE_V2_STAGE_ITERATION_CLOSE_REASONS",
+      "PIPELINE_V2_TERMINAL_FAILURE_REASON",
+      "PipelineV2StateError",
+      "expectSafeId",
+      "parsePipelineV2RunState",
+      "pipelineV2OpenStageIteration",
+      "pipelineV2StageIterationAt",
+      "pipelineV2StageIterationMembershipAt",
+      "reducePipelineV2RunCommand",
+      "validatePipelineIdentityV2",
+      "validatePipelineV2RunState",
+      "validateRunInputState",
+    ]);
   });
 });
