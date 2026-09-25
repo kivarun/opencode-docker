@@ -38,6 +38,35 @@ function nextTick(): Date {
   return new Date(Date.UTC(2026, 8, 25, 0, 0, tick));
 }
 
+/** A fixed ISO timestamp for Date-like stand-ins (no counter involvement). */
+function isoAt(seconds: number): string {
+  return new Date(Date.UTC(2026, 8, 25, 0, 0, seconds)).toISOString();
+}
+
+/** Removes // line and /* block comments so a source pin never counts them. */
+function stripComments(source: string): string {
+  let out = "";
+  let index = 0;
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (char === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") {
+        index += 1;
+      }
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      const end = source.indexOf("*/", index + 2);
+      index = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    out += char;
+    index += 1;
+  }
+  return out;
+}
+
 /** A reducer-only flow builder with a fixed identity and zero inputs. */
 function build(commands: PipelineV2RunCommand[]): PipelineV2RunState {
   let state: PipelineV2RunState | null = null;
@@ -246,37 +275,70 @@ describe("pipeline v2 post-failure successor gate", () => {
     expect(new Set(reads)).toEqual(new Set(["kind"]));
   });
 
-  test("5. the clock is not called at a gate refusal", () => {
+  test("5. the timestamp boundary is the reducer's own now.toISOString() read", () => {
+    // The reducer receives an already-created `now`; the exact contract is
+    // that a gate refusal never reads `now.toISOString()`. A gate refusal
+    // therefore also succeeds against a `Date`-like object whose timestamp
+    // read throws.
     const failed = failedStageState();
-    let clockCalls = 0;
-    const clock = (): Date => {
-      clockCalls += 1;
-      return nextTick();
-    };
-    expect(() =>
-      reducePipelineV2RunCommand(failed, { kind: "agent_data_prepared" }, clock()),
-    ).toThrow(PipelineV2StateError);
-    // the clock is evaluated by the caller before the reducer call in this
-    // binding style; a gate refusal must therefore not reach the reducer's
-    // own `now` read below — asserted through the reducer contract instead
-    expect(clockCalls).toBe(1);
-    // the reducer's own clock use happens only after the gate: a settled
-    // boundary command that fails INSIDE a case does call the clock
-    let caseClockCalls = 0;
-    const caseClock = (): Date => {
-      caseClockCalls += 1;
-      return nextTick();
-    };
+    const before = JSON.stringify(failed);
+    let toIsoCalls = 0;
+    const canary = new Error("TO_ISO_CALLED_AT_GATE");
+    const hostileNow = {
+      toISOString() {
+        toIsoCalls += 1;
+        throw canary;
+      },
+    } as unknown as Date;
+    let caught: unknown;
     try {
-      reducePipelineV2RunCommand(
-        failedStageState().generations.length > 0 ? failedStageState() : failedStageState(),
-        { kind: "agent_running" },
-        caseClock(),
-      );
-    } catch {
-      // the case-level failure path
+      reducePipelineV2RunCommand(failed, { kind: "agent_data_prepared" }, hostileNow);
+    } catch (cause) {
+      caught = cause;
     }
-    expect(caseClockCalls).toBe(1);
+    expect(caught).toBeInstanceOf(PipelineV2StateError);
+    expect((caught as Error).message).toContain(GATE_MESSAGE_PART);
+    expect(caught).not.toBe(canary);
+    expect(toIsoCalls).toBe(0);
+    expect(JSON.stringify(failed)).toBe(before);
+    // positive control: an allowed finalizer reaches the timestamp boundary
+    // exactly once and finalizes successfully with a normal return
+    let finalizeCalls = 0;
+    const finalizeNow = {
+      toISOString() {
+        finalizeCalls += 1;
+        return isoAt(99);
+      },
+    } as unknown as Date;
+    const finalized = reducePipelineV2RunCommand(
+      failedStageState(),
+      { kind: "run_failed", reason: "worker_failed" },
+      finalizeNow,
+    );
+    expect(finalizeCalls).toBe(1);
+    expect(finalized.status).toBe("failed");
+    expect(finalized.phase).toBe("finished");
+    expect(finalized.updated_at).toBe(isoAt(99));
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(finalized)) as never);
+    // a command that passes the gate but fails inside its own case still
+    // reads the timestamp exactly once before the case failure
+    let caseCalls = 0;
+    const caseNow = {
+      toISOString() {
+        caseCalls += 1;
+        return isoAt(98);
+      },
+    } as unknown as Date;
+    let caseMessage: string | undefined;
+    try {
+      reducePipelineV2RunCommand(failedStageState(), { kind: "run_cleanup_failed" }, caseNow);
+    } catch (cause) {
+      caseMessage = (cause as Error).message;
+    }
+    expect(caseMessage).toContain(
+      "a cleanup failure requires the last agent execution to have failed with an unconfirmed session cleanup",
+    );
+    expect(caseCalls).toBe(1);
   });
 
   test("6. a gate refusal leaves the state document byte-identical", () => {
@@ -547,5 +609,219 @@ describe("pipeline v2 post-failure successor gate", () => {
     // the state document carries no event journal
     expect(source.includes("events:")).toBe(false);
     expect(source.includes("event_journal")).toBe(false);
+  });
+
+  test("22. a changing-discriminator command cannot bypass the gate: exactly one kind read, typed rejection", () => {
+    // On the pre-fix reducer this exact accessor sequence — create_run
+    // probe, waiting probe, finalizer probe, switch kind — walked past the
+    // post-failure gate and accepted a forbidden revision-1
+    // task_revision_accepted on a failed planning state (revision grew,
+    // the task ledger grew). The single capture routes every check through
+    // the first read, so the command is now rejected by the typed gate.
+    const failed = failedPlanningState();
+    const before = JSON.stringify(failed);
+    const sequence = ["agent_data_prepared", "agent_data_prepared", "run_failed", "task_revision_accepted"];
+    let kindReads = 0;
+    const hostile = new Proxy(
+      { taskId: "task-b", revision: 1, taskSha256: hex("e") } as unknown as PipelineV2RunCommand,
+      {
+        get(target, property, receiver) {
+          if (property === "kind") {
+            const value = sequence[Math.min(kindReads, sequence.length - 1)];
+            kindReads += 1;
+            return value;
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    let message: string | undefined;
+    try {
+      reducePipelineV2RunCommand(failed, hostile, nextTick());
+    } catch (cause) {
+      message = (cause as Error).message;
+    }
+    expect(message).toContain(`command ${JSON.stringify("agent_data_prepared")} rejected`);
+    expect(message).toContain(GATE_MESSAGE_PART);
+    expect(kindReads).toBe(1);
+    // the state is byte-identical: no revision, no task ledger record
+    expect(JSON.stringify(failed)).toBe(before);
+    expect(failed.revision).toBe(7);
+    expect(failed.task_revisions).toEqual([]);
+  });
+
+  test("23. the gate reads the discriminator exactly once: a second kind read can never happen", () => {
+    const failed = failedPlanningState();
+    let kindReads = 0;
+    const hostile = new Proxy({} as unknown as PipelineV2RunCommand, {
+      get(target, property, receiver) {
+        if (property === "kind") {
+          kindReads += 1;
+          if (kindReads >= 2) {
+            throw new Error("SECOND_KIND_READ");
+          }
+          return "agent_data_prepared";
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    let message: string | undefined;
+    try {
+      reducePipelineV2RunCommand(failed, hostile, nextTick());
+    } catch (cause) {
+      message = (cause as Error).message;
+    }
+    expect(message).toContain(GATE_MESSAGE_PART);
+    expect(message).not.toContain("SECOND_KIND_READ");
+    expect(kindReads).toBe(1);
+  });
+
+  test("24. the allowed run_failed finalizer reads the discriminator exactly once", () => {
+    const failed = failedStageState();
+    let kindReads = 0;
+    const hostile = new Proxy({ reason: "worker_failed" } as unknown as PipelineV2RunCommand, {
+      get(target, property, receiver) {
+        if (property === "kind") {
+          kindReads += 1;
+          return "run_failed";
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const finalized = reducePipelineV2RunCommand(failed, hostile, nextTick());
+    expect(kindReads).toBe(1);
+    expect(finalized.status).toBe("failed");
+    expect(finalized.phase).toBe("finished");
+    expect(finalized.failure).toEqual({ reason: "worker_failed" });
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(finalized)) as never);
+  });
+
+  test("25. the allowed run_cleanup_failed finalizer reads the discriminator exactly once", () => {
+    const failed = cleanupFailedState();
+    let kindReads = 0;
+    const hostile = new Proxy({} as unknown as PipelineV2RunCommand, {
+      get(target, property, receiver) {
+        if (property === "kind") {
+          kindReads += 1;
+          return "run_cleanup_failed";
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const finalized = reducePipelineV2RunCommand(failed, hostile, nextTick());
+    expect(kindReads).toBe(1);
+    expect(finalized.status).toBe("cleanup_failed");
+    expect(finalized.phase).toBe("finished");
+    expect(finalized.failure).toEqual({ reason: "session_cleanup_failed" });
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(finalized)) as never);
+  });
+
+  test("26. a discriminator accessor that throws on the first read propagates by identity and reads no payload", () => {
+    const failed = failedPlanningState();
+    const before = JSON.stringify(failed);
+    const canary = new Error("FIRST_KIND_READ_THROWS");
+    let payloadReads = 0;
+    const hostile = new Proxy(
+      { taskId: "task-b", revision: 1, taskSha256: hex("e") } as unknown as PipelineV2RunCommand,
+      {
+        get(target, property, receiver) {
+          if (property === "kind") {
+            throw canary;
+          }
+          payloadReads += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    let caught: unknown;
+    try {
+      reducePipelineV2RunCommand(failed, hostile, nextTick());
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBe(canary);
+    expect(JSON.stringify(failed)).toBe(before);
+    expect(payloadReads).toBe(0);
+  });
+
+  test("27. plain create_run works and reads the discriminator exactly once", () => {
+    let kindReads = 0;
+    const plain = new Proxy(
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] } as PipelineV2RunCommand,
+      {
+        get(target, property, receiver) {
+          if (property === "kind") {
+            kindReads += 1;
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const created = reducePipelineV2RunCommand(null, plain, nextTick());
+    expect(kindReads).toBe(1);
+    expect(created.run_id).toBe(RUN_ID);
+    expect(created.revision).toBe(1);
+    expect(created.status).toBe("active");
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(created)) as never);
+  });
+
+  test("28. plain no-state, waiting and finalized diagnostics are byte-identical", () => {
+    // no-state diagnostic (the pre-switch message carries the captured kind)
+    let noStateMessage: string | undefined;
+    try {
+      reducePipelineV2RunCommand(null, { kind: "agent_data_prepared" }, nextTick());
+    } catch (cause) {
+      noStateMessage = (cause as Error).message;
+    }
+    expect(noStateMessage).toBe("command agent_data_prepared rejected: no pipeline v2 run state exists yet");
+    // waiting diagnostic
+    const waiting = build([
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      {
+        kind: "run_waiting",
+        stateId: "architect",
+        reason: "stage_iteration_limit_exhausted",
+        requestSha256: hex("1"),
+        actions: [{ id: "revise_task", to: "architect" }],
+      },
+    ]);
+    expect(waiting.status).toBe("waiting");
+    let waitingMessage: string | undefined;
+    try {
+      reducePipelineV2RunCommand(waiting, { kind: "agent_data_prepared" }, nextTick());
+    } catch (cause) {
+      waitingMessage = (cause as Error).message;
+    }
+    expect(waitingMessage).toBe(
+      `command rejected for run ${JSON.stringify(RUN_ID)} (revision 2, status waiting, phase waiting): the run is waiting for an explicit user response; only the wait response and the durable intervention records advance a waiting run`,
+    );
+    // finalized diagnostic
+    const finalized = reducePipelineV2RunCommand(
+      failedPlanningState(),
+      { kind: "run_failed", reason: "worker_failed" },
+      nextTick(),
+    );
+    expect(finalized.status).toBe("failed");
+    let finalizedMessage: string | undefined;
+    try {
+      reducePipelineV2RunCommand(finalized, { kind: "agent_data_prepared" }, nextTick());
+    } catch (cause) {
+      finalizedMessage = (cause as Error).message;
+    }
+    expect(finalizedMessage).toBe(
+      `command rejected for run ${JSON.stringify(RUN_ID)} (revision 8, status failed, phase finished): the run is already finalized with status "failed"; the terminal run status is immutable`,
+    );
+  });
+
+  test("29. source pin: the reducer reads the command discriminator exactly once", () => {
+    const { readFileSync } = require("node:fs") as { readFileSync: (path: string, encoding: string) => string };
+    const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_state.ts"), "utf8");
+    const code = stripComments(source);
+    // exactly one discriminator read in production code: the capture
+    expect((code.match(/command\.kind/g) ?? []).length).toBe(1);
+    expect(code).toContain("const commandKind = command.kind;");
+    // every consumer below the capture goes through the captured value
+    expect(code).toContain("if (commandKind === \"create_run\") {");
+    expect(code).toContain("switch (commandKind) {");
   });
 });

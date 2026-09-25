@@ -3862,7 +3862,11 @@ export function reducePipelineV2RunCommand(
   command: PipelineV2RunCommand,
   now: Date,
 ): PipelineV2RunState {
-  if (command.kind === "create_run") {
+  // The command discriminator is captured exactly once, before the first
+  // branch: a hostile command accessor must not be able to change the
+  // routing between the pre-switch gates and the switch below.
+  const commandKind = command.kind;
+  if (commandKind === "create_run") {
     if (current !== null) {
       throw new PipelineV2StateError(
         `create_run rejected: run ${JSON.stringify(current.run_id)} already exists (revision ${current.revision})`,
@@ -3928,7 +3932,7 @@ export function reducePipelineV2RunCommand(
   }
 
   if (current === null) {
-    throw new PipelineV2StateError(`command ${command.kind} rejected: no pipeline v2 run state exists yet`);
+    throw new PipelineV2StateError(`command ${commandKind} rejected: no pipeline v2 run state exists yet`);
   }
   // The commands a waiting run still accepts: the user-response successor
   // and the schema v7 intervention records that must be durable before
@@ -3941,9 +3945,9 @@ export function reducePipelineV2RunCommand(
     "iteration_grant_recorded",
     "stage_iteration_closed",
   ]);
-  if (command.kind !== "wait_response_recorded" && current.status !== "active") {
+  if (commandKind !== "wait_response_recorded" && current.status !== "active") {
     if (current.status === "waiting") {
-      if (!waitingAllowed.has(command.kind)) {
+      if (!waitingAllowed.has(commandKind)) {
         fail(
           current,
           "the run is waiting for an explicit user response; only the wait response and the durable intervention records advance a waiting run",
@@ -3965,18 +3969,18 @@ export function reducePipelineV2RunCommand(
   // and reject the wrong one with their existing typed semantics. No
   // lifecycle, task/plan, wait, execution, transition, terminal or
   // publication command is accepted after a failed execution. The gate
-  // reads only the command discriminator (never its payload), does not
-  // call the clock, and leaves the revision and the state untouched on
+  // reads the captured discriminator (never the payload), does not read the
+  // clock's timestamp, and leaves the revision and the state untouched on
   // rejection.
   const lastExecution = current.executions[current.executions.length - 1];
   if (
     lastExecution !== undefined &&
     lastExecution.phase === "failed" &&
-    command.kind !== "run_failed" &&
-    command.kind !== "run_cleanup_failed"
+    commandKind !== "run_failed" &&
+    commandKind !== "run_cleanup_failed"
   ) {
     throw new PipelineV2StateError(
-      `command ${JSON.stringify(command.kind)} rejected: the run's last execution ${lastExecution.index} has failed; a failed execution allows only the run failure finalization (run_failed or run_cleanup_failed)`,
+      `command ${JSON.stringify(commandKind)} rejected: the run's last execution ${lastExecution.index} has failed; a failed execution allows only the run failure finalization (run_failed or run_cleanup_failed)`,
     );
   }
 
@@ -3984,7 +3988,7 @@ export function reducePipelineV2RunCommand(
   const at = now.toISOString();
   next.updated_at = at;
   next.revision = current.revision + 1;
-  switch (command.kind) {
+  switch (commandKind) {
     case "start_agent_execution": {
       if (!isPipelineV2SafeId(command.stateId)) {
         throw new PipelineV2StateError(
