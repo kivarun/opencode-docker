@@ -92,7 +92,8 @@
  * in the synchronous prefix as opaque references — the pipeline,
  * candidate and state documents are not traversed here, so no field of
  * them is read before the pipeline/candidate provenance gates have run
- * (the acceptance chain is the first semantic validation: pipeline
+ * (the acceptance chain is the first validation of pipeline/candidate/
+ * state contents after the fail-closed sink poison latch: pipeline
  * provenance, candidate provenance/compile, and only then the state
  * validation and the identity/boundary checks); `dispatch` is bound to
  * the sink once before the first await, caller objects are never frozen

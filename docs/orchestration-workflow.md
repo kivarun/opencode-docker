@@ -2059,7 +2059,8 @@ through the single frozen ops object (`verifyCandidateForAcceptance`,
 `publishCandidate`) — no mutable module-global seam. The capture boundary
 is opaque: the pipeline, candidate and state documents are not traversed
 before the pipeline/candidate provenance gates have run (the acceptance
-chain is the first semantic validation — pipeline provenance, candidate
+chain is the first validation of pipeline/candidate/state contents after
+the fail-closed sink poison latch — pipeline provenance, candidate
 provenance/compile, and only then the state validation and the
 identity/boundary checks), and an unexpected error from a sink getter
 propagates unchanged. The result is
@@ -2070,6 +2071,66 @@ never enter the result or the content-free diagnostics. Not wired:
 coordinator, runner, CLI, the stage generation/iteration lifecycle
 controller, wait/replanning policy, automatic resume and multi-process
 locking.
+
+### Stage generation/iteration controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
+production-neutral controller that guarantees, against the durable
+schema-v7 state, an open stage generation bound exactly to one compiled
+stage of the accepted run plan and an open iteration of that generation.
+The caller chooses the compiled stage (`stageId`) and the initial
+iteration budget (`initialBudget` — the one policy-owned scalar of this
+API); the controller derives every durable binding, index and anchor
+itself and accepts none of them from the caller. The runtime export
+surface is exactly `PipelineV2StageIterationControllerError` (closed
+reasons `invalid_options | invalid_state | lifecycle_conflict |
+state_persist_failed`, immutable `reason`, last authoritative `state`)
+and `ensurePipelineV2StageIteration({compiledPlan, stageId,
+initialBudget, sink})` over the structural `PipelineV2StageIterationControllerSink
+{snapshot, poisoned, dispatch}` seam (the production sink satisfies it);
+the deep-frozen result is `{compiled_stage, generation_index,
+iteration_index, state}` with the exact frozen compiled stage object.
+
+The trusted order is fail-closed: every options field and every sink
+member is captured exactly once as an opaque reference, the sink poison
+latch fires first, then `compiledPipelineV2RunPlanStageFor` is the single
+compiled-plan provenance gate and stage lookup (its own errors keep their
+classes), and only after the gate does `validatePipelineV2RunState` — the
+single state validator — run, followed by the durable bindings: the run
+id must equal the compiled plan's run id and the last durable plan
+revision must carry exactly the compiled plan's revision and digest. The
+stage position comes only from the compiled plan's declaration order, the
+transition anchor only from the durable cursor's transition count, the
+generation and iteration indexes only from the durable ledgers. A run
+boundary that is not active/running — a terminal reached, outputs
+published, a failure recorded, an open wait or an in-flight execution —
+is `invalid_state` before any dispatch.
+
+Reconciliation: with no open generation the controller prepares
+`stage_generation_opened` then `stage_iteration_opened` (iteration 1 of
+the new generation); with an open generation that matches the stage id,
+position, template, plan digest and initial budget exactly, an open
+iteration is an idempotent success with zero dispatch and no open
+iteration is completed by the next `stage_iteration_opened`
+(`iteration_count + 1`); any field difference is a `lifecycle_conflict`
+with zero dispatch — a foreign generation is never accepted, closed or
+rewritten. The reducer stays the single successor authority: the whole
+missing sequence is pre-checked through `reducePipelineV2RunCommand` on a
+local snapshot before the first dispatch (so an effective-budget
+exhaustion is `invalid_state` with zero durable writes), then dispatched
+strictly generation → iteration; after every dispatch the authoritative
+sink snapshot is re-read and must structurally carry exactly the expected
+record, a reducer rejection after a racing identical dispatch is
+idempotent success only on that exact match (otherwise
+`lifecycle_conflict`), and there is no rollback and no automatic second
+dispatch. Durability: sink `not_committed`/`durability_unknown` are
+`state_persist_failed` with the last authoritative (adopted) state; a
+fresh retry recognizes the already durable prefix and dispatches only the
+still-missing steps. Diagnostics are content-free. Not wired: stage
+selection/routing policy, iteration/generation closure, the
+wait/replanning/grant controllers, automatic resume,
+coordinator/runner/CLI wiring, filesystem, Docker Helper/Sessions,
+migrations/API/T3, multi-process locking.
 
 ### Read-only runtime context restoration for a future resume (implemented, not wired)
 
