@@ -1,7 +1,7 @@
 import { basename, join } from "node:path";
+import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 import { isPipelineV2SafeId, isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import {
-  deepFreezeValue,
   immutableDocumentIoFailure,
   immutableDocumentInvalidLayout,
   immutableDocumentConflict,

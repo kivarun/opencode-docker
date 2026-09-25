@@ -2223,7 +2223,7 @@ describe("pipeline v2 run plan acceptance controller", () => {
         "./pipeline_v2_run_plan_candidate.ts",
         "./pipeline_v2_run_plan_compiled.ts",
         "./pipeline_v2.ts",
-        "./pipeline_v2_immutable_document_store_internal.ts",
+        "./pipeline_v2_freeze_internal.ts",
       ];
       expect(importTargets.length).toBeGreaterThan(0);
       for (const target of importTargets) {

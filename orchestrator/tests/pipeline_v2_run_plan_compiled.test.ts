@@ -27,6 +27,11 @@ import {
   type CompiledPipelineV2RunPlanStage,
 } from "../src/pipeline_v2_run_plan_compiled.ts";
 import * as compiledModule from "../src/pipeline_v2_run_plan_compiled.ts";
+import { pipelineV2RunPipelineIdentity } from "../src/pipeline_v2_digest.ts";
+import {
+  compiledRunPlanOriginIdentity,
+  hasCompiledRunPlanProvenance,
+} from "../src/pipeline_v2_run_plan_compiled_internal.ts";
 
 const RUN_ID = "run-1";
 const hex = (char: string): string => char.repeat(64);
@@ -1057,6 +1062,8 @@ test("22. source scan: only pure allowed imports, no second compiler or message 
     "pipeline_v2_orchestration.ts",
     "pipeline_v2_run_plan_candidate_internal.ts",
     "pipeline_v2_run_plan_candidate.ts",
+    "pipeline_v2_digest.ts",
+    "pipeline_v2_run_plan_compiled_internal.ts",
   ];
   for (const target of importTargets) {
     expect(allowed).toContain(target);
@@ -1067,13 +1074,13 @@ test("22. source scan: only pure allowed imports, no second compiler or message 
     "pipeline_v2_coordinator",
     "pipeline_v2_runner",
     "pipeline_v2_wait",
-    "pipeline_v2_digest",
     "pipeline_v2_runtime",
     "pipeline_v2_run_plan_store",
     "pipeline_v2_run_plan_manifests",
     "pipeline_v2_run_plan_bindings",
     "pipeline_v2_run_plan_provenance",
     "pipeline_v2_immutable_document_store_internal",
+    "pipeline_v2_freeze_internal",
     "pipeline_v2_docker",
     "pipeline_v2_resume",
     "run_snapshot_store",
@@ -1102,4 +1109,97 @@ test("22. source scan: only pure allowed imports, no second compiler or message 
   expect(source).not.toContain(".message.indexOf");
   expect(source).not.toContain("instanceof PipelineError ? cause.message");
   expect(source).not.toContain("describeError");
+});
+
+const SINGLE_STAGE = [
+  {
+    id: "stage-1",
+    template: "development",
+    tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+  },
+];
+
+function catchLookup(fn: () => unknown): unknown {
+  try {
+    return fn();
+  } catch (cause) {
+    return cause;
+  }
+}
+
+test("23. the projection shape and byte representation carry no hidden identity", async () => {
+  await withPipeline(async (pipeline) => {
+    const compiled = compilePipelineV2RunPlanCandidate(pipeline, candidateOf(preparedPlan(SINGLE_STAGE), [A1]));
+    expect(Object.keys(compiled).sort()).toEqual([
+      "origin_execution",
+      "plan_revision",
+      "plan_sha256",
+      "run_id",
+      "stages",
+    ]);
+    const json = JSON.stringify(compiled);
+    for (const bannedKey of [
+      "bundle_root",
+      "execution_snapshot",
+      "max_transitions",
+      "schema_version",
+      '"pipeline"',
+    ]) {
+      expect(json.includes(bannedKey)).toBe(false);
+    }
+  });
+});
+
+test("24. the registry binds the exact immutable originating identity, built by the existing construction point", async () => {
+  await withPipeline(async (pipeline) => {
+    const compiled = compilePipelineV2RunPlanCandidate(pipeline, candidateOf(preparedPlan(SINGLE_STAGE), [A1]));
+    const stored = compiledRunPlanOriginIdentity(compiled);
+    const fresh = pipelineV2RunPipelineIdentity(pipeline);
+    expect(Object.isFrozen(stored)).toBe(true);
+    // the stored snapshot is its own object, never an alias of a caller object
+    expect(stored).not.toBe(fresh);
+    expect(stored).not.toBe(pipeline);
+    expect(stored).toEqual(fresh);
+    expect(stored).toEqual(pipelineV2RunPipelineIdentity(pipeline));
+  });
+});
+
+test("25. mutation of the pipeline and of the stored identity is impossible after the compile", async () => {
+  await withPipeline(async (pipeline) => {
+    const compiled = compilePipelineV2RunPlanCandidate(pipeline, candidateOf(preparedPlan(SINGLE_STAGE), [A1]));
+    const stored = compiledRunPlanOriginIdentity(compiled);
+    expect(() => {
+      (stored as unknown as Record<string, unknown>).execution_snapshot_sha256 = hex("0");
+    }).toThrow(TypeError);
+    expect(stored.execution_snapshot_sha256).toBe(pipelineV2RunPipelineIdentity(pipeline).execution_snapshot_sha256);
+    expect(() => {
+      (pipeline as unknown as Record<string, unknown>).entry_state = "architect2";
+    }).toThrow(TypeError);
+    expect(compiledRunPlanOriginIdentity(compiled)).toEqual(pipelineV2RunPipelineIdentity(pipeline));
+  });
+});
+
+test("26. hand-built, spread, cloned and Proxy lookalikes have no registry provenance", async () => {
+  await withPipeline(async (pipeline) => {
+    const compiled = compilePipelineV2RunPlanCandidate(pipeline, candidateOf(preparedPlan(SINGLE_STAGE), [A1]));
+    const handBuilt = JSON.parse(JSON.stringify(compiled)) as CompiledPipelineV2RunPlan;
+    const spread = { ...compiled } as unknown as CompiledPipelineV2RunPlan;
+    const proxy = new Proxy(compiled, {});
+    for (const lookalike of [handBuilt, spread, proxy]) {
+      expect(hasCompiledRunPlanProvenance(lookalike)).toBe(false);
+    }
+    expect(hasCompiledRunPlanProvenance(compiled)).toBe(true);
+    const spreadCause = catchLookup(() => compiledPipelineV2RunPlanStageFor(spread, "stage-1"));
+    expect(spreadCause).toBeInstanceOf(PipelineV2CompiledRunPlanError);
+    expect((spreadCause as PipelineV2CompiledRunPlanError).reason).toBe("invalid_plan");
+  });
+});
+
+test("27. the internal registry runtime surface is exactly the three keys", async () => {
+  const registry = (await import("../src/pipeline_v2_run_plan_compiled_internal.ts")) as Record<string, unknown>;
+  expect(Object.keys(registry).sort()).toEqual([
+    "compiledRunPlanOriginIdentity",
+    "hasCompiledRunPlanProvenance",
+    "registerCompiledRunPlanIdentity",
+  ]);
 });

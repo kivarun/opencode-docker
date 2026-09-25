@@ -13,6 +13,7 @@ import {
   type FileHandle,
 } from "node:fs/promises";
 import { isErrnoException, isInsideRoot } from "./fs_checks.ts";
+import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 
 /**
  * Internal neutral substrate for immutable canonical document publication
@@ -346,23 +347,6 @@ export function describeImmutableObject(info: Stats): string {
           : info.isSocket()
             ? "a unix socket"
             : "an unexpected object";
-}
-
-export function deepFreezeValue<T>(value: T): T {
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      deepFreezeValue(entry);
-    }
-    Object.freeze(value);
-    return value;
-  }
-  if (value !== null && typeof value === "object") {
-    for (const child of Object.values(value)) {
-      deepFreezeValue(child);
-    }
-    Object.freeze(value);
-  }
-  return value;
 }
 
 /**

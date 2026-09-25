@@ -29,10 +29,17 @@
  * registry lookup, the candidate's getters and Proxy traps never fire),
  * and both run before any manifest field is read. The compiled projection
  * is registered in a module-private registry immediately before the
- * successful return; the lookup API gates on that registry before any
- * field of the compiled plan is read. There is no second candidate
- * registry, no public registry/minter/test-seam API, and caller objects
- * are never mutated or frozen.
+ * successful return, together with the immutable snapshot of the
+ * originating pipeline's durable run identity built exclusively by the
+ * existing `pipelineV2RunPipelineIdentity` construction point — so a
+ * compiled plan of one pipeline is provenance-bound to that pipeline and
+ * cannot be accepted against the durable state of another; the lookup API
+ * gates on that registry before any field of the compiled plan is read,
+ * and the durable-state consumers compare the hidden originating identity
+ * through the single existing `comparePipelineV2RunIdentity`. The hidden
+ * identity is not part of the public projection shape. There is no second
+ * candidate registry, no public registry/minter/test-seam API, and caller
+ * objects are never mutated or frozen.
  *
  * Errors stay with their owners: pipeline provenance failures remain the
  * stable `PipelineError` of the pipeline gate, and orchestration resolver
@@ -57,6 +64,11 @@ import {
 } from "./pipeline_v2_orchestration.ts";
 import { hasPreparedRunPlanCandidateProvenance } from "./pipeline_v2_run_plan_candidate_internal.ts";
 import type { PreparedPipelineV2RunPlanCandidate } from "./pipeline_v2_run_plan_candidate.ts";
+import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
+import {
+  hasCompiledRunPlanProvenance,
+  registerCompiledRunPlanIdentity,
+} from "./pipeline_v2_run_plan_compiled_internal.ts";
 
 /** The closed reason set of this layer's own failures. */
 const PIPELINE_V2_COMPILED_RUN_PLAN_ERROR_REASONS = [
@@ -146,16 +158,6 @@ const UNTRUSTED_COMPILED_PLAN_DIAGNOSTIC =
   "compiledPipelineV2RunPlanStageFor requires the frozen compiled run plan object " +
   "returned by compilePipelineV2RunPlanCandidate; hand-built objects, casts, clones and " +
   "Proxies are rejected before any field is read";
-
-const compiledRunPlans = new WeakSet<object>();
-
-function hasCompiledRunPlanProvenance(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  return compiledRunPlans.has(value);
-}
-
 /**
  * Compiles the trusted run plan candidate against the trusted compiled
  * orchestration metadata: one content-free projection stage per plan
@@ -206,7 +208,11 @@ export function compilePipelineV2RunPlanCandidate(
     origin_execution: manifest.origin_execution,
     stages: Object.freeze(stages),
   });
-  compiledRunPlans.add(compiled);
+  // The provenance registration binds the projection to the immutable
+  // identity snapshot of its originating pipeline, built exclusively by
+  // the existing construction point, immediately before the successful
+  // return.
+  registerCompiledRunPlanIdentity(compiled, pipelineV2RunPipelineIdentity(pipeline));
   return compiled;
 }
 

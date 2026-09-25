@@ -57,6 +57,16 @@
  * from a sink getter propagates unchanged. Caller objects are never
  * frozen or modified.
  *
+ * The compiled plan's provenance is the module-private WeakMap binding of
+ * the compiled-plan layer: every compiled projection carries the
+ * immutable identity snapshot of its originating pipeline, and the
+ * controller compares that hidden identity against the durable
+ * `state.pipeline` exclusively through the single existing
+ * `comparePipelineV2RunIdentity` after the state validation — a mismatch
+ * of any of the five durable identity fields is `lifecycle_conflict` with
+ * zero dispatch, so a compiled plan compiled from a foreign pipeline is
+ * never accepted even when run id, plan revision and plan digest coincide.
+ *
  * Only this layer's own failures are
  * `PipelineV2StageIterationControllerError` with the closed reason set
  * (`invalid_options`, `invalid_state`, `lifecycle_conflict`,
@@ -89,6 +99,7 @@ import {
   type PipelineV2RunCommand,
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
+import { comparePipelineV2RunIdentity } from "./pipeline_v2_identity_compare.ts";
 import {
   PipelineV2RunStateDurabilityError,
   PipelineV2RunStateStoreError,
@@ -98,7 +109,8 @@ import {
   type CompiledPipelineV2RunPlan,
   type CompiledPipelineV2RunPlanStage,
 } from "./pipeline_v2_run_plan_compiled.ts";
-import { deepFreezeValue } from "./pipeline_v2_immutable_document_store_internal.ts";
+import { compiledRunPlanOriginIdentity } from "./pipeline_v2_run_plan_compiled_internal.ts";
+import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 
 /** The closed reason set of the stage iteration controller's own failures. */
 export type PipelineV2StageIterationControllerFailureReason =
@@ -399,6 +411,24 @@ export async function ensurePipelineV2StageIteration(
       );
     }
     throw cause;
+  }
+
+  // The compiled plan is provenance-bound to the immutable identity
+  // snapshot of its originating pipeline; the durable run must carry
+  // exactly that identity. The comparison runs only through the single
+  // existing structural comparator; a mismatch of any of the five durable
+  // fields is a lifecycle conflict with zero dispatch, and the mismatching
+  // field name is the only diagnostic detail.
+  const comparison = comparePipelineV2RunIdentity(
+    compiledRunPlanOriginIdentity(ctx.compiledPlan),
+    state.pipeline,
+  );
+  if (comparison.kind !== "match") {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the compiled plan's originating pipeline identity does not match the durable run identity (field ${comparison.field})`,
+      ctx.snapshot,
+    );
   }
 
   // Durable bindings: the run id and the last durable plan revision must

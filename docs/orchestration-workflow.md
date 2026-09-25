@@ -795,7 +795,12 @@ and unknown templates propagate unchanged as `PipelineV2OrchestrationError`
 (never masked or re-classified by message text); only this layer's own
 failures are `PipelineV2CompiledRunPlanError` with the closed reason set
 `invalid_candidate | invalid_plan | invalid_stage_id | stage_not_found`.
-The compiled plan is registered in a module-private registry;
+The compiled plan is registered in a module-private registry (internal
+module `pipeline_v2_run_plan_compiled_internal.ts`) that binds the
+projection to the immutable snapshot of its originating pipeline's durable
+run identity, built exclusively by the existing `pipelineV2RunPipelineIdentity`
+construction point immediately before the successful return; the identity
+is not part of the public projection shape or its bytes.
 `compiledPipelineV2RunPlanStageFor` gates on that registry before any field
 is read, validates the stage id against the shared safe-id predicate
 without echoing an invalid value, and returns the exact frozen stage.
@@ -2096,9 +2101,16 @@ member is captured exactly once as an opaque reference, the sink poison
 latch fires first, then `compiledPipelineV2RunPlanStageFor` is the single
 compiled-plan provenance gate and stage lookup (its own errors keep their
 classes), and only after the gate does `validatePipelineV2RunState` — the
-single state validator — run, followed by the durable bindings: the run
-id must equal the compiled plan's run id and the last durable plan
-revision must carry exactly the compiled plan's revision and digest. The
+single state validator — run. The compiled plan's hidden originating
+identity (the module-private registry binding of the compiled-plan layer)
+is then compared against the durable `state.pipeline` exclusively through
+the single existing `comparePipelineV2RunIdentity`: a mismatch of any of
+the five durable identity fields is a `lifecycle_conflict` with zero
+dispatch, so a compiled plan compiled from a foreign pipeline is never
+accepted even when run id, plan revision and plan digest coincide.
+Followed by the durable bindings: the run id must equal the compiled
+plan's run id and the last durable plan revision must carry exactly the
+compiled plan's revision and digest. The
 stage position comes only from the compiled plan's declaration order, the
 transition anchor only from the durable cursor's transition count, the
 generation and iteration indexes only from the durable ledgers. A run

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,12 @@ import {
   PipelineV2CompiledRunPlanError,
   type CompiledPipelineV2RunPlan,
 } from "../src/pipeline_v2_run_plan_compiled.ts";
+import { compiledRunPlanOriginIdentity } from "../src/pipeline_v2_run_plan_compiled_internal.ts";
+import {
+  comparePipelineV2RunIdentity,
+  type PipelineV2RunIdentityComparison,
+  type PipelineV2RunIdentityField,
+} from "../src/pipeline_v2_identity_compare.ts";
 import {
   acceptPipelineV2RunPlanCandidate,
 } from "../src/pipeline_v2_run_plan_controller.ts";
@@ -1375,7 +1381,9 @@ describe("pipeline v2 stage iteration controller", () => {
       "./pipeline_v2_state.ts",
       "./pipeline_v2_state_store.ts",
       "./pipeline_v2_run_plan_compiled.ts",
-      "./pipeline_v2_immutable_document_store_internal.ts",
+      "./pipeline_v2_run_plan_compiled_internal.ts",
+      "./pipeline_v2_identity_compare.ts",
+      "./pipeline_v2_freeze_internal.ts",
     ];
     expect(importTargets.length).toBeGreaterThan(0);
     for (const target of importTargets) {
@@ -1394,6 +1402,7 @@ describe("pipeline v2 stage iteration controller", () => {
       "pipeline_v2_run_plan_bindings",
       "pipeline_v2_run_plan_controller",
       "pipeline_v2_orchestration",
+      "pipeline_v2_immutable_document_store_internal",
       "run_snapshot_store",
       "pipeline_state_store",
       "agent_smoke",
@@ -1420,12 +1429,164 @@ describe("pipeline v2 stage iteration controller", () => {
       ".match(",
       "RegExp(",
       "node:fs",
-      "comparePipelineV2RunIdentity(",
     ]) {
       expect(source.includes(banned)).toBe(false);
     }
     // no mutable module-global seam
     expect(source.includes("let real")).toBe(false);
     expect(source.includes("installOps")).toBe(false);
+  });
+
+  test("31. a compiled plan compiled from a foreign pipeline is a lifecycle conflict with zero dispatch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-foreign-"));
+    try {
+      const bundle = join(root, "bundle");
+      await mkdir(join(bundle, "prompts"), { recursive: true });
+      await mkdir(join(bundle, "schemas"), { recursive: true });
+      await mkdir(join(bundle, "decisions"), { recursive: true });
+      await writeFile(join(bundle, "pipeline.yaml"), TWO_TEMPLATES_YAML);
+      await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
+      await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
+      await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+      await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
+      // pipeline B drives the durable run; the same bundle content is then
+      // changed and re-loaded as pipeline A: identical bundle root, run id,
+      // plan manifest and template ids, different orchestration content and
+      // therefore a different execution snapshot digest
+      const pipelineB = await loadPipelineV2(bundle);
+      await appendFile(join(bundle, "prompts", "architect.md"), "updated guidance\n");
+      const pipelineA = await loadPipelineV2(bundle);
+      const identityA = pipelineV2RunPipelineIdentity(pipelineA);
+      const identityB = pipelineV2RunPipelineIdentity(pipelineB);
+      expect(identityA.bundle_root).toBe(identityB.bundle_root);
+      expect(identityA.entry_state).toBe(identityB.entry_state);
+      expect(identityA.max_transitions).toBe(identityB.max_transitions);
+      expect(identityA.execution_snapshot_sha256).not.toBe(identityB.execution_snapshot_sha256);
+
+      const fixture = await setupRun();
+      try {
+        const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        await playPlanning(sink, pipelineB);
+        const candidate = revisionOneCandidate(STAGE_ONE_DEV, [A1]);
+        await acceptPipelineV2RunPlanCandidate({ pipeline: pipelineB, runRoot: fixture.runRoot, sink, candidate });
+        // the compiled plan of the same candidate, compiled from pipeline A
+        const compiledA = compilePipelineV2RunPlanCandidate(pipelineA, candidate);
+        const acceptedPlan = sink.snapshot?.plan_revisions[0];
+        if (acceptedPlan === undefined) {
+          throw new Error("the accepted plan revision is missing");
+        }
+        expect(compiledA.plan_sha256).toBe(acceptedPlan.sha256);
+        const recording = recordingSink(sink, fixture, false);
+        const cause = await catchEnsure(() =>
+          ensurePipelineV2StageIteration({ compiledPlan: compiledA, stageId: "stage-1", initialBudget: 2, sink: recording.sink }),
+        );
+        const error = expectControllerError(cause, "lifecycle_conflict");
+        expect(error.message).toContain("field execution_snapshot_sha256");
+        expect(recording.commands).toEqual([]);
+        const persisted = JSON.parse(await readFile(fixture.statePath, "utf8")) as PipelineV2RunState;
+        expect(persisted.generations).toHaveLength(0);
+      } finally {
+        await disposeRun(fixture);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("32. a content-equal bundle in another directory mismatches only bundle_root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-bundles-"));
+    try {
+      const bundleFiles: Record<string, string> = {
+        "pipeline.yaml": TWO_TEMPLATES_YAML,
+        "prompts/architect.md": "plan the work\n",
+        "prompts/coder.md": "implement the task\n",
+        "schemas/facts.schema.json": JSON.stringify(FACTS_SCHEMA),
+        "decisions/dispatch.yaml": DISPATCH_MODEL_YAML,
+      };
+      for (const name of ["bundle-b", "bundle-a"]) {
+        const bundle = join(root, name);
+        for (const [relative, content] of Object.entries(bundleFiles)) {
+          const target = join(bundle, relative);
+          await mkdir(join(target, ".."), { recursive: true });
+          await writeFile(target, content);
+        }
+      }
+      const pipelineB = await loadPipelineV2(join(root, "bundle-b"));
+      const pipelineA = await loadPipelineV2(join(root, "bundle-a"));
+      const identityA = pipelineV2RunPipelineIdentity(pipelineA);
+      const identityB = pipelineV2RunPipelineIdentity(pipelineB);
+      expect(identityA.execution_snapshot_sha256).toBe(identityB.execution_snapshot_sha256);
+      expect(identityA.entry_state).toBe(identityB.entry_state);
+      expect(identityA.max_transitions).toBe(identityB.max_transitions);
+      expect(identityA.bundle_root).not.toBe(identityB.bundle_root);
+
+      const fixture = await setupRun();
+      try {
+        const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        await playPlanning(sink, pipelineB);
+        const candidate = revisionOneCandidate(STAGE_ONE_DEV, [A1]);
+        await acceptPipelineV2RunPlanCandidate({ pipeline: pipelineB, runRoot: fixture.runRoot, sink, candidate });
+        const compiledA = compilePipelineV2RunPlanCandidate(pipelineA, candidate);
+        const recording = recordingSink(sink, fixture, false);
+        const cause = await catchEnsure(() =>
+          ensurePipelineV2StageIteration({ compiledPlan: compiledA, stageId: "stage-1", initialBudget: 2, sink: recording.sink }),
+        );
+        const error = expectControllerError(cause, "lifecycle_conflict");
+        expect(error.message).toContain("field bundle_root");
+        expect(recording.commands).toEqual([]);
+      } finally {
+        await disposeRun(fixture);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("33. each of the five durable identity fields is a mismatch, compared in the fixed field order", () => {
+    const identity = (overrides: Partial<PipelineV2RunState["pipeline"]>): PipelineV2RunState["pipeline"] => ({
+      schema_version: 2,
+      bundle_root: "/opt/orchestrator/pipelines/default",
+      execution_snapshot_sha256: hex("a"),
+      entry_state: "architect",
+      max_transitions: 40,
+      ...overrides,
+    });
+    const base = identity({});
+    const cases: readonly (readonly [
+      PipelineV2RunIdentityField,
+      PipelineV2RunState["pipeline"],
+    ])[] = [
+      ["schema_version", identity({ schema_version: 3 } as unknown as Partial<PipelineV2RunState["pipeline"]>)],
+      ["bundle_root", identity({ bundle_root: "/opt/orchestrator/pipelines/other" })],
+      ["execution_snapshot_sha256", identity({ execution_snapshot_sha256: hex("c") })],
+      ["entry_state", identity({ entry_state: "stage_dispatch" })],
+      ["max_transitions", identity({ max_transitions: 50 })],
+    ];
+    for (const [field, durable] of cases) {
+      const comparison: PipelineV2RunIdentityComparison = comparePipelineV2RunIdentity(base, durable);
+      expect(comparison).toEqual({ kind: "mismatch", field });
+    }
+    expect(comparePipelineV2RunIdentity(base, identity({}))).toEqual({ kind: "match" });
+  });
+
+  test("34. the exact originating identity passes; the hidden identity is frozen and equals the pipeline and the durable record", async () => {
+    await withPipeline(async (pipeline) => {
+      const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+      try {
+        const result = await ensurePipelineV2StageIteration({
+          compiledPlan: ctx.compiledPlan,
+          stageId: "stage-1",
+          initialBudget: 2,
+          sink: ctx.sink,
+        });
+        expect(result.iteration_index).toBe(1);
+        const hidden = compiledRunPlanOriginIdentity(ctx.compiledPlan);
+        expect(Object.isFrozen(hidden)).toBe(true);
+        expect(hidden).toEqual(pipelineV2RunPipelineIdentity(pipeline));
+        expect(hidden).toEqual((ctx.sink.snapshot as PipelineV2RunState).pipeline);
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    });
   });
 });

@@ -8,7 +8,7 @@ import {
   hasPreparedRunPlanProvenance,
   type PipelineV2RunPlanProvenanceKind,
 } from "./pipeline_v2_run_plan_provenance.ts";
-import { deepFreezeValue } from "./pipeline_v2_immutable_document_store_internal.ts";
+import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 import type {
   PreparedPipelineV2RunPlanCandidate,
   PreparePipelineV2RunPlanCandidateOptions,
