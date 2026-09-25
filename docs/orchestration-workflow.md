@@ -1687,8 +1687,14 @@ over the anchors — a stage iteration is open at an execution start exactly
 when it opened at or before the start boundary and is not closed strictly
 before it; a closure anchored at that boundary follows the execution it
 contains, while a wait-bound closure at the same boundary precedes every
-start of that boundary; the recorded iteration index resolves the
-indistinguishable same-boundary touching combination) are the single shared
+start of that boundary; the recorded iteration index — which restarts at 1
+in every generation and is not a global identifier — and the compiled stage
+template of the execution's state are filters of the candidate
+conjunction, so a touching boundary between two generations is resolved by
+the template; when several generations remain indistinguishable (a reused
+template with the same iteration index) the query returns the admissible
+candidate set's last member in generation order, never a silent arbitrary
+pick) are the single shared
 open-iteration resolvers, consumed by the restore verifier (the current
 snapshot query also by the coordinator).
 

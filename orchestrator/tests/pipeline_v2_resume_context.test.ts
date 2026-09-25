@@ -1716,6 +1716,169 @@ states:
     result: failed
 `;
 
+/**
+ * The two-stage-template variant: the gate (development) routes its close
+ * outcome into the second stage's entry state (test, template testing), so
+ * one run can carry two generations with different templates; the reuse of
+ * one template by several plan stages is exercised with the single-template
+ * pipeline above.
+ */
+const STAGE_TWO_PIPELINE = `
+schema_version: 2
+entry_state: architect
+max_transitions: 12
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+  - id: facts
+    type: json
+    protected: false
+    schema: schemas/facts.schema.json
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev
+    - id: testing
+      entry_state: test
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: dispatch
+      role: control
+    - state_id: dev
+      role: stage
+      stage_template: development
+    - state_id: gate
+      role: stage
+      stage_template: development
+    - state_id: control2
+      role: control
+    - state_id: test
+      role: stage
+      stage_template: testing
+    - state_id: testgate
+      role: stage
+      stage_template: testing
+
+states:
+  - id: architect
+    type: agent
+    profile: coder
+    prompt: prompts/architect.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dispatch
+  - id: dispatch
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: dispatch_facts
+        source:
+          pipeline_input: facts
+    transitions:
+      - outcome: d_next_stage
+        to: dev
+      - outcome: d_close_stage
+        to: halt
+      - outcome: uncovered
+        to: halt
+      - outcome: inconsistent_facts
+        to: halt
+      - outcome: invalid_facts
+        to: halt
+  - id: dev
+    type: agent
+    profile: coder
+    prompt: prompts/dev.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: gate
+  - id: gate
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: gate_facts
+        source:
+          pipeline_input: facts
+    transitions:
+      - outcome: d_next_stage
+        to: dev
+      - outcome: d_close_stage
+        to: control2
+      - outcome: uncovered
+        to: halt
+      - outcome: inconsistent_facts
+        to: halt
+      - outcome: invalid_facts
+        to: halt
+  - id: control2
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: control2_facts
+        source:
+          pipeline_input: facts
+    transitions:
+      - outcome: d_next_stage
+        to: test
+      - outcome: d_close_stage
+        to: halt
+      - outcome: uncovered
+        to: halt
+      - outcome: inconsistent_facts
+        to: halt
+      - outcome: invalid_facts
+        to: halt
+  - id: test
+    type: agent
+    profile: coder
+    prompt: prompts/test.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: testgate
+  - id: testgate
+    type: decision
+    model: decisions/model.yaml
+    inputs:
+      - id: testgate_facts
+        source:
+          pipeline_input: facts
+    transitions:
+      - outcome: d_next_stage
+        to: test
+      - outcome: d_close_stage
+        to: done
+      - outcome: uncovered
+        to: halt
+      - outcome: inconsistent_facts
+        to: halt
+      - outcome: invalid_facts
+        to: halt
+  - id: done
+    type: terminal
+    result: success
+  - id: halt
+    type: terminal
+    result: failed
+`;
+
 interface StageBase {
   root: string;
   pipeline: ResolvedPipelineV2;
@@ -1725,15 +1888,16 @@ interface StageBase {
   drive: Drive;
 }
 
-async function setupStageBase(): Promise<StageBase> {
+async function setupStageBase(pipelineYaml: string = STAGE_PIPELINE): Promise<StageBase> {
   const root = await mkdtemp(join(tmpdir(), "pipeline-v2-resume-stage-"));
   const bundle = join(root, "bundle");
   await mkdir(join(bundle, "prompts"), { recursive: true });
   await mkdir(join(bundle, "schemas"), { recursive: true });
   await mkdir(join(bundle, "decisions"), { recursive: true });
-  await writeFile(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+  await writeFile(join(bundle, "pipeline.yaml"), pipelineYaml);
   await writeFile(join(bundle, "prompts", "architect.md"), "plan the task\n");
   await writeFile(join(bundle, "prompts", "dev.md"), "implement the stage\n");
+  await writeFile(join(bundle, "prompts", "test.md"), "test the stage\n");
   await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
   await writeFile(join(bundle, "decisions", "model.yaml"), STAGE_MODEL_YAML);
   const pipeline = await loadPipelineV2(bundle);
@@ -1917,6 +2081,159 @@ test("47. the touching same-boundary pair resolves to the reopened iteration whe
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
     expect(context.cursor).toEqual({ current_state: "done", transition_count: 4 });
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The touching boundary between two generations with different templates,
+ * with the dev execution started inside the OLD generation at that same
+ * boundary (scenario 3).
+ */
+function driveStageCrossGenerationOldExec(base: StageBase): void {
+  runStageAgentPhases(base, "architect");
+  dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
+  commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
+  runStageDecision(base, "dispatch", "d_next_stage");
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
+  commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
+  runStageAgentPhases(base, "dev");
+  dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+  dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "testing", stagePosition: 2, templateId: "testing", planSha256: hex("1"), initialBudget: 2, transitionCount: 2 });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 2 });
+  commitStageTransition(base, "dev", "completed", "gate", 3, 0);
+}
+
+/**
+ * The touching generations with different templates and the test execution
+ * inside the NEW generation (scenario 4): the second generation opens at
+ * the same count the first one closes, the control state then routes into
+ * the second stage's entry and its stage execution runs in the new
+ * generation's iteration.
+ */
+function driveStageCrossGenerationNewExec(base: StageBase): void {
+  runStageAgentPhases(base, "architect");
+  dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
+  commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
+  runStageDecision(base, "dispatch", "d_next_stage");
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
+  commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
+  runStageAgentPhases(base, "dev");
+  commitStageTransition(base, "dev", "completed", "gate", 3, 0);
+  runStageDecision(base, "gate", "d_close_stage");
+  dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+  dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "testing", stagePosition: 2, templateId: "testing", planSha256: hex("1"), initialBudget: 2, transitionCount: 3 });
+  commitStageTransition(base, "gate", "d_close_stage", "control2", 4, 1);
+  dispatchStage(base, { kind: "start_decision_execution", stateId: "control2", inputDigest: hex("e"), executionRole: "control" });
+  dispatchStage(base, {
+    kind: "decision_evaluated",
+    result: { status: "selected", outcome: "d_next_stage", decision: "d_next_stage", rule_id: "R1", active_constraint_ids: [] },
+  });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 4 });
+  commitStageTransition(base, "control2", "d_next_stage", "test", 5, 0);
+  runStageAgentPhases(base, "test");
+  commitStageTransition(base, "test", "completed", "testgate", 6, 0);
+}
+
+/**
+ * One stage template reused by two plan stages: generation 2 opens with the
+ * same template at the touching boundary; the dev execution started at that
+ * boundary is a member of the admissible candidate set (scenario 5).
+ */
+function driveStageReusedTemplate(base: StageBase): void {
+  runStageAgentPhases(base, "architect");
+  dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
+  commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
+  runStageDecision(base, "dispatch", "d_next_stage");
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "first_stage", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
+  commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
+  runStageAgentPhases(base, "dev");
+  dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+  dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+  dispatchStage(base, { kind: "stage_generation_opened", stageId: "second_stage", stagePosition: 2, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 2 });
+  dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 2 });
+  commitStageTransition(base, "dev", "completed", "gate", 3, 0);
+}
+
+test("48. the touching generations with different templates resolve the old generation's execution", async () => {
+  const base = await setupStageBase(STAGE_TWO_PIPELINE);
+  try {
+    driveStageCrossGenerationOldExec(base);
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "gate", transition_count: 3 });
+    expect(context.next_execution_index).toBe(4);
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+test("49. the touching generations with different templates resolve the new generation's execution", async () => {
+  const base = await setupStageBase(STAGE_TWO_PIPELINE);
+  try {
+    driveStageCrossGenerationNewExec(base);
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "testgate", transition_count: 6 });
+    expect(context.next_execution_index).toBe(7);
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+test("50. a reused template at a touching boundary passes the real restore verifier", async () => {
+  const base = await setupStageBase();
+  try {
+    driveStageReusedTemplate(base);
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "gate", transition_count: 3 });
+    expect(context.next_execution_index).toBe(4);
+  } finally {
+    await rm(base.root, { recursive: true, force: true });
+  }
+});
+
+test("51. an execution whose recorded index matches no template-matching candidate is rejected", async () => {
+  // The gate (template development) starts at boundary 3, where generation
+  // 1's iteration closed at count 2 and only generation 2's iteration
+  // (template testing) is open: the recorded index 1 matches a candidate,
+  // but no candidate matches the (index, template) conjunction. The loader
+  // accepts the document (it has no pipeline); the real restore verifier
+  // rejects it.
+  const base = await setupStageBase(STAGE_TWO_PIPELINE);
+  try {
+    runStageAgentPhases(base, "architect");
+    dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
+    commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
+    runStageDecision(base, "dispatch", "d_next_stage");
+    dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
+    dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
+    commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
+    runStageAgentPhases(base, "dev");
+    dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+    dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+    commitStageTransition(base, "dev", "completed", "gate", 3, 0);
+    dispatchStage(base, { kind: "stage_generation_opened", stageId: "testing", stagePosition: 2, templateId: "testing", planSha256: hex("1"), initialBudget: 2, transitionCount: 3 });
+    dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 3 });
+    runStageDecision(base, "gate", "d_close_stage");
+    commitStageTransition(base, "gate", "d_close_stage", "control2", 4, 1);
+    const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    validatePipelineV2RunState(state);
+    const cause = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot).catch((error) => error);
+    expectRestoreError(cause, "pipeline_mismatch");
+    expect((cause as Error).message).toContain(
+      'execution 4 records iteration 1, but no stage iteration open at its start boundary matches the stage template "development"',
+    );
   } finally {
     await rm(base.root, { recursive: true, force: true });
   }

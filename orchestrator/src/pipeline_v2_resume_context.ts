@@ -511,10 +511,19 @@ function verifyCompiledExecutionRoles(
       );
     }
     if (compiled.role === "stage") {
-      const open = pipelineV2StageIterationAt(state, execution.index - 1, execution.iteration_index);
+      // The recorded `iteration_index` restarts at 1 in every generation and
+      // is therefore not a global identifier, so the projection is resolved
+      // as a conjunction over the unified positional interval, the recorded
+      // index and the compiled stage template. When several generations —
+      // typically a reused template — are indistinguishable at the start
+      // boundary, the query resolves the admissible candidate set and the
+      // verifier's checks (template, iteration index) pass exactly when the
+      // execution is a member of that set; no arbitrary generation is
+      // claimed as a distinguished fact.
+      const open = pipelineV2StageIterationAt(state, execution.index - 1, execution.iteration_index, compiled.stage_template);
       if (open === null) {
         throw mismatch(
-          `execution ${execution.index} records iteration ${execution.iteration_index}, but no stage iteration is open at its start boundary`,
+          `execution ${execution.index} records iteration ${execution.iteration_index}, but no stage iteration open at its start boundary matches the stage template ${JSON.stringify(compiled.stage_template)}`,
         );
       }
       if (open.template_id !== compiled.stage_template) {

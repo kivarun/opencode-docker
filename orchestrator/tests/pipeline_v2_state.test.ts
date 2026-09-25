@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +10,7 @@ import {
   PIPELINE_V2_TERMINAL_FAILURE_REASON,
   PipelineV2StateError,
   parsePipelineV2RunState,
+  pipelineV2OpenStageIteration,
   pipelineV2StageIterationAt,
   reducePipelineV2RunCommand,
   validatePipelineV2RunState,
@@ -4592,6 +4595,11 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     // wait over an open iteration — a state the reducer can never produce.
     // The response must never be applied over an open iteration; the
     // loader must terminate with a typed diagnostic.
+    // The potentially hanging validator runs in a dedicated child process
+    // with a finite wall-clock timeout: if the old infinite loop ever
+    // returns, only the child is killed at the timeout and the test fails
+    // normally instead of hanging the whole suite. No sleep-based
+    // orchestration and no leftover processes.
     const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
     planningPrefix(driver);
     driver.apply(planAccepted());
@@ -4617,11 +4625,190 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     driver.apply(grantRecorded());
     driver.apply(iterClosed({ iterationIndex: 1 }));
     driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
-    const raw = JSON.stringify(driver.current);
-    expectInvalid(JSON.parse(raw), (draft) => {
-      delete draft.generations[0].iterations[0].closed;
-      draft.generations[0].open_iteration = { index: 1, opened_transition_count: 2 };
-    }, "wait record 1 is answered while iteration 1 of generation 1 is still open");
+    const draft = draftOf(driver.current as PipelineV2RunState);
+    delete draft.generations[0].iterations[0].closed;
+    draft.generations[0].open_iteration = { index: 1, opened_transition_count: 2 };
+    const dir = mkdtempSync(join(tmpdir(), "loader-term-"));
+    const docPath = join(dir, "state.json");
+    writeFileSync(docPath, JSON.stringify(draft));
+    try {
+      const child = spawnSync(
+        process.execPath,
+        [join(import.meta.dir, "loader_termination_child.ts"), docPath],
+        { timeout: 4000, encoding: "utf8" },
+      );
+      if (child.status === null) {
+        throw new Error(
+          `the loader-termination child was killed at the finite timeout (signal ${String(child.signal)}); the loader hang returned`,
+        );
+      }
+      if (child.status !== 0) {
+        throw new Error(
+          `the loader-termination child exited with code ${String(child.status)}: ${String(child.stderr ?? "").slice(0, 300)}`,
+        );
+      }
+      const stdout = String(child.stdout ?? "").trim();
+      expect(stdout.startsWith("REJECTED:")).toBe(true);
+      expect(stdout).toBe("REJECTED:wait record 1 is answered while iteration 1 of generation 1 is still open");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the loader rejects a transition committed inside an unresolved answered wait", () => {
+    // The exact accepted-at-b10678c form: the reducer builds the run through
+    // the wait entry, the accepted intent and the grant at count 6 (the
+    // iteration stays open); a transition, an execution, a wait-bound
+    // closure at 7 and the response are then forged onto that base. The
+    // reducer can never produce this: the response and every intervention
+    // record of the wait resolve while the run is waiting, and the
+    // transition count cannot move while waiting, so the closure and the
+    // response must anchor at the wait's own count 6.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    stageAgent(driver, "coder", 1, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    runGateDecision(driver, "d_rework", 5);
+    stageAgent(driver, "coder", 1, 6);
+    commitTransition(driver, "coder", "completed", "gate", 6);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "gate",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [
+        { id: "continue_stage", to: "coder" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    const number = driver.nextSessionNumber();
+    expectInvalid(driver.current as PipelineV2RunState, (draft) => {
+      draft.executions.push({
+        index: 7,
+        type: "agent",
+        state_id: "gate",
+        attempt: 1,
+        profile: "coder",
+        execution_role: "stage",
+        iteration_index: 1,
+        phase: "cleanup_completed",
+        execution_session_id: `exec-${number}`,
+        tool_session_id: `tool-${number}`,
+        session_cleanup: { execution: "completed", tool: "completed" },
+        outputs: [],
+      });
+      draft.transitions.push({ index: 0, from: "gate", outcome: "d_rework", to: "coder", execution_index: 7 });
+      draft.cursor = { current_state: "coder", transition_count: 7 };
+      draft.status = "active";
+      draft.phase = "running";
+      draft.generations[0].iterations[0].closed = { by: "grant", closed_transition_count: 7, wait_index: 1 };
+      delete draft.generations[0].open_iteration;
+      draft.waits[0].response = { action_id: "continue_stage", response_sha256: hex("8") };
+    }, "iteration 1 of generation 1 closes at committed transition count 7, but its wait record 1 anchors at 6");
+  });
+
+  test("a wait-bound iteration closure must anchor at its wait's own transition count", () => {
+    // The reducer-built base (the wait entered unanswered at count 6 with
+    // the intent and the grant, the iteration open) plus a forged closure
+    // anchored at 7: the reducer records the closure while the run is
+    // waiting, when the count cannot have moved.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    expectInvalid(driver.current as PipelineV2RunState, (draft) => {
+      draft.generations[0].iterations[0].closed = { by: "grant", closed_transition_count: 7, wait_index: 1 };
+      delete draft.generations[0].open_iteration;
+    }, "iteration 1 of generation 1 closes at committed transition count 7, but its wait record 1 anchors at 3");
+  });
+
+  test("the loader rejects an execution started inside an unresolved answered wait", () => {
+    // The wait resolves completely at its own boundary (the grant-bound
+    // closure and the response, both at count 6); an execution started
+    // inside the wait's span can only reference the iteration that the
+    // intervention just closed, which the unified interval excludes, so
+    // the execution-start check fires before the graph transition is ever
+    // replayed.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    expectInvalid(driver.current as PipelineV2RunState, (draft) => {
+      const number = draft.executions.length + 1;
+      draft.executions.push({
+        index: number,
+        type: "agent",
+        state_id: "coder",
+        attempt: 1,
+        profile: "coder",
+        execution_role: "stage",
+        iteration_index: 1,
+        phase: "cleanup_completed",
+        execution_session_id: `exec-${number}`,
+        tool_session_id: `tool-${number}`,
+        session_cleanup: { execution: "completed", tool: "completed" },
+        outputs: [],
+      });
+      draft.transitions.push({ index: 0, from: "coder", outcome: "completed", to: "gate", execution_index: number });
+      draft.cursor = { current_state: "gate", transition_count: 4 };
+      draft.status = "active";
+      draft.phase = "running";
+      draft.generations[0].iterations[0].closed = { by: "grant", closed_transition_count: 3, wait_index: 1 };
+      delete draft.generations[0].open_iteration;
+      draft.waits[0].response = { action_id: "continue_stage", response_sha256: hex("8") };
+    }, 'execution 4 has the "stage" role but no iteration is open at committed transition count 3');
+  });
+
+  test("the normal wait intervention and response resolve at the wait's own boundary", () => {
+    // The fully reducer-built flow: the wait entered at count 3 with the
+    // iteration open, the intent, the grant-bound closure and the response
+    // all recorded at the same count, then a new iteration opens at the
+    // same count and the next execution starts inside it. Loader-coherent.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    commitTransition(driver, "dev_entry", "completed", "coder", 3);
+    driver.apply({
+      kind: "run_waiting",
+      stateId: "coder",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: hex("7"),
+      actions: [{ id: "continue_stage", to: "coder" }],
+    });
+    driver.apply(intentAccepted());
+    driver.apply(grantRecorded());
+    driver.apply(iterClosed({ iterationIndex: 1 }));
+    driver.apply({ kind: "wait_response_recorded", waitIndex: 1, expectedRequestSha256: hex("7"), actionId: "continue_stage", responseSha256: hex("8") });
+    driver.apply({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 3 });
+    stageAgent(driver, "coder", 2, 4);
+    commitTransition(driver, "coder", "completed", "gate", 4);
+    const state = driver.current as PipelineV2RunState;
+    expect(state.cursor).toEqual({ current_state: "gate", transition_count: 4 });
+    expect(state.waits[0]?.transition_count).toBe(3);
+    const loaded = validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    expect(loaded.cursor).toEqual(state.cursor);
   });
 
   test("the effective iteration budget rejects unrepresentable sums exactly like the reducer", () => {
@@ -4835,9 +5022,78 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     reopenedDraft.generations[0].open_iteration = { index: 2, opened_transition_count: 4 };
     const reopenedState = JSON.parse(JSON.stringify(reopenedDraft)) as PipelineV2RunState;
     expect(pipelineV2StageIterationAt(reopenedState, 4, 2)).toMatchObject({ iteration_index: 2, generation_index: 1 });
-    // the unambiguous single candidate does not depend on the recorded
-    // reference; the restore verifier's own comparison reports the mismatch
-    expect(pipelineV2StageIterationAt(reopenedState, 4, 1)).toMatchObject({ iteration_index: 2 });
+    // the recorded reference is a filter of the candidate conjunction, not
+    // a disambiguator over interval candidates: a reference that matches no
+    // interval candidate resolves to nothing (the restore verifier rejects)
+    expect(pipelineV2StageIterationAt(reopenedState, 4, 1)).toBe(null);
+  });
+
+  test("the touching generations resolve by the recorded index and the compiled stage template", () => {
+    // The reducer-built touching-generations state: generation 1
+    // (development) closes and generation 2 (testing) opens at the same
+    // boundary 2 where the stage execution started; both generations carry
+    // iteration 1, so the recorded index alone cannot pick the generation.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed());
+    driver.apply(genOpened({ stageId: "testing", stagePosition: 2, templateId: "testing", transitionCount: 2 }));
+    driver.apply(iterOpened({ generationIndex: 2, iterationIndex: 1, transitionCount: 2 }));
+    commitTransition(driver, "dev_entry", "completed", "gate", 3);
+    const state = driver.current as PipelineV2RunState;
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    const current = pipelineV2OpenStageIteration(state);
+    expect(current).toMatchObject({ generation_index: 2, template_id: "testing", iteration_index: 1 });
+    // the template filter resolves the touching boundary: the compiled
+    // template of the execution's state picks its generation
+    expect(pipelineV2StageIterationAt(state, 2, 1, "development")).toMatchObject({
+      generation_index: 1,
+      template_id: "development",
+      iteration_index: 1,
+    });
+    expect(pipelineV2StageIterationAt(state, 2, 1, "testing")).toMatchObject({
+      generation_index: 2,
+      template_id: "testing",
+      iteration_index: 1,
+    });
+    // without the template filter the candidates are indistinguishable; the
+    // documented resolution is the admissible set's last member, not the
+    // arbitrary first one
+    expect(pipelineV2StageIterationAt(state, 2, 1)).toMatchObject({
+      generation_index: 2,
+      template_id: "testing",
+      iteration_index: 1,
+    });
+    // a recorded index or template matching no candidate resolves to nothing
+    expect(pipelineV2StageIterationAt(state, 2, 5)).toBe(null);
+    expect(pipelineV2StageIterationAt(state, 2, 1, "nonexistent")).toBe(null);
+  });
+
+  test("a reused template at a touching boundary resolves to the admissible candidate set's member", () => {
+    // The same stage template is reused by two plan stages: generation 2
+    // opens with the same template at the touching boundary. The candidates
+    // agree on template and iteration index and differ only in the
+    // generation ordinal, which the durable data does not distinguish; the
+    // query returns the admissible set's last member and the restore
+    // verifier's checks pass for any member.
+    const driver = loadableDriver(createDriver(STAGE_IDENTITY, []));
+    lifecycleOpenPrefix(driver);
+    stageAgent(driver, "dev_entry", 1, 3);
+    driver.apply(iterClosed({ iterationIndex: 1, by: "normal_close", waitIndex: undefined }));
+    driver.apply(genClosed());
+    driver.apply(genOpened({ stageId: "testing_stage", stagePosition: 2, templateId: "development", transitionCount: 2 }));
+    driver.apply(iterOpened({ generationIndex: 2, iterationIndex: 1, transitionCount: 2 }));
+    commitTransition(driver, "dev_entry", "completed", "gate", 3);
+    const state = driver.current as PipelineV2RunState;
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(state)));
+    expect(pipelineV2OpenStageIteration(state)).toMatchObject({ generation_index: 2, template_id: "development", stage_id: "testing_stage" });
+    expect(pipelineV2StageIterationAt(state, 2, 1, "development")).toMatchObject({
+      generation_index: 2,
+      template_id: "development",
+      stage_id: "testing_stage",
+      iteration_index: 1,
+    });
   });
 
   test("a waiting run never carries lifecycle mutations and the response demands the closed iteration", () => {

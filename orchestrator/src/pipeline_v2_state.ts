@@ -2156,10 +2156,14 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   // applies. Every round terminates: a record whose preconditions do not
   // hold simply does not apply in that round, so no malformed state can
   // loop the worklist. A record that never becomes applicable fails closed
-  // with its specific diagnostic (a pending record at an visited boundary
-  // fails that boundary's pending pass; an answered wait whose response
-  // could never be applied fails the end-of-replay check); there is no
-  // second cursor, no second journal and no event stream. The execution
+  // with its specific diagnostic (a pending record at a visited boundary
+  // fails that boundary's pending pass; an answered wait's response and
+  // every intervention record of the wait resolve inside the wait's own
+  // boundary — the transition count cannot move while the run is waiting —
+  // and a response that is still unapplicable at the end of that boundary
+  // fails that boundary's pending pass, before its execution start and
+  // graph transition); there is no second cursor, no second journal and no
+  // event stream. The execution
   // starts are checked interval-wise after
   // the worklist settles: a stage execution must name an iteration that
   // was open at its start (opened at or before the start boundary, closed
@@ -2242,6 +2246,38 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   for (const task of taskRevisions) {
     if (task.revision !== 1) {
       taskWaitOf(task);
+    }
+  }
+  // A wait-bound iteration closure is recorded while the run is waiting,
+  // and the transition count cannot move while waiting (the transition
+  // commit requires phase "running"), so the closure's anchor must equal
+  // the transition count of the wait it was closed in. A closure anchored
+  // elsewhere is unreachable in reducer time and is rejected before the
+  // replay, deterministically, like the other wait-journal references.
+  for (const generation of generations) {
+    for (const iteration of generation.iterations) {
+      const closed = iteration.closed;
+      if (closed === undefined || (closed.by !== "grant" && closed.by !== "replanned")) {
+        continue;
+      }
+      if (closed.wait_index === undefined) {
+        // the exact-field validation above already rejects a wait-bound
+        // closure without its wait index; the guard keeps the type honest
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} closes with ${JSON.stringify(closed.by)} without a wait index`,
+        );
+      }
+      const wait = waits[closed.wait_index - 1];
+      if (wait === undefined) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} closes with ${JSON.stringify(closed.by)} for wait ${closed.wait_index}, which does not exist`,
+        );
+      }
+      if (closed.closed_transition_count !== wait.transition_count) {
+        throw new PipelineV2StateError(
+          `iteration ${iteration.index} of generation ${generation.index} closes at committed transition count ${closed.closed_transition_count}, but its wait record ${wait.index} anchors at ${wait.transition_count}`,
+        );
+      }
     }
   }
 
@@ -2558,10 +2594,12 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
             ),
           );
           // The response is not applicable this round: the round ends and
-          // the worklist termination check below decides whether the
-          // replay can still progress at a later boundary (a wait-bound
-          // closure of the iteration may be anchored after this one) or
-          // fails closed in the pending pass.
+          // the worklist termination check decides whether another record
+          // of this wait's boundary can still make progress. The response
+          // must resolve inside its own boundary's fixpoint; the pending
+          // pass below fails closed when it does not — an execution start
+          // or a graph transition of this boundary is never reached with
+          // the response unresolved.
           if (grantsDone && closuresDone && openIterationGeneration === null) {
             const action = wait.actions.find((candidate) => candidate.id === wait.response!.action_id);
             if (action === undefined) {
@@ -2585,6 +2623,28 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     // have been consumed by the worklist. Scan in the records' own order
     // and fail closed on the first pending record with its specific
     // diagnostic.
+    // An entered wait must fully resolve at its own boundary. The reducer
+    // records the response and every intervention record of the wait while
+    // the run is waiting, and the transition count cannot move while
+    // waiting, so the response applies at the wait's own transition count
+    // or the document is incoherent. This fires before the boundary's
+    // execution-start check and before the boundary's graph transition —
+    // neither may happen inside an unresolved answered wait.
+    if (enteredWaitIndex !== null) {
+      const wait = waits[enteredWaitIndex - 1]!;
+      if (wait.transition_count === ordinal && wait.response !== undefined) {
+        if (openIterationGeneration !== null) {
+          const generation = generations.find((candidate) => candidate.index === openIterationGeneration)!;
+          const iteration = generation.iterations[openIterationIndex! - 1]!;
+          throw new PipelineV2StateError(
+            `wait record ${wait.index} is answered while iteration ${iteration.index} of generation ${generation.index} is still open`,
+          );
+        }
+        throw new PipelineV2StateError(
+          `wait record ${wait.index} is answered but its response could not be applied at committed transition count ${ordinal}`,
+        );
+      }
+    }
     if (waitPosition < waits.length && waits[waitPosition]!.transition_count === ordinal) {
       const wait = waits[waitPosition]!;
       if (wait.state_id !== replayCursor) {
@@ -2810,26 +2870,10 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     }
     replayCursor = transition.to;
   }
-  // The entered wait must be answered-applied or open (the run ends
-  // waiting). An answered wait whose response the replay could not apply
-  // after the whole journal is incoherent: the durable intervention records
-  // never admitted the response (most notably an iteration that is still
-  // open, which the reducer's response rule forbids).
-  if (enteredWaitIndex !== null) {
-    const wait = waits[enteredWaitIndex - 1]!;
-    if (wait.response !== undefined) {
-      if (openIterationGeneration !== null) {
-        const generation = generations.find((candidate) => candidate.index === openIterationGeneration)!;
-        const iteration = generation.iterations[openIterationIndex! - 1]!;
-        throw new PipelineV2StateError(
-          `wait record ${wait.index} is answered while iteration ${iteration.index} of generation ${generation.index} is still open`,
-        );
-      }
-      throw new PipelineV2StateError(
-        `wait record ${wait.index} is answered but its response could not be applied at committed transition count ${transitions.length}`,
-      );
-    }
-  }
+  // An entered wait that is still unanswered here is the legal end state
+  // (the run ends waiting); an answered wait was already forced to resolve
+  // inside its own boundary's pending pass, so no post-loop answered-wait
+  // check exists.
   if (waitPosition !== waits.length) {
     const wait = waits[waitPosition]!;
     throw new PipelineV2StateError(
@@ -3183,19 +3227,29 @@ function iterationOpenForStart(iteration: PipelineV2StageIterationRecord, bounda
  * the execution's start; this pure query is the read-only resolution the
  * restore verifier uses, resolved with the same unified interval the
  * loader's execution-start check applies, so the two sides cannot drift
- * apart. The optional recorded iteration index disambiguates the one
- * indistinguishable shape: a same-boundary combination of an iteration
- * closed at the boundary and another opened at it admits both orders (the
- * execution started inside the closed one before its closure, or inside
- * the reopened one after its opening), and the recorded reference resolves
- * which one the run took; a reference outside the candidates resolves to
- * nothing. Without the reference an ambiguous boundary resolves to
- * nothing rather than to an arbitrary candidate.
+ * apart. The optional recorded iteration index narrows the candidate set
+ * by the per-generation iteration index (which restarts at 1 in every
+ * generation and is therefore not a global identifier), and the optional
+ * stage template narrows it further by the compiled template the
+ * execution's state belongs to. The one indistinguishable shape that
+ * remains after both filters is a same-boundary combination in which
+ * several generations — typically a reused template across plan stages —
+ * all satisfy the interval and agree on the recorded index and template;
+ * the durable data cannot distinguish their generation ordinals, so the
+ * query resolves the admissible candidate set and returns its last member
+ * in generation order. That member answers every check the restore
+ * verifier performs (template, stage, iteration index), and the returned
+ * `generation_index` is the admissible projection's member, not a
+ * generation the durable data distinguishes. A reference or template
+ * outside the candidates resolves to nothing. Without both filters an
+ * ambiguous boundary resolves to the last interval candidate rather than
+ * to an arbitrary first candidate.
  */
 export function pipelineV2StageIterationAt(
   state: PipelineV2RunState,
   transitionCount: number,
   recordedIterationIndex?: number,
+  stageTemplate?: string,
 ): {
   readonly generation_index: number;
   readonly template_id: string;
@@ -3210,18 +3264,17 @@ export function pipelineV2StageIterationAt(
       }
     }
   }
-  let chosen: { generation: PipelineV2StageGenerationRecord; iteration: PipelineV2StageIterationRecord } | undefined;
-  if (matches.length === 1) {
-    chosen = matches[0];
-  } else if (matches.length > 1) {
-    chosen =
-      recordedIterationIndex === undefined
-        ? undefined
-        : matches.find((match) => match.iteration.index === recordedIterationIndex);
+  let candidates = matches;
+  if (recordedIterationIndex !== undefined) {
+    candidates = candidates.filter((match) => match.iteration.index === recordedIterationIndex);
   }
-  if (chosen === undefined) {
+  if (stageTemplate !== undefined) {
+    candidates = candidates.filter((match) => match.generation.template_id === stageTemplate);
+  }
+  if (candidates.length === 0) {
     return null;
   }
+  const chosen = candidates[candidates.length - 1]!;
   return Object.freeze({
     generation_index: chosen.generation.index,
     template_id: chosen.generation.template_id,
