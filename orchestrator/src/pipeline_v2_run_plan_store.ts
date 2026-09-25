@@ -54,11 +54,14 @@ import {
  * candidate on durability-unknown outcomes — the exact discriminated
  * union branch per manifest kind). Diagnostics are content-free.
  *
- * The final error boundary sanitizes unexpected causes: only this
- * module's own store errors and the manifest module's error class pass
- * unchanged, and every other thrown cause becomes a `not_published`
- * `io_failure` with the fixed content-free fallback message — the
- * original cause is never re-thrown or echoed.
+ * The final error boundary has exactly three branches: this module's own
+ * store errors and the manifest module's error class pass unchanged; a
+ * neutral substrate error (`ImmutableDocumentStoreError`) is re-tagged
+ * into this module's error class by its typed outcome, reason and
+ * candidate fields — never by message text; and only the remaining
+ * unexpected causes are sanitized into a `not_published` `io_failure`
+ * with the fixed content-free fallback message — the original cause is
+ * never re-thrown or echoed.
  *
  * Store responsibility ends at the immutable canonical artifacts:
  * plan↔task linkage, revision chains and the acceptance of published
