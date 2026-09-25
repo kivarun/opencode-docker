@@ -101,14 +101,27 @@
  * active/running with no terminal, run outputs, failure or open wait;
  * exactly one settled-but-unbound execution
  * (`executions.length === transitions.length + 1`) whose execution role
- * is exactly `stage` (never inferred from the profile, the executor name
- * or the state id) in the agent phase `cleanup_completed` or the
- * decision phase `evaluated` exactly, whose `state_id` is one of the
- * compiled stage's state ids, and whose recorded `iteration_index`
- * belongs to the current durable iteration; the last durable generation
- * must match the trusted compiled stage's id, declaration position,
- * template and current plan digest. Every index and anchor is derived
- * from the validated durable state. Reconciliation: with the iteration
+  * is exactly `stage` (never inferred from the profile, the executor name
+  * or the state id) in the agent phase `cleanup_completed` or the
+  * decision phase `evaluated` exactly, whose `state_id` is one of the
+  * compiled stage's state ids, and whose recorded `iteration_index`
+  * resolves — through the single existing exact resolver
+  * `pipelineV2StageIterationAt` at the execution's start boundary
+  * (derived only from the durable data: the global execution index k
+  * starts at committed transition count k − 1) — to exactly one
+  * projection matching the generation and iteration this call would
+  * close (`generation_index`, `iteration_index`, `stage_id`,
+  * `template_id`). Zero and ambiguous resolutions — a reused
+  * template with the same iteration index across touching generations —
+  * are both a `lifecycle_conflict` with zero dispatch; no
+  * first/last/current resolution other than the unique exact one is ever
+  * selected, and the membership form of the same shared resolver is
+  * deliberately not used here: membership is the restore verifier's
+  * tolerance, while a closure mutates a specific generation and demands
+  * a unique exact binding. The last durable generation
+  * must match the trusted compiled stage's id, declaration position,
+  * template and current plan digest. Every index and anchor is derived
+  * from the validated durable state. Reconciliation: with the iteration
  * open, the sequence `stage_iteration_closed` (no wait index) and — if
  * the caller asked — `stage_generation_closed` is prepared; with the
  * iteration already closed at this boundary, an exact match of the
@@ -145,6 +158,7 @@
 import { isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import {
   PipelineV2StateError,
+  pipelineV2StageIterationAt,
   reducePipelineV2RunCommand,
   validatePipelineV2RunState,
   type PipelineV2RunCommand,
@@ -298,7 +312,12 @@ function controllerError(
 
 /**
  * The capture boundary, shared by both public APIs: every options field
- * and every sink member is read exactly once as an opaque reference. The
+ * and the sink's `poisoned` and `dispatch` members are read exactly once
+ * as an opaque reference. The authoritative `snapshot` is read once at
+ * capture and is then re-read after every dispatch and on its typed
+ * failures — the per-dispatch verification and the durability mapping
+ * take their state from the sink's authoritative snapshot, never from a
+ * memoized copy. The
  * compiled plan and the state document are not traversed here (their
  * fields are read only after the compiled-plan provenance gate has run);
  * an unexpected error from a sink getter propagates unchanged. No
@@ -959,10 +978,42 @@ export async function closePipelineV2StageIteration(
     );
   }
   const executionIterationIndex = lastExecution.iteration_index;
-  if (executionIterationIndex === undefined || lastIteration.index !== executionIterationIndex) {
+  if (executionIterationIndex === undefined) {
     throw controllerError(
       "lifecycle_conflict",
-      `the settled stage execution ${lastExecution.index} does not belong to iteration ${lastIteration.index} of generation ${generation.index}`,
+      `the settled stage execution ${lastExecution.index} records no stage iteration index`,
+      ctx.snapshot,
+    );
+  }
+  // The exact execution → generation binding: the execution's start
+  // boundary is derived only from the durable data (the global execution
+  // index k starts at committed transition count k − 1), and the single
+  // existing exact resolver must return exactly one projection that
+  // matches the generation and iteration this call would close. Zero and
+  // ambiguous resolutions — e.g. a reused template with the same
+  // iteration index across touching generations — are both a lifecycle
+  // conflict; no first/last/current resolution is ever selected, and the
+  // membership form of the same shared resolver is deliberately not used
+  // here because a closure mutates a specific generation and demands a
+  // unique exact binding.
+  const resolvedIteration = pipelineV2StageIterationAt(
+    ctx.state,
+    lastExecution.index - 1,
+    executionIterationIndex,
+    ctx.compiledStage.template,
+  );
+  if (
+    resolvedIteration === null ||
+    resolvedIteration.generation_index !== generation.index ||
+    resolvedIteration.iteration_index !== lastIteration.index ||
+    resolvedIteration.stage_id !== generation.stage_id ||
+    resolvedIteration.template_id !== generation.template_id
+  ) {
+    throw controllerError(
+      "lifecycle_conflict",
+      resolvedIteration === null
+        ? `the settled stage execution ${lastExecution.index} does not resolve to exactly one stage iteration of template ${JSON.stringify(ctx.compiledStage.template)} at its start boundary`
+        : `the settled stage execution ${lastExecution.index} resolves to stage iteration ${resolvedIteration.iteration_index} of generation ${resolvedIteration.generation_index}, not the stage iteration ${lastIteration.index} of generation ${generation.index} this call would close`,
       ctx.snapshot,
     );
   }

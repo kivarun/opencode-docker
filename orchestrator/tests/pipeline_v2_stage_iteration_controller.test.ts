@@ -1523,6 +1523,14 @@ describe("pipeline v2 stage iteration controller", () => {
     // both public flows share one pre-check and one dispatch sequence
     expect(source.split("precheckSequence(").length - 1).toBe(3);
     expect(source.split("dispatchPrecheckedSequence(").length - 1).toBe(3);
+    // the execution → generation binding of the closure uses the one
+    // existing exact resolver; the membership form of the same resolver,
+    // a second replay/candidate resolver and any first/last/current
+    // resolution are absent from this module
+    expect(source.split("pipelineV2StageIterationAt(").length - 1).toBe(1);
+    expect(source.includes("pipelineV2StageIterationMembershipAt")).toBe(false);
+    expect(source.includes("stageIterationCandidatesAt")).toBe(false);
+    expect(source.includes("candidates")).toBe(false);
     // no second registry lives in this module
     expect(source.includes("new WeakMap")).toBe(false);
     expect(source.includes("new WeakSet")).toBe(false);
@@ -2502,7 +2510,12 @@ describe("pipeline v2 stage iteration controller", () => {
           const recording = recordingSink(ctx.sink, ctx.fixture, false);
           const cause = await catchClose(() => closePipelineV2StageIteration(closeOptions(ctx, { sink: recording.sink })));
           const error = expectControllerError(cause, "lifecycle_conflict");
-          expect(error.message).toContain("does not belong to iteration 2 of generation 1");
+          // the exact resolver returns the unique positional candidate of
+          // the settled execution (iteration 1 of generation 1), which is
+          // not the iteration this call would close
+          expect(error.message).toContain(
+            "resolves to stage iteration 1 of generation 1, not the stage iteration 2 of generation 1 this call would close",
+          );
           expect(recording.commands).toEqual([]);
         } finally {
           await disposeRun(ctx.fixture);
@@ -2822,6 +2835,10 @@ describe("pipeline v2 stage iteration controller", () => {
           await closePipelineV2StageIteration(closeOptions(ctx, { sink: countingSink }));
           expect(poisonedReads).toBe(1);
           expect(dispatchReads).toBe(1);
+          // the zero-dispatch exact retry reads the authoritative snapshot
+          // exactly once (at capture); it is never memoized, but no
+          // dispatch means no re-read
+          expect(snapshotReads).toBe(1);
           // unexpected getter errors propagate unchanged
           const injected = new Error("injected close snapshot getter failure");
           const brokenSink: PipelineV2StageIterationControllerSink = {
@@ -2862,6 +2879,248 @@ describe("pipeline v2 stage iteration controller", () => {
             expect(error.message).not.toContain(banned);
           }
           expect(Object.keys(error).sort()).toEqual(["name", "reason", "state"]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    /** One settled stage agent execution on the given state id. */
+    async function settleStageExecution(ctx: StageCtx, stateId: string, iterationIndex: number, label: string): Promise<void> {
+      await ctx.sink.dispatch({ kind: "start_agent_execution", stateId, profile: "coder", executionRole: "stage", iterationIndex });
+      for (const command of [
+        { kind: "agent_data_prepared" },
+        { kind: "agent_execution_session_created", sessionId: `sess-${label}` },
+        { kind: "agent_tool_session_created", sessionId: `tool-${label}` },
+        { kind: "agent_running" },
+        { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+        { kind: "agent_cleanup_completed" },
+      ] as PipelineV2RunCommand[]) {
+        await ctx.sink.dispatch(command);
+      }
+    }
+
+    test("71. a reused template's touching generations reject the closure of an execution-free generation", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(REUSED_TEMPLATE_STAGES, [A1, B1], pipeline);
+        try {
+          // generation 1 / iteration 1 for stage-1; the stage execution
+          // settles unbound; the iteration and the generation close
+          await driveAgentStageBoundary(ctx);
+          const closed = await closePipelineV2StageIteration(closeOptions(ctx, { generationCloseReason: "next_stage" }));
+          expect(closed.generation_closed).toBe(true);
+          // generation 2 / iteration 1 for stage-2 (the same template and
+          // the same state ids) opens at the same boundary, before any
+          // transition binds the settled execution; no execution runs in it
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", initialBudget: 3, sink: ctx.sink });
+          const before = JSON.stringify(ctx.sink.snapshot);
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", iterationCloseReason: "normal_close", sink: recording.sink }),
+          );
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain('does not resolve to exactly one stage iteration of template "development" at its start boundary');
+          expect(recording.commands).toEqual([]);
+          // zero dispatch: the state is byte-identical and generation 2's
+          // iteration stays open
+          expect(JSON.stringify(ctx.sink.snapshot)).toBe(before);
+          const state = ctx.sink.snapshot as PipelineV2RunState;
+          expect(state.generations[1]?.open_iteration).toEqual({ index: 1, opened_transition_count: 1 });
+          expect(state.generations[1]?.iterations[0]?.closed).toBeUndefined();
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("72. the same template and iteration index with a unique positional candidate closes normally", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(REUSED_TEMPLATE_STAGES, [A1, B1], pipeline);
+        try {
+          // generation 1 for stage-1 opens and closes entirely at boundary
+          // 0, strictly before the stage-2 execution starts
+          await ctx.sink.dispatch({
+            kind: "stage_generation_opened",
+            stageId: "stage-1",
+            stagePosition: 1,
+            templateId: "development",
+            planSha256: ctx.compiledPlan.plan_sha256,
+            initialBudget: 3,
+            transitionCount: 0,
+          });
+          await ctx.sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 0 });
+          await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+          await ctx.sink.dispatch({ kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+          const ensured = await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", initialBudget: 3, sink: ctx.sink });
+          expect(ensured).toMatchObject({ generation_index: 2, iteration_index: 1 });
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+            executionIndex: 1,
+          });
+          await settleStageExecution(ctx, "dev_entry", 1, "stage-2-exec");
+          // the resolver's only positional candidate at the execution's
+          // start boundary is generation 2's iteration 1 (generation 1's
+          // iteration is closed strictly before) — the closure proceeds
+          const result = await closePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", iterationCloseReason: "normal_close", sink: ctx.sink });
+          expect(result).toMatchObject({ generation_index: 2, iteration_index: 1, generation_closed: false });
+          expect(result.state.generations[1]?.iterations[0]?.closed).toMatchObject({ by: "normal_close", closed_transition_count: 1 });
+          validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("73. a recorded iteration index with no template-matching positional candidate is a conflict", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(TWO_STAGES, [A1, B1], pipeline);
+        try {
+          // generation 1 for stage-1 (development); the first stage
+          // execution runs in iteration 1 and is bound by the transition
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+            executionIndex: 1,
+          });
+          await settleStageExecution(ctx, "dev_entry", 1, "dev-iter1");
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "dev_entry", outcome: "completed", to: "test_entry", transition_index: 1 },
+            executionIndex: 2,
+          });
+          await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          // the next stage execution runs on test_entry (stage-2's state)
+          // inside generation 1's iteration 2 (development) — the reducer
+          // does not check the state↔template relation
+          await settleStageExecution(ctx, "test_entry", 2, "test-iter2");
+          // the iteration and the generation close at the same boundary and
+          // generation 2 for stage-2 (testing) opens with its iteration 1
+          await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 2, by: "normal_close" });
+          await ctx.sink.dispatch({ kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", initialBudget: 3, sink: ctx.sink });
+          // the settled execution's recorded index 2 has no testing-template
+          // positional candidate at its start boundary
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", iterationCloseReason: "normal_close", sink: recording.sink }),
+          );
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain('does not resolve to exactly one stage iteration of template "testing" at its start boundary');
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("74. a unique positional candidate in another generation is a conflict (the exact binding)", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(REUSED_TEMPLATE_STAGES, [A1, B1], pipeline);
+        try {
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+            executionIndex: 1,
+          });
+          await settleStageExecution(ctx, "dev_entry", 1, "dev-iter1");
+          await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
+          await ctx.sink.dispatch({
+            kind: "transition_committed",
+            step: { from: "dev_entry", outcome: "completed", to: "dev_entry", transition_index: 1 },
+            executionIndex: 2,
+          });
+          await settleStageExecution(ctx, "dev_entry", 2, "dev-iter2");
+          // generation 1 (stage-1) closes with its second iteration; a new
+          // generation 2 for stage-2 (the same template) opens
+          await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 2, by: "normal_close" });
+          await ctx.sink.dispatch({ kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+          await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", initialBudget: 3, sink: ctx.sink });
+          // the resolver returns the unique positional candidate of the
+          // settled execution (generation 1's iteration 2), which is not the
+          // generation/iteration this call would close
+          const recording = recordingSink(ctx.sink, ctx.fixture, false);
+          const cause = await catchClose(() =>
+            closePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-2", iterationCloseReason: "normal_close", sink: recording.sink }),
+          );
+          const error = expectControllerError(cause, "lifecycle_conflict");
+          expect(error.message).toContain(
+            "resolves to stage iteration 2 of generation 1, not the stage iteration 1 of generation 2 this call would close",
+          );
+          expect(recording.commands).toEqual([]);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("75. an iteration-only closure reads the authoritative snapshot exactly twice (capture plus post-dispatch verification)", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          let snapshotReads = 0;
+          let poisonedReads = 0;
+          let dispatchReads = 0;
+          const countingSink: PipelineV2StageIterationControllerSink = {
+            get snapshot() {
+              snapshotReads += 1;
+              return ctx.sink.snapshot;
+            },
+            get poisoned() {
+              poisonedReads += 1;
+              return ctx.sink.poisoned;
+            },
+            get dispatch() {
+              dispatchReads += 1;
+              return (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+            },
+          };
+          const result = await closePipelineV2StageIteration(closeOptions(ctx, { sink: countingSink }));
+          expect(result.generation_closed).toBe(false);
+          expect(snapshotReads).toBe(2);
+          expect(poisonedReads).toBe(1);
+          expect(dispatchReads).toBe(1);
+        } finally {
+          await disposeRun(ctx.fixture);
+        }
+      });
+    });
+
+    test("76. a full closure with two dispatches reads the authoritative snapshot exactly three times", async () => {
+      await withPipeline(async (pipeline) => {
+        const ctx = await stageReady(STAGE_ONE_DEV, [A1], pipeline);
+        try {
+          await driveAgentStageBoundary(ctx);
+          let snapshotReads = 0;
+          let poisonedReads = 0;
+          let dispatchReads = 0;
+          const countingSink: PipelineV2StageIterationControllerSink = {
+            get snapshot() {
+              snapshotReads += 1;
+              return ctx.sink.snapshot;
+            },
+            get poisoned() {
+              poisonedReads += 1;
+              return ctx.sink.poisoned;
+            },
+            get dispatch() {
+              dispatchReads += 1;
+              return (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+            },
+          };
+          const result = await closePipelineV2StageIteration(
+            closeOptions(ctx, { sink: countingSink, generationCloseReason: "next_stage" }),
+          );
+          expect(result.generation_closed).toBe(true);
+          expect(snapshotReads).toBe(3);
+          expect(poisonedReads).toBe(1);
+          expect(dispatchReads).toBe(1);
         } finally {
           await disposeRun(ctx.fixture);
         }

@@ -2126,8 +2126,12 @@ iteration_index, state}` and `{compiled_stage, generation_index,
 iteration_index, generation_closed, state}` with the exact frozen
 compiled stage object.
 
-The trusted order is fail-closed: every options field and every sink
-member is captured exactly once as an opaque reference, the sink poison
+The trusted order is fail-closed: every options field and the sink's
+`poisoned`/`dispatch` members are captured exactly once as opaque
+references (the authoritative `snapshot` is captured once and then
+re-read after every dispatch and on its typed failures — never memoized,
+so the per-dispatch verification always takes the sink's authoritative
+state), the sink poison
 latch fires first, then `compiledPipelineV2RunPlanStageFor` is the single
 compiled-plan provenance gate and stage lookup (its own errors keep their
 classes), and only after the gate does `validatePipelineV2RunState` — the
@@ -2193,7 +2197,18 @@ failure or open wait; exactly one settled-but-unbound execution
 the executor name or the state id) in the agent phase
 `cleanup_completed` or the decision phase `evaluated` exactly, whose
 `state_id` is one of the compiled stage's state ids, and whose recorded
-`iteration_index` belongs to the current durable iteration; the last
+`iteration_index` resolves — through the single existing exact resolver
+`pipelineV2StageIterationAt` at the execution's start boundary (derived
+only from the durable data: the global execution index k starts at
+committed transition count k − 1) — to exactly one projection matching
+the generation and iteration this call would close (`generation_index`,
+`iteration_index`, `stage_id`, `template_id`); zero and ambiguous
+resolutions (a reused template with the same iteration index across
+touching generations) are both a `lifecycle_conflict` with zero
+dispatch — no first/last/current resolution is ever selected, and the
+membership resolver is deliberately not used here because a closure
+mutates a specific generation and demands a unique exact binding; the
+last
 durable generation must match the compiled stage's id, declaration
 position, template and current plan digest. Reconciliation: an open
 iteration is closed by `stage_iteration_closed` (no wait index) plus the
