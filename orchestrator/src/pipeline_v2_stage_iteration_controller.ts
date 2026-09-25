@@ -48,9 +48,13 @@
  * identical dispatch is idempotent success only on that exact match. No
  * rollback and no automatic second dispatch ever happen.
  *
- * Capture boundary: every options field and every sink member
- * (`poisoned`, `dispatch`, `snapshot`) is read exactly once as an opaque
- * reference; no field of the compiled plan, the snapshot document or the
+ * Capture boundary: every options field and the sink's `poisoned` and
+ * `dispatch` members are read exactly once as an opaque reference; the
+ * authoritative `snapshot` is read once at capture and is then re-read
+ * after every dispatch and on its typed failures — it is deliberately
+ * never memoized, so the per-dispatch verification and the durability
+ * mapping always take the sink's authoritative state. No field of the
+ * compiled plan, the snapshot document or the
  * stage id is traversed before the compiled-plan provenance gate has run
  * (the gate is the first validation of the compiled plan and stage id
  * contents after the fail-closed sink poison latch). An unexpected error
