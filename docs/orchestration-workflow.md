@@ -2309,6 +2309,62 @@ replanning chain, opening the next iteration, automatic resume,
 coordinator/runner/CLI wiring, schema changes, migrations/API/T3,
 multi-process locking.
 
+### Revise-task intent acceptance controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_revise_task_intent_controller.ts`
+(public, with the internal core
+`pipeline_v2_revise_task_intent_controller_internal.ts`) accepts one
+provenance-registered prepared `revise_task_intent` together with one
+provenance-registered prepared candidate task revision (the only place
+the task body exists) and durably records the exact sequence
+`plan_intent_accepted` → `task_revision_accepted` — the increment ends
+at the accepted task revision: it never closes the iteration, never
+records a wait response, never creates a plan revision and never resumes
+the run.
+
+Binding chain (fail-closed, before any filesystem effect): the waiting
+run, its open wait record and its declared `revise_task` action; the
+intent's run id and wait index; a different already-accepted intent
+digest is `intent_conflict` with zero writes; the CURRENT task revision
+comes only from the durable ledger (the latest record for the intent's
+task id), its immutable manifest is loaded read-only through the
+existing run-plan store and must match the durable record exactly, and
+the existing binding validators are the only binding authorities —
+`validateTaskRevisionChain` (the candidate is the exact successor of the
+current revision) and `validateReviseIntentBinding` (the intent's two
+digests name the current/candidate digests exactly, the candidate origin
+`user_response`). An already durable candidate revision is decided by
+the durable records alone before the current artifact load and the chain
+validators: the exact record is a zero-dispatch success, a different
+digest at the same revision or a ledger that moved past the candidate is
+`candidate_conflict`.
+
+Reconciliation: a wait without a durable intent is pre-checked (the
+whole missing reducer sequence on a local snapshot), then the
+wait-intent manifest and the task-revision manifest are published in
+that order (each published result verified structurally against the
+prepared object), then the two commands are dispatched strictly in order
+with the authoritative sink snapshot re-read and structurally verified
+after each dispatch; a racing identical dispatch is idempotent success
+only on the exact durable record; a resolve-without-change dispatch
+failure is `invalid_state`. Durability: sink `not_committed` keeps the
+published manifests as orphans with the previous snapshot authoritative
+(a fresh retry adopts the files and dispatches the remaining suffix);
+sink `durability_unknown` adopts the visible candidate, poisons the sink
+and dispatches nothing further (a fresh retry recognizes the durable
+prefix). Runtime export surface is exactly
+`PipelineV2ReviseTaskIntentControllerError` (closed reasons
+`invalid_intent | invalid_state | intent_conflict | candidate_conflict |
+state_persist_failed`, last authoritative `state`) and
+`acceptPipelineV2ReviseTaskIntent({runRoot, sink, intent,
+candidateTaskRevision})`; the deep-frozen content-free result is
+`{wait_index, intent_sha256, task_id, task_revision, task_sha256,
+state}`. Not implemented (stays unwired): the revise/continue action
+policy, the iteration closure, the wait response recording, task/plan
+replanning, the next plan revision, opening the next iteration,
+automatic resume, coordinator/runner/CLI wiring, schema changes,
+migrations/API/T3, multi-process locking.
+
 ### Stage generation/iteration controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
