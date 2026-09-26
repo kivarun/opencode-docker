@@ -10,9 +10,11 @@ import {
   type PipelineV2WaitRecord,
 } from "./pipeline_v2_state.ts";
 import {
+  loadPipelineV2PlanRevision,
   loadPipelineV2TaskRevision,
   publishPipelineV2TaskRevision,
   publishPipelineV2WaitIntent,
+  type PublishedPipelineV2RunPlanRevision,
   type PublishedPipelineV2RunTaskRevision,
   type PublishedPipelineV2RunWaitIntent,
 } from "./pipeline_v2_run_plan_store.ts";
@@ -36,62 +38,92 @@ import type {
  * strictly the `revise_task_intent` kind) together with one
  * provenance-registered prepared candidate task revision (the only place
  * the task `body` exists), binds both against the current durable run,
- * publishes the immutable wait-intent and task-revision manifests through
- * the existing run-plan filesystem store, and durably records the exact
- * sequence `plan_intent_accepted` → `task_revision_accepted` through the
+ * publishes the immutable task-revision and wait-intent manifests through
+ * the existing run-plan filesystem store in that exact order, and durably
+ * records the missing suffix of the exact sequence
+ * `plan_intent_accepted` → `task_revision_accepted` through the
  * structural sink. The increment ends at the accepted task revision: the
  * controller never closes the iteration, never records a wait response,
  * never creates a plan revision and never resumes the run.
  *
- * Binding chain (fail-closed, before any filesystem effect): the waiting
- * run, its open wait record and its declared `revise_task` action; the
- * intent's run id and wait index against the durable record; a different
- * already-accepted intent digest is an `intent_conflict` with zero writes
- * and zero dispatch. The CURRENT task revision is taken only from the
- * durable ledger (the latest record for the intent's task id — a missing
- * current revision is `invalid_state`), its immutable manifest is loaded
- * read-only through the existing run-plan store and must match the
- * durable record exactly (run, task, revision, digest), and the chain and
- * revise binding validators are the only binding authorities: the
- * candidate must be the exact successor of the current revision
- * (`validateTaskRevisionChain`) and the intent's two digests must name
- * the current and candidate digests exactly with the candidate origin
- * `user_response` (`validateReviseIntentBinding`). Binding, manifest and
- * store errors keep their original classes and identity.
+ * CURRENT task revision is derived ONLY from the last accepted plan
+ * revision's task pointer of the current stage, never from the end of the
+ * task ledger: the last open stage generation and its open iteration must
+ * exist, the last durable plan record must exist and its digest must
+ * equal the generation's `plan_sha256`, the plan manifest is loaded
+ * read-only by the durable revision and must match the durable record
+ * exactly (run id, revision, digest, previous digest, origin execution),
+ * the plan must carry the open generation's stage, the stage must carry
+ * exactly the intent's task as its task pointer, that pointer must have
+ * an exact durable task record (task id, revision, digest), and the
+ * pointer's immutable task artifact must be loadable and must match both
+ * the pointer and the durable record. A historical task, a task of
+ * another stage, a task of an older plan or a task that survives only in
+ * the ledger is rejected as `invalid_state` before any publication or
+ * dispatch.
  *
- * Validation order: the options shape; every options field read exactly
- * once (`runRoot` → `sink` → `intent` → `candidateTaskRevision`); the
- * sink's `poisoned`, `dispatch` and initial `snapshot` members captured
- * exactly once as opaque references with `dispatch` bound to the sink
- * before the first await; the per-call ops getters read exactly once; the
- * poisoned-sink latch; the intent provenance gate and then the candidate
- * provenance gate (registry lookups — hand-built, cast, spread,
- * `structuredClone` and Proxy look-alikes are rejected before any field
- * of the intent, the candidate or the durable snapshot is read, Proxy
- * traps never invoked); only then the single `validatePipelineV2RunState`
- * of the durable snapshot and the durable bindings. A hostile extra
- * options field is ignored.
+ * The candidate binding is fully checked in every reconciliation state,
+ * including the exact durable candidate: the existing
+ * `validateTaskRevisionChain` (the candidate is the exact successor of
+ * the plan-bound current revision) and `validateReviseIntentBinding` (the
+ * intent's two digests name the current/candidate digests exactly, the
+ * candidate origin `user_response`) are the only binding authorities —
+ * their errors keep their original classes — and the candidate must
+ * actually change the task: an unchanged body is the controller's own
+ * `invalid_intent` with zero publication and zero dispatch. The body is
+ * never part of any diagnostic.
  *
- * Reconciliation: a wait without a durable intent is pre-checked (the
- * whole missing reducer sequence on a local snapshot — a rejection is
- * `invalid_state` with zero filesystem effects), then the wait-intent
- * manifest and the task-revision manifest are published in that order
- * (each published result is verified structurally against the prepared
- * object before any dispatch; store errors keep their class), then the
- * two commands are dispatched strictly in order with the authoritative
- * sink snapshot re-read and structurally verified after each dispatch.
- * An exact durable intent is an idempotent retry: the intent publication
- * is re-verified or restored (no second `plan_intent_accepted`), and the
- * task revision branch decides — a missing revision is published
- * (idempotent adoption) and dispatched once, the exact durable record is
- * a zero-dispatch success, a different digest at the same revision or a
- * durable ledger that moved past the candidate is a `candidate_conflict`.
- * A racing identical dispatch is idempotent success only on the exact
- * durable record; a dispatch that reports failure without any durable
- * effect is `invalid_state`. Sink `not_committed` keeps the published
- * manifests as orphans with the previous snapshot authoritative; sink
- * `durability_unknown` adopts the visible candidate, poisons the sink and
- * dispatches nothing further. Nothing is ever rolled back.
+ * Reconciliation over the durable records only:
+ * - R0: no durable intent, no durable candidate — the whole missing
+ *   sequence (`plan_intent_accepted` → `task_revision_accepted`) is
+ *   pre-checked through the single reducer on a local snapshot before any
+ *   filesystem effect;
+ * - R1: the exact durable intent, no durable candidate — only the task
+ *   revision is pre-checked;
+ * - R2: the exact durable intent and the exact durable candidate — zero
+ *   dispatch, but both artifacts are still re-published and
+ *   re-verified (idempotent adoption restores removed files without
+ *   touching existing ones);
+ * - a durable candidate without the exact accepted wait intent is
+ *   `invalid_state`; another digest at the candidate revision or a ledger
+ *   entry beyond the candidate revision is `candidate_conflict`; nothing
+ *   is ever returned as success before the full binding checks and the
+ *   filesystem reconciliation.
+ *
+ * Publication order (always `task` → `intent`): the task revision
+ * manifest is published and structurally verified first, then the
+ * wait-intent manifest. A task publication failure or conflict never
+ * calls the intent publisher and never dispatches; an intent publication
+ * failure leaves the task artifact as an orphan and dispatches nothing;
+ * conflicting files are never overwritten and exact retries adopt the
+ * existing bytes without changing inode, mode, mtime or content.
+ *
+ * Dispatch capture: `sink.dispatch` is read exactly once before the
+ * first await and is used through one bound local in every branch and
+ * helper; any re-read of the sink member is impossible. The
+ * authoritative `snapshot` is re-read after every dispatch.
+ *
+ * Post-dispatch verification is a full targeted boundary check (no second
+ * state validator, no general deep comparator, no `TypeError` on hostile
+ * nested shapes): the run stays waiting with the target wait the last and
+ * only record of its index with unchanged binding fields, no response and
+ * the exact accepted intent; the last durable plan record, the last open
+ * generation and its identity bindings, the open target iteration with
+ * its exact `open_iteration` projection and the cursor, transition and
+ * execution journals stay unchanged; after the intent command the task
+ * ledger stays unchanged (or gains only the exact racing candidate); the
+ * task command must append exactly one exact candidate record at the end
+ * of the ledger with the exact predecessor. A dispatch that reports
+ * failure without the required durable change is `invalid_state`; a
+ * racing identical dispatch is idempotent success only on the exact R1/R2
+ * progression.
+ *
+ * Durability: sink `not_committed` keeps the published manifests as
+ * orphans with the previous snapshot authoritative (a fresh retry adopts
+ * the files and dispatches the remaining suffix); sink `durability_unknown`
+ * adopts the visible candidate, poisons the sink and dispatches nothing
+ * further (a fresh retry recognizes the durable prefix). Nothing is ever
+ * rolled back.
  *
  * Runtime export surface (public module) is exactly
  * `PipelineV2ReviseTaskIntentControllerError` and
@@ -162,13 +194,17 @@ export interface AcceptedPipelineV2ReviseTaskIntent {
 }
 
 /**
- * The per-call structural ops of the internal core: the task revision
- * loader and the task/intent publishers of the existing run-plan store.
- * One frozen production object binds them to the public store functions;
- * tests inject their own per-call object. There is no mutable
- * module-global seam and no installer.
+ * The per-call structural ops of the internal core: the plan revision
+ * loader, the task revision loader and the task/intent publishers of the
+ * existing run-plan store. One frozen production object binds them to the
+ * public store functions; tests inject their own per-call object. There
+ * is no mutable module-global seam and no installer.
  */
 export interface PipelineV2ReviseTaskIntentControllerOps {
+  readonly loadPlanRevision: (
+    runRoot: string,
+    revision: number,
+  ) => Promise<PublishedPipelineV2RunPlanRevision | null>;
   readonly loadTaskRevision: (
     runRoot: string,
     taskId: string,
@@ -185,6 +221,7 @@ export interface PipelineV2ReviseTaskIntentControllerOps {
 }
 
 export const productionReviseTaskIntentOps: PipelineV2ReviseTaskIntentControllerOps = Object.freeze({
+  loadPlanRevision: (runRoot: string, revision: number) => loadPipelineV2PlanRevision(runRoot, revision),
   loadTaskRevision: (runRoot: string, taskId: string, revision: number) =>
     loadPipelineV2TaskRevision(runRoot, taskId, revision),
   publishTaskRevision: (runRoot: string, manifest: unknown) => publishPipelineV2TaskRevision(runRoot, manifest),
@@ -210,16 +247,17 @@ function invalidIntent(message: string): PipelineV2ReviseTaskIntentControllerErr
 }
 
 /**
- * The latest durable task revision record for one task id, read from the
- * append-only ledger.
+ * The durable task record exactly matching one plan task pointer:
+ * task id, revision and digest.
  */
-function latestTaskRevisionRecord(
+function findDurableTaskRecord(
   state: PipelineV2RunState,
   taskId: string,
+  revision: number,
+  sha256: string,
 ): PipelineV2TaskRevisionState | undefined {
-  for (let index = state.task_revisions.length - 1; index >= 0; index -= 1) {
-    const record = state.task_revisions[index];
-    if (record !== undefined && record.task_id === taskId) {
+  for (const record of state.task_revisions) {
+    if (record.task_id === taskId && record.revision === revision && record.sha256 === sha256) {
       return record;
     }
   }
@@ -227,9 +265,26 @@ function latestTaskRevisionRecord(
 }
 
 /**
- * The exact durable task revision record of the accepted candidate:
- * identity, digest, chain predecessor and the wait/intent links of the
- * open wait.
+ * The task ledger entries of one task id that sit at or beyond a given
+ * revision.
+ */
+function taskRecordsAtOrBeyond(
+  state: PipelineV2RunState,
+  taskId: string,
+  revision: number,
+): PipelineV2TaskRevisionState[] {
+  const found: PipelineV2TaskRevisionState[] = [];
+  for (const record of state.task_revisions) {
+    if (record.task_id === taskId && record.revision >= revision) {
+      found.push(record);
+    }
+  }
+  return found;
+}
+
+/**
+ * The exact durable candidate record: task id, revision, digest, chain
+ * predecessor and the wait/intent links of the open wait.
  */
 function taskRevisionRecordMatches(
   record: PipelineV2TaskRevisionState,
@@ -248,45 +303,61 @@ function taskRevisionRecordMatches(
 }
 
 /**
- * The durable authoritative state after the task revision dispatch must
- * carry exactly the accepted record at the end of the ledger.
+ * The task ledger is unchanged: same length and same targeted record
+ * fields at every position (no general deep comparator).
  */
-function stateCarriesTaskRevision(
-  state: PipelineV2RunState | null,
-  candidate: PreparedPipelineV2RunTaskRevision,
-  waitIndex: number,
-  intentSha256: string,
+function taskLedgerUnchanged(
+  before: PipelineV2RunState,
+  after: PipelineV2RunState,
 ): boolean {
-  if (state === null) {
+  if (!Array.isArray(after.task_revisions) || after.task_revisions.length !== before.task_revisions.length) {
     return false;
   }
-  const record = latestTaskRevisionRecord(state, candidate.manifest.task_id);
-  return record !== undefined && taskRevisionRecordMatches(record, candidate, waitIndex, intentSha256);
+  for (let index = 0; index < before.task_revisions.length; index += 1) {
+    const left = before.task_revisions[index];
+    const right = after.task_revisions[index];
+    if (
+      left === undefined ||
+      right === undefined ||
+      left.index !== right.index ||
+      left.task_id !== right.task_id ||
+      left.revision !== right.revision ||
+      left.sha256 !== right.sha256 ||
+      left.previous_sha256 !== right.previous_sha256 ||
+      left.wait_index !== right.wait_index ||
+      left.intent_sha256 !== right.intent_sha256
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
- * The open wait record after the intent dispatch must carry exactly the
- * accepted intent digest with its binding fields unchanged.
+ * The exact post-wait wait record: found exactly once by index, binding
+ * fields unchanged, no response, and the exact accepted intent digest.
  */
-function waitCarriesIntent(
-  state: PipelineV2RunState | null,
+function waitBoundaryUnchangedForRevise(
+  state: PipelineV2RunState,
   waitIndex: number,
   intentSha256: string,
   before: PipelineV2WaitRecord,
 ): boolean {
-  if (state === null) {
+  if (state.status !== "waiting" || state.phase !== "waiting") {
     return false;
   }
+  if (!Array.isArray(state.waits)) {
+    return false;
+  }
+  let matches = 0;
   let after: PipelineV2WaitRecord | undefined;
   for (const record of state.waits) {
     if (record.index === waitIndex) {
+      matches += 1;
       after = record;
     }
   }
-  if (after === undefined) {
-    return false;
-  }
-  if (after.intent?.intent_sha256 !== intentSha256) {
+  if (matches !== 1 || after === undefined) {
     return false;
   }
   if (
@@ -296,7 +367,8 @@ function waitCarriesIntent(
     before.reason !== after.reason ||
     before.request_sha256 !== after.request_sha256 ||
     after.response !== undefined ||
-    before.actions.length !== after.actions.length
+    before.actions.length !== after.actions.length ||
+    after.intent?.intent_sha256 !== intentSha256
   ) {
     return false;
   }
@@ -304,6 +376,71 @@ function waitCarriesIntent(
     const other = after.actions[position];
     return other !== undefined && other.id === action.id && other.to === action.to;
   });
+}
+
+/**
+ * The plan and lifecycle boundary is unchanged: the last durable plan
+ * record, the last open generation with its identity bindings, the open
+ * target iteration with its exact `open_iteration` projection and the
+ * cursor, transition and execution journals.
+ */
+function planBoundaryUnchanged(
+  before: PipelineV2RunState,
+  after: PipelineV2RunState,
+): boolean {
+  const beforePlan = before.plan_revisions[before.plan_revisions.length - 1];
+  const afterPlan = after.plan_revisions[after.plan_revisions.length - 1];
+  if (
+    beforePlan === undefined ||
+    afterPlan === undefined ||
+    beforePlan.index !== afterPlan.index ||
+    beforePlan.revision !== afterPlan.revision ||
+    beforePlan.sha256 !== afterPlan.sha256 ||
+    beforePlan.previous_sha256 !== afterPlan.previous_sha256 ||
+    beforePlan.origin_execution !== afterPlan.origin_execution ||
+    after.plan_revisions.length !== before.plan_revisions.length
+  ) {
+    return false;
+  }
+  const beforeGeneration = before.generations[before.generations.length - 1];
+  const afterGeneration = after.generations[after.generations.length - 1];
+  if (
+    beforeGeneration === undefined ||
+    afterGeneration === undefined ||
+    afterGeneration.closed !== undefined ||
+    after.generations.length !== before.generations.length ||
+    beforeGeneration.stage_id !== afterGeneration.stage_id ||
+    beforeGeneration.stage_position !== afterGeneration.stage_position ||
+    beforeGeneration.template_id !== afterGeneration.template_id ||
+    beforeGeneration.plan_sha256 !== afterGeneration.plan_sha256 ||
+    beforeGeneration.initial_budget !== afterGeneration.initial_budget ||
+    beforeGeneration.opened_transition_count !== afterGeneration.opened_transition_count ||
+    beforeGeneration.iteration_count !== afterGeneration.iteration_count ||
+    beforeGeneration.iterations.length !== afterGeneration.iterations.length
+  ) {
+    return false;
+  }
+  const beforeIteration = beforeGeneration.iterations[beforeGeneration.iterations.length - 1];
+  const afterIteration = afterGeneration.iterations[afterGeneration.iterations.length - 1];
+  if (
+    beforeIteration === undefined ||
+    afterIteration === undefined ||
+    beforeIteration.index !== afterIteration.index ||
+    beforeIteration.opened_transition_count !== afterIteration.opened_transition_count ||
+    afterIteration.closed !== undefined ||
+    afterGeneration.open_iteration?.index !== afterIteration.index ||
+    afterGeneration.open_iteration?.opened_transition_count !== afterIteration.opened_transition_count
+  ) {
+    return false;
+  }
+  return (
+    after.cursor.current_state === before.cursor.current_state &&
+    after.cursor.transition_count === before.cursor.transition_count &&
+    Array.isArray(after.transitions) &&
+    after.transitions.length === before.transitions.length &&
+    Array.isArray(after.executions) &&
+    after.executions.length === before.executions.length
+  );
 }
 
 /**
@@ -357,7 +494,7 @@ function requirePublishedTask(
 }
 
 /**
- * The reducer pre-check of the whole missing durable sequence on a local
+ * The reducer pre-check of the missing durable sequence on a local
  * snapshot, before any filesystem side effect; every reducer precondition
  * is already covered by the reconciliation, so this is defense-in-depth.
  */
@@ -420,21 +557,27 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
   const poisoned = sink["poisoned"];
   const dispatch = sink["dispatch"];
   const initialSnapshot = sink["snapshot"];
+  const sinkRef = sink as unknown as PipelineV2ReviseTaskIntentControllerSink;
   if (typeof poisoned !== "boolean") {
     throw invalidIntent("the run state sink requires a boolean poisoned flag");
   }
   if (typeof dispatch !== "function") {
     throw invalidIntent("the run state sink requires a dispatch function");
   }
+  const loadPlanRevision = ops.loadPlanRevision;
   const loadTaskRevision = ops.loadTaskRevision;
   const publishTaskRevision = ops.publishTaskRevision;
   const publishWaitIntent = ops.publishWaitIntent;
-  if (typeof loadTaskRevision !== "function" || typeof publishTaskRevision !== "function" || typeof publishWaitIntent !== "function") {
-    throw invalidIntent("the revise task intent controller requires its task loader and publishers");
+  if (
+    typeof loadPlanRevision !== "function" ||
+    typeof loadTaskRevision !== "function" ||
+    typeof publishTaskRevision !== "function" ||
+    typeof publishWaitIntent !== "function"
+  ) {
+    throw invalidIntent("the revise task intent controller requires its loaders and publishers");
   }
-  const sinkRef = sink as unknown as PipelineV2ReviseTaskIntentControllerSink;
-  // The dispatch is bound to the sink immediately at capture: a later
-  // reassignment of the sink's member cannot change the dispatch target.
+  // The dispatch is captured and bound exactly once here; every branch
+  // and helper uses only this bound local.
   const dispatchCommand = (command: PipelineV2RunCommand): Promise<unknown> =>
     Promise.resolve((dispatch as (...args: unknown[]) => unknown).call(sink, command));
   // The fail-closed poison latch: a poisoned sink accepts no acceptance.
@@ -521,59 +664,107 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
       state,
     );
   }
-  // The current task revision comes only from the durable ledger.
-  const currentRecord = latestTaskRevisionRecord(state, manifest.task_id);
+  // The open stage generation and its open iteration.
+  const generation = state.generations[state.generations.length - 1];
+  if (generation === undefined || generation.closed !== undefined) {
+    throw controllerError(
+      "invalid_state",
+      "the run has no open stage generation for the revise intent",
+      state,
+    );
+  }
+  if (generation.open_iteration === undefined) {
+    throw controllerError(
+      "invalid_state",
+      `the stage generation ${generation.index} carries no open iteration for the revise intent`,
+      state,
+    );
+  }
+  // The last durable plan record and the generation's plan binding.
+  const lastPlanRecord = state.plan_revisions[state.plan_revisions.length - 1];
+  if (lastPlanRecord === undefined) {
+    throw controllerError(
+      "invalid_state",
+      "the run has no durable plan revision for the revise intent",
+      state,
+    );
+  }
+  if (generation.plan_sha256 !== lastPlanRecord.sha256) {
+    throw controllerError(
+      "invalid_state",
+      `the open stage generation ${generation.index} does not belong to the last durable plan revision ${lastPlanRecord.revision}`,
+      state,
+    );
+  }
+  // The authoritative plan revision: loaded only from the durable ledger
+  // through the existing run-plan store, then bound to the durable record
+  // exactly.
+  const loadedPlan = await loadPlanRevision(runRoot, lastPlanRecord.revision);
+  if (loadedPlan === null) {
+    throw controllerError(
+      "invalid_state",
+      `the durable plan revision ${lastPlanRecord.revision} is not published on the run's data plane`,
+      state,
+    );
+  }
+  const plan = loadedPlan.plan;
+  if (
+    plan.manifest.run_id !== state.run_id ||
+    plan.manifest.revision !== lastPlanRecord.revision ||
+    plan.sha256 !== lastPlanRecord.sha256 ||
+    plan.manifest.previous_sha256 !== lastPlanRecord.previous_sha256 ||
+    plan.manifest.origin_execution !== lastPlanRecord.origin_execution
+  ) {
+    throw controllerError(
+      "invalid_state",
+      `the published plan revision ${lastPlanRecord.revision} does not match the durable plan record`,
+      state,
+    );
+  }
+  // The plan-bound CURRENT task pointer: the intent's task must be a task
+  // of the open generation's stage in the last accepted plan revision.
+  const stage = plan.manifest.stages.find((entry) => entry.id === generation.stage_id);
+  if (stage === undefined) {
+    throw controllerError(
+      "invalid_state",
+      `the published plan revision ${lastPlanRecord.revision} does not carry the stage of the open generation`,
+      state,
+    );
+  }
+  const pointer = stage.tasks.find((entry) => entry.id === manifest.task_id);
+  if (pointer === undefined) {
+    throw controllerError(
+      "invalid_state",
+      `the stage ${JSON.stringify(generation.stage_id)} of the last accepted plan revision does not carry the task of the revise intent`,
+      state,
+    );
+  }
+  // The plan pointer must have an exact durable task record.
+  const currentRecord = findDurableTaskRecord(state, pointer.id, pointer.revision, pointer.sha256);
   if (currentRecord === undefined) {
     throw controllerError(
       "invalid_state",
-      `the run has no durable task revision for the revise intent's task`,
+      `the plan's task pointer for revision ${pointer.revision} of the revise intent's task has no exact durable task record`,
       state,
     );
   }
-  // The task-revision reconciliation of an already durable candidate
-  // revision runs before the current artifact load: a ledger that already
-  // carries the candidate revision (or moved past it) is decided by the
-  // durable records alone.
-  const existingRecord = currentRecord;
-  if (existingRecord.revision === preparedCandidate.manifest.revision) {
-    if (taskRevisionRecordMatches(existingRecord, preparedCandidate, manifest.wait_index, preparedIntent.sha256)) {
-      return deepFreezeValue({
-        wait_index: manifest.wait_index,
-        intent_sha256: preparedIntent.sha256,
-        task_id: preparedCandidate.manifest.task_id,
-        task_revision: preparedCandidate.manifest.revision,
-        task_sha256: preparedCandidate.sha256,
-        state,
-      });
-    }
-    throw controllerError(
-      "candidate_conflict",
-      `the durable task revision ${existingRecord.revision} of the candidate task already carries different content`,
-      state,
-    );
-  }
-  if (existingRecord.revision > preparedCandidate.manifest.revision) {
-    throw controllerError(
-      "candidate_conflict",
-      `the task ledger already moved past revision ${preparedCandidate.manifest.revision} of the candidate task`,
-      state,
-    );
-  }
-  // The authoritative current task revision: loaded read-only from the
-  // run-plan store, then bound to the durable record exactly.
-  const loadedCurrent = await loadTaskRevision(runRoot, manifest.task_id, currentRecord.revision);
+  // The authoritative current task artifact: loaded read-only from the
+  // run-plan store, then bound to the pointer and the durable record
+  // exactly.
+  const loadedCurrent = await loadTaskRevision(runRoot, pointer.id, pointer.revision);
   if (loadedCurrent === null) {
     throw controllerError(
       "invalid_state",
-      `the durable task revision ${currentRecord.revision} is not published on the run's data plane`,
+      `the durable task revision ${currentRecord.revision} of the revise intent's task is not published on the run's data plane`,
       state,
     );
   }
   const currentPrepared = loadedCurrent.task;
   if (
     currentPrepared.manifest.run_id !== state.run_id ||
-    currentPrepared.manifest.task_id !== manifest.task_id ||
-    currentPrepared.manifest.revision !== currentRecord.revision ||
+    currentPrepared.manifest.task_id !== pointer.id ||
+    currentPrepared.manifest.revision !== pointer.revision ||
+    currentPrepared.sha256 !== pointer.sha256 ||
     currentPrepared.sha256 !== currentRecord.sha256 ||
     currentPrepared.manifest.previous_sha256 !== currentRecord.previous_sha256
   ) {
@@ -586,7 +777,41 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
   // The existing binding validators are the only binding authorities;
   // their errors keep their original classes.
   validateTaskRevisionChain({ previous: currentPrepared, current: preparedCandidate });
-  validateReviseIntentBinding({ intent: preparedIntent, candidateTaskRevision: preparedCandidate, currentTaskRevision: currentPrepared });
+  validateReviseIntentBinding({
+    intent: preparedIntent,
+    candidateTaskRevision: preparedCandidate,
+    currentTaskRevision: currentPrepared,
+  });
+  // The candidate must actually change the task body; the body itself is
+  // never part of any diagnostic.
+  if (preparedCandidate.manifest.body === currentPrepared.manifest.body) {
+    throw controllerError(
+      "invalid_intent",
+      "the candidate task revision does not change the current task body",
+      state,
+    );
+  }
+  // The task ledger reconciliation of a durable candidate revision.
+  const candidateRecords = taskRecordsAtOrBeyond(state, manifest.task_id, preparedCandidate.manifest.revision);
+  for (const record of candidateRecords) {
+    if (record.revision > preparedCandidate.manifest.revision) {
+      throw controllerError(
+        "candidate_conflict",
+        `the task ledger already moved past revision ${preparedCandidate.manifest.revision} of the candidate task`,
+        state,
+      );
+    }
+    if (!taskRevisionRecordMatches(record, preparedCandidate, manifest.wait_index, preparedIntent.sha256)) {
+      throw controllerError(
+        "candidate_conflict",
+        `the durable task revision ${record.revision} of the candidate task already carries different content`,
+        state,
+      );
+    }
+  }
+  const candidateDurable = candidateRecords.length > 0;
+  // The reconciliation classification over the durable records only.
+  const intentDurable = wait.intent?.intent_sha256 === preparedIntent.sha256;
   const intentCommand: PipelineV2RunCommand = {
     kind: "plan_intent_accepted",
     waitIndex: manifest.wait_index,
@@ -600,20 +825,18 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
     waitIndex: manifest.wait_index,
     intentSha256: preparedIntent.sha256,
   };
-  if (wait.intent === undefined) {
-    // The reducer pre-check of the whole missing sequence on the local
-    // snapshot, before any filesystem side effect.
+  // Publication order (always task → intent): the task revision manifest
+  // first, then the wait intent manifest, each verified structurally
+  // against the prepared object before any dispatch. A task publication
+  // failure never calls the intent publisher and never dispatches.
+  const publishedTask = await publishTaskRevision(runRoot, preparedCandidate.manifest);
+  requirePublishedTask(publishedTask, preparedCandidate, state);
+  const publishedIntent = await publishWaitIntent(runRoot, manifest);
+  requirePublishedIntent(publishedIntent, preparedIntent, state);
+  if (!intentDurable && !candidateDurable) {
+    // R0: pre-check the whole missing sequence, then dispatch both
+    // commands strictly in order.
     precheckReviseSequence(state, [intentCommand, taskCommand], state);
-    // Publish the immutable manifests in the durable order (the intent
-    // manifest, then the task revision manifest); store errors keep
-    // their original class and identity (a conflict leaves nothing
-    // behind).
-    const publishedIntent = await publishWaitIntent(runRoot, manifest);
-    requirePublishedIntent(publishedIntent, preparedIntent, state);
-    const publishedTask = await publishTaskRevision(runRoot, preparedCandidate.manifest);
-    requirePublishedTask(publishedTask, preparedCandidate, state);
-    // The durable dispatches, strictly in order, each followed by the
-    // authoritative verification.
     try {
       await dispatchCommand(intentCommand);
     } catch (cause) {
@@ -621,92 +844,123 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
         throw controllerError(
           "state_persist_failed",
           "the revise task intent acceptance could not be confirmed durable",
-          sinkRef.snapshot,
+          sinkRefSnapshot(sinkRef),
         );
       }
       if (cause instanceof PipelineV2RunStateStoreError) {
         throw controllerError(
           "state_persist_failed",
           "the revise task intent acceptance could not be committed",
-          sinkRef.snapshot,
+          sinkRefSnapshot(sinkRef),
         );
       }
       if (cause instanceof PipelineV2StateError) {
         // A racing identical dispatch is idempotent success only on the
-        // exact durable record.
-        const after = sinkRef.snapshot;
-        if (after !== null && waitCarriesIntent(after, manifest.wait_index, preparedIntent.sha256, wait)) {
-          return await acceptAfterIntentDurable(
-            publishTaskRevision,
-            runRoot,
-            sinkRef,
-            preparedIntent,
-            preparedCandidate,
-            manifest.wait_index,
-            preparedIntent.sha256,
-            after,
-          );
+        // exact R1 progression: the exact durable intent with the
+        // boundary unchanged, and the ledger unchanged or carrying only
+        // the exact racing candidate.
+        const after = sinkRefSnapshot(sinkRef);
+        if (after !== null && waitBoundaryUnchangedForRevise(after, manifest.wait_index, preparedIntent.sha256, wait)) {
+          const afterCandidate = taskRecordsAtOrBeyond(after, manifest.task_id, preparedCandidate.manifest.revision);
+          if (
+            taskLedgerUnchanged(state, after) ||
+            (afterCandidate.length === 1 &&
+              taskRevisionRecordMatches(afterCandidate[0] as PipelineV2TaskRevisionState, preparedCandidate, manifest.wait_index, preparedIntent.sha256))
+          ) {
+            return await dispatchTaskRevisionSuffix(
+              dispatchCommand,
+              sinkRefSnapshot,
+              sinkRef,
+              preparedCandidate,
+              manifest.wait_index,
+              preparedIntent.sha256,
+              after,
+              wait,
+            );
+          }
         }
         throw controllerError(
           "invalid_state",
           `the run state rejected the revise task intent acceptance and does not carry it in the open wait ${manifest.wait_index}`,
-          after,
+          sinkRefSnapshot(sinkRef),
         );
       }
       throw cause;
     }
-    const afterIntent = sinkRef.snapshot;
-    if (afterIntent === null || !waitCarriesIntent(afterIntent, manifest.wait_index, preparedIntent.sha256, wait)) {
+    const afterIntent = sinkRefSnapshot(sinkRef);
+    if (
+      afterIntent === null ||
+      !waitBoundaryUnchangedForRevise(afterIntent, manifest.wait_index, preparedIntent.sha256, wait) ||
+      !planBoundaryUnchanged(state, afterIntent) ||
+      !taskLedgerUnchanged(state, afterIntent)
+    ) {
       throw controllerError(
         "invalid_state",
         `the committed run state does not carry the accepted revise intent in the open wait ${manifest.wait_index}`,
         afterIntent,
       );
     }
-    return await acceptAfterIntentDurable(
-      publishTaskRevision,
-      runRoot,
+    return await dispatchTaskRevisionSuffix(
+      dispatchCommand,
+      sinkRefSnapshot,
       sinkRef,
-      preparedIntent,
       preparedCandidate,
       manifest.wait_index,
       preparedIntent.sha256,
       afterIntent,
+      wait,
     );
   }
-  // The exact durable intent: idempotent retry. The intent publication is
-  // re-verified or restored; no second `plan_intent_accepted` happens.
-  const publishedIntent = await publishWaitIntent(runRoot, manifest);
-  requirePublishedIntent(publishedIntent, preparedIntent, state);
-  return await acceptAfterIntentDurable(
-    publishTaskRevision,
-    runRoot,
-    sinkRef,
-    preparedIntent,
-    preparedCandidate,
-    manifest.wait_index,
-    preparedIntent.sha256,
+  if (intentDurable && !candidateDurable) {
+    // R1: pre-check the task revision, then dispatch only it.
+    precheckReviseSequence(state, [taskCommand], state);
+    return await dispatchTaskRevisionSuffix(
+      dispatchCommand,
+      sinkRefSnapshot,
+      sinkRef,
+      preparedCandidate,
+      manifest.wait_index,
+      preparedIntent.sha256,
+      state,
+      wait,
+    );
+  }
+  // R2: the exact durable intent and candidate; zero dispatch, both
+  // artifacts re-published and re-verified above.
+  return deepFreezeValue({
+    wait_index: manifest.wait_index,
+    intent_sha256: preparedIntent.sha256,
+    task_id: preparedCandidate.manifest.task_id,
+    task_revision: preparedCandidate.manifest.revision,
+    task_sha256: preparedCandidate.sha256,
     state,
-  );
+  });
 }
 
 /**
- * The shared task-revision suffix of the acceptance: the durable state
- * after the intent acceptance (or on the exact durable intent retry) is
- * reconciled against the candidate task revision — missing revisions are
- * published (idempotent adoption) and dispatched once, the exact durable
- * record is a zero-dispatch success, and anything else is a typed
- * conflict.
+ * Reads the sink's authoritative snapshot through one captured accessor
+ * local; the snapshot is never memoized.
  */
-async function acceptAfterIntentDurable(
-  publishTaskRevision: PipelineV2ReviseTaskIntentControllerOps["publishTaskRevision"],
-  runRoot: string,
-  sinkRef: PipelineV2ReviseTaskIntentControllerSink,
-  preparedIntent: PreparedPipelineV2RunWaitIntent,
+function sinkRefSnapshot(sink: PipelineV2ReviseTaskIntentControllerSink): PipelineV2RunState | null {
+  return sink.snapshot;
+}
+
+/**
+ * The shared task-revision suffix: dispatch the task revision command
+ * through the captured dispatch local, then verify the full boundary —
+ * the wait, the plan/lifecycle state and the task ledger's exact single
+ * append. A racing identical dispatch is idempotent success only on the
+ * exact durable record.
+ */
+async function dispatchTaskRevisionSuffix(
+  dispatchCommand: (command: PipelineV2RunCommand) => Promise<unknown>,
+  readSnapshot: (sink: PipelineV2ReviseTaskIntentControllerSink) => PipelineV2RunState | null,
+  sink: PipelineV2ReviseTaskIntentControllerSink,
   preparedCandidate: PreparedPipelineV2RunTaskRevision,
   waitIndex: number,
   intentSha256: string,
-  state: PipelineV2RunState,
+  before: PipelineV2RunState,
+  beforeWait: PipelineV2WaitRecord,
 ): Promise<AcceptedPipelineV2ReviseTaskIntent> {
   const taskCommand: PipelineV2RunCommand = {
     kind: "task_revision_accepted",
@@ -716,78 +970,74 @@ async function acceptAfterIntentDurable(
     waitIndex,
     intentSha256,
   };
-  const record = latestTaskRevisionRecord(state, preparedCandidate.manifest.task_id);
-  if (record !== undefined) {
-    if (record.revision > preparedCandidate.manifest.revision) {
-      throw controllerError(
-        "candidate_conflict",
-        `the task ledger already moved past revision ${preparedCandidate.manifest.revision} of the candidate task`,
-        state,
-      );
-    }
-    if (record.revision === preparedCandidate.manifest.revision) {
-      if (taskRevisionRecordMatches(record, preparedCandidate, waitIndex, intentSha256)) {
-        return deepFreezeValue({
-          wait_index: waitIndex,
-          intent_sha256: intentSha256,
-          task_id: preparedCandidate.manifest.task_id,
-          task_revision: preparedCandidate.manifest.revision,
-          task_sha256: preparedCandidate.sha256,
-          state,
-        });
-      }
-      throw controllerError(
-        "candidate_conflict",
-        `the durable task revision ${record.revision} of the candidate task already carries different content`,
-        state,
-      );
-    }
-  }
-  // The exact retry adoption of the task manifest, then the single
-  // durable dispatch.
-  const publishedTask = await publishTaskRevision(runRoot, preparedCandidate.manifest);
-  requirePublishedTask(publishedTask, preparedCandidate, state);
   try {
-    await Promise.resolve(
-      (sinkRef.dispatch as (...args: unknown[]) => unknown).call(sinkRef, taskCommand),
-    );
+    await dispatchCommand(taskCommand);
   } catch (cause) {
     if (cause instanceof PipelineV2RunStateDurabilityError) {
       throw controllerError(
         "state_persist_failed",
         "the task revision acceptance could not be confirmed durable",
-        sinkRef.snapshot,
+        readSnapshot(sink),
       );
     }
     if (cause instanceof PipelineV2RunStateStoreError) {
       throw controllerError(
         "state_persist_failed",
         "the task revision acceptance could not be committed",
-        sinkRef.snapshot,
+        readSnapshot(sink),
       );
     }
     if (cause instanceof PipelineV2StateError) {
-      const after = sinkRef.snapshot;
-      if (after !== null && stateCarriesTaskRevision(after, preparedCandidate, waitIndex, intentSha256)) {
-        return deepFreezeValue({
-          wait_index: waitIndex,
-          intent_sha256: intentSha256,
-          task_id: preparedCandidate.manifest.task_id,
-          task_revision: preparedCandidate.manifest.revision,
-          task_sha256: preparedCandidate.sha256,
-          state: after,
-        });
+      const after = readSnapshot(sink);
+      if (
+        after !== null &&
+        waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) &&
+        planBoundaryUnchanged(before, after)
+      ) {
+        const records = taskRecordsAtOrBeyond(after, preparedCandidate.manifest.task_id, preparedCandidate.manifest.revision);
+        if (
+          records.length === 1 &&
+          taskRevisionRecordMatches(records[0] as PipelineV2TaskRevisionState, preparedCandidate, waitIndex, intentSha256) &&
+          after.task_revisions[after.task_revisions.length - 1] === records[0]
+        ) {
+          return deepFreezeValue({
+            wait_index: waitIndex,
+            intent_sha256: intentSha256,
+            task_id: preparedCandidate.manifest.task_id,
+            task_revision: preparedCandidate.manifest.revision,
+            task_sha256: preparedCandidate.sha256,
+            state: after,
+          });
+        }
       }
       throw controllerError(
         "invalid_state",
         `the run state rejected the task revision acceptance and does not carry it for task revision ${preparedCandidate.manifest.revision}`,
-        after,
+        readSnapshot(sink),
       );
     }
     throw cause;
   }
-  const after = sinkRef.snapshot;
-  if (after === null || !stateCarriesTaskRevision(after, preparedCandidate, waitIndex, intentSha256)) {
+  const after = readSnapshot(sink);
+  if (
+    after === null ||
+    !waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) ||
+    !planBoundaryUnchanged(before, after) ||
+    after.task_revisions.length !== before.task_revisions.length + 1 ||
+    after.task_revisions.length < 1
+  ) {
+    throw controllerError(
+      "invalid_state",
+      `the committed run state does not carry the accepted task revision ${preparedCandidate.manifest.revision} of the candidate task`,
+      after,
+    );
+  }
+  const appended = after.task_revisions[after.task_revisions.length - 1];
+  if (
+    appended === undefined ||
+    !taskRevisionRecordMatches(appended, preparedCandidate, waitIndex, intentSha256) ||
+    appended.previous_sha256 !== preparedCandidate.manifest.previous_sha256
+  ) {
     throw controllerError(
       "invalid_state",
       `the committed run state does not carry the accepted task revision ${preparedCandidate.manifest.revision} of the candidate task`,

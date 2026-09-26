@@ -2326,27 +2326,40 @@ Binding chain (fail-closed, before any filesystem effect): the waiting
 run, its open wait record and its declared `revise_task` action; the
 intent's run id and wait index; a different already-accepted intent
 digest is `intent_conflict` with zero writes; the CURRENT task revision
-comes only from the durable ledger (the latest record for the intent's
-task id), its immutable manifest is loaded read-only through the
-existing run-plan store and must match the durable record exactly, and
+is derived ONLY from the last accepted plan revision's task pointer of
+the current stage, never from the end of the task ledger — the last open
+stage generation and its open iteration must exist, the last durable
+plan record must exist and its digest must equal the generation's
+`plan_sha256`, the plan manifest is loaded read-only by the durable
+revision and must match the durable record exactly, the plan must carry
+the open generation's stage, the stage must carry exactly the intent's
+task as its task pointer, that pointer must have an exact durable task
+record, and the pointer's immutable task artifact must be loadable and
+must match both the pointer and the durable record; a historical task, a
+task of another stage, a task of an older plan or a task that survives
+only in the ledger is `invalid_state` before any publication/dispatch;
 the existing binding validators are the only binding authorities —
-`validateTaskRevisionChain` (the candidate is the exact successor of the
-current revision) and `validateReviseIntentBinding` (the intent's two
-digests name the current/candidate digests exactly, the candidate origin
-`user_response`). An already durable candidate revision is decided by
-the durable records alone before the current artifact load and the chain
-validators: the exact record is a zero-dispatch success, a different
-digest at the same revision or a ledger that moved past the candidate is
-`candidate_conflict`.
+`validateTaskRevisionChain` and `validateReviseIntentBinding`; the
+candidate must actually change the task — an unchanged body is
+`invalid_intent` with zero publication and zero dispatch. An already
+durable candidate revision never bypasses the binding checks: a durable
+candidate without the exact accepted wait intent is `invalid_state`;
+another digest at the candidate revision or a ledger entry beyond the
+candidate revision is `candidate_conflict`.
 
-Reconciliation: a wait without a durable intent is pre-checked (the
-whole missing reducer sequence on a local snapshot), then the
-wait-intent manifest and the task-revision manifest are published in
-that order (each published result verified structurally against the
-prepared object), then the two commands are dispatched strictly in order
-with the authoritative sink snapshot re-read and structurally verified
-after each dispatch; a racing identical dispatch is idempotent success
-only on the exact durable record; a resolve-without-change dispatch
+Reconciliation: R0 (no durable intent, no durable candidate — the whole
+missing sequence pre-checked), R1 (the exact durable intent, no durable
+candidate — only the task revision pre-checked) and R2 (the exact
+durable intent and candidate — zero dispatch with both artifacts
+re-published and re-verified); the task-revision manifest and then the
+wait-intent manifest are published (each published result verified
+structurally against the prepared object; a task publication failure
+never calls the intent publisher), then the missing commands are
+dispatched strictly in order with the authoritative sink snapshot
+re-read and the full targeted boundary verified after each dispatch (the
+wait, the plan record/generation/iteration, the cursor and the journals,
+and the task ledger); a racing identical dispatch is idempotent success
+only on the exact R1/R2 progression; a resolve-without-change dispatch
 failure is `invalid_state`. Durability: sink `not_committed` keeps the
 published manifests as orphans with the previous snapshot authoritative
 (a fresh retry adopts the files and dispatches the remaining suffix);

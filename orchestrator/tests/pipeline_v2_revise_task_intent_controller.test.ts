@@ -202,6 +202,16 @@ function prepareCandidate(body: string, revision = 2, previous: string | null = 
 }
 
 const A2 = prepareCandidate("Body A revised");
+const B1 = prepareTaskRevisionManifest({
+  schema_version: 1,
+  kind: "task_revision",
+  run_id: RUN_ID,
+  task_id: "task-b",
+  revision: 1,
+  previous_sha256: null,
+  origin: "planning_proposal",
+  body: "Body B",
+});
 
 function prepareReviseIntent(candidate: PreparedPipelineV2RunTaskRevision, currentDigest: string): PreparedPipelineV2RunWaitIntent {
   return prepareWaitIntent({
@@ -233,6 +243,11 @@ interface ReadyOptions {
   noReviseAction?: boolean;
   dropCurrentArtifact?: boolean;
   tamperCurrentArtifact?: boolean;
+  secondPlanRevision?: boolean;
+  dropPlanArtifact?: boolean;
+  tamperPlanArtifact?: boolean;
+  dropCandidateArtifact?: boolean;
+  dropIntentArtifact?: boolean;
 }
 
 /**
@@ -262,11 +277,16 @@ async function reviseReady(options: ReadyOptions = {}): Promise<ReviseCtx> {
           template: "development",
           tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
         },
+        {
+          id: "stage-2",
+          template: "development",
+          tasks: [{ id: "task-b", revision: 1, sha256: B1.sha256, depends_on: [] }],
+        },
       ],
     });
     const candidate: PreparedPipelineV2RunPlanCandidate = preparePipelineV2RunPlanCandidate({
       plan: plan1,
-      taskRevisions: [A1],
+      taskRevisions: [A1, B1],
       previousPlan: null,
       previousTaskRevisions: [],
       protectedInputDigest: PROTECTED_DIGEST,
@@ -288,6 +308,55 @@ async function reviseReady(options: ReadyOptions = {}): Promise<ReviseCtx> {
         step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
         executionIndex: 2,
       });
+      if (options.secondPlanRevision === true) {
+        // close the iteration, run a second planning execution and accept
+        // plan revision 2 while generation 1 stays open with the plan-1
+        // digest, then open iteration 2 and run the stage execution again
+        await sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+        await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+        for (const command of agentPhases("planning2")) {
+          await sink.dispatch(command);
+        }
+        const plan2 = preparePlanRevisionManifest({
+          schema_version: 1,
+          kind: "plan_revision",
+          run_id: RUN_ID,
+          revision: 2,
+          previous_sha256: plan1.sha256,
+          root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+          origin_execution: 3,
+          stages: [
+            {
+              id: "stage-1",
+              template: "development",
+              tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+            },
+          ],
+        });
+        const candidate2: PreparedPipelineV2RunPlanCandidate = preparePipelineV2RunPlanCandidate({
+          plan: plan2,
+          taskRevisions: [A1],
+          previousPlan: plan1,
+          previousTaskRevisions: [],
+          protectedInputDigest: PROTECTED_DIGEST,
+        });
+        await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: candidate2 });
+        await sink.dispatch({
+          kind: "transition_committed",
+          step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+          executionIndex: 3,
+        });
+        await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 3 });
+        await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 2 });
+        for (const command of agentPhases("stage2")) {
+          await sink.dispatch(command);
+        }
+        await sink.dispatch({
+          kind: "transition_committed",
+          step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+          executionIndex: 4,
+        });
+      }
       const request = preparePipelineV2WaitRequest({
         schema_version: 1,
         run_id: RUN_ID,
@@ -343,8 +412,37 @@ async function reviseReady(options: ReadyOptions = {}): Promise<ReviseCtx> {
         await publishPipelineV2TaskRevision(fixture.runRoot, A3.manifest);
       }
     }
+    if (options.dropPlanArtifact === true) {
+      await unlink(join(fixture.runRoot, "run-plan", "plans", "1.json"));
+    }
+    if (options.tamperPlanArtifact === true) {
+      await unlink(join(fixture.runRoot, "run-plan", "plans", "1.json"));
+      const plan1Tampered = preparePlanRevisionManifest({
+        schema_version: 1,
+        kind: "plan_revision",
+        run_id: RUN_ID,
+        revision: 1,
+        previous_sha256: null,
+        root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+        origin_execution: 1,
+        stages: [
+          {
+            id: "stage-1",
+            template: "development",
+            tasks: [{ id: "task-a", revision: 1, sha256: hex("7"), depends_on: [] }],
+          },
+        ],
+      });
+      await (await import("../src/pipeline_v2_run_plan_store.ts")).publishPipelineV2PlanRevision(fixture.runRoot, plan1Tampered.manifest);
+    }
     if (options.dropCurrentArtifact === true) {
       await unlink(join(fixture.runRoot, "run-plan", "tasks", "task-a", "1.json"));
+    }
+    if (options.dropCandidateArtifact === true) {
+      await unlink(join(fixture.runRoot, "run-plan", "tasks", "task-a", "2.json"));
+    }
+    if (options.dropIntentArtifact === true) {
+      await unlink(join(fixture.runRoot, "run-plan", "intents", "1.json"));
     }
     if (options.tamperCurrentArtifact === true) {
       await unlink(join(fixture.runRoot, "run-plan", "tasks", "task-a", "1.json"));
@@ -493,7 +591,8 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       const recording = recordingSink(ctx.sink);
       const result = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
       expect(recording.commands.map((command) => command.kind)).toEqual(["task_revision_accepted"]);
-      expect(result.state.task_revisions).toHaveLength(2);
+      expect(result.state.task_revisions).toHaveLength(3);
+      expect(result.state.task_revisions[2]?.sha256).toBe(ctx.candidate.sha256);
       expect(result.state.revision).toBe((ctx.sink.snapshot?.revision ?? 0));
     } finally {
       await disposeRun(ctx.fixture);
@@ -503,7 +602,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
   test("6. full idempotent retry: both durable, zero dispatch, files preserved", async () => {
     const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {} });
     try {
-      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
       const revision = ctx.sink.snapshot?.revision;
       if (typeof revision !== "number") {
         throw new Error("the durable revision must be recorded");
@@ -626,13 +725,12 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       cause = await catchAccept(() =>
         acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: wrongTaskId, candidateTaskRevision: ctx.candidate }),
       );
-      // the ledger-first order: an unknown task has no durable current
-      // revision, so the controller's own invalid_state fires before the
-      // binding validators
+      // the plan-first order: an unknown task has no task pointer in the
+      // open generation's stage of the last accepted plan revision
       const taskIdError = expectReviseError(cause, "invalid_state");
-      expect(taskIdError.message).toContain("no durable task revision");
+      expect(taskIdError.message).toContain("does not carry the task of the revise intent");
       expect(ctx.sink.snapshot?.waits[0]?.intent).toBeUndefined();
-      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(1);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
     } finally {
       await disposeRun(ctx.fixture);
     }
@@ -747,7 +845,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
         acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: unknownTaskIntent, candidateTaskRevision: ctx.candidate }),
       );
       const error = expectReviseError(cause, "invalid_state");
-      expect(error.message).toContain("no durable task revision");
+      expect(error.message).toContain("does not carry the task of the revise intent");
       // the dropped artifact
       const droppedCtx = await reviseReady({ dropCurrentArtifact: true });
       try {
@@ -785,7 +883,8 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       expect(cause).toBeInstanceOf(PipelineV2RunPlanStoreError);
       expect(ctx.sink.snapshot?.waits[0]?.intent).toBeUndefined();
       expect(await readFile(INTENT_PATH(ctx.fixture.runRoot), "utf8")).toBe("{}");
-      // task file conflict
+      // task file conflict: the intent publisher is never called and the
+      // intent file stays absent
       const cleanCtx = await reviseReady();
       try {
         await mkdir(join(cleanCtx.fixture.runRoot, "run-plan", "tasks", "task-a"), { recursive: true, mode: 0o700 });
@@ -795,8 +894,9 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
         );
         expect(cause).toBeInstanceOf(PipelineV2RunPlanStoreError);
         expect(cleanCtx.sink.snapshot?.waits[0]?.intent).toBeUndefined();
-        expect(cleanCtx.sink.snapshot?.task_revisions).toHaveLength(1);
+        expect(cleanCtx.sink.snapshot?.task_revisions).toHaveLength(2);
         expect(await readFile(TASK2_PATH(cleanCtx.fixture.runRoot), "utf8")).toBe("{}");
+        await expect(lstat(INTENT_PATH(cleanCtx.fixture.runRoot))).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
         await disposeRun(cleanCtx.fixture);
       }
@@ -820,13 +920,13 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       const error = expectReviseError(cause, "state_persist_failed");
       expect(error.message).toContain("the revise task intent acceptance could not be committed");
       expect(ctx.sink.snapshot?.waits[0]?.intent).toBeUndefined();
-      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(1);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
       expect((await lstat(INTENT_PATH(ctx.fixture.runRoot))).isFile()).toBe(true);
       expect((await lstat(TASK2_PATH(ctx.fixture.runRoot))).isFile()).toBe(true);
       const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
       const result = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: fresh, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
       expect(result.state.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
-      expect(result.state.task_revisions).toHaveLength(2);
+      expect(result.state.task_revisions).toHaveLength(3);
     } finally {
       await disposeRun(ctx.fixture);
     }
@@ -851,7 +951,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       const recording = recordingSink(fresh);
       const result = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
       expect(recording.commands.map((command) => command.kind)).toEqual(["task_revision_accepted"]);
-      expect(result.state.task_revisions).toHaveLength(2);
+      expect(result.state.task_revisions).toHaveLength(3);
     } finally {
       await disposeRun(ctx.fixture);
     }
@@ -872,12 +972,12 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       const error = expectReviseError(cause, "state_persist_failed");
       expect(error.message).toContain("the task revision acceptance could not be committed");
       expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
-      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(1);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
       const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
       const recording = recordingSink(fresh);
       const result = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
       expect(recording.commands.map((command) => command.kind)).toEqual(["task_revision_accepted"]);
-      expect(result.state.task_revisions).toHaveLength(2);
+      expect(result.state.task_revisions).toHaveLength(3);
     } finally {
       await disposeRun(ctx.fixture);
     }
@@ -901,7 +1001,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       const recording = recordingSink(fresh);
       const retry = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
       expect(recording.commands).toEqual([]);
-      expect(retry.state.task_revisions).toHaveLength(2);
+      expect(retry.state.task_revisions).toHaveLength(3);
     } finally {
       await disposeRun(ctx.fixture);
     }
@@ -969,8 +1069,8 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       expect(one).toMatchObject({ task_revision: 2 });
       expect(two).toMatchObject({ task_revision: 2 });
       expect(ctx.sink.snapshot?.revision).toBe(revisionBefore + 2);
-      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
-      expect(ctx.sink.snapshot?.task_revisions[1]?.sha256).toBe(ctx.candidate.sha256);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.task_revisions[2]?.sha256).toBe(ctx.candidate.sha256);
       expect((await lstat(INTENT_PATH(ctx.fixture.runRoot))).ino).toBeNumber();
       expect((await lstat(TASK2_PATH(ctx.fixture.runRoot))).ino).toBeNumber();
     } finally {
@@ -1071,6 +1171,387 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
   });
 });
 
+  test("28. a task of another stage of the last plan is rejected as invalid state", async () => {
+    const ctx = await reviseReady();
+    try {
+      const otherStageIntent = prepareWaitIntent({
+        schema_version: 1,
+        kind: "revise_task_intent",
+        run_id: RUN_ID,
+        wait_index: 1,
+        task_id: "task-b",
+        expected_previous_task_sha256: B1.sha256,
+        new_task_revision_sha256: hex("4"),
+      });
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: otherStageIntent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the task of the revise intent");
+      expect(ctx.sink.snapshot?.waits[0]?.intent).toBeUndefined();
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("29. a generation bound to another plan digest is rejected as invalid state", async () => {
+    const ctx = await reviseReady({ secondPlanRevision: true });
+    try {
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not belong to the last durable plan revision 2");
+      expect(ctx.sink.snapshot?.waits[0]?.intent).toBeUndefined();
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30. a missing or mismatched last plan artifact is rejected as invalid state", async () => {
+    const dropped = await reviseReady({ dropPlanArtifact: true });
+    try {
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: dropped.fixture.runRoot, sink: dropped.sink, intent: dropped.intent, candidateTaskRevision: dropped.candidate }),
+      );
+      expect((cause as Error).message).toContain("is not published on the run's data plane");
+    } finally {
+      await disposeRun(dropped.fixture);
+    }
+    const tampered = await reviseReady({ tamperPlanArtifact: true });
+    try {
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: tampered.fixture.runRoot, sink: tampered.sink, intent: tampered.intent, candidateTaskRevision: tampered.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not match the durable plan record");
+      expect(tampered.sink.snapshot?.waits[0]?.intent).toBeUndefined();
+    } finally {
+      await disposeRun(tampered.fixture);
+    }
+  });
+
+  test("31. the plan pointer, not the ledger tail, derives the current revision", async () => {
+    // R2: the ledger's latest task-a record is the candidate (revision 2),
+    // while the plan pointer names revision 1 — the current revision must
+    // still come from the pointer, so the identical retry succeeds
+    const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {} });
+    try {
+      const recording = recordingSink(ctx.sink);
+      const retry = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      expect(recording.commands).toEqual([]);
+      expect(retry).toMatchObject({ task_id: "task-a", task_revision: 2, task_sha256: ctx.candidate.sha256 });
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+    // and on a fresh run (no durable intent) a candidate whose
+    // predecessor names the ledger tail instead of the pointer revision is
+    // rejected by the chain validator
+    const fresh = await reviseReady();
+    try {
+      const stalePredecessor = prepareCandidate("Body A fourth", 2, hex("6"));
+      const staleIntent = prepareReviseIntent(stalePredecessor, A1.sha256);
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: fresh.fixture.runRoot, sink: fresh.sink, intent: staleIntent, candidateTaskRevision: stalePredecessor }),
+      );
+      expect(cause).toBeInstanceOf(PipelineV2RunPlanBindingError);
+      expect((cause as Error).message).toContain("previous_sha256 does not name the predecessor digest");
+    } finally {
+      await disposeRun(fresh.fixture);
+    }
+  });
+
+  test("32. an unchanged task body is invalid intent with zero publication and dispatch", async () => {
+    const ctx = await reviseReady();
+    try {
+      const unchanged = prepareCandidate("Body A");
+      const unchangedIntent = prepareReviseIntent(unchanged, A1.sha256);
+      await expect(lstat(TASK2_PATH(ctx.fixture.runRoot))).rejects.toMatchObject({ code: "ENOENT" });
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: unchangedIntent, candidateTaskRevision: unchanged }),
+      );
+      const error = expectReviseError(cause, "invalid_intent");
+      expect(error.message).toContain("does not change the current task body");
+      expect(error.message).not.toContain("Body A");
+      expect(ctx.sink.snapshot?.waits[0]?.intent).toBeUndefined();
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
+      await expect(lstat(TASK2_PATH(ctx.fixture.runRoot))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(lstat(INTENT_PATH(ctx.fixture.runRoot))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("33. R2 with a removed candidate artifact restores it exactly with zero dispatch", async () => {
+    const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {}, dropCandidateArtifact: true });
+    try {
+      const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const recording = recordingSink(fresh);
+      const retry = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      expect(recording.commands).toEqual([]);
+      expect(await readFile(TASK2_PATH(ctx.fixture.runRoot), "utf8")).toBe(ctx.candidate.canonical_json);
+      expect((await lstat(TASK2_PATH(ctx.fixture.runRoot))).mode & 0o777).toBe(0o600);
+      expect(retry.state.task_revisions).toHaveLength(3);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("34. R2 with a removed intent artifact restores it exactly with zero dispatch", async () => {
+    const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {}, dropIntentArtifact: true });
+    try {
+      const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const recording = recordingSink(fresh);
+      const retry = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      expect(recording.commands).toEqual([]);
+      expect(await readFile(INTENT_PATH(ctx.fixture.runRoot), "utf8")).toBe(ctx.intent.canonical_json);
+      expect((await lstat(INTENT_PATH(ctx.fixture.runRoot))).mode & 0o777).toBe(0o600);
+      expect(retry.state.task_revisions).toHaveLength(3);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("35. R2 with both artifacts removed restores them in the task then intent order with zero dispatch", async () => {
+    const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {}, dropCandidateArtifact: true, dropIntentArtifact: true });
+    try {
+      const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const recording = recordingSink(fresh);
+      const retry = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      expect(recording.commands).toEqual([]);
+      expect(await readFile(TASK2_PATH(ctx.fixture.runRoot), "utf8")).toBe(ctx.candidate.canonical_json);
+      expect(await readFile(INTENT_PATH(ctx.fixture.runRoot), "utf8")).toBe(ctx.intent.canonical_json);
+      expect(retry.state.task_revisions).toHaveLength(3);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("36. a hostile sink dispatch getter is read exactly once", async () => {
+    const ctx = await reviseReady();
+    try {
+      let dispatchReads = 0;
+      const hostileSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get snapshot() {
+          return ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        get dispatch(): (command: PipelineV2RunCommand) => Promise<void> {
+          dispatchReads += 1;
+          if (dispatchReads > 1) {
+            throw new Error("the sink dispatch member must be read exactly once");
+          }
+          return (command) => ctx.sink.dispatch(command);
+        },
+      };
+      const result = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: hostileSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      expect(result).toMatchObject({ task_revision: 2 });
+      expect(dispatchReads).toBe(1);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("37. a hostile post-intent snapshot that closes the generation is invalid state without a task dispatch", async () => {
+    const ctx = await reviseReady();
+    try {
+      let taskDispatches = 0;
+      const realDispatch = (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+      const hostileSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get snapshot() {
+          return ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          if (command.kind === "task_revision_accepted") {
+            taskDispatches += 1;
+          }
+          return await realDispatch(command);
+        },
+      };
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await realDispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.waits[0]?.intent === undefined) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const generation = derived.generations[0];
+          if (generation !== undefined) {
+            (derived.generations as unknown as PipelineV2RunState["generations"])[0] = { ...generation, closed: { by: "next_stage", closed_transition_count: generation.opened_transition_count } };
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the accepted revise intent");
+      expect(taskDispatches).toBe(0);
+      expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("38. a hostile post-task snapshot that removes or changes the wait intent is invalid state", async () => {
+    const ctx = await reviseReady();
+    try {
+      const realDispatch = (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await realDispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.waits[0]?.response !== undefined || real.task_revisions.length < 3) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const waitRecord = derived.waits[0];
+          if (waitRecord !== undefined) {
+            (derived.waits as unknown as PipelineV2RunState["waits"])[0] = { ...waitRecord, intent: undefined };
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the accepted task revision");
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("39. a hostile post-task snapshot with a duplicate or later task record is not success", async () => {
+    const ctx = await reviseReady();
+    try {
+      const realDispatch = (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await realDispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.task_revisions.length < 3) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const last = derived.task_revisions[derived.task_revisions.length - 1];
+          if (last !== undefined) {
+            (derived.task_revisions as unknown as PipelineV2RunState["task_revisions"]).push({
+              ...last,
+              index: last.index + 1,
+              revision: last.revision + 1,
+            });
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the accepted task revision");
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("40. a malformed nested post-dispatch snapshot is typed invalid state, never a TypeError", async () => {
+    const ctx = await reviseReady();
+    try {
+      const realDispatch = (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await realDispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.waits[0]?.intent === undefined) {
+            return real;
+          }
+          const derived = structuredClone(real) as unknown as Record<string, unknown>;
+          derived["waits"] = "boom";
+          return derived as unknown as PipelineV2RunState;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message.length).toBeGreaterThan(0);
+      expect(error.message).not.toContain("boom");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("41. conflicting concurrent candidates: one winner, one typed loser, no winner rewrite", async () => {
+    const ctx = await reviseReady();
+    try {
+      const revisionBefore = ctx.sink.snapshot?.revision;
+      if (typeof revisionBefore !== "number") {
+        throw new Error("the durable revision must be recorded");
+      }
+      const loserCandidate = prepareCandidate("Body A loser");
+      const loserIntent = prepareReviseIntent(loserCandidate, A1.sha256);
+      const winner = acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      // the loser's task publication is deterministically delayed behind
+      // the winner's full completion (a promise barrier, no sleep)
+      const winnerSettled = winner.then(() => undefined, () => undefined);
+      const loserOps: PipelineV2ReviseTaskIntentControllerOps = {
+        ...productionReviseTaskIntentOps,
+        publishTaskRevision: async (runRoot: string, manifest: unknown) => {
+          await winnerSettled;
+          return await productionReviseTaskIntentOps.publishTaskRevision(runRoot, manifest);
+        },
+      };
+      const loser = acceptPipelineV2ReviseTaskIntentWithIo(loserOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: loserIntent, candidateTaskRevision: loserCandidate });
+      const [win, lose] = await Promise.all([winner.catch((cause) => cause), loser.catch((cause) => cause)]);
+      const winnerResult = win as { task_revision?: number };
+            expect(winnerResult.task_revision).toBe(2);
+      // the loser's candidate file conflicts with the winner's at the same
+      // task path: the typed store conflict wins and the winner is never
+      // rewritten
+      expect(lose).toBeInstanceOf(PipelineV2RunPlanStoreError);
+      expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.task_revisions[2]?.sha256).toBe(ctx.candidate.sha256);
+      expect(ctx.sink.snapshot?.revision).toBe(revisionBefore + 2);
+      expect(await readFile(TASK2_PATH(ctx.fixture.runRoot), "utf8")).toBe(ctx.candidate.canonical_json);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
 test("26. the runtime export surfaces are exact (public two keys, internal core)", async () => {
   const publicModule = await import("../src/pipeline_v2_revise_task_intent_controller.ts");
   expect(Object.keys(publicModule).sort()).toEqual([
@@ -1116,4 +1597,5 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     expect(source).not.toContain(banned);
   }
   expect(countOf("let production")).toBe(0);
+
 });
