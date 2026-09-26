@@ -1091,6 +1091,320 @@ describe("applyPipelineV2ContinueStageGrant", () => {
     }
   });
 
+  test("28b. a hostile grant snapshot removing the accepted wait intent is rejected", async () => {
+    const ctx = await grantReady();
+    try {
+      let mutated = false;
+      const stripIntent = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const position = derived.waits.length - 1;
+        const wait = derived.waits[position];
+        if (wait === undefined) {
+          throw new Error("fixture wait missing");
+        }
+        const { intent: _removed, ...rest } = wait;
+        (derived.waits as unknown as PipelineV2RunState["waits"])[position] = rest;
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? stripIntent(ctx.sink.snapshot as PipelineV2RunState) : ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx.sink.dispatch(command);
+          mutated = true;
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx.intent }),
+      );
+      const error = expectGrantError(cause, "invalid_state");
+      expect(error.message).toContain("missing or replaced in the authoritative state");
+      // the real durable state advanced with the grant; the closure never
+      // dispatched
+      const durable = ctx.sink.snapshot;
+      expect(durable?.grants).toHaveLength(1);
+      expect(durable?.generations[0]?.open_iteration).toBeDefined();
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("28c. a hostile grant snapshot replacing the accepted intent digest is rejected", async () => {
+    const ctx = await grantReady();
+    try {
+      let mutated = false;
+      const replaceIntent = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const position = derived.waits.length - 1;
+        const wait = derived.waits[position];
+        if (wait === undefined || wait.intent === undefined) {
+          throw new Error("fixture wait intent missing");
+        }
+        (derived.waits as unknown as PipelineV2RunState["waits"])[position] = {
+          ...wait,
+          intent: { intent_sha256: hex("f") },
+        };
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? replaceIntent(ctx.sink.snapshot as PipelineV2RunState) : ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx.sink.dispatch(command);
+          mutated = true;
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx.intent }),
+      );
+      expectGrantError(cause, "invalid_state");
+      expect((cause as Error).message).toContain("missing or replaced in the authoritative state");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("28d. a hostile closure snapshot removing the accepted wait intent is rejected", async () => {
+    const ctx = await grantReady({ recordGrant: { additionalIterations: 2 } });
+    try {
+      let mutated = false;
+      const stripIntent = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const position = derived.waits.length - 1;
+        const wait = derived.waits[position];
+        if (wait === undefined) {
+          throw new Error("fixture wait missing");
+        }
+        const { intent: _removed, ...rest } = wait;
+        (derived.waits as unknown as PipelineV2RunState["waits"])[position] = rest;
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? stripIntent(ctx.sink.snapshot as PipelineV2RunState) : ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx.sink.dispatch(command);
+          mutated = true;
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx.intent }),
+      );
+      expectGrantError(cause, "invalid_state");
+      expect((cause as Error).message).toContain("missing or replaced in the authoritative state");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("28e. a hostile closure snapshot replacing the accepted intent digest is rejected", async () => {
+    const ctx = await grantReady({ recordGrant: { additionalIterations: 2 } });
+    try {
+      let mutated = false;
+      const replaceIntent = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const position = derived.waits.length - 1;
+        const wait = derived.waits[position];
+        if (wait === undefined || wait.intent === undefined) {
+          throw new Error("fixture wait intent missing");
+        }
+        (derived.waits as unknown as PipelineV2RunState["waits"])[position] = {
+          ...wait,
+          intent: { intent_sha256: hex("f") },
+        };
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? replaceIntent(ctx.sink.snapshot as PipelineV2RunState) : ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx.sink.dispatch(command);
+          mutated = true;
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx.intent }),
+      );
+      expectGrantError(cause, "invalid_state");
+      expect((cause as Error).message).toContain("missing or replaced in the authoritative state");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("28f. a hostile closure snapshot closing the generation is rejected", async () => {
+    const ctx = await grantReady({ recordGrant: { additionalIterations: 2 } });
+    try {
+      let mutated = false;
+      const closeGeneration = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const generation = derived.generations[0];
+        if (generation === undefined) {
+          throw new Error("fixture generation missing");
+        }
+        const { open_iteration: _open, ...rest } = generation;
+        (derived.generations as unknown as PipelineV2RunState["generations"])[0] = {
+          ...rest,
+          closed: { by: "next_stage", closed_transition_count: 2 },
+        };
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? closeGeneration(ctx.sink.snapshot as PipelineV2RunState) : ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx.sink.dispatch(command);
+          mutated = true;
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx.intent }),
+      );
+      expectGrantError(cause, "lifecycle_conflict");
+      expect((cause as Error).message).toContain("already closed differently");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("28g. a hostile closure snapshot substituting the generation stage binding is rejected", async () => {
+    const ctx = await grantReady({ recordGrant: { additionalIterations: 2 } });
+    try {
+      let mutated = false;
+      const swapStage = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const generation = derived.generations[0];
+        if (generation === undefined) {
+          throw new Error("fixture generation missing");
+        }
+        const { open_iteration: _open, ...rest } = generation;
+        (derived.generations as unknown as PipelineV2RunState["generations"])[0] = {
+          ...rest,
+          stage_id: "stage-9",
+        };
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? swapStage(ctx.sink.snapshot as PipelineV2RunState) : ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx.sink.dispatch(command);
+          mutated = true;
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx.intent }),
+      );
+      expectGrantError(cause, "lifecycle_conflict");
+      expect((cause as Error).message).toContain("already closed differently");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("28h. the same hostile shapes through the racing PipelineV2StateError path are never idempotent success", async () => {
+    // stripped wait intent on the grant step: the racing dispatch must not
+    // be recognized as success
+    const ctx = await grantReady();
+    try {
+      let mutated = false;
+      const stripIntent = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const position = derived.waits.length - 1;
+        const wait = derived.waits[position];
+        if (wait === undefined) {
+          throw new Error("fixture wait missing");
+        }
+        const { intent: _removed, ...rest } = wait;
+        (derived.waits as unknown as PipelineV2RunState["waits"])[position] = rest;
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? stripIntent(ctx.sink.snapshot as PipelineV2RunState) : ctx.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx.sink.dispatch(command);
+          mutated = true;
+          throw new PipelineV2StateError("the grant is already recorded (simulated race)");
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx.intent }),
+      );
+      expectGrantError(cause, "invalid_state");
+      expect((cause as Error).message).toContain("missing or replaced in the authoritative state");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+    // the substituted generation binding on the closure step: the racing
+    // dispatch must not be recognized as success
+    const ctx2 = await grantReady({ recordGrant: { additionalIterations: 2 } });
+    try {
+      let mutated = false;
+      const swapStage = (state: PipelineV2RunState): PipelineV2RunState => {
+        const derived = structuredClone(state) as PipelineV2RunState;
+        const generation = derived.generations[0];
+        if (generation === undefined) {
+          throw new Error("fixture generation missing");
+        }
+        const { open_iteration: _open, ...rest } = generation;
+        (derived.generations as unknown as PipelineV2RunState["generations"])[0] = {
+          ...rest,
+          stage_id: "stage-9",
+        };
+        return derived;
+      };
+      const hostile: PipelineV2ContinueStageGrantControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return mutated ? swapStage(ctx2.sink.snapshot as PipelineV2RunState) : ctx2.sink.snapshot;
+        },
+        get poisoned() {
+          return ctx2.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          await ctx2.sink.dispatch(command);
+          mutated = true;
+          throw new PipelineV2StateError("the iteration is already closed (simulated race)");
+        },
+      };
+      const cause = await catchAccept(() =>
+        applyPipelineV2ContinueStageGrant({ sink: hostile, intent: ctx2.intent }),
+      );
+      expectGrantError(cause, "lifecycle_conflict");
+      expect((cause as Error).message).toContain("already closed differently");
+    } finally {
+      await disposeRun(ctx2.fixture);
+    }
+  });
+
   test("29. a grant not-committed leaves the state unchanged and a fresh retry commits the full suffix", async () => {
     const ctx = await grantReady();
     try {

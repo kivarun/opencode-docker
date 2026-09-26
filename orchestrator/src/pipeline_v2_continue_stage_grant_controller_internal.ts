@@ -72,6 +72,22 @@ import type { PipelineV2ContinueStageIntentManifest } from "./pipeline_v2_run_pl
  *   ledger forms are `invalid_state`. Nothing is ever rewritten or
  *   repaired.
  *
+ * The authoritative verification after every dispatch is complete, and no
+ * partial match is ever a success: the target wait record exists exactly
+ * once and keeps every binding field (index, transition count, state id,
+ * reason, request digest, ordered actions) with no response and exactly
+ * the accepted intent digest; the target generation exists at its exact
+ * position, remains the last one, stays open with unchanged identity
+ * bindings (stage, position, template, plan digest, budget, opening
+ * anchor); the target iteration remains the generation's last iteration
+ * — open after the grant, with the `open_iteration` projection
+ * referencing it exactly with its opening anchor, or carrying exactly the
+ * grant closure after the closure dispatch; and the exact grant record is
+ * present exactly once. A removed or replaced wait intent is
+ * `invalid_state` identically on the resolve path and on the racing
+ * dispatch path; a closed or substituted generation is classified
+ * uniformly through the same race-or-mismatch mapping.
+ *
  * Durability: a sink `not_committed` keeps the previous snapshot
  * authoritative (a fresh retry dispatches the failed command again — the
  * exact durable prefix is recognized); a sink `durability_unknown` adopts
@@ -288,24 +304,77 @@ function exactGrantPresent(
   return grant.intent_sha256 === intentSha256 && grant.additional_iterations === additionalIterations;
 }
 
+/**
+ * The contract-owned binding fields of the target generation after a
+ * dispatch: the generation exists at its exact position, remains the last
+ * one, stays open, and carries unchanged identity bindings.
+ */
+function targetGenerationBindingMatches(
+  after: PipelineV2RunState,
+  before: PipelineV2StageGenerationRecord,
+): boolean {
+  const generation = after.generations[before.index - 1];
+  if (generation === undefined || generation.index !== before.index) {
+    return false;
+  }
+  if (after.generations.length !== before.index) {
+    return false;
+  }
+  if (generation.closed !== undefined) {
+    return false;
+  }
+  return (
+    generation.stage_id === before.stage_id &&
+    generation.stage_position === before.stage_position &&
+    generation.template_id === before.template_id &&
+    generation.plan_sha256 === before.plan_sha256 &&
+    generation.initial_budget === before.initial_budget &&
+    generation.opened_transition_count === before.opened_transition_count
+  );
+}
+
+/**
+ * The target iteration after the grant dispatch: still the last
+ * iteration of the generation, still open, with its opening anchor
+ * unchanged and the `open_iteration` projection referencing it exactly.
+ */
+function targetIterationOpenMatches(
+  after: PipelineV2RunState,
+  before: PipelineV2StageGenerationRecord,
+  iteration: PipelineV2StageIterationRecord,
+): boolean {
+  const generation = after.generations[before.index - 1];
+  if (generation === undefined) {
+    return false;
+  }
+  const last = generation.iterations[generation.iterations.length - 1];
+  if (last === undefined || last.index !== iteration.index || last.closed !== undefined) {
+    return false;
+  }
+  if (last.opened_transition_count !== iteration.opened_transition_count) {
+    return false;
+  }
+  const open = generation.open_iteration;
+  return open !== undefined && open.index === iteration.index && open.opened_transition_count === iteration.opened_transition_count;
+}
+
 function exactGrantClosurePresent(
   state: PipelineV2RunState,
   generationIndex: number,
   iterationIndex: number,
+  iterationOpenedTransitionCount: number,
   waitIndex: number,
   waitTransitionCount: number,
 ): boolean {
   const generation = state.generations[generationIndex - 1];
-  if (generation === undefined || generation.open_iteration !== undefined) {
+  if (generation === undefined || generation.closed !== undefined || generation.open_iteration !== undefined) {
     return false;
   }
-  let iteration: PipelineV2StageIterationRecord | undefined;
-  for (const record of generation.iterations) {
-    if (record.index === iterationIndex) {
-      iteration = record;
-    }
+  const last = generation.iterations[generation.iterations.length - 1];
+  if (last === undefined || last.index !== iterationIndex || last.opened_transition_count !== iterationOpenedTransitionCount) {
+    return false;
   }
-  const closed = iteration?.closed;
+  const closed = last.closed;
   if (closed === undefined) {
     return false;
   }
@@ -314,9 +383,11 @@ function exactGrantClosurePresent(
 
 /**
  * The binding fields of one wait record that a grant application must not
- * change: everything except nothing — the grant changes only the ledgers.
+ * change: everything except the exact accepted intent, which must remain
+ * present with exactly the accepted digest. The grant changes only the
+ * ledgers, never the wait record's bindings.
  */
-function waitBindingMatches(before: PipelineV2WaitRecord, after: PipelineV2WaitRecord): boolean {
+function waitBindingMatches(before: PipelineV2WaitRecord, after: PipelineV2WaitRecord, intentSha256: string): boolean {
   if (
     before.index !== after.index ||
     before.transition_count !== after.transition_count ||
@@ -324,6 +395,7 @@ function waitBindingMatches(before: PipelineV2WaitRecord, after: PipelineV2WaitR
     before.reason !== after.reason ||
     before.request_sha256 !== after.request_sha256 ||
     after.response !== undefined ||
+    after.intent?.intent_sha256 !== intentSha256 ||
     before.actions.length !== after.actions.length
   ) {
     return false;
@@ -334,14 +406,20 @@ function waitBindingMatches(before: PipelineV2WaitRecord, after: PipelineV2WaitR
   });
 }
 
+/**
+ * The target wait record must exist exactly once in the journal; a
+ * duplicated wait index is never a valid verification target.
+ */
 function findWaitRecord(state: PipelineV2RunState, waitIndex: number): PipelineV2WaitRecord | undefined {
   let found: PipelineV2WaitRecord | undefined;
+  let count = 0;
   for (const record of state.waits) {
     if (record.index === waitIndex) {
       found = record;
+      count += 1;
     }
   }
-  return found;
+  return count === 1 ? found : undefined;
 }
 
 /**
@@ -446,17 +524,35 @@ export async function applyPipelineV2ContinueStageGrantInternal(
   const wait = bindings.wait;
   const generation = bindings.generation;
   const iteration = bindings.iteration;
-  const grantVerification = (after: PipelineV2RunState): boolean =>
-    exactGrantPresent(after, generation.index, wait.index, preparedIntent.sha256, manifest.additional_iterations);
+  // The authoritative verification after every dispatch: the exact
+  // durable record plus the unchanged wait bindings including the exact
+  // accepted intent, the unchanged generation bindings and the exact
+  // iteration state. No partial match is ever a success.
+  const grantVerification = (after: PipelineV2RunState): boolean => {
+    if (!exactGrantPresent(after, generation.index, wait.index, preparedIntent.sha256, manifest.additional_iterations)) {
+      return false;
+    }
+    if (!targetGenerationBindingMatches(after, generation)) {
+      return false;
+    }
+    if (!targetIterationOpenMatches(after, generation, iteration)) {
+      return false;
+    }
+    const afterWait = findWaitRecord(after, wait.index);
+    return afterWait !== undefined && waitBindingMatches(wait, afterWait, preparedIntent.sha256);
+  };
   const closureVerification = (after: PipelineV2RunState): boolean => {
-    if (!exactGrantClosurePresent(after, generation.index, iteration.index, wait.index, wait.transition_count)) {
+    if (!targetGenerationBindingMatches(after, generation)) {
+      return false;
+    }
+    if (!exactGrantClosurePresent(after, generation.index, iteration.index, iteration.opened_transition_count, wait.index, wait.transition_count)) {
       return false;
     }
     if (!exactGrantPresent(after, generation.index, wait.index, preparedIntent.sha256, manifest.additional_iterations)) {
       return false;
     }
     const afterWait = findWaitRecord(after, wait.index);
-    return afterWait !== undefined && waitBindingMatches(wait, afterWait);
+    return afterWait !== undefined && waitBindingMatches(wait, afterWait, preparedIntent.sha256);
   };
   const finish = (after: PipelineV2RunState): AppliedPipelineV2ContinueStageGrant =>
     deepFreezeValue({
@@ -470,10 +566,24 @@ export async function applyPipelineV2ContinueStageGrantInternal(
   function raceOrMismatch(after: PipelineV2RunState | null, step: "grant" | "closure"): never {
     if (step === "grant" && after !== null) {
       const matching = grantRecordsFor(after, generation.index, wait.index);
-      if (matching.length > 0 && !grantVerification(after)) {
+      if (matching.length > 0 && !exactGrantPresent(after, generation.index, wait.index, preparedIntent.sha256, manifest.additional_iterations)) {
         throw controllerError(
           "grant_conflict",
           `wait ${wait.index} already carries a different grant for generation ${generation.index}`,
+          after,
+        );
+      }
+    }
+    // The accepted intent of the open wait is contract-owned: a removed
+    // or replaced intent is never a conflict-class mismatch, it is a
+    // failed authoritative verification — identically on the resolve path
+    // and on the racing dispatch path.
+    if (after !== null) {
+      const afterWait = findWaitRecord(after, wait.index);
+      if (afterWait === undefined || afterWait.intent?.intent_sha256 !== preparedIntent.sha256) {
+        throw controllerError(
+          "invalid_state",
+          `the accepted intent of open wait ${wait.index} is missing or replaced in the authoritative state`,
           after,
         );
       }
@@ -532,10 +642,24 @@ export async function applyPipelineV2ContinueStageGrantInternal(
   }
   const plan = planContinueStageGrant(state, bindings, preparedIntent);
   if (plan.kind === "s2") {
-    // S2: the exact durable grant plus the exact grant closure; the open
-    // wait record must still match the accepted intent.
+    // S2: the exact durable grant plus the exact grant closure; the full
+    // binding verification applies to the authoritative state as well.
+    if (!targetGenerationBindingMatches(plan.state, generation)) {
+      throw controllerError(
+        "lifecycle_conflict",
+        `the stage generation ${generation.index} does not match the grant's durable bindings`,
+        plan.state,
+      );
+    }
+    if (!exactGrantClosurePresent(plan.state, generation.index, iteration.index, iteration.opened_transition_count, wait.index, wait.transition_count)) {
+      throw controllerError(
+        "lifecycle_conflict",
+        `the iteration ${iteration.index} of generation ${generation.index} does not carry the exact grant closure`,
+        plan.state,
+      );
+    }
     const afterWait = findWaitRecord(plan.state, bindings.wait.index);
-    if (afterWait === undefined || !waitBindingMatches(bindings.wait, afterWait)) {
+    if (afterWait === undefined || !waitBindingMatches(bindings.wait, afterWait, preparedIntent.sha256)) {
       throw controllerError("invalid_state", "the open wait record does not match the accepted intent", plan.state);
     }
     return finish(plan.state);
