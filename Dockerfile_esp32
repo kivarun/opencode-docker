@@ -137,6 +137,45 @@ RUN pio pkg install --global --platform "${PIOARDUINO_PLATFORM_URL}" \
     && pio pkg list --global --only-platforms \
     && test -w "${PLATFORMIO_CORE_DIR}"
 
+# Pre-warm the complete Arduino build environment for the X4 Classic
+# target: fully compile a throwaway minimal project at image build time
+# (esp32-s3-devkitc1-n16r8: 16 MB QIO flash + 8 MB OPI PSRAM, matching the
+# device). This downloads the Arduino core, the Xtensa toolchain and
+# every other required package into /home/opencode/.platformio.
+RUN set -eux; \
+    proj=/tmp/prewarm-x4classic; \
+    mkdir -p "${proj}/src"; \
+    printf '%s\n' \
+        '[env:prewarm]' \
+        'platform = espressif32' \
+        'board = esp32-s3-devkitc1-n16r8' \
+        'framework = arduino' \
+        'board_build.flash_mode = qio' \
+        'board_build.psram_type = opi' \
+        'board_upload.flash_size = 16MB' \
+        > "${proj}/platformio.ini"; \
+    printf '%s\n' \
+        '#include <Arduino.h>' \
+        '' \
+        'void setup() {}' \
+        'void loop() {}' \
+        > "${proj}/src/main.cpp"; \
+    cd "${proj}" \
+    && pio run
+
+# The same project must compile in a new container with the network
+# disabled: every RUN step is a fresh container and --network=none
+# removes all network access for this step, so this full rebuild of a
+# clean copy proves the cached PlatformIO environment is complete.
+RUN --network=none set -eux; \
+    cp -a /tmp/prewarm-x4classic /tmp/offline-check-x4classic; \
+    rm -rf /tmp/offline-check-x4classic/.pio; \
+    cd /tmp/offline-check-x4classic \
+    && pio run
+
+# Remove the throwaway projects; the PlatformIO cache stays.
+RUN rm -rf /tmp/prewarm-x4classic /tmp/offline-check-x4classic
+
 RUN pio --version \
     && esptool version \
     && opencode --version \
