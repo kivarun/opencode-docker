@@ -2402,6 +2402,88 @@ replanning, the next plan revision, opening the next iteration,
 automatic resume, coordinator/runner/CLI wiring, schema changes,
 migrations/API/T3, multi-process locking.
 
+### Revise-task durable closure controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_revise_task_closure_controller.ts`
+(public facade) + `pipeline_v2_revise_task_closure_controller_internal.ts`
+(internal core) applies the durable closure step of the revise flow —
+the exact boundary `accepted revise_task intent + accepted task
+revision → stage_iteration_closed {by: "replanned"}` — through
+`applyPipelineV2ReviseTaskClosure({sink, intent})` over the structural
+sink (the production `PipelineV2RunStateSink` satisfies it). The
+controller performs no filesystem work at all: no runRoot, no manifest
+publication, no loaders/publishers — the accepted task revision is read
+exclusively from the durable ledger. Capture order: the options shape →
+`sink` → `intent` each read once → the sink's `poisoned`/`dispatch`/
+initial `snapshot` captured once with `dispatch` bound to the sink
+before the first await → the poison latch → the intent provenance gate
+(the shared manifest registry; Proxy traps stay at zero) → strictly the
+`revise_task_intent` kind → the single `validatePipelineV2RunState` →
+the durable bindings. Waiting-form bindings: the waiting run, the target
+wait the last and only record of its index with no response, the exact
+accepted intent digest, the declared `revise_task` action, and the
+cursor exactly on the wait boundary; the last durable plan revision
+exists; the last generation is open and bound to its digest; the target
+iteration is the generation's last; the generation identity bindings are
+fixed as the verification basis. The accepted task revision: exactly one
+wait-bound record for the intent's task with exact digests and links and
+a positive safe revision above 1, and no later revision of the same task
+— absent is `invalid_state`; a contradicting record, a ledger that moved
+further and duplicate or multiple wait-bound records are
+`revision_conflict` (fail closed, never success). Reconciliation is one
+internal classification: C0 (the target iteration open — the single
+command `stage_iteration_closed {generationIndex, iterationIndex,
+by: "replanned", waitIndex}` pre-checked through the single reducer on a
+local snapshot before the dispatch, then dispatched exactly once), C1
+(the exact durable closure with the generation still last and open, the
+target iteration still the last one, no `open_iteration`, and the
+task/wait/cursor bindings exact — zero dispatch) and conflicts (another
+close reason, another wait or anchor, a closed/replaced/no-longer-last
+generation, another or later iteration, an `open_iteration`
+contradiction, or a moved-on lifecycle → `lifecycle_conflict`; a partial
+match is never an idempotent success). The active/answered retry is
+recognized only as the immediate post-response boundary of the future
+completion flow (active/running, the answered target wait still last
+with the exact intent, the response carrying exactly the `revise_task`
+action id, the cursor exactly at the declared action's target with the
+journals exactly at the wait's `transition_count`, the exact task
+record, the exact closure, and no `open_iteration`) — zero-dispatch
+success; any later execution/transition, a new wait, a new generation or
+iteration, another response action or a shifted cursor is
+`lifecycle_conflict`. Post-dispatch verification is the same full
+targeted check on the normal resolve path and the racing
+`PipelineV2StateError` path (the wait journal by length, position and
+every binding; the task ledger fully unchanged by all seven contract
+fields; the plan ledger unchanged; the generation identity bindings plus
+the exact closure anchor; the cursor and journals at the wait boundary)
+with defensive `Array.isArray`/record guards before any field read —
+hostile `null`/primitive/malformed snapshots yield typed errors, never a
+`TypeError`; the result is built from the verified snapshot without a
+re-read after the classification. Durability: sink `not_committed` keeps
+the previous open state authoritative (a fresh retry dispatches the
+closure again); sink `durability_unknown` adopts the visible candidate,
+poisons the sink (a fresh reopened sink recognizes the durable closure
+with zero dispatch); nothing is ever rolled back. Runtime export surface
+is exactly `PipelineV2ReviseTaskClosureControllerError` (closed reasons
+`invalid_intent | invalid_state | revision_conflict |
+lifecycle_conflict | state_persist_failed`, last authoritative `state`)
+and `applyPipelineV2ReviseTaskClosure({sink, intent})`; the internal
+core module exports exactly `PipelineV2ReviseTaskClosureControllerError`
+and `applyPipelineV2ReviseTaskClosureInternal`; the deep-frozen
+content-free result is `{wait_index, generation_index, iteration_index,
+task_id, task_revision, task_sha256, intent_sha256, state}`.
+Concurrency has no sleeps: two identical racing attempts both succeed
+with one durable closure and exactly one revision increment. This
+increment does not publish or record a wait response, does not create a
+new task or plan revision, does not close the generation, does not open
+a new generation or iteration, does not run the architect/replanning
+execution, does not resume, does not change the action policy or select
+intents, and is not wired into the production coordinator/runner/CLI.
+Still unwired: the wait response publication, task/plan replanning, the
+next generation/iteration opening, the architect/replanning execution,
+resume, the action policy and intent selection, coordinator/runner/CLI
+wiring, schema changes, migrations/API/T3, multi-process locking.
+
 ### Stage generation/iteration controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
