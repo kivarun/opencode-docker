@@ -78,9 +78,14 @@ import type {
  * the only allowed change is the exact `continue_stage` response; the
  * request digest and the routing target are taken from the pre-response
  * wait; the final state must be active and running with the cursor at the
- * declared action target; and the exact grant, the exact grant closure
+ * declared action target and with the cursor transition count, the
+ * transition journal and the execution journal exactly at the
+ * pre-response wait's boundary; the C4 boundary must keep the
+ * pre-response response binding (the same action id and response digest)
+ * unchanged; and the exact grant, the exact grant closure
  * (checked against the original wait anchor) and the generation/iteration
- * bindings of the grant result's state must be unchanged. A coherent
+ * bindings (including the iteration count and the iteration list length)
+ * of the grant result's state must be unchanged. A coherent
  * hostile mutation of both the result fields and the final state is
  * detected by the binding comparison; a hostile injected result is the
  * controller's own typed `invalid_result`.
@@ -281,7 +286,9 @@ function generationBindingsUnchanged(
     beforeGeneration.template_id !== afterGeneration.template_id ||
     beforeGeneration.plan_sha256 !== afterGeneration.plan_sha256 ||
     beforeGeneration.initial_budget !== afterGeneration.initial_budget ||
-    beforeGeneration.opened_transition_count !== afterGeneration.opened_transition_count
+    beforeGeneration.opened_transition_count !== afterGeneration.opened_transition_count ||
+    beforeGeneration.iteration_count !== afterGeneration.iteration_count ||
+    beforeGeneration.iterations.length !== afterGeneration.iterations.length
   ) {
     return false;
   }
@@ -312,6 +319,50 @@ function generationBindingsUnchanged(
  * result becomes the controller's own typed `invalid_result`, never a
  * leaked `TypeError`.
  */
+/**
+ * The exact immediate wait boundary: the cursor sits exactly at the
+ * expected state with the transition journal, the transition count and
+ * the execution journal all exactly at the wait's boundary. The expected
+ * cursor state is `wait.state_id` for the waiting/open form and the
+ * declared `continue_stage` action's target for the active/answered C4
+ * form.
+ */
+function verifyImmediateWaitBoundary(
+  state: PipelineV2RunState,
+  wait: PipelineV2WaitRecord,
+  expectedCursorState: string,
+): void {
+  const cursor = state.cursor;
+  if (!isRecord(cursor) || cursor.current_state !== expectedCursorState) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state cursor is not at the expected boundary state",
+      state,
+    );
+  }
+  if (cursor.transition_count !== wait.transition_count) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state cursor transition count does not match the wait boundary",
+      state,
+    );
+  }
+  if (!Array.isArray(state.transitions) || state.transitions.length !== wait.transition_count) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state transition journal does not match the wait boundary",
+      state,
+    );
+  }
+  if (!Array.isArray(state.executions) || state.executions.length !== wait.transition_count) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state execution journal does not match the wait boundary",
+      state,
+    );
+  }
+}
+
 function verifyGrantResultBeforeResponse(
   grant: AppliedPipelineV2ContinueStageGrant,
   manifest: PipelineV2ContinueStageIntentManifest,
@@ -348,7 +399,8 @@ function verifyGrantResultBeforeResponse(
     );
   }
   // The acceptable boundary form: the waiting/open wait (C0–C3) or the
-  // exact active/answered C4 boundary.
+  // exact active/answered C4 boundary — in both forms the cursor and the
+  // transition/execution journals sit exactly at the wait boundary.
   if (state.status === "waiting" && state.phase === "waiting") {
     if (wait.response !== undefined) {
       throw completionError(
@@ -357,6 +409,7 @@ function verifyGrantResultBeforeResponse(
         state,
       );
     }
+    verifyImmediateWaitBoundary(state, wait as PipelineV2WaitRecord, wait.state_id);
   } else if (state.status === "active" && state.phase === "running") {
     if (!isRecord(wait.response) || wait.response.action_id !== CONTINUE_STAGE_ACTION_ID) {
       throw completionError(
@@ -365,6 +418,17 @@ function verifyGrantResultBeforeResponse(
         state,
       );
     }
+    const declaredAction = (wait.actions as Array<Record<string, unknown>>).find(
+      (action) => action.id === CONTINUE_STAGE_ACTION_ID,
+    );
+    if (!isRecord(declaredAction)) {
+      throw completionError(
+        "invalid_result",
+        "the applied grant result state does not declare the continue_stage action on the target wait",
+        state,
+      );
+    }
+    verifyImmediateWaitBoundary(state, wait as PipelineV2WaitRecord, declaredAction.to as string);
   } else {
     throw completionError(
       "invalid_result",
@@ -529,6 +593,36 @@ function verifyResponseResult(
       finalState,
     );
   }
+  // The final state pins the exact post-response boundary: the cursor
+  // count and the transition/execution journals sit exactly at the
+  // pre-response wait's boundary.
+  if (
+    finalState.cursor.transition_count !== beforeWait.transition_count ||
+    !Array.isArray(finalState.transitions) ||
+    finalState.transitions.length !== beforeWait.transition_count ||
+    !Array.isArray(finalState.executions) ||
+    finalState.executions.length !== beforeWait.transition_count
+  ) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result does not keep the transition and execution journals at the response boundary",
+      finalState,
+    );
+  }
+  // The C4 boundary: the pre-response wait already carries the response,
+  // and the final state must keep exactly that response binding unchanged.
+  if (
+    beforeWait.response !== undefined &&
+    (finalWait.response === undefined ||
+      finalWait.response.action_id !== beforeWait.response.action_id ||
+      finalWait.response.response_sha256 !== beforeWait.response.response_sha256)
+  ) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result changed the pre-response response binding",
+      finalState,
+    );
+  }
   // The exact grant, the exact grant closure and the generation/iteration
   // bindings of the grant result's state must be unchanged in the final
   // state; the final closure is checked against the original wait anchor.
@@ -644,7 +738,10 @@ export async function completePipelineV2ContinueStageWithIo(
   // reason, request digest, ordered actions, journal position, accepted
   // intent) must be unchanged; the only allowed change is the exact
   // continue_stage response; the request digest and the routing target
-  // are taken from the pre-response wait, and the final closure is
+  // are taken from the pre-response wait; the final state pins the exact
+  // post-response boundary (the cursor count and the transition/execution
+  // journals at the pre-response wait's boundary); the C4 boundary keeps
+  // the pre-response response binding unchanged; and the final closure is
   // checked against the original wait anchor. Field accesses are
   // defensive; a structurally inconsistent injected result becomes the
   // controller's own `invalid_result`, never a leaked `TypeError`.

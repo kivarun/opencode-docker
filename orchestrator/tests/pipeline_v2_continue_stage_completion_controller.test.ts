@@ -47,7 +47,7 @@ import { preparePipelineV2WaitRequest } from "../src/pipeline_v2_wait_manifest.t
 import { publishPipelineV2WaitRequest } from "../src/pipeline_v2_wait_store.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
 import type { RecordedPipelineV2WaitResponse } from "../src/pipeline_v2_wait_controller.ts";
-import type { PipelineV2WaitRecord } from "../src/pipeline_v2_state.ts";
+import type { PipelineV2StageIterationRecord, PipelineV2WaitRecord } from "../src/pipeline_v2_state.ts";
 
 const RUN_ID = "run-1";
 const hex = (char: string): string => char.repeat(64);
@@ -1330,6 +1330,179 @@ test("1b. the answered S2 refuses a later execution started at a planning target
       } finally {
         await disposeRun(ctx.fixture);
       }
+    }
+  });
+
+test("2b. a hostile grant result with a moved active boundary is rejected before any response work", async () => {
+    const ctx = await completionReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      let recordCalls = 0;
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      const hostileOps: PipelineV2ContinueStageCompletionOps = {
+        applyGrant: async (options) => {
+          const real = await realApply(options);
+          const derived = structuredClone(real.state) as PipelineV2RunState;
+          (derived.cursor as { transition_count: number }).transition_count = 5;
+          return { ...real, state: derived };
+        },
+        recordWaitAction: async () => {
+          recordCalls += 1;
+          return await realRecord({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, waitIndex: 1, actionId: "continue_stage" });
+        },
+      };
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStageWithIo(hostileOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+      );
+      const error = expectCompletionError(cause, "invalid_result");
+      expect(error.message).toContain("cursor transition count does not match the wait boundary");
+      expect(recordCalls).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("2c. a hostile grant result with a moved waiting boundary is rejected before any response work", async () => {
+    const ctx = await completionReady();
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      let recordCalls = 0;
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      const hostileOps: PipelineV2ContinueStageCompletionOps = {
+        applyGrant: async (options) => {
+          const real = await realApply(options);
+          const derived = structuredClone(real.state) as PipelineV2RunState;
+          (derived.cursor as { current_state: string }).current_state = "dev_entry";
+          return { ...real, state: derived };
+        },
+        recordWaitAction: async () => {
+          recordCalls += 1;
+          return await realRecord({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, waitIndex: 1, actionId: "continue_stage" });
+        },
+      };
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStageWithIo(hostileOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+      );
+      const error = expectCompletionError(cause, "invalid_result");
+      expect(error.message).toContain("cursor is not at the expected boundary state");
+      expect(recordCalls).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30c. a coherent-hostile response result with a moved transition count is invalid_result", async () => {
+    const ctx = await completionReady();
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      const hostileOps: PipelineV2ContinueStageCompletionOps = {
+        applyGrant: realApply,
+        recordWaitAction: async (options) => {
+          const real = await realRecord(options);
+          const derived = structuredClone(real.state) as PipelineV2RunState;
+          (derived.cursor as { transition_count: number }).transition_count = 5;
+          return { ...real, state: derived };
+        },
+      };
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStageWithIo(hostileOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+      );
+      const error = expectCompletionError(cause, "invalid_result");
+      expect(error.message).toContain("transition and execution journals at the response boundary");
+      expect(ctx.sink.snapshot?.status).toBe("active");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30d. a hostile C4 grant result with a mutated pre-response digest is rejected after the real response", async () => {
+    const ctx = await completionReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      let recordCalls = 0;
+      const hostileOps: PipelineV2ContinueStageCompletionOps = {
+        applyGrant: async (options) => {
+          const real = await realApply(options);
+          const derived = structuredClone(real.state) as PipelineV2RunState;
+          const waitRecord = derived.waits[0];
+          if (waitRecord?.response === undefined) {
+            throw new Error("fixture response missing");
+          }
+          (waitRecord.response as { response_sha256: string }).response_sha256 = hex("a");
+          return { ...real, state: derived };
+        },
+        recordWaitAction: async (options) => {
+          recordCalls += 1;
+          return await realRecord(options);
+        },
+      };
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStageWithIo(hostileOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+      );
+      const error = expectCompletionError(cause, "invalid_result");
+      expect(error.message).toContain("changed the pre-response response binding");
+      expect(recordCalls).toBe(1);
+      expect(ctx.sink.snapshot?.waits[0]?.response?.action_id).toBe("continue_stage");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30e. a coherent-hostile response result with extra generation iterations is invalid_result", async () => {
+    const ctx = await completionReady();
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      const variants: Array<[string, (derived: PipelineV2RunState) => void]> = [
+        [
+          "extra iteration",
+          (derived) => {
+            const generation = derived.generations[0];
+            if (generation === undefined) {
+              throw new Error("fixture generation missing");
+            }
+            const last = generation.iterations[generation.iterations.length - 1];
+            if (last === undefined) {
+              throw new Error("fixture iteration missing");
+            }
+            (generation.iterations as unknown as PipelineV2StageIterationRecord[]).push({
+              ...last,
+              index: (last.index as number) + 1,
+            });
+            (generation as { iteration_count: number }).iteration_count += 1;
+          },
+        ],
+        [
+          "iteration count only",
+          (derived) => {
+            const generation = derived.generations[0];
+            if (generation === undefined) {
+              throw new Error("fixture generation missing");
+            }
+            (generation as { iteration_count: number }).iteration_count += 1;
+          },
+        ],
+      ];
+      for (const [, mutate] of variants) {
+        const hostileOps: PipelineV2ContinueStageCompletionOps = {
+          applyGrant: realApply,
+          recordWaitAction: async (options) => {
+            const real = await realRecord(options);
+            const derived = structuredClone(real.state) as PipelineV2RunState;
+            mutate(derived);
+            return { ...real, state: derived };
+          },
+        };
+        const cause = await catchAccept(() =>
+          completePipelineV2ContinueStageWithIo(hostileOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+        );
+        const error = expectCompletionError(cause, "invalid_result");
+        expect(error.message).toContain("changed the durable grant or iteration bindings");
+      }
+    } finally {
+      await disposeRun(ctx.fixture);
     }
   });
 

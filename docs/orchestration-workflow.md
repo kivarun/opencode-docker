@@ -2276,18 +2276,24 @@ response_sha256, action_id: "continue_stage", action_to, state}`. The
 grant result is verified against the accepted intent COMPLETELY before
 any response work (the target wait as the last wait record with the
 exact accepted intent and the declared action, the waiting/open or
-exact active/answered boundary form, the exact durable grant exactly
-once, the generation bound to the intent's stage and plan digest, the
-exact grant closure — hostile or structurally inconsistent results,
-including malformed nested state, are the controller's own
-`invalid_result` and never a leaked `TypeError`), and the response
+exact active/answered boundary form with the immediate wait boundary
+pinned (the cursor exactly at the wait state or the declared action's
+target and the cursor count and transition/execution journals exactly at
+the wait boundary), the exact durable grant exactly once, the generation
+bound to the intent's stage and plan digest, the exact grant closure —
+hostile or structurally inconsistent results, including malformed nested
+state, are the controller's own `invalid_result` and never a leaked
+`TypeError`), and the response
 result is verified against the verified pre-response wait of the grant
 result (the unchanged wait bindings with only the exact `continue_stage`
 response added, the request digest and the routing target taken from the
-pre-response wait, the final active state with the cursor at the action
-target, and the unchanged grant/closure/generation bindings — coherent
-hostile mutations of the result fields and the final state are
-detected). Retry windows: C0 (accepted intent, no grant — the full
+pre-response wait, the final active state with the cursor at the action target and the
+cursor count and transition/execution journals exactly at the
+pre-response wait's boundary, the C4 boundary keeping the pre-response
+response binding unchanged, and the unchanged
+grant/closure/generation bindings including the iteration count and
+iteration list length — coherent hostile mutations of the result fields
+and the final state are detected). Retry windows: C0 (accepted intent, no grant — the full
 suffix grant → closure → response, three durable revisions), C1 (the
 durable grant — the closure then the response), C2 (the grant and
 closure durable, the wait open — the response only), C3 (the response
