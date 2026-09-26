@@ -1596,6 +1596,41 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
       await disposeRun(ctx.fixture);
     }
   });
+
+  test("47. a hostile post-dispatch snapshot with a mutated generation index is invalid state", async () => {
+    const ctx = await closureReady();
+    try {
+      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      const { sink, closureDispatches } = mutationSink(ctx.sink, {
+        mutateAfterClosure: (derived): PipelineV2RunState => {
+          const generation = derived.generations[0]!;
+          (derived.generations as unknown as PipelineV2RunState["generations"])[0] = {
+            ...generation,
+            index: 2,
+          };
+          return derived;
+        },
+      });
+      const cause = await catchAccept(() => applyPipelineV2ReviseTaskClosure({ sink, intent: ctx.intent }));
+      const error = expectClosureError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the applied closure");
+      expect(closureDispatches()).toBe(1);
+      // the underlying authoritative state keeps the original generation
+      // index and carries the exact replanned closure of the real dispatch
+      const durable = await validatePipelineV2RunState(JSON.parse(JSON.stringify(ctx.sink.snapshot)));
+      expect(durable.generations).toHaveLength(1);
+      expect(durable.generations[0]!.index).toBe(1);
+      expect(durable.generations[0]!.open_iteration).toBeUndefined();
+      expect(durable.generations[0]!.iterations[0]!.closed).toEqual({
+        by: "replanned",
+        wait_index: 1,
+        closed_transition_count: 2,
+      });
+      expect(durable.revision).toBe(revisionBefore + 1);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
 });
 
 /**
