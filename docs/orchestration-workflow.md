@@ -2226,9 +2226,14 @@ accepted intent digest and be answered with exactly the `continue_stage`
 action, exactly one exact grant record must exist for the wait, the
 grant's generation must remain the last open generation bound to the
 intent's stage, and its last iteration must carry the exact grant
-closure with the wait's anchor and no `open_iteration`; later lifecycle
-progress (an open next iteration, a closed or foreign generation,
-another wait) is a typed failure, never a retry of this boundary.
+closure with the wait's anchor and no `open_iteration`; the immediate
+post-response boundary is pinned fail-closed (the cursor exactly at the
+declared `continue_stage` action's target, the transition journal still
+at the wait's `transition_count`, no execution started after the fully
+settled wait boundary); later graph progress (a started or fully
+executed and transitioned execution after the response, an open next
+iteration, a closed or foreign generation, another wait) is a typed
+`lifecycle_conflict`, never a retry of this boundary.
 Not implemented (stays unwired): the response completion policy (the
 completion controller below records the response through the existing
 generic wait controller), opening the next iteration, automatic resume,
@@ -2268,12 +2273,21 @@ reasons `invalid_options | invalid_result`) and
 deep-frozen content-free result is `{wait_index, generation_index,
 iteration_index, additional_iterations, intent_sha256, request_sha256,
 response_sha256, action_id: "continue_stage", action_to, state}`. The
-grant result is verified against the accepted intent before any response
-work, and the response result is verified against the durable target
-wait (the request/response digests from the durable record, the routing
-target from the declared action, the final active state with the cursor
-at the action target, and the unchanged grant/closure/generation
-bindings). Retry windows: C0 (accepted intent, no grant — the full
+grant result is verified against the accepted intent COMPLETELY before
+any response work (the target wait as the last wait record with the
+exact accepted intent and the declared action, the waiting/open or
+exact active/answered boundary form, the exact durable grant exactly
+once, the generation bound to the intent's stage and plan digest, the
+exact grant closure — hostile or structurally inconsistent results,
+including malformed nested state, are the controller's own
+`invalid_result` and never a leaked `TypeError`), and the response
+result is verified against the verified pre-response wait of the grant
+result (the unchanged wait bindings with only the exact `continue_stage`
+response added, the request digest and the routing target taken from the
+pre-response wait, the final active state with the cursor at the action
+target, and the unchanged grant/closure/generation bindings — coherent
+hostile mutations of the result fields and the final state are
+detected). Retry windows: C0 (accepted intent, no grant — the full
 suffix grant → closure → response, three durable revisions), C1 (the
 durable grant — the closure then the response), C2 (the grant and
 closure durable, the wait open — the response only), C3 (the response

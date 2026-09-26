@@ -46,6 +46,8 @@ import {
 import { preparePipelineV2WaitRequest } from "../src/pipeline_v2_wait_manifest.ts";
 import { publishPipelineV2WaitRequest } from "../src/pipeline_v2_wait_store.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
+import type { RecordedPipelineV2WaitResponse } from "../src/pipeline_v2_wait_controller.ts";
+import type { PipelineV2WaitRecord } from "../src/pipeline_v2_state.ts";
 
 const RUN_ID = "run-1";
 const hex = (char: string): string => char.repeat(64);
@@ -200,6 +202,7 @@ interface ReadyOptions {
   closeGrantIteration?: boolean;
   recordResponse?: boolean;
   extraWaitActions?: boolean;
+  continueStageTo?: string;
 }
 
 /**
@@ -262,7 +265,7 @@ async function completionReady(options: ReadyOptions = {}): Promise<CompletionCt
       state_id: "architect",
       reason: "stage_iteration_limit_exhausted",
       actions: [
-        { id: "continue_stage", to: "dev_entry" },
+        { id: "continue_stage", to: options.continueStageTo ?? "dev_entry" },
         { id: "revise_task", to: "architect" },
       ],
     });
@@ -272,7 +275,7 @@ async function completionReady(options: ReadyOptions = {}): Promise<CompletionCt
       reason: "stage_iteration_limit_exhausted",
       requestSha256: request.sha256,
       actions: [
-        { id: "continue_stage", to: "dev_entry" },
+        { id: "continue_stage", to: options.continueStageTo ?? "dev_entry" },
         { id: "revise_task", to: "architect" },
       ],
     });
@@ -1116,6 +1119,219 @@ describe("completePipelineV2ContinueStage", () => {
     }
   });
 });
+
+test("1b. the answered S2 refuses a later execution started at a planning target without a transition", async () => {
+    const ctx = await completionReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true, continueStageTo: "architect" });
+    try {
+      // later graph progress after the response: a planning execution
+      // starts at the response target, no transition yet
+      await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+      const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const recording = recordingSink(fresh);
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStage({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent }),
+      );
+      expect(cause).toBeInstanceOf(PipelineV2ContinueStageGrantControllerError);
+      const error = cause as PipelineV2ContinueStageGrantControllerError;
+      expect(error.reason).toBe("lifecycle_conflict");
+      expect(error.message).toContain("an execution was started after the settled wait boundary");
+      expect(recording.commands).toEqual([]);
+      expect(ctx.sink.snapshot?.waits[1]).toBeUndefined();
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("1c. the answered S2 refuses a later execution and committed transition after the response", async () => {
+    const ctx = await completionReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true, continueStageTo: "architect" });
+    try {
+      await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+      for (const command of agentPhases("later")) {
+        await ctx.sink.dispatch(command);
+      }
+      await ctx.sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+        executionIndex: 3,
+      });
+      const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const recording = recordingSink(fresh);
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStage({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent }),
+      );
+      expect(cause).toBeInstanceOf(PipelineV2ContinueStageGrantControllerError);
+      const error = cause as PipelineV2ContinueStageGrantControllerError;
+      expect(error.reason).toBe("lifecycle_conflict");
+      expect(recording.commands).toEqual([]);
+      // the wait journal and the grant closure records are unchanged
+      expect(ctx.sink.snapshot?.waits).toHaveLength(1);
+      expect(ctx.sink.snapshot?.generations[0]?.iterations[0]?.closed?.by).toBe("grant");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("29b. a hostile grant result with a removed closure yields invalid_result before any response work", async () => {
+    const ctx = await completionReady();
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      let recordCalls = 0;
+      const hostileOps: PipelineV2ContinueStageCompletionOps = {
+        applyGrant: async (options) => {
+          const real = await realApply(options);
+          const derived = structuredClone(real.state) as PipelineV2RunState;
+          const generation = derived.generations[0];
+          const iteration = generation?.iterations[0];
+          if (generation === undefined || iteration === undefined) {
+            throw new Error("fixture generation missing");
+          }
+          (generation.iterations[0] as { closed?: unknown }).closed = undefined;
+          return { ...real, state: derived };
+        },
+        recordWaitAction: async () => {
+          recordCalls += 1;
+          throw new Error("the response recorder must not be called for a hostile grant result");
+        },
+      };
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStageWithIo(hostileOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+      );
+      const error = expectCompletionError(cause, "invalid_result");
+      expect(error.message).toContain("does not carry the exact grant closure");
+      expect(recordCalls).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("29c. a hostile grant result with a replaced wait intent, stage or plan binding yields invalid_result", async () => {
+    const ctx = await completionReady();
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      let recordCalls = 0;
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      const makeHostile = (mutate: (derived: PipelineV2RunState) => void): PipelineV2ContinueStageCompletionOps => ({
+        applyGrant: async (options) => {
+          const real = await realApply(options);
+          const derived = structuredClone(real.state) as PipelineV2RunState;
+          mutate(derived);
+          return { ...real, state: derived };
+        },
+        recordWaitAction: async () => {
+          recordCalls += 1;
+          return await realRecord({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, waitIndex: 1, actionId: "continue_stage" });
+        },
+      });
+      const wait = (derived: PipelineV2RunState) => derived.waits[0] as PipelineV2WaitRecord;
+      const generation = (derived: PipelineV2RunState) => derived.generations[0] as NonNullable<PipelineV2RunState["generations"][number]>;
+      const variants: Array<[string, (derived: PipelineV2RunState) => void, string]> = [
+        ["wait intent", (derived) => { (wait(derived).intent as { intent_sha256: string }).intent_sha256 = hex("e"); }, "does not carry the exact accepted intent"],
+        ["stage binding", (derived) => { (generation(derived) as { stage_id: string }).stage_id = "stage-9"; }, "generation bindings do not match the accepted intent"],
+        ["plan binding", (derived) => { (generation(derived) as { plan_sha256: string }).plan_sha256 = hex("f"); }, "generation bindings do not match the accepted intent"],
+      ];
+      for (const [label, mutate, expectedMessage] of variants) {
+        recordCalls = 0;
+        const cause = await catchAccept(() =>
+          completePipelineV2ContinueStageWithIo(makeHostile(mutate), { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+        );
+        const error = expectCompletionError(cause, "invalid_result");
+        expect(error.message).toContain(expectedMessage);
+        expect(recordCalls).toBe(0);
+        expect(ctx.sink.snapshot?.waits[0]?.response).toBeUndefined();
+      }
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("29d. a malformed nested grant result state yields typed invalid_result, never a leaked TypeError", async () => {
+    const ctx = await completionReady();
+    try {
+      const realApply = productionContinueStageCompletionOps.applyGrant;
+      const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+      let recordCalls = 0;
+      const malformedOps: PipelineV2ContinueStageCompletionOps = {
+        applyGrant: async (options) => {
+          const real = await realApply(options);
+          const derived = structuredClone(real.state) as unknown as Record<string, unknown>;
+          derived["grants"] = null;
+          return { ...real, state: derived as unknown as PipelineV2RunState };
+        },
+        recordWaitAction: async () => {
+          recordCalls += 1;
+          return await realRecord({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, waitIndex: 1, actionId: "continue_stage" });
+        },
+      };
+      const cause = await catchAccept(() =>
+        completePipelineV2ContinueStageWithIo(malformedOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+      );
+      const error = expectCompletionError(cause, "invalid_result");
+      expect(error.message.length).toBeGreaterThan(0);
+      expect(error.message).not.toContain("null");
+      expect(recordCalls).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30b. coherent-hostile response results (the result fields and the cloned state changed together) are invalid_result", async () => {
+    const realApply = productionContinueStageCompletionOps.applyGrant;
+    const realRecord = productionContinueStageCompletionOps.recordWaitAction;
+    const makeHostile = (mutate: (real: RecordedPipelineV2WaitResponse, derived: PipelineV2RunState) => void): PipelineV2ContinueStageCompletionOps => ({
+      applyGrant: realApply,
+      recordWaitAction: async (options) => {
+        const real = await realRecord(options);
+        const derived = structuredClone(real.state) as PipelineV2RunState;
+        const realCopy = { ...real };
+        mutate(realCopy, derived);
+        return { ...realCopy, state: derived };
+      },
+    });
+    const finalWait = (derived: PipelineV2RunState) => derived.waits[0] as PipelineV2WaitRecord;
+    const variants: Array<[string, (real: RecordedPipelineV2WaitResponse, derived: PipelineV2RunState) => void, string]> = [
+      [
+        "coherent request digest",
+        (real, derived) => {
+          (finalWait(derived) as { request_sha256: string }).request_sha256 = hex("7");
+          (real as { request_sha256: string }).request_sha256 = hex("7");
+        },
+        "changed the target wait bindings",
+      ],
+      [
+        "coherent action target",
+        (real, derived) => {
+          (finalWait(derived).actions[0] as { to: string }).to = "architect";
+          (real as { action_to: string }).action_to = "architect";
+        },
+        "changed the target wait bindings",
+      ],
+      [
+        "coherent transition count and closure anchor",
+        (real, derived) => {
+          (finalWait(derived) as { transition_count: number }).transition_count = 5;
+          const iteration = derived.generations[0]?.iterations[0];
+          if (iteration?.closed === undefined) {
+            throw new Error("fixture closure missing");
+          }
+          (iteration.closed as { closed_transition_count: number }).closed_transition_count = 5;
+        },
+        "changed the target wait bindings",
+      ],
+    ];
+    for (const [, mutate, expectedMessage] of variants) {
+      const ctx = await completionReady();
+      try {
+        const cause = await catchAccept(() =>
+          completePipelineV2ContinueStageWithIo(makeHostile(mutate), { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+        );
+        const error = expectCompletionError(cause, "invalid_result");
+        expect(error.message).toContain(expectedMessage);
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    }
+  });
 
 test("36. the runtime export surfaces are exact (public two keys, internal core)", async () => {
   const publicModule = await import("../src/pipeline_v2_continue_stage_completion_controller.ts");

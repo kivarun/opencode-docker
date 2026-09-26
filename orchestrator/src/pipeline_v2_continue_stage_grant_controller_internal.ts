@@ -72,9 +72,15 @@ import type { PipelineV2ContinueStageIntentManifest } from "./pipeline_v2_run_pl
  *   for the wait, the grant's generation must remain the last open
  *   generation bound to the intent's stage, and the generation's last
  *   iteration must carry the exact grant closure with the wait's anchor
- *   and no `open_iteration`. Later lifecycle progress (an open next
- *   iteration, a closed or foreign generation, another wait) is a typed
- *   failure, never a retry of this boundary;
+ *   and no `open_iteration`. The immediate post-response boundary is
+ *   pinned fail-closed: the cursor must sit exactly at the declared
+ *   `continue_stage` action's target, the transition journal must still
+ *   be at the wait's `transition_count`, and no execution may have been
+ *   started after the fully settled wait boundary. Later graph progress
+ *   (a started or fully executed and transitioned execution after the
+ *   response, an open next iteration, a closed or foreign generation,
+ *   another wait) is a typed `lifecycle_conflict`, never a retry of this
+ *   boundary;
  * - conflicts: an existing grant with a different digest or amount is
  *   `grant_conflict`; a differently closed target iteration (another
  *   close reason, another wait index or another anchor) is
@@ -532,6 +538,40 @@ function applyCompletedGrantRetry(
     throw controllerError(
       "lifecycle_conflict",
       `the last wait ${wait.index} was answered with another action; this is not the continue-stage completion boundary`,
+      state,
+    );
+  }
+  // The immediate post-response boundary: the cursor must sit exactly at
+  // the declared continue_stage action's target, the transition journal
+  // must still be at the wait's boundary, and no execution may have been
+  // started after the fully settled wait boundary. Later graph progress
+  // is a lifecycle conflict, never a retry of this boundary.
+  const declared = wait.actions.find((action) => action.id === CONTINUE_STAGE_ACTION_ID);
+  if (declared === undefined) {
+    throw controllerError(
+      "invalid_state",
+      "the last wait record does not declare the continue_stage action",
+      state,
+    );
+  }
+  if (state.cursor.current_state !== declared.to) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the cursor is not at the continue_stage action target of the completed boundary",
+      state,
+    );
+  }
+  if (state.cursor.transition_count !== wait.transition_count) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the transition journal moved past the settled wait boundary",
+      state,
+    );
+  }
+  if (state.executions.length > wait.transition_count) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "an execution was started after the settled wait boundary",
       state,
     );
   }

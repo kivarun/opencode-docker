@@ -54,24 +54,36 @@ import type {
  * result has been verified. There is no second state validator and no
  * duplicated durable grant binding logic.
  *
- * Grant result verification (the contract-owned values): the wait index,
- * the additional iteration count and the intent digest must equal the
- * accepted intent's, the generation and iteration indexes must be
- * positive safe integers, and the result state must carry the exact
- * durable grant and the exact grant closure. A hostile injected result is
- * the controller's own typed `invalid_result` with zero response
- * publication and zero dispatch.
+ * Grant result verification (the contract-owned values, complete and
+ * strictly before any response filesystem work or dispatch): the wait
+ * index, the additional iteration count and the intent digest must equal
+ * the accepted intent's, the generation and iteration indexes must be
+ * positive safe integers, the target wait must be the last wait record
+ * carrying the exact accepted intent digest and the declared
+ * `continue_stage` action, the boundary must be exactly the waiting/open
+ * form (C0–C3) or the exact active/answered C4 form, the exact durable
+ * grant must be present exactly once, the grant's generation must be the
+ * last open generation bound to the intent's stage and plan digest, and
+ * the target iteration must be the last one closed with the exact grant
+ * closure. Every field access is defensive; a hostile or structurally
+ * inconsistent injected result (including a removed closure, a replaced
+ * wait intent, a changed stage/plan binding and malformed nested state)
+ * is the controller's own typed `invalid_result` — never a leaked
+ * `TypeError` — with zero response publication and zero dispatch.
  *
- * Response result verification: the wait index and the action id must
- * match, the request digest must equal the durable target wait's request
- * digest, the response digest must equal the durable wait's recorded
- * response digest, the routing target must equal the declared
- * `continue_stage` action's target, the final state must be active and
- * running with the cursor at the action target, the target wait must keep
- * the exact accepted intent digest and the exact response, and the exact
- * grant, the exact grant closure and the generation/iteration bindings of
- * the grant result's state must be unchanged. A hostile injected result is
- * the controller's own typed `invalid_result`.
+ * Response result verification (against the verified pre-response wait of
+ * the grant result, never against the result's own final wait): the wait
+ * bindings (index, transition count, state id, reason, request digest,
+ * ordered actions, journal position, accepted intent) must be unchanged;
+ * the only allowed change is the exact `continue_stage` response; the
+ * request digest and the routing target are taken from the pre-response
+ * wait; the final state must be active and running with the cursor at the
+ * declared action target; and the exact grant, the exact grant closure
+ * (checked against the original wait anchor) and the generation/iteration
+ * bindings of the grant result's state must be unchanged. A coherent
+ * hostile mutation of both the result fields and the final state is
+ * detected by the binding comparison; a hostile injected result is the
+ * controller's own typed `invalid_result`.
  *
  * Retry windows: C0 (accepted intent, no grant — the full suffix grant →
  * closure → response, three durable revisions), C1 (the durable grant —
@@ -288,6 +300,253 @@ function generationBindingsUnchanged(
 }
 
 /**
+ * The full pre-response verification of the grant result state, against
+ * the contract-owned values only: the target wait must be the last wait
+ * record and carry the exact accepted intent digest and the declared
+ * `continue_stage` action, the boundary must be exactly the waiting/open
+ * form or the exact active/answered C4 form, the exact durable grant must
+ * be present exactly once, the grant's generation must be the last open
+ * generation bound to the intent's stage and plan digest, and the target
+ * iteration must be the last one closed with the exact grant closure.
+ * Every field access is defensive; a structurally inconsistent injected
+ * result becomes the controller's own typed `invalid_result`, never a
+ * leaked `TypeError`.
+ */
+function verifyGrantResultBeforeResponse(
+  grant: AppliedPipelineV2ContinueStageGrant,
+  manifest: PipelineV2ContinueStageIntentManifest,
+  intentSha256: string,
+): void {
+  const state = grant.state;
+  if (!Array.isArray(state.waits) || state.waits.length !== grant.wait_index) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not carry the target wait as the last wait record",
+      isRecord(state) ? (state as PipelineV2RunState) : null,
+    );
+  }
+  const wait = state.waits[grant.wait_index - 1];
+  if (!isRecord(wait) || wait.index !== grant.wait_index) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not carry the target wait",
+      state,
+    );
+  }
+  if (wait.intent?.intent_sha256 !== intentSha256) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not carry the exact accepted intent on the target wait",
+      state,
+    );
+  }
+  if (!Array.isArray(wait.actions) || !wait.actions.some((action) => isRecord(action) && action.id === CONTINUE_STAGE_ACTION_ID)) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not declare the continue_stage action on the target wait",
+      state,
+    );
+  }
+  // The acceptable boundary form: the waiting/open wait (C0–C3) or the
+  // exact active/answered C4 boundary.
+  if (state.status === "waiting" && state.phase === "waiting") {
+    if (wait.response !== undefined) {
+      throw completionError(
+        "invalid_result",
+        "the applied grant result state claims a waiting run with a recorded response",
+        state,
+      );
+    }
+  } else if (state.status === "active" && state.phase === "running") {
+    if (!isRecord(wait.response) || wait.response.action_id !== CONTINUE_STAGE_ACTION_ID) {
+      throw completionError(
+        "invalid_result",
+        "the applied grant result state claims an active run without the exact continue_stage response",
+        state,
+      );
+    }
+  } else {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not carry an acceptable completion boundary",
+      state,
+    );
+  }
+  if (!grantResultStateCarriesExactGrant(grant, intentSha256)) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not carry the exact durable grant",
+      state,
+    );
+  }
+  const generation = state.generations[grant.generation_index - 1];
+  if (
+    !isRecord(generation) ||
+    generation.index !== grant.generation_index ||
+    !Array.isArray(state.generations) ||
+    state.generations.length !== grant.generation_index ||
+    generation.closed !== undefined
+  ) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not carry the last open target generation",
+      state,
+    );
+  }
+  if (generation.stage_id !== manifest.stage_id || generation.plan_sha256 !== manifest.expected_plan_sha256) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state generation bindings do not match the accepted intent",
+      state,
+    );
+  }
+  if (!grantResultStateCarriesExactClosure(grant, wait as PipelineV2WaitRecord)) {
+    throw completionError(
+      "invalid_result",
+      "the applied grant result state does not carry the exact grant closure",
+      state,
+    );
+  }
+}
+
+/**
+ * The contract-owned ordered action list equality: same length, same
+ * order, same ids and targets.
+ */
+function orderedActionsEqual(a: unknown, b: unknown): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+    return false;
+  }
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (!isRecord(left) || !isRecord(right) || left.id !== right.id || left.to !== right.to) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The response result verification against the verified pre-response wait:
+ * the wait bindings must be unchanged, the only allowed change is the
+ * exact `continue_stage` response, the request digest and the routing
+ * target come from the pre-response wait, and the exact grant, grant
+ * closure and generation/iteration bindings of the grant result's state
+ * must be unchanged in the final state. No response digest is rebuilt by
+ * this controller.
+ */
+function verifyResponseResult(
+  response: RecordedPipelineV2WaitResponse,
+  grant: AppliedPipelineV2ContinueStageGrant,
+  beforeWait: PipelineV2WaitRecord,
+  intentSha256: string,
+): void {
+  if (!isRecord(response)) {
+    throw completionError("invalid_result", "the recorded wait response result is not an object", null);
+  }
+  const finalState = response.state;
+  if (!isRecord(finalState)) {
+    throw completionError("invalid_result", "the recorded wait response result is not an object", null);
+  }
+  if (response.wait_index !== grant.wait_index || response.action_id !== CONTINUE_STAGE_ACTION_ID) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result does not match the requested action",
+      finalState,
+    );
+  }
+  if (!Array.isArray(finalState.waits) || finalState.waits.length !== grant.wait_index) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result changed the wait journal position",
+      finalState,
+    );
+  }
+  const finalWait = finalState.waits[grant.wait_index - 1];
+  if (!isRecord(finalWait) || finalWait.index !== grant.wait_index) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result does not carry the target wait",
+      finalState,
+    );
+  }
+  if (
+    finalWait.transition_count !== beforeWait.transition_count ||
+    finalWait.state_id !== beforeWait.state_id ||
+    finalWait.reason !== beforeWait.reason ||
+    finalWait.request_sha256 !== beforeWait.request_sha256 ||
+    !orderedActionsEqual(finalWait.actions, beforeWait.actions) ||
+    finalWait.intent?.intent_sha256 !== intentSha256
+  ) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result changed the target wait bindings",
+      finalState,
+    );
+  }
+  // The only allowed change on the target wait: the exact continue_stage
+  // response.
+  if (
+    !isRecord(finalWait.response) ||
+    finalWait.response.action_id !== CONTINUE_STAGE_ACTION_ID ||
+    finalWait.response.response_sha256 !== response.response_sha256
+  ) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result does not match the durable response on the target wait",
+      finalState,
+    );
+  }
+  // The request digest and the routing target come from the pre-response
+  // wait, never from the result's own final wait.
+  const beforeDeclared = beforeWait.actions.find((action) => action.id === CONTINUE_STAGE_ACTION_ID);
+  if (!isRecord(beforeDeclared)) {
+    throw completionError(
+      "invalid_result",
+      "the pre-response wait record does not declare the continue_stage action",
+      finalState,
+    );
+  }
+  if (response.request_sha256 !== beforeWait.request_sha256) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result request digest does not match the pre-response wait",
+      finalState,
+    );
+  }
+  if (response.action_to !== beforeDeclared.to || finalState.cursor.current_state !== beforeDeclared.to) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result does not route to the declared action target",
+      finalState,
+    );
+  }
+  if (finalState.status !== "active" || finalState.phase !== "running") {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result does not carry the active post-response state",
+      finalState,
+    );
+  }
+  // The exact grant, the exact grant closure and the generation/iteration
+  // bindings of the grant result's state must be unchanged in the final
+  // state; the final closure is checked against the original wait anchor.
+  if (
+    !grantResultStateCarriesExactGrant({ ...grant, state: finalState }, intentSha256) ||
+    !grantResultStateCarriesExactClosure({ ...grant, state: finalState }, beforeWait) ||
+    !grantResultStateCarriesExactClosure(grant, beforeWait) ||
+    !generationBindingsUnchanged(grant.state, finalState, grant.generation_index, grant.iteration_index)
+  ) {
+    throw completionError(
+      "invalid_result",
+      "the recorded wait response result changed the durable grant or iteration bindings",
+      finalState,
+    );
+  }
+}
+
+/**
  * Validate, compose and complete the continue-stage intervention through
  * the existing controllers (see the module docstring for the full order
  * and durability semantics).
@@ -348,18 +607,27 @@ export async function completePipelineV2ContinueStageWithIo(
       isRecord(grant.state) ? (grant.state as PipelineV2RunState) : null,
     );
   }
-  const beforeWait = grant.state.waits[grant.wait_index - 1];
-  if (
-    !grantResultStateCarriesExactGrant(grant, (intent as unknown as PreparedPipelineV2RunWaitIntent).sha256) ||
-    beforeWait === undefined ||
-    beforeWait.index !== grant.wait_index
-  ) {
+  // The full pre-response verification of the grant result state: the
+  // target wait, the accepted intent, the declared action, the boundary
+  // form, the exact grant, the generation/plan bindings and the exact
+  // grant closure must all hold before any response filesystem work or
+  // dispatch. Field accesses are defensive; a structurally inconsistent
+  // injected result becomes the controller's own `invalid_result`, never
+  // a leaked `TypeError`.
+  const intentSha256 = (intent as unknown as PreparedPipelineV2RunWaitIntent).sha256;
+  try {
+    verifyGrantResultBeforeResponse(grant, manifest, intentSha256);
+  } catch (cause) {
+    if (cause instanceof PipelineV2ContinueStageCompletionControllerError) {
+      throw cause;
+    }
     throw completionError(
       "invalid_result",
-      "the applied grant result state does not carry the exact durable grant",
-      grant.state,
+      "the applied grant result state is structurally inconsistent",
+      isRecord(grant.state) ? (grant.state as PipelineV2RunState) : null,
     );
   }
+  const beforeWait = grant.state.waits[grant.wait_index - 1] as PipelineV2WaitRecord;
   // Step 4: record the continue_stage response through the existing
   // generic wait controller; its publication, acceptance, dispatch and
   // durability semantics are authoritative and its typed errors keep
@@ -370,47 +638,28 @@ export async function completePipelineV2ContinueStageWithIo(
     waitIndex: grant.wait_index,
     actionId: CONTINUE_STAGE_ACTION_ID,
   });
-  // Step 5: verify the response result against the durable target wait.
-  if (!isRecord(response)) {
-    throw completionError("invalid_result", "the recorded wait response result is not an object", null);
-  }
-  const finalState = response.state;
-  const finalWait = finalState.waits[grant.wait_index - 1];
-  const declaredAction = finalWait?.actions.find((action) => action.id === CONTINUE_STAGE_ACTION_ID);
-  if (
-    response.wait_index !== grant.wait_index ||
-    response.action_id !== CONTINUE_STAGE_ACTION_ID ||
-    finalWait === undefined ||
-    response.request_sha256 !== finalWait.request_sha256 ||
-    finalWait.response === undefined ||
-    response.response_sha256 !== finalWait.response.response_sha256 ||
-    finalWait.response.action_id !== CONTINUE_STAGE_ACTION_ID ||
-    finalWait.intent?.intent_sha256 !== (intent as unknown as PreparedPipelineV2RunWaitIntent).sha256 ||
-    declaredAction === undefined ||
-    response.action_to !== declaredAction.to ||
-    finalState.status !== "active" ||
-    finalState.phase !== "running" ||
-    finalState.cursor.current_state !== declaredAction.to
-  ) {
+  // Step 5: verify the response result against the pre-response wait of
+  // the verified grant result — never against the hostile result's own
+  // final wait. The wait bindings (index, transition count, state id,
+  // reason, request digest, ordered actions, journal position, accepted
+  // intent) must be unchanged; the only allowed change is the exact
+  // continue_stage response; the request digest and the routing target
+  // are taken from the pre-response wait, and the final closure is
+  // checked against the original wait anchor. Field accesses are
+  // defensive; a structurally inconsistent injected result becomes the
+  // controller's own `invalid_result`, never a leaked `TypeError`.
+  try {
+    verifyResponseResult(response, grant, beforeWait, intentSha256);
+  } catch (cause) {
+    if (cause instanceof PipelineV2ContinueStageCompletionControllerError) {
+      throw cause;
+    }
     throw completionError(
       "invalid_result",
-      "the recorded wait response result does not match the durable target wait",
-      finalState,
-    );
-  }
-  // The exact grant, the exact grant closure and the generation/iteration
-  // bindings of the grant result's state must be unchanged in the final
-  // state.
-  if (
-    !grantResultStateCarriesExactGrant({ ...grant, state: finalState }, (intent as unknown as PreparedPipelineV2RunWaitIntent).sha256) ||
-    !grantResultStateCarriesExactClosure({ ...grant, state: finalState }, finalWait) ||
-    !grantResultStateCarriesExactClosure(grant, beforeWait) ||
-    !generationBindingsUnchanged(grant.state, finalState, grant.generation_index, grant.iteration_index)
-  ) {
-    throw completionError(
-      "invalid_result",
-      "the recorded wait response result changed the durable grant or iteration bindings",
-      finalState,
+      "the recorded wait response result is structurally inconsistent",
+      isRecord(response) && isRecord((response as Record<string, unknown>).state)
+        ? ((response as Record<string, unknown>).state as PipelineV2RunState)
+        : null,
     );
   }
   // Step 6: the unified content-free result with the response
@@ -420,11 +669,11 @@ export async function completePipelineV2ContinueStageWithIo(
     generation_index: grant.generation_index,
     iteration_index: grant.iteration_index,
     additional_iterations: grant.additional_iterations,
-    intent_sha256: (intent as unknown as PreparedPipelineV2RunWaitIntent).sha256,
+    intent_sha256: intentSha256,
     request_sha256: response.request_sha256,
     response_sha256: response.response_sha256,
     action_id: CONTINUE_STAGE_ACTION_ID,
     action_to: response.action_to,
-    state: finalState,
+    state: response.state,
   });
 }
