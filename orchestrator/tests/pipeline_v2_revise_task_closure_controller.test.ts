@@ -195,6 +195,17 @@ const B1 = prepareTaskRevisionManifest({
   body: "Body B",
 });
 
+const B2 = prepareTaskRevisionManifest({
+  schema_version: 1,
+  kind: "task_revision",
+  run_id: RUN_ID,
+  task_id: "task-b",
+  revision: 2,
+  previous_sha256: B1.sha256,
+  origin: "user_response",
+  body: "Body B revised",
+});
+
 const A3 = prepareTaskRevisionManifest({
   schema_version: 1,
   kind: "task_revision",
@@ -241,10 +252,12 @@ interface ClosureReadyOptions {
   recordTaskRevision?: boolean;
   recordTaskSha256?: string;
   extraTaskRevision?: boolean;
+  extraOtherTaskRevision?: boolean;
   noReviseAction?: boolean;
   closeIterationNormal?: boolean;
   closeGeneration?: boolean;
   secondPlanRevision?: boolean;
+  secondIteration?: boolean;
   respondReviseTask?: boolean;
   answerOtherAction?: boolean;
   laterExecution?: boolean;
@@ -357,6 +370,36 @@ async function closureReady(options: ClosureReadyOptions = {}): Promise<ClosureC
         step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
         executionIndex: 4,
       });
+    } else if (options.secondIteration === true) {
+      // a second iteration of the same generation through the real graph:
+      // the first iteration closed by the ordinary active-boundary
+      // closure, the planning execution re-runs at the architect state,
+      // and the second iteration runs a real stage execution
+      await sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: 2,
+      });
+      await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+      for (const command of agentPhases("planning2")) {
+        await sink.dispatch(command);
+      }
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+        executionIndex: 3,
+      });
+      await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 3 });
+      await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 2 });
+      for (const command of agentPhases("stage2")) {
+        await sink.dispatch(command);
+      }
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: 4,
+      });
     } else {
       if (options.closeIterationNormal === true) {
         await sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
@@ -401,6 +444,16 @@ async function closureReady(options: ClosureReadyOptions = {}): Promise<ClosureC
             taskId: "task-a",
             revision: 3,
             taskSha256: A3.sha256,
+            waitIndex: 1,
+            intentSha256: acceptedIntentSha256,
+          });
+        }
+        if (options.extraOtherTaskRevision === true) {
+          await sink.dispatch({
+            kind: "task_revision_accepted",
+            taskId: "task-b",
+            revision: 2,
+            taskSha256: B2.sha256,
             waitIndex: 1,
             intentSha256: acceptedIntentSha256,
           });
@@ -1373,7 +1426,188 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
       expect(message).not.toContain("credential");
     }
   });
+
+  test("40. a second task revision of another task accepted for the same wait is revision conflict", async () => {
+    const ctx = await closureReady({ extraOtherTaskRevision: true });
+    try {
+      const recording = recordingSink(ctx.sink);
+      const cause = await catchAccept(() => applyPipelineV2ReviseTaskClosure({ sink: recording, intent: ctx.intent }));
+      const error = expectClosureError(cause, "revision_conflict");
+      expect(error.message).toContain("carries several accepted task revisions");
+      expect(recording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).generations[0]!.iterations[0]!.closed).toBeUndefined();
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("41. a normal hostile post-dispatch snapshot with an unchanged or larger revision is invalid state", async () => {
+    for (const revisionDelta of [0, 2]) {
+      const ctx = await closureReady();
+      try {
+        const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+        const { sink, closureDispatches } = mutationSink(ctx.sink, {
+          mutateAfterClosure: (derived): PipelineV2RunState => {
+            (derived as unknown as Record<string, unknown>)["revision"] = revisionBefore + revisionDelta;
+            return derived;
+          },
+        });
+        const cause = await catchAccept(() => applyPipelineV2ReviseTaskClosure({ sink, intent: ctx.intent }));
+        const error = expectClosureError(cause, "invalid_state");
+        expect(error.message).toContain("does not carry the applied closure");
+        // exactly one closure dispatch; the closure is durably recorded by
+        // the underlying production sink; no success is returned
+        expect(closureDispatches()).toBe(1);
+        const durable = await validatePipelineV2RunState(JSON.parse(JSON.stringify(ctx.sink.snapshot)));
+        const generation = durable.generations[0]!;
+        expect(generation.iterations[generation.iterations.length - 1]!.closed).toEqual({
+          by: "replanned",
+          wait_index: 1,
+          closed_transition_count: 2,
+        });
+        expect(durable.revision).toBe(revisionBefore + 1);
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    }
+  });
+
+  test("42. a racing hostile post-dispatch snapshot with an unchanged revision is invalid state", async () => {
+    const ctx = await closureReady();
+    try {
+      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      const { sink, closureDispatches } = mutationSink(ctx.sink, {
+        race: true,
+        mutateAfterClosure: (derived): PipelineV2RunState => {
+          (derived as unknown as Record<string, unknown>)["revision"] = revisionBefore;
+          return derived;
+        },
+      });
+      const cause = await catchAccept(() => applyPipelineV2ReviseTaskClosure({ sink, intent: ctx.intent }));
+      const error = expectClosureError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the applied closure");
+      expect(closureDispatches()).toBe(1);
+      expect((ctx.sink.snapshot as PipelineV2RunState).revision).toBe(revisionBefore + 1);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("43. a normal hostile post-dispatch snapshot with a foreign run id is invalid state", async () => {
+    const ctx = await closureReady();
+    try {
+      const { sink } = mutationSink(ctx.sink, {
+        mutateAfterClosure: (derived): PipelineV2RunState => {
+          (derived as unknown as Record<string, unknown>)["run_id"] = "run-other";
+          return derived;
+        },
+      });
+      const cause = await catchAccept(() => applyPipelineV2ReviseTaskClosure({ sink, intent: ctx.intent }));
+      const error = expectClosureError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the applied closure");
+      expect((ctx.sink.snapshot as PipelineV2RunState).run_id).toBe(RUN_ID);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("44. the multi-iteration boundary applies the closure to the last iteration and keeps the historical prefix", async () => {
+    const ctx = await closureReady({ secondIteration: true });
+    try {
+      const recording = recordingSink(ctx.sink);
+      const result = await applyPipelineV2ReviseTaskClosure({ sink: recording, intent: ctx.intent });
+      expect(recording.commands).toEqual([{
+        kind: "stage_iteration_closed",
+        generationIndex: 1,
+        iterationIndex: 2,
+        by: "replanned",
+        waitIndex: 1,
+      }]);
+      expect(result).toMatchObject({
+        wait_index: 1,
+        generation_index: 1,
+        iteration_index: 2,
+        task_revision: 2,
+      });
+      const generation = (ctx.sink.snapshot as PipelineV2RunState).generations[0]!;
+      expect(generation.iterations).toHaveLength(2);
+      // the historical prefix keeps its exact closed projection
+      expect(generation.iterations[0]!.closed).toEqual({
+        by: "normal_close",
+        closed_transition_count: 1,
+      });
+      expect(generation.iterations[0]!.opened_transition_count).toBe(0);
+      // only the last target iteration carries the replanned closure
+      expect(generation.iterations[1]!.closed).toEqual({
+        by: "replanned",
+        wait_index: 1,
+        closed_transition_count: 4,
+      });
+      expect(generation.open_iteration).toBeUndefined();
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("45. a hostile post-dispatch snapshot that changes a historical iteration is invalid state", async () => {
+    const ctx = await closureReady({ secondIteration: true });
+    try {
+      const { sink, closureDispatches } = mutationSink(ctx.sink, {
+        mutateAfterClosure: (derived): PipelineV2RunState => {
+          const generation = derived.generations[0]!;
+          (derived.generations as unknown as PipelineV2RunState["generations"])[0] = {
+            ...generation,
+            iterations: iterationMutation(generation),
+          };
+          return derived;
+        },
+      });
+      const cause = await catchAccept(() => applyPipelineV2ReviseTaskClosure({ sink, intent: ctx.intent }));
+      const error = expectClosureError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the applied closure");
+      expect(closureDispatches()).toBe(1);
+      // the durable state keeps the historical iteration unchanged
+      const generation = (ctx.sink.snapshot as PipelineV2RunState).generations[0]!;
+      expect(generation.iterations[0]!.opened_transition_count).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("46. a racing hostile snapshot that changes a historical iteration is not an idempotent success", async () => {
+    const ctx = await closureReady({ secondIteration: true });
+    try {
+      const { sink, closureDispatches } = mutationSink(ctx.sink, {
+        race: true,
+        mutateAfterClosure: (derived): PipelineV2RunState => {
+          const generation = derived.generations[0]!;
+          (derived.generations as unknown as PipelineV2RunState["generations"])[0] = {
+            ...generation,
+            iterations: iterationMutation(generation),
+          };
+          return derived;
+        },
+      });
+      const cause = await catchAccept(() => applyPipelineV2ReviseTaskClosure({ sink, intent: ctx.intent }));
+      const error = expectClosureError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the applied closure");
+      expect(closureDispatches()).toBe(1);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
 });
+
+/**
+ * The narrow hostile mutation of the historical iteration prefix: the
+ * first iteration's opening anchor is changed while everything else stays
+ * exact.
+ */
+function iterationMutation(generation: PipelineV2RunState["generations"][number]): PipelineV2RunState["generations"][number]["iterations"] {
+  const first = generation.iterations[0]!;
+  const rest = generation.iterations.slice(1);
+  return [{ ...first, opened_transition_count: 99 }, ...rest];
+}
 
 test("38. the runtime export surfaces are exact (public two keys, internal two keys)", async () => {
   const publicModule = await import("../src/pipeline_v2_revise_task_closure_controller.ts");

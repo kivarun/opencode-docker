@@ -68,16 +68,17 @@ import type {
  *   `initial_budget`, `opened_transition_count`, `iteration_count`) are
  *   fixed as the comparison basis of the post-dispatch verification;
  * - the accepted task revision: the ledger is the only source (no
- *   filesystem read). Exactly one wait-bound record must exist for the
- *   target wait and the intent's task — `task_id`,
- *   `new_task_revision_sha256`, `expected_previous_task_sha256`, the
- *   wait index and the intent digest all exact, with a positive safe
- *   revision above 1 — and it must be the last durable revision of that
- *   task (no later revision of the same task). No accepted task record is
- *   `invalid_state`; a record contradicting the digest, the predecessor or
- *   the intent binding, a ledger that already moved further, and
- *   duplicate or multiple wait-bound records are all `revision_conflict`
- *   (fail closed, never success).
+ *   filesystem read). The wait-bound records of the target wait — of ANY
+ *   task — must be exactly one, and that single record must be bound
+ *   exactly to the intent's task (`task_id`), digests
+ *   (`new_task_revision_sha256`, `expected_previous_task_sha256`), wait
+ *   index and intent digest, with a positive safe revision above 1 — and
+ *   it must be the last durable revision of that task (no later revision
+ *   of the same task). No accepted task record is `invalid_state`; a
+ *   record contradicting the task, the digest, the predecessor or the
+ *   intent binding, a ledger that already moved further, and several
+ *   wait-bound records (of the same or of another task) are all
+ *   `revision_conflict` (fail closed, never success).
  *
  * Reconciliation is ONE internal classification:
  * - C0 — the closure is absent: the target iteration is open. The single
@@ -118,13 +119,18 @@ import type {
  * normal resolve path and the racing `PipelineV2StateError` path: the
  * only allowed changes are the target iteration's exact `replanned`
  * closure, the disappearing `open_iteration` projection and the expected
- * state revision increment by the existing sink/reducer. Verified: the
+ * state revision increment (`after.revision === before.revision + 1`,
+ * with the run identity pinned: `after.run_id === before.run_id`).
+ * Verified: the
  * wait journal by length, position and every binding (ordered
  * `{id,to}` actions, exact intent, response absent); the task ledger
  * fully unchanged by length, positions and every contract field
  * (`index`/`task_id`/`revision`/`sha256`/`previous_sha256`/`wait_index`/
- * `intent_sha256`); the plan ledger boundary unchanged; the generation
- * identity bindings and the exact closure anchor; the cursor, transition
+ * `intent_sha256`); the plan ledger boundary unchanged; the target
+ * generation's exact index and identity bindings, its whole historical
+ * iteration prefix unchanged by position (index, opening anchor and the
+ * exact closed projection) and the exact closure anchor on the last
+ * target iteration; the cursor, transition
  * and execution journals still at the wait boundary. Every array and
  * nested entry is checked defensively (`Array.isArray`/record guards)
  * before any field read, so a hostile `null`, primitive or malformed
@@ -409,13 +415,15 @@ function requireReviseClosureBindings(
 
 /**
  * The accepted task revision of the target wait, read exclusively from
- * the durable ledger (no filesystem): exactly one wait-bound record for
- * the intent's task, bound exactly to the intent's digests and the wait,
+ * the durable ledger (no filesystem): the wait-bound records of the
+ * target wait — of ANY task — must be exactly one, and that single record
+ * must be bound exactly to the intent's task, digests, wait and intent,
  * with a positive safe revision above 1, and no later revision of the
- * same task. No accepted record is `invalid_state`; a contradicting
- * record, a ledger that moved further and duplicate or multiple
- * wait-bound records are `revision_conflict` (fail closed, never
- * success).
+ * same task. A second task revision accepted for the same wait is never
+ * passed by an exact task-id filter first. No accepted record is
+ * `invalid_state`; a contradicting record, a ledger that moved further
+ * and several wait-bound records are `revision_conflict` (fail closed,
+ * never success).
  */
 function requireAcceptedTaskRecord(
   state: PipelineV2RunState,
@@ -425,30 +433,27 @@ function requireAcceptedTaskRecord(
   expectedPreviousSha256: string,
   intentSha256: string,
 ): PipelineV2TaskRevisionState {
-  const bound = state.task_revisions.filter(
-    (record) =>
-      record.task_id === taskId &&
-      record.wait_index === waitIndex &&
-      record.intent_sha256 === intentSha256,
-  );
-  if (bound.length === 0) {
+  const waitBound = state.task_revisions.filter((record) => record.wait_index === waitIndex);
+  if (waitBound.length === 0) {
     throw controllerError(
       "invalid_state",
-      `wait ${waitIndex} carries no accepted task revision for task ${JSON.stringify(taskId)}`,
+      `wait ${waitIndex} carries no accepted task revision for the revise closure`,
       state,
     );
   }
-  if (bound.length > 1) {
+  if (waitBound.length > 1) {
     throw controllerError(
       "revision_conflict",
-      `wait ${waitIndex} carries several accepted task revisions for task ${JSON.stringify(taskId)}`,
+      `wait ${waitIndex} carries several accepted task revisions`,
       state,
     );
   }
-  const record = bound[0]!;
+  const record = waitBound[0]!;
   if (
+    record.task_id !== taskId ||
     record.sha256 !== expectedNewSha256 ||
     record.previous_sha256 !== expectedPreviousSha256 ||
+    record.intent_sha256 !== intentSha256 ||
     !(typeof record.revision === "number" && Number.isSafeInteger(record.revision) && record.revision > 1)
   ) {
     throw controllerError(
@@ -660,8 +665,11 @@ function planLedgerUnchanged(before: PipelineV2RunState, after: PipelineV2RunSta
 
 /**
  * The exact post-closure generation: still the last generation at its
- * position, still open, with unchanged identity bindings; its last
- * iteration is the target iteration with unchanged opening anchor and the
+ * position with its exact index, still open, with unchanged identity
+ * bindings; the whole historical iteration prefix (every iteration before
+ * the last) is unchanged by position — index, opening anchor and the
+ * exact closed projection (absence/presence, `by`, wait index and
+ * boundary); only the last target iteration may have changed, gaining the
  * exact `replanned` closure of the wait; no `open_iteration` projection.
  */
 function generationClosedExactly(after: PipelineV2RunState, bindings: ReviseClosureBindings): boolean {
@@ -673,6 +681,7 @@ function generationClosedExactly(after: PipelineV2RunState, bindings: ReviseClos
     return false;
   }
   if (
+    generation["index"] !== bindings.generation.index ||
     generation["closed"] !== undefined ||
     generation["stage_id"] !== bindings.generation.stage_id ||
     generation["stage_position"] !== bindings.generation.stage_position ||
@@ -688,7 +697,33 @@ function generationClosedExactly(after: PipelineV2RunState, bindings: ReviseClos
   if (!Array.isArray(iterations) || iterations.length !== bindings.generation.iterations.length) {
     return false;
   }
-  const last = iterations[iterations.length - 1];
+  const lastPosition = iterations.length - 1;
+  for (let position = 0; position < lastPosition; position += 1) {
+    const beforeIteration = bindings.generation.iterations[position];
+    if (beforeIteration === undefined) {
+      return false;
+    }
+    const entry = iterations[position];
+    if (entry === undefined || !isRecord(entry)) {
+      return false;
+    }
+    const closed = entry["closed"];
+    const closedEqual =
+      beforeIteration.closed === undefined
+        ? closed === undefined
+        : isRecord(closed) &&
+          closed["by"] === beforeIteration.closed.by &&
+          closed["wait_index"] === beforeIteration.closed.wait_index &&
+          closed["closed_transition_count"] === beforeIteration.closed.closed_transition_count;
+    if (
+      entry["index"] !== beforeIteration.index ||
+      entry["opened_transition_count"] !== beforeIteration.opened_transition_count ||
+      !closedEqual
+    ) {
+      return false;
+    }
+  }
+  const last = iterations[lastPosition];
   if (last === undefined || !isRecord(last)) {
     return false;
   }
@@ -731,10 +766,11 @@ function cursorAtWaitBoundary(after: PipelineV2RunState, wait: PipelineV2WaitRec
 /**
  * The full post-closure verification: the only allowed changes are the
  * target iteration's exact `replanned` closure, the disappearing
- * `open_iteration` projection and the expected state revision increment.
- * Every array and nested entry is shape-checked before any field read, so
- * a hostile malformed snapshot yields `false` and a typed error, never a
- * `TypeError`.
+ * `open_iteration` projection and the expected state revision increment
+ * (`after.revision === before.revision + 1`, with the run identity
+ * pinned). Every array and nested entry is shape-checked before any field
+ * read, so a hostile malformed snapshot yields `false` and a typed error,
+ * never a `TypeError`.
  */
 function closureAppliedExactly(
   after: PipelineV2RunState,
@@ -745,6 +781,12 @@ function closureAppliedExactly(
     return false;
   }
   if (after.status !== "waiting" || after.phase !== "waiting") {
+    return false;
+  }
+  if (after.run_id !== before.run_id) {
+    return false;
+  }
+  if (after.revision !== before.revision + 1) {
     return false;
   }
   if (!waitJournalUnchanged(before, after)) {

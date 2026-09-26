@@ -2425,12 +2425,15 @@ accepted intent digest, the declared `revise_task` action, and the
 cursor exactly on the wait boundary; the last durable plan revision
 exists; the last generation is open and bound to its digest; the target
 iteration is the generation's last; the generation identity bindings are
-fixed as the verification basis. The accepted task revision: exactly one
-wait-bound record for the intent's task with exact digests and links and
-a positive safe revision above 1, and no later revision of the same task
+fixed as the verification basis. The accepted task revision: the wait-bound records of the target wait
+(of ANY task) must be exactly one, and the single record must carry
+exact `task_id`, `new_task_revision_sha256`,
+`expected_previous_task_sha256`, wait index and intent digest with a
+positive safe revision above 1, and no later revision of the same task
 — absent is `invalid_state`; a contradicting record, a ledger that moved
-further and duplicate or multiple wait-bound records are
-`revision_conflict` (fail closed, never success). Reconciliation is one
+further and several wait-bound records (of the same or of another task)
+are `revision_conflict` (fail closed, never success). Reconciliation is
+one
 internal classification: C0 (the target iteration open — the single
 command `stage_iteration_closed {generationIndex, iterationIndex,
 by: "replanned", waitIndex}` pre-checked through the single reducer on a
@@ -2452,11 +2455,15 @@ success; any later execution/transition, a new wait, a new generation or
 iteration, another response action or a shifted cursor is
 `lifecycle_conflict`. Post-dispatch verification is the same full
 targeted check on the normal resolve path and the racing
-`PipelineV2StateError` path (the wait journal by length, position and
-every binding; the task ledger fully unchanged by all seven contract
-fields; the plan ledger unchanged; the generation identity bindings plus
-the exact closure anchor; the cursor and journals at the wait boundary)
-with defensive `Array.isArray`/record guards before any field read —
+`PipelineV2StateError` path (the state revision exactly `before + 1`
+with `after.run_id === before.run_id` pinned; the wait journal by
+length, position and every binding; the task ledger fully unchanged by
+all seven contract fields; the plan ledger unchanged; the target
+generation's exact index and identity bindings plus its whole historical
+iteration prefix unchanged by position — index, opening anchor and the
+exact closed projection — with the exact closure anchor on the last
+target iteration; the cursor and journals at the wait boundary) with
+defensive `Array.isArray`/record guards before any field read —
 hostile `null`/primitive/malformed snapshots yield typed errors, never a
 `TypeError`; the result is built from the verified snapshot without a
 re-read after the classification. Durability: sink `not_committed` keeps
