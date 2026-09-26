@@ -2593,8 +2593,166 @@ response-result battery, the
 getter-count/mutation-isolation/throwing-getter batteries, content-free
 diagnostics, both export surfaces, and the source scan. Still unwired:
 the intent selection policy, the architect/replanning execution, the
-acceptance of the next plan revision, closing the old generation, opening
-the next generation/iteration, automatic resume,
+acceptance of the next plan revision, opening the next
+generation/iteration, automatic resume,
+coordinator/runner/CLI/default-pipeline wiring, schema changes,
+migrations/API/T3, multi-process locking.
+
+- Replanned-generation controller (production-neutral, implemented, **not
+wired**): `orchestrator/src/pipeline_v2_replanned_generation_controller.ts`
+(public facade) + `pipeline_v2_replanned_generation_controller_internal.ts`
+(internal core) is the durable bridge that closes the previous stage
+generation after the next plan revision has been accepted — the full
+revise-cycle order is now `revise intent/task accepted → iteration closed
+by replanned → revise_task response → planning execution → next plan
+accepted → old generation closed by replanned`, from which a future
+increment opens the new plan's generation and iteration. The single
+durable command is `stage_generation_closed {generationIndex, by:
+"replanned"}`, built only from the durable records and dispatched through
+the structural `PipelineV2ReplannedGenerationControllerSink {snapshot,
+poisoned, dispatch}` seam (the production `PipelineV2RunStateSink`
+satisfies it without an adapter); the reducer stays the single successor
+authority. The controller performs no filesystem work: it never runs the
+architect, never builds or accepts a plan candidate, never publishes any
+manifest, never opens a new generation or iteration, never selects a
+stage or a budget, never commits a graph transition, never resumes the
+run, and is not wired into the coordinator, the runner, the CLI or the
+default pipeline. Capture and provenance ordering (fail-closed, tested):
+the options shape → `sink` → `intent` → `compiledPlan` each read exactly
+once → the sink's `poisoned`, `dispatch` and initial `snapshot` members
+each captured exactly once as opaque references with `dispatch` bound to
+the sink before the first await → the poison latch (`invalid_state`) →
+the existing manifest-registry provenance gate of the prepared intent
+(no intent field is read before it, Proxy traps never invoked) with the
+strict `revise_task_intent` kind → the existing compiled-plan provenance
+gate, equally before any field of the compiled plan is read and with
+zero Proxy traps → the single `validatePipelineV2RunState` (a missing or
+invalid initial snapshot is a typed `invalid_state` with `state: null`
+and a fixed content-free diagnostic; unexpected causes propagate
+unchanged) → the hidden compiled-plan pipeline identity comparison
+through the single existing `comparePipelineV2RunIdentity` → the durable
+bindings and reconciliation → the reducer pre-check of the single
+closing command → the dispatch. Exact prerequisite boundary (the fixed
+check order, tested): the active/running run with no terminal, run
+outputs or failure → the target wait the last wait-journal record and
+the only record of its index (a full defensive journal pass: every
+viewed entry a record, the target index exactly once, the last
+position) → the durable wait intent equal to the prepared intent's
+digest → the wait answered with exactly the `revise_task` response → the
+intent manifest bound to the durable state (run id; the task ledger is
+the binding authority for task id, predecessor digest and new-task
+digest) → the accepted task revision read exclusively from the ledger
+(exactly one wait-bound record of ANY task, exact contract fields, a
+positive safe revision above 1, no later revision of the same task;
+absent → `invalid_state`, several or conflicting or later →
+`revision_conflict`) → the old generation the LAST durable generation
+bound to the previous plan digest without an `open_iteration`, with at
+least one iteration and the last iteration as the exact replanned
+closure of the target wait (`closed.by === "replanned"`,
+`closed.wait_index === wait.index`,
+`closed.closed_transition_count === wait.transition_count`), the whole
+historical iteration prefix well-shaped → the new accepted plan exactly
+the last durable plan revision with `plan_revisions.length ===
+compiledPlan.plan_revision`, a revision above 1, the immediately
+preceding plan record at revision −1 whose digest equals the new
+record's predecessor AND the old generation's plan digest (a stale,
+foreign or non-successor plan → `plan_conflict`) → the compiled plan
+projection carrying the revised task exactly once with the exact
+accepted id, revision and digest — the task may live in any stage;
+absent, duplicated or stale → `plan_conflict` → the declared
+`revise_task` action with the cursor on its declared target and the
+cursor transition count and the transition journal exactly at the wait
+boundary (an advance past it → `lifecycle_conflict`) → the settled
+planning execution: `executions.length === transitions.length + 1`, the
+last execution exactly `compiledPlan.origin_execution` at its journal
+position, the role strictly `planning`, the type strictly `agent`, the
+phase strictly `cleanup_completed`, the state id on the declared action
+target, and no committed transition, new wait or new execution beyond
+the boundary. Reconciliation is ONE internal classification point: C0 —
+the old generation still open: the single closing command pre-checked
+through the single `reducePipelineV2RunCommand` on the local validated
+snapshot (a rejection is a typed `invalid_state` with zero dispatch;
+defense-in-depth, the verified boundary is strictly stronger than the
+reducer's preconditions), dispatched exactly once, and the authoritative
+snapshot re-read and fully verified; C1 — the exact durable replanned
+closure already on the last generation: an idempotent zero-dispatch
+success built from the already verified snapshot, with no snapshot
+re-read after the classification and no state restoration; a partially
+matching closure is never an idempotent success. Post-dispatch
+verification is the same targeted comparison on the normal resolve path
+and the racing `PipelineV2StateError` path: the revision moved exactly
+`before + 1`; the run id and the durable pipeline identity unchanged;
+status, phase, cursor and the boundary journals unchanged; the wait
+journal, the task ledger and the plan ledger positionally unchanged; the
+generation journal length unchanged with historical generations and the
+historical iteration prefix unchanged; the target generation keeping its
+index and identity bindings and its target iteration with the exact
+replanned closure; the single new field the exact generation closure
+with `closed_transition_count === wait.transition_count`. The
+comparisons are defensive contract-owned helpers with
+`Array.isArray`/record guards — a malformed hostile snapshot yields a
+typed controller error, never a `TypeError`; nothing is compared by
+serialization and there is no recursive deep comparator. Durability: a
+`PipelineV2RunStateDurabilityError` adopts the exact closure candidate
+visible on disk, poisons the sink, stops every further dispatch and
+fails `state_persist_failed` with the adopted state (a fresh retry with
+a reopened sink recognizes the exact C1 closure with zero dispatch); a
+plain store error (`not_committed`) keeps the previous open-generation
+state authoritative and a fresh retry dispatches the closing command
+again; unexpected errors keep their identity. The closed reason set is
+`invalid_intent | invalid_state | revision_conflict | plan_conflict |
+lifecycle_conflict | state_persist_failed` with the last authoritative
+state (`null` until the initial snapshot validated); diagnostics are
+content-free. Runtime export surface is exactly
+`PipelineV2ReplannedGenerationControllerError` and
+`closePipelineV2ReplannedGeneration` (public) /
+`closePipelineV2ReplannedGenerationInternal` (internal); no planner,
+pre-check, comparator or test seam is exported and there is no mutable
+ops seam. The deep-frozen content-free result is
+`{wait_index, generation_index, iteration_index, intent_sha256, task_id,
+task_revision, task_sha256, previous_plan_revision, previous_plan_sha256,
+plan_revision, plan_sha256, origin_execution, state}` — no manifest,
+canonical JSON, paths, bodies, prepared intent, compiled plan or other
+caller-owned objects. Tests: `orchestrator/tests/pipeline_v2_replanned_generation_controller.test.ts`
+(34 tests, fixtures built only through the real reducer/sink/store and
+the existing run-plan/stage-iteration/revise-task controllers — plan r1
+accepted, generation/iteration opened, the real revise intent accepted,
+task r2 durably accepted, the iteration closed `by:"replanned"` and the
+response recorded through the existing completion controller, the real
+planning execution on the declared action target, and the real plan r2
+carrying exactly task r2 accepted through
+`acceptPipelineV2RunPlanCandidate`) cover the C0 happy path with the
+exact single command, revision +1 and the loader round-trip, the exact
+deep-frozen content-free result shape, the C1 exact retry with zero
+dispatch, the not-yet-accepted plan and the stale-successor plan
+conflicts, a foreign compiled-plan pipeline identity, the fake/cloned/
+Proxy compiled-plan and intent provenance gates with zero traps, the
+strict `revise_task_intent` kind, the whole revise flow under a
+different intent (a real reducer path to `invalid_intent`), the
+`continue_stage` response conflict, the duplicate wait index, the
+missing/conflicting/later wait-bound task revision, the wrong iteration
+closure reason (loader-visible `lifecycle_conflict` on my check) and a
+wrong anchor (loader-typed `invalid_state`), the generation closed with
+another reason or anchor, the replaced generation plan binding and a
+later generation, a later transition or wait past the boundary, the
+pre-check source-order proof, the racing bare rejection and the
+resolve-without-change, the racing exact closure as an idempotent
+success through the same verification, the racing hostile closure, the
+wrong revision delta and a foreign run id in the post-dispatch snapshot,
+`not_committed` and `durability_unknown` with fresh-retry semantics,
+identical concurrency with one durable closure and exactly +1 revision,
+the conflicting retry rewriting nothing, the capture/getter counts with
+bound dispatch and caller mutation isolation, the malformed hostile
+snapshot matrix typed without `TypeError`, the unexpected getter and
+dispatch error identity, content-free diagnostics, both export surfaces,
+and the source scan (one validator called twice, the reducer only for
+the pre-check, no filesystem/store/publisher/serializer/digest-builder/
+coordinator/runner/CLI imports, no mutable seam and no new registry).
+Still unwired: the action/intent selection policy, the architect worker
+output parsing, plan candidate construction, the plan acceptance
+controller (already implemented, still not called from a policy layer),
+opening the next generation/iteration, stage selection and the
+initial-budget policy, the graph transition commit, automatic resume,
 coordinator/runner/CLI/default-pipeline wiring, schema changes,
 migrations/API/T3, multi-process locking.
 
