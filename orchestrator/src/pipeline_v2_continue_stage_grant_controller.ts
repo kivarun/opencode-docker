@@ -20,7 +20,10 @@ import {
  * sink (satisfied by the production `PipelineV2RunStateSink` without an
  * adapter). The controller performs no filesystem work, never
  * republishes the intent and never calls the acceptance controller; it
- * owns no successor rules, no policy and no routing.
+ * owns no successor rules, no policy and no routing. An already answered
+ * target wait on the active run is recognized only as the exact
+ * completed S2 retry (zero dispatch, no state restoration), which lets a
+ * full completion retry succeed after a durable `wait_response_recorded`.
  *
  * Runtime export surface is exactly two keys:
  * `PipelineV2ContinueStageGrantControllerError` and

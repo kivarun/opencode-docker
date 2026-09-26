@@ -63,6 +63,18 @@ import type { PipelineV2ContinueStageIntentManifest } from "./pipeline_v2_run_pl
  *   (`by: "grant"`, the wait index, `closed_transition_count` equal to the
  *   wait's `transition_count`, no `open_iteration`) — zero dispatch, the
  *   authoritative state returned;
+ * - S2 on the active/answered run: after `wait_response_recorded` the run
+ *   is active again, so an already answered target wait is recognized
+ *   ONLY as the exact completed S2 retry — zero dispatch, no state
+ *   restoration: the target wait must be the last wait and must keep the
+ *   exact accepted intent digest, its response must carry exactly the
+ *   `continue_stage` action id, exactly one exact grant record must exist
+ *   for the wait, the grant's generation must remain the last open
+ *   generation bound to the intent's stage, and the generation's last
+ *   iteration must carry the exact grant closure with the wait's anchor
+ *   and no `open_iteration`. Later lifecycle progress (an open next
+ *   iteration, a closed or foreign generation, another wait) is a typed
+ *   failure, never a retry of this boundary;
  * - conflicts: an existing grant with a different digest or amount is
  *   `grant_conflict`; a differently closed target iteration (another
  *   close reason, another wait index or another anchor) is
@@ -453,6 +465,180 @@ export function precheckGrantSequence(
 }
 
 /**
+ * The exact completed S2 retry on the active/answered run: the grant and
+ * the grant-bound closure are already durable, the target wait is
+ * answered with the `continue_stage` action, and nothing is dispatched or
+ * restored. The recognition requires the target wait to be the last wait,
+ * the response to carry the `continue_stage` action id (the response
+ * digest's structural validity is guaranteed by the state validation
+ * above), the wait to keep the exact accepted intent digest, exactly one
+ * exact grant record for the wait, the grant's generation to be the last
+ * open generation bound to the intent's stage, the generation's last
+ * iteration to carry the exact grant closure with the wait's anchor, and
+ * no `open_iteration`. Later lifecycle progress (an open next iteration,
+ * a closed or foreign generation, or another wait) is a typed failure,
+ * never a retry of this boundary.
+ */
+function applyCompletedGrantRetry(
+  state: PipelineV2RunState,
+  preparedIntent: PreparedPipelineV2RunWaitIntent,
+): AppliedPipelineV2ContinueStageGrant {
+  const manifest = preparedIntent.manifest as PipelineV2ContinueStageIntentManifest;
+  const wait = state.waits[state.waits.length - 1];
+  if (wait === undefined) {
+    throw controllerError(
+      "invalid_state",
+      "the run records no wait to recognize the completed continue-stage boundary",
+      state,
+    );
+  }
+  if (manifest.run_id !== state.run_id) {
+    throw controllerError(
+      "invalid_state",
+      "the wait intent names another run than the durable run state",
+      state,
+    );
+  }
+  if (manifest.wait_index !== wait.index) {
+    throw controllerError(
+      "invalid_state",
+      `the wait intent names wait index ${manifest.wait_index}, but the last wait record is ${wait.index}`,
+      state,
+    );
+  }
+  if (!wait.actions.some((action) => action.id === CONTINUE_STAGE_ACTION_ID)) {
+    throw controllerError(
+      "invalid_state",
+      "the last wait record does not declare the continue_stage action",
+      state,
+    );
+  }
+  if (wait.intent?.intent_sha256 !== preparedIntent.sha256) {
+    throw controllerError(
+      "invalid_state",
+      `the last wait ${wait.index} accepted a different intent; one intent belongs to one wait`,
+      state,
+    );
+  }
+  const response = wait.response;
+  if (response === undefined) {
+    throw controllerError(
+      "invalid_state",
+      `the last wait ${wait.index} is not answered; the completed boundary requires the recorded response`,
+      state,
+    );
+  }
+  if (response.action_id !== CONTINUE_STAGE_ACTION_ID) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the last wait ${wait.index} was answered with another action; this is not the continue-stage completion boundary`,
+      state,
+    );
+  }
+  // The exact durable grant of this wait, exactly once.
+  const grantsOfWait = state.grants.filter((grant) => grant.wait_index === wait.index);
+  if (grantsOfWait.length > 1) {
+    throw controllerError(
+      "invalid_state",
+      `wait ${wait.index} carries several grant records; the completed boundary is not a recognizable retry`,
+      state,
+    );
+  }
+  const grant = grantsOfWait[0];
+  if (grant === undefined) {
+    throw controllerError(
+      "invalid_state",
+      `wait ${wait.index} carries no durable grant; the completed boundary is not a recognizable retry`,
+      state,
+    );
+  }
+  if (grant.intent_sha256 !== preparedIntent.sha256 || grant.additional_iterations !== manifest.additional_iterations) {
+    throw controllerError(
+      "grant_conflict",
+      `wait ${wait.index} already carries a different grant for generation ${grant.generation_index}`,
+      state,
+    );
+  }
+  // The grant's generation: the last open generation bound to the
+  // intent's stage.
+  const generation = state.generations[grant.generation_index - 1];
+  if (generation === undefined || generation.index !== grant.generation_index) {
+    throw controllerError(
+      "invalid_state",
+      `the durable grant names generation ${grant.generation_index}, which the run does not record`,
+      state,
+    );
+  }
+  if (state.generations.length !== grant.generation_index) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the generation ${grant.generation_index} of the completed boundary is no longer the last generation`,
+      state,
+    );
+  }
+  if (generation.closed !== undefined) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the generation ${grant.generation_index} of the completed boundary is closed`,
+      state,
+    );
+  }
+  if (generation.stage_id !== manifest.stage_id) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the generation ${generation.index} belongs to stage ${JSON.stringify(generation.stage_id)}, but the wait intent names stage ${JSON.stringify(manifest.stage_id)}`,
+      state,
+    );
+  }
+  // The generation's last iteration carries the exact grant closure.
+  const iteration = generation.iterations[generation.iterations.length - 1];
+  if (iteration === undefined) {
+    throw controllerError(
+      "invalid_state",
+      `the generation ${generation.index} records no iterations`,
+      state,
+    );
+  }
+  const closed = iteration.closed;
+  if (closed === undefined) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the iteration ${iteration.index} of generation ${generation.index} is open; the completed boundary is not a recognizable retry`,
+      state,
+    );
+  }
+  if (closed.by !== "grant") {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the iteration ${iteration.index} of generation ${generation.index} was closed with ${JSON.stringify(closed.by)}, not by the grant`,
+      state,
+    );
+  }
+  if (closed.wait_index !== wait.index || closed.closed_transition_count !== wait.transition_count) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the iteration ${iteration.index} of generation ${generation.index} was closed against another wait or another boundary`,
+      state,
+    );
+  }
+  if (generation.open_iteration !== undefined) {
+    throw controllerError(
+      "lifecycle_conflict",
+      `the generation ${generation.index} still projects an open iteration`,
+      state,
+    );
+  }
+  return deepFreezeValue({
+    wait_index: wait.index,
+    generation_index: grant.generation_index,
+    iteration_index: iteration.index,
+    additional_iterations: manifest.additional_iterations,
+    intent_sha256: preparedIntent.sha256,
+    state,
+  });
+}
+
+/**
  * Validate, bind and apply the continue-stage grant through the existing
  * reducer (see the module docstring for the full order and durability
  * semantics).
@@ -518,6 +704,14 @@ export async function applyPipelineV2ContinueStageGrantInternal(
       );
     }
     throw cause;
+  }
+  // The run must be either waiting (the open-wait grant boundary) or
+  // active with the answered target wait recognized as the exact
+  // completed S2 retry (zero dispatch). Any other status is a typed
+  // failure; later lifecycle progress is never treated as this
+  // boundary's retry.
+  if (state.status === "active" && state.phase === "running") {
+    return applyCompletedGrantRetry(state, preparedIntent);
   }
   const bindings = requireContinueStageGrantBindings(state, preparedIntent);
   const manifest = bindings.manifest;

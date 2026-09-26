@@ -2219,11 +2219,75 @@ state_persist_failed`, last authoritative `state`) and
 `applyPipelineV2ContinueStageGrant({sink, intent})`; the deep-frozen
 content-free result is `{wait_index, generation_index,
 iteration_index, additional_iterations, intent_sha256, state}`.
-Not implemented (stays unwired): the response manifest and
-`wait_response_recorded`, opening the next iteration, automatic resume,
+The grant controller additionally recognizes an already answered target
+wait on the active/running run as the exact completed S2 retry (zero
+dispatch, no state restoration): the last wait must keep the exact
+accepted intent digest and be answered with exactly the `continue_stage`
+action, exactly one exact grant record must exist for the wait, the
+grant's generation must remain the last open generation bound to the
+intent's stage, and its last iteration must carry the exact grant
+closure with the wait's anchor and no `open_iteration`; later lifecycle
+progress (an open next iteration, a closed or foreign generation,
+another wait) is a typed failure, never a retry of this boundary.
+Not implemented (stays unwired): the response completion policy (the
+completion controller below records the response through the existing
+generic wait controller), opening the next iteration, automatic resume,
 `revise_task_intent`, the task/plan revision replanning chain, the
 action policy, coordinator/runner/CLI wiring, schema changes,
 migrations/API/T3, multi-process locking.
+
+### Continue-stage completion controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_continue_stage_completion_controller.ts`
+(public, with the internal core
+`pipeline_v2_continue_stage_completion_controller_internal.ts`) is the
+final step of the continue-stage intervention. It composes the two
+existing authoritative steps in one fixed order — apply (or confirm) the
+grant and the grant-bound iteration closure through
+`applyPipelineV2ContinueStageGrant`, then record the user's
+`continue_stage` response through the existing generic wait controller
+(`recordPipelineV2WaitAction`). The durable order of the whole
+intervention is therefore exactly:
+
+    accepted intent
+      → grant
+      → grant-bound iteration closure
+      → response publication
+      → wait_response_recorded
+
+No new response manifest, serializer, digest builder, store protocol or
+response dispatcher is introduced; the response document, its
+publication and the durable `wait_response_recorded` command stay
+entirely owned by the existing wait-manifest substrate. The completion
+controller itself performs no filesystem work, never calls the reducer
+or a store, never calls the intent acceptance controller, does not open
+the next iteration and does not resume the run. Runtime export surface
+is exactly `PipelineV2ContinueStageCompletionControllerError` (closed
+reasons `invalid_options | invalid_result`) and
+`completePipelineV2ContinueStage({runRoot, sink, intent})`; the
+deep-frozen content-free result is `{wait_index, generation_index,
+iteration_index, additional_iterations, intent_sha256, request_sha256,
+response_sha256, action_id: "continue_stage", action_to, state}`. The
+grant result is verified against the accepted intent before any response
+work, and the response result is verified against the durable target
+wait (the request/response digests from the durable record, the routing
+target from the declared action, the final active state with the cursor
+at the action target, and the unchanged grant/closure/generation
+bindings). Retry windows: C0 (accepted intent, no grant — the full
+suffix grant → closure → response, three durable revisions), C1 (the
+durable grant — the closure then the response), C2 (the grant and
+closure durable, the wait open — the response only), C3 (the response
+file published but not durable — adopted and committed once) and C4
+(the response durable or durability-unknown — the grant controller's
+active/answered S2 recognition and the wait controller's durable
+response recognition both return zero dispatch and restore the
+publications). Conflicts surface as the existing controllers' typed
+errors unchanged; nothing is ever rewritten or rolled back. Not
+implemented (stays unwired): the intent selection policy, the choice of
+`additional_iterations`, `revise_task_intent`, the task/plan revision
+replanning chain, opening the next iteration, automatic resume,
+coordinator/runner/CLI wiring, schema changes, migrations/API/T3,
+multi-process locking.
 
 ### Stage generation/iteration controller (production-neutral, not wired)
 
