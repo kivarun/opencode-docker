@@ -137,23 +137,58 @@ RUN pio pkg install --global --platform "${PIOARDUINO_PLATFORM_URL}" \
     && pio pkg list --global --only-platforms \
     && test -w "${PLATFORMIO_CORE_DIR}"
 
-# Pre-warm the complete Arduino build environment for the X4 Classic
+# pioarduino 55.03.37 bug fix (upstream fragment: builder/penv_setup.py in
+# the platform zip pinned by PIOARDUINO_PLATFORM_URL). The script installs
+# the PlatformIO CLI from the pinned pioarduino platformio-core v6.1.19
+# URL, but that distribution registers as "pioarduino-core" (upstream
+# setup.py: name = __title__ = "pioarduino core"), while the dependency
+# check looks up only the "platformio" key. Every networked project build
+# therefore treats the CLI as missing and re-resolves the URL package - an
+# unnecessary download that x4-classic-lab currently works around with
+# scripts/build_offline.sh. Minimal upstream-targeted fix, not a separate
+# package-manager implementation: the installed "pioarduino-core" dist is
+# normalised into the "platformio" key the check expects. The guard fails
+# the build if the checked upstream fragment changed.
+RUN set -eux; \
+    penv_setup="${PLATFORMIO_CORE_DIR}/platforms/espressif32/builder/penv_setup.py"; \
+    test -f "${penv_setup}"; \
+    python3 - "${penv_setup}" <<'PYEOF'
+import py_compile
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+old = "    for package, spec in deps.items():\n"
+new = (
+    "    if \"platformio\" not in installed_packages and \"pioarduino-core\" in installed_packages:\n"
+    "        installed_packages[\"platformio\"] = installed_packages[\"pioarduino-core\"]\n"
+    "    for package, spec in deps.items():\n"
+)
+assert src.count(old) == 1, "unexpected upstream penv_setup.py change"
+out = src.replace(old, new)
+open(path, "w", encoding="utf-8").write(out)
+assert out.count(new) == 1
+py_compile.compile(path, doraise=True)
+PYEOF
+
+# Pre-warm the complete Arduino build environment for the exact X4 Classic
 # target: fully compile a throwaway minimal project at image build time
-# (esp32-s3-devkitc1-n16r8: 16 MB QIO flash + 8 MB OPI PSRAM, matching the
-# device). This downloads the Arduino core, the Xtensa toolchain and
-# every other required package into /home/opencode/.platformio.
+# (esp32-s3-devkitc1-n16r8: 16 MB DIO flash + 8 MB OPI PSRAM, Arduino
+# framework, resolved from the same pinned pioarduino platform URL as
+# FreeInk's x4c sample). This downloads the platform from that URL, the
+# Arduino core, the Xtensa toolchain and every other required package into
+# /home/opencode/.platformio. The FreeInk SDK itself is not included.
 RUN set -eux; \
     proj=/tmp/prewarm-x4classic; \
     mkdir -p "${proj}/src"; \
     printf '%s\n' \
         '[env:prewarm]' \
-        'platform = espressif32' \
         'board = esp32-s3-devkitc1-n16r8' \
         'framework = arduino' \
-        'board_build.flash_mode = qio' \
+        'board_build.flash_mode = dio' \
         'board_build.psram_type = opi' \
         'board_upload.flash_size = 16MB' \
         > "${proj}/platformio.ini"; \
+    printf 'platform = %s\n' "${PIOARDUINO_PLATFORM_URL}" >> "${proj}/platformio.ini"; \
     printf '%s\n' \
         '#include <Arduino.h>' \
         '' \
@@ -163,22 +198,46 @@ RUN set -eux; \
     cd "${proj}" \
     && pio run
 
-# The same project must compile in a new container with the network
-# disabled: every RUN step is a fresh container and --network=none
-# removes all network access for this step, so this full rebuild of a
-# clean copy proves the cached PlatformIO environment is complete.
+# Full rebuild in a fresh container with the network disabled: every RUN
+# step is a fresh container and --network=none removes all network access,
+# and the rebuild happens in place (no temporary overlay copy), so this
+# proves the cached PlatformIO environment is complete for the exact X4
+# Classic configuration, including the URL-based platform resolution.
 RUN --network=none set -eux; \
-    cp -a /tmp/prewarm-x4classic /tmp/offline-check-x4classic; \
-    rm -rf /tmp/offline-check-x4classic/.pio; \
-    cd /tmp/offline-check-x4classic \
+    cd /tmp/prewarm-x4classic \
+    && rm -rf .pio \
     && pio run
 
-# Remove the throwaway projects; the PlatformIO cache stays.
-RUN rm -rf /tmp/prewarm-x4classic /tmp/offline-check-x4classic
+# Second offline rebuild after removing the project's .pio again.
+# GITHUB_ACTIONS forces penv_setup.py to run its Python-dependency branch
+# even without network (upstream skips that branch when its connection
+# check fails), so with the penv_setup fix the install list is empty and
+# no download is attempted; this step fails the build if the fix were
+# missing.
+RUN --network=none set -eux; \
+    cd /tmp/prewarm-x4classic \
+    && rm -rf .pio \
+    && GITHUB_ACTIONS=1 pio run
 
-RUN pio --version \
+# Remove the throwaway project; the PlatformIO cache stays.
+RUN rm -rf /tmp/prewarm-x4classic
+
+# Verify the installed versions and the OpenCode launch contract in a
+# fresh container without network: `opencode -c --version` proves that
+# launcher-appended arguments reach OpenCode itself instead of being
+# exec'd as a program.
+RUN --network=none set -eux; \
+    pio --version \
     && esptool version \
     && opencode --version \
-    && docker-helper version
+    && docker-helper version \
+    && pio pkg list --global --only-platforms \
+    && test "$(opencode -c --version)" = "$(opencode --version)"
 
-CMD ["opencode"]
+# Launch contract: the launcher's container command list is appended to
+# the ENTRYPOINT, so `oc-esp32 -c` runs OpenCode with the `-c`
+# (continue-last-session) argument instead of trying to exec "-c" as a
+# program (the former CMD ["opencode"] form). The orchestrator's worker
+# launcher overrides the entrypoint explicitly with --entrypoint
+# opencode, so this stays compatible with it.
+ENTRYPOINT ["opencode"]
