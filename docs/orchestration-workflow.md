@@ -2177,6 +2177,54 @@ revision publication/acceptance, the continue/revise action policy,
 automatic resume, coordinator/runner/CLI wiring, schema changes,
 migrations/API/T3, multi-process locking.
 
+### Continue-stage grant application controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_continue_stage_grant_controller.ts`
+(public, with the internal core
+`pipeline_v2_continue_stage_grant_controller_internal.ts`) is the
+durable step that follows the intent acceptance: for an already durably
+accepted `continue_stage_intent` it records the iteration grant and
+closes the current stage iteration with the wait-bound grant closure.
+The controller performs no filesystem work, never republishes the intent
+and never calls the acceptance controller; the plan binding was already
+proven before the durable `plan_intent_accepted`, so it re-checks only
+the durable bindings (the waiting run, the open wait with the accepted
+exact intent digest and the declared `continue_stage` action, the last
+open generation bound to the intent's stage, the generation's target
+(last) iteration, and the positive `additional_iterations`). The
+reconciliation is classified by one pure planner (`planContinueStageGrant`)
+over the durable records only: S0 (no grant, the target iteration open —
+the whole suffix `iteration_grant_recorded` → `stage_iteration_closed
+{by: "grant", waitIndex}` is pre-checked through the single reducer on a
+local sequence before the first dispatch, then dispatched strictly in
+order with the authoritative snapshot re-read and structurally verified
+after each dispatch), S1 (the exact durable grant with the target
+iteration still open — only the closure), and S2 (the exact grant plus
+the exact grant closure `by: "grant"`, the wait index and
+`closed_transition_count` equal to the wait's `transition_count` — zero
+dispatch, the authoritative state returned). Conflicts are typed:
+`grant_conflict` for a differently digested or sized existing grant;
+`lifecycle_conflict` for a differently closed target iteration, a
+mismatching generation/iteration or a hostile racing dispatch;
+`invalid_state` for a closure without the exact durable grant, several
+matching grants, missing/invalid snapshots and resolve-without-change
+dispatches; `state_persist_failed` for sink `not_committed`/
+`durability_unknown` (a fresh retry dispatches only the remaining
+suffix). Capture order: options shape → `sink` → `intent` once each →
+the sink members once → the poison latch → the provenance gate → the
+single state validator → the durable bindings. Runtime export surface is
+exactly `PipelineV2ContinueStageGrantControllerError` (closed reasons
+`invalid_intent | invalid_state | grant_conflict | lifecycle_conflict |
+state_persist_failed`, last authoritative `state`) and
+`applyPipelineV2ContinueStageGrant({sink, intent})`; the deep-frozen
+content-free result is `{wait_index, generation_index,
+iteration_index, additional_iterations, intent_sha256, state}`.
+Not implemented (stays unwired): the response manifest and
+`wait_response_recorded`, opening the next iteration, automatic resume,
+`revise_task_intent`, the task/plan revision replanning chain, the
+action policy, coordinator/runner/CLI wiring, schema changes,
+migrations/API/T3, multi-process locking.
+
 ### Stage generation/iteration controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
