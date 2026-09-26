@@ -349,8 +349,26 @@ export async function acceptPipelineV2ContinueStageIntentWithIo(
     throw invalidIntent("the intent is not a provenance-registered continue_stage_intent");
   }
   const preparedIntent = intent as unknown as PreparedPipelineV2RunWaitIntent;
-  // The single state validation of the durable snapshot.
-  const state = validatePipelineV2RunState(initialSnapshot as unknown as PipelineV2RunState | null);
+  // The single state validation of the durable snapshot. An invalid or
+  // missing snapshot is the controller's own typed failure
+  // (`invalid_state` with a fixed content-free diagnostic and no state —
+  // the raw validation error is neither echoed nor classified by
+  // message text); unexpected causes propagate unchanged. This boundary
+  // covers only the initial validation; the reducer/dispatch
+  // reconciliation below keeps its separate semantics.
+  let state: PipelineV2RunState;
+  try {
+    state = validatePipelineV2RunState(initialSnapshot as unknown as PipelineV2RunState | null);
+  } catch (cause) {
+    if (cause instanceof PipelineV2StateError) {
+      throw controllerError(
+        "invalid_state",
+        "the durable run state is missing or not a valid pipeline v2 run state",
+        null,
+      );
+    }
+    throw cause;
+  }
   // The provenance gate above guarantees the exact continue-stage kind;
   // the manifest is the frozen continue-stage form from here on.
   const manifest = preparedIntent.manifest as PipelineV2ContinueStageIntentManifest;

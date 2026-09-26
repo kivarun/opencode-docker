@@ -1094,7 +1094,6 @@ describe("acceptPipelineV2ContinueStageIntent", () => {
       const one = acceptPipelineV2ContinueStageIntentWithIo(barrierOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: first });
       const two = acceptPipelineV2ContinueStageIntentWithIo(barrierOps, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: second });
       const outcomes = await Promise.allSettled([one, two]);
-      console.error("OUTCOMES", outcomes.map((entry) => entry.status));
       const winners = outcomes.filter((entry) => entry.status === "fulfilled");
       const losers = outcomes.filter((entry) => entry.status === "rejected");
       expect(winners).toHaveLength(1);
@@ -1106,6 +1105,103 @@ describe("acceptPipelineV2ContinueStageIntent", () => {
       const stored = await readFile(join(ctx.fixture.runRoot, "run-plan", "intents", "1.json"), "utf8");
       expect(stored).toBe(durable === first.sha256 ? first.canonical_json : second.canonical_json);
       expect(durable).toBe(winnerIntent?.intent_sha256);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30a. a null snapshot is the controller's typed invalid_state with zero side effects", async () => {
+    const ctx = await waitingReady();
+    try {
+      const intent = preparedIntent(ctx);
+      let planLoads = 0;
+      let publishes = 0;
+      let dispatches: PipelineV2RunCommand[] = [];
+      const countingOps: PipelineV2ContinueStageIntentControllerOps = {
+        loadPlanRevision: async (runRoot, revision) => {
+          planLoads += 1;
+          return await loadPipelineV2PlanRevision(runRoot, revision);
+        },
+        publishWaitIntent: async (runRoot, manifest) => {
+          publishes += 1;
+          return await publishPipelineV2WaitIntent(runRoot, manifest);
+        },
+      };
+      const nullSink: PipelineV2ContinueStageIntentControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return null;
+        },
+        get poisoned() {
+          return false;
+        },
+        dispatch(command: PipelineV2RunCommand) {
+          dispatches.push(command);
+          return undefined;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ContinueStageIntentWithIo(countingOps, { runRoot: ctx.fixture.runRoot, sink: nullSink, intent }),
+      );
+      const error = expectControllerError(cause, "invalid_state");
+      expect(error.message).toBe("the durable run state is missing or not a valid pipeline v2 run state");
+      expect(error.state).toBeNull();
+      expect(planLoads).toBe(0);
+      expect(publishes).toBe(0);
+      expect(dispatches).toEqual([]);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30b. a structurally invalid snapshot is the controller's typed invalid_state without echoing caller values", async () => {
+    const ctx = await waitingReady();
+    try {
+      const intent = preparedIntent(ctx);
+      const brokenSnapshot = {
+        schema_version: 7,
+        run_id: "CANARY-RUN",
+        revision: 1,
+        status: "not-a-status",
+        phase: "running",
+        waits: [{ canary: true }],
+      };
+      let planLoads = 0;
+      let publishes = 0;
+      let dispatches: PipelineV2RunCommand[] = [];
+      const countingOps: PipelineV2ContinueStageIntentControllerOps = {
+        loadPlanRevision: async (runRoot, revision) => {
+          planLoads += 1;
+          return await loadPipelineV2PlanRevision(runRoot, revision);
+        },
+        publishWaitIntent: async (runRoot, manifest) => {
+          publishes += 1;
+          return await publishPipelineV2WaitIntent(runRoot, manifest);
+        },
+      };
+      const brokenSink: PipelineV2ContinueStageIntentControllerSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return brokenSnapshot as unknown as PipelineV2RunState;
+        },
+        get poisoned() {
+          return false;
+        },
+        dispatch(command: PipelineV2RunCommand) {
+          dispatches.push(command);
+          return undefined;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ContinueStageIntentWithIo(countingOps, { runRoot: ctx.fixture.runRoot, sink: brokenSink, intent }),
+      );
+      const error = expectControllerError(cause, "invalid_state");
+      expect(error.message).toBe("the durable run state is missing or not a valid pipeline v2 run state");
+      expect(error.state).toBeNull();
+      expect(error.message).not.toContain("CANARY-RUN");
+      expect(error.message).not.toContain("not-a-status");
+      expect(error.message).not.toContain("canary");
+      expect(planLoads).toBe(0);
+      expect(publishes).toBe(0);
+      expect(dispatches).toEqual([]);
     } finally {
       await disposeRun(ctx.fixture);
     }
