@@ -73,50 +73,72 @@ import type {
  * `invalid_intent` with zero publication and zero dispatch. The body is
  * never part of any diagnostic.
  *
- * Reconciliation over the durable records only:
+ * Reconciliation over the durable records only, with the reducer
+ * pre-check preceding every filesystem effect:
  * - R0: no durable intent, no durable candidate — the whole missing
  *   sequence (`plan_intent_accepted` → `task_revision_accepted`) is
- *   pre-checked through the single reducer on a local snapshot before any
- *   filesystem effect;
+ *   pre-checked through the single reducer on a local snapshot BEFORE any
+ *   publication (a rejection is `invalid_state` with zero publishers
+ *   called and zero dispatch);
  * - R1: the exact durable intent, no durable candidate — only the task
- *   revision is pre-checked;
- * - R2: the exact durable intent and the exact durable candidate — zero
- *   dispatch, but both artifacts are still re-published and
- *   re-verified (idempotent adoption restores removed files without
+ *   revision is pre-checked, again before any publication;
+ * - R2: the exact durable intent and the exact durable candidate — no
+ *   pre-check, zero dispatch, but both artifacts are still re-published
+ *   and re-verified (idempotent adoption restores removed files without
  *   touching existing ones);
- * - a durable candidate without the exact accepted wait intent is
- *   `invalid_state`; another digest at the candidate revision or a ledger
- *   entry beyond the candidate revision is `candidate_conflict`; nothing
- *   is ever returned as success before the full binding checks and the
- *   filesystem reconciliation.
+ * - a durable candidate without the exact accepted wait intent is an
+ *   explicit fail-closed `invalid_state` branch (unreachable through
+ *   loader-valid states, enforced before any publication); another digest
+ *   at the candidate revision or a ledger entry beyond the candidate
+ *   revision is `candidate_conflict`; nothing is ever returned as success
+ *   before the full binding checks and the filesystem reconciliation.
  *
- * Publication order (always `task` → `intent`): the task revision
- * manifest is published and structurally verified first, then the
- * wait-intent manifest. A task publication failure or conflict never
- * calls the intent publisher and never dispatches; an intent publication
- * failure leaves the task artifact as an orphan and dispatches nothing;
- * conflicting files are never overwritten and exact retries adopt the
- * existing bytes without changing inode, mode, mtime or content.
+ * Publication order (always `task` → `intent`, and always after the
+ * pre-check): the task revision manifest is published and structurally
+ * verified first, then the wait-intent manifest. A task publication
+ * failure or conflict never calls the intent publisher and never
+ * dispatches; an intent publication failure leaves the task artifact as
+ * an orphan and dispatches nothing; conflicting files are never
+ * overwritten and exact retries adopt the existing bytes without changing
+ * inode, mode, mtime or content.
  *
  * Dispatch capture: `sink.dispatch` is read exactly once before the
  * first await and is used through one bound local in every branch and
  * helper; any re-read of the sink member is impossible. The
- * authoritative `snapshot` is re-read after every dispatch.
+ * authoritative `snapshot` is re-read after every dispatch through one
+ * captured accessor local. Unexpected throwing getters propagate by
+ * identity and are never sanitized by message text.
+ *
+ * Post-intent reconciliation is ONE unified targeted classification of
+ * the authoritative snapshot against the verified `before` state, used
+ * identically on the normal resolve path and the racing-error path: P1
+ * (the exact intent accepted, the plan/lifecycle boundary unchanged, the
+ * task ledger fully unchanged) — dispatch the task suffix; P2 (the exact
+ * intent accepted, the boundary unchanged, the ledger differing only by
+ * the one exact candidate record appended last) — idempotent success with
+ * ZERO further dispatch; mismatch — typed `invalid_state` with zero task
+ * dispatch. The task suffix is never entered when the
+ * generation/iteration/plan/wait boundary changed.
  *
  * Post-dispatch verification is a full targeted boundary check (no second
- * state validator, no general deep comparator, no `TypeError` on hostile
- * nested shapes): the run stays waiting with the target wait the last and
- * only record of its index with unchanged binding fields, no response and
- * the exact accepted intent; the last durable plan record, the last open
- * generation and its identity bindings, the open target iteration with
- * its exact `open_iteration` projection and the cursor, transition and
- * execution journals stay unchanged; after the intent command the task
- * ledger stays unchanged (or gains only the exact racing candidate); the
- * task command must append exactly one exact candidate record at the end
- * of the ledger with the exact predecessor. A dispatch that reports
- * failure without the required durable change is `invalid_state`; a
- * racing identical dispatch is idempotent success only on the exact R1/R2
- * progression.
+ * state validator, no general deep comparator, and structurally safe:
+ * every nested access is guarded by array/record shape checks, so a
+ * hostile malformed snapshot yields `false` and a typed `invalid_state`,
+ * never a `TypeError`): the run stays waiting with the wait journal
+ * length unchanged, the target wait the last and only record of its index
+ * with unchanged binding fields, exact ordered `{id,to}` actions, no
+ * response and the exact accepted intent; the last durable plan record
+ * (position and fields), the last open generation (index and identity
+ * bindings), the open target iteration (the last, with the exact
+ * `open_iteration` projection), the cursor shape and fields and the
+ * transition/execution journal lengths stay unchanged; the task-ledger
+ * delta is checked exactly (after the intent command the ledger is
+ * unchanged or differs only by the exact racing candidate appended last;
+ * after the task command exactly one exact candidate record is appended
+ * at its append position with the exact predecessor and no duplicate or
+ * later record). A dispatch that reports failure without the required
+ * durable change is `invalid_state`; a racing identical dispatch is
+ * idempotent success only on the exact R1/R2 progression.
  *
  * Durability: sink `not_committed` keeps the published manifests as
  * orphans with the previous snapshot authoritative (a fresh retry adopts
@@ -303,22 +325,25 @@ function taskRevisionRecordMatches(
 }
 
 /**
- * The task ledger is unchanged: same length and same targeted record
- * fields at every position (no general deep comparator).
+ * The task ledger prefix is exact: the first `length` positions carry the
+ * same record identities and contract fields (index, task id, revision,
+ * digest, chain predecessor, wait and intent links). Structural
+ * malformation (a non-array ledger or a non-record entry) yields `false`.
  */
-function taskLedgerUnchanged(
+function taskLedgerPrefixExact(
   before: PipelineV2RunState,
   after: PipelineV2RunState,
+  length: number,
 ): boolean {
-  if (!Array.isArray(after.task_revisions) || after.task_revisions.length !== before.task_revisions.length) {
+  if (!Array.isArray(after.task_revisions)) {
     return false;
   }
-  for (let index = 0; index < before.task_revisions.length; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     const left = before.task_revisions[index];
     const right = after.task_revisions[index];
     if (
       left === undefined ||
-      right === undefined ||
+      !isRecord(right) ||
       left.index !== right.index ||
       left.task_id !== right.task_id ||
       left.revision !== right.revision ||
@@ -331,6 +356,88 @@ function taskLedgerUnchanged(
     }
   }
   return true;
+}
+
+/**
+ * The task ledger is unchanged: the same length and the exact contract
+ * fields at every position.
+ */
+function taskLedgerUnchanged(
+  before: PipelineV2RunState,
+  after: PipelineV2RunState,
+): boolean {
+  return (
+    Array.isArray(after.task_revisions) &&
+    after.task_revisions.length === before.task_revisions.length &&
+    taskLedgerPrefixExact(before, after, before.task_revisions.length)
+  );
+}
+
+/**
+ * The exact task-ledger delta of the task command: the ledger grows by
+ * exactly one record, the whole prefix is exact by positions and contract
+ * fields, the appended record is the exact candidate at its append
+ * position, and nothing follows or duplicates it.
+ */
+function taskLedgerExactAppend(
+  before: PipelineV2RunState,
+  after: PipelineV2RunState,
+  candidate: PreparedPipelineV2RunTaskRevision,
+  waitIndex: number,
+  intentSha256: string,
+): boolean {
+  if (
+    !Array.isArray(after.task_revisions) ||
+    after.task_revisions.length !== before.task_revisions.length + 1 ||
+    !taskLedgerPrefixExact(before, after, before.task_revisions.length)
+  ) {
+    return false;
+  }
+  const appended = after.task_revisions[after.task_revisions.length - 1];
+  if (
+    appended === undefined ||
+    appended.index !== after.task_revisions.length ||
+    !taskRevisionRecordMatches(appended, candidate, waitIndex, intentSha256)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * The unified reconciliation of the authoritative post-intent snapshot
+ * against the verified `before` state, shared by the normal resolve path
+ * and the racing-error path: P1 (the exact intent accepted, the
+ * plan/lifecycle boundary unchanged, the task ledger fully unchanged) —
+ * dispatch the task suffix; P2 (the exact intent accepted, the boundary
+ * unchanged, the ledger differing only by the one exact candidate record
+ * appended last) — idempotent success with zero further dispatch;
+ * mismatch — typed `invalid_state` with zero task dispatch.
+ */
+function classifyPostIntentState(
+  before: PipelineV2RunState,
+  beforeWait: PipelineV2WaitRecord,
+  after: PipelineV2RunState | null,
+  waitIndex: number,
+  intentSha256: string,
+  candidate: PreparedPipelineV2RunTaskRevision,
+): { readonly kind: "p1" } | { readonly kind: "p2" } | { readonly kind: "mismatch" } {
+  if (after === null) {
+    return { kind: "mismatch" };
+  }
+  if (
+    !waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) ||
+    !planBoundaryUnchanged(before, after)
+  ) {
+    return { kind: "mismatch" };
+  }
+  if (taskLedgerUnchanged(before, after)) {
+    return { kind: "p1" };
+  }
+  if (taskLedgerExactAppend(before, after, candidate, waitIndex, intentSha256)) {
+    return { kind: "p2" };
+  }
+  return { kind: "mismatch" };
 }
 
 /**
@@ -358,6 +465,11 @@ function waitBoundaryUnchangedForRevise(
     }
   }
   if (matches !== 1 || after === undefined) {
+    return false;
+  }
+  // The target wait stays the last element of an unchanged journal.
+  const last = state.waits[state.waits.length - 1];
+  if (last === undefined || last.index !== waitIndex) {
     return false;
   }
   if (
@@ -388,6 +500,9 @@ function planBoundaryUnchanged(
   before: PipelineV2RunState,
   after: PipelineV2RunState,
 ): boolean {
+  if (!Array.isArray(after.plan_revisions) || !Array.isArray(after.generations) || !isRecord(after.cursor)) {
+    return false;
+  }
   const beforePlan = before.plan_revisions[before.plan_revisions.length - 1];
   const afterPlan = after.plan_revisions[after.plan_revisions.length - 1];
   if (
@@ -409,6 +524,7 @@ function planBoundaryUnchanged(
     afterGeneration === undefined ||
     afterGeneration.closed !== undefined ||
     after.generations.length !== before.generations.length ||
+    afterGeneration.index !== beforeGeneration.index ||
     beforeGeneration.stage_id !== afterGeneration.stage_id ||
     beforeGeneration.stage_position !== afterGeneration.stage_position ||
     beforeGeneration.template_id !== afterGeneration.template_id ||
@@ -428,8 +544,9 @@ function planBoundaryUnchanged(
     beforeIteration.index !== afterIteration.index ||
     beforeIteration.opened_transition_count !== afterIteration.opened_transition_count ||
     afterIteration.closed !== undefined ||
-    afterGeneration.open_iteration?.index !== afterIteration.index ||
-    afterGeneration.open_iteration?.opened_transition_count !== afterIteration.opened_transition_count
+    !isRecord(afterGeneration.open_iteration) ||
+    (afterGeneration.open_iteration as Record<string, unknown>).index !== afterIteration.index ||
+    (afterGeneration.open_iteration as Record<string, unknown>).opened_transition_count !== afterIteration.opened_transition_count
   ) {
     return false;
   }
@@ -498,7 +615,11 @@ function requirePublishedTask(
  * snapshot, before any filesystem side effect; every reducer precondition
  * is already covered by the reconciliation, so this is defense-in-depth.
  */
-function precheckReviseSequence(
+/**
+ * Exported for targeted tests of the defense-in-depth pre-check on real
+ * reducer-produced prefixes; not part of the public runtime surface.
+ */
+export function precheckReviseSequence(
   start: PipelineV2RunState,
   commands: readonly PipelineV2RunCommand[],
   snapshot: PipelineV2RunState,
@@ -812,6 +933,13 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
   const candidateDurable = candidateRecords.length > 0;
   // The reconciliation classification over the durable records only.
   const intentDurable = wait.intent?.intent_sha256 === preparedIntent.sha256;
+  if (candidateDurable && !intentDurable) {
+    throw controllerError(
+      "invalid_state",
+      `the durable candidate task revision is not linked to the exact accepted intent of open wait ${manifest.wait_index}`,
+      state,
+    );
+  }
   const intentCommand: PipelineV2RunCommand = {
     kind: "plan_intent_accepted",
     waitIndex: manifest.wait_index,
@@ -825,6 +953,15 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
     waitIndex: manifest.wait_index,
     intentSha256: preparedIntent.sha256,
   };
+  // The reducer pre-check of the missing durable sequence precedes every
+  // filesystem effect: R0 pre-checks the whole sequence, R1 only the task
+  // revision, R2 needs no pre-check. A pre-check rejection is
+  // `invalid_state` with zero publications and zero dispatch.
+  if (!intentDurable && !candidateDurable) {
+    precheckReviseSequence(state, [intentCommand, taskCommand], state);
+  } else if (intentDurable && !candidateDurable) {
+    precheckReviseSequence(state, [taskCommand], state);
+  }
   // Publication order (always task → intent): the task revision manifest
   // first, then the wait intent manifest, each verified structurally
   // against the prepared object before any dispatch. A task publication
@@ -833,10 +970,10 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
   requirePublishedTask(publishedTask, preparedCandidate, state);
   const publishedIntent = await publishWaitIntent(runRoot, manifest);
   requirePublishedIntent(publishedIntent, preparedIntent, state);
-  if (!intentDurable && !candidateDurable) {
-    // R0: pre-check the whole missing sequence, then dispatch both
-    // commands strictly in order.
-    precheckReviseSequence(state, [intentCommand, taskCommand], state);
+  if (!intentDurable) {
+    // R0: dispatch the intent command, then reconcile the authoritative
+    // snapshot through the unified P1/P2/mismatch classification (shared
+    // with the racing-error path).
     try {
       await dispatchCommand(intentCommand);
     } catch (cause) {
@@ -856,28 +993,38 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
       }
       if (cause instanceof PipelineV2StateError) {
         // A racing identical dispatch is idempotent success only on the
-        // exact R1 progression: the exact durable intent with the
-        // boundary unchanged, and the ledger unchanged or carrying only
-        // the exact racing candidate.
+        // exact R1/R2 progression of the same call.
         const after = sinkRefSnapshot(sinkRef);
-        if (after !== null && waitBoundaryUnchangedForRevise(after, manifest.wait_index, preparedIntent.sha256, wait)) {
-          const afterCandidate = taskRecordsAtOrBeyond(after, manifest.task_id, preparedCandidate.manifest.revision);
-          if (
-            taskLedgerUnchanged(state, after) ||
-            (afterCandidate.length === 1 &&
-              taskRevisionRecordMatches(afterCandidate[0] as PipelineV2TaskRevisionState, preparedCandidate, manifest.wait_index, preparedIntent.sha256))
-          ) {
-            return await dispatchTaskRevisionSuffix(
-              dispatchCommand,
-              sinkRefSnapshot,
-              sinkRef,
-              preparedCandidate,
-              manifest.wait_index,
-              preparedIntent.sha256,
-              after,
-              wait,
+        const classified = classifyPostIntentState(state, wait, after, manifest.wait_index, preparedIntent.sha256, preparedCandidate);
+        if (classified.kind === "p1") {
+          return await dispatchTaskRevisionSuffix(
+            dispatchCommand,
+            sinkRefSnapshot,
+            sinkRef,
+            preparedCandidate,
+            manifest.wait_index,
+            preparedIntent.sha256,
+            state,
+            wait,
+          );
+        }
+        if (classified.kind === "p2") {
+          const racingState = sinkRefSnapshot(sinkRef);
+          if (racingState === null) {
+            throw controllerError(
+              "invalid_state",
+              `the run state rejected the revise task intent acceptance and does not carry it in the open wait ${manifest.wait_index}`,
+              null,
             );
           }
+          return deepFreezeValue({
+            wait_index: manifest.wait_index,
+            intent_sha256: preparedIntent.sha256,
+            task_id: preparedCandidate.manifest.task_id,
+            task_revision: preparedCandidate.manifest.revision,
+            task_sha256: preparedCandidate.sha256,
+            state: racingState,
+          });
         }
         throw controllerError(
           "invalid_state",
@@ -888,32 +1035,45 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
       throw cause;
     }
     const afterIntent = sinkRefSnapshot(sinkRef);
-    if (
-      afterIntent === null ||
-      !waitBoundaryUnchangedForRevise(afterIntent, manifest.wait_index, preparedIntent.sha256, wait) ||
-      !planBoundaryUnchanged(state, afterIntent) ||
-      !taskLedgerUnchanged(state, afterIntent)
-    ) {
-      throw controllerError(
-        "invalid_state",
-        `the committed run state does not carry the accepted revise intent in the open wait ${manifest.wait_index}`,
-        afterIntent,
+    const classified = classifyPostIntentState(state, wait, afterIntent, manifest.wait_index, preparedIntent.sha256, preparedCandidate);
+    if (classified.kind === "p1") {
+      return await dispatchTaskRevisionSuffix(
+        dispatchCommand,
+        sinkRefSnapshot,
+        sinkRef,
+        preparedCandidate,
+        manifest.wait_index,
+        preparedIntent.sha256,
+        state,
+        wait,
       );
     }
-    return await dispatchTaskRevisionSuffix(
-      dispatchCommand,
-      sinkRefSnapshot,
-      sinkRef,
-      preparedCandidate,
-      manifest.wait_index,
-      preparedIntent.sha256,
+    if (classified.kind === "p2") {
+      const racingState = afterIntent;
+      if (racingState === null) {
+        throw controllerError(
+          "invalid_state",
+          `the committed run state does not carry the accepted revise intent in the open wait ${manifest.wait_index}`,
+          null,
+        );
+      }
+      return deepFreezeValue({
+        wait_index: manifest.wait_index,
+        intent_sha256: preparedIntent.sha256,
+        task_id: preparedCandidate.manifest.task_id,
+        task_revision: preparedCandidate.manifest.revision,
+        task_sha256: preparedCandidate.sha256,
+        state: racingState,
+      });
+    }
+    throw controllerError(
+      "invalid_state",
+      `the committed run state does not carry the accepted revise intent in the open wait ${manifest.wait_index}`,
       afterIntent,
-      wait,
     );
   }
-  if (intentDurable && !candidateDurable) {
-    // R1: pre-check the task revision, then dispatch only it.
-    precheckReviseSequence(state, [taskCommand], state);
+  if (!candidateDurable) {
+    // R1: dispatch only the task revision.
     return await dispatchTaskRevisionSuffix(
       dispatchCommand,
       sinkRefSnapshot,
@@ -988,27 +1148,23 @@ async function dispatchTaskRevisionSuffix(
       );
     }
     if (cause instanceof PipelineV2StateError) {
+      // A racing identical dispatch is idempotent success only on the
+      // exact durable record with the full boundary unchanged.
       const after = readSnapshot(sink);
       if (
         after !== null &&
         waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) &&
-        planBoundaryUnchanged(before, after)
+        planBoundaryUnchanged(before, after) &&
+        taskLedgerExactAppend(before, after, preparedCandidate, waitIndex, intentSha256)
       ) {
-        const records = taskRecordsAtOrBeyond(after, preparedCandidate.manifest.task_id, preparedCandidate.manifest.revision);
-        if (
-          records.length === 1 &&
-          taskRevisionRecordMatches(records[0] as PipelineV2TaskRevisionState, preparedCandidate, waitIndex, intentSha256) &&
-          after.task_revisions[after.task_revisions.length - 1] === records[0]
-        ) {
-          return deepFreezeValue({
-            wait_index: waitIndex,
-            intent_sha256: intentSha256,
-            task_id: preparedCandidate.manifest.task_id,
-            task_revision: preparedCandidate.manifest.revision,
-            task_sha256: preparedCandidate.sha256,
-            state: after,
-          });
-        }
+        return deepFreezeValue({
+          wait_index: waitIndex,
+          intent_sha256: intentSha256,
+          task_id: preparedCandidate.manifest.task_id,
+          task_revision: preparedCandidate.manifest.revision,
+          task_sha256: preparedCandidate.sha256,
+          state: after,
+        });
       }
       throw controllerError(
         "invalid_state",
@@ -1023,20 +1179,7 @@ async function dispatchTaskRevisionSuffix(
     after === null ||
     !waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) ||
     !planBoundaryUnchanged(before, after) ||
-    after.task_revisions.length !== before.task_revisions.length + 1 ||
-    after.task_revisions.length < 1
-  ) {
-    throw controllerError(
-      "invalid_state",
-      `the committed run state does not carry the accepted task revision ${preparedCandidate.manifest.revision} of the candidate task`,
-      after,
-    );
-  }
-  const appended = after.task_revisions[after.task_revisions.length - 1];
-  if (
-    appended === undefined ||
-    !taskRevisionRecordMatches(appended, preparedCandidate, waitIndex, intentSha256) ||
-    appended.previous_sha256 !== preparedCandidate.manifest.previous_sha256
+    !taskLedgerExactAppend(before, after, preparedCandidate, waitIndex, intentSha256)
   ) {
     throw controllerError(
       "invalid_state",

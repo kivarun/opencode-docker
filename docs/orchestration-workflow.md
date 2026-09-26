@@ -2347,20 +2347,34 @@ candidate without the exact accepted wait intent is `invalid_state`;
 another digest at the candidate revision or a ledger entry beyond the
 candidate revision is `candidate_conflict`.
 
-Reconciliation: R0 (no durable intent, no durable candidate — the whole
-missing sequence pre-checked), R1 (the exact durable intent, no durable
-candidate — only the task revision pre-checked) and R2 (the exact
-durable intent and candidate — zero dispatch with both artifacts
-re-published and re-verified); the task-revision manifest and then the
-wait-intent manifest are published (each published result verified
-structurally against the prepared object; a task publication failure
-never calls the intent publisher), then the missing commands are
-dispatched strictly in order with the authoritative sink snapshot
-re-read and the full targeted boundary verified after each dispatch (the
-wait, the plan record/generation/iteration, the cursor and the journals,
-and the task ledger); a racing identical dispatch is idempotent success
-only on the exact R1/R2 progression; a resolve-without-change dispatch
-failure is `invalid_state`. Durability: sink `not_committed` keeps the
+Reconciliation with the reducer pre-check preceding every filesystem
+effect: R0 (no durable intent, no durable candidate — the whole missing
+sequence pre-checked), R1 (the exact durable intent, no durable
+candidate — only the task revision pre-checked) and R2 (no pre-check,
+zero dispatch with both artifacts re-published and re-verified); a
+pre-check rejection is `invalid_state` with zero publishers called and
+zero dispatch. The task-revision manifest and then the wait-intent
+manifest are published (each published result verified structurally
+against the prepared object; a task publication failure never calls the
+intent publisher), then the missing commands are dispatched strictly in
+order with the authoritative sink snapshot re-read. The post-intent
+reconciliation is ONE unified targeted classification shared by the
+normal resolve path and the racing-error path — P1 (the exact intent
+accepted, the plan/lifecycle boundary unchanged, the task ledger fully
+unchanged → dispatch the task suffix), P2 (the exact intent accepted,
+the boundary unchanged, the ledger differing only by the one exact
+racing candidate appended last → idempotent success with zero further
+dispatch) and mismatch (`invalid_state` with zero task dispatch). The
+full targeted boundary is verified after each dispatch (the wait journal
+length unchanged with the target wait the last and only record of its
+index; the last plan record, the last open generation, the open
+iteration, the cursor and the transition/execution journal lengths
+unchanged; the task-ledger prefix exact by positions and contract fields
+with exactly one exact candidate append). Structural malformation
+post-dispatch yields a typed `invalid_state`, never a `TypeError`; a
+racing identical dispatch is idempotent success only on the exact R1/R2
+progression; a resolve-without-change dispatch failure is
+`invalid_state`. Durability: sink `not_committed` keeps the
 published manifests as orphans with the previous snapshot authoritative
 (a fresh retry adopts the files and dispatches the remaining suffix);
 sink `durability_unknown` adopts the visible candidate, poisons the sink

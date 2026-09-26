@@ -43,6 +43,7 @@ import {
 } from "../src/pipeline_v2_revise_task_intent_controller.ts";
 import {
   acceptPipelineV2ReviseTaskIntentWithIo,
+  precheckReviseSequence,
   productionReviseTaskIntentOps,
   type PipelineV2ReviseTaskIntentControllerOps,
 } from "../src/pipeline_v2_revise_task_intent_controller_internal.ts";
@@ -1359,11 +1360,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     const ctx = await reviseReady();
     try {
       let taskDispatches = 0;
-      const realDispatch = (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
-      const hostileSink: PipelineV2ReviseTaskIntentControllerSink = {
-        get snapshot() {
-          return ctx.sink.snapshot;
-        },
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
         get poisoned() {
           return ctx.sink.poisoned;
         },
@@ -1371,15 +1368,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
           if (command.kind === "task_revision_accepted") {
             taskDispatches += 1;
           }
-          return await realDispatch(command);
-        },
-      };
-      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
-        get poisoned() {
-          return ctx.sink.poisoned;
-        },
-        async dispatch(command: PipelineV2RunCommand) {
-          return await realDispatch(command);
+          return await ctx.sink.dispatch(command);
         },
         get snapshot() {
           const real = ctx.sink.snapshot as PipelineV2RunState;
@@ -1401,6 +1390,46 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
       expect(error.message).toContain("does not carry the accepted revise intent");
       expect(taskDispatches).toBe(0);
       expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("37b. a racing intent whose authoritative snapshot closed the generation is rejected with zero task dispatch", async () => {
+    const ctx = await reviseReady();
+    try {
+      let taskDispatches = 0;
+      const raceSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          if (command.kind === "task_revision_accepted") {
+            taskDispatches += 1;
+          }
+          await ctx.sink.dispatch(command);
+          throw new PipelineV2StateError("simulated lost race");
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.waits[0]?.intent === undefined) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const generation = derived.generations[0];
+          if (generation !== undefined) {
+            (derived.generations as unknown as PipelineV2RunState["generations"])[0] = { ...generation, closed: { by: "next_stage", closed_transition_count: generation.opened_transition_count } };
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: raceSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry it in the open wait 1");
+      expect(taskDispatches).toBe(0);
       expect(ctx.sink.snapshot?.task_revisions).toHaveLength(2);
     } finally {
       await disposeRun(ctx.fixture);
@@ -1562,6 +1591,7 @@ test("26. the runtime export surfaces are exact (public two keys, internal core)
   expect(Object.keys(internalModule).sort()).toEqual([
     "PipelineV2ReviseTaskIntentControllerError",
     "acceptPipelineV2ReviseTaskIntentWithIo",
+    "precheckReviseSequence",
     "productionReviseTaskIntentOps",
   ]);
 });
@@ -1598,4 +1628,367 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
   }
   expect(countOf("let production")).toBe(0);
 
+
 });
+  test("42. the reducer pre-check precedes both publishers (source-order proof)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync("orchestrator/src/pipeline_v2_revise_task_intent_controller_internal.ts", "utf8");
+    const flow = source.slice(source.indexOf("export async function acceptPipelineV2ReviseTaskIntentWithIo"));
+    const precheck = flow.indexOf("precheckReviseSequence(state, [intentCommand, taskCommand], state)");
+    const precheckR1 = flow.indexOf("precheckReviseSequence(state, [taskCommand], state)");
+    const publishTask = flow.indexOf("await publishTaskRevision(runRoot");
+    const publishIntent = flow.indexOf("await publishWaitIntent(runRoot");
+    expect(precheck).toBeGreaterThan(0);
+    expect(precheckR1).toBeGreaterThan(precheck);
+    expect(publishTask).toBeGreaterThan(precheckR1);
+    expect(publishIntent).toBeGreaterThan(publishTask);
+    // the explicit fail-closed branch for a durable candidate without the
+    // exact accepted intent (unreachable through loader-valid states)
+    expect(flow).toContain("if (candidateDurable && !intentDurable)");
+    // the unified post-intent classification is used on both paths
+    expect(flow.split("classifyPostIntentState(").length - 1).toBe(2);
+  });
+
+  test("43. the reducer pre-check helper rejects a hostile reducer-produced prefix", async () => {
+    // the exported helper over real reducer-produced states: an accepted
+    // sequence passes, a sequence the durable state cannot accept is
+    // rejected as the controller's typed invalid_state, and the helper
+    // performs no dispatch or filesystem effect
+    const ctx = await reviseReady();
+    try {
+      const before = ctx.sink.snapshot;
+      if (before === null) {
+        throw new Error("fixture state missing");
+      }
+      const intentCommand: PipelineV2RunCommand = { kind: "plan_intent_accepted", waitIndex: 1, intentSha256: ctx.intent.sha256 };
+      const taskCommand: PipelineV2RunCommand = { kind: "task_revision_accepted", taskId: "task-a", revision: 2, taskSha256: ctx.candidate.sha256, waitIndex: 1, intentSha256: ctx.intent.sha256 };
+      // the accepted R0 sequence passes
+      precheckReviseSequence(before, [intentCommand, taskCommand], before);
+      // the R2 state cannot accept the same sequence again
+      const accepted = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      const after = accepted.state;
+      let cause: unknown;
+      try {
+        precheckReviseSequence(after, [taskCommand], after);
+      } catch (thrown) {
+        cause = thrown;
+      }
+      expect(cause).toBeInstanceOf(PipelineV2ReviseTaskIntentControllerError);
+      expect((cause as Error).message).toContain("does not accept the revise task revision sequence");
+      // the helper performed no dispatch and no filesystem effect
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.revision).toBe(after.revision);
+      await expect(lstat(TASK2_PATH(ctx.fixture.runRoot))).resolves.toBeDefined();
+      await expect(lstat(INTENT_PATH(ctx.fixture.runRoot))).resolves.toBeDefined();
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("44. a racing intent with the unchanged ledger dispatches the task suffix exactly once", async () => {
+    const ctx = await reviseReady();
+    try {
+      let taskDispatches = 0;
+      const raceSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          if (command.kind === "task_revision_accepted") {
+            taskDispatches += 1;
+          }
+          await ctx.sink.dispatch(command);
+          throw new PipelineV2StateError("simulated lost race");
+        },
+        get snapshot() {
+          return ctx.sink.snapshot;
+        },
+      };
+      const result = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: raceSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      expect(result).toMatchObject({ task_revision: 2, task_sha256: ctx.candidate.sha256 });
+      expect(taskDispatches).toBe(1);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("45. a racing intent that already appended the exact candidate is idempotent success with zero further dispatch", async () => {
+    const ctx = await reviseReady();
+    try {
+      let taskDispatches = 0;
+      const raceSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          if (command.kind === "task_revision_accepted") {
+            taskDispatches += 1;
+          }
+          if (command.kind === "plan_intent_accepted") {
+            // the racing full progression: both commands committed, the
+            // task dispatch routed through this sink to be counted
+            await ctx.sink.dispatch(command);
+            await raceSink.dispatch({ kind: "task_revision_accepted", taskId: ctx.candidate.manifest.task_id, revision: ctx.candidate.manifest.revision, taskSha256: ctx.candidate.sha256, waitIndex: 1, intentSha256: ctx.intent.sha256 });
+            throw new PipelineV2StateError("simulated lost race");
+          }
+          return await ctx.sink.dispatch(command);
+        },
+        get snapshot() {
+          return ctx.sink.snapshot;
+        },
+      };
+      const result = await acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: raceSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate });
+      expect(result).toMatchObject({ task_revision: 2, task_sha256: ctx.candidate.sha256 });
+      expect(taskDispatches).toBe(1);
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("46. a racing intent with a changed plan binding is rejected with zero task dispatch", async () => {
+    const ctx = await reviseReady();
+    try {
+      let taskDispatches = 0;
+      const raceSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          if (command.kind === "task_revision_accepted") {
+            taskDispatches += 1;
+          }
+          await ctx.sink.dispatch(command);
+          throw new PipelineV2StateError("simulated lost race");
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.waits[0]?.intent === undefined) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const generation = derived.generations[0];
+          if (generation !== undefined) {
+            (derived.generations as unknown as PipelineV2RunState["generations"])[0] = { ...generation, plan_sha256: hex("2") };
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: raceSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry it in the open wait 1");
+      expect(taskDispatches).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("47. a post-task snapshot with a mutated predecessor digest is invalid state", async () => {
+    const ctx = await reviseReady();
+    try {
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await ctx.sink.dispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.task_revisions.length < 3) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const last = derived.task_revisions[derived.task_revisions.length - 1];
+          if (last !== undefined) {
+            (derived.task_revisions as unknown as PipelineV2RunState["task_revisions"])[derived.task_revisions.length - 1] = { ...last, previous_sha256: hex("5") };
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the accepted task revision");
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("48. a post-task snapshot with a mutated early foreign task record is invalid state", async () => {
+    const ctx = await reviseReady();
+    try {
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await ctx.sink.dispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.task_revisions.length < 3) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const foreign = derived.task_revisions[1];
+          if (foreign !== undefined) {
+            (derived.task_revisions as unknown as PipelineV2RunState["task_revisions"])[1] = { ...foreign, sha256: hex("6") };
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the accepted task revision");
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("49. a post-task snapshot with a foreign record inserted before the exact candidate is invalid state", async () => {
+    const ctx = await reviseReady();
+    try {
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await ctx.sink.dispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.task_revisions.length < 3) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const last = derived.task_revisions[derived.task_revisions.length - 1];
+          if (last !== undefined) {
+            (derived.task_revisions as unknown as PipelineV2RunState["task_revisions"]).splice(derived.task_revisions.length - 1, 0, { ...last, index: 99 });
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the accepted task revision");
+      expect(ctx.sink.snapshot?.task_revisions).toHaveLength(3);
+      expect(ctx.sink.snapshot?.waits[0]?.intent?.intent_sha256).toBe(ctx.intent.sha256);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("50. a hostile post-intent snapshot with a second wait record is invalid state", async () => {
+    const ctx = await reviseReady();
+    try {
+      const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+        get poisoned() {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand) {
+          return await ctx.sink.dispatch(command);
+        },
+        get snapshot() {
+          const real = ctx.sink.snapshot as PipelineV2RunState;
+          if (real.waits[0]?.intent === undefined) {
+            return real;
+          }
+          const derived = structuredClone(real) as PipelineV2RunState;
+          const waitRecord = derived.waits[0];
+          if (waitRecord !== undefined) {
+            (derived.waits as unknown as PipelineV2RunState["waits"]).push({ ...waitRecord, index: 2 });
+          }
+          return derived;
+        },
+      };
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+      );
+      const error = expectReviseError(cause, "invalid_state");
+      expect(error.message).toContain("does not carry the accepted revise intent");
+      expect(ctx.sink.snapshot?.waits).toHaveLength(1);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("51. malformed post-dispatch snapshot shapes yield typed invalid state, never a TypeError", async () => {
+    const variants: Array<[string, (derived: Record<string, unknown>) => void]> = [
+      ["plan_revisions", (derived) => { derived["plan_revisions"] = "boom"; }],
+      ["generations", (derived) => { derived["generations"] = "boom"; }],
+      ["iterations", (derived) => {
+        const generations = derived["generations"];
+        if (Array.isArray(generations) && generations.length > 0 && typeof generations[0] === "object" && generations[0] !== null) {
+          (generations[0] as Record<string, unknown>)["iterations"] = "boom";
+        }
+      }],
+      ["cursor", (derived) => { derived["cursor"] = "boom"; }],
+      ["wait actions", (derived) => {
+        const waits = derived["waits"];
+        if (Array.isArray(waits) && waits.length > 0 && typeof waits[0] === "object" && waits[0] !== null) {
+          (waits[0] as Record<string, unknown>)["actions"] = "boom";
+        }
+      }],
+      ["action entry", (derived) => {
+        const waits = derived["waits"];
+        if (Array.isArray(waits) && waits.length > 0 && typeof waits[0] === "object" && waits[0] !== null) {
+          const record = waits[0] as Record<string, unknown>;
+          if (Array.isArray(record["actions"]) && record["actions"].length > 0) {
+            (record["actions"] as unknown[])[0] = "boom";
+          }
+        }
+      }],
+      ["task ledger entry", (derived) => {
+        const ledger = derived["task_revisions"];
+        if (Array.isArray(ledger) && ledger.length > 1) {
+          (ledger as unknown[])[1] = "boom";
+        }
+      }],
+      ["transitions", (derived) => { derived["transitions"] = "boom"; }],
+      ["executions", (derived) => { derived["executions"] = "boom"; }],
+    ];
+    for (const [label, mutate] of variants) {
+      const ctx = await reviseReady();
+      try {
+        const realDispatch = (command: PipelineV2RunCommand) => ctx.sink.dispatch(command);
+        const mutationSink: PipelineV2ReviseTaskIntentControllerSink = {
+          get poisoned() {
+            return ctx.sink.poisoned;
+          },
+          async dispatch(command: PipelineV2RunCommand) {
+            return await realDispatch(command);
+          },
+          get snapshot() {
+            const real = ctx.sink.snapshot as PipelineV2RunState;
+            if (real.waits[0]?.intent === undefined) {
+              return real;
+            }
+            const derived = structuredClone(real) as unknown as Record<string, unknown>;
+            mutate(derived);
+            return derived as unknown as PipelineV2RunState;
+          },
+        };
+        const cause = await catchAccept(() =>
+          acceptPipelineV2ReviseTaskIntent({ runRoot: ctx.fixture.runRoot, sink: mutationSink, intent: ctx.intent, candidateTaskRevision: ctx.candidate }),
+        );
+        const error = expectReviseError(cause, "invalid_state");
+        expect(error.message).not.toContain(label);
+        expect(error.message).not.toContain("boom");
+        expect((cause as Error).name).toBe("PipelineV2ReviseTaskIntentControllerError");
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    }
+  });
