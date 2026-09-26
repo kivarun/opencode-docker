@@ -92,6 +92,9 @@ import type {
  *   at the candidate revision or a ledger entry beyond the candidate
  *   revision is `candidate_conflict`; nothing is ever returned as success
  *   before the full binding checks and the filesystem reconciliation.
+ * The pre-check helper is internal to this module: not a runtime export
+ * and not a test seam; the pre-check-before-publication ordering is
+ * proven by the source-order test of the acceptance flow.
  *
  * Publication order (always `task` → `intent`, and always after the
  * pre-check): the task revision manifest is published and structurally
@@ -116,29 +119,35 @@ import type {
  * task ledger fully unchanged) — dispatch the task suffix; P2 (the exact
  * intent accepted, the boundary unchanged, the ledger differing only by
  * the one exact candidate record appended last) — idempotent success with
- * ZERO further dispatch; mismatch — typed `invalid_state` with zero task
- * dispatch. The task suffix is never entered when the
- * generation/iteration/plan/wait boundary changed.
+ * ZERO further dispatch, and the result carries exactly the snapshot that
+ * passed the classification (no re-read of the sink between the
+ * classification and the result construction); mismatch — typed
+ * `invalid_state` with zero task dispatch. The task suffix is never
+ * entered when the generation/iteration/plan/wait boundary changed.
  *
  * Post-dispatch verification is a full targeted boundary check (no second
  * state validator, no general deep comparator, and structurally safe:
  * every nested access is guarded by array/record shape checks, so a
- * hostile malformed snapshot yields `false` and a typed `invalid_state`,
- * never a `TypeError`): the run stays waiting with the wait journal
- * length unchanged, the target wait the last and only record of its index
- * with unchanged binding fields, exact ordered `{id,to}` actions, no
- * response and the exact accepted intent; the last durable plan record
- * (position and fields), the last open generation (index and identity
- * bindings), the open target iteration (the last, with the exact
- * `open_iteration` projection), the cursor shape and fields and the
- * transition/execution journal lengths stay unchanged; the task-ledger
- * delta is checked exactly (after the intent command the ledger is
- * unchanged or differs only by the exact racing candidate appended last;
- * after the task command exactly one exact candidate record is appended
- * at its append position with the exact predecessor and no duplicate or
- * later record). A dispatch that reports failure without the required
- * durable change is `invalid_state`; a racing identical dispatch is
- * idempotent success only on the exact R1/R2 progression.
+ * hostile snapshot carrying `null`, a primitive or a non-record entry at
+ * any viewed position yields `false` and a typed `invalid_state`, never a
+ * `TypeError`; string and other primitive values are rejected the same
+ * way because property reads on them never throw): the run stays waiting
+ * with the wait journal pinned by length (no record appears, disappears
+ * or moves), the target wait the last and only record of its index with
+ * unchanged binding fields, exact ordered `{id,to}` actions, no response
+ * and the exact accepted intent; the last durable plan record (position
+ * and fields), the last open generation (index and identity bindings),
+ * the open target iteration (the last, with the exact `open_iteration`
+ * projection), the cursor shape and fields and the transition/execution
+ * journal lengths stay unchanged; the task-ledger delta is checked
+ * exactly (after the intent command the ledger is unchanged or differs
+ * only by the exact racing candidate appended last; after the task
+ * command exactly one exact candidate record is appended at its append
+ * position with the exact predecessor and no duplicate or later record).
+ * A dispatch that reports failure without the required durable change is
+ * `invalid_state`; a racing identical dispatch is idempotent success only
+ * on the exact R1/R2 progression. Unexpected throwing getters propagate
+ * by identity and are never sanitized or classified by message text.
  *
  * Durability: sink `not_committed` keeps the published manifests as
  * orphans with the previous snapshot authoritative (a fresh retry adopts
@@ -149,7 +158,11 @@ import type {
  *
  * Runtime export surface (public module) is exactly
  * `PipelineV2ReviseTaskIntentControllerError` and
- * `acceptPipelineV2ReviseTaskIntent`. The closed reason set is
+ * `acceptPipelineV2ReviseTaskIntent`. The internal core module exports
+ * exactly `PipelineV2ReviseTaskIntentControllerError`,
+ * `acceptPipelineV2ReviseTaskIntentWithIo` and `productionReviseTaskIntentOps`
+ * — the reducer pre-check helper is internal and never exported. The closed
+ * reason set is
  * `invalid_intent | invalid_state | intent_conflict | candidate_conflict |
  * state_persist_failed` with the last authoritative state (`null` when
  * none exists). Diagnostics are content-free (validated safe ids and
@@ -306,21 +319,27 @@ function taskRecordsAtOrBeyond(
 
 /**
  * The exact durable candidate record: task id, revision, digest, chain
- * predecessor and the wait/intent links of the open wait.
+ * predecessor and the wait/intent links of the open wait. The record is
+ * accepted as a structurally unknown value and fails closed on a
+ * non-record; every caller may hand over an untrusted entry.
  */
 function taskRevisionRecordMatches(
-  record: PipelineV2TaskRevisionState,
+  record: unknown,
   candidate: PreparedPipelineV2RunTaskRevision,
   waitIndex: number,
   intentSha256: string,
 ): boolean {
+  if (!isRecord(record)) {
+    return false;
+  }
+  const manifest = candidate.manifest;
   return (
-    record.task_id === candidate.manifest.task_id &&
-    record.revision === candidate.manifest.revision &&
-    record.sha256 === candidate.sha256 &&
-    record.previous_sha256 === candidate.manifest.previous_sha256 &&
-    record.wait_index === waitIndex &&
-    record.intent_sha256 === intentSha256
+    record["task_id"] === manifest.task_id &&
+    record["revision"] === manifest.revision &&
+    record["sha256"] === candidate.sha256 &&
+    record["previous_sha256"] === manifest.previous_sha256 &&
+    record["wait_index"] === waitIndex &&
+    record["intent_sha256"] === intentSha256
   );
 }
 
@@ -396,6 +415,7 @@ function taskLedgerExactAppend(
   const appended = after.task_revisions[after.task_revisions.length - 1];
   if (
     appended === undefined ||
+    !isRecord(appended) ||
     appended.index !== after.task_revisions.length ||
     !taskRevisionRecordMatches(appended, candidate, waitIndex, intentSha256)
   ) {
@@ -411,8 +431,10 @@ function taskLedgerExactAppend(
  * plan/lifecycle boundary unchanged, the task ledger fully unchanged) —
  * dispatch the task suffix; P2 (the exact intent accepted, the boundary
  * unchanged, the ledger differing only by the one exact candidate record
- * appended last) — idempotent success with zero further dispatch;
- * mismatch — typed `invalid_state` with zero task dispatch.
+ * appended last) — idempotent success with zero further dispatch, and the
+ * classification result carries exactly the snapshot that passed the
+ * checks (the caller never re-reads the sink for the result); mismatch —
+ * typed `invalid_state` with zero task dispatch.
  */
 function classifyPostIntentState(
   before: PipelineV2RunState,
@@ -421,12 +443,12 @@ function classifyPostIntentState(
   waitIndex: number,
   intentSha256: string,
   candidate: PreparedPipelineV2RunTaskRevision,
-): { readonly kind: "p1" } | { readonly kind: "p2" } | { readonly kind: "mismatch" } {
-  if (after === null) {
+): { readonly kind: "p1" } | { readonly kind: "p2"; readonly state: PipelineV2RunState } | { readonly kind: "mismatch" } {
+  if (after === null || !isRecord(after)) {
     return { kind: "mismatch" };
   }
   if (
-    !waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) ||
+    !waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait, before.waits.length) ||
     !planBoundaryUnchanged(before, after)
   ) {
     return { kind: "mismatch" };
@@ -435,33 +457,43 @@ function classifyPostIntentState(
     return { kind: "p1" };
   }
   if (taskLedgerExactAppend(before, after, candidate, waitIndex, intentSha256)) {
-    return { kind: "p2" };
+    return { kind: "p2", state: after };
   }
   return { kind: "mismatch" };
 }
 
 /**
- * The exact post-wait wait record: found exactly once by index, binding
+ * The exact post-wait wait record: the wait journal pinned by length, the
+ * target found exactly once by index and still the last element, binding
  * fields unchanged, no response, and the exact accepted intent digest.
+ * Every viewed entry is shape-checked (`null`, primitives and non-record
+ * entries fail closed) before any field access.
  */
 function waitBoundaryUnchangedForRevise(
   state: PipelineV2RunState,
   waitIndex: number,
   intentSha256: string,
   before: PipelineV2WaitRecord,
+  beforeWaitsLength: number,
 ): boolean {
+  if (!isRecord(state)) {
+    return false;
+  }
   if (state.status !== "waiting" || state.phase !== "waiting") {
     return false;
   }
-  if (!Array.isArray(state.waits)) {
+  if (!Array.isArray(state.waits) || state.waits.length !== beforeWaitsLength) {
     return false;
   }
   let matches = 0;
   let after: PipelineV2WaitRecord | undefined;
-  for (const record of state.waits) {
-    if (record.index === waitIndex) {
+  for (const entry of state.waits) {
+    if (!isRecord(entry)) {
+      return false;
+    }
+    if (entry.index === waitIndex) {
       matches += 1;
-      after = record;
+      after = entry;
     }
   }
   if (matches !== 1 || after === undefined) {
@@ -472,6 +504,7 @@ function waitBoundaryUnchangedForRevise(
   if (last === undefined || last.index !== waitIndex) {
     return false;
   }
+  const intentLink = after.intent as { readonly intent_sha256?: unknown } | undefined;
   if (
     before.index !== after.index ||
     before.transition_count !== after.transition_count ||
@@ -479,14 +512,21 @@ function waitBoundaryUnchangedForRevise(
     before.reason !== after.reason ||
     before.request_sha256 !== after.request_sha256 ||
     after.response !== undefined ||
+    !Array.isArray(after.actions) ||
     before.actions.length !== after.actions.length ||
-    after.intent?.intent_sha256 !== intentSha256
+    !isRecord(intentLink) ||
+    intentLink.intent_sha256 !== intentSha256
   ) {
     return false;
   }
   return before.actions.every((action, position) => {
     const other = after.actions[position];
-    return other !== undefined && other.id === action.id && other.to === action.to;
+    return (
+      other !== undefined &&
+      isRecord(other) &&
+      other.id === action.id &&
+      other.to === action.to
+    );
   });
 }
 
@@ -494,36 +534,53 @@ function waitBoundaryUnchangedForRevise(
  * The plan and lifecycle boundary is unchanged: the last durable plan
  * record, the last open generation with its identity bindings, the open
  * target iteration with its exact `open_iteration` projection and the
- * cursor, transition and execution journals.
+ * cursor, transition and execution journals. Every viewed entry is
+ * shape-checked (`null`, primitives and non-record entries fail closed)
+ * before any field access.
  */
 function planBoundaryUnchanged(
   before: PipelineV2RunState,
   after: PipelineV2RunState,
 ): boolean {
-  if (!Array.isArray(after.plan_revisions) || !Array.isArray(after.generations) || !isRecord(after.cursor)) {
+  if (
+    !isRecord(after) ||
+    !Array.isArray(after.plan_revisions) ||
+    !Array.isArray(after.generations) ||
+    !isRecord(after.cursor)
+  ) {
     return false;
   }
-  const beforePlan = before.plan_revisions[before.plan_revisions.length - 1];
   const afterPlan = after.plan_revisions[after.plan_revisions.length - 1];
   if (
-    beforePlan === undefined ||
     afterPlan === undefined ||
-    beforePlan.index !== afterPlan.index ||
-    beforePlan.revision !== afterPlan.revision ||
-    beforePlan.sha256 !== afterPlan.sha256 ||
-    beforePlan.previous_sha256 !== afterPlan.previous_sha256 ||
-    beforePlan.origin_execution !== afterPlan.origin_execution ||
+    !isRecord(afterPlan) ||
     after.plan_revisions.length !== before.plan_revisions.length
   ) {
     return false;
   }
-  const beforeGeneration = before.generations[before.generations.length - 1];
+  const beforePlan = before.plan_revisions[before.plan_revisions.length - 1];
+  if (
+    beforePlan === undefined ||
+    beforePlan.index !== afterPlan.index ||
+    beforePlan.revision !== afterPlan.revision ||
+    beforePlan.sha256 !== afterPlan.sha256 ||
+    beforePlan.previous_sha256 !== afterPlan.previous_sha256 ||
+    beforePlan.origin_execution !== afterPlan.origin_execution
+  ) {
+    return false;
+  }
   const afterGeneration = after.generations[after.generations.length - 1];
   if (
-    beforeGeneration === undefined ||
     afterGeneration === undefined ||
+    !isRecord(afterGeneration) ||
     afterGeneration.closed !== undefined ||
-    after.generations.length !== before.generations.length ||
+    after.generations.length !== before.generations.length
+  ) {
+    return false;
+  }
+  const beforeGeneration = before.generations[before.generations.length - 1];
+  if (
+    beforeGeneration === undefined ||
     afterGeneration.index !== beforeGeneration.index ||
     beforeGeneration.stage_id !== afterGeneration.stage_id ||
     beforeGeneration.stage_position !== afterGeneration.stage_position ||
@@ -532,21 +589,25 @@ function planBoundaryUnchanged(
     beforeGeneration.initial_budget !== afterGeneration.initial_budget ||
     beforeGeneration.opened_transition_count !== afterGeneration.opened_transition_count ||
     beforeGeneration.iteration_count !== afterGeneration.iteration_count ||
-    beforeGeneration.iterations.length !== afterGeneration.iterations.length
+    !Array.isArray(afterGeneration.iterations) ||
+    afterGeneration.iterations.length !== beforeGeneration.iterations.length
   ) {
     return false;
   }
-  const beforeIteration = beforeGeneration.iterations[beforeGeneration.iterations.length - 1];
   const afterIteration = afterGeneration.iterations[afterGeneration.iterations.length - 1];
+  if (afterIteration === undefined || !isRecord(afterIteration)) {
+    return false;
+  }
+  const beforeIteration = beforeGeneration.iterations[beforeGeneration.iterations.length - 1];
+  const openIteration = afterGeneration.open_iteration;
   if (
     beforeIteration === undefined ||
-    afterIteration === undefined ||
     beforeIteration.index !== afterIteration.index ||
     beforeIteration.opened_transition_count !== afterIteration.opened_transition_count ||
     afterIteration.closed !== undefined ||
-    !isRecord(afterGeneration.open_iteration) ||
-    (afterGeneration.open_iteration as Record<string, unknown>).index !== afterIteration.index ||
-    (afterGeneration.open_iteration as Record<string, unknown>).opened_transition_count !== afterIteration.opened_transition_count
+    !isRecord(openIteration) ||
+    openIteration.index !== afterIteration.index ||
+    openIteration.opened_transition_count !== afterIteration.opened_transition_count
   ) {
     return false;
   }
@@ -614,12 +675,10 @@ function requirePublishedTask(
  * The reducer pre-check of the missing durable sequence on a local
  * snapshot, before any filesystem side effect; every reducer precondition
  * is already covered by the reconciliation, so this is defense-in-depth.
+ * Internal to this module: not a runtime export and not a test seam (the
+ * ordering is proven by the source-order test of the acceptance flow).
  */
-/**
- * Exported for targeted tests of the defense-in-depth pre-check on real
- * reducer-produced prefixes; not part of the public runtime surface.
- */
-export function precheckReviseSequence(
+function precheckReviseSequence(
   start: PipelineV2RunState,
   commands: readonly PipelineV2RunCommand[],
   snapshot: PipelineV2RunState,
@@ -1009,21 +1068,16 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
           );
         }
         if (classified.kind === "p2") {
-          const racingState = sinkRefSnapshot(sinkRef);
-          if (racingState === null) {
-            throw controllerError(
-              "invalid_state",
-              `the run state rejected the revise task intent acceptance and does not carry it in the open wait ${manifest.wait_index}`,
-              null,
-            );
-          }
+          // The exact snapshot that passed the classification is the
+          // result; the sink is never read again between the
+          // classification and the result construction.
           return deepFreezeValue({
             wait_index: manifest.wait_index,
             intent_sha256: preparedIntent.sha256,
             task_id: preparedCandidate.manifest.task_id,
             task_revision: preparedCandidate.manifest.revision,
             task_sha256: preparedCandidate.sha256,
-            state: racingState,
+            state: classified.state,
           });
         }
         throw controllerError(
@@ -1049,21 +1103,14 @@ export async function acceptPipelineV2ReviseTaskIntentWithIo(
       );
     }
     if (classified.kind === "p2") {
-      const racingState = afterIntent;
-      if (racingState === null) {
-        throw controllerError(
-          "invalid_state",
-          `the committed run state does not carry the accepted revise intent in the open wait ${manifest.wait_index}`,
-          null,
-        );
-      }
+      // The exact snapshot that passed the classification is the result.
       return deepFreezeValue({
         wait_index: manifest.wait_index,
         intent_sha256: preparedIntent.sha256,
         task_id: preparedCandidate.manifest.task_id,
         task_revision: preparedCandidate.manifest.revision,
         task_sha256: preparedCandidate.sha256,
-        state: racingState,
+        state: classified.state,
       });
     }
     throw controllerError(
@@ -1153,7 +1200,7 @@ async function dispatchTaskRevisionSuffix(
       const after = readSnapshot(sink);
       if (
         after !== null &&
-        waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) &&
+        waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait, before.waits.length) &&
         planBoundaryUnchanged(before, after) &&
         taskLedgerExactAppend(before, after, preparedCandidate, waitIndex, intentSha256)
       ) {
@@ -1177,7 +1224,7 @@ async function dispatchTaskRevisionSuffix(
   const after = readSnapshot(sink);
   if (
     after === null ||
-    !waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait) ||
+    !waitBoundaryUnchangedForRevise(after, waitIndex, intentSha256, beforeWait, before.waits.length) ||
     !planBoundaryUnchanged(before, after) ||
     !taskLedgerExactAppend(before, after, preparedCandidate, waitIndex, intentSha256)
   ) {

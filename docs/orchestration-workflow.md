@@ -2353,7 +2353,11 @@ sequence pre-checked), R1 (the exact durable intent, no durable
 candidate — only the task revision pre-checked) and R2 (no pre-check,
 zero dispatch with both artifacts re-published and re-verified); a
 pre-check rejection is `invalid_state` with zero publishers called and
-zero dispatch. The task-revision manifest and then the wait-intent
+zero dispatch. The pre-check helper is internal to the controller
+module: not a runtime export and not a test seam (the ordering is proven
+by a source-order test of the acceptance flow, and the explicit
+`candidateDurable && !intentDurable` branch is fail-closed
+defense-in-depth). The task-revision manifest and then the wait-intent
 manifest are published (each published result verified structurally
 against the prepared object; a task publication failure never calls the
 intent publisher), then the missing commands are dispatched strictly in
@@ -2364,14 +2368,17 @@ accepted, the plan/lifecycle boundary unchanged, the task ledger fully
 unchanged → dispatch the task suffix), P2 (the exact intent accepted,
 the boundary unchanged, the ledger differing only by the one exact
 racing candidate appended last → idempotent success with zero further
-dispatch) and mismatch (`invalid_state` with zero task dispatch). The
+dispatch; the result carries exactly the snapshot that passed the
+classification, with no second sink read between classification and
+result) and mismatch (`invalid_state` with zero task dispatch). The
 full targeted boundary is verified after each dispatch (the wait journal
-length unchanged with the target wait the last and only record of its
+pinned by length with the target wait the last and only record of its
 index; the last plan record, the last open generation, the open
 iteration, the cursor and the transition/execution journal lengths
 unchanged; the task-ledger prefix exact by positions and contract fields
 with exactly one exact candidate append). Structural malformation
-post-dispatch yields a typed `invalid_state`, never a `TypeError`; a
+post-dispatch — `null`/primitives/non-record entries at any viewed
+position — yields a typed `invalid_state`, never a `TypeError`; a
 racing identical dispatch is idempotent success only on the exact R1/R2
 progression; a resolve-without-change dispatch failure is
 `invalid_state`. Durability: sink `not_committed` keeps the
@@ -2384,7 +2391,10 @@ prefix). Runtime export surface is exactly
 `invalid_intent | invalid_state | intent_conflict | candidate_conflict |
 state_persist_failed`, last authoritative `state`) and
 `acceptPipelineV2ReviseTaskIntent({runRoot, sink, intent,
-candidateTaskRevision})`; the deep-frozen content-free result is
+candidateTaskRevision})`; the internal core module exports exactly
+`PipelineV2ReviseTaskIntentControllerError`,
+`acceptPipelineV2ReviseTaskIntentWithIo` and
+`productionReviseTaskIntentOps`; the deep-frozen content-free result is
 `{wait_index, intent_sha256, task_id, task_revision, task_sha256,
 state}`. Not implemented (stays unwired): the revise/continue action
 policy, the iteration closure, the wait response recording, task/plan
