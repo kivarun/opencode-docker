@@ -2491,6 +2491,101 @@ next generation/iteration opening, the architect/replanning execution,
 resume, the action policy and intent selection, coordinator/runner/CLI
 wiring, schema changes, migrations/API/T3, multi-process locking.
 
+### Revise-task completion controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_revise_task_completion_controller.ts`
+(public facade) + `pipeline_v2_revise_task_completion_controller_internal.ts`
+(internal core) completes the `revise_task` intervention by composing the
+existing controllers in one fixed order — `applyPipelineV2ReviseTaskClosure`
+→ full closure-result verification → `recordPipelineV2WaitAction` with the
+fixed `revise_task` action id (the response publication and the durable
+`wait_response_recorded` remain entirely owned by the existing
+wait-manifest substrate) → full response-result verification against the
+verified pre-response state. The durable revise intervention chain is:
+accepted revise intent → accepted task revision → replanned iteration
+closure → response publication → `wait_response_recorded`. Capture order:
+the options shape → `runRoot` → `sink` → `intent` each read once → the
+per-call ops getters (`applyClosure`, `recordWaitAction`) each read once,
+all before the first await; the completion reads no intent fields itself
+before the closure call (the provenance authority stays in the closure
+controller). Closure-result verification (before any response work; a
+hostile injected result never publishes or records): the result is a
+record; the wait/generation/iteration indexes and `task_revision` are
+positive safe integers; the wait index, task id, task digest and intent
+digest match the prepared revise intent and the durable task binding; the
+target wait is the last and only record of its index carrying the exact
+accepted intent and the declared `revise_task` action; the state is
+exactly one of the two immediate-boundary forms (waiting/waiting with the
+response absent and the cursor at the wait's state, or the exact
+active/answered retry with the response action strictly `revise_task` and
+the cursor at the declared target) with the cursor count, transition
+journal and execution journal exactly at the wait boundary; the last
+durable plan record exists; the generation is the last open one with the
+exact index and identity bindings and its `plan_sha256` bound to the last
+durable plan digest; the target iteration is the last one with no
+`open_iteration` and the exact `replanned` closure; the wait-bound task
+records of ANY task are exactly one and match the result and the intent on
+all contract fields with no later revision of the same task. The
+completion reads the sink's durable snapshot exactly once during the
+closure verification — the durable reference for the accepted task
+binding, the exact identity bindings and the iteration history (the
+revise intent carries no stage/plan references, so the continue-style
+manifest comparison is impossible); when a racing completion has already
+moved the durable run past the closure result's boundary the durable
+comparison does not apply and the response verification remains the
+backstop; after the classification the durable snapshot is never read
+again. Response-result verification (against the verified pre-response
+state, never against the result's own final wait): `run_id` unchanged; the
+wait journal keeps its length, target position and every record's
+bindings with no earlier response binding changed; the only allowed
+change on the target wait is the exact `revise_task` response; the request
+digest and the routing target come from the pre-response wait's declared
+action; the final state is active/running with the cursor at the declared
+target and the journals exactly at the wait boundary; the revision is
+exactly `before + 1` on the waiting form and exactly unchanged on the
+active form; the C4 pre-response response binding cannot change; the task
+and plan ledgers are fully unchanged; the generation stays the last open
+one with the same exact index and identity bindings, the iteration count
+and list length unchanged, the whole historical iteration prefix
+unchanged, the target iteration keeping the exact `replanned` closure and
+anchor, and `open_iteration` absent. Own reasons are exactly
+`invalid_options | invalid_result`; the closure- and wait-controllers'
+typed errors and unexpected errors pass by identity; errors are never
+classified from message text; any malformed nested shape is a typed
+`invalid_result`, never a `TypeError`. Retry windows: C0 (closure +
+response, revision exactly +2), C1 (the durable closure — the response
+only), C2 (the response orphan after `not_committed` — exact adoption and
+one durable response commit), C3 (response durability_unknown — a fresh
+retry dispatches nothing), C4 (the response durable — zero dispatch
+through both recognitions with the publications verified/restored); a
+closure `not_committed`/`durability_unknown` stops the completion before
+any response work (the response is never started into a poisoned sink)
+and a fresh retry with a reopened sink performs the remaining suffix only;
+a response failure never rolls the closure back; a conflicting retry
+rewrites nothing. Runtime export surface is exactly
+`PipelineV2ReviseTaskCompletionControllerError` (own reasons
+`invalid_options | invalid_result`, last authoritative `state`) and
+`completePipelineV2ReviseTask({runRoot, sink, intent})`; the internal core
+exports exactly the error, `completePipelineV2ReviseTaskWithIo` and one
+frozen `productionReviseTaskCompletionOps` (`applyClosure`,
+`recordWaitAction`). Tests:
+`orchestrator/tests/pipeline_v2_revise_task_completion_controller.test.ts`
+(34 tests) cover the C0 happy path with the exact command order, revision
++2 and the loader round-trip, the exact content-free deep-frozen result
+shape, the C1 response-only retry, the C2 orphan adoption, the C3
+zero-dispatch fresh retry, the C4 zero-dispatch answered retry, all four
+sink fault windows with fresh-retry semantics, identical concurrency
+without sleeps, the conflicting retry, the closure- and wait-controller
+error identity, the hostile closure-result battery with zero
+`recordWaitAction`, the hostile response-result battery, the
+getter-count/mutation-isolation/throwing-getter batteries, content-free
+diagnostics, both export surfaces, and the source scan. Still unwired:
+the intent selection policy, the architect/replanning execution, the
+acceptance of the next plan revision, closing the old generation, opening
+the next generation/iteration, automatic resume,
+coordinator/runner/CLI/default-pipeline wiring, schema changes,
+migrations/API/T3, multi-process locking.
+
 ### Stage generation/iteration controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
