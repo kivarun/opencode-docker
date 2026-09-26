@@ -356,6 +356,139 @@ async function reviseReady(options: ReviseReadyOptions = {}): Promise<ReviseComp
   });
 }
 
+/**
+ * A reducer-produced multi-wait prefix: a full first continue_stage wait
+ * cycle (intent, grant, grant closure, response) dispatched through the
+ * real reducer, then the second revise_task wait cycle reached the same
+ * boundary as `reviseReady` (intent accepted, task revision accepted, the
+ * real replanned closure dispatched). `waits` therefore carries an
+ * answered early record (index 1) plus the open target record (index 2).
+ */
+async function reviseReadyMultiWait(): Promise<ReviseCompletionCtx> {
+  return await withPipeline(async (pipeline) => {
+    const fixture = await setupRun();
+    const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS });
+    await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+    for (const command of agentPhases("planning")) {
+      await sink.dispatch(command);
+    }
+    const plan1 = preparePlanRevisionManifest({
+      schema_version: 1,
+      kind: "plan_revision",
+      run_id: RUN_ID,
+      revision: 1,
+      previous_sha256: null,
+      root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+      origin_execution: 1,
+      stages: [
+        {
+          id: "stage-1",
+          template: "development",
+          tasks: [{ id: "task-a", revision: 1, sha256: A1.sha256, depends_on: [] }],
+        },
+      ],
+    });
+    const planCandidate: PreparedPipelineV2RunPlanCandidate = preparePipelineV2RunPlanCandidate({
+      plan: plan1,
+      taskRevisions: [A1],
+      previousPlan: null,
+      previousTaskRevisions: [],
+      protectedInputDigest: PROTECTED_DIGEST,
+    });
+    const accepted = await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: planCandidate });
+    await ensurePipelineV2StageIteration({ compiledPlan: accepted.compiled_plan, stageId: "stage-1", initialBudget: 2, sink });
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+    for (const command of agentPhases("stage")) {
+      await sink.dispatch(command);
+    }
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+      executionIndex: 2,
+    });
+    // First wait cycle: continue_stage, answered through the real
+    // reducer commands only (intent, grant, grant closure, response).
+    const firstWaitRequest = preparePipelineV2WaitRequest({
+      schema_version: 1,
+      run_id: RUN_ID,
+      wait_index: 1,
+      transition_count: 2,
+      state_id: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      actions: [{ id: "continue_stage", to: "dev_entry" }],
+    });
+    await sink.dispatch({
+      kind: "run_waiting",
+      stateId: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: firstWaitRequest.sha256,
+      actions: [{ id: "continue_stage", to: "dev_entry" }],
+    });
+    const continueIntentSha256 = hex("c");
+    await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: continueIntentSha256 });
+    await sink.dispatch({
+      kind: "iteration_grant_recorded",
+      generationIndex: 1,
+      waitIndex: 1,
+      intentSha256: continueIntentSha256,
+      additionalIterations: 1,
+    });
+    await sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "grant", waitIndex: 1 });
+    await sink.dispatch({
+      kind: "wait_response_recorded",
+      waitIndex: 1,
+      expectedRequestSha256: firstWaitRequest.sha256,
+      actionId: "continue_stage",
+      responseSha256: hex("f"),
+    });
+    // Second wait cycle: revise_task, at the same boundary shape as the
+    // single-wait fixture.
+    await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 2 });
+    const request2 = preparePipelineV2WaitRequest({
+      schema_version: 1,
+      run_id: RUN_ID,
+      wait_index: 2,
+      transition_count: 2,
+      state_id: "dev_entry",
+      reason: "stage_iteration_limit_exhausted",
+      actions: [{ id: "revise_task", to: "architect" }],
+    });
+    await sink.dispatch({
+      kind: "run_waiting",
+      stateId: "dev_entry",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: request2.sha256,
+      actions: [{ id: "revise_task", to: "architect" }],
+    });
+    const intent2 = prepareWaitIntent({
+      schema_version: 1,
+      kind: "revise_task_intent",
+      run_id: RUN_ID,
+      wait_index: 2,
+      task_id: "task-a",
+      expected_previous_task_sha256: A1.sha256,
+      new_task_revision_sha256: A2.sha256,
+    });
+    await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 2, intentSha256: intent2.sha256 });
+    await sink.dispatch({
+      kind: "task_revision_accepted",
+      taskId: "task-a",
+      revision: 2,
+      taskSha256: A2.sha256,
+      waitIndex: 2,
+      intentSha256: intent2.sha256,
+    });
+    await applyPipelineV2ReviseTaskClosure({ sink, intent: intent2 });
+    return { fixture, sink, pipeline, intent: intent2, candidate: A2, request: request2 };
+  });
+}
+
 interface RecordingSink extends PipelineV2ReviseTaskCompletionControllerSink {
   commands: PipelineV2RunCommand[];
 }
@@ -605,20 +738,34 @@ describe("completePipelineV2ReviseTask", () => {
     }
   });
 
-  test("6. C4 committed response retry: zero dispatch through both recognitions", async () => {
+  test("6. C4 committed response retry: zero dispatch, publications restored byte-for-byte", async () => {
     const ctx = await reviseReady();
     try {
       await applyPipelineV2ReviseTaskClosure({ sink: ctx.sink, intent: ctx.intent });
       const first = await recordPipelineV2WaitAction({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, waitIndex: 1, actionId: "revise_task" });
-      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      const stateBeforeRetry = ctx.sink.snapshot as PipelineV2RunState;
+      const revisionBefore = stateBeforeRetry.revision;
+      const durableResponse = stateBeforeRetry.waits[0]!.response;
+      expect(durableResponse).toBeDefined();
+      // pin the exact publication bytes, then delete both files
+      const requestPath = waitRequestPath(ctx.fixture.runRoot);
+      const responsePath = waitResponsePath(ctx.fixture.runRoot);
+      const requestBytes = await readFile(requestPath);
+      const responseBytes = await readFile(responsePath);
+      await rm(requestPath);
+      await rm(responsePath);
       const recording = recordingSink(ctx.sink);
       const result = await completePipelineV2ReviseTask({ runRoot: ctx.fixture.runRoot, sink: recording, intent: ctx.intent });
+      // zero dispatch; the durable response and state are unchanged
       expect(recording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).revision).toBe(revisionBefore);
+      expect((ctx.sink.snapshot as PipelineV2RunState).waits[0]!.response).toEqual(durableResponse);
       expect(result.response_sha256).toBe(first.response_sha256);
       expect(result.request_sha256).toBe(first.request_sha256);
       expect(result.state.revision).toBe(revisionBefore);
-      expect(await readFile(waitRequestPath(ctx.fixture.runRoot))).toEqual(await readFile(waitRequestPath(ctx.fixture.runRoot)));
-      expect((ctx.sink.snapshot as PipelineV2RunState).status).toBe("active");
+      // both publications were restored byte-for-byte
+      expect(await readFile(requestPath)).toEqual(requestBytes);
+      expect(await readFile(responsePath)).toEqual(responseBytes);
     } finally {
       await disposeRun(ctx.fixture);
     }
@@ -1060,6 +1207,34 @@ describe("completePipelineV2ReviseTask", () => {
     }
   });
 
+  test("20b. a mutated multi-wait journal with an early duplicate of the target index is invalid_result", async () => {
+    const ctx = await reviseReadyMultiWait();
+    try {
+      // The reducer-produced prefix: an answered early wait (index 1)
+      // plus the open target wait (index 2) with the durable replanned
+      // closure. A narrow hostile mutation rewrites the EARLY record's
+      // index inside the injected closure result into the target index;
+      // the length and the last-position checks would still pass, so the
+      // full-journal pass is what proves the target is the last and ONLY
+      // record of its index.
+      const { ops, responseCalls } = completionOps({
+        mutateClosureState: (derived) => {
+          const wait = derived.waits[0]!;
+          (derived.waits as unknown as PipelineV2RunState["waits"])[0] = { ...wait, index: 2 };
+          return derived;
+        },
+      });
+      const cause = await catchAccept(() =>
+        completePipelineV2ReviseTaskWithIo(ops, { runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: ctx.intent }),
+      );
+      const error = expectCompletionError(cause, "invalid_result");
+      expect(error.message).toContain("last and only record of its index");
+      expect(responseCalls()).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
   test("21. hostile response results with a changed request digest, action target or wait anchor are invalid_result", async () => {
     const variants: Array<[string, (response: RecordedPipelineV2WaitResponse) => void]> = [
       ["request digest", (response) => {
@@ -1432,6 +1607,38 @@ describe("completePipelineV2ReviseTask", () => {
         completePipelineV2ReviseTaskWithIo(productionReviseTaskCompletionOps, hostileOptions),
       );
       expect(optionsCause).toBe(optionsFault);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30b. an unexpected direct sink.snapshot getter error keeps its identity and the response is never recorded", async () => {
+    const ctx = await reviseReady();
+    try {
+      // A valid injected closure result produced by the real controller.
+      const validClosure = await applyPipelineV2ReviseTaskClosure({ sink: ctx.sink, intent: ctx.intent });
+      const { ops, responseCalls } = completionOps();
+      const canary = new Error("sink.snapshot getter canary");
+      const hostileOps: PipelineV2ReviseTaskCompletionOps = {
+        applyClosure: () => Promise.resolve(validClosure),
+        recordWaitAction: ops.recordWaitAction,
+      };
+      const throwingSink = {
+        get snapshot(): PipelineV2RunState | null {
+          throw canary;
+        },
+        poisoned: false,
+        dispatch: async () => undefined,
+      };
+      const cause = await catchAccept(() =>
+        completePipelineV2ReviseTaskWithIo(hostileOps, { runRoot: ctx.fixture.runRoot, sink: throwingSink, intent: ctx.intent }),
+      );
+      // The unexpected getter error passes through by identity; it is
+      // never converted into the controller's own invalid_result.
+      expect(cause).toBe(canary);
+      expect(cause).not.toBeInstanceOf(PipelineV2ReviseTaskCompletionControllerError);
+      expect(responseCalls()).toBe(0);
+      expect((ctx.sink.snapshot as PipelineV2RunState).status).toBe("waiting");
     } finally {
       await disposeRun(ctx.fixture);
     }

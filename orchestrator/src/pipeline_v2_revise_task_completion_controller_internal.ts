@@ -56,9 +56,15 @@ import type {
  * runs before any field read), so the intent's manifest fields are read
  * only after the closure result has been produced. There is no second
  * state validator and no duplicated closure binding logic. The completion
- * reads the sink's durable snapshot exactly once during the closure
- * verification (the durable reference for the accepted task binding, the
- * exact identity bindings and the iteration history); when a racing
+ * reads the sink's authoritative `snapshot` directly exactly once, right
+ * after the closure result was produced and before any response work (the
+ * durable reference for the accepted task binding, the exact identity
+ * bindings and the iteration history); that read sits outside the
+ * verification try/catch, so an unexpected getter error keeps its class
+ * and identity, while structural verification failures become the
+ * controller's own `invalid_result`; after that single direct read the
+ * snapshot is never read again by this controller (reads performed inside
+ * the composed controllers belong to those controllers). When a racing
  * completion has already moved the durable run past the closure result's
  * boundary, the durable comparison does not apply and the response
  * verification remains the backstop; after the classification the durable
@@ -119,8 +125,11 @@ import type {
  * unchanged. A structurally inconsistent injected response result is the
  * controller's own typed `invalid_result` — never a success and never a
  * leaked `TypeError`. The unified result is built from the single final
- * snapshot that passed the verification; the sink's snapshot is never
- * read by this controller at all.
+ * snapshot that passed the verification; after its one direct read of the
+ * sink's authoritative `snapshot` (performed once after the closure
+ * result and before any response work) this controller does not read the
+ * snapshot again — reads performed inside the composed controllers belong
+ * to those controllers.
  *
  * Retry windows: C0 (the accepted intent with the accepted task revision
  * and the iteration still open — the closure then the response, two
@@ -180,8 +189,10 @@ export class PipelineV2ReviseTaskCompletionControllerError extends Error {
 /**
  * The structural sink seam passed through to the existing controllers;
  * the production `PipelineV2RunStateSink` satisfies it without an
- * adapter. The completion controller itself never reads the sink's
- * members or dispatches commands.
+ * adapter. The completion itself reads the sink's authoritative
+ * `snapshot` directly exactly once (after the closure result, before any
+ * response work) and dispatches nothing; every other sink read and every
+ * dispatch belongs to the composed controllers.
  */
 export interface PipelineV2ReviseTaskCompletionControllerSink {
   readonly snapshot: PipelineV2RunState | null;
@@ -570,6 +581,33 @@ function verifyClosureResultBeforeResponse(
     throw completionError(
       "invalid_result",
       "the applied closure result state does not carry the target wait",
+      state,
+    );
+  }
+  // The target wait must be the last and ONLY record of its index: a
+  // defensive pass over the whole wait journal. Every viewed entry is a
+  // record; the target index must occur exactly once; with the pinned
+  // journal length above, exactly one occurrence also pins the target to
+  // the last position (an early record carrying the target index — e.g.
+  // a mutated reducer-produced multi-wait journal — is rejected).
+  let targetOccurrences = 0;
+  for (let position = 0; position < state.waits.length; position += 1) {
+    const entry = state.waits[position];
+    if (!isRecord(entry)) {
+      throw completionError(
+        "invalid_result",
+        "the applied closure result state wait journal carries a malformed record",
+        state,
+      );
+    }
+    if (entry["index"] === closure.wait_index) {
+      targetOccurrences += 1;
+    }
+  }
+  if (targetOccurrences !== 1) {
+    throw completionError(
+      "invalid_result",
+      "the applied closure result state does not carry the target wait as the last and only record of its index",
       state,
     );
   }
@@ -1115,14 +1153,18 @@ export async function completePipelineV2ReviseTaskWithIo(
   }
   // The full pre-response verification of the closure result state (see
   // the module docstring): every check must hold before any response
-  // filesystem work or dispatch. The durable snapshot is read exactly
-  // once here; it is never read again after the classification. Field
-  // accesses are defensive; a structurally inconsistent injected result
-  // becomes the controller's own `invalid_result`, never a leaked
-  // `TypeError`.
+  // filesystem work or dispatch. The authoritative sink snapshot is read
+  // DIRECTLY exactly once here, outside the verification try/catch, so an
+  // unexpected getter error keeps its class and identity, while the
+  // structural verification failures become the controller's own
+  // `invalid_result`; the snapshot is never read again after the
+  // classification. Field accesses are defensive; a structurally
+  // inconsistent injected result becomes the controller's own
+  // `invalid_result`, never a leaked `TypeError`.
+  const durableSnapshot = (sink as Record<string, unknown>)["snapshot"];
   try {
     verifyClosureResultBeforeResponse(closure, manifest, intentSha256);
-    verifyClosureResultAgainstDurable(closure, (sink as Record<string, unknown>)["snapshot"], intentSha256);
+    verifyClosureResultAgainstDurable(closure, durableSnapshot, intentSha256);
   } catch (cause) {
     if (cause instanceof PipelineV2ReviseTaskCompletionControllerError) {
       throw cause;

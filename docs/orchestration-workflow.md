@@ -2526,16 +2526,24 @@ durable plan digest; the target iteration is the last one with no
 `open_iteration` and the exact `replanned` closure; the wait-bound task
 records of ANY task are exactly one and match the result and the intent on
 all contract fields with no later revision of the same task. The
-completion reads the sink's durable snapshot exactly once during the
-closure verification — the durable reference for the accepted task
-binding, the exact identity bindings and the iteration history (the
-revise intent carries no stage/plan references, so the continue-style
-manifest comparison is impossible); when a racing completion has already
-moved the durable run past the closure result's boundary the durable
-comparison does not apply and the response verification remains the
-backstop; after the classification the durable snapshot is never read
-again. Response-result verification (against the verified pre-response
-state, never against the result's own final wait): `run_id` unchanged; the
+completion reads the sink's authoritative `snapshot` directly exactly
+once, right after the closure result and before any response work — the
+durable reference for the accepted task binding, the exact identity
+bindings and the iteration history (the revise intent carries no
+stage/plan references, so the continue-style manifest comparison is
+impossible); that direct read sits outside the verification try/catch, so
+an unexpected getter error keeps its class and identity while structural
+verification failures become the controller's own `invalid_result`; the
+target wait is proven as the last and ONLY record of its index by a
+defensive full-journal pass (an early record carrying the target index —
+e.g. a mutated reducer-produced multi-wait journal — is rejected); when a
+racing completion has already moved the durable run past the closure
+result's boundary the durable comparison does not apply and the response
+verification remains the backstop; after the classification the durable
+snapshot is never read again (reads performed inside the composed
+controllers belong to those controllers). Response-result verification
+(against the verified pre-response state, never against the result's own
+final wait): `run_id` unchanged; the
 wait journal keeps its length, target position and every record's
 bindings with no earlier response binding changed; the only allowed
 change on the target wait is the exact `revise_task` response; the request
@@ -2570,14 +2578,18 @@ exports exactly the error, `completePipelineV2ReviseTaskWithIo` and one
 frozen `productionReviseTaskCompletionOps` (`applyClosure`,
 `recordWaitAction`). Tests:
 `orchestrator/tests/pipeline_v2_revise_task_completion_controller.test.ts`
-(34 tests) cover the C0 happy path with the exact command order, revision
+(36 tests) cover the C0 happy path with the exact command order, revision
 +2 and the loader round-trip, the exact content-free deep-frozen result
 shape, the C1 response-only retry, the C2 orphan adoption, the C3
-zero-dispatch fresh retry, the C4 zero-dispatch answered retry, all four
+zero-dispatch fresh retry, the C4 zero-dispatch answered retry with both
+publications deleted and restored byte-for-byte, all four
 sink fault windows with fresh-retry semantics, identical concurrency
 without sleeps, the conflicting retry, the closure- and wait-controller
 error identity, the hostile closure-result battery with zero
-`recordWaitAction`, the hostile response-result battery, the
+`recordWaitAction` (including a mutated reducer-produced multi-wait
+journal with an early duplicate of the target index), the unexpected
+direct `sink.snapshot` getter error kept by identity, the hostile
+response-result battery, the
 getter-count/mutation-isolation/throwing-getter batteries, content-free
 diagnostics, both export surfaces, and the source scan. Still unwired:
 the intent selection policy, the architect/replanning execution, the
