@@ -13,6 +13,7 @@ RUN apt-get update \
         libnotify-bin \
         ca-certificates \
         curl \
+        rsync \
         tar \
     && rm -rf /var/lib/apt/lists/*
 

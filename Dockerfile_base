@@ -34,6 +34,7 @@ RUN echo '@edge-testing https://dl-cdn.alpinelinux.org/alpine/edge/testing' \
         less \
         openssh-client \
         ripgrep \
+        rsync \
         tree \
         xclip \
         coreutils \

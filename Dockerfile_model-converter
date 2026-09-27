@@ -46,6 +46,7 @@ RUN apt-get update \
         patchelf \
         procps \
         ripgrep \
+        rsync \
         tar \
         tree \
         unzip \
