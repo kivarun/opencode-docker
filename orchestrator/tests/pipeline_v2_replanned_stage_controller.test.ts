@@ -194,6 +194,17 @@ const INTENT = prepareWaitIntent({
 
 const FAKE_DIGEST = "f".repeat(64);
 
+const B1 = prepareTaskRevisionManifest({
+  schema_version: 1,
+  kind: "task_revision",
+  run_id: RUN_ID,
+  task_id: "task-b",
+  revision: 1,
+  previous_sha256: null,
+  origin: "planning_proposal",
+  body: "Body B",
+});
+
 /**
  * A composition ops object with the real close controller and a fake
  * ensure step; the returned ops type is erased so the fake can return
@@ -260,6 +271,7 @@ interface ReadyCtx {
  */
 interface ReplannedStageReadyOptions {
   withPrefixGeneration?: boolean;
+  withStageTwoGeneration?: boolean;
 }
 
 async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Promise<ReadyCtx> {
@@ -399,6 +411,26 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
       await sink.dispatch(command);
     }
     const planningExecutionIndex = options.withPrefixGeneration === true ? 5 : 3;
+    const stages2 = options.withStageTwoGeneration === true
+      ? [
+          {
+            id: "stage-1",
+            template: "development",
+            tasks: [{ id: "task-a", revision: 2, sha256: A2.sha256, depends_on: [] }],
+          },
+          {
+            id: "stage-2",
+            template: "development",
+            tasks: [{ id: "task-b", revision: 1, sha256: B1.sha256, depends_on: [] }],
+          },
+        ]
+      : [
+          {
+            id: "stage-1",
+            template: "development",
+            tasks: [{ id: "task-a", revision: 2, sha256: A2.sha256, depends_on: [] }],
+          },
+        ];
     const plan2 = preparePlanRevisionManifest({
       schema_version: 1,
       kind: "plan_revision",
@@ -407,22 +439,35 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
       previous_sha256: plan1.sha256,
       root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
       origin_execution: planningExecutionIndex,
-      stages: [
-        {
-          id: "stage-1",
-          template: "development",
-          tasks: [{ id: "task-a", revision: 2, sha256: A2.sha256, depends_on: [] }],
-        },
-      ],
+      stages: stages2,
     });
     const candidate2 = preparePipelineV2RunPlanCandidate({
       plan: plan2,
-      taskRevisions: [A2],
+      taskRevisions: options.withStageTwoGeneration === true ? [A2, B1] : [A2],
       previousPlan: plan1,
       previousTaskRevisions: [A1],
       protectedInputDigest: PROTECTED_DIGEST,
     });
     const accepted = await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: candidate2 });
+    if (options.withStageTwoGeneration === true) {
+      // Close the old generation through the real close controller (the
+      // composition's own C0 step), then open the next generation bound
+      // to stage 2 of the two-stage plan (the reducer accepts it: stage
+      // 2 is compiled with position 2 and the same template). The
+      // composition later selects stage 1, so the preserved generation
+      // carries a mismatching caller stage binding.
+      await closePipelineV2ReplannedGeneration({ sink, intent: INTENT, compiledPlan: accepted.compiled_plan });
+      await sink.dispatch({
+        kind: "stage_generation_opened",
+        stageId: "stage-2",
+        stagePosition: 2,
+        templateId: "development",
+        planSha256: plan2.sha256,
+        initialBudget: 2,
+        transitionCount: waitTransitionCount,
+      });
+      await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: waitTransitionCount });
+    }
     return { fixture, sink, pipeline, intent: INTENT, compiledPlan: accepted.compiled_plan, plan2 };
   });
 }
@@ -2078,7 +2123,11 @@ describe("openPipelineV2ReplannedStage", () => {
     }
   });
 
-  test("42. a C2-open hostile ensure preserving mismatching stage and budget bindings never succeeds", async () => {
+  test("42. a C2-open hostile ensure preserving a mismatching caller budget never succeeds", async () => {
+    // The precise stage-mismatch counterpart of this case is test 48:
+    // here the preserved generation keeps its durably bound budget (5)
+    // while the caller selects 2, and the fake ensure returns an
+    // unchanged success result.
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
     try {
       await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
@@ -2235,6 +2284,126 @@ describe("openPipelineV2ReplannedStage", () => {
         expect(error.reason).toBe("invalid_result");
         expect(ops.ensureCalls()).toBe(0);
       }
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("46. corrupted nested execution shapes are invalid_result with zero ensure calls", async () => {
+    const ctx = await replannedStageReady();
+    try {
+      const variants: Array<(state: PipelineV2RunState) => void> = [
+        (state) => {
+          ((state.executions[0] as unknown as Record<string, unknown>) as unknown as Record<string, unknown>)["outputs"] = null;
+        },
+        (state) => {
+          const outputs = (state.executions[0] as unknown as Record<string, unknown>)["outputs"] as unknown[];
+          outputs[0] = null;
+        },
+        (state) => {
+          ((state.executions[0] as unknown as Record<string, unknown>) as unknown as Record<string, unknown>)["session_cleanup"] = null;
+        },
+        (state) => {
+          ((state.executions[0] as unknown as Record<string, unknown>) as unknown as Record<string, unknown>)["result"] = null;
+        },
+      ];
+      await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      for (const variant of variants) {
+        const ops = mutatedCloseOps(ctx, (_result, state) => variant(state));
+        const cause = await catchOpen(() =>
+          openPipelineV2ReplannedStageWithOps(ops, {
+            sink: ctx.sink,
+            intent: ctx.intent,
+            compiledPlan: ctx.compiledPlan,
+            stageId: "stage-1",
+            initialBudget: 2,
+          }),
+        );
+        const error = expectOpenError(cause);
+        expect(error.reason).toBe("invalid_result");
+        expect(error.message).not.toContain("Body A");
+        expect(ops.ensureCalls()).toBe(0);
+      }
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("47. corrupted nested wait and generation shapes are invalid_result with zero ensure calls", async () => {
+    const ctx = await replannedStageReady();
+    try {
+      const variants: Array<(state: PipelineV2RunState) => void> = [
+        (state) => {
+          ((state.waits[state.waits.length - 1] as unknown as Record<string, unknown>))["intent"] = null;
+        },
+        (state) => {
+          ((state.waits[state.waits.length - 1] as unknown as Record<string, unknown>))["response"] = null;
+        },
+        (state) => {
+          ((state.generations[0] as unknown as Record<string, unknown>))["open_iteration"] = null;
+        },
+        (state) => {
+          const iterations = (state.generations[0] as unknown as Record<string, unknown>)["iterations"] as unknown[];
+          iterations[0] = null;
+        },
+        (state) => {
+          const iterations = (state.generations[0] as unknown as Record<string, unknown>)["iterations"] as unknown[];
+          ((iterations[0] as unknown as Record<string, unknown>))["closed"] = null;
+        },
+      ];
+      await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      for (const variant of variants) {
+        const ops = mutatedCloseOps(ctx, (_result, state) => variant(state));
+        const cause = await catchOpen(() =>
+          openPipelineV2ReplannedStageWithOps(ops, {
+            sink: ctx.sink,
+            intent: ctx.intent,
+            compiledPlan: ctx.compiledPlan,
+            stageId: "stage-1",
+            initialBudget: 2,
+          }),
+        );
+        const error = expectOpenError(cause);
+        expect(error.reason).toBe("invalid_result");
+        expect(ops.ensureCalls()).toBe(0);
+      }
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("48. a C2-open preserved generation on another compiled stage is invalid_result with zero dispatch", async () => {
+    const ctx = await replannedStageReady({ withStageTwoGeneration: true });
+    try {
+      // The preserved new generation is durably bound to stage-2 while
+      // the caller selects stage-1: the close verification accepts the
+      // C2-open form (stage-2 is a compiled stage), and the caller
+      // policy check refuses the mismatching preserved binding alone.
+      const close = await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(close.generation_index).toBe(1);
+      const compiledStage = compiledPipelineV2RunPlanStageFor(ctx.compiledPlan, "stage-1");
+      const recording = recordingSink(ctx.sink);
+      const cause = await catchOpen(() =>
+        openPipelineV2ReplannedStageWithOps(
+          {
+            closeGeneration: closePipelineV2ReplannedGeneration,
+            ensureStageIteration: async () => {
+              const clone = structuredClone(ctx.sink.snapshot) as PipelineV2RunState;
+              return { compiled_stage: compiledStage, generation_index: 2, iteration_index: 1, state: clone };
+            },
+          } as unknown as PipelineV2ReplannedStageOps,
+          {
+            sink: recording,
+            intent: ctx.intent,
+            compiledPlan: ctx.compiledPlan,
+            stageId: "stage-1",
+            initialBudget: 2,
+          },
+        ),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(recording.commands).toEqual([]);
     } finally {
       await disposeRun(ctx.fixture);
     }

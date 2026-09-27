@@ -109,7 +109,15 @@ import type {
  * on the declared revise target (`index === origin_execution`); all
  * three run ids (compiled plan, intent manifest, state) agreeing; and
  * the predecessor plan revision strictly the accepted revision minus
- * one. A hostile close result therefore never reaches the ensure
+ * one. The nested shapes the ensure comparison later reads without
+ * guards are covered too: every execution record's `outputs` (undefined
+ * or an array of records), `session_cleanup` and a decision `result`
+ * (undefined or records, the result's id lists undefined or arrays);
+ * every wait record's `actions` (undefined or an array of records),
+ * `intent` and `response` (undefined or records); and every generation
+ * record's `open_iteration` (undefined or a record), `iterations`
+ * (undefined or an array) and iteration records' `closed` (undefined or
+ * a record). A hostile close result therefore never reaches the ensure
  * call and never escapes as a `TypeError`.
  *
  * Ensure-result verification (defensive, targeted): `compiled_stage`
@@ -448,6 +456,67 @@ function verifyCloseResult(
         );
       }
     }
+    if (journalName === "executions") {
+      // The nested execution shapes the ensure comparison later reads
+      // without guards: `outputs` (undefined or an array of records),
+      // `session_cleanup` (undefined or a record) and a decision
+      // `result` (undefined or a record whose id lists are undefined or
+      // arrays). A null or malformed nested value must be rejected here,
+      // BEFORE the ensure call, not as a post-ensure `TypeError`.
+      for (const entry of journal) {
+        const record = entry as unknown as Record<string, unknown>;
+        const outputs = record["outputs"];
+        if (outputs !== undefined && !Array.isArray(outputs)) {
+          throw controllerError(
+            "invalid_result",
+            "the closure result state carries a malformed execution outputs region",
+            state,
+          );
+        }
+        if (Array.isArray(outputs)) {
+          for (const output of outputs) {
+            if (!isRecord(output)) {
+              throw controllerError(
+                "invalid_result",
+                "the closure result state carries a malformed execution output record",
+                state,
+              );
+            }
+          }
+        }
+        if (record["session_cleanup"] !== undefined && !isRecord(record["session_cleanup"])) {
+          throw controllerError(
+            "invalid_result",
+            "the closure result state carries a malformed execution session cleanup projection",
+            state,
+          );
+        }
+        const decisionResult = record["result"];
+        if (decisionResult !== undefined && !isRecord(decisionResult)) {
+          throw controllerError(
+            "invalid_result",
+            "the closure result state carries a malformed decision result projection",
+            state,
+          );
+        }
+        if (isRecord(decisionResult)) {
+          if (decisionResult["active_constraint_ids"] !== undefined && !Array.isArray(decisionResult["active_constraint_ids"])) {
+            throw controllerError(
+              "invalid_result",
+              "the closure result state carries a malformed decision result constraint id list",
+              state,
+            );
+          }
+          if (decisionResult["violated_relation_ids"] !== undefined && !Array.isArray(decisionResult["violated_relation_ids"])) {
+            throw controllerError(
+              "invalid_result",
+              "the closure result state carries a malformed decision result relation id list",
+              state,
+            );
+          }
+        }
+      }
+    }
   }
   if (!Array.isArray(state.plan_revisions)) {
     throw controllerError(
@@ -480,6 +549,42 @@ function verifyCloseResult(
         state,
       );
     }
+    // The nested generation shapes the ensure comparison later reads
+    // without guards: `open_iteration` (undefined or a record),
+    // `iterations` (undefined or an array) and every iteration record's
+    // `closed` (undefined or a record).
+    if (entry["open_iteration"] !== undefined && !isRecord(entry["open_iteration"])) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed generation open iteration projection",
+        state,
+      );
+    }
+    if (entry["iterations"] !== undefined && !Array.isArray(entry["iterations"])) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed generation iteration region",
+        state,
+      );
+    }
+    if (Array.isArray(entry["iterations"])) {
+      for (const iteration of entry["iterations"]) {
+        if (!isRecord(iteration)) {
+          throw controllerError(
+            "invalid_result",
+            "the closure result state carries a malformed generation iteration record",
+            state,
+          );
+        }
+        if (iteration["closed"] !== undefined && !isRecord(iteration["closed"])) {
+          throw controllerError(
+            "invalid_result",
+            "the closure result state carries a malformed generation iteration closure projection",
+            state,
+          );
+        }
+      }
+    }
   }
   if (!Array.isArray(state.waits)) {
     throw controllerError(
@@ -496,6 +601,42 @@ function verifyCloseResult(
       throw controllerError(
         "invalid_result",
         "the closure result state carries a malformed wait record",
+        state,
+      );
+    }
+    // The nested wait shapes the ensure comparison later reads without
+    // guards, for every wait record (not only the target): `actions`
+    // (undefined or an array of records), `intent` and `response`
+    // (undefined or records).
+    if (entry["actions"] !== undefined && !Array.isArray(entry["actions"])) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed wait action declaration region",
+        state,
+      );
+    }
+    if (Array.isArray(entry["actions"])) {
+      for (const action of entry["actions"]) {
+        if (!isRecord(action)) {
+          throw controllerError(
+            "invalid_result",
+            "the closure result state carries a malformed wait action declaration",
+            state,
+          );
+        }
+      }
+    }
+    if (entry["intent"] !== undefined && !isRecord(entry["intent"])) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed wait intent projection",
+        state,
+      );
+    }
+    if (entry["response"] !== undefined && !isRecord(entry["response"])) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed wait response projection",
         state,
       );
     }

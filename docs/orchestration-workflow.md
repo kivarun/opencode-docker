@@ -2878,8 +2878,13 @@ and the transition journal exactly at the wait boundary with
 execution as the completed planning execution on the declared revise
 target with `index === origin_execution`; all three run ids agreeing;
 the predecessor plan revision strictly the accepted revision minus
-one) — a hostile close result never reaches the ensure call and never
-escapes as a `TypeError`. Ensure-result verification (defensive,
+one; and the nested shapes the ensure comparison later reads without
+guards — every execution record's `outputs`/`session_cleanup`/decision
+`result` and their elements, every wait record's
+`actions`/`intent`/`response`, and every generation record's
+`open_iteration`/`iterations`/iteration `closed`) — a hostile close
+result never reaches the ensure call and never escapes as a
+`TypeError`. Ensure-result verification (defensive,
 targeted): `compiled_stage` the exact object the trusted resolver
 returned (identity, never a clone); the generation index exactly the
 old index + 1 and the iteration index exactly 1; the EXACT revision
@@ -2943,7 +2948,7 @@ origin_execution, stage_id, stage_position, template_id,
 initial_budget, state}` — no compiled plan/stage object, no
 intent/candidate/manifests, no canonical JSON, no paths, no task
 bodies, no caller-owned objects. Tests:
-`orchestrator/tests/pipeline_v2_replanned_stage_controller.test.ts` (27
+`orchestrator/tests/pipeline_v2_replanned_stage_controller.test.ts` (48
 tests, fixtures built only through the real reducer/sink/store and the
 existing run-plan/stage-iteration/revise-task/replanned-generation
 controllers) cover the C0 path with the exact composed command order
@@ -2976,13 +2981,21 @@ byte-identical, the C2-open zero-dispatch recognition, a hostile extra
 generation refused by the close controller identity), the
 preserved-mismatch battery (a C2-bare hostile ensure preserving a
 mismatching caller budget with the exact iteration appended, a C2-open
-unchanged success preserving mismatching stage and budget), the
+unchanged success preserving a mismatching caller budget, and a
+separate precise C2-open stage-mismatch case on a two-stage plan whose
+preserved generation is bound to stage 2 while the caller selects
+stage 1), the
 malformed close-result matrix refused before the ensure call with zero
 ensure calls (a `wait.actions` null and a null action entry; null and
 null-entry `inputs`/`transitions`/`executions`; a null `grants`
 journal; an early plan record null on the two-plan prefix; a malformed
 cursor and a malformed pipeline; a coherent changed predecessor plan
-revision that is not the accepted revision minus one), the option/ops
+revision that is not the accepted revision minus one) plus the
+corrupted nested close-state shapes (execution
+`outputs`/`session_cleanup`/decision `result`, their output and
+id-list elements, historical wait `actions`/`intent`/`response`, and
+generation `open_iteration`/`iterations`/iteration `closed`), the
+option/ops
 getter-count battery with caller mutation isolation across the
 composition, downstream/unexpected error identity, content-free
 diagnostics, both export surfaces, and the source scan (no
