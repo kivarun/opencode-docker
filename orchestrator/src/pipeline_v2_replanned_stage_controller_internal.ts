@@ -96,7 +96,21 @@ import type {
  * of the two immediate opening forms, which the verification returns
  * as the exact ensure form (`c2-bare` / `c2-open`). Malformed nested
  * results fail as the controller's own `invalid_result`, never a
- * `TypeError`.
+ * `TypeError`. Before any of the binding checks the close result
+ * passes a targeted defensive boundary over every region the ensure
+ * verification later uses as its trusted `before` state: `pipeline`
+ * and `cursor` records; `inputs`, `transitions`, `executions`,
+ * `waits`, `task_revisions`, `plan_revisions`, `grants` and
+ * `generations` arrays with every viewed entry a record; the wait's
+ * ordered action declarations as records declaring the `revise_task`
+ * action exactly; the cursor and the transition journal exactly at
+ * the wait boundary with `executions.length === transitions.length +
+ * 1`; the last settled execution as the completed planning execution
+ * on the declared revise target (`index === origin_execution`); all
+ * three run ids (compiled plan, intent manifest, state) agreeing; and
+ * the predecessor plan revision strictly the accepted revision minus
+ * one. A hostile close result therefore never reaches the ensure
+ * call and never escapes as a `TypeError`.
  *
  * Ensure-result verification (defensive, targeted): `compiled_stage`
  * is the exact object the trusted resolver returned (identity, never a
@@ -121,7 +135,16 @@ import type {
  * C2-bare allowing only the exact first-iteration append
  * (`iteration_count: 0 → 1`, `iterations: [] → [exact iteration 1]`,
  * `open_iteration: undefined → exact projection`) and C2-open leaving
- * the whole generation record unchanged. The settled-but-unbound
+ * the whole generation record unchanged. Both C2 retry forms
+ * additionally require the preserved generation to carry exactly the
+ * caller-selected compiled stage and budget (stage id, stage
+ * position, template, current plan digest, initial budget and the
+ * wait-boundary anchor): the composition result must agree with the
+ * caller policy, never only with the verified close state, so a
+ * hostile ensure that merely preserves a mismatching binding and
+ * returns a success is refused; a real production mismatch is refused
+ * by the composed ensure controller itself (by identity) before this
+ * check is ever reached. The settled-but-unbound
  * planning execution and the final active/running boundary are
  * pinned in all forms. A hostile coherent result with simultaneously
  * mutated result fields and nested state is compared against the
@@ -389,6 +412,75 @@ function verifyCloseResult(
       state,
     );
   }
+  // The targeted defensive boundary of the close result: every region
+  // the ensure verification later uses as its trusted `before` state is
+  // checked here, BEFORE the ensure call — a hostile close result never
+  // reaches the second composed controller and never escapes as a
+  // `TypeError`. No second state validator: these are targeted
+  // record/array guards over the regions the composition itself reads.
+  if (
+    compiledPlan.run_id !== state.run_id ||
+    !isRecord(state.pipeline) ||
+    !isRecord(state.cursor)
+  ) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result state carries a malformed pipeline identity, cursor or run binding",
+      state,
+    );
+  }
+  const defensiveJournals: readonly string[] = ["inputs", "transitions", "executions", "grants"];
+  for (const journalName of defensiveJournals) {
+    const journal = (state as unknown as Record<string, unknown>)[journalName];
+    if (!Array.isArray(journal)) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed durable journal region",
+        state,
+      );
+    }
+    for (const entry of journal) {
+      if (!isRecord(entry)) {
+        throw controllerError(
+          "invalid_result",
+          "the closure result state carries a malformed durable journal record",
+          state,
+        );
+      }
+    }
+  }
+  if (!Array.isArray(state.plan_revisions)) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result state carries no plan ledger",
+      state,
+    );
+  }
+  for (const entry of state.plan_revisions) {
+    if (!isRecord(entry)) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed plan ledger record",
+        state,
+      );
+    }
+  }
+  if (!Array.isArray(state.generations)) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result state carries no generation journal",
+      state,
+    );
+  }
+  for (const entry of state.generations) {
+    if (!isRecord(entry)) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed generation record",
+        state,
+      );
+    }
+  }
   if (!Array.isArray(state.waits)) {
     throw controllerError(
       "invalid_result",
@@ -429,6 +521,50 @@ function verifyCloseResult(
     throw controllerError(
       "invalid_result",
       "the closure result wait does not carry the accepted revise intent and the revise_task response",
+      state,
+    );
+  }
+  // The target wait's ordered action declarations are part of the
+  // boundary the ensure verification reads positionally.
+  if (!Array.isArray(wait.actions)) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result wait declares no ordered actions",
+      state,
+    );
+  }
+  let declaredReviseTo: string | undefined;
+  let declaredReviseCount = 0;
+  for (const action of wait.actions) {
+    if (!isRecord(action)) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result wait declares a malformed action",
+        state,
+      );
+    }
+    if (action["id"] === REVISE_TASK_ACTION_ID) {
+      declaredReviseCount += 1;
+      if (typeof action["to"] === "string") {
+        declaredReviseTo = action["to"];
+      }
+    }
+  }
+  if (declaredReviseCount !== 1 || declaredReviseTo === undefined) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result wait does not declare the revise_task action exactly",
+      state,
+    );
+  }
+  if (
+    state.cursor["transition_count"] !== wait["transition_count"] ||
+    state.transitions.length !== wait["transition_count"] ||
+    state.executions.length !== state.transitions.length + 1
+  ) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result cursor and transition journal do not sit at the wait boundary",
       state,
     );
   }
@@ -516,6 +652,9 @@ function verifyCloseResult(
     previousPlan["index"] !== result["previous_plan_revision"] ||
     previousPlan["revision"] !== result["previous_plan_revision"] ||
     previousPlan["sha256"] !== result["previous_plan_sha256"] ||
+    // The predecessor revision is strictly the accepted plan revision
+    // minus one, not merely any value the hostile result names.
+    result["previous_plan_revision"] !== compiledPlan.plan_revision - 1 ||
     // The plan successor binding: the last plan names its predecessor's
     // digest exactly, and the predecessor is bound to the old replanned
     // generation through the result's previous plan digest (checked
@@ -525,6 +664,24 @@ function verifyCloseResult(
     throw controllerError(
       "invalid_result",
       "the closure result plan ledger does not agree with the accepted plan revision and its predecessor",
+      state,
+    );
+  }
+  // The settled planning execution on the declared revise target: the
+  // region the ensure verification later reads as its last-execution
+  // boundary.
+  const lastExecution = state.executions[state.executions.length - 1];
+  if (
+    !isRecord(lastExecution) ||
+    lastExecution["index"] !== compiledPlan.origin_execution ||
+    lastExecution["type"] !== "agent" ||
+    lastExecution["execution_role"] !== "planning" ||
+    lastExecution["phase"] !== "cleanup_completed" ||
+    lastExecution["state_id"] !== declaredReviseTo
+  ) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result last settled execution is not the completed planning execution on the declared revise target",
       state,
     );
   }
@@ -1311,6 +1468,23 @@ function verifyEnsureResult(
     lastGeneration["opened_transition_count"] !== beforeGeneration["opened_transition_count"] ||
     lastGeneration["closed"] !== undefined ||
     beforeGeneration["closed"] !== undefined
+  ) {
+    throw mismatch();
+  }
+  // The preserved generation must ALSO carry exactly the caller-selected
+  // compiled stage and budget: the composition result agrees with the
+  // caller policy, not only with the verified close state. A hostile
+  // ensure that merely preserves a mismatching generation binding and
+  // returns a success never passes; a real production mismatch is
+  // refused by the composed ensure controller itself (by identity)
+  // before this check is ever reached.
+  if (
+    lastGeneration["stage_id"] !== stageId ||
+    lastGeneration["stage_position"] !== stagePosition ||
+    lastGeneration["template_id"] !== compiledStage.template ||
+    lastGeneration["plan_sha256"] !== compiledPlan.plan_sha256 ||
+    lastGeneration["initial_budget"] !== initialBudget ||
+    lastGeneration["opened_transition_count"] !== close.wait["transition_count"]
   ) {
     throw mismatch();
   }

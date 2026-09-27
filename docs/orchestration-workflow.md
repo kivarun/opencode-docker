@@ -2860,13 +2860,26 @@ exact durable index, bound to the previous plan digest, with
 `iteration_count === iterations.length`, the last iteration at its
 durable position carrying the exact replanned closure, `open_iteration`
 absent, and the result's `iteration_index` equal to that last
-iteration's index; and the admissible state form returned as the exact
+iteration's index; the admissible state form returned as the exact
 ensure form — C1: the old generation the last durable generation,
 C2-bare: the new current-plan generation directly following it (new =
 strictly last, old = strictly second-to-last, arbitrary unmodified
 historical prefix admitted unchanged, `index === predecessor.index +
 1`) without an iteration, C2-open: the same shape with exactly
-iteration 1 open on the same anchor. Ensure-result verification (defensive,
+iteration 1 open on the same anchor; and before any of the binding
+checks the targeted defensive boundary over every region the ensure
+verification later uses as its trusted `before` state
+(`pipeline`/`cursor` records; `inputs`/`transitions`/`executions`/
+`waits`/`task_revisions`/`plan_revisions`/`grants`/`generations`
+arrays with every viewed entry a record; the wait's ordered action
+declarations as records declaring `revise_task` exactly; the cursor
+and the transition journal exactly at the wait boundary with
+`executions.length === transitions.length + 1`; the last settled
+execution as the completed planning execution on the declared revise
+target with `index === origin_execution`; all three run ids agreeing;
+the predecessor plan revision strictly the accepted revision minus
+one) — a hostile close result never reaches the ensure call and never
+escapes as a `TypeError`. Ensure-result verification (defensive,
 targeted): `compiled_stage` the exact object the trusted resolver
 returned (identity, never a clone); the generation index exactly the
 old index + 1 and the iteration index exactly 1; the EXACT revision
@@ -2889,7 +2902,13 @@ rewrites them, even into the caller-selected values, never passes —
 with C2-bare allowing only the exact first-iteration append
 (`iteration_count: 0 → 1`, `iterations: [] → [exact iteration 1]`,
 `open_iteration: undefined → exact projection`) and C2-open leaving
-the whole generation record unchanged; a real downstream conflict of
+the whole generation record unchanged; both C2 retry forms additionally require the preserved generation to
+carry exactly the caller-selected compiled stage and budget (stage id,
+stage position, template, current plan digest, initial budget and the
+wait-boundary anchor) — the composition result must agree with the
+caller policy, never only with the verified close state, so a hostile
+ensure that merely preserves a mismatching binding and returns a
+success is refused; a real downstream conflict of
 the caller-selected stage/budget passes through by identity (the
 stage-iteration controller's own `lifecycle_conflict`) and is never
 pre-classified by this layer. A hostile coherent result with simultaneously
@@ -2944,13 +2963,32 @@ compiled stage, wrong generation/iteration index, closed final
 generation, wrong stage position/template/plan digest/budget/anchor,
 missing/closed iterations, a changed old generation, advanced
 boundaries, malformed states), the coherent hostile result detected
-through the verified close state, the option/ops getter-count battery
-with caller mutation isolation across the composition,
-downstream/unexpected error identity, content-free diagnostics, both
-export surfaces, and the source scan (no
+through the verified close state, the regression battery over the exact
+ensure delta (a changed revision, a changed pipeline identity, the
+C2-bare hostile heal of budget/plan digest/template/anchor, the C2-open
+immutable binding rewrite), the close-result negatives with zero ensure
+calls (a changed result `iteration_index`, a coherent hostile task
+id/digest off the intent manifest, a changed predecessor task digest, a
+broken plan predecessor digest, broken iteration count/index/open
+projection), the prefix-C2 composition battery on an old generation
+with index > 1 (the C2-bare fresh retry with the historical prefix
+byte-identical, the C2-open zero-dispatch recognition, a hostile extra
+generation refused by the close controller identity), the
+preserved-mismatch battery (a C2-bare hostile ensure preserving a
+mismatching caller budget with the exact iteration appended, a C2-open
+unchanged success preserving mismatching stage and budget), the
+malformed close-result matrix refused before the ensure call with zero
+ensure calls (a `wait.actions` null and a null action entry; null and
+null-entry `inputs`/`transitions`/`executions`; a null `grants`
+journal; an early plan record null on the two-plan prefix; a malformed
+cursor and a malformed pipeline; a coherent changed predecessor plan
+revision that is not the accepted revision minus one), the option/ops
+getter-count battery with caller mutation isolation across the
+composition, downstream/unexpected error identity, content-free
+diagnostics, both export surfaces, and the source scan (no
 reducer/validator/filesystem/store/publisher/serializer/registry/
-coordinator/runner/CLI imports; exactly the six composed-layer
-imports). Still unwired: the architect output parsing, plan candidate
+coordinator/runner/CLI imports; exactly the seven composed-layer
+imports including the schema-owned identity comparator). Still unwired: the architect output parsing, plan candidate
 construction and acceptance, the stage/budget selection policy, the
 graph transition commit, automatic resume,
 coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
