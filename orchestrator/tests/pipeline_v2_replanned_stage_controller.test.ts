@@ -268,10 +268,18 @@ interface ReadyCtx {
  * the revise_task response recorded, the settled planning execution on
  * the declared action target, and the next plan r2 accepted — the old
  * generation is still open at this boundary (the composition's C0 start).
+ *
+ * `withEarlyWait` answers an additional first wait before the ordinary
+ * cycle (so the journal carries an early wait record and the target
+ * wait becomes index 2), and `withDecisionExecution` prepends a
+ * historical decision execution with a correct selected result (every
+ * later index shifts by one).
  */
 interface ReplannedStageReadyOptions {
   withPrefixGeneration?: boolean;
   withStageTwoGeneration?: boolean;
+  withEarlyWait?: boolean;
+  withDecisionExecution?: boolean;
 }
 
 async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Promise<ReadyCtx> {
@@ -279,6 +287,71 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
     const fixture = await setupRun();
     const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
     await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS });
+    const decisionShift = options.withDecisionExecution === true ? 1 : 0;
+    if (options.withDecisionExecution === true) {
+      // A historical decision execution with a correct selected result:
+      // `decisionResultEquals` later reads the status-required id list
+      // through `stringListEquals`, so only the status-shaped pre-ensure
+      // check can reject a mutation that removes it.
+      await sink.dispatch({
+        kind: "start_decision_execution",
+        stateId: "architect",
+        inputDigest: hex("c"),
+        executionRole: "control",
+      });
+      await sink.dispatch({
+        kind: "decision_evaluated",
+        result: {
+          status: "selected",
+          outcome: "iterate",
+          decision: "iterate",
+          rule_id: "rule-1",
+          active_constraint_ids: [],
+        },
+      });
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "iterate", to: "architect", transition_index: 0 },
+        executionIndex: 1,
+      });
+    }
+    const actions = [
+      { id: "continue_stage", to: "dev_entry" },
+      { id: "revise_task", to: "architect" },
+    ];
+    let targetWaitIndex = 1;
+    if (options.withEarlyWait === true) {
+      // An answered early wait on the same cursor: the response moves
+      // the cursor back to the declared revise target (architect), so
+      // the ordinary cycle continues from the same state. The early
+      // wait record becomes waits[0]; the target wait becomes the last
+      // record with index 2.
+      const earlyRequest = preparePipelineV2WaitRequest({
+        schema_version: 1,
+        run_id: RUN_ID,
+        wait_index: 1,
+        transition_count: decisionShift,
+        state_id: "architect",
+        reason: "user_intervention",
+        actions,
+      });
+      await publishPipelineV2WaitRequest(fixture.runRoot, earlyRequest.manifest);
+      await sink.dispatch({
+        kind: "run_waiting",
+        stateId: "architect",
+        reason: "user_intervention",
+        requestSha256: earlyRequest.sha256,
+        actions,
+      });
+      await sink.dispatch({
+        kind: "wait_response_recorded",
+        waitIndex: 1,
+        expectedRequestSha256: earlyRequest.sha256,
+        actionId: "revise_task",
+        responseSha256: hex("e"),
+      });
+      targetWaitIndex = 2;
+    }
     await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of agentPhases("planning")) {
       await sink.dispatch(command);
@@ -290,7 +363,7 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
       revision: 1,
       previous_sha256: null,
       root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
-      origin_execution: 1,
+      origin_execution: 1 + decisionShift,
       stages: [
         {
           id: "stage-1",
@@ -308,12 +381,25 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
     });
     await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: plan1Candidate });
     const compiledPlan1 = compilePipelineV2RunPlanCandidate(pipeline, plan1Candidate);
+    if (options.withEarlyWait === true) {
+      // The early wait's response must resolve at its own boundary
+      // (committed transition count 0), which must carry no open
+      // iteration: commit the planning transition BEFORE generation 1
+      // opens, so the early wait's boundary stays clean.
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+        executionIndex: 1 + decisionShift,
+      });
+    }
     await ensurePipelineV2StageIteration({ compiledPlan: compiledPlan1, stageId: "stage-1", initialBudget: 2, sink });
-    await sink.dispatch({
-      kind: "transition_committed",
-      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
-      executionIndex: 1,
-    });
+    if (options.withEarlyWait !== true) {
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+        executionIndex: 1 + decisionShift,
+      });
+    }
     await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
     for (const command of agentPhases("stage")) {
       await sink.dispatch(command);
@@ -370,18 +456,14 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
       await sink.dispatch({
         kind: "transition_committed",
         step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
-        executionIndex: 2,
+        executionIndex: 2 + decisionShift,
       });
     }
-    const actions = [
-      { id: "continue_stage", to: "dev_entry" },
-      { id: "revise_task", to: "architect" },
-    ];
-    const waitTransitionCount = options.withPrefixGeneration === true ? 4 : 2;
+    const waitTransitionCount = (options.withPrefixGeneration === true ? 4 : 2) + decisionShift;
     const request = preparePipelineV2WaitRequest({
       schema_version: 1,
       run_id: RUN_ID,
-      wait_index: 1,
+      wait_index: targetWaitIndex,
       transition_count: waitTransitionCount,
       state_id: "architect",
       reason: "stage_iteration_limit_exhausted",
@@ -395,22 +477,33 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
       requestSha256: request.sha256,
       actions,
     });
-    await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: INTENT.sha256 });
+    const intent = options.withEarlyWait === true
+      ? prepareWaitIntent({
+          schema_version: 1,
+          kind: "revise_task_intent",
+          run_id: RUN_ID,
+          wait_index: 2,
+          task_id: "task-a",
+          expected_previous_task_sha256: A1.sha256,
+          new_task_revision_sha256: A2.sha256,
+        })
+      : INTENT;
+    await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: targetWaitIndex, intentSha256: intent.sha256 });
     await sink.dispatch({
       kind: "task_revision_accepted",
       taskId: "task-a",
       revision: 2,
       taskSha256: A2.sha256,
-      waitIndex: 1,
-      intentSha256: INTENT.sha256,
+      waitIndex: targetWaitIndex,
+      intentSha256: intent.sha256,
     });
-    await applyPipelineV2ReviseTaskClosure({ sink, intent: INTENT });
-    await completePipelineV2ReviseTask({ runRoot: fixture.runRoot, sink, intent: INTENT });
+    await applyPipelineV2ReviseTaskClosure({ sink, intent });
+    await completePipelineV2ReviseTask({ runRoot: fixture.runRoot, sink, intent });
     await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of agentPhases("planning3")) {
       await sink.dispatch(command);
     }
-    const planningExecutionIndex = options.withPrefixGeneration === true ? 5 : 3;
+    const planningExecutionIndex = (options.withPrefixGeneration === true ? 5 : 3) + decisionShift;
     const stages2 = options.withStageTwoGeneration === true
       ? [
           {
@@ -468,7 +561,7 @@ async function replannedStageReady(options: ReplannedStageReadyOptions = {}): Pr
       });
       await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: waitTransitionCount });
     }
-    return { fixture, sink, pipeline, intent: INTENT, compiledPlan: accepted.compiled_plan, plan2 };
+    return { fixture, sink, pipeline, intent, compiledPlan: accepted.compiled_plan, plan2 };
   });
 }
 
@@ -2438,19 +2531,17 @@ describe("openPipelineV2ReplannedStage", () => {
     }
   });
 
-  test("50. a wait record without its actions array is invalid_result with zero ensure calls", async () => {
-    const ctx = await replannedStageReady();
+  test("50. an early wait record without its actions array is invalid_result with zero ensure calls", async () => {
+    const ctx = await replannedStageReady({ withEarlyWait: true });
     try {
-      // `waitRecordEquals` reads `before.actions.length` without a
-      // guard; the schema-v7 wait record always carries its ordered
-      // action declarations, so the close-result verification requires
-      // the array for every wait record BEFORE the ensure call. The
-      // default fixture carries exactly one wait, so the same missing
-      // check path the request names for an earlier wait is proven on
-      // the reachable single-wait journal.
+      // The target (last) wait record keeps its correct actions, so the
+      // existing target-wait checks never see the damage; only the
+      // general pre-ensure check over every wait record can reject the
+      // early record whose `actions` array is gone.
       await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
       const ops = mutatedCloseOps(ctx, (_result, state) => {
-        delete ((state.waits[state.waits.length - 1] as unknown as Record<string, unknown>))["actions"];
+        expect(state.waits).toHaveLength(2);
+        delete ((state.waits[0] as unknown as Record<string, unknown>))["actions"];
       });
       const cause = await catchOpen(() =>
         openPipelineV2ReplannedStageWithOps(ops, {
@@ -2470,32 +2561,25 @@ describe("openPipelineV2ReplannedStage", () => {
     }
   });
 
-  test("51. selected, uncovered and inconsistent decision results without their required id lists are invalid_result with zero ensure calls", async () => {
-    const ctx = await replannedStageReady();
+  test("51. historical decision results without their required id lists are invalid_result with zero ensure calls", async () => {
+    const ctx = await replannedStageReady({ withDecisionExecution: true });
     try {
-      // `decisionResultEquals` reads the id lists through
-      // `stringListEquals(before.<list>, ...)` for these statuses, so a
-      // record whose required list is absent must be rejected by the
-      // close-result verification BEFORE the ensure call. The check is
-      // status-shaped, so the mutation places the hostile result on the
-      // reachable settled execution record.
+      // Execution 1 is a historical decision execution with a correct
+      // selected result; `decisionResultEquals` reads the status's id
+      // list through `stringListEquals(before.<list>, ...)`, so only
+      // the status-shaped pre-ensure check rejects the removal. The
+      // settled planning execution stays untouched.
+      expect(((ctx.sink.snapshot as PipelineV2RunState).executions[0] as unknown as Record<string, unknown>)["type"]).toBe("decision");
       await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
-      const variants: Array<(state: PipelineV2RunState) => void> = [
-        (state) => {
-          const execution = state.executions[state.executions.length - 1] as unknown as Record<string, unknown>;
-          execution["result"] = { status: "selected", outcome: "stage_development", decision: "next", rule_id: "r" };
-        },
-        (state) => {
-          const execution = state.executions[state.executions.length - 1] as unknown as Record<string, unknown>;
-          execution["result"] = { status: "uncovered", outcome: "uncovered" };
-        },
-        (state) => {
-          const execution = state.executions[state.executions.length - 1] as unknown as Record<string, unknown>;
-          execution["result"] = { status: "inconsistent_facts", outcome: "inconsistent_facts" };
-        },
+      const variants: Array<Record<string, unknown>> = [
+        { status: "selected", outcome: "iterate", decision: "iterate", rule_id: "rule-1" },
+        { status: "uncovered", outcome: "uncovered" },
+        { status: "inconsistent_facts", outcome: "inconsistent_facts" },
       ];
-      for (const variant of variants) {
-        const ops = mutatedCloseOps(ctx, (_result, state) => variant(state));
+      for (const replacement of variants) {
+        const ops = mutatedCloseOps(ctx, (_result, state) => {
+          ((state.executions[0] as unknown as Record<string, unknown>))["result"] = replacement;
+        });
         const cause = await catchOpen(() =>
           openPipelineV2ReplannedStageWithOps(ops, {
             sink: ctx.sink,
