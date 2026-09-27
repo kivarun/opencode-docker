@@ -139,8 +139,13 @@ import type {
  * retry form needed by the composition controller after a fault window
  * inside the stage-iteration opening — the exact closed old generation
  * is the direct predecessor of exactly one still-open generation of the
- * CURRENT compiled plan (`index === old.index + 1`, the accepted plan
- * digest, exactly one compiled stage of that id, the exact
+ * CURRENT compiled plan (the new generation is strictly the LAST
+ * durable record, the old replanned generation strictly the
+ * second-to-last one, and an arbitrary unmodified historical prefix
+ * before them is admitted unchanged — the loader owns its coherence and
+ * C2 is not a historical search; `index === predecessor.index + 1`,
+ * nothing sits between predecessor and new generation, the accepted
+ * plan digest, exactly one compiled stage of that id, the exact
  * stage position and template, the wait-boundary anchor, a positive
  * initial budget) in one of the two immediate opening forms (the bare
  * generation with `iteration_count === 0`, or exactly iteration 1 open
@@ -149,7 +154,8 @@ import type {
  * iteration. A generation of the current plan without the exact
  * replanned predecessor closure, a wrong stage position, template, plan
  * digest or anchor, a closed new generation, more than one new
- * generation, a closed or second iteration, and any lifecycle advance
+ * generation after the closed old one, a closed or second iteration,
+ * and any lifecycle advance
  * past the wait boundary are `lifecycle_conflict` with zero dispatch;
  * C2 is never a general historical search.
  *
@@ -668,8 +674,9 @@ function replannedNewGenerationForm(
  * exact already-durable replanned closure that stays last (C1), and the
  * narrow C2 retry form — the exact closed old generation as the direct
  * predecessor of exactly one still-open generation of the CURRENT
- * compiled plan in one of the two immediate opening forms — are
- * admissible. Anything else fails closed.
+ * compiled plan in one of the two immediate opening forms, with an
+ * arbitrary unmodified historical prefix before the predecessor admitted
+ * unchanged — are admissible. Anything else fails closed.
  */
 function replannedGenerationContext(
   state: PipelineV2RunState,
@@ -687,7 +694,10 @@ function replannedGenerationContext(
   const lastPlanDigest = last["plan_sha256"];
   if (lastPlanDigest === compiledPlan.plan_sha256 && last["closed"] === undefined) {
     // The C2 retry candidate: the last durable generation already belongs
-    // to the current compiled plan and is still open.
+    // to the current compiled plan and is still open. The exact closed
+    // old generation is its DIRECT predecessor; any unmodified historical
+    // prefix before the predecessor is admitted unchanged — the loader
+    // owns its coherence, and C2 is not a historical search.
     if (state.generations.length < 2) {
       throw controllerError(
         "lifecycle_conflict",
@@ -695,14 +705,8 @@ function replannedGenerationContext(
         state,
       );
     }
-    if (state.generations.length > 2) {
-      throw controllerError(
-        "lifecycle_conflict",
-        "several generations of the current plan already exist after the replanned closure",
-        state,
-      );
-    }
-    const predecessor = replannedOldGenerationAt(state, wait, 0);
+    const predecessorPosition = lastPosition - 1;
+    const predecessor = replannedOldGenerationAt(state, wait, predecessorPosition);
     const predecessorClosed = predecessor.generation["closed"];
     if (
       !isRecord(predecessorClosed) ||
@@ -943,9 +947,11 @@ function planningExecutionBoundary(
  * and malformed nested records yield the typed mismatch, never a
  * `TypeError`. When `suffixPlan` is non-null (the racing path only) the
  * state is additionally allowed to change in exactly one further way: the
- * exact closed old generation is followed by exactly one still-open
- * generation of the CURRENT compiled plan in one of the two immediate
- * opening forms (the C2 retry form); every other durable region still
+ * exact closed old generation is followed directly by exactly one
+ * still-open generation of the CURRENT compiled plan in one of the two
+ * immediate opening forms (the C2 retry form — with an arbitrary
+ * unmodified historical prefix before the closed old generation
+ * admitted unchanged); every other durable region still
  * compares positionally, so a racing suffix that already advanced past
  * the immediate opening never passes.
  */
@@ -1866,8 +1872,9 @@ export async function closePipelineV2ReplannedGenerationInternal(
   // C2 is the narrow retry form after a stage-iteration fault window
   // (the closed old generation as the direct predecessor of exactly one
   // still-open generation of the current compiled plan in an immediate
-  // opening form). The result in both forms describes the old closed
-  // generation and its replanned iteration.
+  // opening form, with an arbitrary unmodified historical prefix before
+  // the predecessor admitted unchanged). The result in both forms
+  // describes the old closed generation and its replanned iteration.
   if (boundary.form !== "c0") {
     return buildResult(boundary, compiledPlan);
   }
@@ -1922,8 +1929,9 @@ export async function closePipelineV2ReplannedGenerationInternal(
       // additionally admits the narrow C2 retry suffix: the closed old
       // generation as the direct predecessor of exactly one still-open
       // generation of the current compiled plan in an immediate opening
-      // form — so a concurrent full retry after the closure never turns
-      // into a false conflict.
+      // form (with an arbitrary unmodified historical prefix before the
+      // predecessor admitted unchanged) — so a concurrent full retry
+      // after the closure never turns into a false conflict.
       const after: unknown = (sinkValue as Record<string, unknown>)["snapshot"];
       const verified = verifyAppliedClosure(state, after, boundary.wait, boundary.generationIndex, compiledPlan);
       return buildResult(

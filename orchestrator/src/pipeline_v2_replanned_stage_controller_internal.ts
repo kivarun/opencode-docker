@@ -2,6 +2,7 @@ import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 import { closePipelineV2ReplannedGeneration, type ClosedPipelineV2ReplannedGeneration } from "./pipeline_v2_replanned_generation_controller.ts";
 import { ensurePipelineV2StageIteration, type EnsuredPipelineV2StageIteration } from "./pipeline_v2_stage_iteration_controller.ts";
 import { compiledPipelineV2RunPlanStageFor, type CompiledPipelineV2RunPlan, type CompiledPipelineV2RunPlanStage } from "./pipeline_v2_run_plan_compiled.ts";
+import { comparePipelineV2RunIdentity } from "./pipeline_v2_identity_compare.ts";
 import type { PreparedPipelineV2RunWaitIntent } from "./pipeline_v2_run_plan_manifests.ts";
 import type {
   PipelineV2RunCommand,
@@ -69,33 +70,67 @@ import type {
  *
  * Close-result verification (defensive, contract-owned, targeted):
  * the positive safe wait/generation/iteration/task/plan indexes; the
- * exact `intent_sha256`; the exact plan revision, digest and origin
- * against the compiled plan; the old generation at its exact durable
- * index with the exact replanned iteration closure and the exact
- * replanned generation closure; the wait, task-ledger and plan-ledger
- * bindings agreeing with the result; and the admissible state form —
- * C1: the old generation is the last durable generation; C2: exactly
- * one still-open generation of the current compiled plan follows it in
- * one of the two immediate opening forms. Malformed nested results
- * fail as the controller's own `invalid_result`, never a `TypeError`.
+ * exact plan revision, digest and origin against the compiled plan;
+ * the intent bindings come from the provenance-backed prepared intent,
+ * never from the hostile result alone: `intent_sha256 === intent.sha256`,
+ * `wait_index === intent.manifest.wait_index`, `task_id ===
+ * intent.manifest.task_id`, `task_sha256 ===
+ * intent.manifest.new_task_revision_sha256`, and the single wait-bound
+ * task record agrees on all seven contract fields including
+ * `previous_sha256 === intent.manifest.expected_previous_task_sha256`
+ * with no later revision of the same task; the plan ledger carries the
+ * last plan as the exact successor of its predecessor
+ * (`last.previous_sha256 === previous.sha256`, exact positions for
+ * revisions and indexes) and the current compiled plan stays the last
+ * accepted plan; the old generation sits at its exact durable index,
+ * bound to the previous plan digest, with `iteration_count ===
+ * iterations.length`, the last iteration at its durable position
+ * carrying the exact replanned closure, `open_iteration` absent, and
+ * the result's `iteration_index` equal to that last iteration's index;
+ * and the admissible state form — C1: the old generation is the last
+ * durable generation; C2: the new current-plan generation follows it
+ * DIRECTLY (a new generation is strictly the last record, the old
+ * replanned generation strictly the second-to-last one, arbitrary
+ * unmodified historical prefix before them admitted unchanged, the
+ * new generation's index exactly the predecessor's index + 1) in one
+ * of the two immediate opening forms, which the verification returns
+ * as the exact ensure form (`c2-bare` / `c2-open`). Malformed nested
+ * results fail as the controller's own `invalid_result`, never a
+ * `TypeError`.
  *
  * Ensure-result verification (defensive, targeted): `compiled_stage`
  * is the exact object the trusted resolver returned (identity, never a
  * clone); the generation index is exactly the old index + 1 and the
- * iteration index exactly 1; the final generation is the last durable
- * generation, still open, with the exact stage id, stage position,
- * template, current plan digest, initial budget and the wait-boundary
- * opening anchor; exactly one iteration (index 1, open on the same
- * anchor, exact `open_iteration` projection); the old generation and
- * its historical iteration prefix/closure are unchanged; the wait,
- * task, plan, execution and transition boundaries did not advance
- * (positional equality against the verified close state, with the
- * routine `updated_at` refresh allowed); the final state remains
- * active and running on the settled-but-unbound planning execution. A
- * hostile coherent result with simultaneously mutated result fields
- * and nested state is compared against the verified close state and
- * the trusted compiled stage, never against itself. Malformed shapes
- * fail as `invalid_result`, never a `TypeError`.
+ * iteration index exactly 1; the EXACT revision delta follows the
+ * verified close form (C1: +2 — one generation and one iteration
+ * appended; C2-bare: +1 — only the first iteration appended; C2-open:
+ * 0 — the durable state unchanged); `after.pipeline` matches
+ * `before.pipeline` through the schema-owned structural identity
+ * comparator; `schema_version`, `run_id`, status/phase, `started_at`,
+ * inputs, cursor, executions, transitions, waits, task/plan ledgers,
+ * grants, terminal/run outputs/failure and the whole generation
+ * prefix stay positionally pinned (only the routine `updated_at`
+ * refresh allowed); and the last generation follows the exact form
+ * delta: C1 opens one new generation bound to the caller-selected
+ * stage id/position/template/plan digest/budget and the wait-boundary
+ * anchor; in the C2 retry forms the already durable generation's
+ * immutable bindings (index, stage id/position, template, plan
+ * digest, initial budget, opening anchor, no generation closure) must
+ * match before/after exactly — a hostile ensure that rewrites them
+ * (even into the caller-selected values) never passes — with
+ * C2-bare allowing only the exact first-iteration append
+ * (`iteration_count: 0 → 1`, `iterations: [] → [exact iteration 1]`,
+ * `open_iteration: undefined → exact projection`) and C2-open leaving
+ * the whole generation record unchanged. The settled-but-unbound
+ * planning execution and the final active/running boundary are
+ * pinned in all forms. A hostile coherent result with simultaneously
+ * mutated result fields and nested state is compared against the
+ * verified close state and the trusted compiled stage, never against
+ * itself. A real downstream conflict of the caller-selected
+ * stage/budget passes through by identity (the stage-iteration
+ * controller's own `lifecycle_conflict`) and is never pre-classified
+ * by this layer. Malformed shapes fail as `invalid_result`, never a
+ * `TypeError`.
  *
  * Durability: the composed controllers' typed failures
  * (`state_persist_failed` with `not_committed`/`durability_unknown`
@@ -232,20 +267,51 @@ interface VerifiedCloseResult {
   readonly state: PipelineV2RunState;
   readonly wait: PipelineV2WaitRecord;
   readonly oldGenerationIndex: number;
+  readonly form: "c1" | "c2-bare" | "c2-open";
+}
+
+/**
+ * The contract-owned bindings of the provenance-backed prepared revise
+ * intent, read only after the close controller has run its own
+ * provenance gate.
+ */
+function reviseIntentBindings(intentValue: unknown): { readonly manifest: Record<string, unknown>; readonly intentSha256: string } {
+  const intent = intentValue as Record<string, unknown>;
+  const manifest = intent["manifest"];
+  const intentSha256 = intent["sha256"];
+  if (
+    !isRecord(manifest) ||
+    manifest["kind"] !== "revise_task_intent" ||
+    typeof manifest["run_id"] !== "string" ||
+    !isPositiveSafeInteger(manifest["wait_index"]) ||
+    typeof manifest["task_id"] !== "string" ||
+    typeof manifest["new_task_revision_sha256"] !== "string" ||
+    typeof manifest["expected_previous_task_sha256"] !== "string" ||
+    typeof intentSha256 !== "string"
+  ) {
+    throw controllerError(
+      "invalid_result",
+      "the prepared revise intent does not carry the revise_task contract fields",
+      null,
+    );
+  }
+  return { manifest, intentSha256 };
 }
 
 /**
  * The full targeted verification of the close controller's returned
  * result. Defensive with record/array guards before every field
  * access, so malformed nested results fail as the controller's own
- * `invalid_result`, never a `TypeError`.
+ * `invalid_result`, never a `TypeError`. The contract-owned bindings
+ * are checked against the provenance-backed prepared intent and the
+ * trusted compiled plan, never against the hostile result alone.
  */
 function verifyCloseResult(
   resultValue: unknown,
-  intentSha256: string,
+  intentValue: unknown,
   compiledPlan: CompiledPipelineV2RunPlan,
-  initialBudget: number,
 ): VerifiedCloseResult {
+  const { manifest, intentSha256 } = reviseIntentBindings(intentValue);
   if (!isRecord(resultValue)) {
     throw controllerError(
       "invalid_result",
@@ -286,6 +352,13 @@ function verifyCloseResult(
       null,
     );
   }
+  if (result["wait_index"] !== manifest["wait_index"]) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result wait does not match the revise intent's wait",
+      null,
+    );
+  }
   const stateValue = result["state"];
   if (!isRecord(stateValue)) {
     throw controllerError(
@@ -306,6 +379,13 @@ function verifyCloseResult(
     throw controllerError(
       "invalid_result",
       "the closure result state already carries a terminal, publication or failure projection",
+      state,
+    );
+  }
+  if (manifest["run_id"] !== state.run_id) {
+    throw controllerError(
+      "invalid_result",
+      "the revise intent belongs to a different run than the closure result state",
       state,
     );
   }
@@ -342,7 +422,7 @@ function verifyCloseResult(
   const wait = state.waits[waitPosition] as unknown as PipelineV2WaitRecord;
   if (
     !isRecord(wait.intent) ||
-    wait.intent["intent_sha256"] !== result["intent_sha256"] ||
+    wait.intent["intent_sha256"] !== intentSha256 ||
     !isRecord(wait.response) ||
     wait.response["action_id"] !== REVISE_TASK_ACTION_ID
   ) {
@@ -380,7 +460,17 @@ function verifyCloseResult(
     taskBound["task_id"] !== result["task_id"] ||
     taskBound["revision"] !== result["task_revision"] ||
     taskBound["sha256"] !== result["task_sha256"] ||
-    taskBound["intent_sha256"] !== result["intent_sha256"]
+    taskBound["intent_sha256"] !== result["intent_sha256"] ||
+    // The accepted task revision is bound to the intent manifest, not to
+    // the hostile result alone: task id, both digests, revision above 1,
+    // the wait index and the intent digest must agree exactly.
+    taskBound["task_id"] !== manifest["task_id"] ||
+    taskBound["sha256"] !== manifest["new_task_revision_sha256"] ||
+    taskBound["previous_sha256"] !== manifest["expected_previous_task_sha256"] ||
+    taskBound["wait_index"] !== manifest["wait_index"] ||
+    taskBound["intent_sha256"] !== intentSha256 ||
+    taskBound["revision"] !== result["task_revision"] ||
+    (taskBound["revision"] as number) <= 1
   ) {
     throw controllerError(
       "invalid_result",
@@ -388,7 +478,26 @@ function verifyCloseResult(
       state,
     );
   }
-  if (!Array.isArray(state.plan_revisions) || !isPositiveSafeInteger(result["plan_revision"]) || state.plan_revisions.length !== result["plan_revision"]) {
+  if (
+    state.task_revisions.some(
+      (entry) =>
+        isRecord(entry) &&
+        entry["task_id"] === manifest["task_id"] &&
+        typeof entry["revision"] === "number" &&
+        entry["revision"] > (taskBound["revision"] as number),
+    )
+  ) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result task ledger already moved past the accepted revision",
+      state,
+    );
+  }
+  if (
+    !Array.isArray(state.plan_revisions) ||
+    !isPositiveSafeInteger(result["plan_revision"]) ||
+    state.plan_revisions.length !== result["plan_revision"]
+  ) {
     throw controllerError(
       "invalid_result",
       "the closure result plan ledger does not carry the accepted plan revision",
@@ -399,12 +508,19 @@ function verifyCloseResult(
   const previousPlan = state.plan_revisions[state.plan_revisions.length - 2];
   if (
     !isRecord(lastPlan) ||
+    lastPlan["index"] !== result["plan_revision"] ||
     lastPlan["revision"] !== result["plan_revision"] ||
     lastPlan["sha256"] !== result["plan_sha256"] ||
     lastPlan["origin_execution"] !== result["origin_execution"] ||
     !isRecord(previousPlan) ||
+    previousPlan["index"] !== result["previous_plan_revision"] ||
     previousPlan["revision"] !== result["previous_plan_revision"] ||
-    previousPlan["sha256"] !== result["previous_plan_sha256"]
+    previousPlan["sha256"] !== result["previous_plan_sha256"] ||
+    // The plan successor binding: the last plan names its predecessor's
+    // digest exactly, and the predecessor is bound to the old replanned
+    // generation through the result's previous plan digest (checked
+    // below together with the old generation).
+    lastPlan["previous_sha256"] !== previousPlan["sha256"]
   ) {
     throw controllerError(
       "invalid_result",
@@ -445,9 +561,19 @@ function verifyCloseResult(
     );
   }
   const oldIterations = oldGeneration["iterations"] as unknown[];
+  if (oldGeneration["iteration_count"] !== oldIterations.length) {
+    throw controllerError(
+      "invalid_result",
+      "the closure result old generation iteration count does not match the iteration history",
+      state,
+    );
+  }
   const lastIteration = oldIterations[oldIterations.length - 1];
   if (
     !isRecord(lastIteration) ||
+    lastIteration["index"] !== oldIterations.length ||
+    result["iteration_index"] !== lastIteration["index"] ||
+    oldGeneration["open_iteration"] !== undefined ||
     !isRecord(lastIteration["closed"]) ||
     lastIteration["closed"]["by"] !== "replanned" ||
     lastIteration["closed"]["wait_index"] !== wait["index"] ||
@@ -472,7 +598,7 @@ function verifyCloseResult(
   }
   if (state.generations.length === result["generation_index"]) {
     // C1: the old generation is the last durable generation.
-    return { state, wait, oldGenerationIndex: result["generation_index"] as number };
+    return { state, wait, oldGenerationIndex: result["generation_index"] as number, form: "c1" };
   }
   if (state.generations.length !== result["generation_index"] + 1) {
     throw controllerError(
@@ -482,7 +608,7 @@ function verifyCloseResult(
     );
   }
   // C2: the immediate new-generation retry form follows the closed old
-  // generation.
+  // generation as its direct predecessor.
   const newGeneration = state.generations[state.generations.length - 1];
   if (
     !isRecord(newGeneration) ||
@@ -546,8 +672,7 @@ function verifyCloseResult(
         state,
       );
     }
-    void initialBudget;
-    return { state, wait, oldGenerationIndex: result["generation_index"] as number };
+    return { state, wait, oldGenerationIndex: result["generation_index"] as number, form: "c2-bare" };
   }
   if (newGeneration["iteration_count"] === 1) {
     if (!Array.isArray(newIterations) || newIterations.length !== 1) {
@@ -573,8 +698,7 @@ function verifyCloseResult(
         state,
       );
     }
-    void initialBudget;
-    return { state, wait, oldGenerationIndex: result["generation_index"] as number };
+    return { state, wait, oldGenerationIndex: result["generation_index"] as number, form: "c2-open" };
   }
   throw controllerError(
     "invalid_result",
@@ -1001,6 +1125,15 @@ function verifyEnsureResult(
       "the stage iteration result state does not carry the exact planned stage opening over the verified closure boundary",
       isRecord(stateValue) ? (stateValue as unknown as PipelineV2RunState) : close.state,
     );
+  // The exact revision delta of the ensure step: from a C1 boundary the
+  // ensure opens both the generation and its first iteration (+2); from
+  // a C2-bare boundary only the iteration is appended (+1); a C2-open
+  // boundary is a full zero-dispatch recognition (no revision change).
+  const expectedRevisionDelta = close.form === "c1" ? 2 : close.form === "c2-bare" ? 1 : 0;
+
+  if (after.revision !== before.revision + expectedRevisionDelta) {
+    throw mismatch();
+  }
   if (after.status !== "active" || after.phase !== "running") {
     throw controllerError(
       "invalid_result",
@@ -1012,6 +1145,13 @@ function verifyEnsureResult(
     after.schema_version !== before.schema_version ||
     after.run_id !== before.run_id ||
     after.started_at !== before.started_at
+  ) {
+    throw mismatch();
+  }
+  if (
+    !isRecord(after.pipeline) ||
+    !isRecord(before.pipeline) ||
+    comparePipelineV2RunIdentity(before.pipeline, after.pipeline).kind !== "match"
   ) {
     throw mismatch();
   }
@@ -1090,60 +1230,118 @@ function verifyEnsureResult(
   if (!terminalEquals(before.terminal, after.terminal) || !runOutputsEquals(before.run_outputs, after.run_outputs) || !failureEquals(before.failure, after.failure)) {
     throw mismatch();
   }
-  // The ensure step either opened exactly one new generation on top of
-  // the verified close state (the C0/C1 flows) or recognized the already
-  // open current-plan generation of the C2 retry form (zero dispatch);
-  // both shapes end with the new generation last and everything before
-  // it unchanged.
-  if (
-    !Array.isArray(after.generations) ||
-    (after.generations.length !== before.generations.length &&
-      after.generations.length !== before.generations.length + 1)
-  ) {
+  // The ensure step's generation shape follows the verified close form
+  // exactly: C1 opens one new generation (caller bindings), C2-bare
+  // appends only the first iteration to the already durable generation
+  // (whose immutable bindings stay the close result's, never the
+  // caller-selected ones), and C2-open changes the durable state not at
+  // all.
+  if (!Array.isArray(after.generations)) {
     throw mismatch();
   }
-  const unchangedPrefixLength = after.generations.length === before.generations.length
-    ? before.generations.length - 1
-    : before.generations.length;
-  for (let position = 0; position < unchangedPrefixLength; position += 1) {
+  if (close.form === "c1") {
+    if (after.generations.length !== before.generations.length + 1) {
+      throw mismatch();
+    }
+    for (let position = 0; position < before.generations.length; position += 1) {
+      if (!generationUnchanged(before.generations[position], after.generations[position])) {
+        throw mismatch();
+      }
+    }
+    const newGeneration = after.generations[after.generations.length - 1];
+    if (!isRecord(newGeneration)) {
+      throw mismatch();
+    }
+    const wait = close.wait;
+    if (
+      newGeneration["index"] !== result["generation_index"] ||
+      newGeneration["stage_id"] !== stageId ||
+      newGeneration["stage_position"] !== stagePosition ||
+      newGeneration["template_id"] !== compiledStage.template ||
+      newGeneration["plan_sha256"] !== compiledPlan.plan_sha256 ||
+      newGeneration["initial_budget"] !== initialBudget ||
+      newGeneration["opened_transition_count"] !== wait["transition_count"] ||
+      newGeneration["closed"] !== undefined ||
+      newGeneration["iteration_count"] !== 1 ||
+      !Array.isArray(newGeneration["iterations"]) ||
+      newGeneration["iterations"].length !== 1
+    ) {
+      throw mismatch();
+    }
+    const iteration = newGeneration["iterations"][0];
+    if (
+      !isRecord(iteration) ||
+      iteration["index"] !== 1 ||
+      iteration["opened_transition_count"] !== wait["transition_count"] ||
+      iteration["closed"] !== undefined ||
+      !isRecord(newGeneration["open_iteration"]) ||
+      newGeneration["open_iteration"]["index"] !== 1 ||
+      newGeneration["open_iteration"]["opened_transition_count"] !== wait["transition_count"]
+    ) {
+      throw mismatch();
+    }
+    return;
+  }
+  // Both C2 retry forms: the new current-plan generation already sits at
+  // the last position of the verified close state.
+  if (after.generations.length !== before.generations.length) {
+    throw mismatch();
+  }
+  const prefixLength = before.generations.length - 1;
+  for (let position = 0; position < prefixLength; position += 1) {
     if (!generationUnchanged(before.generations[position], after.generations[position])) {
       throw mismatch();
     }
   }
-  // The last generation is verified by the exact new-generation check
-  // below in both shapes: in the opened shape it is new, and in the
-  // zero-dispatch retry shape the ensure step may have appended its
-  // first iteration to the already-open generation.
-  const newGeneration = after.generations[after.generations.length - 1];
-  if (!isRecord(newGeneration)) {
+  const lastGeneration = after.generations[after.generations.length - 1];
+  const beforeGeneration = before.generations[prefixLength];
+  if (!isRecord(lastGeneration) || !isRecord(beforeGeneration)) {
     throw mismatch();
   }
-  const wait = close.wait;
+  // The immutable bindings of the already durable generation must match
+  // before/after exactly; a hostile ensure that rewrites them (even into
+  // the caller-selected stage/budget) never passes.
   if (
-    newGeneration["index"] !== result["generation_index"] ||
-    newGeneration["stage_id"] !== stageId ||
-    newGeneration["stage_position"] !== stagePosition ||
-    newGeneration["template_id"] !== compiledStage.template ||
-    newGeneration["plan_sha256"] !== compiledPlan.plan_sha256 ||
-    newGeneration["initial_budget"] !== initialBudget ||
-    newGeneration["opened_transition_count"] !== wait["transition_count"] ||
-    newGeneration["closed"] !== undefined ||
-    newGeneration["iteration_count"] !== 1 ||
-    !Array.isArray(newGeneration["iterations"]) ||
-    newGeneration["iterations"].length !== 1
+    lastGeneration["index"] !== beforeGeneration["index"] ||
+    lastGeneration["stage_id"] !== beforeGeneration["stage_id"] ||
+    lastGeneration["stage_position"] !== beforeGeneration["stage_position"] ||
+    lastGeneration["template_id"] !== beforeGeneration["template_id"] ||
+    lastGeneration["plan_sha256"] !== beforeGeneration["plan_sha256"] ||
+    lastGeneration["initial_budget"] !== beforeGeneration["initial_budget"] ||
+    lastGeneration["opened_transition_count"] !== beforeGeneration["opened_transition_count"] ||
+    lastGeneration["closed"] !== undefined ||
+    beforeGeneration["closed"] !== undefined
   ) {
     throw mismatch();
   }
-  const iteration = newGeneration["iterations"][0];
-  if (
-    !isRecord(iteration) ||
-    iteration["index"] !== 1 ||
-    iteration["opened_transition_count"] !== wait["transition_count"] ||
-    iteration["closed"] !== undefined ||
-    !isRecord(newGeneration["open_iteration"]) ||
-    newGeneration["open_iteration"]["index"] !== 1 ||
-    newGeneration["open_iteration"]["opened_transition_count"] !== wait["transition_count"]
-  ) {
+  if (close.form === "c2-bare") {
+    // The only permitted change: the exact first iteration appended.
+    if (
+      beforeGeneration["iteration_count"] !== 0 ||
+      lastGeneration["iteration_count"] !== 1 ||
+      !Array.isArray(lastGeneration["iterations"]) ||
+      lastGeneration["iterations"].length !== 1
+    ) {
+      throw mismatch();
+    }
+    const iteration = lastGeneration["iterations"][0];
+    const anchor = close.wait["transition_count"];
+    if (
+      !isRecord(iteration) ||
+      iteration["index"] !== 1 ||
+      iteration["opened_transition_count"] !== anchor ||
+      iteration["closed"] !== undefined ||
+      !isRecord(lastGeneration["open_iteration"]) ||
+      lastGeneration["open_iteration"]["index"] !== 1 ||
+      lastGeneration["open_iteration"]["opened_transition_count"] !== anchor
+    ) {
+      throw mismatch();
+    }
+    return;
+  }
+  // C2-open: the whole durable generation record stays exactly as the
+  // close result carried it.
+  if (!generationUnchanged(beforeGeneration, lastGeneration)) {
     throw mismatch();
   }
 }
@@ -1244,15 +1442,7 @@ export async function openPipelineV2ReplannedStageWithOps(
     intent,
     compiledPlan,
   });
-  const intentSha256 = (intentValue as Record<string, unknown>)["sha256"];
-  if (typeof intentSha256 !== "string") {
-    throw controllerError(
-      "invalid_result",
-      "the prepared wait intent carries no digest",
-      null,
-    );
-  }
-  const close = verifyCloseResult(closeResult, intentSha256, compiledPlan, initialBudgetValue);
+  const close = verifyCloseResult(closeResult, intentValue, compiledPlan);
 
   // The ensure step runs only after the verified close result; its own
   // verification compares the returned state against the verified close
@@ -1269,6 +1459,14 @@ export async function openPipelineV2ReplannedStageWithOps(
 
   const verifiedResult = ensureResult as EnsuredPipelineV2StageIteration;
   const verifiedClose = closeResult as ClosedPipelineV2ReplannedGeneration;
+  const intentSha256 = (intentValue as Record<string, unknown>)["sha256"];
+  if (typeof intentSha256 !== "string") {
+    throw controllerError(
+      "invalid_result",
+      "the prepared wait intent carries no digest",
+      null,
+    );
+  }
   return deepFreezeValue({
     wait_index: verifiedClose.wait_index,
     previous_generation_index: close.oldGenerationIndex,

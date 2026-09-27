@@ -2682,8 +2682,13 @@ matching closure is never an idempotent success; C2 — the narrow
 crash-recovery retry form needed by the replanned-stage composition
 controller after a fault window inside the stage-iteration opening: the
 exact closed old generation as the direct predecessor of exactly one
-still-open generation of the CURRENT compiled plan
-(`index === old.index + 1`, the accepted plan digest, exactly one
+still-open generation of the CURRENT compiled plan (the new generation
+is strictly the LAST durable record, the old replanned generation
+strictly the second-to-last one at `lastPosition - 1`, and an arbitrary
+unmodified historical prefix before the predecessor is admitted
+unchanged — the loader owns its coherence; nothing sits between
+predecessor and new generation, and
+`index === predecessor.index + 1`, the accepted plan digest, exactly one
 compiled stage of that stage id, the exact stage position and template,
 the wait-boundary anchor, a positive initial budget) in one of the two
 immediate opening forms (the bare generation with `iteration_count ===
@@ -2693,7 +2698,8 @@ result still describes the old closed generation and its replanned
 iteration; a generation of the current plan without the exact
 replanned predecessor closure, a wrong stage position, template, plan
 digest or anchor, a closed new generation, more than one new
-generation, a closed or second iteration, and any lifecycle advance
+generation after the closed old one, a closed or second iteration, and
+any lifecycle advance
 past the wait boundary are `lifecycle_conflict` with zero dispatch, and
 C2 is never a general historical search. Post-dispatch
 verification is the same targeted comparison on the normal resolve path
@@ -2733,7 +2739,7 @@ task_revision, task_sha256, previous_plan_revision, previous_plan_sha256,
 plan_revision, plan_sha256, origin_execution, state}` — no manifest,
 canonical JSON, paths, bodies, prepared intent, compiled plan or other
 caller-owned objects. Tests: `orchestrator/tests/pipeline_v2_replanned_generation_controller.test.ts`
-(42 tests, fixtures built only through the real reducer/sink/store and
+(46 tests, fixtures built only through the real reducer/sink/store and
 the existing run-plan/stage-iteration/revise-task controllers — plan r1
 accepted, generation/iteration opened, the real revise intent accepted,
 task r2 durably accepted, the iteration closed `by:"replanned"` and the
@@ -2764,7 +2770,10 @@ success through the extended racing verification, the racing hostile
 closure, the C2 zero-dispatch retry paths (the bare new generation and
 the first iteration open), the hostile C2 shapes (a closed new
 generation, a closed or second iteration, a foreign anchor —
-loader-typed and lifecycle-typed), the
+loader-typed and lifecycle-typed), the prefix-C2 battery on an old
+generation with index > 1 (a closed generation-1 prefix: C2-bare and
+C2-open zero-dispatch retries, the racing extended suffix, and a
+hostile extra generation), the
 wrong revision delta and a foreign run id in the post-dispatch snapshot,
 `not_committed` and `durability_unknown` with fresh-retry semantics,
 identical concurrency with one durable closure and exactly +1 revision,
@@ -2835,31 +2844,55 @@ trusted compiled stage, the verified close result and the intent/plan
 bindings; the result is built from the ensure controller's
 authoritative state without any additional `sink.snapshot` read.
 Close-result verification (defensive, targeted): positive safe
-wait/generation/iteration/task/plan indexes; the exact `intent_sha256`;
-the exact plan revision/digest/origin against the compiled plan; the
-old generation at its exact durable index with the exact replanned
-iteration and generation closures; the wait, task-ledger and
-plan-ledger bindings agreeing with the result; and the admissible state
-form — C1: the old generation the last durable generation, C2: exactly
-one still-open current-plan generation following it in one of the two
-immediate opening forms. Ensure-result verification (defensive,
+wait/generation/iteration/task/plan indexes; the exact plan
+revision/digest/origin against the compiled plan; the intent bindings
+taken from the provenance-backed prepared intent, never from the
+hostile result alone (`intent_sha256 === intent.sha256`,
+`wait_index`/`task_id`/`task_sha256` against `intent.manifest`, and the
+single wait-bound task record agreeing on all seven contract fields
+including `previous_sha256 ===
+intent.manifest.expected_previous_task_sha256` with no later revision
+of the same task); the plan ledger carrying the last plan as the exact
+successor of its predecessor (`last.previous_sha256 ===
+previous.sha256`, exact revision/index positions) with the current
+compiled plan still the last accepted plan; the old generation at its
+exact durable index, bound to the previous plan digest, with
+`iteration_count === iterations.length`, the last iteration at its
+durable position carrying the exact replanned closure, `open_iteration`
+absent, and the result's `iteration_index` equal to that last
+iteration's index; and the admissible state form returned as the exact
+ensure form — C1: the old generation the last durable generation,
+C2-bare: the new current-plan generation directly following it (new =
+strictly last, old = strictly second-to-last, arbitrary unmodified
+historical prefix admitted unchanged, `index === predecessor.index +
+1`) without an iteration, C2-open: the same shape with exactly
+iteration 1 open on the same anchor. Ensure-result verification (defensive,
 targeted): `compiled_stage` the exact object the trusted resolver
 returned (identity, never a clone); the generation index exactly the
-old index + 1 and the iteration index exactly 1; the final generation
-the last durable generation, still open, with the exact stage id, stage
-position, template, current plan digest, initial budget and the
-wait-boundary opening anchor; exactly one iteration (index 1, open on
-the same anchor, exact `open_iteration` projection); the old generation
-and its historical iteration prefix/closure unchanged; the
-wait/task/plan/execution/transition boundaries not advanced
-(positional equality against the verified close state with only the
-routine `updated_at` refresh allowed); the final state active and
-running on the settled-but-unbound planning execution; both
-zero-dispatch ensure shapes (the ensure step either opened the new
-generation on top of the verified close state or recognized the already
-open C2 generation — appending its first iteration is the only
-permitted change to the last generation) verified by the same exact
-new-generation check. A hostile coherent result with simultaneously
+old index + 1 and the iteration index exactly 1; the EXACT revision
+delta follows the verified close form (C1: +2 — generation and
+iteration appended; C2-bare: +1 — only the first iteration appended;
+C2-open: 0 — the durable state unchanged); `after.pipeline` matching
+`before.pipeline` through the schema-owned structural identity
+comparator; `schema_version`, `run_id`, status/phase, `started_at`,
+inputs, cursor, executions, transitions, waits, task/plan ledgers,
+grants, terminal/run outputs/failure and the whole generation prefix
+positionally pinned (only the routine `updated_at` refresh allowed);
+and the last generation following the exact form delta: in C1 one new
+generation bound to the caller-selected stage
+id/position/template/plan digest/budget and the wait-boundary anchor
+with exactly one open iteration; in the C2 retry forms the already
+durable generation's immutable bindings (index, stage id/position,
+template, plan digest, initial budget, opening anchor, no generation
+closure) matching before/after exactly — a hostile ensure that
+rewrites them, even into the caller-selected values, never passes —
+with C2-bare allowing only the exact first-iteration append
+(`iteration_count: 0 → 1`, `iterations: [] → [exact iteration 1]`,
+`open_iteration: undefined → exact projection`) and C2-open leaving
+the whole generation record unchanged; a real downstream conflict of
+the caller-selected stage/budget passes through by identity (the
+stage-iteration controller's own `lifecycle_conflict`) and is never
+pre-classified by this layer. A hostile coherent result with simultaneously
 mutated result fields and nested state is compared against the verified
 close state and the trusted compiled stage, never against itself.
 Malformed nested results fail as the composition's own

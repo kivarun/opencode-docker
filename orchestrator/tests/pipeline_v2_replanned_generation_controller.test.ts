@@ -23,7 +23,7 @@ import {
   type CompiledPipelineV2RunPlan,
 } from "../src/pipeline_v2_run_plan_compiled.ts";
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
-import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
+import { ensurePipelineV2StageIteration, closePipelineV2StageIteration, PipelineV2StageIterationControllerError } from "../src/pipeline_v2_stage_iteration_controller.ts";
 import { applyPipelineV2ReviseTaskClosure } from "../src/pipeline_v2_revise_task_closure_controller.ts";
 import { completePipelineV2ReviseTask } from "../src/pipeline_v2_revise_task_completion_controller.ts";
 import {
@@ -220,6 +220,7 @@ interface ReplannedReadyOptions {
   withShiftedIntent?: boolean;
   withContinueResponse?: boolean;
   withLaterWait?: boolean;
+  withPrefixGeneration?: boolean;
 }
 
 interface ReplannedCtx {
@@ -277,7 +278,8 @@ async function replannedReady(options: ReplannedReadyOptions = {}): Promise<Repl
       protectedInputDigest: PROTECTED_DIGEST,
     });
     await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: plan1Candidate });
-    await ensurePipelineV2StageIteration({ compiledPlan: compilePipelineV2RunPlanCandidate(pipeline, plan1Candidate), stageId: "stage-1", initialBudget: 2, sink });
+    const compiledPlan1 = compilePipelineV2RunPlanCandidate(pipeline, plan1Candidate);
+    await ensurePipelineV2StageIteration({ compiledPlan: compiledPlan1, stageId: "stage-1", initialBudget: 2, sink });
     await sink.dispatch({
       kind: "transition_committed",
       step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
@@ -287,20 +289,71 @@ async function replannedReady(options: ReplannedReadyOptions = {}): Promise<Repl
     for (const command of agentPhases("stage")) {
       await sink.dispatch(command);
     }
-    await sink.dispatch({
-      kind: "transition_committed",
-      step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
-      executionIndex: 2,
-    });
+    if (options.withPrefixGeneration === true) {
+      // Close generation 1 through the real active-boundary closure (the
+      // settled stage execution is still unbound), commit the transition,
+      // and open generation 2 of the same plan as a bare generation; the
+      // planning execution of the cycle then runs outside any iteration
+      // and the stage cycle runs inside generation 2's open iteration 1,
+      // so the replanned old generation carries a non-trivial historical
+      // prefix (index 2).
+      await closePipelineV2StageIteration({
+        compiledPlan: compiledPlan1,
+        stageId: "stage-1",
+        iterationCloseReason: "normal_close",
+        generationCloseReason: "next_stage",
+        sink,
+      });
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: 2,
+      });
+      await sink.dispatch({
+        kind: "stage_generation_opened",
+        stageId: "stage-1",
+        stagePosition: 1,
+        templateId: "development",
+        planSha256: plan1.sha256,
+        initialBudget: 2,
+        transitionCount: 2,
+      });
+      await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+      for (const command of agentPhases("planning2")) {
+        await sink.dispatch(command);
+      }
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+        executionIndex: 3,
+      });
+      await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 3 });
+      await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+      for (const command of agentPhases("stage2")) {
+        await sink.dispatch(command);
+      }
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: 4,
+      });
+    } else {
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: 2,
+      });
+    }
     const actions = [
       { id: "continue_stage", to: "dev_entry" },
       { id: "revise_task", to: "architect" },
     ];
+    const waitTransitionCount = options.withPrefixGeneration === true ? 4 : 2;
     const request = preparePipelineV2WaitRequest({
       schema_version: 1,
       run_id: RUN_ID,
       wait_index: 1,
-      transition_count: 2,
+      transition_count: waitTransitionCount,
       state_id: "architect",
       reason: "stage_iteration_limit_exhausted",
       actions,
@@ -377,6 +430,7 @@ async function replannedReady(options: ReplannedReadyOptions = {}): Promise<Repl
       await applyPipelineV2ReviseTaskClosure({ sink, intent: intentUsed });
       await completePipelineV2ReviseTask({ runRoot: fixture.runRoot, sink, intent: intentUsed });
     }
+    const planningExecutionIndex = options.withPrefixGeneration === true ? 5 : 3;
     const preparedPlan2Manifest = {
       schema_version: 1,
       kind: "plan_revision",
@@ -384,7 +438,7 @@ async function replannedReady(options: ReplannedReadyOptions = {}): Promise<Repl
       revision: 2,
       previous_sha256: plan1.sha256,
       root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
-      origin_execution: 3,
+      origin_execution: planningExecutionIndex,
       stages: [
         {
           id: "stage-1",
@@ -1967,6 +2021,142 @@ describe("closePipelineV2ReplannedGeneration", () => {
       expectCloseError(cause, "invalid_state");
     } finally {
       await disposeRun(foreignAnchor.fixture);
+    }
+  });
+
+  test("42. the prefix C2 retry form (old generation index 2, bare new generation) is a zero-dispatch success", async () => {
+    const ctx = await replannedReady({ withPrefixGeneration: true });
+    try {
+      const stateBefore = ctx.sink.snapshot as PipelineV2RunState;
+      expect(stateBefore.generations).toHaveLength(2);
+      expect(stateBefore.generations[0]!.closed?.by).toBe("next_stage");
+      expect(stateBefore.generations[1]!.closed).toBeUndefined();
+      const first = await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(first.generation_index).toBe(2);
+      const faultedSink = await PipelineV2RunStateSink.open({
+        stateRoot: ctx.fixture.stateRoot,
+        runId: RUN_ID,
+        io: faultIo({ failCommit: 2, failStep: "rename" }),
+        now: nextTick,
+      });
+      const faultCause = await catchClose(() =>
+        ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: faultedSink }),
+      );
+      expect(faultCause).toBeInstanceOf(PipelineV2StageIterationControllerError);
+      const afterFault = (await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick })).snapshot as PipelineV2RunState;
+      expect(afterFault.generations).toHaveLength(3);
+      expect(afterFault.generations[2]!.open_iteration).toBeUndefined();
+      const retrySink = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const recording = recordingSink(retrySink);
+      const result = await closePipelineV2ReplannedGeneration({ sink: recording, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(recording.commands).toEqual([]);
+      expect(result.generation_index).toBe(2);
+      expect(result.iteration_index).toBe(1);
+      expect(result.wait_index).toBe(1);
+      const state = retrySink.snapshot as PipelineV2RunState;
+      expect(state.generations).toHaveLength(3);
+      expect(state.generations[0]!.closed?.by).toBe("next_stage");
+      expect(state.generations[1]!.closed).toEqual({ by: "replanned", closed_transition_count: 4 });
+      expect(state.generations[2]!.index).toBe(3);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("43. the prefix C2 retry form with the first iteration open is a zero-dispatch success", async () => {
+    const ctx = await replannedReady({ withPrefixGeneration: true });
+    try {
+      const first = await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(first.generation_index).toBe(2);
+      await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: ctx.sink });
+      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      const recording = recordingSink(ctx.sink);
+      const result = await closePipelineV2ReplannedGeneration({ sink: recording, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(recording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).revision).toBe(revisionBefore);
+      expect(result.generation_index).toBe(2);
+      const state = ctx.sink.snapshot as PipelineV2RunState;
+      expect(state.generations).toHaveLength(3);
+      expect(state.generations[1]!.closed).toEqual({ by: "replanned", closed_transition_count: 4 });
+      expect(state.generations[2]!.open_iteration).toEqual({ index: 1, opened_transition_count: 4 });
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("44. the racing path recognizes the prefix C2 suffix on an old generation with index > 1", async () => {
+    const ctx = await replannedReady({ withPrefixGeneration: true });
+    try {
+      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      let racingAfter: PipelineV2RunState | null | undefined;
+      const racing: PipelineV2ReplannedGenerationControllerSink = {
+        get snapshot() {
+          if (racingAfter === undefined) {
+            return ctx.sink.snapshot;
+          }
+          return racingAfter;
+        },
+        poisoned: ctx.sink.poisoned,
+        async dispatch(command) {
+          await ctx.sink.dispatch(command);
+          await ctx.sink.dispatch({
+            kind: "stage_generation_opened",
+            stageId: "stage-1",
+            stagePosition: 1,
+            templateId: "development",
+            planSha256: ctx.plan2.sha256,
+            initialBudget: 2,
+            transitionCount: 4,
+          });
+          await ctx.sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 3, iterationIndex: 1, transitionCount: 4 });
+          racingAfter = ctx.sink.snapshot;
+          throw new PipelineV2StateError("racing injected");
+        },
+      };
+      const result = await closePipelineV2ReplannedGeneration({ sink: racing, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(result.generation_index).toBe(2);
+      expect(result.state.revision).toBe(revisionBefore + 3);
+      const state = ctx.sink.snapshot as PipelineV2RunState;
+      expect(state.generations).toHaveLength(3);
+      expect(state.generations[1]!.closed).toEqual({ by: "replanned", closed_transition_count: 4 });
+      expect(state.generations[2]!.open_iteration).toEqual({ index: 1, opened_transition_count: 4 });
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("45. an extra generation after the prefix C2 form is fail-closed", async () => {
+    const ctx = await replannedReady({ withPrefixGeneration: true });
+    try {
+      await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: ctx.sink });
+      const hostile = mutateSnapshotSink(ctx.sink, (state) => {
+        const generation = state.generations[2]!;
+        (state.generations as unknown as unknown[]).push({
+          index: 4,
+          stage_id: "stage-1",
+          stage_position: 1,
+          template_id: "development",
+          plan_sha256: ctx.plan2.sha256,
+          initial_budget: 2,
+          opened_transition_count: 4,
+          iteration_count: 0,
+          iterations: [],
+        });
+        (state.generations as unknown as unknown[])[2] = {
+          ...generation,
+          closed: { by: "next_stage", closed_transition_count: 4 },
+          open_iteration: undefined,
+          iterations: [{ index: 1, opened_transition_count: 4, closed: { by: "normal_close", closed_transition_count: 4 } }],
+        };
+      });
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: hostile, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+      );
+      const error = expectCloseError(cause, "lifecycle_conflict");
+      expect(error.message).toContain("the target iteration closure is not the exact replanned closure");
+    } finally {
+      await disposeRun(ctx.fixture);
     }
   });
 });
