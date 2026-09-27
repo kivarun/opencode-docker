@@ -42,8 +42,9 @@ export {
  * Capture and provenance ordering (fail-closed, tested): the options
  * shape → `sink` → `intent` → `compiledPlan` each read once → the sink's
  * `poisoned`, `dispatch` and initial `snapshot` members each captured
- * exactly once as opaque references with `dispatch` bound to the sink
- * before the first await → the poison latch → the existing manifest
+ * exactly once as opaque references; the captured dispatch is then
+ * checked and bound to the sink before the first await; only after that
+ * does the poison latch run → the existing manifest
  * registry provenance gate of the intent (no intent field is read before
  * it, Proxy traps never invoked) with the strict `revise_task_intent`
  * kind → the existing compiled-plan provenance gate, equally before any
@@ -100,17 +101,25 @@ export {
  * classification and no state restoration. A partially matching closure
  * is never an idempotent success. The post-dispatch verification is the
  * same targeted comparison on the normal resolve path and the racing
- * reducer-rejection path: the revision moved exactly `before + 1`, the
- * run id and the durable pipeline identity unchanged, status, phase,
- * cursor and boundary journals unchanged, the wait journal, the task
- * ledger and the plan ledger positionally unchanged, the generation
- * journal length unchanged with historical generations and the
- * historical iteration prefix unchanged, and the single new field the
- * exact `replanned` closure with
- * `closed_transition_count === wait.transition_count`; the comparisons
- * are defensive contract-owned helpers — a malformed hostile snapshot
- * yields a typed controller error, never a `TypeError`; a racing exact
- * closure is an idempotent success on that full verification, while a
+ * reducer-rejection path. After the C0 dispatch the state is allowed to
+ * change in exactly three ways — the revision `before + 1`, the routine
+ * `updated_at` refresh, and the exact `replanned` closure with
+ * `closed_transition_count === wait.transition_count` appearing on the
+ * target generation — while every other durable region is compared
+ * positionally by its schema-owned fields: `schema_version`, `run_id`,
+ * `status`, `phase`, `started_at`, the pipeline identity, the whole
+ * `inputs[]`, the cursor, the whole `executions[]` (common
+ * identity/role/phase fields plus the agent attempt/profile/session
+ * ids/cleanup pair/outputs/failure and the decision input/result/failure),
+ * the whole `transitions[]` (all five fields), `waits[]`,
+ * `task_revisions[]`, `plan_revisions[]`, `grants[]`, the
+ * terminal/run-outputs/failure projections, and the generation journal
+ * with its iteration history; the comparisons are defensive
+ * contract-owned helpers — every viewed array and record is checked
+ * before any field access, a malformed hostile snapshot yields a typed
+ * controller error, never a `TypeError`, no clone-and-compare and no
+ * recursive deep comparator is used; a racing exact closure is an
+ * idempotent success on that full verification, while a
  * resolve-without-change, a wrong revision delta, a changed run id, an
  * altered binding or a partial closure is a failure, never a success.
  *
@@ -119,10 +128,13 @@ export {
  * further dispatch and fails `state_persist_failed` with the adopted
  * state (a fresh retry with a reopened sink recognizes the exact C1
  * closure with zero dispatch); a plain store error (`not_committed`)
- * keeps the previous open-generation state authoritative and a fresh
- * retry dispatches the closing command again; unexpected errors keep
- * their identity. Diagnostics are content-free (no digest values,
- * canonical JSON, bodies, paths, env values or credentials).
+ * keeps the previous open-generation state — the already validated
+ * initial snapshot — authoritative (no snapshot re-read and no second
+ * validator run: the single `validatePipelineV2RunState` call remains
+ * the only one) and a fresh retry dispatches the closing command again;
+ * unexpected errors keep their identity. Diagnostics are content-free
+ * (no digest values, canonical JSON, bodies, paths, env values or
+ * credentials).
  *
  * The result is deep-frozen and content-free:
  * `{wait_index, generation_index, iteration_index, intent_sha256,
