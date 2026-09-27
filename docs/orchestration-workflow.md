@@ -2948,7 +2948,7 @@ origin_execution, stage_id, stage_position, template_id,
 initial_budget, state}` — no compiled plan/stage object, no
 intent/candidate/manifests, no canonical JSON, no paths, no task
 bodies, no caller-owned objects. Tests:
-`orchestrator/tests/pipeline_v2_replanned_stage_controller.test.ts` (48
+`orchestrator/tests/pipeline_v2_replanned_stage_controller.test.ts` (51
 tests, fixtures built only through the real reducer/sink/store and the
 existing run-plan/stage-iteration/revise-task/replanned-generation
 controllers) cover the C0 path with the exact composed command order
@@ -2994,7 +2994,12 @@ revision that is not the accepted revision minus one) plus the
 corrupted nested close-state shapes (execution
 `outputs`/`session_cleanup`/decision `result`, their output and
 id-list elements, historical wait `actions`/`intent`/`response`, and
-generation `open_iteration`/`iterations`/iteration `closed`), the
+generation `open_iteration`/`iterations`/iteration `closed`) and the
+pre-ensure obligation regressions (a null `closed` projection on a
+historical prefix generation, a wait record without its actions
+array, and `selected`/`uncovered`/`inconsistent_facts` decision
+results without their required id lists — all with zero ensure
+calls), the
 option/ops
 getter-count battery with caller mutation isolation across the
 composition, downstream/unexpected error identity, content-free

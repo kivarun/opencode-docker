@@ -2408,6 +2408,112 @@ describe("openPipelineV2ReplannedStage", () => {
       await disposeRun(ctx.fixture);
     }
   });
+  test("49. a null closure projection on a historical prefix generation is invalid_result with zero ensure calls", async () => {
+    const ctx = await replannedStageReady({ withPrefixGeneration: true });
+    try {
+      // The historical prefix generation's `closed` projection is only
+      // compared positionally inside the ensure verification
+      // (`generationUnchanged` → `closureProjectionEquals`), which reads
+      // `before.by` without a guard — a hostile null must be rejected by
+      // the close-result verification BEFORE the ensure call.
+      await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      const ops = mutatedCloseOps(ctx, (_result, state) => {
+        ((state.generations[0] as unknown as Record<string, unknown>))["closed"] = null;
+      });
+      const cause = await catchOpen(() =>
+        openPipelineV2ReplannedStageWithOps(ops, {
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          stageId: "stage-1",
+          initialBudget: 2,
+        }),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(error.message).not.toContain("Body A");
+      expect(ops.ensureCalls()).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("50. a wait record without its actions array is invalid_result with zero ensure calls", async () => {
+    const ctx = await replannedStageReady();
+    try {
+      // `waitRecordEquals` reads `before.actions.length` without a
+      // guard; the schema-v7 wait record always carries its ordered
+      // action declarations, so the close-result verification requires
+      // the array for every wait record BEFORE the ensure call. The
+      // default fixture carries exactly one wait, so the same missing
+      // check path the request names for an earlier wait is proven on
+      // the reachable single-wait journal.
+      await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      const ops = mutatedCloseOps(ctx, (_result, state) => {
+        delete ((state.waits[state.waits.length - 1] as unknown as Record<string, unknown>))["actions"];
+      });
+      const cause = await catchOpen(() =>
+        openPipelineV2ReplannedStageWithOps(ops, {
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          stageId: "stage-1",
+          initialBudget: 2,
+        }),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(error.message).not.toContain("Body A");
+      expect(ops.ensureCalls()).toBe(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("51. selected, uncovered and inconsistent decision results without their required id lists are invalid_result with zero ensure calls", async () => {
+    const ctx = await replannedStageReady();
+    try {
+      // `decisionResultEquals` reads the id lists through
+      // `stringListEquals(before.<list>, ...)` for these statuses, so a
+      // record whose required list is absent must be rejected by the
+      // close-result verification BEFORE the ensure call. The check is
+      // status-shaped, so the mutation places the hostile result on the
+      // reachable settled execution record.
+      await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      const variants: Array<(state: PipelineV2RunState) => void> = [
+        (state) => {
+          const execution = state.executions[state.executions.length - 1] as unknown as Record<string, unknown>;
+          execution["result"] = { status: "selected", outcome: "stage_development", decision: "next", rule_id: "r" };
+        },
+        (state) => {
+          const execution = state.executions[state.executions.length - 1] as unknown as Record<string, unknown>;
+          execution["result"] = { status: "uncovered", outcome: "uncovered" };
+        },
+        (state) => {
+          const execution = state.executions[state.executions.length - 1] as unknown as Record<string, unknown>;
+          execution["result"] = { status: "inconsistent_facts", outcome: "inconsistent_facts" };
+        },
+      ];
+      for (const variant of variants) {
+        const ops = mutatedCloseOps(ctx, (_result, state) => variant(state));
+        const cause = await catchOpen(() =>
+          openPipelineV2ReplannedStageWithOps(ops, {
+            sink: ctx.sink,
+            intent: ctx.intent,
+            compiledPlan: ctx.compiledPlan,
+            stageId: "stage-1",
+            initialBudget: 2,
+          }),
+        );
+        const error = expectOpenError(cause);
+        expect(error.reason).toBe("invalid_result");
+        expect(error.message).not.toContain("Body A");
+        expect(ops.ensureCalls()).toBe(0);
+      }
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
 });
 
 test("26. the runtime export surfaces are exact (public two keys, internal three keys)", async () => {

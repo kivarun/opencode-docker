@@ -112,13 +112,16 @@ import type {
  * one. The nested shapes the ensure comparison later reads without
  * guards are covered too: every execution record's `outputs` (undefined
  * or an array of records), `session_cleanup` and a decision `result`
- * (undefined or records, the result's id lists undefined or arrays);
- * every wait record's `actions` (undefined or an array of records),
- * `intent` and `response` (undefined or records); and every generation
- * record's `open_iteration` (undefined or a record), `iterations`
- * (undefined or an array) and iteration records' `closed` (undefined or
- * a record). A hostile close result therefore never reaches the ensure
- * call and never escapes as a `TypeError`.
+ * (undefined or records; for `selected`/`uncovered` statuses the
+ * `active_constraint_ids` list and for `inconsistent_facts` the
+ * `violated_relation_ids` list are REQUIRED arrays, otherwise the id
+ * lists are undefined or arrays); every wait record's REQUIRED
+ * `actions` (an array of records), `intent` and `response` (undefined or
+ * records); and every generation record's `closed` and `open_iteration`
+ * (undefined or records), `iterations` (undefined or an array) and
+ * iteration records' `closed` (undefined or a record). A hostile close
+ * result therefore never reaches the ensure call and never escapes as a
+ * `TypeError`.
  *
  * Ensure-result verification (defensive, targeted): `compiled_stage`
  * is the exact object the trusted resolver returned (identity, never a
@@ -500,6 +503,31 @@ function verifyCloseResult(
           );
         }
         if (isRecord(decisionResult)) {
+          // Status-dependent list obligations: `decisionResultEquals`
+          // reads the list through `stringListEquals(before.<list>, ...)`
+          // for these statuses, so an absent or null list must be
+          // rejected here, BEFORE the ensure call. `invalid_facts`
+          // carries no id lists and has no obligation.
+          if (
+            (decisionResult["status"] === "selected" || decisionResult["status"] === "uncovered") &&
+            !Array.isArray(decisionResult["active_constraint_ids"])
+          ) {
+            throw controllerError(
+              "invalid_result",
+              "the closure result state carries a selected or uncovered decision result without its constraint id list",
+              state,
+            );
+          }
+          if (
+            decisionResult["status"] === "inconsistent_facts" &&
+            !Array.isArray(decisionResult["violated_relation_ids"])
+          ) {
+            throw controllerError(
+              "invalid_result",
+              "the closure result state carries an inconsistent decision result without its violated relation id list",
+              state,
+            );
+          }
           if (decisionResult["active_constraint_ids"] !== undefined && !Array.isArray(decisionResult["active_constraint_ids"])) {
             throw controllerError(
               "invalid_result",
@@ -550,9 +578,17 @@ function verifyCloseResult(
       );
     }
     // The nested generation shapes the ensure comparison later reads
-    // without guards: `open_iteration` (undefined or a record),
-    // `iterations` (undefined or an array) and every iteration record's
-    // `closed` (undefined or a record).
+    // without guards, for every generation record (not only the old
+    // target): `closed` (undefined or a record), `open_iteration`
+    // (undefined or a record), `iterations` (undefined or an array) and
+    // every iteration record's `closed` (undefined or a record).
+    if (entry["closed"] !== undefined && !isRecord(entry["closed"])) {
+      throw controllerError(
+        "invalid_result",
+        "the closure result state carries a malformed generation closure projection",
+        state,
+      );
+    }
     if (entry["open_iteration"] !== undefined && !isRecord(entry["open_iteration"])) {
       throw controllerError(
         "invalid_result",
@@ -605,25 +641,24 @@ function verifyCloseResult(
       );
     }
     // The nested wait shapes the ensure comparison later reads without
-    // guards, for every wait record (not only the target): `actions`
-    // (undefined or an array of records), `intent` and `response`
-    // (undefined or records).
-    if (entry["actions"] !== undefined && !Array.isArray(entry["actions"])) {
+    // guards, for every wait record (not only the target): `actions` is
+    // REQUIRED (an array of records — the schema-v7 wait record always
+    // carries its ordered action declarations), while `intent` and
+    // `response` are undefined or records.
+    if (!Array.isArray(entry["actions"])) {
       throw controllerError(
         "invalid_result",
-        "the closure result state carries a malformed wait action declaration region",
+        "the closure result state carries a wait record without its ordered action declarations",
         state,
       );
     }
-    if (Array.isArray(entry["actions"])) {
-      for (const action of entry["actions"]) {
-        if (!isRecord(action)) {
-          throw controllerError(
-            "invalid_result",
-            "the closure result state carries a malformed wait action declaration",
-            state,
-          );
-        }
+    for (const action of entry["actions"]) {
+      if (!isRecord(action)) {
+        throw controllerError(
+          "invalid_result",
+          "the closure result state carries a malformed wait action declaration",
+          state,
+        );
       }
     }
     if (entry["intent"] !== undefined && !isRecord(entry["intent"])) {
