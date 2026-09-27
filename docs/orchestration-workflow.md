@@ -3012,6 +3012,71 @@ graph transition commit, automatic resume,
 coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
 migrations/API/T3, multi-process locking.
 
+### Replanned-stage transition controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_replanned_stage_transition_controller.ts`
+(public facade) +
+`pipeline_v2_replanned_stage_transition_controller_internal.ts`
+(internal core) commits the single planning transition that follows a
+successful replanned-stage composition. Input is exactly
+`{pipeline, sink, intent, compiledPlan, stageId, initialBudget}`; the
+controller accepts no transition fields from the caller and commits at
+most one `transition_committed`. Capture order: options shape → the six
+options fields each exactly once → the sink's
+`poisoned`/`dispatch`/`snapshot` members once with `dispatch` bound to
+the sink → poison latch → the intent provenance gate → the compiled
+stage through the single trusted resolver
+`compiledPipelineV2RunPlanStageFor` (stage position from the compiled
+plan's declaration order; resolver errors pass by identity) →
+`initialBudget` a positive safe integer → the single
+`validatePipelineV2RunState` → the hidden originating-identity
+comparison (`comparePipelineV2RunIdentity`) → the durable bindings.
+C0 bindings: active/running, no terminal/publication/failure; the
+target wait exactly once, keeping the exact accepted intent and
+answered exactly with `revise_task`; the last durable plan revision
+equal to the compiled plan (revision/digest/origin) with a predecessor
+record; the OLD generation closed exactly `by: "replanned"` on the
+wait's anchor, bound to the PREDECESSOR plan digest, and its last
+iteration bound to the wait by the exact `replanned` closure
+(`wait_index` and `closed_transition_count` exact; the generation's
+`closed.by` alone is never sufficient); the NEW generation (strictly
+the last) open with the exact stage id/position/template/current-plan
+digest and the caller-selected budget, opening on the wait anchor with
+exactly iteration 1 (exact `open_iteration` projection); the last
+execution the settled planning execution (`cleanup_completed`, at the
+declared target, `index === origin_execution`). The PREMATURE call
+(before the composition) — the old iteration already closed
+`by: "replanned"` while the old GENERATION is still open and no next
+generation of the accepted plan exists — is typed `invalid_state`
+before any dispatch and is never described as a stage execution inside
+the old iteration. The step is derived only from the durable cursor
+(C0) or the exact durable transition (C1), the last planning execution
+and `compiledTransitionFor(pipeline, from, "completed")`; `to` must
+equal the compiled stage's `entry_state` (two stages may share one
+entry state, so the step alone never proves the stage binding); engine
+errors pass by identity. C1 recognizes only the exact durable
+transition by all five fields with the cursor at `to` and no started
+next execution; a changed field is `lifecycle_conflict`, never an
+idempotent success. Post-dispatch verification: revision exactly +1,
+the exact new transition record and moved cursor; every other durable
+field unchanged except the routine `updated_at`; a dispatch resolving
+without this exact change is `invalid_state`, never a success.
+Durability: `not_committed` keeps the previous snapshot (fresh retry
+re-dispatches); `durability_unknown` adopts the candidate, poisons the
+sink and a fresh reopened sink recognizes the durable transition with
+zero dispatch. Failure reasons: `invalid_options | invalid_state |
+lifecycle_conflict | state_persist_failed`; diagnostics are
+content-free. Tests:
+`orchestrator/tests/pipeline_v2_replanned_stage_transition_controller.test.ts`
+(12 tests) cover the premature refusal with zero dispatch and a
+byte-identical snapshot, the exact C0 command/result/loader round-trip,
+the foreign stage with a shared entry state and the foreign budget
+refused before dispatch, the C1 exact retry, a changed transition
+field, a resolve-without-change dispatch, both durability windows with
+fresh-retry continuations, the provenance battery (hand-built intent,
+cloned compiled plan, Proxy pipeline with zero traps and pass-through
+typed errors), and the export/source scans.
+
 ### Stage generation/iteration controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
