@@ -128,6 +128,46 @@ RUN groupadd --gid 1000 opencode \
 ENV HOME=/home/opencode \
     PLATFORMIO_CORE_DIR=/home/opencode/.platformio
 
+# OpenCode global permission config: deterministic read-only access to the
+# pre-installed ESP32 toolchain (the pip venv and the PlatformIO core dir)
+# without opening the rest of the filesystem. opencode evaluates permission
+# patterns with the LAST matching rule winning, so the broad deny is listed
+# first and the two tool roots after it: every path outside the workspace
+# stays denied for external access (no permission prompts, headless runs
+# included), both tool roots stay readable by the read/grep/glob tools, and
+# the edit tool is explicitly denied on both roots. The edit tool submits
+# out-of-worktree paths as worktree-relative strings (`../home/...`), so the
+# deny list carries the absolute forms and wildcard forms that also match
+# those relative submissions (the absolute forms stay inert for an absolute
+# submission or a future opencode that matches absolutes). The hard write
+# boundary is the Unix permissions: /opt/esp32-venv is root-owned (opencode
+# cannot write it at all), while /home/opencode/.platformio must stay
+# user-owned for PlatformIO build operations (package installs, platform
+# caches) — the edit deny covers OpenCode's file-editing tools; `pio` runs
+# through bash and keeps working. A per-profile OPENCODE_CONFIG_CONTENT
+# merge that does not redefine `permission` leaves these rules in effect.
+RUN set -eux; \
+    install -m 0644 /dev/null /home/opencode/.config/opencode/opencode.json; \
+    printf '%s\n' \
+        '{' \
+        '  "$schema": "https://opencode.ai/config.json",' \
+        '  "permission": {' \
+        '    "external_directory": {' \
+        '      "*": "deny",' \
+        '      "/opt/esp32-venv/**": "allow",' \
+        '      "/home/opencode/.platformio/**": "allow"' \
+        '    },' \
+        '    "edit": {' \
+        '      "*": "allow",' \
+        '      "/opt/esp32-venv/**": "deny",' \
+        '      "/home/opencode/.platformio/**": "deny",' \
+        '      "**/opt/esp32-venv/**": "deny",' \
+        '      "**/.platformio/**": "deny"' \
+        '    }' \
+        '  }' \
+        '}' > /home/opencode/.config/opencode/opencode.json; \
+    chown opencode:opencode /home/opencode/.config/opencode/opencode.json
+
 USER opencode
 WORKDIR /workspace
 
@@ -233,6 +273,29 @@ RUN --network=none set -eux; \
     && docker-helper version \
     && pio pkg list --global --only-platforms \
     && test "$(opencode -c --version)" = "$(opencode --version)"
+
+# Regression: the baked OpenCode permission config grants read access to the
+# installed toolchain roots without opening the rest of the filesystem, and
+# denies OpenCode edits there. jq pins the exact rule set AND the rule order
+# (opencode evaluates the LAST matching rule, so the broad deny must precede
+# the tool-root allows), the file stays owned by opencode with a fixed mode,
+# and `opencode debug config` proves OpenCode itself resolves the file
+# cleanly with the rules surviving resolution.
+RUN --network=none set -eux; \
+    cfg=/home/opencode/.config/opencode/opencode.json; \
+    test "$(stat -c '%U:%G %a' "${cfg}")" = "opencode:opencode 644"; \
+    test "$(jq -r '."$schema"' "${cfg}")" = "https://opencode.ai/config.json"; \
+    test "$(jq -c '.permission.external_directory | keys_unsorted' "${cfg}")" = '["*","/opt/esp32-venv/**","/home/opencode/.platformio/**"]'; \
+    test "$(jq -r '.permission.external_directory["*"]' "${cfg}")" = "deny"; \
+    test "$(jq -r '.permission.external_directory["/opt/esp32-venv/**"]' "${cfg}")" = "allow"; \
+    test "$(jq -r '.permission.external_directory["/home/opencode/.platformio/**"]' "${cfg}")" = "allow"; \
+    test "$(jq -c '.permission.edit | keys_unsorted' "${cfg}")" = '["*","/opt/esp32-venv/**","/home/opencode/.platformio/**","**/opt/esp32-venv/**","**/.platformio/**"]'; \
+    test "$(jq -r '.permission.edit["*"]' "${cfg}")" = "allow"; \
+    test "$(jq -r '.permission.edit["/opt/esp32-venv/**"]' "${cfg}")" = "deny"; \
+    test "$(jq -r '.permission.edit["/home/opencode/.platformio/**"]' "${cfg}")" = "deny"; \
+    test "$(jq -r '.permission.edit["**/opt/esp32-venv/**"]' "${cfg}")" = "deny"; \
+    test "$(jq -r '.permission.edit["**/.platformio/**"]' "${cfg}")" = "deny"; \
+    opencode debug config | jq -e '.permission.external_directory["/home/opencode/.platformio/**"] == "allow" and .permission.external_directory["*"] == "deny" and .permission.edit["/opt/esp32-venv/**"] == "deny"' > /dev/null
 
 # Launch contract: the launcher's container command list is appended to
 # the ENTRYPOINT, so `oc-esp32 -c` runs OpenCode with the `-c`
