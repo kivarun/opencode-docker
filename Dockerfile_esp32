@@ -148,7 +148,7 @@ ENV HOME=/home/opencode \
 # through bash and keeps working. A per-profile OPENCODE_CONFIG_CONTENT
 # merge that does not redefine `permission` leaves these rules in effect.
 RUN set -eux; \
-    install -m 0644 /dev/null /home/opencode/.config/opencode/opencode.json; \
+    install -m 0644 -o opencode -g opencode /dev/null /home/opencode/.config/opencode/opencode.json; \
     printf '%s\n' \
         '{' \
         '  "$schema": "https://opencode.ai/config.json",' \
@@ -166,8 +166,7 @@ RUN set -eux; \
         '      "**/.platformio/**": "deny"' \
         '    }' \
         '  }' \
-        '}' > /home/opencode/.config/opencode/opencode.json; \
-    chown opencode:opencode /home/opencode/.config/opencode/opencode.json
+        '}' > /home/opencode/.config/opencode/opencode.json
 
 USER opencode
 WORKDIR /workspace

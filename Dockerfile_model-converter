@@ -206,11 +206,7 @@ RUN chmod 0755 /usr/local/bin/verify-litertlm \
 #
 COPY model-converter/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
-    && chown -R opencode:opencode \
-        /home/opencode \
-        /workspace \
-        /tmp/opencode
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 ENV HOME=/home/opencode
 

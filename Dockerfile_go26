@@ -18,7 +18,6 @@ ENV GOROOT=/usr/local/go
 ENV GOPATH=/home/opencode/go
 ENV PATH="/usr/local/go/bin:/home/opencode/go/bin:${PATH}"
 
-RUN mkdir -p /home/opencode/go \
-    && chown -R opencode:opencode /home/opencode/go
+RUN install -d -m 0755 -o opencode -g opencode /home/opencode/go
 
 USER opencode

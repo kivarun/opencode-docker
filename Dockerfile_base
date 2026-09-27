@@ -21,8 +21,6 @@ RUN install -d \
       /home/opencode/.cache \
       /tmp/opencode
 
-USER root
-
 RUN echo '@edge-testing https://dl-cdn.alpinelinux.org/alpine/edge/testing' \
       >> /etc/apk/repositories \
     && apk add --no-cache \
