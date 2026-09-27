@@ -24,6 +24,8 @@ import {
   PipelineV2CompiledRunPlanError,
 } from "../src/pipeline_v2_run_plan_compiled.ts";
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
+import { acceptPipelineV2ContinueStageIntent } from "../src/pipeline_v2_continue_stage_intent_controller.ts";
+import { applyPipelineV2ContinueStageGrant } from "../src/pipeline_v2_continue_stage_grant_controller.ts";
 import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
 import { closePipelineV2ReplannedGeneration } from "../src/pipeline_v2_replanned_generation_controller.ts";
 import { openPipelineV2ReplannedStage } from "../src/pipeline_v2_replanned_stage_controller.ts";
@@ -201,6 +203,8 @@ interface ReadyCtx {
 
 interface TransitionReadyOptions {
   withStageTwoGeneration?: boolean;
+  withGrantHistory?: boolean;
+  withDecisionExecution?: boolean;
 }
 
 /**
@@ -219,6 +223,21 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
     const fixture = await setupRun();
     const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
     await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS });
+    const decisionShift = options.withDecisionExecution === true ? 1 : 0;
+    if (options.withDecisionExecution === true) {
+      // A historical decision execution with a correct selected result:
+      // every later index shifts by one.
+      await sink.dispatch({ kind: "start_decision_execution", stateId: "architect", inputDigest: hex("c"), executionRole: "control" });
+      await sink.dispatch({
+        kind: "decision_evaluated",
+        result: { status: "selected", outcome: "iterate", decision: "iterate", rule_id: "rule-1", active_constraint_ids: [] },
+      });
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "iterate", to: "architect", transition_index: 0 },
+        executionIndex: 1,
+      });
+    }
     await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of agentPhases("planning")) {
       await sink.dispatch(command);
@@ -230,7 +249,7 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
       revision: 1,
       previous_sha256: null,
       root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
-      origin_execution: 1,
+      origin_execution: 1 + decisionShift,
       stages: [
         {
           id: "stage-1",
@@ -252,7 +271,7 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
     await sink.dispatch({
       kind: "transition_committed",
       step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
-      executionIndex: 1,
+      executionIndex: 1 + decisionShift,
     });
     await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
     for (const command of agentPhases("stage")) {
@@ -261,8 +280,65 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
     await sink.dispatch({
       kind: "transition_committed",
       step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
-      executionIndex: 2,
+      executionIndex: 2 + decisionShift,
     });
+    if (options.withGrantHistory === true) {
+      // A real continue-stage intervention extends generation 1 by one
+      // iteration: the durable grant ledger becomes non-empty before the
+      // revise cycle starts (the revision-1 tasks in the ledgers stay
+      // untouched by it).
+      const actions = [
+        { id: "continue_stage", to: "dev_entry" },
+        { id: "revise_task", to: "architect" },
+      ];
+      const grantRequest = preparePipelineV2WaitRequest({
+        schema_version: 1,
+        run_id: RUN_ID,
+        wait_index: 1,
+        transition_count: 2 + decisionShift,
+        state_id: "architect",
+        reason: "user_intervention",
+        actions,
+      });
+      await publishPipelineV2WaitRequest(fixture.runRoot, grantRequest.manifest);
+      await sink.dispatch({
+        kind: "run_waiting",
+        stateId: "architect",
+        reason: "user_intervention",
+        requestSha256: grantRequest.sha256,
+        actions,
+      });
+      const continueIntent = prepareWaitIntent({
+        schema_version: 1,
+        kind: "continue_stage_intent",
+        run_id: RUN_ID,
+        wait_index: 1,
+        stage_id: "stage-1",
+        expected_plan_sha256: plan1.sha256,
+        additional_iterations: 1,
+      });
+      await acceptPipelineV2ContinueStageIntent({ runRoot: fixture.runRoot, sink, intent: continueIntent });
+      await applyPipelineV2ContinueStageGrant({ sink, intent: continueIntent });
+      await sink.dispatch({
+        kind: "wait_response_recorded",
+        waitIndex: 1,
+        expectedRequestSha256: grantRequest.sha256,
+        actionId: "continue_stage",
+        responseSha256: hex("a"),
+      });
+      await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 2 + decisionShift });
+      await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 2 });
+      for (const command of agentPhases("stage2")) {
+        await sink.dispatch(command);
+      }
+      await sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: 3 + decisionShift,
+      });
+    }
+    const reviseWaitIndex = options.withGrantHistory === true ? 2 : 1;
+    const reviseWaitTransitionCount = (options.withGrantHistory === true ? 3 : 2) + decisionShift;
     const actions = [
       { id: "continue_stage", to: "dev_entry" },
       { id: "revise_task", to: "architect" },
@@ -270,8 +346,8 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
     const request = preparePipelineV2WaitRequest({
       schema_version: 1,
       run_id: RUN_ID,
-      wait_index: 1,
-      transition_count: 2,
+      wait_index: reviseWaitIndex,
+      transition_count: reviseWaitTransitionCount,
       state_id: "architect",
       reason: "stage_iteration_limit_exhausted",
       actions,
@@ -284,36 +360,45 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
       requestSha256: request.sha256,
       actions,
     });
-    await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: INTENT.sha256 });
+    const reviseIntent = options.withGrantHistory === true
+      ? prepareWaitIntent({
+          schema_version: 1,
+          kind: "revise_task_intent",
+          run_id: RUN_ID,
+          wait_index: 2,
+          task_id: "task-a",
+          expected_previous_task_sha256: A1.sha256,
+          new_task_revision_sha256: A2.sha256,
+        })
+      : INTENT;
+    await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: reviseWaitIndex, intentSha256: reviseIntent.sha256 });
     await sink.dispatch({
       kind: "task_revision_accepted",
       taskId: "task-a",
       revision: 2,
       taskSha256: A2.sha256,
-      waitIndex: 1,
-      intentSha256: INTENT.sha256,
+      waitIndex: reviseWaitIndex,
+      intentSha256: reviseIntent.sha256,
     });
-    await sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "replanned", waitIndex: 1 });
-    await publishPipelineV2WaitRequest(fixture.runRoot, request.manifest);
-    const responseManifest = JSON.stringify({
-      schema_version: 1,
-      run_id: RUN_ID,
-      wait_index: 1,
-      request_sha256: request.sha256,
-      action_id: "revise_task",
+    await sink.dispatch({
+      kind: "stage_iteration_closed",
+      generationIndex: 1,
+      iterationIndex: options.withGrantHistory === true ? 2 : 1,
+      by: "replanned",
+      waitIndex: reviseWaitIndex,
     });
     await sink.dispatch({
       kind: "wait_response_recorded",
-      waitIndex: 1,
+      waitIndex: reviseWaitIndex,
       expectedRequestSha256: request.sha256,
       actionId: "revise_task",
       responseSha256: hex("e"),
     });
-    void responseManifest;
     await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of agentPhases("planning3")) {
       await sink.dispatch(command);
     }
+    const planningExecutionIndex = (options.withGrantHistory === true ? 4 : 3) + decisionShift;
     const stages2 = options.withStageTwoGeneration === true
       ? [
           {
@@ -341,7 +426,7 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
       revision: 2,
       previous_sha256: plan1.sha256,
       root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
-      origin_execution: 3,
+      origin_execution: planningExecutionIndex,
       stages: stages2,
     });
     const candidate2 = preparePipelineV2RunPlanCandidate({
@@ -353,7 +438,7 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
     });
     const accepted = await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot: fixture.runRoot, sink, candidate: candidate2 });
     if (options.withStageTwoGeneration === true) {
-      await closePipelineV2ReplannedGeneration({ sink, intent: INTENT, compiledPlan: accepted.compiled_plan });
+      await closePipelineV2ReplannedGeneration({ sink, intent: reviseIntent, compiledPlan: accepted.compiled_plan });
       await sink.dispatch({
         kind: "stage_generation_opened",
         stageId: "stage-2",
@@ -361,11 +446,11 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
         templateId: "development",
         planSha256: plan2.sha256,
         initialBudget: 2,
-        transitionCount: 2,
+        transitionCount: reviseWaitTransitionCount,
       });
-      await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 2 });
+      await sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: reviseWaitTransitionCount });
     }
-    return { fixture, sink, pipeline, intent: INTENT, compiledPlan: accepted.compiled_plan };
+    return { fixture, sink, pipeline, intent: reviseIntent, compiledPlan: accepted.compiled_plan };
   });
 }
 
@@ -722,6 +807,148 @@ describe("openPipelineV2ReplannedStageTransition", () => {
       expect(recording.commands).toEqual([]);
     } finally {
       await disposeRun(ctx.fixture);
+    }
+  });
+});
+
+/**
+ * A sink that really commits every dispatch but presents a hostile clone
+ * of the authoritative snapshot AFTER the dispatch: the transition
+ * record, cursor and revision delta stay exact while one injected field
+ * is changed. The pre-dispatch snapshot stays the clean authoritative
+ * state, so the comparison baseline is untouched.
+ */
+function mutatedResultSink(
+  inner: PipelineV2RunStateSink,
+  mutate: (state: PipelineV2RunState) => void,
+): PipelineV2ReplannedStageTransitionControllerSink {
+  let dispatched = false;
+  return {
+    get snapshot(): PipelineV2RunState | null {
+      const snapshot = inner.snapshot;
+      if (snapshot === null || !dispatched) {
+        return snapshot;
+      }
+      const clone = structuredClone(snapshot) as PipelineV2RunState;
+      mutate(clone);
+      return clone;
+    },
+    get poisoned() {
+      return inner.poisoned;
+    },
+    async dispatch(command: PipelineV2RunCommand) {
+      await inner.dispatch(command);
+      dispatched = true;
+    },
+  };
+}
+
+describe("post-dispatch full verification", () => {
+  test("13. a dispatch result with a changed historical profile is invalid_state", async () => {
+    const ctx = await transitionReady();
+    try {
+      await openPipelineV2ReplannedStage({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2 });
+      const hostile = mutatedResultSink(ctx.sink, (state) => {
+        ((state.executions[0] as unknown as Record<string, unknown>))["profile"] = "other";
+      });
+      const cause = await callTransition(ctx, hostile).catch((error) => error);
+      const error = expectTransitionError(cause);
+      expect(error.reason).toBe("invalid_state");
+      // The real durable transition stayed committed (the sink really
+      // dispatched); the controller refused the hostile presentation.
+      expect((ctx.sink.snapshot as PipelineV2RunState).transitions).toHaveLength(3);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("14. a changed schema_version is invalid_state", async () => {
+    const ctx = await transitionReady();
+    try {
+      await openPipelineV2ReplannedStage({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2 });
+      const hostile = mutatedResultSink(ctx.sink, (state) => {
+        (state as unknown as Record<string, unknown>)["schema_version"] = 6;
+      });
+      const cause = await callTransition(ctx, hostile).catch((error) => error);
+      const error = expectTransitionError(cause);
+      expect(error.reason).toBe("invalid_state");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("15. a changed protected input digest is invalid_state", async () => {
+    const ctx = await transitionReady();
+    try {
+      await openPipelineV2ReplannedStage({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2 });
+      const hostile = mutatedResultSink(ctx.sink, (state) => {
+        ((state.inputs[0] as unknown as Record<string, unknown>))["digest"] = hex("1");
+      });
+      const cause = await callTransition(ctx, hostile).catch((error) => error);
+      const error = expectTransitionError(cause);
+      expect(error.reason).toBe("invalid_state");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("16. a changed historical grant is invalid_state (real grant fixture)", async () => {
+    const ctx = await transitionReady({ withGrantHistory: true });
+    try {
+      expect((ctx.sink.snapshot as PipelineV2RunState).grants).toHaveLength(1);
+      await openPipelineV2ReplannedStage({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2 });
+      const hostile = mutatedResultSink(ctx.sink, (state) => {
+        ((state.grants[0] as unknown as Record<string, unknown>))["additional_iterations"] = 2;
+      });
+      const cause = await callTransition(ctx, hostile).catch((error) => error);
+      const error = expectTransitionError(cause);
+      expect(error.reason).toBe("invalid_state");
+      expect((ctx.sink.snapshot as PipelineV2RunState).transitions).toHaveLength(4);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("17. hostile historical decision results are invalid_state", async () => {
+    // Every variant needs its own fresh C0 boundary: the hostile sink
+    // really dispatches, so the first attempt commits the transition.
+    const variants: Array<(state: PipelineV2RunState) => void> = [
+      (state) => {
+        ((state.executions[0] as unknown as Record<string, unknown>))["result"] = null;
+      },
+      (state) => {
+        const execution = state.executions[0] as unknown as Record<string, unknown>;
+        execution["result"] = { status: "selected", outcome: "iterate", decision: "iterate", rule_id: "rule-1", active_constraint_ids: ["injected"] };
+      },
+      (state) => {
+        const execution = state.executions[0] as unknown as Record<string, unknown>;
+        execution["result"] = { status: "selected", outcome: "iterate", decision: "iterate", rule_id: "rule-1", active_constraint_ids: [], violated_relation_ids: ["fc-1"] };
+      },
+      (state) => {
+        const execution = state.executions[0] as unknown as Record<string, unknown>;
+        execution["result"] = { status: "selected", outcome: "iterate", decision: "iterate", rule_id: "rule-other", active_constraint_ids: [] };
+      },
+      (state) => {
+        // A control-role decision execution carries no iteration_index;
+        // injecting one is a change of a schema-owned execution field.
+        ((state.executions[0] as unknown as Record<string, unknown>))["iteration_index"] = 2;
+      },
+    ];
+    for (const variant of variants) {
+      const ctx = await transitionReady({ withDecisionExecution: true });
+      try {
+        expect(((ctx.sink.snapshot as PipelineV2RunState).executions[0] as unknown as Record<string, unknown>)["type"]).toBe("decision");
+        await openPipelineV2ReplannedStage({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2 });
+        const hostile = mutatedResultSink(ctx.sink, variant);
+        const cause = await callTransition(ctx, hostile).catch((error) => error);
+        const error = expectTransitionError(cause);
+        expect(error.reason).toBe("invalid_state");
+        // The real durable transition stayed committed (the sink really
+        // dispatched); the controller refused the hostile presentation.
+        expect((ctx.sink.snapshot as PipelineV2RunState).transitions).toHaveLength(4);
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
     }
   });
 });

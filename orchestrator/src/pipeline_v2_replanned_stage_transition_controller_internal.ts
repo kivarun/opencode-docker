@@ -857,9 +857,52 @@ function executionUnchanged(before: PipelineV2RunState["executions"][number], af
   }
   return (
     after["input_digest"] === before.input_digest &&
-    after["result"] === before.result &&
+    after["iteration_index"] === before.iteration_index &&
+    decisionResultUnchanged(before.result, after["result"]) &&
     after["failure_reason"] === before.failure_reason
   );
+}
+
+/**
+ * The historical decision result unchanged by its schema-owned fields
+ * (narrow per-field comparison; no deep comparator, no revalidation).
+ */
+function decisionResultUnchanged(
+  before: unknown,
+  after: unknown,
+): boolean {
+  if (before === undefined) {
+    return after === undefined;
+  }
+  if (!isRecord(before) || !isRecord(after)) {
+    return false;
+  }
+  const scalarEqual = (field: string) => after[field] === before[field];
+  if (
+    !scalarEqual("status") ||
+    !scalarEqual("outcome") ||
+    !scalarEqual("decision") ||
+    !scalarEqual("rule_id") ||
+    !scalarEqual("reason") ||
+    !scalarEqual("fact_id") ||
+    !scalarEqual("actual_type")
+  ) {
+    return false;
+  }
+  const listEqual = (field: string) => {
+    const beforeList = before[field];
+    const afterList = after[field];
+    if (beforeList === undefined) {
+      return afterList === undefined;
+    }
+    return (
+      Array.isArray(beforeList) &&
+      Array.isArray(afterList) &&
+      afterList.length === beforeList.length &&
+      beforeList.every((entry, position) => afterList[position] === entry)
+    );
+  };
+  return listEqual("active_constraint_ids") && listEqual("violated_relation_ids");
 }
 
 /**
@@ -898,6 +941,7 @@ function transitionAppliedExactly(
   if (
     after.run_id !== before.run_id ||
     after.revision !== before.revision + 1 ||
+    after.schema_version !== before.schema_version ||
     after.status !== before.status ||
     after.phase !== before.phase ||
     after.started_at !== before.started_at
@@ -916,6 +960,20 @@ function transitionAppliedExactly(
   }
   if (!Array.isArray(after.inputs) || after.inputs.length !== before.inputs.length) {
     return false;
+  }
+  for (let position = 0; position < before.inputs.length; position += 1) {
+    const beforeInput = before.inputs[position]!;
+    const afterEntry = after.inputs[position];
+    if (
+      afterEntry === undefined ||
+      !isRecord(afterEntry) ||
+      afterEntry["id"] !== beforeInput.id ||
+      afterEntry["type"] !== beforeInput.type ||
+      afterEntry["protected"] !== beforeInput.protected ||
+      afterEntry["digest"] !== beforeInput.digest
+    ) {
+      return false;
+    }
   }
   if (!Array.isArray(after.transitions) || after.transitions.length !== before.transitions.length + 1) {
     return false;
@@ -946,8 +1004,10 @@ function transitionAppliedExactly(
   if (!Array.isArray(after.executions) || after.executions.length !== before.executions.length) {
     return false;
   }
-  if (!executionUnchanged(before.executions[before.executions.length - 1]!, after.executions[after.executions.length - 1])) {
-    return false;
+  for (let position = 0; position < before.executions.length; position += 1) {
+    if (!executionUnchanged(before.executions[position]!, after.executions[position])) {
+      return false;
+    }
   }
   if (
     !Array.isArray(after.waits) ||
@@ -997,6 +1057,21 @@ function transitionAppliedExactly(
   if (!Array.isArray(after.grants) || after.grants.length !== before.grants.length) {
     return false;
   }
+  for (let position = 0; position < before.grants.length; position += 1) {
+    const beforeGrant = before.grants[position]!;
+    const afterEntry = after.grants[position];
+    if (
+      afterEntry === undefined ||
+      !isRecord(afterEntry) ||
+      afterEntry["index"] !== beforeGrant.index ||
+      afterEntry["generation_index"] !== beforeGrant.generation_index ||
+      afterEntry["wait_index"] !== beforeGrant.wait_index ||
+      afterEntry["intent_sha256"] !== beforeGrant.intent_sha256 ||
+      afterEntry["additional_iterations"] !== beforeGrant.additional_iterations
+    ) {
+      return false;
+    }
+  }
   if (
     !Array.isArray(after.generations) ||
     after.generations.length !== before.generations.length ||
@@ -1008,8 +1083,13 @@ function transitionAppliedExactly(
 }
 
 /**
- * The typed classification of a failed authoritative verification,
- * shared by the normal resolve path and the racing dispatch path.
+ * The typed classification of a failed racing-dispatch verification: the
+ * reducer rejected the command because another dispatch already moved the
+ * run, so the presented snapshot is searched for a different committed
+ * transition at the boundary. Used only on the racing `PipelineV2StateError`
+ * path; the normal post-dispatch resolve path reports a mismatched
+ * presentation as `invalid_state` directly (the controller's own dispatch
+ * succeeded, so only the exact change or a lying presentation is possible).
  */
 function raceOrMismatch(
   after: PipelineV2RunState | null,
@@ -1189,7 +1269,14 @@ export async function openPipelineV2ReplannedStageTransitionInternal(
   }
   const after = sinkRef.snapshot;
   if (after === null || !transitionAppliedExactly(after, state, bindings)) {
-    raceOrMismatch(after, bindings);
+    // The dispatch itself just succeeded, so a full mismatch can only be
+    // a hostile or non-authoritative snapshot presentation: the exact
+    // change is missing, never a different lifecycle step.
+    throw controllerError(
+      "invalid_state",
+      `the run state does not carry the committed planning transition of wait ${bindings.wait.index}`,
+      after,
+    );
   }
   return finishResult(after, bindings);
 }
