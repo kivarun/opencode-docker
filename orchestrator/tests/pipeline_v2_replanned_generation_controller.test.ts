@@ -551,6 +551,43 @@ async function catchClose(fn: () => Promise<unknown>): Promise<unknown> {
   throw new Error("the call was expected to fail");
 }
 
+/**
+ * A sink whose post-dispatch snapshot is a narrow `structuredClone`
+ * mutation of the REAL successful reducer-produced state (built after
+ * the actual dispatch); the racing variant additionally throws
+ * `PipelineV2StateError` after applying the command.
+ */
+function mutateAfterDispatchSink(
+  inner: PipelineV2RunStateSink,
+  mutate: (state: PipelineV2RunState) => void,
+  throwRacing = false,
+): { sink: PipelineV2ReplannedGenerationControllerSink; dispatchCount: () => number } {
+  let mutateNext = false;
+  let dispatchCount = 0;
+  const sink: PipelineV2ReplannedGenerationControllerSink = {
+    get snapshot(): PipelineV2RunState | null {
+      const snapshot = inner.snapshot;
+      if (snapshot === null || !mutateNext) {
+        return snapshot;
+      }
+      const clone = structuredClone(snapshot) as PipelineV2RunState;
+      mutate(clone);
+      return clone;
+    },
+    poisoned: inner.poisoned,
+    async dispatch(command: PipelineV2RunCommand) {
+      dispatchCount += 1;
+      await inner.dispatch(command);
+      if (throwRacing) {
+        mutateNext = true;
+        throw new PipelineV2StateError("racing injected");
+      }
+      mutateNext = true;
+    },
+  };
+  return { sink, dispatchCount: () => dispatchCount };
+}
+
 function expectCloseError(
   cause: unknown,
   reason: PipelineV2ReplannedGenerationControllerFailureReason,
@@ -1449,8 +1486,293 @@ describe("closePipelineV2ReplannedGeneration", () => {
       expect(error.message).not.toContain(ctx.intent.sha256);
       expect(error.message).not.toContain("Body");
       expect(error.message).not.toContain(ctx.fixture.runRoot);
+      expect(error.message).not.toContain(hex("9"));
+      expect(error.message).not.toContain(ctx.intent.sha256);
+      expect(error.message).not.toContain("Body");
+      expect(error.message).not.toContain(ctx.fixture.runRoot);
       expect(error.message).not.toContain("run-1");
       expect(error.message).not.toContain("canonical");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("35. the post-dispatch hostile matrix: no false success through narrowed mutations", async () => {
+    const variants: Array<[string, (state: PipelineV2RunState) => void]> = [
+      ["last planning execution state_id", (state) => {
+        const last = state.executions[2] as unknown as Record<string, unknown>;
+        last["state_id"] = "dev_entry";
+      }],
+      ["execution role changed", (state) => {
+        const last = state.executions[2] as unknown as Record<string, unknown>;
+        last["execution_role"] = "control";
+      }],
+      ["execution phase changed", (state) => {
+        const last = state.executions[2] as unknown as Record<string, unknown>;
+        last["phase"] = "agent_data_prepared";
+      }],
+      ["early execution record changed", (state) => {
+        const first = state.executions[0] as unknown as Record<string, unknown>;
+        first["profile"] = "coder";
+      }],
+      ["transition target changed", (state) => {
+        const first = state.transitions[0] as unknown as Record<string, unknown>;
+        first["to"] = "architect";
+      }],
+      ["transition execution index changed", (state) => {
+        const first = state.transitions[0] as unknown as Record<string, unknown>;
+        first["execution_index"] = 2;
+      }],
+      ["input digest changed", (state) => {
+        const input = state.inputs[0] as unknown as Record<string, unknown>;
+        input["digest"] = hex("9");
+      }],
+      ["grant ledger extended", (state) => {
+        (state.grants as unknown as unknown[]).push({
+          index: 1,
+          generation_index: 1,
+          wait_index: 1,
+          intent_sha256: hex("a"),
+          additional_iterations: 1,
+        });
+      }],
+      ["unexpected terminal", (state) => {
+        (state as unknown as Record<string, unknown>)["terminal"] = { state_id: "done", result: "success" };
+      }],
+      ["unexpected run outputs", (state) => {
+        (state as unknown as Record<string, unknown>)["run_outputs"] = [
+          { id: "report", type: "file", required: true, present: true, digest: hex("c") },
+        ];
+      }],
+      ["unexpected failure", (state) => {
+        (state as unknown as Record<string, unknown>)["failure"] = { reason: "internal_error" };
+      }],
+      ["pipeline null", (state) => {
+        (state as unknown as Record<string, unknown>)["pipeline"] = null;
+      }],
+      ["execution entry null", (state) => {
+        (state.executions as unknown as unknown[])[2] = null;
+      }],
+      ["transition entry null", (state) => {
+        (state.transitions as unknown as unknown[])[0] = null;
+      }],
+      ["grant entry null", (state) => {
+        (state.grants as unknown as unknown[])[0] = null;
+      }],
+      ["cleanup pair malformed", (state) => {
+        const last = state.executions[2] as unknown as Record<string, unknown>;
+        last["session_cleanup"] = { execution: "completed" };
+      }],
+      ["agent outputs malformed", (state) => {
+        const last = state.executions[2] as unknown as Record<string, unknown>;
+        last["outputs"] = [{ id: "plan" }];
+      }],
+    ];
+    for (const [label, mutate] of variants) {
+      const ctx = await replannedReady();
+      try {
+        const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+        const { sink, dispatchCount } = mutateAfterDispatchSink(ctx.sink, mutate);
+        const cause = await catchClose(() =>
+          closePipelineV2ReplannedGeneration({ sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+        );
+        if (!(cause instanceof Error)) {
+          throw new Error(`variant ${label}: unexpected success`);
+        }
+        const error = expectCloseError(cause, "lifecycle_conflict");
+        expect(error.message).toContain("does not carry the exact replanned generation closure");
+        expect(error.message).not.toContain(label);
+        expect(error.message).not.toContain(hex("9"));
+        expect(dispatchCount()).toBe(1);
+        // The underlying sink still carries the real closure; the
+        // controller never returns a success built from the hostile
+        // snapshot.
+        const underlying = ctx.sink.snapshot as PipelineV2RunState;
+        expect(underlying.revision).toBe(revisionBefore + 1);
+        expect(underlying.generations[0]!.closed).toEqual({ by: "replanned", closed_transition_count: 2 });
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    }
+  });
+
+  test("36. the same post-dispatch hostile matrix through the racing PipelineV2StateError path", async () => {
+    const variants: Array<(state: PipelineV2RunState) => void> = [
+      (state) => {
+        const last = state.executions[2] as unknown as Record<string, unknown>;
+        last["state_id"] = "dev_entry";
+      },
+      (state) => {
+        (state.executions as unknown as unknown[])[2] = null;
+      },
+      (state) => {
+        const first = state.transitions[0] as unknown as Record<string, unknown>;
+        first["execution_index"] = 2;
+      },
+      (state) => {
+        (state as unknown as Record<string, unknown>)["pipeline"] = null;
+      },
+    ];
+    for (const mutate of variants) {
+      const ctx = await replannedReady();
+      try {
+        const { sink, dispatchCount } = mutateAfterDispatchSink(ctx.sink, mutate, true);
+        const cause = await catchClose(() =>
+          closePipelineV2ReplannedGeneration({ sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+        );
+        expectCloseError(cause, "lifecycle_conflict");
+        expect(dispatchCount()).toBe(1);
+      } finally {
+        await disposeRun(ctx.fixture);
+      }
+    }
+  });
+
+  test("37. an injected PipelineV2RunStateStoreError keeps the single-validator contract", async () => {
+    const ctx = await replannedReady();
+    try {
+      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      const memberReads: Record<string, number> = {};
+      const faulted = await PipelineV2RunStateSink.open({
+        stateRoot: ctx.fixture.stateRoot,
+        runId: RUN_ID,
+        now: nextTick,
+        io: faultIo({ failCommit: 1, failStep: "rename" }),
+      });
+      let dispatchCalls = 0;
+      const proxied = new Proxy(faulted as unknown as Record<string, unknown>, {
+        get(target, prop: string) {
+          memberReads[prop] = (memberReads[prop] ?? 0) + 1;
+          const value = Reflect.get(target, prop);
+          if (prop === "dispatch" && typeof value === "function") {
+            return (command: PipelineV2RunCommand) => {
+              dispatchCalls += 1;
+              return (value as (c: PipelineV2RunCommand) => Promise<void>).call(target, command);
+            };
+          }
+          return value;
+        },
+      }) as unknown as PipelineV2ReplannedGenerationControllerSink;
+      const initialSnapshot = ctx.sink.snapshot;
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: proxied, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+      );
+      const error = expectCloseError(cause, "state_persist_failed");
+      // The already validated initial snapshot stays authoritative: the
+      // exact same revision and the open generation.
+      expect(error.state).not.toBeNull();
+      expect(error.state).toEqual(initialSnapshot);
+      expect((error.state as PipelineV2RunState).revision).toBe(revisionBefore);
+      expect((error.state as PipelineV2RunState).generations[0]!.closed).toBeUndefined();
+      // The snapshot getter was read exactly once (at capture); no
+      // re-read and no second validator run happened.
+      expect(memberReads["snapshot"]).toBe(1);
+      expect(dispatchCalls).toBe(1);
+      const fresh = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const recording = recordingSink(fresh);
+      const result = await closePipelineV2ReplannedGeneration({ sink: recording, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(recording.commands).toEqual([{ kind: "stage_generation_closed", generationIndex: 1, by: "replanned" }]);
+      expect((fresh.snapshot as PipelineV2RunState).revision).toBe(revisionBefore + 1);
+      expect(result.generation_index).toBe(1);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("38. the poisoned-sink capture order: all three members read once, the latch last, no traversal after it", async () => {
+    const ctx = await replannedReady();
+    try {
+      const memberReads: Record<string, number> = {};
+      let dispatchCalls = 0;
+      const poisonedSink: PipelineV2ReplannedGenerationControllerSink = {
+        get poisoned() {
+          memberReads["poisoned"] = (memberReads["poisoned"] ?? 0) + 1;
+          return true;
+        },
+        get dispatch() {
+          memberReads["dispatch"] = (memberReads["dispatch"] ?? 0) + 1;
+          return async (command: PipelineV2RunCommand) => {
+            dispatchCalls += 1;
+            await ctx.sink.dispatch(command);
+          };
+        },
+        get snapshot() {
+          memberReads["snapshot"] = (memberReads["snapshot"] ?? 0) + 1;
+          return ctx.sink.snapshot;
+        },
+      };
+      let intentReads = 0;
+      let planReads = 0;
+      const options = {
+        sink: poisonedSink,
+        get intent(): PreparedPipelineV2RunWaitIntent {
+          intentReads += 1;
+          return ctx.intent;
+        },
+        get compiledPlan(): CompiledPipelineV2RunPlan {
+          planReads += 1;
+          return ctx.compiledPlan;
+        },
+      };
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration(options),
+      );
+      const error = expectCloseError(cause, "invalid_state");
+      expect(error.message).toContain("poisoned");
+      expect(error.state).toBeNull();
+      expect(memberReads["poisoned"]).toBe(1);
+      expect(memberReads["dispatch"]).toBe(1);
+      expect(memberReads["snapshot"]).toBe(1);
+      expect(dispatchCalls).toBe(0);
+      // The intent and compiled-plan fields are read exactly once at
+      // capture (before the latch, per the fixed capture order) and never
+      // again: no provenance or state traversal follows the latch.
+      expect(intentReads).toBe(1);
+      expect(planReads).toBe(1);
+      // A throwing getter at each capture position keeps its identity in
+      // the capture order; no later member is read after the throw.
+      const poisonedCanary = new Error("poisoned getter canary");
+      const poisonedThrowing = {
+        get poisoned() {
+          throw poisonedCanary;
+        },
+        get dispatch() {
+          throw new Error("dispatch must not be read after a throwing poisoned getter");
+        },
+        get snapshot() {
+          throw new Error("snapshot must not be read after a throwing poisoned getter");
+        },
+      };
+      const poisonedCause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: poisonedThrowing as unknown as PipelineV2ReplannedGenerationControllerSink, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+      );
+      expect(poisonedCause).toBe(poisonedCanary);
+      const dispatchCanary = new Error("dispatch getter canary");
+      const dispatchThrowing = {
+        poisoned: false,
+        get dispatch() {
+          throw dispatchCanary;
+        },
+        get snapshot() {
+          throw new Error("snapshot must not be read after a throwing dispatch getter");
+        },
+      };
+      const dispatchCause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: dispatchThrowing as unknown as PipelineV2ReplannedGenerationControllerSink, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+      );
+      expect(dispatchCause).toBe(dispatchCanary);
+      const snapshotCanary = new Error("snapshot getter canary");
+      const snapshotThrowing = {
+        poisoned: false,
+        dispatch: async () => undefined,
+        get snapshot() {
+          throw snapshotCanary;
+        },
+      };
+      const snapshotCause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: snapshotThrowing as unknown as PipelineV2ReplannedGenerationControllerSink, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+      );
+      expect(snapshotCause).toBe(snapshotCanary);
     } finally {
       await disposeRun(ctx.fixture);
     }
@@ -1475,7 +1797,7 @@ test("34. the controller composes the existing layers only (source scan)", async
   const source = readFileSync("orchestrator/src/pipeline_v2_replanned_generation_controller_internal.ts", "utf8");
   const countOf = (pattern: string): number => source.split(pattern).length - 1;
   expect(countOf("reducePipelineV2RunCommand(")).toBe(1);
-  expect(countOf("validatePipelineV2RunState(")).toBe(2);
+  expect(countOf("validatePipelineV2RunState(")).toBe(1);
   expect(countOf("comparePipelineV2RunIdentity(")).toBe(2);
   expect(countOf("hasPreparedRunPlanProvenance(")).toBe(1);
   expect(countOf("hasCompiledRunPlanProvenance(")).toBe(1);

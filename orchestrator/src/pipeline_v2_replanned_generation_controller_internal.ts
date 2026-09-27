@@ -6,6 +6,14 @@ import {
   type PipelineV2RunCommand,
   type PipelineV2RunState,
   type PipelineV2WaitRecord,
+  type PipelineV2RunInputState,
+  type PipelineV2CommittedTransitionState,
+  type PipelineV2IterationGrantState,
+  type PipelineV2AgentOutputState,
+  type PipelineV2SessionCleanupPair,
+  type PipelineDecisionStateRecord,
+  type PipelineV2ExecutionState,
+  type PipelineV2RunOutputState,
 } from "./pipeline_v2_state.ts";
 import {
   PipelineV2RunStateStoreError,
@@ -126,21 +134,26 @@ import type {
  * classification and no state is ever restored. A partially matching
  * closure is never an idempotent success.
  *
- * Post-dispatch verification is the same targeted comparison for the
- * normal resolve path and the racing `PipelineV2StateError` path: the
- * state revision moved exactly `before + 1`; the run id and the durable
- * pipeline identity did not change; status, phase, cursor and the
- * boundary journals are unchanged; the wait journal, the task ledger and
- * the plan ledger keep their length and their positional records; the
- * generation journal keeps its length with historical generations and
- * the historical iteration prefix unchanged; the target generation keeps
- * its index and identity bindings and its target iteration with the
- * exact replanned closure; the single new field is the exact generation
- * closure with `closed_transition_count === wait.transition_count`. The
- * comparisons are defensive contract-owned helpers with
- * `Array.isArray`/record guards; a malformed hostile snapshot yields a
- * typed controller error, never a `TypeError`; nothing is compared by
- * serialization and there is no recursive deep comparator. A racing
+ * Post-dispatch verification is the same full targeted comparison for
+ * the normal resolve path and the racing `PipelineV2StateError` path.
+ * After the C0 dispatch the state is allowed to change in exactly three
+ * ways: `revision === before.revision + 1`, the routine `updated_at`
+ * refresh, and the exact `closed: {by: "replanned", closed_transition_count
+ * === wait.transition_count}` projection appearing on the target
+ * generation; every other durable region is compared positionally by its
+ * schema-owned fields: `schema_version`, `run_id`, `status`, `phase`,
+ * `started_at`, the pipeline identity, the whole `inputs[]`, the cursor,
+ * the whole `executions[]` (common identity/role/phase fields plus the
+ * agent attempt/profile/session ids/cleanup pair/outputs/failure and the
+ * decision input/result/failure), the whole `transitions[]` (all five
+ * fields), `waits[]`, `task_revisions[]`, `plan_revisions[]`, `grants[]`,
+ * the terminal/run-outputs/failure projections, and the generation
+ * journal with its iteration history. The comparisons are defensive
+ * contract-owned helpers with `Array.isArray`/record guards; every
+ * viewed array and record is checked before any field access, so hostile
+ * `null` entries and malformed nested records yield the typed controller
+ * error, never a `TypeError`; nothing is compared by serialization, no
+ * clone-and-compare is used and there is no recursive deep comparator. A racing
  * exact closure is recognized as an idempotent success on that full
  * verification; a resolve-without-change, a wrong revision delta, a
  * changed run id, an altered plan/task/wait/lifecycle binding or a
@@ -153,8 +166,10 @@ import type {
  * further dispatch and fails `state_persist_failed` with the adopted
  * state; a fresh retry with a reopened sink recognizes the exact C1
  * closure with zero dispatch. A plain store error (`not_committed`)
- * leaves the previous open-generation state authoritative (the fresh
- * authoritative snapshot is re-read for the error) and a fresh retry
+ * leaves the previous open-generation state — the already validated
+ * initial snapshot — authoritative (no snapshot re-read and no second
+ * validator run: the single `validatePipelineV2RunState` call remains
+ * the only one) and a fresh retry
  * dispatches the closing command again. Unexpected errors keep their
  * identity. Diagnostics are content-free: no digest values, canonical
  * JSON, task bodies, paths, env values, credentials or hostile canaries.
@@ -675,8 +690,24 @@ function planningExecutionBoundary(
  * The full targeted verification of the state that carries the applied
  * generation closure, against the pre-dispatch state. The same helper
  * verifies the normal resolve path and the racing reducer-rejection path.
- * Defensive, contract-owned, positional; no serialization and no deep
- * comparator.
+ * Defensive, contract-owned, positional; no serialization, no deep
+ * comparator and no second state validation. After the C0 dispatch the
+ * state is allowed to change in exactly three ways: `revision ===
+ * before.revision + 1`, the routine `updated_at` refresh, and the exact
+ * `closed: {by: "replanned", closed_transition_count: wait.transition_count}`
+ * projection appearing on the target generation; every other durable
+ * region is compared positionally by its schema-owned fields — the run
+ * shape (`schema_version`, `run_id`, `status`, `phase`, `started_at`),
+ * the pipeline identity, the whole `inputs[]`, the cursor, the whole
+ * `executions[]` (common identity/role/phase fields plus the agent
+ * attempt/profile/session ids/cleanup pair/outputs/failure and the
+ * decision input/result/failure), the whole `transitions[]` (all five
+ * fields), `waits[]`, `task_revisions[]`, `plan_revisions[]`,
+ * `grants[]`, the terminal/run-outputs/failure projections, and the
+ * generation journal with its iteration history. Every viewed array and
+ * record is checked before any field access, so hostile `null` entries
+ * and malformed nested records yield the typed mismatch, never a
+ * `TypeError`.
  */
 function verifyAppliedClosure(
   before: PipelineV2RunState,
@@ -701,13 +732,16 @@ function verifyAppliedClosure(
   if (after.revision !== before.revision + 1) {
     throw mismatch();
   }
-  if (after.run_id !== before.run_id) {
+  if (
+    after.schema_version !== before.schema_version ||
+    after.run_id !== before.run_id ||
+    after.status !== before.status ||
+    after.phase !== before.phase ||
+    after.started_at !== before.started_at
+  ) {
     throw mismatch();
   }
-  if (comparePipelineV2RunIdentity(before.pipeline, after.pipeline).kind !== "match") {
-    throw mismatch();
-  }
-  if (after.status !== before.status || after.phase !== before.phase) {
+  if (!isRecord(after.pipeline) || comparePipelineV2RunIdentity(before.pipeline, after.pipeline).kind !== "match") {
     throw mismatch();
   }
   if (
@@ -718,11 +752,32 @@ function verifyAppliedClosure(
   ) {
     throw mismatch();
   }
+  if (!Array.isArray(after.inputs) || after.inputs.length !== before.inputs.length) {
+    throw mismatch();
+  }
+  for (let position = 0; position < before.inputs.length; position += 1) {
+    const beforeInput = before.inputs[position];
+    if (beforeInput === undefined || !inputStateEquals(beforeInput, after.inputs[position])) {
+      throw mismatch();
+    }
+  }
   if (!Array.isArray(after.transitions) || after.transitions.length !== before.transitions.length) {
     throw mismatch();
   }
+  for (let position = 0; position < before.transitions.length; position += 1) {
+    const beforeTransition = before.transitions[position];
+    if (beforeTransition === undefined || !transitionEquals(beforeTransition, after.transitions[position])) {
+      throw mismatch();
+    }
+  }
   if (!Array.isArray(after.executions) || after.executions.length !== before.executions.length) {
     throw mismatch();
+  }
+  for (let position = 0; position < before.executions.length; position += 1) {
+    const beforeExecution = before.executions[position];
+    if (beforeExecution === undefined || !executionRecordEquals(beforeExecution, after.executions[position])) {
+      throw mismatch();
+    }
   }
   if (!Array.isArray(after.waits) || after.waits.length !== before.waits.length) {
     throw mismatch();
@@ -734,6 +789,24 @@ function verifyAppliedClosure(
     }
   }
   if (!taskLedgerEquals(before, after) || !planLedgerEquals(before, after)) {
+    throw mismatch();
+  }
+  if (!Array.isArray(after.grants) || after.grants.length !== before.grants.length) {
+    throw mismatch();
+  }
+  for (let position = 0; position < before.grants.length; position += 1) {
+    const beforeGrant = before.grants[position];
+    if (beforeGrant === undefined || !grantEquals(beforeGrant, after.grants[position])) {
+      throw mismatch();
+    }
+  }
+  if (!terminalEquals(before.terminal, after.terminal)) {
+    throw mismatch();
+  }
+  if (!runOutputsEquals(before.run_outputs, after.run_outputs)) {
+    throw mismatch();
+  }
+  if (!failureEquals(before.failure, after.failure)) {
     throw mismatch();
   }
   if (!Array.isArray(after.generations) || after.generations.length !== before.generations.length) {
@@ -844,6 +917,253 @@ function planLedgerEquals(before: PipelineV2RunState, after: PipelineV2RunState)
       afterEntry["origin_execution"] === beforeEntry.origin_execution
     );
   });
+}
+
+/**
+ * The exact positional equality of one run-input record.
+ */
+function inputStateEquals(before: PipelineV2RunInputState, afterValue: unknown): boolean {
+  return (
+    isRecord(afterValue) &&
+    afterValue["id"] === before.id &&
+    afterValue["type"] === before.type &&
+    afterValue["protected"] === before.protected &&
+    afterValue["digest"] === before.digest
+  );
+}
+
+/**
+ * The exact positional equality of one committed-transition record (all
+ * five schema-owned fields).
+ */
+function transitionEquals(before: PipelineV2CommittedTransitionState, afterValue: unknown): boolean {
+  return (
+    isRecord(afterValue) &&
+    afterValue["index"] === before.index &&
+    afterValue["from"] === before.from &&
+    afterValue["outcome"] === before.outcome &&
+    afterValue["to"] === before.to &&
+    afterValue["execution_index"] === before.execution_index
+  );
+}
+
+/**
+ * The exact equality of one iteration-grant record.
+ */
+function grantEquals(before: PipelineV2IterationGrantState, afterValue: unknown): boolean {
+  return (
+    isRecord(afterValue) &&
+    afterValue["index"] === before.index &&
+    afterValue["generation_index"] === before.generation_index &&
+    afterValue["wait_index"] === before.wait_index &&
+    afterValue["intent_sha256"] === before.intent_sha256 &&
+    afterValue["additional_iterations"] === before.additional_iterations
+  );
+}
+
+/**
+ * The exact equality of one agent-output record inside an execution.
+ */
+function agentOutputEquals(before: PipelineV2AgentOutputState, afterValue: unknown): boolean {
+  return (
+    isRecord(afterValue) &&
+    afterValue["id"] === before.id &&
+    afterValue["digest"] === before.digest
+  );
+}
+
+/**
+ * The exact positional equality of one accepted-agent-outputs list; the
+ * absent list stays absent.
+ */
+function agentOutputListEquals(
+  before: PipelineV2AgentOutputState[] | undefined,
+  afterValue: unknown,
+): boolean {
+  if (before === undefined) {
+    return afterValue === undefined;
+  }
+  if (!Array.isArray(afterValue) || afterValue.length !== before.length) {
+    return false;
+  }
+  for (let position = 0; position < before.length; position += 1) {
+    const beforeOutput = before[position];
+    if (beforeOutput === undefined || !agentOutputEquals(beforeOutput, afterValue[position])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The exact equality of one durable session-cleanup pair.
+ */
+function sessionCleanupEquals(
+  before: PipelineV2SessionCleanupPair | undefined,
+  afterValue: unknown,
+): boolean {
+  if (before === undefined) {
+    return afterValue === undefined;
+  }
+  return (
+    isRecord(afterValue) &&
+    afterValue["execution"] === before.execution &&
+    afterValue["tool"] === before.tool
+  );
+}
+
+/**
+ * The exact equality of one durable decision-state record, discriminated
+ * by its status projection.
+ */
+function decisionResultEquals(
+  before: PipelineDecisionStateRecord | undefined,
+  afterValue: unknown,
+): boolean {
+  if (before === undefined) {
+    return afterValue === undefined;
+  }
+  if (!isRecord(afterValue) || afterValue["status"] !== before.status) {
+    return false;
+  }
+  if (before.status === "selected") {
+    return (
+      afterValue["outcome"] === before.outcome &&
+      afterValue["decision"] === before.decision &&
+      afterValue["rule_id"] === before.rule_id &&
+      stringListEquals(before.active_constraint_ids, afterValue["active_constraint_ids"])
+    );
+  }
+  if (before.status === "uncovered") {
+    return (
+      afterValue["outcome"] === before.outcome &&
+      stringListEquals(before.active_constraint_ids, afterValue["active_constraint_ids"])
+    );
+  }
+  if (before.status === "inconsistent_facts") {
+    return (
+      afterValue["outcome"] === before.outcome &&
+      stringListEquals(before.violated_relation_ids, afterValue["violated_relation_ids"])
+    );
+  }
+  return (
+    afterValue["outcome"] === before.outcome &&
+    afterValue["reason"] === before.reason &&
+    afterValue["fact_id"] === before.fact_id &&
+    afterValue["actual_type"] === before.actual_type
+  );
+}
+
+function stringListEquals(before: readonly string[], after: unknown): boolean {
+  if (!Array.isArray(after) || after.length !== before.length) {
+    return false;
+  }
+  for (let position = 0; position < before.length; position += 1) {
+    if (before[position] !== after[position]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The exact positional equality of one execution record: the common
+ * identity/role/phase fields plus, per type, the agent
+ * attempt/profile/session ids/cleanup pair/outputs/failure and the
+ * decision input/result/failure fields.
+ */
+function executionRecordEquals(before: PipelineV2ExecutionState, afterValue: unknown): boolean {
+  if (!isRecord(afterValue)) {
+    return false;
+  }
+  if (
+    afterValue["index"] !== before.index ||
+    afterValue["type"] !== before.type ||
+    afterValue["state_id"] !== before.state_id ||
+    afterValue["execution_role"] !== before.execution_role ||
+    afterValue["phase"] !== before.phase ||
+    afterValue["iteration_index"] !== before.iteration_index
+  ) {
+    return false;
+  }
+  if (before.type === "agent") {
+    return (
+      afterValue["attempt"] === before.attempt &&
+      afterValue["profile"] === before.profile &&
+      afterValue["execution_session_id"] === before.execution_session_id &&
+      afterValue["tool_session_id"] === before.tool_session_id &&
+      sessionCleanupEquals(before.session_cleanup, afterValue["session_cleanup"]) &&
+      agentOutputListEquals(before.outputs, afterValue["outputs"]) &&
+      afterValue["failure_reason"] === before.failure_reason
+    );
+  }
+  return (
+    afterValue["input_digest"] === before.input_digest &&
+    decisionResultEquals(before.result, afterValue["result"]) &&
+    afterValue["failure_reason"] === before.failure_reason
+  );
+}
+
+/**
+ * The exact equality of the optional terminal projection.
+ */
+function terminalEquals(
+  before: { readonly state_id: string; readonly result: string } | undefined,
+  afterValue: unknown,
+): boolean {
+  if (before === undefined) {
+    return afterValue === undefined;
+  }
+  return (
+    isRecord(afterValue) &&
+    afterValue["state_id"] === before.state_id &&
+    afterValue["result"] === before.result
+  );
+}
+
+/**
+ * The exact positional equality of the optional run-outputs projection.
+ */
+function runOutputsEquals(
+  before: PipelineV2RunOutputState[] | undefined,
+  afterValue: unknown,
+): boolean {
+  if (before === undefined) {
+    return afterValue === undefined;
+  }
+  if (!Array.isArray(afterValue) || afterValue.length !== before.length) {
+    return false;
+  }
+  for (let position = 0; position < before.length; position += 1) {
+    const beforeOutput = before[position];
+    if (beforeOutput === undefined || !isRecord(afterValue[position])) {
+      return false;
+    }
+    const afterOutput = afterValue[position] as Record<string, unknown>;
+    if (
+      afterOutput["id"] !== beforeOutput.id ||
+      afterOutput["type"] !== beforeOutput.type ||
+      afterOutput["required"] !== beforeOutput.required ||
+      afterOutput["present"] !== beforeOutput.present ||
+      (beforeOutput.present ? afterOutput["digest"] !== beforeOutput.digest : false)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The exact equality of the optional failure projection.
+ */
+function failureEquals(
+  before: { readonly reason: string } | undefined,
+  afterValue: unknown,
+): boolean {
+  if (before === undefined) {
+    return afterValue === undefined;
+  }
+  return isRecord(afterValue) && afterValue["reason"] === before.reason;
 }
 
 /**
@@ -1181,15 +1501,14 @@ export async function closePipelineV2ReplannedGenerationInternal(
     );
   }
   const sink = sinkValue as unknown as PipelineV2ReplannedGenerationControllerSink;
+  // The capture order (tested): `poisoned` → `dispatch` → the initial
+  // `snapshot` are each read exactly once as opaque references; the
+  // captured dispatch is then checked and bound to the sink; only after
+  // that does the poison latch run. A throwing getter keeps its identity
+  // at the capture position it occupies in this order.
   const poisoned: unknown = (sinkValue as Record<string, unknown>)["poisoned"];
-  if (poisoned === true) {
-    throw controllerError(
-      "invalid_state",
-      "the run state sink is poisoned by a durability-unknown commit; the replanned generation is not closed for this run",
-      null,
-    );
-  }
   const dispatchValue = (sinkValue as Record<string, unknown>)["dispatch"];
+  const initialSnapshot: unknown = (sinkValue as Record<string, unknown>)["snapshot"];
   if (typeof dispatchValue !== "function") {
     throw controllerError(
       "invalid_state",
@@ -1198,7 +1517,13 @@ export async function closePipelineV2ReplannedGenerationInternal(
     );
   }
   const dispatchBound = (dispatchValue as (command: PipelineV2RunCommand) => void | Promise<void>).bind(sinkValue);
-  const initialSnapshot: unknown = (sinkValue as Record<string, unknown>)["snapshot"];
+  if (poisoned === true) {
+    throw controllerError(
+      "invalid_state",
+      "the run state sink is poisoned by a durability-unknown commit; the replanned generation is not closed for this run",
+      null,
+    );
+  }
 
   // Provenance gates: the prepared intent first, then the compiled plan,
   // both before any field read and with zero Proxy traps.
@@ -1300,22 +1625,15 @@ export async function closePipelineV2ReplannedGenerationInternal(
       );
     }
     if (cause instanceof PipelineV2RunStateStoreError) {
-      // The rename did not happen; the previous open-generation state
-      // stays authoritative. Re-read the fresh authoritative snapshot
-      // for the failure.
-      let authoritative: PipelineV2RunState | null = null;
-      const fresh: unknown = (sinkValue as Record<string, unknown>)["snapshot"];
-      if (isRecord(fresh)) {
-        try {
-          authoritative = validatePipelineV2RunState(fresh);
-        } catch {
-          authoritative = null;
-        }
-      }
+      // The rename did not happen; the previous open-generation state —
+      // the already validated initial snapshot — stays authoritative.
+      // No snapshot re-read and no second validator run: the single
+      // `validatePipelineV2RunState` call remains the only one, and
+      // unexpected causes are never absorbed here.
       throw controllerError(
         "state_persist_failed",
         "the replanned generation closure commit did not happen; the previous state stays authoritative",
-        authoritative,
+        state,
       );
     }
     if (cause instanceof PipelineV2StateError) {
