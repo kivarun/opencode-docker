@@ -20,7 +20,10 @@ import {
   PipelineV2RunStateDurabilityError,
 } from "./pipeline_v2_state_store.ts";
 import { comparePipelineV2RunIdentity } from "./pipeline_v2_identity_compare.ts";
-import type { CompiledPipelineV2RunPlan } from "./pipeline_v2_run_plan_compiled.ts";
+import type {
+  CompiledPipelineV2RunPlan,
+  CompiledPipelineV2RunPlanStage,
+} from "./pipeline_v2_run_plan_compiled.ts";
 import {
   hasCompiledRunPlanProvenance,
   compiledRunPlanOriginIdentity,
@@ -132,7 +135,32 @@ import type {
  * zero-dispatch success whose result is built from the already verified
  * authoritative snapshot; no snapshot is re-read after the
  * classification and no state is ever restored. A partially matching
- * closure is never an idempotent success.
+ * closure is never an idempotent success. C2: the narrow crash-recovery
+ * retry form needed by the composition controller after a fault window
+ * inside the stage-iteration opening — the exact closed old generation
+ * is the direct predecessor of exactly one still-open generation of the
+ * CURRENT compiled plan (`index === old.index + 1`, the accepted plan
+ * digest, exactly one compiled stage of that id, the exact
+ * stage position and template, the wait-boundary anchor, a positive
+ * initial budget) in one of the two immediate opening forms (the bare
+ * generation with `iteration_count === 0`, or exactly iteration 1 open
+ * on the same anchor); this is also a zero-dispatch success whose result
+ * still describes the old closed generation and its replanned
+ * iteration. A generation of the current plan without the exact
+ * replanned predecessor closure, a wrong stage position, template, plan
+ * digest or anchor, a closed new generation, more than one new
+ * generation, a closed or second iteration, and any lifecycle advance
+ * past the wait boundary are `lifecycle_conflict` with zero dispatch;
+ * C2 is never a general historical search.
+ *
+ * The racing reducer-rejection path additionally recognizes the C2
+ * suffix: a concurrent composition that already closed the old
+ * generation AND opened the new plan's generation (and possibly its
+ * first iteration) is verified through the same targeted comparison with
+ * the compiled-plan suffix admitted, so two racing identical operations
+ * both succeed. Any further lifecycle advance (a second iteration, a
+ * closed new generation, a committed transition, a new wait) never
+ * passes.
  *
  * Post-dispatch verification is the same full targeted comparison for
  * the normal resolve path and the racing `PipelineV2StateError` path.
@@ -378,33 +406,32 @@ interface ReplannedGenerationContext {
   readonly generation: Record<string, unknown>;
   readonly generationIndex: number;
   readonly iterationIndex: number;
-  readonly form: "c0" | "c1";
+  readonly form: "c0" | "c1" | "c2";
+  readonly newGeneration?: Record<string, unknown>;
 }
 
 /**
- * The old generation must be the last durable generation, bound to the
+ * The old replanned generation at its durable position, bound to the
  * previous plan digest, without an open iteration, with at least one
  * iteration whose last member is the exact replanned closure of the
  * target wait; the whole historical iteration prefix must be well-shaped.
- * The classification point: only the still-open form (C0) and the exact
- * already-durable replanned closure form (C1) are admissible.
  */
-function replannedGenerationContext(
+function replannedOldGenerationAt(
   state: PipelineV2RunState,
   wait: PipelineV2WaitRecord,
-): ReplannedGenerationContext {
-  if (!Array.isArray(state.generations) || state.generations.length === 0) {
-    throw controllerError("invalid_state", "the durable state carries no stage generation", state);
-  }
-  const generation = state.generations[state.generations.length - 1];
+  position: number,
+): { readonly generation: Record<string, unknown>; readonly generationIndex: number; readonly iterationIndex: number } {
+  const generation = state.generations[position];
   if (!isRecord(generation)) {
     throw controllerError("invalid_state", "the durable generation record is malformed", state);
   }
   const generationIndex = generation["index"];
-  if (!isPositiveSafeInteger(generationIndex) || generationIndex !== state.generations.length) {
+  if (!isPositiveSafeInteger(generationIndex) || generationIndex !== position + 1) {
     throw controllerError(
       "lifecycle_conflict",
-      "the replanned generation is not the last durable generation",
+      position === state.generations.length - 1
+        ? "the replanned generation is not the last durable generation"
+        : "the replanned generation predecessor does not sit at its durable position",
       state,
     );
   }
@@ -491,12 +518,219 @@ function replannedGenerationContext(
       state,
     );
   }
-  const generationClosed = generation["closed"];
+  return { generation, generationIndex, iterationIndex: lastIteration["index"] as number };
+}
+
+/**
+ * The immediate opening form of the new plan's last generation: either
+ * the bare generation record (no iteration yet) or exactly its first
+ * iteration open on the same wait-boundary anchor; any closed iteration,
+ * a second iteration, a closed generation or a different stage binding
+ * is never an admissible retry form.
+ */
+function replannedNewGenerationForm(
+  state: PipelineV2RunState,
+  wait: PipelineV2WaitRecord,
+  compiledPlan: CompiledPipelineV2RunPlan,
+  newGeneration: Record<string, unknown>,
+  expectedIndex: number,
+): void {
+  if (
+    typeof newGeneration["stage_id"] !== "string" ||
+    !isPositiveSafeInteger(newGeneration["stage_position"]) ||
+    typeof newGeneration["template_id"] !== "string" ||
+    typeof newGeneration["plan_sha256"] !== "string" ||
+    !isPositiveSafeInteger(newGeneration["initial_budget"]) ||
+    !isNonNegativeSafeInteger(newGeneration["opened_transition_count"]) ||
+    !isNonNegativeSafeInteger(newGeneration["iteration_count"])
+  ) {
+    throw controllerError(
+      "invalid_state",
+      "the new generation identity bindings are malformed",
+      state,
+    );
+  }
+  if (newGeneration["index"] !== expectedIndex) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the new generation's index does not continue the replanned predecessor",
+      state,
+    );
+  }
+  if (newGeneration["closed"] !== undefined) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the new generation is already closed",
+      state,
+    );
+  }
+  if (!Array.isArray(compiledPlan.stages)) {
+    throw controllerError("invalid_state", "the compiled plan carries no stages", state);
+  }
+  let matches = 0;
+  let matching: CompiledPipelineV2RunPlanStage | undefined;
+  for (const stage of compiledPlan.stages) {
+    if (stage["id"] === newGeneration["stage_id"]) {
+      matches += 1;
+      matching = stage as unknown as CompiledPipelineV2RunPlanStage;
+    }
+  }
+  if (matches !== 1 || matching === undefined) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the new generation does not name exactly one compiled plan stage",
+      state,
+    );
+  }
+  if (newGeneration["stage_position"] !== compiledPlan.stages.indexOf(matching) + 1) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the new generation's stage position does not match the compiled stage",
+      state,
+    );
+  }
+  if (newGeneration["template_id"] !== matching.template) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the new generation's stage template does not match the compiled stage",
+      state,
+    );
+  }
+  if (newGeneration["plan_sha256"] !== compiledPlan.plan_sha256) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the new generation is not bound to the accepted plan revision's digest",
+      state,
+    );
+  }
+  if (newGeneration["opened_transition_count"] !== wait.transition_count) {
+    throw controllerError(
+      "lifecycle_conflict",
+      "the new generation's opening anchor is not the wait boundary",
+      state,
+    );
+  }
+  const iterations = newGeneration["iterations"];
+  const openIteration = newGeneration["open_iteration"];
+  if (newGeneration["iteration_count"] === 0) {
+    if (!Array.isArray(iterations) || iterations.length !== 0 || openIteration !== undefined) {
+      throw controllerError(
+        "lifecycle_conflict",
+        "the new generation carries unexpected iteration history",
+        state,
+      );
+    }
+    return;
+  }
+  if (newGeneration["iteration_count"] === 1) {
+    if (!Array.isArray(iterations) || iterations.length !== 1) {
+      throw controllerError(
+        "lifecycle_conflict",
+        "the new generation carries unexpected iteration history",
+        state,
+      );
+    }
+    const iteration = iterations[0];
+    if (
+      !isRecord(iteration) ||
+      iteration["index"] !== 1 ||
+      iteration["opened_transition_count"] !== wait.transition_count ||
+      iteration["closed"] !== undefined
+    ) {
+      throw controllerError(
+        "lifecycle_conflict",
+        "the new generation's first iteration is not open on the wait boundary anchor",
+        state,
+      );
+    }
+    if (
+      !isRecord(openIteration) ||
+      openIteration["index"] !== 1 ||
+      openIteration["opened_transition_count"] !== wait.transition_count
+    ) {
+      throw controllerError(
+        "lifecycle_conflict",
+        "the new generation's open iteration does not match its first iteration",
+        state,
+      );
+    }
+    return;
+  }
+  throw controllerError(
+    "lifecycle_conflict",
+    "the new generation already opened more than its first iteration",
+    state,
+  );
+}
+
+/**
+ * The classification point: only the still-open old generation (C0), the
+ * exact already-durable replanned closure that stays last (C1), and the
+ * narrow C2 retry form — the exact closed old generation as the direct
+ * predecessor of exactly one still-open generation of the CURRENT
+ * compiled plan in one of the two immediate opening forms — are
+ * admissible. Anything else fails closed.
+ */
+function replannedGenerationContext(
+  state: PipelineV2RunState,
+  wait: PipelineV2WaitRecord,
+  compiledPlan: CompiledPipelineV2RunPlan,
+): ReplannedGenerationContext {
+  if (!Array.isArray(state.generations) || state.generations.length === 0) {
+    throw controllerError("invalid_state", "the durable state carries no stage generation", state);
+  }
+  const lastPosition = state.generations.length - 1;
+  const last = state.generations[lastPosition];
+  if (!isRecord(last)) {
+    throw controllerError("invalid_state", "the durable generation record is malformed", state);
+  }
+  const lastPlanDigest = last["plan_sha256"];
+  if (lastPlanDigest === compiledPlan.plan_sha256 && last["closed"] === undefined) {
+    // The C2 retry candidate: the last durable generation already belongs
+    // to the current compiled plan and is still open.
+    if (state.generations.length < 2) {
+      throw controllerError(
+        "lifecycle_conflict",
+        "the new plan's generation carries no exact replanned predecessor",
+        state,
+      );
+    }
+    if (state.generations.length > 2) {
+      throw controllerError(
+        "lifecycle_conflict",
+        "several generations of the current plan already exist after the replanned closure",
+        state,
+      );
+    }
+    const predecessor = replannedOldGenerationAt(state, wait, 0);
+    const predecessorClosed = predecessor.generation["closed"];
+    if (
+      !isRecord(predecessorClosed) ||
+      predecessorClosed["by"] !== "replanned" ||
+      predecessorClosed["closed_transition_count"] !== wait.transition_count
+    ) {
+      throw controllerError(
+        "lifecycle_conflict",
+        "the generation closure is not the exact replanned closure of the target wait",
+        state,
+      );
+    }
+    replannedNewGenerationForm(state, wait, compiledPlan, last, predecessor.generationIndex + 1);
+    return {
+      generation: predecessor.generation,
+      generationIndex: predecessor.generationIndex,
+      iterationIndex: predecessor.iterationIndex,
+      form: "c2",
+      newGeneration: last,
+    };
+  }
+  const context = replannedOldGenerationAt(state, wait, lastPosition);
+  const generationClosed = context.generation["closed"];
   if (generationClosed === undefined) {
     return {
-      generation,
-      generationIndex,
-      iterationIndex: lastIteration["index"] as number,
+      generation: context.generation,
+      generationIndex: context.generationIndex,
+      iterationIndex: context.iterationIndex,
       form: "c0",
     };
   }
@@ -512,9 +746,9 @@ function replannedGenerationContext(
     );
   }
   return {
-    generation,
-    generationIndex,
-    iterationIndex: lastIteration["index"] as number,
+    generation: context.generation,
+    generationIndex: context.generationIndex,
+    iterationIndex: context.iterationIndex,
     form: "c1",
   };
 }
@@ -707,13 +941,20 @@ function planningExecutionBoundary(
  * generation journal with its iteration history. Every viewed array and
  * record is checked before any field access, so hostile `null` entries
  * and malformed nested records yield the typed mismatch, never a
- * `TypeError`.
+ * `TypeError`. When `suffixPlan` is non-null (the racing path only) the
+ * state is additionally allowed to change in exactly one further way: the
+ * exact closed old generation is followed by exactly one still-open
+ * generation of the CURRENT compiled plan in one of the two immediate
+ * opening forms (the C2 retry form); every other durable region still
+ * compares positionally, so a racing suffix that already advanced past
+ * the immediate opening never passes.
  */
 function verifyAppliedClosure(
   before: PipelineV2RunState,
   afterValue: unknown,
   wait: PipelineV2WaitRecord,
   generationIndex: number,
+  suffixPlan: CompiledPipelineV2RunPlan | null,
 ): PipelineV2RunState {
   if (!isRecord(afterValue)) {
     throw controllerError(
@@ -729,7 +970,11 @@ function verifyAppliedClosure(
       "the committed run state does not carry the exact replanned generation closure",
       after,
     );
-  if (after.revision !== before.revision + 1) {
+  // The exact revision delta is determined together with the generation
+  // shape below: the strict closure is exactly +1; the racing C2 suffix
+  // is +2 (the bare new generation) or +3 (its first iteration open).
+  const revisionDelta = after.revision - before.revision;
+  if (revisionDelta < 1 || revisionDelta > 3) {
     throw mismatch();
   }
   if (
@@ -809,10 +1054,19 @@ function verifyAppliedClosure(
   if (!failureEquals(before.failure, after.failure)) {
     throw mismatch();
   }
-  if (!Array.isArray(after.generations) || after.generations.length !== before.generations.length) {
+  if (
+    !Array.isArray(after.generations) ||
+    (after.generations.length !== before.generations.length &&
+      !(suffixPlan !== null && after.generations.length === before.generations.length + 1))
+  ) {
     throw mismatch();
   }
+  const extendedSuffix = suffixPlan !== null && after.generations.length === before.generations.length + 1;
   for (let position = 0; position < before.generations.length; position += 1) {
+    // In both shapes the last compared generation is the old replanned
+    // generation whose exact closure is the admitted new field; in the
+    // extended racing shape it sits at the penultimate position of the
+    // committed journal.
     const target = position === before.generations.length - 1;
     const beforeGeneration = before.generations[position];
     if (
@@ -821,6 +1075,26 @@ function verifyAppliedClosure(
     ) {
       throw mismatch();
     }
+  }
+  if (extendedSuffix) {
+    const newGeneration = after.generations[after.generations.length - 1];
+    if (!isRecord(newGeneration)) {
+      throw mismatch();
+    }
+    try {
+      replannedNewGenerationForm(after, wait, suffixPlan as CompiledPipelineV2RunPlan, newGeneration, generationIndex + 1);
+    } catch (cause) {
+      if (cause instanceof PipelineV2ReplannedGenerationControllerError) {
+        throw mismatch();
+      }
+      throw cause;
+    }
+    const expectedRevisionDelta = newGeneration["iteration_count"] === 0 ? 2 : 3;
+    if (revisionDelta !== expectedRevisionDelta) {
+      throw mismatch();
+    }
+  } else if (revisionDelta !== 1) {
+    throw mismatch();
   }
   return after;
 }
@@ -1344,7 +1618,7 @@ interface ValidatedReplannedBoundary {
   readonly generationIndex: number;
   readonly iterationIndex: number;
   readonly previousPlan: Record<string, unknown>;
-  readonly form: "c0" | "c1";
+  readonly form: "c0" | "c1" | "c2";
 }
 
 function validateReplannedBoundary(
@@ -1384,7 +1658,7 @@ function validateReplannedBoundary(
     throw controllerError("invalid_intent", "the revise intent belongs to a different run", state);
   }
   const taskRecord = acceptedTaskRevisionOfWait(state, wait, manifest, intentSha256);
-  const context = replannedGenerationContext(state, wait);
+  const context = replannedGenerationContext(state, wait, compiledPlan);
   const previousPlan = acceptedPlanBoundaries(state, compiledPlan, context.generation);
   compiledPlanCarriesRevisedTask(compiledPlan, taskRecord, state);
   const declaredTo = declaredReviseActionTo(state, wait);
@@ -1587,8 +1861,14 @@ export async function closePipelineV2ReplannedGenerationInternal(
   // snapshot.
   const boundary = validateReplannedBoundary(state, manifest, intentSha256, compiledPlan);
 
-  // The single reconciliation classification point.
-  if (boundary.form === "c1") {
+  // The single reconciliation classification point. C1 and C2 are
+  // zero-dispatch successes: C1 is the exact already-durable closure;
+  // C2 is the narrow retry form after a stage-iteration fault window
+  // (the closed old generation as the direct predecessor of exactly one
+  // still-open generation of the current compiled plan in an immediate
+  // opening form). The result in both forms describes the old closed
+  // generation and its replanned iteration.
+  if (boundary.form !== "c0") {
     return buildResult(boundary, compiledPlan);
   }
 
@@ -1638,9 +1918,14 @@ export async function closePipelineV2ReplannedGenerationInternal(
     }
     if (cause instanceof PipelineV2StateError) {
       // A racing completion already applied the exact closure; recognize
-      // it through the same full targeted verification.
+      // it through the same full targeted verification. The racing path
+      // additionally admits the narrow C2 retry suffix: the closed old
+      // generation as the direct predecessor of exactly one still-open
+      // generation of the current compiled plan in an immediate opening
+      // form — so a concurrent full retry after the closure never turns
+      // into a false conflict.
       const after: unknown = (sinkValue as Record<string, unknown>)["snapshot"];
-      const verified = verifyAppliedClosure(state, after, boundary.wait, boundary.generationIndex);
+      const verified = verifyAppliedClosure(state, after, boundary.wait, boundary.generationIndex, compiledPlan);
       return buildResult(
         {
           ...boundary,
@@ -1655,9 +1940,10 @@ export async function closePipelineV2ReplannedGenerationInternal(
 
   // The authoritative snapshot after the dispatch, verified by the same
   // targeted comparison; the result is built from the verified snapshot
-  // without a second read.
+  // without a second read. The controller's own dispatch only applies the
+  // single closure, so the strict shape is verified here.
   const after: unknown = (sinkValue as Record<string, unknown>)["snapshot"];
-  const verified = verifyAppliedClosure(state, after, boundary.wait, boundary.generationIndex);
+  const verified = verifyAppliedClosure(state, after, boundary.wait, boundary.generationIndex, null);
   return buildResult({ ...boundary, state: verified, form: "c1" }, compiledPlan);
 }
 

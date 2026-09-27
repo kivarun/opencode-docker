@@ -2678,10 +2678,29 @@ snapshot re-read and fully verified; C1 — the exact durable replanned
 closure already on the last generation: an idempotent zero-dispatch
 success built from the already verified snapshot, with no snapshot
 re-read after the classification and no state restoration; a partially
-matching closure is never an idempotent success. Post-dispatch
+matching closure is never an idempotent success; C2 — the narrow
+crash-recovery retry form needed by the replanned-stage composition
+controller after a fault window inside the stage-iteration opening: the
+exact closed old generation as the direct predecessor of exactly one
+still-open generation of the CURRENT compiled plan
+(`index === old.index + 1`, the accepted plan digest, exactly one
+compiled stage of that stage id, the exact stage position and template,
+the wait-boundary anchor, a positive initial budget) in one of the two
+immediate opening forms (the bare generation with `iteration_count ===
+0`, or exactly iteration 1 open on the same anchor with an exact
+`open_iteration` projection) — also a zero-dispatch success whose
+result still describes the old closed generation and its replanned
+iteration; a generation of the current plan without the exact
+replanned predecessor closure, a wrong stage position, template, plan
+digest or anchor, a closed new generation, more than one new
+generation, a closed or second iteration, and any lifecycle advance
+past the wait boundary are `lifecycle_conflict` with zero dispatch, and
+C2 is never a general historical search. Post-dispatch
 verification is the same targeted comparison on the normal resolve path
-and the racing `PipelineV2StateError` path: the revision moved exactly
-`before + 1`; the run id and the durable pipeline identity unchanged;
+and the racing `PipelineV2StateError` path: the revision delta is
+exactly +1 on the strict closure shape and exactly +2/+3 on the racing
+C2 suffix (the bare new generation / its first iteration open); the run
+id and the durable pipeline identity unchanged;
 status, phase, cursor and the boundary journals unchanged; the wait
 journal, the task ledger and the plan ledger positionally unchanged; the
 generation journal length unchanged with historical generations and the
@@ -2714,7 +2733,7 @@ task_revision, task_sha256, previous_plan_revision, previous_plan_sha256,
 plan_revision, plan_sha256, origin_execution, state}` — no manifest,
 canonical JSON, paths, bodies, prepared intent, compiled plan or other
 caller-owned objects. Tests: `orchestrator/tests/pipeline_v2_replanned_generation_controller.test.ts`
-(34 tests, fixtures built only through the real reducer/sink/store and
+(42 tests, fixtures built only through the real reducer/sink/store and
 the existing run-plan/stage-iteration/revise-task controllers — plan r1
 accepted, generation/iteration opened, the real revise intent accepted,
 task r2 durably accepted, the iteration closed `by:"replanned"` and the
@@ -2733,11 +2752,19 @@ different intent (a real reducer path to `invalid_intent`), the
 missing/conflicting/later wait-bound task revision, the wrong iteration
 closure reason (loader-visible `lifecycle_conflict` on my check) and a
 wrong anchor (loader-typed `invalid_state`), the generation closed with
-another reason or anchor, the replaced generation plan binding and a
-later generation, a later transition or wait past the boundary, the
+another reason or anchor, the replaced generation plan binding
+(loader-typed) with the opened new plan's generation now admissible as
+the C2 retry form, several generations of the current plan fail-closed,
+a later transition or wait past the boundary, the
 pre-check source-order proof, the racing bare rejection and the
 resolve-without-change, the racing exact closure as an idempotent
-success through the same verification, the racing hostile closure, the
+success through the same verification, the racing full immediate suffix
+(close + bare generation / first iteration open) as an idempotent
+success through the extended racing verification, the racing hostile
+closure, the C2 zero-dispatch retry paths (the bare new generation and
+the first iteration open), the hostile C2 shapes (a closed new
+generation, a closed or second iteration, a foreign anchor —
+loader-typed and lifecycle-typed), the
 wrong revision delta and a foreign run id in the post-dispatch snapshot,
 `not_committed` and `durability_unknown` with fresh-retry semantics,
 identical concurrency with one durable closure and exactly +1 revision,
@@ -2751,9 +2778,149 @@ coordinator/runner/CLI imports, no mutable seam and no new registry).
 Still unwired: the action/intent selection policy, the architect worker
 output parsing, plan candidate construction, the plan acceptance
 controller (already implemented, still not called from a policy layer),
-opening the next generation/iteration, stage selection and the
+opening the next generation/iteration (the replanned-stage composition
+controller below), stage selection and the
 initial-budget policy, the graph transition commit, automatic resume,
 coordinator/runner/CLI/default-pipeline wiring, schema changes,
+migrations/API/T3, multi-process locking.
+
+### Replanned-stage composition controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_replanned_stage_controller.ts` (public
+facade) + `pipeline_v2_replanned_stage_controller_internal.ts` (internal
+core) is the single layer that, after a NEW plan revision has already
+been durably accepted, composes the two existing authoritative
+controllers in one fixed order to move the run onto the caller-selected
+stage of that plan — `closePipelineV2ReplannedGeneration` (old
+generation closed `by: "replanned"`, C0 dispatch, C1/C2 zero-dispatch
+retries) → `ensurePipelineV2StageIteration` (the open generation bound
+to the selected compiled stage plus its open iteration 1) — completing
+the revise-cycle order `accepted revised task → replanned iteration
+closure → revise_task response → settled planning execution → accepted
+next plan revision → old generation closed by replanned → selected
+new-plan generation opened → iteration 1 opened → future transition
+commit`. Runtime export surface is exactly
+`PipelineV2ReplannedStageControllerError` (own reasons only
+`invalid_options | invalid_result`, last authoritative `state`) and
+`openPipelineV2ReplannedStage({sink, intent, compiledPlan, stageId,
+initialBudget})` (public) / `openPipelineV2ReplannedStageWithOps` + the
+frozen `productionReplannedStageOps` (internal; ops carries exactly
+`closeGeneration` and `ensureStageIteration` bound by identity — no
+reducer, filesystem, store, publisher, serializer, registry,
+coordinator, runner or CLI capability is reachable through it, no
+installer, no mutable seam). `stageId` and `initialBudget` are explicit
+caller-policy decisions (the controller selects nothing);
+`compiledPlan` must be the exact provenance-backed compiled plan the
+run-plan acceptance returned and `intent` the exact provenance-backed
+prepared `revise_task_intent`. The controller never reads or binds
+`sink.dispatch` itself (dispatch belongs to the two composed
+controllers) and adds no second provenance registry, state validator or
+reducer. Capture and pre-side-effect validation (fail-closed, tested):
+the options shape → `sink` → `intent` → `compiledPlan` → `stageId` →
+`initialBudget` each read exactly once → both ops getters read exactly
+once before the first await → `initialBudget` a positive safe integer
+and the stage id resolved through the single existing trusted compiled
+resolver `compiledPipelineV2RunPlanStageFor` (its provenance gate,
+stage existence and template binding belong to that resolver alone;
+compiled-resolver errors pass by identity) — any invalid shape,
+forged/cloned/proxied compiled plan or invalid budget refuses before
+any durable dispatch, before any close call and with zero composed
+effects (Proxy compiled-plan traps never invoked) → the stage position
+derived only from the trusted `compiledPlan.stages` declaration order.
+Composition ordering: `closeGeneration` runs first; its returned result
+is verified COMPLETELY before `ensureStageIteration` is called (a
+hostile, malformed or binding-mismatched close result never reaches the
+ensure call); only then the ensure result is verified against the
+trusted compiled stage, the verified close result and the intent/plan
+bindings; the result is built from the ensure controller's
+authoritative state without any additional `sink.snapshot` read.
+Close-result verification (defensive, targeted): positive safe
+wait/generation/iteration/task/plan indexes; the exact `intent_sha256`;
+the exact plan revision/digest/origin against the compiled plan; the
+old generation at its exact durable index with the exact replanned
+iteration and generation closures; the wait, task-ledger and
+plan-ledger bindings agreeing with the result; and the admissible state
+form — C1: the old generation the last durable generation, C2: exactly
+one still-open current-plan generation following it in one of the two
+immediate opening forms. Ensure-result verification (defensive,
+targeted): `compiled_stage` the exact object the trusted resolver
+returned (identity, never a clone); the generation index exactly the
+old index + 1 and the iteration index exactly 1; the final generation
+the last durable generation, still open, with the exact stage id, stage
+position, template, current plan digest, initial budget and the
+wait-boundary opening anchor; exactly one iteration (index 1, open on
+the same anchor, exact `open_iteration` projection); the old generation
+and its historical iteration prefix/closure unchanged; the
+wait/task/plan/execution/transition boundaries not advanced
+(positional equality against the verified close state with only the
+routine `updated_at` refresh allowed); the final state active and
+running on the settled-but-unbound planning execution; both
+zero-dispatch ensure shapes (the ensure step either opened the new
+generation on top of the verified close state or recognized the already
+open C2 generation — appending its first iteration is the only
+permitted change to the last generation) verified by the same exact
+new-generation check. A hostile coherent result with simultaneously
+mutated result fields and nested state is compared against the verified
+close state and the trusted compiled stage, never against itself.
+Malformed nested results fail as the composition's own
+`invalid_result`, never a `TypeError`. Durability: the composed
+controllers' typed failures (`not_committed`/`durability_unknown` with
+their adopted/previous states, poisoned-sink refusals,
+lifecycle/plan/revision conflicts) pass through unchanged by identity —
+the fault-window matrix: close `not_committed` → ensure 0 calls, a
+fresh retry runs the full suffix; close `durability_unknown` → ensure 0
+calls, a fresh sink continues from C1; generation-open `not_committed`
+→ the old closure durable, a fresh retry continues from C1;
+generation-open `durability_unknown` → the candidate visible, a fresh
+retry continues from C2; iteration-open `not_committed` → a fresh retry
+continues from C2 (opens only the iteration); iteration-open
+`durability_unknown` → a fresh retry is zero-dispatch through both
+controllers; the exact complete retry dispatches nothing; no rollback,
+no automatic second dispatch. Concurrency has no sleeps: two identical
+C0 races both succeed with exactly one old-generation closure, one new
+generation, one iteration and revision exactly +3 (the racing suffix is
+recognized through the composition's zero-dispatch paths and the close
+controller's extended racing verification); two identical races after
+C1 both succeed with the generation and iteration written once; a
+conflicting stage/budget retry dispatches nothing, the winner state
+stays unchanged and the loser receives the stage-iteration controller's
+existing `lifecycle_conflict`. The deep-frozen content-free result is
+`{wait_index, previous_generation_index, generation_index,
+iteration_index, intent_sha256, plan_revision, plan_sha256,
+origin_execution, stage_id, stage_position, template_id,
+initial_budget, state}` — no compiled plan/stage object, no
+intent/candidate/manifests, no canonical JSON, no paths, no task
+bodies, no caller-owned objects. Tests:
+`orchestrator/tests/pipeline_v2_replanned_stage_controller.test.ts` (27
+tests, fixtures built only through the real reducer/sink/store and the
+existing run-plan/stage-iteration/revise-task/replanned-generation
+controllers) cover the C0 path with the exact composed command order
+(`stage_generation_closed` → `stage_generation_opened` →
+`stage_iteration_opened`) and revision +3, the exact deep-frozen
+content-free result shape and the loader round-trip, the C1 and both C2
+retry paths, the four ensure fault windows and the two close fault
+windows with identity refusals and fresh-retry continuations, the exact
+complete retry, the two identical-race batteries and the conflicting
+budget retry, the unknown-stage/forged-plan/Proxy-plan/budget/option-shape
+refusals with zero dispatches and zero traps, the hostile close-result
+battery with zero ensure calls (wait index, intent digest, plan digest,
+generation index, state null, malformed waits/generations, a missing
+old closure, a wrong task digest, a closed new generation), the hostile
+ensure-result battery compared against the verified close state (clone
+compiled stage, wrong generation/iteration index, closed final
+generation, wrong stage position/template/plan digest/budget/anchor,
+missing/closed iterations, a changed old generation, advanced
+boundaries, malformed states), the coherent hostile result detected
+through the verified close state, the option/ops getter-count battery
+with caller mutation isolation across the composition,
+downstream/unexpected error identity, content-free diagnostics, both
+export surfaces, and the source scan (no
+reducer/validator/filesystem/store/publisher/serializer/registry/
+coordinator/runner/CLI imports; exactly the six composed-layer
+imports). Still unwired: the architect output parsing, plan candidate
+construction and acceptance, the stage/budget selection policy, the
+graph transition commit, automatic resume,
+coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
 migrations/API/T3, multi-process locking.
 
 ### Stage generation/iteration controller (production-neutral, not wired)

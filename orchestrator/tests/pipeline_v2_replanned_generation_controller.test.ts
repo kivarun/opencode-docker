@@ -1007,7 +1007,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     }
   });
 
-  test("17. a replaced generation plan binding or a later generation is typed", async () => {
+  test("17. a replaced generation plan binding is loader-typed; the opened new plan's generation is the C2 retry form", async () => {
     const replaced = await replannedReady();
     try {
       const hostile = mutateSnapshotSink(replaced.sink, (state) => {
@@ -1034,14 +1034,61 @@ describe("closePipelineV2ReplannedGeneration", () => {
         initialBudget: 2,
         transitionCount: 2,
       });
-      const cause = await catchClose(() =>
-        closePipelineV2ReplannedGeneration({ sink: later.sink, intent: later.intent, compiledPlan: later.compiledPlan }),
-      );
-      const error = expectCloseError(cause, "invalid_state");
-      expect(error.message).toContain("records no iterations");
+      const recording = recordingSink(later.sink);
+      const result = await closePipelineV2ReplannedGeneration({ sink: recording, intent: later.intent, compiledPlan: later.compiledPlan });
+      expect(recording.commands).toEqual([]);
       expect((later.sink.snapshot as PipelineV2RunState).revision).toBe(revisionBefore + 2);
+      expect(result.generation_index).toBe(1);
+      expect(result.iteration_index).toBe(1);
+      expect(result.plan_revision).toBe(2);
+      const state = later.sink.snapshot as PipelineV2RunState;
+      expect(state.generations).toHaveLength(2);
+      expect(state.generations[0]!.closed).toEqual({ by: "replanned", closed_transition_count: 2 });
+      expect(state.generations[1]!.open_iteration).toBeUndefined();
+      expect(state.generations[1]!.iteration_count).toBe(0);
     } finally {
       await disposeRun(later.fixture);
+    }
+  });
+
+  test("17b. several generations of the current plan after the replanned closure are fail-closed", async () => {
+    const ctx = await replannedReady();
+    try {
+      const hostile = mutateSnapshotSink(ctx.sink, (state) => {
+        const generation = state.generations[0]!;
+        (state.generations as unknown as unknown[])[0] = {
+          ...generation,
+          closed: { by: "replanned", closed_transition_count: 2 },
+        };
+        (state.generations as unknown as unknown[]).push({
+          index: 2,
+          stage_id: "stage-1",
+          stage_position: 1,
+          template_id: "development",
+          plan_sha256: ctx.plan2.sha256,
+          initial_budget: 2,
+          opened_transition_count: 2,
+          iteration_count: 0,
+          iterations: [],
+        });
+        (state.generations as unknown as unknown[]).push({
+          index: 3,
+          stage_id: "stage-1",
+          stage_position: 1,
+          template_id: "development",
+          plan_sha256: ctx.plan2.sha256,
+          initial_budget: 2,
+          opened_transition_count: 2,
+          iteration_count: 0,
+          iterations: [],
+        });
+      });
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: hostile, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
+      );
+      expectCloseError(cause, "invalid_state");
+    } finally {
+      await disposeRun(ctx.fixture);
     }
   });
 
@@ -1775,6 +1822,151 @@ describe("closePipelineV2ReplannedGeneration", () => {
       expect(snapshotCause).toBe(snapshotCanary);
     } finally {
       await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("39. the C2 retry form with the first iteration open is a zero-dispatch success", async () => {
+    const ctx = await replannedReady();
+    try {
+      const first = await closePipelineV2ReplannedGeneration({ sink: ctx.sink, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: ctx.sink });
+      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      const recording = recordingSink(ctx.sink);
+      const result = await closePipelineV2ReplannedGeneration({ sink: recording, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(recording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).revision).toBe(revisionBefore);
+      expect(result.generation_index).toBe(first.generation_index);
+      expect(result.iteration_index).toBe(first.iteration_index);
+      expect(result.wait_index).toBe(first.wait_index);
+      const state = ctx.sink.snapshot as PipelineV2RunState;
+      expect(state.generations).toHaveLength(2);
+      expect(state.generations[0]!.closed).toEqual({ by: "replanned", closed_transition_count: 2 });
+      expect(state.generations[1]!.open_iteration).toEqual({ index: 1, opened_transition_count: 2 });
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("40. the racing path recognizes the full immediate suffix as an idempotent success", async () => {
+    const ctx = await replannedReady();
+    try {
+      const revisionBefore = (ctx.sink.snapshot as PipelineV2RunState).revision;
+      let racingAfter: PipelineV2RunState | null | undefined;
+      const racing: PipelineV2ReplannedGenerationControllerSink = {
+        get snapshot() {
+          if (racingAfter === undefined) {
+            return ctx.sink.snapshot;
+          }
+          return racingAfter;
+        },
+        poisoned: ctx.sink.poisoned,
+        async dispatch(command) {
+          await ctx.sink.dispatch(command);
+          await ctx.sink.dispatch({
+            kind: "stage_generation_opened",
+            stageId: "stage-1",
+            stagePosition: 1,
+            templateId: "development",
+            planSha256: ctx.plan2.sha256,
+            initialBudget: 2,
+            transitionCount: 2,
+          });
+          await ctx.sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 2 });
+          racingAfter = ctx.sink.snapshot;
+          throw new PipelineV2StateError("racing injected");
+        },
+      };
+      const result = await closePipelineV2ReplannedGeneration({ sink: racing, intent: ctx.intent, compiledPlan: ctx.compiledPlan });
+      expect(result.generation_index).toBe(1);
+      expect(result.state.revision).toBe(revisionBefore + 3);
+      const state = ctx.sink.snapshot as PipelineV2RunState;
+      expect(state.generations).toHaveLength(2);
+      expect(state.generations[1]!.open_iteration).toEqual({ index: 1, opened_transition_count: 2 });
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("41. hostile C2 shapes: a closed new generation, a closed or second iteration and a foreign anchor never pass", async () => {
+    const closedNewGeneration = await replannedReady();
+    try {
+      const first = await closePipelineV2ReplannedGeneration({ sink: closedNewGeneration.sink, intent: closedNewGeneration.intent, compiledPlan: closedNewGeneration.compiledPlan });
+      await ensurePipelineV2StageIteration({ compiledPlan: closedNewGeneration.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: closedNewGeneration.sink });
+      const hostile = mutateSnapshotSink(closedNewGeneration.sink, (state) => {
+        const generation = state.generations[1]!;
+        (state.generations as unknown as unknown[])[1] = {
+          ...generation,
+          closed: { by: "next_stage", closed_transition_count: 2 },
+          open_iteration: undefined,
+          iterations: [{ index: 1, opened_transition_count: 2, closed: { by: "normal_close", closed_transition_count: 2 } }],
+        };
+      });
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: hostile, intent: closedNewGeneration.intent, compiledPlan: closedNewGeneration.compiledPlan }),
+      );
+      const error = expectCloseError(cause, "lifecycle_conflict");
+      expect(error.message).toContain("the target iteration closure is not the exact replanned closure");
+      expect(first).toBeDefined();
+    } finally {
+      await disposeRun(closedNewGeneration.fixture);
+    }
+    const secondIteration = await replannedReady();
+    try {
+      await closePipelineV2ReplannedGeneration({ sink: secondIteration.sink, intent: secondIteration.intent, compiledPlan: secondIteration.compiledPlan });
+      await ensurePipelineV2StageIteration({ compiledPlan: secondIteration.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: secondIteration.sink });
+      const hostile = mutateSnapshotSink(secondIteration.sink, (state) => {
+        const generation = state.generations[1]!;
+        (generation.iterations as unknown as unknown[]).push({ index: 2, opened_transition_count: 2 });
+        (state.generations as unknown as unknown[])[1] = {
+          ...generation,
+          iteration_count: 2,
+          open_iteration: { index: 2, opened_transition_count: 2 },
+        };
+      });
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: hostile, intent: secondIteration.intent, compiledPlan: secondIteration.compiledPlan }),
+      );
+      // A second open iteration is never loader-representable, so the
+      // fail-closed boundary is the loader's, not the controller's own.
+      const error2 = expectCloseError(cause, "invalid_state");
+      expect(error2.message).toContain("requires a durable pipeline v2 run state document");
+    } finally {
+      await disposeRun(secondIteration.fixture);
+    }
+    const closedIteration = await replannedReady();
+    try {
+      await closePipelineV2ReplannedGeneration({ sink: closedIteration.sink, intent: closedIteration.intent, compiledPlan: closedIteration.compiledPlan });
+      await ensurePipelineV2StageIteration({ compiledPlan: closedIteration.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: closedIteration.sink });
+      const hostile = mutateSnapshotSink(closedIteration.sink, (state) => {
+        const generation = state.generations[1]!;
+        (generation.iterations as unknown as unknown[])[0] = {
+          ...(generation.iterations as unknown as { closed?: unknown }[])[0],
+          closed: { by: "normal_close", closed_transition_count: 2 },
+        };
+        (state.generations as unknown as unknown[])[1] = { ...generation, open_iteration: undefined };
+      });
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: hostile, intent: closedIteration.intent, compiledPlan: closedIteration.compiledPlan }),
+      );
+      const error3 = expectCloseError(cause, "lifecycle_conflict");
+      expect(error3.message).toContain("the new generation's first iteration is not open");
+    } finally {
+      await disposeRun(closedIteration.fixture);
+    }
+    const foreignAnchor = await replannedReady();
+    try {
+      await closePipelineV2ReplannedGeneration({ sink: foreignAnchor.sink, intent: foreignAnchor.intent, compiledPlan: foreignAnchor.compiledPlan });
+      await ensurePipelineV2StageIteration({ compiledPlan: foreignAnchor.compiledPlan, stageId: "stage-1", initialBudget: 2, sink: foreignAnchor.sink });
+      const hostile = mutateSnapshotSink(foreignAnchor.sink, (state) => {
+        const generation = state.generations[1]!;
+        (state.generations as unknown as unknown[])[1] = { ...generation, opened_transition_count: 3 };
+      });
+      const cause = await catchClose(() =>
+        closePipelineV2ReplannedGeneration({ sink: hostile, intent: foreignAnchor.intent, compiledPlan: foreignAnchor.compiledPlan }),
+      );
+      expectCloseError(cause, "invalid_state");
+    } finally {
+      await disposeRun(foreignAnchor.fixture);
     }
   });
 });
