@@ -2620,7 +2620,7 @@ test("26. the runtime export surfaces are exact (public two keys, internal three
 
 test("27. the composition module imports only the composed layers (source scan)", async () => {
   const { readFile } = await import("node:fs/promises");
-  const source = await readFile("orchestrator/src/pipeline_v2_replanned_stage_controller_internal.ts", "utf8");
+  const source = await readFile(join(import.meta.dir, "..", "src", "pipeline_v2_replanned_stage_controller_internal.ts"), "utf8");
   const countOf = (needle: string): number => source.split(needle).length - 1;
   expect(countOf("reducePipelineV2RunCommand")).toBe(0);
   expect(countOf("validatePipelineV2RunState")).toBe(0);

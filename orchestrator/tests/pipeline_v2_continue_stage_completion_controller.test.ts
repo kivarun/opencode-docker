@@ -1522,7 +1522,7 @@ test("36. the runtime export surfaces are exact (public two keys, internal core)
 
 test("37. the completion composes the existing layers only (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
-  const source = readFileSync("orchestrator/src/pipeline_v2_continue_stage_completion_controller_internal.ts", "utf8");
+  const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_continue_stage_completion_controller_internal.ts"), "utf8");
   const countOf = (pattern: string): number => source.split(pattern).length - 1;
   expect(countOf("applyPipelineV2ContinueStageGrant")).toBe(6);
   expect(countOf("recordPipelineV2WaitAction")).toBe(5);

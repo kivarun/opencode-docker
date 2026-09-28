@@ -969,7 +969,7 @@ test("11. the runtime export surfaces are exact (public two keys, internal two k
 
 test("12. the controller composes the existing layers only (source scan)", async () => {
   const { readFile } = await import("node:fs/promises");
-  const source = await readFile("orchestrator/src/pipeline_v2_replanned_stage_transition_controller_internal.ts", "utf8");
+  const source = await readFile(join(import.meta.dir, "..", "src", "pipeline_v2_replanned_stage_transition_controller_internal.ts"), "utf8");
   const countOf = (pattern: string): number => source.split(pattern).length - 1;
   expect(countOf("validatePipelineV2RunState(")).toBe(1);
   expect(countOf("reducePipelineV2RunCommand(")).toBe(1);

@@ -1175,7 +1175,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
 
   test("19. the pre-check precedes the dispatch (source-order proof)", async () => {
     const { readFileSync } = await import("node:fs");
-    const source = readFileSync("orchestrator/src/pipeline_v2_replanned_generation_controller_internal.ts", "utf8");
+    const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_replanned_generation_controller_internal.ts"), "utf8");
     const precheck = source.indexOf("reducePipelineV2RunCommand(");
     const dispatch = source.indexOf("await dispatchBound(command)");
     expect(precheck).toBeGreaterThan(0);
@@ -2176,7 +2176,7 @@ test("33. the runtime export surfaces are exact (public two keys, internal two k
 
 test("34. the controller composes the existing layers only (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
-  const source = readFileSync("orchestrator/src/pipeline_v2_replanned_generation_controller_internal.ts", "utf8");
+  const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_replanned_generation_controller_internal.ts"), "utf8");
   const countOf = (pattern: string): number => source.split(pattern).length - 1;
   expect(countOf("reducePipelineV2RunCommand(")).toBe(1);
   expect(countOf("validatePipelineV2RunState(")).toBe(1);

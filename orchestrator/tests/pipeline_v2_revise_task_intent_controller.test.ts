@@ -1596,7 +1596,7 @@ test("26. the runtime export surfaces are exact (public two keys, internal three
 
 test("27. the revise acceptance composes the existing layers only (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
-  const source = readFileSync("orchestrator/src/pipeline_v2_revise_task_intent_controller_internal.ts", "utf8");
+  const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_revise_task_intent_controller_internal.ts"), "utf8");
   const countOf = (pattern: string): number => source.split(pattern).length - 1;
   expect(countOf("reducePipelineV2RunCommand(")).toBe(1);
   expect(countOf("validatePipelineV2RunState(")).toBe(1);
@@ -1631,7 +1631,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
 });
   test("42. the reducer pre-check precedes both publishers (source-order proof)", async () => {
     const { readFileSync } = await import("node:fs");
-    const source = readFileSync("orchestrator/src/pipeline_v2_revise_task_intent_controller_internal.ts", "utf8");
+    const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_revise_task_intent_controller_internal.ts"), "utf8");
     const flow = source.slice(source.indexOf("export async function acceptPipelineV2ReviseTaskIntentWithIo"));
     const precheck = flow.indexOf("precheckReviseSequence(state, [intentCommand, taskCommand], state)");
     const precheckR1 = flow.indexOf("precheckReviseSequence(state, [taskCommand], state)");

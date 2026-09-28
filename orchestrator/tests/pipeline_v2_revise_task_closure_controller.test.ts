@@ -878,7 +878,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
 
   test("20. the reducer pre-check precedes the dispatch (source-order proof)", async () => {
     const { readFileSync } = await import("node:fs");
-    const source = readFileSync("orchestrator/src/pipeline_v2_revise_task_closure_controller_internal.ts", "utf8");
+    const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_revise_task_closure_controller_internal.ts"), "utf8");
     const flow = source.slice(source.indexOf("export async function applyPipelineV2ReviseTaskClosureInternal"));
     const classification = flow.indexOf("classifyReviseClosure(state, bindings)");
     const precheck = flow.indexOf("precheckClosure(state, closureCommand, state)");
@@ -1659,7 +1659,7 @@ test("38. the runtime export surfaces are exact (public two keys, internal two k
 
 test("39. the closure controller is pure state-and-sink (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
-  const source = readFileSync("orchestrator/src/pipeline_v2_revise_task_closure_controller_internal.ts", "utf8");
+  const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_revise_task_closure_controller_internal.ts"), "utf8");
   const countOf = (pattern: string): number => source.split(pattern).length - 1;
   expect(countOf("validatePipelineV2RunState(")).toBe(1);
   expect(countOf("reducePipelineV2RunCommand(")).toBe(1);
