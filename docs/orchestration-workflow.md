@@ -3060,7 +3060,9 @@ next execution; a changed field is `lifecycle_conflict`, never an
 idempotent success. Post-dispatch verification: revision exactly +1,
 the exact new transition record and moved cursor; every other durable
 field unchanged except the routine `updated_at`; a dispatch resolving
-without this exact change is `invalid_state`, never a success.
+without this exact change is `invalid_state`, never a success; a
+reducer rejection because a racing dispatch has already recorded a
+different transition for the same execution stays `lifecycle_conflict`.
 Durability: `not_committed` keeps the previous snapshot (fresh retry
 re-dispatches); `durability_unknown` adopts the candidate, poisons the
 sink and a fresh reopened sink recognizes the durable transition with
@@ -3068,14 +3070,20 @@ zero dispatch. Failure reasons: `invalid_options | invalid_state |
 lifecycle_conflict | state_persist_failed`; diagnostics are
 content-free. Tests:
 `orchestrator/tests/pipeline_v2_replanned_stage_transition_controller.test.ts`
-(12 tests) cover the premature refusal with zero dispatch and a
+(17 tests) cover the premature refusal with zero dispatch and a
 byte-identical snapshot, the exact C0 command/result/loader round-trip,
 the foreign stage with a shared entry state and the foreign budget
 refused before dispatch, the C1 exact retry, a changed transition
 field, a resolve-without-change dispatch, both durability windows with
 fresh-retry continuations, the provenance battery (hand-built intent,
 cloned compiled plan, Proxy pipeline with zero traps and pass-through
-typed errors), and the export/source scans.
+typed errors), and the export/source scans; the post-dispatch
+full-verification battery adds a changed historical agent execution
+`profile`, a changed `schema_version`, a changed schema-owned input
+field (the protected input digest), a changed historical grant on a
+real grant fixture, and hostile historical decision
+executions/results (an injected `iteration_index`, changed result
+scalar fields and both id lists) — every `invalid_state`.
 
 ### Stage generation/iteration controller (production-neutral, not wired)
 
