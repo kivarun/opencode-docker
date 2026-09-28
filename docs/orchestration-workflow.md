@@ -2305,9 +2305,129 @@ publications). Conflicts surface as the existing controllers' typed
 errors unchanged; nothing is ever rewritten or rolled back. Not
 implemented (stays unwired): the intent selection policy, the choice of
 `additional_iterations`, `revise_task_intent`, the task/plan revision
-replanning chain, opening the next iteration, automatic resume,
-coordinator/runner/CLI wiring, schema changes, migrations/API/T3,
-multi-process locking.
+replanning chain, automatic resume, coordinator/runner/CLI wiring,
+schema changes, migrations/API/T3, multi-process locking.
+
+### Continued-stage composition controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_continued_stage_controller.ts` (public,
+with the internal core
+`pipeline_v2_continued_stage_controller_internal.ts`) closes exactly one
+gap of the continue-stage branch: after
+`completePipelineV2ContinueStage` has durably applied (or confirmed) the
+grant, closed the grant-bound iteration and recorded the
+`continue_stage` response — but deliberately not opened the next
+iteration — this controller opens the NEXT iteration of the SAME
+generation through the existing `ensurePipelineV2StageIteration` and
+returns one unified flat result:
+
+    closed_iteration_index  — the iteration the grant closed
+    iteration_index         — the opened successor
+    generation_index
+    wait_index / intent_sha256 / request_sha256 / response_sha256
+    additional_iterations
+    action_id ("continue_stage") / action_to
+    compiled_stage (the exact frozen object)
+    state (the ensure controller's authoritative state)
+
+Fixed sequence: completion → the full defensive verification of its
+successful result → ensure → the full defensive verification of its
+result → the unified result; the ensure call is impossible until the
+completed boundary passed every check, and a mismatching or malformed
+completion result is the composition's own `invalid_result` with zero
+ensure calls. Own failure reasons are exactly `invalid_options` and
+`invalid_result`; the composed controllers' and sink's typed errors pass
+through unchanged by identity. Capture (before the first side effect):
+the options shape → `runRoot`/`sink`/`intent`/`compiledPlan`/
+`initialBudget` each exactly once → both ops getters once → `runRoot` a
+string, `initialBudget` a positive safe integer → the intent gated
+through the single provenance registry (strictly
+`continue_stage_intent`) → the stage resolved ONLY through
+`compiledPipelineV2RunPlanStageFor(compiledPlan, intent.stage_id)`
+(resolver errors pass by identity) → the stage position from the
+compiled plan's declaration order → the policy fixed as captured
+scalars, so later caller mutation cannot reinterpret the checks; there
+is no second compiled-plan parser or validator.
+
+The completed boundary must prove, against contract-owned values only
+(every access guarded — malformed shapes are `invalid_result`, never a
+`TypeError`): active/running with no terminal/publication/failure
+projection and the intent's `run_id`; the declared wait the last record
+and the only one of its index, carrying the exact accepted intent
+digest, exactly one declared `continue_stage` action whose target is
+exactly the selected compiled stage's `entry_state`, and the exact
+durable response; the cursor at the declared target on the wait's
+boundary; the transition and execution journals exactly at the wait
+boundary; exactly one grant matching the (generation, wait) pair with
+the exact intent digest and `additional_iterations`; the target
+generation the LAST open one bound exactly to the intent's stage id, the
+derived stage position, the compiled template, the current compiled plan
+digest and the caller `initialBudget`; and exactly one iteration closed
+by the exact `by: "grant"` closure (`wait_index`/`closed_transition_count`
+exact). Exactly two generation retry shapes are admissible: the next
+iteration not yet opened, and the exact next iteration already opened by
+a concurrent or previous successful call (the open iteration exactly
+`closed_iteration_index + 1` on the same anchor); any other open
+iteration is not a success.
+
+C5 recognition: the grant controller pins the completed boundary BEFORE
+any next iteration (an open next iteration is its typed conflict, never
+a retry of that boundary) — with zero dispatch and zero filesystem work —
+so when the completion fails with the grant controller's
+`lifecycle_conflict`, the composition re-recognizes the exact
+completed-and-opened shape on the authoritative snapshot against the
+fixed policy and continues with the ensure only on that exact match;
+every other failure is re-thrown unchanged (the same object identity).
+The ensure is called with the original trusted `compiledPlan`, the fixed
+`stageId`, the caller-owned `initialBudget` and the same sink; the
+effective budget is never computed by the composition (the reducer stays
+its source of truth) and a real conflict the ensure detects itself passes
+by identity — never pre-classified. Ensure-result verification: the
+exact `compiled_stage` object (identity, never a clone), the same
+generation, `iteration_index === closed_iteration_index + 1`, and the
+exact durable delta — one appended open iteration (+1 revision), or the
+zero-dispatch recognition (zero revision delta) when the iteration was
+already open — with every other durable region pinned positionally
+unchanged; hostile or malformed results are `invalid_result`, never a
+`TypeError`.
+
+Durability: the composed controllers' `state_persist_failed` windows
+pass through by identity, the suffix after a failed command is never
+executed, a fresh retry executes only the missing durable suffix, and
+nothing is ever dispatched twice. Two identical concurrent calls
+converge to one durable state. Tests:
+`orchestrator/tests/pipeline_v2_continued_stage_controller.test.ts`
+(26 tests) cover the C0 happy path with the exact four-command order
+(`iteration_grant_recorded` → `stage_iteration_closed` →
+`wait_response_recorded` → `stage_iteration_opened`, revision +4), the
+result key set/deep-freeze/loader round-trip, the C1–C5 partial retries
+with the exact remaining suffixes and revision deltas (+3/+2/
+response+open/zero-dispatch+open/zero), the C3 orphan and C4
+durability-unknown windows with fresh-retry semantics and no duplicates,
+the C5 zero-dispatch full retry with byte-equal result fields, the
+deviating open iteration and the hostile budget presentation refused
+(identity/`invalid_result`), the hostile successful completion and
+ensure batteries with zero ensure calls and content-free diagnostics,
+the four sink fault windows with fresh-retry continuations and no
+duplicates, two identical concurrent calls converging with exactly one
+of each command, the conflicting caller budget refused by the completion
+policy verification before the ensure, the unknown stage id as the
+compiled resolver's typed error before any dispatch, the
+foreign-pipeline compiled plan as the ensure's `lifecycle_conflict` by
+identity (naming `bundle_root`), the conflicting durable grant as the
+typed grant conflict by identity, the boundary answered with another
+action re-thrown by identity (never reconciled), the caller mutation +
+ops reassignment barrier test, both export surfaces, and the source
+scan (nine imports: the two composed facades, the grant error class,
+freeze, identity compare, compiled plan, manifests, provenance, state;
+no reducer/validator/store/filesystem/coordinator/runner/CLI imports; no
+second parser/serializer/digest builder/registry; no message parsing).
+Still unwired: the action/`additional_iterations` selection policy, the
+graph transition on the opened iteration and the next stage execution,
+the architect/replanning branch (`revise_task_intent`), model profile
+replacement, automatic resume, coordinator/runner/CLI/default-pipeline
+wiring, schema/reducer changes, migrations/API/T3, multi-process
+locking.
 
 ### Revise-task intent acceptance controller (production-neutral, not wired)
 
