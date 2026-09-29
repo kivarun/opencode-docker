@@ -2529,6 +2529,128 @@ replacement, automatic resume, coordinator/runner/CLI/default-pipeline
 wiring, schema/reducer changes, migrations/API/T3, multi-process
 locking.
 
+### Restart-aware continue-stage intervention controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_continue_stage_intervention_controller.ts`
+(public, with the internal core
+`pipeline_v2_continue_stage_intervention_controller_internal.ts`) is the
+single layer that connects the three existing authoritative layers into
+one full `continue_stage` intervention that survives a process restart:
+
+    acceptPipelineV2ContinueStageIntent
+      → restorePipelineV2AcceptedRunPlan
+      → openPipelineV2ContinuedStage
+
+It exists because after a restart no in-memory compiled run plan
+survives: the continued-stage composition refuses anything but a real
+provenance-backed `CompiledPipelineV2RunPlan` of the existing chain. The
+intervention accepts the intent first, then hands the acceptance
+result's authoritative durable state to the restore — the restore stays
+the single owner of the compiled plan reconstruction — and only then
+calls the composition with the exact restored compiled plan, the original
+intent, the caller budget and the same sink. The whole chain is proven
+by an honest prefix through the existing facades only (real plan
+acceptance, real generation/iteration, real stage execution back to the
+planning/wait boundary, real published wait request, prepared
+provenance-backed intent, simulated restart through the ordinary
+`PipelineV2RunStateSink.open`) driving the exact five-command durable
+suffix:
+
+    plan_intent_accepted
+      → iteration_grant_recorded
+      → stage_iteration_closed
+      → wait_response_recorded
+      → stage_iteration_opened
+
+with revision +5, entirely through the reopened run and with the
+in-memory compiled plan unused after the restart.
+
+The controller dispatches nothing itself, performs no filesystem work of
+its own, never calls the reducer and never starts a worker; the three
+composed layers remain the only owners of durable side effects. Runtime
+export surface is exactly
+`PipelineV2ContinueStageInterventionControllerError` (own reasons
+`invalid_options | invalid_result`, the last verified authoritative
+state) and `applyPipelineV2ContinueStageIntervention`. The internal ops
+seam carries exactly the three facades; there is no installer and no
+mutable module-global seam.
+
+Options: `{pipeline, runRoot, sink, intent, initialBudget}` —
+`compiledPlan` is not a caller field (only the restore obtains it), and
+stage id, plan digest and `additional_iterations` are never duplicated
+caller fields (they belong to the intent/restored plan). Capture order:
+the options shape → the five fields once each → the ops record shape and
+its three members once each (function checks) → a non-empty run root and
+a positive safe-integer budget → the pipeline provenance gate → the
+intent provenance gate (strictly the `continue_stage_intent` kind) plus
+the intent contract fields; the policy is fixed as captured scalars
+before the first await and a hostile extra options field is ignored.
+
+The progressed retry is one narrow reconciliation without message
+parsing: only the intent controller's `invalid_state`, only the
+authoritative `error.state`, and only when the target wait is still the
+last and only record of its index carrying the exact accepted intent
+digest and the durable lifecycle has provably moved beyond the
+intent-acceptance boundary — the exact `by: "grant"` closure of the
+target wait with no response (the closed-iteration window), or the
+recorded `continue_stage` response with the journals exactly at the wait
+boundary (the answered and already-reopened windows). A state after an
+already started successor execution or a committed transition, a newer
+wait, an absent/different/historical intent or a boundary answered with
+another action is never an intervention retry; every unrecognized
+acceptance error is re-thrown unchanged by object identity, after which
+the restore and the composition — the owners of all C2–C5 windows and
+the full lifecycle verification — run unchanged.
+
+Each successful composed result is verified completely before the next
+layer (malformed/null/primitive/nested shapes are the layer's own
+`invalid_result`, never a `TypeError`): the acceptance result binds the
+exact intent and the waiting durable state; the restore result must
+carry the unchanged authoritative state and the real provenance-backed
+compiled plan of the same pipeline identity and authoritative accepted
+plan (the public stage resolver as the provenance probe, the hidden
+originating identity through the single comparator, and the plan's
+revision/digest/origin against the last durable plan record and the
+intent's expected digest); the open result binds the intent, the durable
+wait declaration, the successor iteration, the exact restored compiled
+stage object by identity, the caller budget and the authoritative final
+state. Hostile successful results are never healed downstream;
+diagnostics are content-free.
+
+Durability: the three composed layers' typed failures pass through by
+identity; a fresh retry executes only the missing durable suffix, and
+nothing is ever rolled back or dispatched twice; two identical
+concurrent calls converge to one durable state. Tests:
+`orchestrator/tests/pipeline_v2_continue_stage_intervention_controller.test.ts`
+(41 tests) cover the honest three-facade proof through the reopened run,
+the C0 intervention with the exact suffix and revision +5 (the in-memory
+plan deliberately unused), the flat/deep-frozen/content-free result with
+the restored compiled stage identity, the C1–C5 windows with the exact
+remaining command lists and revision deltas (+4/+3/+2/+1/+0), the
+progressed-retry classification battery (wrong class/reason, state null,
+absent/different/historical intent, a `revise_task` answer, a started
+successor execution, a committed transition — each re-thrown by identity
+with zero downstream calls), the hostile successful-result battery
+(mutated and malformed acceptance/restore/open results, a forged cloned
+compiled plan, a foreign-pipeline compiled plan — every `invalid_result`,
+never a `TypeError`, zero downstream calls), the capture/provenance
+battery (the one-time read order, hostile extra fields, forged
+intents/pipelines, malformed options/ops, caller mutation after the
+pending acceptance), the ten durability windows (a fresh retry after
+every `not_committed`/`durability_unknown` of the five suffix commands
+executes only the missing suffix), the identical concurrency
+convergence, the conflicting budget/stage/intent refusals, both export
+surfaces, and the source scan (only the three facades plus the
+compiled/provenance/identity/scalar/state/freeze helpers; no
+reducer/validator/store/filesystem; no second
+parser/serializer/digest builder/registry; no coordinator/runner/CLI; no
+message parsing; no mutable seam). Still unwired: the
+action/`additional_iterations` selection policy, the revise-task branch
+(`revise_task_intent`), the graph transition on the opened iteration and
+the next stage execution, automatic resume,
+coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
+migrations/API/T3 and multi-process locking.
+
 ### Revise-task intent acceptance controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_revise_task_intent_controller.ts`
