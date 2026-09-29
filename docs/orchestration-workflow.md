@@ -2120,6 +2120,78 @@ coordinator, runner, CLI, the stage generation/iteration lifecycle
 controller, wait/replanning policy, automatic resume and multi-process
 locking.
 
+### Run plan restoration after a restart (production-neutral, not wired)
+
+The compiled run plan exists in memory only immediately after the run plan
+acceptance controller compiled it; after a process restart the
+continued-stage composition still refuses anything but a real
+provenance-backed `CompiledPipelineV2RunPlan` of the existing chain. The
+single official bridge back is the read-only restoration
+`orchestrator/src/pipeline_v2_run_plan_restore.ts` (public facade) over
+`pipeline_v2_run_plan_restore_internal.ts` (internal core and the one
+frozen production ops object):
+
+    restorePipelineV2AcceptedRunPlan({pipeline, runRoot, state})
+      → {compiled_plan, state}
+
+The reconstruction chain is entirely the existing one — pipeline
+provenance gate, the single `validatePipelineV2RunState`, the durable
+pipeline identity construction/comparison, `loadPipelineV2PlanRevision` /
+`loadPipelineV2TaskRevision` (read-only store loaders returning the
+provenance-backed prepared manifests), then the existing
+`preparePipelineV2RunPlanCandidate` and `compilePipelineV2RunPlanCandidate`;
+no second parser, compiler, serializer, digest builder, provenance
+registry or minter. The internal ops expose exactly the two read-only
+store loaders as one frozen object; the pure validation, preparation and
+compilation functions are never a replaceable parallel path.
+
+Capture and trust order, all before the first `await`: the options shape,
+each options field and both ops methods exactly once, the run root as a
+non-empty string, then the pipeline provenance gate — before any field of
+the durable state or of the pipeline is read. The state then goes through
+the single validator, the durable pipeline identity is compared through
+the shared comparator, `basename(runRoot)` must equal the durable run id
+before any store load, and at least one durable plan revision must exist;
+the authoritative revision is strictly the last durable plan ledger
+record — the filesystem never selects it, and newer or foreign orphan
+artifacts are ignored.
+
+Fixed strictly sequential read order (no parallel batch loads): the
+current plan manifest at the exact durable revision, verified field by
+field against the ledger record (run id, revision, digest, previous
+digest, origin execution); its immediate predecessor plan manifest read
+and verified only above revision 1; then, per task pointer in the
+manifest's normalized semantic order, the exact durable task record
+(task id + revision, exactly one), the current task manifest verified
+against pointer and record, and the immediate predecessor task manifest
+read and verified only above revision 1. Finally the durable protected
+input named by the plan's root task binding — exactly one, protected,
+with the exact digest — feeds the existing candidate preparation, whose
+result is compiled through the existing compiler. The loaded history
+stops at the current plan, its immediate predecessor and the current task
+revisions plus their immediate predecessors; nothing is re-published,
+dispatched, repaired or recovered.
+
+The typed failure contract is
+`PipelineV2RunPlanRestoreError {reason, state}` over exactly
+`invalid_options | invalid_state | pipeline_mismatch | artifact_missing |
+artifact_mismatch`: malformed durable state or no accepted plan is
+`invalid_state`, a durable identity or run-root mismatch is
+`pipeline_mismatch`, an absent required plan/task/predecessor artifact is
+`artifact_missing`, any ledger/pointer/chain/root-task divergence is
+`artifact_mismatch`, and hostile malformed loader results are typed
+failures — never `TypeError`s. Typed store/manifest/binding/compiler
+errors keep their own classes and identity; unexpected errors propagate
+unchanged; diagnostics are content-free. The result is deep-frozen, and
+the restored `compiled_plan` is the exact provenance-backed compiled
+object (accepted by `compiledPipelineV2RunPlanStageFor`). The bridge is
+proven end to end in `orchestrator/tests/pipeline_v2_run_plan_restore.test.ts`
+(28 tests): an honest continued-stage prefix through the real facades,
+the simulated restart, the restoration from the durable ledger plus the
+immutable manifests, and the existing continued-stage composition
+consuming exactly the restored compiled plan. Not wired: the CLI, the
+runner, the coordinator, automatic resume, retries and migrations.
+
 ### Continue-stage intent acceptance controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_continue_stage_intent_controller.ts`
