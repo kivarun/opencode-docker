@@ -472,7 +472,11 @@ function mutatedCompletionOps(
 
 /**
  * The real completion beside a real ensure whose successful result is
- * mutated before it reaches the composition verification.
+ * mutated before it reaches the composition verification. The shallow
+ * result copy preserves the exact `compiled_stage` object identity (the
+ * composition verifies it by identity), so a mutation is caught by the
+ * comparison it attacks — never by an accidental clone of the trusted
+ * compiled stage.
  */
 function mutatedEnsureOps(
   mutate: (result: Record<string, unknown>, state: PipelineV2RunState) => void,
@@ -481,7 +485,7 @@ function mutatedEnsureOps(
     completeStage: completePipelineV2ContinueStage,
     ensureStageIteration: async (args: unknown) => {
       const real = await ensurePipelineV2StageIteration(args as never);
-      const clone = structuredClone(real) as unknown as Record<string, unknown>;
+      const clone = { ...real, state: structuredClone(real.state) } as unknown as Record<string, unknown>;
       mutate(clone, clone["state"] as PipelineV2RunState);
       return clone as never;
     },
@@ -1255,9 +1259,243 @@ describe("openPipelineV2ContinuedStage", () => {
       await disposeRun(ctx.fixture);
     }
   });
+
+  test("25. the completion result's generation_index is bound to the verified durable grant boundary", async () => {
+    const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
+    try {
+      const ops = mutatedCompletionOps((result) => {
+        result["generation_index"] = 2;
+      });
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(ops.ensureCalls()).toBe(0);
+      expect(cause).not.toBeInstanceOf(TypeError);
+      expect(error.message).not.toContain("Body A");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("26. the completion result's iteration_index is bound to the grant-closed iteration", async () => {
+    const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
+    try {
+      const ops = mutatedCompletionOps((result) => {
+        result["iteration_index"] = 2;
+      });
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(ops.ensureCalls()).toBe(0);
+      expect(cause).not.toBeInstanceOf(TypeError);
+      expect(error.message).not.toContain("Body A");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("27. a second conflicting grant of the granted pair is invalid_result with zero ensure calls", async () => {
+    const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
+    try {
+      const ops = mutatedCompletionOps((_result, state) => {
+        (state.grants as unknown as unknown[]).push({
+          index: 2,
+          generation_index: 1,
+          wait_index: 1,
+          intent_sha256: ctx.intent.sha256,
+          additional_iterations: 5,
+        });
+      });
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(ops.ensureCalls()).toBe(0);
+      expect(cause).not.toBeInstanceOf(TypeError);
+      expect(error.message).not.toContain("Body A");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("28. a hostile ensure result changing only the grant closure's wait_index is invalid_result; the exact closure is still accepted", async () => {
+    const ctx = await continuedStageReady();
+    try {
+      const ops = mutatedEnsureOps((_result, state) => {
+        const closed = (((state.generations[0] as unknown as Record<string, unknown>)["iterations"] as unknown[])[0] as unknown as Record<string, unknown>)["closed"] as Record<string, unknown>;
+        closed["wait_index"] = 2;
+      });
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(error.message).not.toContain("Body A");
+      expect(cause).not.toBeInstanceOf(TypeError);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+    const fresh = await continuedStageReady();
+    try {
+      const result = await callComposition(fresh, fresh.sink);
+      expect(result.closed_iteration_index).toBe(1);
+      expect(result.state.generations[0]?.iterations[0]?.closed).toEqual({
+        by: "grant",
+        wait_index: 1,
+        closed_transition_count: 2,
+      });
+    } finally {
+      await disposeRun(fresh.fixture);
+    }
+  });
+
+  test("29. a hostile C5 ensure result changing only updated_at is invalid_result", async () => {
+    const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true, openNextIteration: true });
+    try {
+      const ops = mutatedEnsureOps((_result, state) => {
+        (state as unknown as Record<string, unknown>)["updated_at"] = "2020-01-01T00:00:00.000Z";
+      });
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      const error = expectOpenError(cause);
+      expect(error.reason).toBe("invalid_result");
+      expect(error.message).not.toContain("Body A");
+      expect(cause).not.toBeInstanceOf(TypeError);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("30. a non-C5 completion error is re-thrown as the exact same object", async () => {
+    const ctx = await continuedStageReady();
+    try {
+      const sentinel = new Error("sentinel completion failure");
+      let ensureCalls = 0;
+      const ops = {
+        completeStage: async () => {
+          throw sentinel;
+        },
+        ensureStageIteration: async () => {
+          ensureCalls += 1;
+          throw new Error("ensure must not be called");
+        },
+      } as unknown as PipelineV2ContinuedStageOps;
+      const recording = recordSink(ctx.sink);
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: recording,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      expect(cause).toBe(sentinel);
+      expect(ensureCalls).toBe(0);
+      expect(recording.commands).toEqual([]);
+      expect(ctx.sink.snapshot?.grants).toHaveLength(0);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("31. an ensure error is re-thrown as the exact same object", async () => {
+    const ctx = await continuedStageReady();
+    try {
+      const sentinel = new Error("sentinel ensure failure");
+      const ops = {
+        completeStage: completePipelineV2ContinueStage,
+        ensureStageIteration: async () => {
+          throw sentinel;
+        },
+      } as unknown as PipelineV2ContinuedStageOps;
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: ctx.sink,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      expect(cause).toBe(sentinel);
+      expect(ctx.sink.snapshot?.waits[0]?.response?.action_id).toBe("continue_stage");
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("32. a lifecycle_conflict that is not the exact C5 shape is re-thrown as the exact same object", async () => {
+    const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
+    try {
+      const sentinel = new PipelineV2ContinueStageGrantControllerError("lifecycle_conflict", "sentinel lifecycle refusal", null);
+      let ensureCalls = 0;
+      const ops = {
+        completeStage: async () => {
+          throw sentinel;
+        },
+        ensureStageIteration: async () => {
+          ensureCalls += 1;
+          throw new Error("ensure must not be called");
+        },
+      } as unknown as PipelineV2ContinuedStageOps;
+      const recording = recordSink(ctx.sink);
+      const cause = await catchOpen(() =>
+        openPipelineV2ContinuedStageWithIo(ops, {
+          runRoot: ctx.fixture.runRoot,
+          sink: recording,
+          intent: ctx.intent,
+          compiledPlan: ctx.compiledPlan,
+          initialBudget: 2,
+        }),
+      );
+      expect(cause).toBe(sentinel);
+      expect(ensureCalls).toBe(0);
+      expect(recording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).generations[0]?.open_iteration).toBeUndefined();
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
 });
 
-test("25. the runtime export surfaces are exact (public two keys, internal three keys)", async () => {
+test("33. the runtime export surfaces are exact (public two keys, internal three keys)", async () => {
   const publicModule = await import("../src/pipeline_v2_continued_stage_controller.ts");
   expect(Object.keys(publicModule).sort()).toEqual([
     "PipelineV2ContinuedStageControllerError",
@@ -1274,7 +1512,7 @@ test("25. the runtime export surfaces are exact (public two keys, internal three
   expect(Object.isFrozen(productionContinuedStageOps)).toBe(true);
 });
 
-test("26. the composition module imports only the composed layers (source scan)", async () => {
+test("34. the composition module imports only the composed layers (source scan)", async () => {
   const { readFile } = await import("node:fs/promises");
   const source = await readFile(join(import.meta.dir, "..", "src", "pipeline_v2_continued_stage_controller_internal.ts"), "utf8");
   const countOf = (needle: string): number => source.split(needle).length - 1;

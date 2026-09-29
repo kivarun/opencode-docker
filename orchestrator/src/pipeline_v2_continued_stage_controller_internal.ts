@@ -88,9 +88,11 @@ import type {
  * durable `continue_stage` response; the cursor sits at that declared
  * target with its transition count at the wait's boundary; the
  * transition and execution journals sit exactly at the wait boundary
- * (no execution or transition advanced past the answered wait); exactly
- * one grant matches the (generation, wait) pair with the exact intent
- * digest and `additional_iterations`; the target generation is the LAST
+ * (no execution or transition advanced past the answered wait); for the
+ * granted (generation, wait) pair exactly one durable grant record
+ * exists and exactly it carries the exact intent digest and
+ * `additional_iterations` (a second conflicting record of the same pair
+ * is never a valid boundary); the target generation is the LAST
  * open generation bound exactly to the intent's stage id, the derived
  * stage position, the compiled stage template, the current compiled plan
  * digest and the caller `initialBudget` on the wait's anchor; and the
@@ -126,7 +128,10 @@ import type {
  * `iteration_index`/`additional_iterations`, the string digests, the
  * literal `action_id: "continue_stage"`, the `action_to` equal to the
  * selected compiled stage's `entry_state`, and a record state that
- * satisfies the completed-boundary shape above. Every field access is
+ * satisfies the completed-boundary shape above; the flat
+ * `generation_index`/`iteration_index` are bound exactly to the verified
+ * durable grant boundary (the granted generation and the grant-closed
+ * iteration). Every field access is
  * defensive: a hostile or structurally inconsistent successful result
  * (a mismatching stage, plan digest, budget, grant, closure, wait anchor
  * or action; a malformed nested document) is the composition's own typed
@@ -156,7 +161,11 @@ import type {
  * iteration, the ensure is the zero-dispatch recognition: zero revision
  * delta and every durable region unchanged. The wait, response, grant,
  * closure, cursor, journals, ledgers, generation prefix and identity
- * bindings must be identical before/after; a hostile ensure result is the
+ * bindings must be identical before/after; the preserved iteration
+ * closures are compared over their exact `by`/`closed_transition_count`/
+ * `wait_index` triple (the wait index absent exactly for non-wait-bound
+ * closures), and the zero-delta recognition additionally requires the
+ * exact unchanged `updated_at`; a hostile ensure result is the
  * composition's own `invalid_result`, never a `TypeError`.
  *
  * Durability: the composed controllers' typed failures
@@ -603,7 +612,11 @@ function closureProjectionEquals(
     isRecord(before) &&
     isRecord(after) &&
     after["by"] === before["by"] &&
-    after["closed_transition_count"] === before["closed_transition_count"]
+    after["closed_transition_count"] === before["closed_transition_count"] &&
+    // The schema-owned wait index is part of the exact closure identity:
+    // present exactly for wait-bound closures and absent otherwise, so
+    // the comparison includes it exactly.
+    after["wait_index"] === before["wait_index"]
   );
 }
 
@@ -889,6 +902,31 @@ function verifyCompletedShape(stateValue: unknown, policy: ContinuedStagePolicy)
       state,
     );
   }
+  // The exact grant-pair uniqueness: for the granted (generation, wait)
+  // pair exactly one durable grant record exists, and exactly that
+  // record carries the exact intent digest and additional iteration
+  // count — a second conflicting record of the same pair is never a
+  // valid boundary, even when one of the copies matches exactly.
+  let pairCount = 0;
+  let pairGrant: PipelineV2IterationGrantState | undefined;
+  for (const entry of state.grants as PipelineV2IterationGrantState[]) {
+    if (entry.generation_index === generationIndex && entry.wait_index === policy.waitIndex) {
+      pairCount += 1;
+      pairGrant = entry;
+    }
+  }
+  if (
+    pairCount !== 1 ||
+    pairGrant === undefined ||
+    pairGrant.intent_sha256 !== policy.intentSha256 ||
+    pairGrant.additional_iterations !== policy.additionalIterations
+  ) {
+    throw controllerError(
+      "invalid_result",
+      "the completed continue-stage boundary does not carry exactly one grant of the granted generation and wait pair",
+      state,
+    );
+  }
   // The target generation: the last open one, bound exactly to the fixed
   // stage/plan/budget policy on the wait's anchor.
   if (!Array.isArray(state.generations)) {
@@ -1084,6 +1122,20 @@ function verifyCompletionResult(resultValue: unknown, policy: ContinuedStagePoli
       completed.state,
     );
   }
+  // The flat result indexes are bound exactly to the verified durable
+  // grant boundary: the generation the grant extended and the iteration
+  // the grant closed, as the completed-boundary verification derived
+  // them from the durable records.
+  if (
+    result["generation_index"] !== completed.generationIndex ||
+    result["iteration_index"] !== completed.closedIterationIndex
+  ) {
+    throw controllerError(
+      "invalid_result",
+      "the continue-stage completion result indexes do not match the verified durable grant boundary",
+      completed.state,
+    );
+  }
   return completed;
 }
 
@@ -1226,10 +1278,15 @@ function verifyEnsureResult(
   const afterIterations = afterGeneration.iterations as PipelineV2StageIterationRecord[];
   if (expectedRevisionDelta === 0) {
     // The already-opened retry: the whole durable generation record stays
-    // exactly as the verified completed state carried it.
+    // exactly as the verified completed state carried it, and the
+    // zero-dispatch recognition changes no durable byte — the exact
+    // `updated_at` included. (The +1 opening path deliberately does not
+    // pin `updated_at`: the reducer refreshes it on the committed
+    // opening.)
     if (
       beforeGeneration.iteration_count !== before.closedIterationIndex + 1 ||
-      !generationUnchanged(beforeGeneration, afterGeneration)
+      !generationUnchanged(beforeGeneration, afterGeneration) ||
+      after.updated_at !== beforeState.updated_at
     ) {
       throw mismatch();
     }
@@ -1379,10 +1436,12 @@ export async function openPipelineV2ContinuedStageWithIo(
   opsValue: unknown,
   optionsValue: unknown,
 ): Promise<OpenedPipelineV2ContinuedStage> {
-  // Capture boundary: the options shape, then every options field and
-  // both ops getters each read exactly once before the first await; the
-  // caller policy is fixed from the captured values, so later caller
-  // mutations cannot influence the execution.
+  // Capture boundary: the options shape and every options field through
+  // the fixed capture, then both ops getters, each read exactly once
+  // before the first await; the caller policy is fixed from the captured
+  // values, so later caller mutations cannot influence the execution.
+  const captured = capturePolicy(optionsValue);
+  const { policy, runRoot, sink, intent, compiledPlan } = captured;
   if (!isRecord(opsValue)) {
     throw controllerError("invalid_options", "openPipelineV2ContinuedStage requires an ops object", null);
   }
@@ -1396,8 +1455,6 @@ export async function openPipelineV2ContinuedStageWithIo(
       null,
     );
   }
-  const captured = capturePolicy(optionsValue);
-  const { policy, runRoot, sink, intent, compiledPlan } = captured;
 
   // Step 1: complete the durable continue-stage flow through the
   // existing controller; its provenance gates, state validation,

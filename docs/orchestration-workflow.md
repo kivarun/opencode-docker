@@ -2334,8 +2334,11 @@ Fixed sequence: completion → the full defensive verification of its
 successful result → ensure → the full defensive verification of its
 result → the unified result; the ensure call is impossible until the
 completed boundary passed every check, and a mismatching or malformed
-completion result is the composition's own `invalid_result` with zero
-ensure calls. Own failure reasons are exactly `invalid_options` and
+completion result — including a flat `generation_index`/
+`iteration_index` not bound exactly to the verified durable grant
+boundary (the granted generation and the grant-closed iteration) — is
+the composition's own `invalid_result` with zero ensure calls. Own
+failure reasons are exactly `invalid_options` and
 `invalid_result`; the composed controllers' and sink's typed errors pass
 through unchanged by identity. Capture (before the first side effect):
 the options shape → `runRoot`/`sink`/`intent`/`compiledPlan`/
@@ -2358,8 +2361,10 @@ digest, exactly one declared `continue_stage` action whose target is
 exactly the selected compiled stage's `entry_state`, and the exact
 durable response; the cursor at the declared target on the wait's
 boundary; the transition and execution journals exactly at the wait
-boundary; exactly one grant matching the (generation, wait) pair with
-the exact intent digest and `additional_iterations`; the target
+boundary; for the granted (generation, wait) pair exactly one durable
+grant record exists and exactly it carries the exact intent digest and
+`additional_iterations` (a second conflicting record of the same pair
+is never a valid boundary); the target
 generation the LAST open one bound exactly to the intent's stage id, the
 derived stage position, the compiled template, the current compiled plan
 digest and the caller `initialBudget`; and exactly one iteration closed
@@ -2386,9 +2391,13 @@ by identity — never pre-classified. Ensure-result verification: the
 exact `compiled_stage` object (identity, never a clone), the same
 generation, `iteration_index === closed_iteration_index + 1`, and the
 exact durable delta — one appended open iteration (+1 revision), or the
-zero-dispatch recognition (zero revision delta) when the iteration was
-already open — with every other durable region pinned positionally
-unchanged; hostile or malformed results are `invalid_result`, never a
+zero-dispatch recognition (zero revision delta, exact unchanged
+`updated_at`) when the iteration was already open — with every other
+durable region pinned positionally unchanged and the preserved
+iteration closures compared over their exact
+`by`/`closed_transition_count`/`wait_index` triple (the wait index
+absent exactly for non-wait-bound closures); hostile or malformed
+results are `invalid_result`, never a
 `TypeError`.
 
 Durability: the composed controllers' `state_persist_failed` windows
@@ -2397,7 +2406,7 @@ executed, a fresh retry executes only the missing durable suffix, and
 nothing is ever dispatched twice. Two identical concurrent calls
 converge to one durable state. Tests:
 `orchestrator/tests/pipeline_v2_continued_stage_controller.test.ts`
-(26 tests) cover the C0 happy path with the exact four-command order
+(34 tests) cover the C0 happy path with the exact four-command order
 (`iteration_grant_recorded` → `stage_iteration_closed` →
 `wait_response_recorded` → `stage_iteration_opened`, revision +4), the
 result key set/deep-freeze/loader round-trip, the C1–C5 partial retries
@@ -2406,9 +2415,19 @@ response+open/zero-dispatch+open/zero), the C3 orphan and C4
 durability-unknown windows with fresh-retry semantics and no duplicates,
 the C5 zero-dispatch full retry with byte-equal result fields, the
 deviating open iteration and the hostile budget presentation refused
-(identity/`invalid_result`), the hostile successful completion and
-ensure batteries with zero ensure calls and content-free diagnostics,
-the four sink fault windows with fresh-retry continuations and no
+(identity/`invalid_result`), the hostile successful completion battery
+(stage/plan/budget/grant/closure/wait anchor/action/action_to/additional
+iterations plus the flat `generation_index`/`iteration_index` bindings
+and a second conflicting grant of the granted pair — every
+`invalid_result` with zero ensure calls) with content-free diagnostics
+and no `TypeError`, the hostile successful ensure battery (a cloned
+compiled stage, wrong indexes, wrong revision deltas, mutated
+waits/grants/generations/executions, extra iterations, a removed open
+projection, a changed grant-closure `wait_index`, a changed zero-delta
+`updated_at`, terminal/cursor mutations), the injected-sentinel identity
+proofs (a non-C5 completion error, an ensure error and an unrecognized
+`lifecycle_conflict` each re-thrown as the exact same object), the four
+sink fault windows with fresh-retry continuations and no
 duplicates, two identical concurrent calls converging with exactly one
 of each command, the conflicting caller budget refused by the completion
 policy verification before the ensure, the unknown stage id as the

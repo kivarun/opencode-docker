@@ -34,12 +34,14 @@ import {
  * provenance-backed prepared `continue_stage_intent`.
  *
  * Retry semantics: the completion controller recognizes its own C1–C4
- * partial retries; because the grant controller pins the completed
- * boundary before any next iteration, this composition additionally
- * recognizes the exact completed-and-opened shape on the authoritative
- * snapshot before the completion call (the C5 full retry) and skips the
- * completion only on an exact match — every deviation falls through to
- * the completion controller, whose typed errors pass by identity. The
+ * partial retries and is always called first; because the grant
+ * controller pins the completed boundary before any next iteration (an
+ * open next iteration is its typed conflict, never a retry of that
+ * boundary), the C5 full retry surfaces as the grant controller's
+ * `lifecycle_conflict` — the composition then re-recognizes the exact
+ * completed-and-opened shape on the authoritative snapshot against the
+ * fixed policy and continues with the ensure only on that exact match,
+ * while every other failure is re-thrown unchanged by identity. The
  * ensure step opens exactly the successor iteration of the granted
  * generation (`closed_iteration_index + 1`) or recognizes the exact
  * already-open one with zero dispatch.
