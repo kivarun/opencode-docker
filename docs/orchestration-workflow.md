@@ -2148,13 +2148,16 @@ compilation functions are never a replaceable parallel path.
 Capture and trust order, all before the first `await`: the options shape,
 each options field and both ops methods exactly once, the run root as a
 non-empty string, then the pipeline provenance gate — before any field of
-the durable state or of the pipeline is read. The state then goes through
-the single validator, the durable pipeline identity is compared through
-the shared comparator, `basename(runRoot)` must equal the durable run id
-before any store load, and at least one durable plan revision must exist;
-the authoritative revision is strictly the last durable plan ledger
-record — the filesystem never selects it, and newer or foreign orphan
-artifacts are ignored.
+the durable state or of the pipeline is read. The injected-ops record
+shape is checked before the first indexed read of its loader fields, so
+`null`, `undefined`, primitives, arrays and loader-less records fail as
+the typed `invalid_options` instead of a native `TypeError`. The state
+then goes through the single validator, the durable pipeline identity is
+compared through the shared comparator, `basename(runRoot)` must equal
+the durable run id before any store load, and at least one durable plan
+revision must exist; the authoritative revision is strictly the last
+durable plan ledger record — the filesystem never selects it, and newer
+or foreign orphan artifacts are ignored.
 
 Fixed strictly sequential read order (no parallel batch loads): the
 current plan manifest at the exact durable revision, verified field by
@@ -2175,10 +2178,11 @@ dispatched, repaired or recovered.
 The typed failure contract is
 `PipelineV2RunPlanRestoreError {reason, state}` over exactly
 `invalid_options | invalid_state | pipeline_mismatch | artifact_missing |
-artifact_mismatch`: malformed durable state or no accepted plan is
-`invalid_state`, a durable identity or run-root mismatch is
-`pipeline_mismatch`, an absent required plan/task/predecessor artifact is
-`artifact_missing`, any ledger/pointer/chain/root-task divergence is
+artifact_mismatch`: malformed options or injected-ops record shapes are
+`invalid_options` at the capture boundary, malformed durable state or no
+accepted plan is `invalid_state`, a durable identity or run-root mismatch
+is `pipeline_mismatch`, an absent required plan/task/predecessor artifact
+is `artifact_missing`, any ledger/pointer/chain/root-task divergence is
 `artifact_mismatch`, and hostile malformed loader results are typed
 failures — never `TypeError`s. Typed store/manifest/binding/compiler
 errors keep their own classes and identity; unexpected errors propagate
@@ -2186,7 +2190,7 @@ unchanged; diagnostics are content-free. The result is deep-frozen, and
 the restored `compiled_plan` is the exact provenance-backed compiled
 object (accepted by `compiledPipelineV2RunPlanStageFor`). The bridge is
 proven end to end in `orchestrator/tests/pipeline_v2_run_plan_restore.test.ts`
-(28 tests): an honest continued-stage prefix through the real facades,
+(29 tests): an honest continued-stage prefix through the real facades,
 the simulated restart, the restoration from the durable ledger plus the
 immutable manifests, and the existing continued-stage composition
 consuming exactly the restored compiled plan. Not wired: the CLI, the

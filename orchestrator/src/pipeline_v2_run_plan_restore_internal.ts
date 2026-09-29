@@ -273,11 +273,11 @@ export async function restorePipelineV2AcceptedRunPlanInternal(
   options: unknown,
   ops: PipelineV2RunPlanRestoreOps,
 ): Promise<RestoredPipelineV2AcceptedRunPlan> {
-  // Capture boundary: the options shape, every options field and both ops
-  // methods are read exactly once, all before the first await. No field
-  // of the durable state or of the pipeline is read here; a later
-  // mutation of the caller's options or ops cannot change this
-  // restoration's policy.
+  // Capture boundary: the options shape, every options field, the ops
+  // record shape and both ops methods are read exactly once, all before
+  // the first await. No field of the durable state or of the pipeline is
+  // read here; a later mutation of the caller's options or ops cannot
+  // change this restoration's policy.
   if (!isRecord(options)) {
     throw new PipelineV2RunPlanRestoreError(
       "invalid_options",
@@ -288,6 +288,13 @@ export async function restorePipelineV2AcceptedRunPlanInternal(
   const pipeline = options["pipeline"] as ResolvedPipelineV2;
   const runRoot = options["runRoot"];
   const state = options["state"];
+  if (!isRecord(ops)) {
+    throw new PipelineV2RunPlanRestoreError(
+      "invalid_options",
+      "restorePipelineV2AcceptedRunPlan requires a read-only loader record",
+      null,
+    );
+  }
   const loadPlanRevision = ops["loadPlanRevision"];
   const loadTaskRevision = ops["loadTaskRevision"];
   if (typeof loadPlanRevision !== "function" || typeof loadTaskRevision !== "function") {

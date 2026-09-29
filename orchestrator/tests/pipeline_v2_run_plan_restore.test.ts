@@ -1422,6 +1422,101 @@ test("8c. cloned, spread and Proxy pipelines are rejected by the existing proven
   }
 });
 
+test("8d. malformed ops are typed invalid_options at the capture boundary, before any downstream verification", async () => {
+  const fixture = await setupRevisionOne();
+  const { harness } = fixture;
+  try {
+    const state = harness.recording.snapshot as PipelineV2RunState;
+    // The downstream poison: a pipeline clone trips the provenance gate
+    // with a PipelineError, a foreign run root trips the pipeline_mismatch
+    // binding and a Proxy state trips reads at validation — the malformed
+    // ops must be rejected at the capture boundary first, every time.
+    const clonePipeline = JSON.parse(JSON.stringify(harness.pipeline)) as ResolvedPipelineV2;
+    const foreignRunRoot = join(harness.dirs.root, "runs", "foreign-run");
+    const cases: ReadonlyArray<{ name: string; ops: unknown; expectedOpsReads: readonly string[] }> = [
+      { name: "null", ops: null, expectedOpsReads: [] },
+      { name: "undefined", ops: undefined, expectedOpsReads: [] },
+      { name: "primitive number", ops: 42, expectedOpsReads: [] },
+      { name: "primitive string", ops: "HOSTILE-OPS-PRIMITIVE", expectedOpsReads: [] },
+      { name: "array", ops: ["HOSTILE-OPS-ARRAY"], expectedOpsReads: [] },
+      {
+        name: "record with no loaders",
+        ops: { hostile: "HOSTILE-OPS-FIELD" },
+        expectedOpsReads: ["loadPlanRevision", "loadTaskRevision"],
+      },
+      {
+        name: "record with only loadPlanRevision",
+        ops: { loadPlanRevision: async () => null, hostile: "HOSTILE-OPS-FIELD" },
+        expectedOpsReads: ["loadPlanRevision", "loadTaskRevision"],
+      },
+      {
+        name: "record with only loadTaskRevision",
+        ops: { loadTaskRevision: async () => null, hostile: "HOSTILE-OPS-FIELD" },
+        expectedOpsReads: ["loadPlanRevision", "loadTaskRevision"],
+      },
+      {
+        name: "non-function loadPlanRevision",
+        ops: { loadPlanRevision: "HOSTILE-NOT-A-FUNCTION", loadTaskRevision: async () => null },
+        expectedOpsReads: ["loadPlanRevision", "loadTaskRevision"],
+      },
+      {
+        name: "non-function loadTaskRevision",
+        ops: { loadPlanRevision: async () => null, loadTaskRevision: 42 },
+        expectedOpsReads: ["loadPlanRevision", "loadTaskRevision"],
+      },
+      {
+        name: "both loaders non-functions",
+        ops: { loadPlanRevision: null, loadTaskRevision: null, hostile: "HOSTILE-OPS-FIELD" },
+        expectedOpsReads: ["loadPlanRevision", "loadTaskRevision"],
+      },
+    ];
+
+    for (const item of cases) {
+      const optionReads: string[] = [];
+      let stateReads = 0;
+      const stateProxy = new Proxy(state as unknown as Record<string, unknown>, {
+        get(target, property) {
+          stateReads += 1;
+          return target[property as string];
+        },
+      });
+      const optionsProxy = new Proxy(
+        { pipeline: clonePipeline, runRoot: foreignRunRoot, state: stateProxy, hostile: "HOSTILE-OPTIONS-FIELD" },
+        {
+          get(target, property) {
+            optionReads.push(String(property));
+            return (target as Record<string, unknown>)[property as string];
+          },
+        },
+      );
+      const opsReads: string[] = [];
+      const opsValue = item.ops;
+      const opsArg: unknown =
+        opsValue !== null && typeof opsValue === "object"
+          ? new Proxy(opsValue as Record<string, unknown>, {
+              get(target, property) {
+                opsReads.push(String(property));
+                return target[property as string];
+              },
+            })
+          : opsValue;
+      const cause = await restorePipelineV2AcceptedRunPlanInternal(
+        optionsProxy,
+        opsArg as PipelineV2RunPlanRestoreOps,
+      ).catch((error) => error);
+      const error = expectRestoreError(cause, "invalid_options");
+      expect(cause).not.toBeInstanceOf(TypeError);
+      expect(error.message).not.toContain("CANARY");
+      expect(error.message).not.toContain("HOSTILE");
+      expect(optionReads).toEqual(["pipeline", "runRoot", "state"]);
+      expect(stateReads).toBe(0);
+      expect(opsReads).toEqual([...item.expectedOpsReads]);
+    }
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
 // --- 9. the read-only proof --------------------------------------------------
 
 test("9a. the restoration never mutates the filesystem on success or on failure", async () => {
