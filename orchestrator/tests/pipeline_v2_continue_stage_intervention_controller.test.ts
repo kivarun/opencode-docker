@@ -83,6 +83,10 @@ inputs:
   - id: task
     type: file
     protected: true
+  - id: facts
+    type: json
+    protected: false
+    schema: schemas/facts.json
 
 outputs: []
 
@@ -94,6 +98,9 @@ orchestration:
     - state_id: architect
       role: planning
     - state_id: dev_entry
+      role: stage
+      stage_template: development
+    - state_id: decide_next
       role: stage
       stage_template: development
 
@@ -120,6 +127,24 @@ states:
     max_attempts: 1
     transitions:
       - outcome: completed
+        to: decide_next
+
+  - id: decide_next
+    type: decision
+    model: decisions/next.yaml
+    inputs:
+      - id: facts
+        source: {pipeline_input: facts}
+    transitions:
+      - outcome: go
+        to: architect
+      - outcome: stop
+        to: architect
+      - outcome: uncovered
+        to: architect
+      - outcome: inconsistent_facts
+        to: architect
+      - outcome: invalid_facts
         to: architect
 
   - id: done
@@ -127,7 +152,29 @@ states:
     result: success
 `;
 
-const BASE_INPUTS = [{ id: "task", type: "file" as const, protected: true, digest: PROTECTED_DIGEST }];
+const FACTS_SCHEMA = `{"type":"object","required":["f1"],"properties":{"f1":{"type":"boolean"}},"additionalProperties":false}`;
+
+const NEXT_MODEL_YAML = `schema_version: 1
+facts:
+  - id: f1
+decisions:
+  - id: go
+  - id: stop
+relations: []
+constraints: []
+rules:
+  - id: rule-go
+    when: {fact: f1, equals: true}
+    decision: go
+  - id: rule-stop
+    when: {fact: f1, equals: false}
+    decision: stop
+`;
+
+const BASE_INPUTS = [
+  { id: "task", type: "file" as const, protected: true, digest: PROTECTED_DIGEST },
+  { id: "facts", type: "json" as const, protected: false, digest: hex("c") },
+];
 
 let clockCounter = 0;
 function nextTick(): Date {
@@ -172,6 +219,7 @@ interface Fixture {
   plan1: ReturnType<typeof preparePlanRevisionManifest>;
   candidate: PreparedPipelineV2RunPlanCandidate;
   reopened: PipelineV2RunStateSink;
+  sink: PipelineV2RunStateSink;
 }
 
 interface ProgressOptions {
@@ -182,6 +230,17 @@ interface ProgressOptions {
   openNextIteration?: boolean;
 }
 
+async function writeBundle(bundle: string): Promise<void> {
+  await mkdir(join(bundle, "prompts"), { recursive: true });
+  await mkdir(join(bundle, "decisions"), { recursive: true });
+  await mkdir(join(bundle, "schemas"), { recursive: true });
+  await writeFile(join(bundle, "pipeline.yaml"), STAGE_YAML);
+  await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
+  await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
+  await writeFile(join(bundle, "decisions", "next.yaml"), NEXT_MODEL_YAML);
+  await writeFile(join(bundle, "schemas", "facts.json"), FACTS_SCHEMA);
+}
+
 /**
  * The honest prefix through the existing production facades only: real
  * run/project-free input state, real planning execution, real accepted
@@ -190,15 +249,28 @@ interface ProgressOptions {
  * provenance-backed continue_stage intent — followed by the simulated
  * restart through the ordinary `PipelineV2RunStateSink.open`.
  */
-async function driveToReopenedWait(options: ProgressOptions = {}): Promise<Fixture> {
+let sharedPipeline: ResolvedPipelineV2 | null = null;
+
+/**
+ * The compiled pipeline is deep-frozen, provenance-registered and never
+ * mutated by any test, so the bundle and its Ajv compilation are built
+ * once and shared by every fixture; test 19 builds its own foreign
+ * bundle.
+ */
+async function sharedBundlePipeline(): Promise<ResolvedPipelineV2> {
+  if (sharedPipeline === null) {
+    const bundle = join(tmpdir(), "pipeline-v2-stage-intervention-shared-bundle");
+    await rm(bundle, { recursive: true, force: true });
+    await writeBundle(bundle);
+    sharedPipeline = await loadPipelineV2(bundle);
+  }
+  return sharedPipeline;
+}
+
+async function driveToWaitBoundary(): Promise<Omit<Fixture, "intent" | "reopened"> & { intent1: PreparedPipelineV2RunWaitIntent }> {
   const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-intervention-"));
   try {
-    const bundle = join(root, "bundle");
-    await mkdir(join(bundle, "prompts"), { recursive: true });
-    await writeFile(join(bundle, "pipeline.yaml"), STAGE_YAML);
-    await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
-    await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
-    const pipeline = await loadPipelineV2(bundle);
+    const pipeline = await sharedBundlePipeline();
     const stateRoot = join(root, "state-root");
     await mkdir(stateRoot, { mode: 0o700 });
     const runRoot = join(stateRoot, "pipeline-runs", RUN_ID);
@@ -245,14 +317,30 @@ async function driveToReopenedWait(options: ProgressOptions = {}): Promise<Fixtu
     }
     await sink.dispatch({
       kind: "transition_committed",
-      step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+      step: { from: "dev_entry", outcome: "completed", to: "decide_next", transition_index: 0 },
       executionIndex: 2,
+    });
+    await sink.dispatch({
+      kind: "start_decision_execution",
+      stateId: "decide_next",
+      inputDigest: hex("e"),
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    await sink.dispatch({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "go", decision: "go", rule_id: "rule-go", active_constraint_ids: [] },
+    });
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "decide_next", outcome: "go", to: "architect", transition_index: 0 },
+      executionIndex: 3,
     });
     const request = preparePipelineV2WaitRequest({
       schema_version: 1,
       run_id: RUN_ID,
       wait_index: 1,
-      transition_count: 2,
+      transition_count: 3,
       state_id: "architect",
       reason: "stage_iteration_limit_exhausted",
       actions: [
@@ -271,7 +359,7 @@ async function driveToReopenedWait(options: ProgressOptions = {}): Promise<Fixtu
       ],
     });
     await publishPipelineV2WaitRequest(runRoot, request.manifest);
-    const intent = prepareWaitIntent({
+    const intent1 = prepareWaitIntent({
       schema_version: 1,
       kind: "continue_stage_intent",
       run_id: RUN_ID,
@@ -280,6 +368,18 @@ async function driveToReopenedWait(options: ProgressOptions = {}): Promise<Fixtu
       expected_plan_sha256: acceptedPlan.compiled_plan.plan_sha256,
       additional_iterations: 2,
     });
+    return { root, stateRoot, runRoot, statePath, pipeline, intent1, inMemoryPlan: acceptedPlan.compiled_plan, plan1, candidate, sink } as unknown as Omit<Fixture, "intent" | "reopened"> & { intent1: PreparedPipelineV2RunWaitIntent };
+  } catch (cause) {
+    await rm(root, { recursive: true, force: true });
+    throw cause;
+  }
+}
+
+async function driveToReopenedWait(options: ProgressOptions = {}): Promise<Fixture> {
+  const ctx = await driveToWaitBoundary();
+  const { runRoot, sink } = ctx;
+  const intent = ctx.intent1;
+  try {
     if (options.acceptIntent === true || options.recordGrant !== undefined) {
       await acceptPipelineV2ContinueStageIntent({ runRoot, sink, intent });
     }
@@ -299,14 +399,135 @@ async function driveToReopenedWait(options: ProgressOptions = {}): Promise<Fixtu
       await recordPipelineV2WaitAction({ runRoot, sink, waitIndex: 1, actionId: "continue_stage" });
     }
     if (options.openNextIteration === true) {
-      await ensurePipelineV2StageIteration({ compiledPlan: acceptedPlan.compiled_plan, stageId: "stage-1", initialBudget: INITIAL_BUDGET, sink });
+      await ensurePipelineV2StageIteration({ compiledPlan: ctx.inMemoryPlan, stageId: "stage-1", initialBudget: INITIAL_BUDGET, sink });
     }
     // The simulated process restart: the run is reopened through the
     // ordinary sink open; nothing in memory survives it.
-    const reopened = await PipelineV2RunStateSink.open({ stateRoot, runId: RUN_ID, now: nextTick });
-    return { root, stateRoot, runRoot, statePath, pipeline, intent, inMemoryPlan: acceptedPlan.compiled_plan, plan1, candidate, reopened };
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: ctx.stateRoot, runId: RUN_ID, now: nextTick });
+    return { root: ctx.root, stateRoot: ctx.stateRoot, runRoot, statePath: ctx.statePath, pipeline: ctx.pipeline, intent, inMemoryPlan: ctx.inMemoryPlan, plan1: ctx.plan1, candidate: ctx.candidate, reopened, sink };
   } catch (cause) {
-    await rm(root, { recursive: true, force: true });
+    await rm(ctx.root, { recursive: true, force: true });
+    throw cause;
+  }
+}
+
+/**
+ * The two-cycle prefix for the healing and matrix tests: the first wait
+ * is answered by a real first intervention through the public facade,
+ * the stage work continues through the generation rollover (generation 1
+ * closed `next_stage`, generation 2 opened with iteration 1) and the
+ * second wait opens at the exhausted second-cycle decision boundary —
+ * so the intervention under test operates on wait 2 with the historical
+ * wait 1, the historical generation 1 (with its grant-closed iterations)
+ * and the live generation 2 all durable.
+ */
+async function driveToSecondWait(): Promise<Fixture> {
+  const ctx = await driveToWaitBoundary();
+  const { runRoot, sink } = ctx;
+  try {
+    await applyPipelineV2ContinueStageIntervention({
+      pipeline: ctx.pipeline,
+      runRoot,
+      sink,
+      intent: ctx.intent1,
+      initialBudget: INITIAL_BUDGET,
+    });
+    // The second cycle inside the granted iteration 2: the settled
+    // decision execution closes the iteration and the generation (the
+    // contract hook order), the transition moves the cursor back to the
+    // stage entry, the new generation and its first iteration open at the
+    // same boundary, and the second stage cycle runs inside it.
+    await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 2 });
+    for (const command of agentPhases("stage")) {
+      await sink.dispatch(command);
+    }
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "dev_entry", outcome: "completed", to: "decide_next", transition_index: 0 },
+      executionIndex: 4,
+    });
+    await sink.dispatch({
+      kind: "start_decision_execution",
+      stateId: "decide_next",
+      inputDigest: hex("e"),
+      executionRole: "stage",
+      iterationIndex: 2,
+    });
+    await sink.dispatch({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "go", decision: "go", rule_id: "rule-go", active_constraint_ids: [] },
+    });
+    await sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 2, by: "normal_close" });
+    await sink.dispatch({ kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "decide_next", outcome: "go", to: "dev_entry", transition_index: 0 },
+      executionIndex: 5,
+    });
+    await ensurePipelineV2StageIteration({ compiledPlan: ctx.inMemoryPlan, stageId: "stage-1", initialBudget: INITIAL_BUDGET, sink });
+    await sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+    for (const command of agentPhases("stage")) {
+      await sink.dispatch(command);
+    }
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "dev_entry", outcome: "completed", to: "decide_next", transition_index: 0 },
+      executionIndex: 6,
+    });
+    await sink.dispatch({
+      kind: "start_decision_execution",
+      stateId: "decide_next",
+      inputDigest: hex("e"),
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    await sink.dispatch({
+      kind: "decision_evaluated",
+      result: { status: "selected", outcome: "go", decision: "go", rule_id: "rule-go", active_constraint_ids: [] },
+    });
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "decide_next", outcome: "go", to: "architect", transition_index: 0 },
+      executionIndex: 7,
+    });
+    const request2 = preparePipelineV2WaitRequest({
+      schema_version: 1,
+      run_id: RUN_ID,
+      wait_index: 2,
+      transition_count: 7,
+      state_id: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      actions: [
+        { id: "continue_stage", to: "dev_entry" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    await sink.dispatch({
+      kind: "run_waiting",
+      stateId: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: request2.sha256,
+      actions: [
+        { id: "continue_stage", to: "dev_entry" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    await publishPipelineV2WaitRequest(runRoot, request2.manifest);
+    const intent = prepareWaitIntent({
+      schema_version: 1,
+      kind: "continue_stage_intent",
+      run_id: RUN_ID,
+      wait_index: 2,
+      stage_id: "stage-1",
+      expected_plan_sha256: ctx.inMemoryPlan.plan_sha256,
+      additional_iterations: 2,
+    });
+    // The simulated process restart: the run is reopened through the
+    // ordinary sink open; nothing in memory survives it.
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: ctx.stateRoot, runId: RUN_ID, now: nextTick });
+    return { root: ctx.root, stateRoot: ctx.stateRoot, runRoot, statePath: ctx.statePath, pipeline: ctx.pipeline, intent, inMemoryPlan: ctx.inMemoryPlan, plan1: ctx.plan1, candidate: ctx.candidate, reopened, sink };
+  } catch (cause) {
+    await rm(ctx.root, { recursive: true, force: true });
     throw cause;
   }
 }
@@ -370,8 +591,8 @@ test("1. the proof: the existing three-facade chain drives the reopened run thro
     const state = ctx.reopened.snapshot as PipelineV2RunState;
     expect(state.status).toBe("active");
     expect(state.phase).toBe("running");
-    expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 2 });
-    expect(state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 2 });
+    expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 3 });
+    expect(state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 3 });
     expect(state.waits[0]?.intent).toEqual({ intent_sha256: ctx.intent.sha256 });
     expect(state.waits[0]?.response?.action_id).toBe("continue_stage");
     expect(state.grants).toEqual([
@@ -445,9 +666,9 @@ const SUFFIX = [
 function assertIntervenedBoundary(state: PipelineV2RunState, intent: PreparedPipelineV2RunWaitIntent): void {
   expect(state.status).toBe("active");
   expect(state.phase).toBe("running");
-  expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 2 });
-  expect(state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 2 });
-  expect(state.generations[0]?.iterations[0]?.closed).toEqual({ by: "grant", wait_index: 1, closed_transition_count: 2 });
+  expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 3 });
+  expect(state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 3 });
+  expect(state.generations[0]?.iterations[0]?.closed).toEqual({ by: "grant", wait_index: 1, closed_transition_count: 3 });
   expect(state.waits[0]?.intent).toEqual({ intent_sha256: intent.sha256 });
   expect(state.waits[0]?.response?.action_id).toBe("continue_stage");
   expect(state.grants).toEqual([
@@ -605,7 +826,7 @@ test("8. the C5 window: the exact open successor iteration is the zero-dispatch 
     expect(recording.commands).toEqual([]);
     expect((ctx.reopened.snapshot as PipelineV2RunState).revision).toBe(revisionBefore);
     expect(result.iteration_index).toBe(2);
-    expect(result.state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 2 });
+    expect(result.state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 3 });
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
@@ -764,7 +985,7 @@ test("12. a historical intent (the target wait not the last record) is never a p
     const newerWaitState = structuredClone(state) as PipelineV2RunState;
     newerWaitState.waits.push({
       index: 2,
-      transition_count: 2,
+      transition_count: 3,
       state_id: "dev_entry",
       reason: "stage_iteration_limit_exhausted",
       request_sha256: hex("2"),
@@ -825,7 +1046,7 @@ test("14. a state after an already started successor execution is never an inter
     // a successor execution started after the response (in flight)
     const startedState = structuredClone(state) as PipelineV2RunState;
     startedState.executions.push({
-      index: 3,
+      index: 4,
       type: "agent",
       state_id: "dev_entry",
       execution_role: "stage",
@@ -849,7 +1070,7 @@ test("14. a state after an already started successor execution is never an inter
     expect(startedCause).toBe(started);
     // a committed transition after the response
     const transitionedState = structuredClone(state) as PipelineV2RunState;
-    transitionedState.transitions.push({ index: 2, from: "dev_entry", outcome: "completed", to: "architect", execution_index: 3 });
+    transitionedState.transitions.push({ index: 3, from: "dev_entry", outcome: "completed", to: "architect", execution_index: 4 });
     const transitioned = new PipelineV2ContinueStageIntentControllerError("invalid_state", "broken", transitionedState);
     const transitionedCause = await catchApply(() =>
       applyPipelineV2ContinueStageInterventionWithIo(injectAcceptanceError(transitioned), {
@@ -1056,7 +1277,7 @@ test("17. a mutated successful restore result is invalid_result before the compo
     const stateMutations: Array<[string, (result: Record<string, unknown>, state: PipelineV2RunState) => void]> = [
       ["state revision", (_result, state) => { state.revision = state.revision + 1; }],
       ["state status", (_result, state) => { state.status = "active"; }],
-      ["state cursor", (_result, state) => { state.cursor = { current_state: "nowhere", transition_count: 2 }; }],
+      ["state cursor", (_result, state) => { state.cursor = { current_state: "nowhere", transition_count: 3 }; }],
       ["state plan ledger", (_result, state) => { planRecordAt(state, 0)["sha256"] = hex("3"); }],
       ["state wait intent", (_result, state) => { waitRecordAt(state, 0)["intent"] = { intent_sha256: hex("4") }; }],
       ["dropped generations", (_result, state) => { state.generations = []; }],
@@ -1135,10 +1356,7 @@ test("19. a foreign-pipeline compiled plan in the restore result is invalid_resu
     const secondRoot = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-intervention-foreign-"));
     try {
       const secondBundle = join(secondRoot, "bundle");
-      await mkdir(join(secondBundle, "prompts"), { recursive: true });
-      await writeFile(join(secondBundle, "pipeline.yaml"), STAGE_YAML);
-      await writeFile(join(secondBundle, "prompts", "architect.md"), "plan the work\n");
-      await writeFile(join(secondBundle, "prompts", "coder.md"), "implement the task\n");
+      await writeBundle(secondBundle);
       const foreignPipeline = await loadPipelineV2(secondBundle);
       const foreignPlan = compilePipelineV2RunPlanCandidate(foreignPipeline, ctx.candidate);
       const ops = {
@@ -1186,10 +1404,10 @@ test("20. a mutated successful open result is invalid_result", async () => {
       ["compiled stage clone", (result) => { result["compiled_stage"] = structuredClone(result["compiled_stage"]); }],
       ["state status", (_result, state) => { state.status = "waiting"; }],
       ["state response", (_result, state) => { waitRecordAt(state, 0)["response"] = { action_id: "continue_stage", response_sha256: hex("3") }; }],
-      ["state cursor", (_result, state) => { state.cursor = { current_state: "architect", transition_count: 2 }; }],
+      ["state cursor", (_result, state) => { state.cursor = { current_state: "architect", transition_count: 3 }; }],
       ["state grant", (_result, state) => { state.grants = []; }],
       ["state generation budget", (_result, state) => { generationRecordAt(state, 0)["initial_budget"] = 9; }],
-      ["state generation closed", (_result, state) => { generationRecordAt(state, 0)["closed"] = { by: "next_stage", closed_transition_count: 2 }; }],
+      ["state generation closed", (_result, state) => { generationRecordAt(state, 0)["closed"] = { by: "next_stage", closed_transition_count: 3 }; }],
     ];
     for (const [name, mutate] of mutations) {
       const ops = mutatedOpenOps(mutate);
@@ -1257,6 +1475,330 @@ test("21. malformed open result shapes are invalid_result, never a TypeError", a
     await rm(ctx.root, { recursive: true, force: true });
   }
 });
+
+// --- healing red-before -----------------------------------------------------
+
+/**
+ * The real acceptance beside the real downstream layers whose calls are
+ * counted: the successful acceptance result is shallow-copied with a
+ * cloned state and mutated before it reaches the intervention
+ * verification.
+ */
+function healedAcceptanceOps(
+  mutate: (state: PipelineV2RunState) => void,
+): CountingInterventionOps {
+  let restoreCalls = 0;
+  let openCalls = 0;
+  return {
+    acceptIntent: async (args: unknown) => {
+      const real = await acceptPipelineV2ContinueStageIntent(args as never);
+      const clone = { ...real, state: structuredClone(real.state) } as unknown as Record<string, unknown>;
+      mutate(clone["state"] as PipelineV2RunState);
+      return clone as never;
+    },
+    restoreAcceptedPlan: async (args: unknown) => {
+      restoreCalls += 1;
+      return await restorePipelineV2AcceptedRunPlan(args as never);
+    },
+    openContinuedStage: async (args: unknown) => {
+      openCalls += 1;
+      return await openPipelineV2ContinuedStage(args as never);
+    },
+    restoreCalls: () => restoreCalls,
+    openCalls: () => openCalls,
+  } as unknown as CountingInterventionOps;
+}
+
+/**
+ * The real acceptance and restore; the successful restore result is
+ * shallow-copied with a cloned state and mutated before it reaches the
+ * intervention verification, with the compiled plan identity preserved.
+ */
+function healedRestoreOps(
+  mutate: (state: PipelineV2RunState) => void,
+): CountingInterventionOps {
+  let openCalls = 0;
+  return {
+    acceptIntent: acceptPipelineV2ContinueStageIntent,
+    restoreAcceptedPlan: async (args: unknown) => {
+      const real = await restorePipelineV2AcceptedRunPlan(args as never);
+      const clone = { ...real, state: structuredClone(real.state) } as unknown as Record<string, unknown>;
+      mutate(clone["state"] as PipelineV2RunState);
+      return clone as never;
+    },
+    openContinuedStage: async (args: unknown) => {
+      openCalls += 1;
+      return await openPipelineV2ContinuedStage(args as never);
+    },
+    restoreCalls: () => 0,
+    openCalls: () => openCalls,
+  } as unknown as CountingInterventionOps;
+}
+
+/**
+ * The real acceptance and restore beside the real composition whose
+ * successful result state is cloned and mutated before it reaches the
+ * intervention verification.
+ */
+function healedOpenOps(
+  mutate: (state: PipelineV2RunState) => void,
+): PipelineV2ContinueStageInterventionOps {
+  return {
+    acceptIntent: acceptPipelineV2ContinueStageIntent,
+    restoreAcceptedPlan: restorePipelineV2AcceptedRunPlan,
+    openContinuedStage: async (args: unknown) => {
+      const real = await openPipelineV2ContinuedStage(args as never);
+      const clone = { ...real, state: structuredClone(real.state) } as unknown as Record<string, unknown>;
+      mutate(clone["state"] as PipelineV2RunState);
+      return clone as never;
+    },
+  } as unknown as PipelineV2ContinueStageInterventionOps;
+}
+
+test("42. a successful acceptance result with a forged started_at heals downstream and is refused", async () => {
+  const ctx = await driveToSecondWait();
+  try {
+    const ops = healedAcceptanceOps((state) => {
+      state.started_at = "1999-01-01T00:00:00.000Z";
+    });
+    const cause = await catchApply(() =>
+      applyPipelineV2ContinueStageInterventionWithIo(ops, {
+        pipeline: ctx.pipeline,
+        runRoot: ctx.runRoot,
+        sink: recordSink(ctx.reopened),
+        intent: ctx.intent,
+        initialBudget: INITIAL_BUDGET,
+      }),
+    );
+    const error = expectApplyError(cause);
+    expect(error.reason).toBe("invalid_result");
+    expect(cause).not.toBeInstanceOf(TypeError);
+    expect(error.message).not.toContain("HOSTILE");
+    expect(ops.restoreCalls()).toBe(0);
+    expect(ops.openCalls()).toBe(0);
+    // the durable state stays untouched by the refused presentation
+    expect((ctx.reopened.snapshot as PipelineV2RunState).waits[1]?.response).toBeUndefined();
+  } finally {
+    await rm(ctx.root, { recursive: true, force: true });
+  }
+});
+
+test("43. a successful restore result with a forged input digest heals downstream and is refused", async () => {
+  const ctx = await driveToSecondWait();
+  try {
+    const ops = healedRestoreOps((state) => {
+      (state.inputs[0] as unknown as Record<string, unknown>)["digest"] = hex("9");
+    });
+    const cause = await catchApply(() =>
+      applyPipelineV2ContinueStageInterventionWithIo(ops, {
+        pipeline: ctx.pipeline,
+        runRoot: ctx.runRoot,
+        sink: recordSink(ctx.reopened),
+        intent: ctx.intent,
+        initialBudget: INITIAL_BUDGET,
+      }),
+    );
+    const error = expectApplyError(cause);
+    expect(error.reason).toBe("invalid_result");
+    expect(cause).not.toBeInstanceOf(TypeError);
+    expect(error.message).not.toContain("HOSTILE");
+    expect(ops.openCalls()).toBe(0);
+  } finally {
+    await rm(ctx.root, { recursive: true, force: true });
+  }
+});
+
+test("44. a forged final open state with a forged input digest is refused with the verified state", async () => {
+  const ctx = await driveToSecondWait();
+  try {
+    const ops = healedOpenOps((state) => {
+      (state.inputs[0] as unknown as Record<string, unknown>)["digest"] = hex("9");
+    });
+    const cause = await catchApply(() =>
+      applyPipelineV2ContinueStageInterventionWithIo(ops, {
+        pipeline: ctx.pipeline,
+        runRoot: ctx.runRoot,
+        sink: recordSink(ctx.reopened),
+        intent: ctx.intent,
+        initialBudget: INITIAL_BUDGET,
+      }),
+    );
+    const error = expectApplyError(cause);
+    expect(error.reason).toBe("invalid_result");
+    expect(cause).not.toBeInstanceOf(TypeError);
+    expect(error.message).not.toContain("HOSTILE");
+    // the authoritative error state is the verified restored state, never
+    // the hostile presentation
+    expect((error.state as PipelineV2RunState).inputs[0]?.digest).toBe(PROTECTED_DIGEST);
+  } finally {
+    await rm(ctx.root, { recursive: true, force: true });
+  }
+});
+
+
+/**
+ * Bounded concurrent runner for the independent matrix cases: every case
+ * builds its own temp fixture, so the heavy matrix loops do not inflate
+ * the suite's worker load.
+ */
+async function runBounded<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
+  const queue = [...items];
+  await Promise.all(
+    Array.from({ length: Math.min(limit, queue.length) }, async () => {
+      for (;;) {
+        const item = queue.shift();
+        if (item === undefined) {
+          return;
+        }
+        await worker(item);
+      }
+    }),
+  );
+}
+
+// --- the full schema-owned regression matrix ---------------------------------
+
+type StateMutation = (state: PipelineV2RunState) => void;
+
+function mutationList(): [string, StateMutation][] {
+  const grantRecord = {
+    index: 2,
+    generation_index: 2,
+    wait_index: 2,
+    intent_sha256: "",
+    additional_iterations: 2,
+  };
+  return [
+    ["schema version", (state) => { (state as unknown as Record<string, unknown>)["schema_version"] = 6; }],
+    ["revision delta", (state) => { (state as unknown as Record<string, unknown>)["revision"] = (state.revision as number) + 9; }],
+    ["pipeline identity", (state) => { (state.pipeline as unknown as Record<string, unknown>)["execution_snapshot_sha256"] = hex("f"); }],
+    ["input digest", (state) => { (state.inputs[0] as unknown as Record<string, unknown>)["digest"] = hex("9"); }],
+    ["input type", (state) => { (state.inputs[1] as unknown as Record<string, unknown>)["type"] = "file"; }],
+    ["agent execution profile", (state) => { (state.executions[0] as unknown as Record<string, unknown>)["profile"] = "stranger"; }],
+    ["agent execution outputs", (state) => {
+      const record = state.executions[0] as unknown as Record<string, unknown>;
+      (record["outputs"] as unknown[])[0] = { id: "plan", digest: hex("9") };
+    }],
+    ["agent session cleanup", (state) => {
+      const record = state.executions[1] as unknown as Record<string, unknown>;
+      (record["session_cleanup"] as unknown as Record<string, unknown>)["tool"] = "failed";
+    }],
+    ["decision execution result", (state) => {
+      const record = state.executions[2] as unknown as Record<string, unknown>;
+      (record["result"] as unknown as Record<string, unknown>)["decision"] = "stop";
+    }],
+    ["decision execution rule", (state) => {
+      const record = state.executions[2] as unknown as Record<string, unknown>;
+      (record["result"] as unknown as Record<string, unknown>)["rule_id"] = "rule-stop";
+    }],
+    ["transition target", (state) => { (state.transitions[0] as unknown as Record<string, unknown>)["to"] = "done"; }],
+    ["historical wait request digest", (state) => { (state.waits[0] as unknown as Record<string, unknown>)["request_sha256"] = hex("9"); }],
+    ["target wait reason", (state) => { (state.waits[1] as unknown as Record<string, unknown>)["reason"] = "other_reason"; }],
+    ["target wait actions", (state) => {
+      (state.waits[1] as unknown as Record<string, unknown>)["actions"] = [{ id: "continue_stage", to: "architect" }];
+    }],
+    ["task revision digest", (state) => { (state.task_revisions[0] as unknown as Record<string, unknown>)["sha256"] = hex("9"); }],
+    ["plan predecessor digest", (state) => { (state.plan_revisions[0] as unknown as Record<string, unknown>)["previous_sha256"] = hex("9"); }],
+    ["grant append", (state) => { (state.grants as unknown[]).push({ ...grantRecord, intent_sha256: hex("9") }); }],
+    ["live generation stage position", (state) => { (state.generations[1] as unknown as Record<string, unknown>)["stage_position"] = 2; }],
+    ["live generation open iteration", (state) => {
+      (state.generations[1] as unknown as Record<string, unknown>)["open_iteration"] = { index: 9, opened_transition_count: 7 };
+    }],
+    ["historical generation stage", (state) => { (state.generations[0] as unknown as Record<string, unknown>)["stage_id"] = "other"; }],
+    ["historical iteration closure", (state) => {
+      const generation = state.generations[0] as unknown as Record<string, unknown>;
+      ((generation["iterations"] as unknown[])[1] as unknown as Record<string, unknown>)["closed"] = {
+        by: "exhausted",
+        closed_transition_count: 9,
+      };
+    }],
+  ];
+}
+
+test("45. the acceptance matrix: every schema-owned mutation is refused before the restore", async () => {
+  await runBounded(mutationList(), 5, async ([label, mutate]) => {
+    const ctx = await driveToSecondWait();
+    try {
+      const ops = healedAcceptanceOps(mutate);
+      const cause = await catchApply(() =>
+        applyPipelineV2ContinueStageInterventionWithIo(ops, {
+          pipeline: ctx.pipeline,
+          runRoot: ctx.runRoot,
+          sink: recordSink(ctx.reopened),
+          intent: ctx.intent,
+          initialBudget: INITIAL_BUDGET,
+        }),
+      );
+      const error = expectApplyError(cause);
+      if (error.reason !== "invalid_result") {
+        throw new Error(`${label}: expected invalid_result, got ${error.reason}`);
+      }
+      expect(cause).not.toBeInstanceOf(TypeError);
+      expect(error.message).not.toContain("HOSTILE");
+      expect(ops.restoreCalls()).toBe(0);
+      expect(ops.openCalls()).toBe(0);
+    } finally {
+      await rm(ctx.root, { recursive: true, force: true });
+    }
+  });
+}, 90000);
+
+
+test("46. the restore matrix: every schema-owned mutation is refused before the open", async () => {
+  await runBounded(mutationList(), 5, async ([label, mutate]) => {
+    const ctx = await driveToSecondWait();
+    try {
+      const ops = healedRestoreOps(mutate);
+      const cause = await catchApply(() =>
+        applyPipelineV2ContinueStageInterventionWithIo(ops, {
+          pipeline: ctx.pipeline,
+          runRoot: ctx.runRoot,
+          sink: recordSink(ctx.reopened),
+          intent: ctx.intent,
+          initialBudget: INITIAL_BUDGET,
+        }),
+      );
+      const error = expectApplyError(cause);
+      if (error.reason !== "invalid_result") {
+        throw new Error(`${label}: expected invalid_result, got ${error.reason}`);
+      }
+      expect(cause).not.toBeInstanceOf(TypeError);
+      expect(error.message).not.toContain("HOSTILE");
+      expect(ops.openCalls()).toBe(0);
+    } finally {
+      await rm(ctx.root, { recursive: true, force: true });
+    }
+  });
+}, 90000);
+
+
+test("47. the open matrix: every schema-owned mutation of the final state is refused with the verified state", async () => {
+  await runBounded(mutationList(), 5, async ([label, mutate]) => {
+    const ctx = await driveToSecondWait();
+    try {
+      const ops = healedOpenOps(mutate);
+      const cause = await catchApply(() =>
+        applyPipelineV2ContinueStageInterventionWithIo(ops, {
+          pipeline: ctx.pipeline,
+          runRoot: ctx.runRoot,
+          sink: recordSink(ctx.reopened),
+          intent: ctx.intent,
+          initialBudget: INITIAL_BUDGET,
+        }),
+      );
+      const error = expectApplyError(cause);
+      if (error.reason !== "invalid_result") {
+        throw new Error(`${label}: expected invalid_result, got ${error.reason}`);
+      }
+      expect(cause).not.toBeInstanceOf(TypeError);
+      expect(error.message).not.toContain("HOSTILE");
+      expect((error.state as PipelineV2RunState).inputs[0]?.digest).toBe(PROTECTED_DIGEST);
+    } finally {
+      await rm(ctx.root, { recursive: true, force: true });
+    }
+  });
+}, 90000);
+
 
 // --- capture, provenance and caller policy ----------------------------------
 
@@ -1548,7 +2090,7 @@ test("26. caller mutation after the pending acceptance cannot change the interve
     expect(result.additional_iterations).toBe(2);
     expect(result.closed_iteration_index).toBe(1);
     expect(result.iteration_index).toBe(2);
-    expect(result.state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 2 });
+    expect(result.state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 3 });
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
@@ -1667,7 +2209,7 @@ test("37. two identical concurrent interventions converge to one durable suffix"
     const state = ctx.reopened.snapshot as PipelineV2RunState;
     expect(state.grants).toHaveLength(1);
     expect(state.waits[0]?.response?.action_id).toBe("continue_stage");
-    expect(state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 2 });
+    expect(state.generations[0]?.open_iteration).toEqual({ index: 2, opened_transition_count: 3 });
     expect(resultFields(second)).toEqual(resultFields(first));
     for (const recording of [firstRecording, secondRecording]) {
       for (const kind of SUFFIX) {

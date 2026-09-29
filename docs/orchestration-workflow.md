@@ -2604,25 +2604,49 @@ the full lifecycle verification — run unchanged.
 
 Each successful composed result is verified completely before the next
 layer (malformed/null/primitive/nested shapes are the layer's own
-`invalid_result`, never a `TypeError`): the acceptance result binds the
-exact intent and the waiting durable state; the restore result must
-carry the unchanged authoritative state and the real provenance-backed
+`invalid_result`, never a `TypeError`). The authoritative pre-call
+`sink.snapshot` is captured as an opaque `before` reference right after
+the gates; the acceptance result binds the exact intent and pins its
+durable state as the exact contiguous intervention-suffix progression of
+`before` (the fresh acceptance, revision +1 with `updated_at` refresh,
+or the exact idempotent recognition, revision +0 with `updated_at`
+unchanged and a raced state's further exact suffix steps admissible;
+every other region pinned position by position); the restore result must
+carry the state fully equal to the verified acceptance state on every
+schema-owned field position by position (all top-level scalars and
+optional projections, the pipeline identity, the cursor, the inputs,
+every agent and decision execution record with all nested
+outputs/session-cleanup/decision-result fields, every transition, the
+waits including actions/intent/response, the task and plan revisions
+including predecessors, the grants, and every generation with every
+iteration and its open/closed projections and conditional wait indexes —
+no length-only historical regions) plus the real provenance-backed
 compiled plan of the same pipeline identity and authoritative accepted
 plan (the public stage resolver as the provenance probe, the hidden
 originating identity through the single comparator, and the plan's
 revision/digest/origin against the last durable plan record and the
 intent's expected digest); the open result binds the intent, the durable
-wait declaration, the successor iteration, the exact restored compiled
-stage object by identity, the caller budget and the authoritative final
-state. Hostile successful results are never healed downstream;
-diagnostics are content-free.
+wait declaration (a schema-valid response digest matching between the
+flat result and the state), the successor iteration, the exact restored
+compiled stage object by identity, the caller budget and pins its final
+state as the exact contiguous suffix progression of the verified
+restored state (only the missing grant append/target-iteration
+closure/wait response/successor-opening steps, appended exactly once in
+order with the revision delta equal to the appended steps, the zero-step
+recognition preserving `updated_at` exactly, no rewriting of existing
+records, all nested schema-owned fields compared position by position).
+Hostile successful results are never healed downstream; the error
+carries the last verified authoritative state (acceptance mismatch →
+`before`, restore mismatch → verified acceptance state, open mismatch →
+verified restored state; `null` when none was established), never the
+hostile presentation; diagnostics are content-free.
 
 Durability: the three composed layers' typed failures pass through by
 identity; a fresh retry executes only the missing durable suffix, and
 nothing is ever rolled back or dispatched twice; two identical
 concurrent calls converge to one durable state. Tests:
 `orchestrator/tests/pipeline_v2_continue_stage_intervention_controller.test.ts`
-(41 tests) cover the honest three-facade proof through the reopened run,
+(47 tests) cover the honest three-facade proof through the reopened run,
 the C0 intervention with the exact suffix and revision +5 (the in-memory
 plan deliberately unused), the flat/deep-frozen/content-free result with
 the restored compiled stage identity, the C1–C5 windows with the exact
@@ -2639,8 +2663,25 @@ intents/pipelines, malformed options/ops, caller mutation after the
 pending acceptance), the ten durability windows (a fresh retry after
 every `not_committed`/`durability_unknown` of the five suffix commands
 executes only the missing suffix), the identical concurrency
-convergence, the conflicting budget/stage/intent refusals, both export
-surfaces, and the source scan (only the three facades plus the
+convergence, the conflicting budget/stage/intent refusals, the healing
+reds and the schema-owned regression matrix on the rich two-cycle
+fixture (a real first intervention answers wait 1, the stage cycle rolls
+the generation over `next_stage` into generation 2, and the second wait
+opens at the exhausted second-cycle decision boundary, so the historical
+wait, the historical generation with its grant-closed iterations and the
+live generation/iteration/closure/open projection are all durable): a
+forged acceptance `started_at`, a forged restore input digest and a
+forged final open input digest each refused with the verified
+authoritative state and zero downstream facade calls, plus the
+21-mutation acceptance/restore/open matrix (schema version, revision
+delta, pipeline identity, input digest/type, agent profile/outputs/
+session cleanup, decision result/rule, transition target, historical and
+target wait bindings, task revision digest, plan predecessor digest, a
+hostile grant append, live and historical generation bindings, the
+open-iteration projection and the historical iteration closure — every
+case own `invalid_result`, canary-free, with the next facade never
+called for acceptance/restore mismatches), both export surfaces, and the
+source scan (only the three facades plus the
 compiled/provenance/identity/scalar/state/freeze helpers; no
 reducer/validator/store/filesystem; no second
 parser/serializer/digest builder/registry; no coordinator/runner/CLI; no
