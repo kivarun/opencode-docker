@@ -410,16 +410,27 @@ function reconstructAcceptedRecords(
 }
 
 /**
- * The compiled-history verification: every durable transition of the
- * already validated state must equal the exact step the compiled pipeline
- * produces for the walked cursor state and the recorded outcome — resolved
- * through the single `compiledTransitionFor` the engine itself uses, so
- * execution and verification share one `outcome -> {to, transition_index}`
- * implementation. A structurally coherent journal that names an outcome
- * with a different target or transition index (or an undeclared outcome)
- * is incompatible with the trusted pipeline and is rejected before any
- * filesystem access. Diagnostics carry only the transition ordinal and the
- * already validated safe identifiers, never raw objects or bodies.
+ * The compiled-history verification: the compiled cursor replay of the
+ * already validated state. Every durable transition must equal the exact
+ * step the compiled pipeline produces for the walked cursor state and the
+ * recorded outcome — resolved through the single `compiledTransitionFor`
+ * the engine itself uses, so execution and verification share one
+ * `outcome -> {to, transition_index}` implementation. The replay is the
+ * same joint graph-transition + answered-wait replay the state loader
+ * proves positionally, read here against the trusted compiled pipeline:
+ * on every boundary the wait journal is replayed in journal order BEFORE
+ * the boundary's graph transition — an answered wait moves the replay
+ * cursor to the selected action's target, which must be a state the
+ * trusted compiled pipeline declares, without consuming the transition
+ * budget, while an unanswered wait moves nothing (its admissibility and
+ * position are already proven by the schema loader) — and only then is
+ * the boundary's transition resolved from the moved cursor. A structurally
+ * coherent journal that names an outcome with a different target or
+ * transition index (or an undeclared outcome), or routes a selected wait
+ * action to a state outside the compiled pipeline, is incompatible with
+ * the trusted pipeline and is rejected before any filesystem access.
+ * Diagnostics carry only the transition ordinal and the already validated
+ * safe identifiers, never raw objects or bodies.
  */
 function verifyCompiledTransitionHistory(
   pipeline: ResolvedPipelineV2,
@@ -430,8 +441,41 @@ function verifyCompiledTransitionHistory(
       "pipeline_mismatch",
       `the durable transition history is incompatible with the compiled pipeline: ${what}`,
     );
+  const declaredStateIds = new Set(pipeline.states.map((declared) => declared.id));
   let cursor = pipeline.entry_state;
-  for (let ordinal = 0; ordinal < state.transitions.length; ordinal++) {
+  for (let ordinal = 0; ordinal <= state.transitions.length; ordinal++) {
+    // The joint replay: the boundary's waits move the compiled replay
+    // cursor before the boundary's graph transition is resolved, in the
+    // journal order the loader proves positionally.
+    for (const wait of state.waits) {
+      if (wait.transition_count !== ordinal) {
+        continue;
+      }
+      if (wait.state_id !== cursor) {
+        throw mismatch(
+          `wait ${wait.index} anchors at ${JSON.stringify(wait.state_id)}, but the compiled replay cursor is ${JSON.stringify(cursor)}`,
+        );
+      }
+      const response = wait.response;
+      if (response === undefined) {
+        continue;
+      }
+      const selected = wait.actions.find((action) => action.id === response.action_id);
+      if (selected === undefined) {
+        throw mismatch(
+          `wait ${wait.index} carries a response for action ${JSON.stringify(response.action_id)}, which the wait does not declare`,
+        );
+      }
+      if (!declaredStateIds.has(selected.to)) {
+        throw mismatch(
+          `wait ${wait.index} routes the selected action ${JSON.stringify(selected.id)} to ${JSON.stringify(selected.to)}, which the compiled pipeline does not declare`,
+        );
+      }
+      cursor = selected.to;
+    }
+    if (ordinal === state.transitions.length) {
+      break;
+    }
     const transition = state.transitions[ordinal]!;
     let expected;
     try {

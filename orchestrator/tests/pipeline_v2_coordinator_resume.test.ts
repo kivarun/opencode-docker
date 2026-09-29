@@ -37,6 +37,18 @@ import {
   pipelineV2RunStatePath,
 } from "../src/pipeline_v2_state_store.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
+import { preparePipelineV2WaitRequest } from "../src/pipeline_v2_wait_manifest.ts";
+import { publishPipelineV2WaitRequest } from "../src/pipeline_v2_wait_store.ts";
+import {
+  preparePlanRevisionManifest,
+  prepareTaskRevisionManifest,
+  prepareWaitIntent,
+} from "../src/pipeline_v2_run_plan_manifests.ts";
+import { preparePipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_candidate.ts";
+import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
+import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
+import { acceptPipelineV2ContinueStageIntent } from "../src/pipeline_v2_continue_stage_intent_controller.ts";
+import { openPipelineV2ContinuedStage } from "../src/pipeline_v2_continued_stage_controller.ts";
 import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 import type { PipelineStateIo } from "../src/pipeline_state_store.ts";
@@ -315,10 +327,14 @@ async function writeBundle(
   if (yaml.includes("facts_seed")) {
     await writeFile(join(dirs.sources, "facts.json"), options.facts ?? FACTS_ALPHA);
   }
+  if (yaml.includes("  - id: task")) {
+    await writeFile(join(dirs.sources, "task.md"), "TASK-BODY\n");
+  }
 }
 
 const SOURCE_FILE_NAMES: Record<string, string> = {
   facts_seed: "facts.json",
+  task: "task.md",
 };
 
 function bindingsFor(dirs: BundleDirs, pipeline: ResolvedPipelineV2): Array<{ id: string; path: string }> {
@@ -706,7 +722,7 @@ interface FakeRuntimeHandle {
   events: string[];
 }
 
-function fakeRuntime(specs: readonly FakeSessionSpec[]): FakeRuntimeHandle {
+function fakeRuntime(specs: readonly FakeSessionSpec[], idPrefix = ""): FakeRuntimeHandle {
   const pairs: FakePair[] = [];
   const createCalls: FakeRuntimeHandle["createCalls"] = [];
   const events: string[] = [];
@@ -721,9 +737,9 @@ function fakeRuntime(specs: readonly FakeSessionSpec[]): FakeRuntimeHandle {
         throw new Error("EXEC-CREATE-EXPLODED");
       }
       createCalls.push({ stateId: state.id, activationIndex: activation.activation_index, session: "execution" });
-      const execution = new FakeAgentSession(spec, state.id, activation, "execution", `exec-${index + 1}`, logEvent);
+      const execution = new FakeAgentSession(spec, state.id, activation, "execution", `${idPrefix}exec-${index + 1}`, logEvent);
       events.push(`create-exec:${state.id}:${activation.activation_index}`);
-      const tool = new FakeAgentSession(spec, state.id, activation, "tool", `tool-${index + 1}`, logEvent);
+      const tool = new FakeAgentSession(spec, state.id, activation, "tool", `${idPrefix}tool-${index + 1}`, logEvent);
       const pair: FakePair = { stateId: state.id, activationIndex: activation.activation_index, execution, tool };
       pairs.push(pair);
       return execution as unknown as PipelineV2ExecutionSession;
@@ -2284,4 +2300,333 @@ test("the resumed stage execution carries the compiled role and the open iterati
   expect(fake.pairs).toHaveLength(1);
   expect(fake.pairs[0]?.execution.cleanupCount).toBe(1);
   expect(fake.pairs[0]?.tool.cleanupCount).toBe(1);
+});
+
+/** architect (planning) <-> dev_entry (stage of template development); the
+ * intervention wait lives at the planning state the stage returns to. */
+const PIPELINE_CONTINUED_STAGE_RESUME = `
+schema_version: 2
+entry_state: architect
+max_transitions: 20
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: dev_entry
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dev_entry
+  - id: dev_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: architect
+  - id: done
+    type: terminal
+    result: success
+`;
+
+test("a real continued-stage composition reopens into the existing resume coordinator and starts the successor stage execution", async () => {
+  const harness = await setupHarness(PIPELINE_CONTINUED_STAGE_RESUME);
+  const runInputs = await prefixCreateRun(harness);
+  const protectedInput = runInputs.inputs[0];
+  if (protectedInput === undefined) {
+    throw new Error("the prefix fixture lost its protected run input");
+  }
+
+  // Real prefix, real facades only — no hand-built intervention suffix.
+  // 1. the planning execution settles unbound with real activation artifacts
+  const accepted: AcceptedStateOutput[] = [];
+  const { profile } = stateOf(harness.pipeline, "architect");
+  const architectActivation = await prepareActivationData(harness.pipeline, runInputs, accepted, "architect", 1);
+  await harness.recording.dispatch({
+    kind: "start_agent_execution",
+    stateId: "architect",
+    profile,
+    ...startRoleArgs(harness.pipeline, "architect", harness.recording.snapshot),
+  });
+  await harness.recording.dispatch({ kind: "agent_data_prepared" });
+  await harness.recording.dispatch({ kind: "agent_execution_session_created", sessionId: "exec-1" });
+  await harness.recording.dispatch({ kind: "agent_tool_session_created", sessionId: "tool-1" });
+  await harness.recording.dispatch({ kind: "agent_running" });
+  const architectWorker = new PrefixWorker({}, architectActivation);
+  await architectWorker.run();
+  const architectRecords = await acceptActivationOutputs(harness.pipeline, architectActivation);
+  accepted.push(...architectRecords);
+  await harness.recording.dispatch({
+    kind: "agent_outputs_accepted",
+    outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })),
+  });
+  await architectWorker.cleanup();
+  await harness.recording.dispatch({ kind: "agent_cleanup_completed" });
+
+  // 2. the revision-1 task/plan acceptance through the public controller,
+  //    binding the real protected-input digest of the real snapshot
+  const taskA = prepareTaskRevisionManifest({
+    schema_version: 1,
+    kind: "task_revision",
+    run_id: harness.runId,
+    task_id: "task-a",
+    revision: 1,
+    previous_sha256: null,
+    origin: "planning_proposal",
+    body: "PLAN-TASK-BODY",
+  });
+  const plan1 = preparePlanRevisionManifest({
+    schema_version: 1,
+    kind: "plan_revision",
+    run_id: harness.runId,
+    revision: 1,
+    previous_sha256: null,
+    root_task: { input_id: "task", sha256: protectedInput.digest },
+    origin_execution: 1,
+    stages: [
+      {
+        id: "stage-1",
+        template: "development",
+        tasks: [{ id: "task-a", revision: 1, sha256: taskA.sha256, depends_on: [] }],
+      },
+    ],
+  });
+  const candidate = preparePipelineV2RunPlanCandidate({
+    plan: plan1,
+    taskRevisions: [taskA],
+    previousPlan: null,
+    previousTaskRevisions: [],
+    protectedInputDigest: protectedInput.digest,
+  });
+  const acceptedPlan = await acceptPipelineV2RunPlanCandidate({
+    pipeline: harness.pipeline,
+    runRoot: harness.dirs.runRoot,
+    sink: harness.recording,
+    candidate,
+  });
+
+  // 3. generation 1 / iteration 1 through the public stage-iteration controller
+  await ensurePipelineV2StageIteration({
+    compiledPlan: acceptedPlan.compiled_plan,
+    stageId: "stage-1",
+    initialBudget: 2,
+    sink: harness.recording,
+  });
+
+  // the planning transition commits in the contract hook order (settled
+  // execution → generation → iteration → transition)
+  const architectTarget = transitionTarget(harness.pipeline, "architect", "completed");
+  await harness.recording.dispatch({
+    kind: "transition_committed",
+    step: { from: "architect", outcome: "completed", to: architectTarget.to, transition_index: architectTarget.index },
+    executionIndex: 1,
+  });
+
+  // 4. the stage execution of iteration 1 settles with real artifacts and the
+  //    durable transition back to the planning/wait state
+  await prefixAgentStep(harness, runInputs, accepted, "dev_entry", 2);
+
+  // 5. the wait request through the established manifest/store APIs
+  const request = preparePipelineV2WaitRequest({
+    schema_version: 1,
+    run_id: harness.runId,
+    wait_index: 1,
+    transition_count: 2,
+    state_id: "architect",
+    reason: "stage_iteration_limit_exhausted",
+    actions: [
+      { id: "continue_stage", to: "dev_entry" },
+      { id: "revise_task", to: "architect" },
+    ],
+  });
+  await harness.recording.dispatch({
+    kind: "run_waiting",
+    stateId: "architect",
+    reason: "stage_iteration_limit_exhausted",
+    requestSha256: request.sha256,
+    actions: [
+      { id: "continue_stage", to: "dev_entry" },
+      { id: "revise_task", to: "architect" },
+    ],
+  });
+  await publishPipelineV2WaitRequest(harness.dirs.runRoot, request.manifest);
+
+  // 6. the real continue-stage intent acceptance
+  const intent = prepareWaitIntent({
+    schema_version: 1,
+    kind: "continue_stage_intent",
+    run_id: harness.runId,
+    wait_index: 1,
+    stage_id: "stage-1",
+    expected_plan_sha256: acceptedPlan.compiled_plan.plan_sha256,
+    additional_iterations: 2,
+  });
+  await acceptPipelineV2ContinueStageIntent({ runRoot: harness.dirs.runRoot, sink: harness.recording, intent });
+
+  // 7. the public continued-stage composition owns the whole intervention
+  //    suffix: the grant, the grant-bound closure, the response and the
+  //    successor opening — no suffix command is dispatched by hand
+  const commandsBeforeComposition = harness.recording.commands.length;
+  const composed = await openPipelineV2ContinuedStage({
+    runRoot: harness.dirs.runRoot,
+    sink: harness.recording,
+    intent,
+    compiledPlan: acceptedPlan.compiled_plan,
+    initialBudget: 2,
+  });
+  expect(kinds(harness.recording).slice(commandsBeforeComposition)).toEqual([
+    "iteration_grant_recorded",
+    "stage_iteration_closed",
+    "wait_response_recorded",
+    "stage_iteration_opened",
+  ]);
+
+  // the completed boundary, checked against the real durable snapshot
+  const completedState = harness.recording.snapshot as PipelineV2RunState;
+  expect(completedState.status).toBe("active");
+  expect(completedState.phase).toBe("running");
+  expect(completedState.cursor).toEqual({ current_state: "dev_entry", transition_count: 2 });
+  // generation 1 remains the only, open generation
+  expect(completedState.generations).toHaveLength(1);
+  const generation = completedState.generations[0];
+  expect(generation?.index).toBe(1);
+  // iteration 1 carries the exact grant closure on the wait anchor
+  expect(generation?.iterations[0]?.closed).toEqual({
+    by: "grant",
+    wait_index: 1,
+    closed_transition_count: 2,
+  });
+  // iteration 2 is open on the same anchor
+  expect(generation?.open_iteration).toEqual({ index: 2, opened_transition_count: 2 });
+  expect(generation?.iterations[1]).toEqual({ index: 2, opened_transition_count: 2 });
+  // the wait carries the exact accepted intent and the exact response
+  expect(completedState.waits).toHaveLength(1);
+  expect(completedState.waits[0]?.transition_count).toBe(2);
+  expect(completedState.waits[0]?.intent).toEqual({ intent_sha256: intent.sha256 });
+  expect(completedState.waits[0]?.response).toEqual({
+    action_id: "continue_stage",
+    response_sha256: composed.response_sha256,
+  });
+  // exactly one grant of the pair
+  expect(completedState.grants).toHaveLength(1);
+  expect(completedState.grants[0]).toEqual({
+    index: 1,
+    generation_index: 1,
+    wait_index: 1,
+    intent_sha256: intent.sha256,
+    additional_iterations: 2,
+  });
+  // the composition result and the durable snapshot agree
+  expect(composed.generation_index).toBe(1);
+  expect(composed.closed_iteration_index).toBe(1);
+  expect(composed.iteration_index).toBe(2);
+  expect(composed.action_to).toBe("dev_entry");
+  expect(composed.state).toEqual(completedState);
+
+  // the simulated process restart: the initial sink is closed, the run is
+  // reopened through the real loader/store path
+  const reopened = await reopenHarness(harness);
+  expect((reopened.snapshot as PipelineV2RunState)).toEqual(completedState);
+
+  // the resume proof: one stage execution that fails, then the durable run
+  // failure — an ordinary execution failure, never a resume refusal
+  const fake = fakeRuntime([{ run: "worker_failed" }], "resumed-");
+  const result = await resumePipelineV2Run({
+    pipeline: harness.pipeline,
+    runId: harness.runId,
+    runRoot: harness.dirs.runRoot,
+    sink: reopened,
+    runtime: fake.runtime,
+  }, NEUTRAL_CONTROL);
+  const state = expectResumeFailed(result, "worker_failed");
+  expect(kinds(reopened)).toEqual([
+    "start_agent_execution",
+    "agent_data_prepared",
+    "agent_execution_session_created",
+    "agent_tool_session_created",
+    "agent_running",
+    "agent_failed",
+    "run_failed",
+  ]);
+  // the first and only new start carries the exact stage role and the
+  // successor iteration
+  expect(reopened.commands[0]).toMatchObject({
+    stateId: "dev_entry",
+    executionRole: "stage",
+    iterationIndex: 2,
+  });
+  // exactly one session pair, cleaned exactly once each, tool first
+  expect(fake.createCalls).toEqual([
+    { stateId: "dev_entry", activationIndex: 3, session: "execution" },
+    { stateId: "dev_entry", activationIndex: 3, session: "tool" },
+  ]);
+  expect(fake.pairs).toHaveLength(1);
+  expect(fake.pairs[0]?.execution.cleanupCount).toBe(1);
+  expect(fake.pairs[0]?.tool.cleanupCount).toBe(1);
+  expect(fake.events).toEqual([
+    "create-exec:dev_entry:3",
+    "create-tool:dev_entry:3",
+    "run:dev_entry",
+    "cleanup-tool:dev_entry",
+    "cleanup-exec:dev_entry",
+  ]);
+  // the durable record: the next global execution index without a gap
+  expect(state.executions.map((execution) => execution.index)).toEqual([1, 2, 3]);
+  expect(state.executions[2]).toMatchObject({
+    index: 3,
+    type: "agent",
+    state_id: "dev_entry",
+    execution_role: "stage",
+    iteration_index: 2,
+    failure_reason: "worker_failed",
+    session_cleanup: { execution: "completed", tool: "completed" },
+  });
+  // the coordinator repeated no intervention command
+  expect(kinds(reopened).filter((kind) => [
+    "run_waiting",
+    "plan_intent_accepted",
+    "iteration_grant_recorded",
+    "stage_iteration_closed",
+    "wait_response_recorded",
+    "stage_iteration_opened",
+  ].includes(kind))).toEqual([]);
+  // the intervention records are untouched; no new graph transition; the
+  // cursor and transition count stay at the continued-stage boundary
+  expect(state.grants).toEqual(completedState.grants);
+  expect(state.waits).toEqual(completedState.waits);
+  expect(state.generations).toEqual(completedState.generations);
+  expect(state.task_revisions).toEqual(completedState.task_revisions);
+  expect(state.plan_revisions).toEqual(completedState.plan_revisions);
+  expect(state.transitions).toHaveLength(2);
+  expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 2 });
+  expect(state.status).toBe("failed");
+  expect(state.failure).toEqual({ reason: "worker_failed" });
+  // loader round-trip of the final durable state
+  expect(await readDurableState(harness)).toEqual(state);
 });

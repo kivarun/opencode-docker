@@ -2238,3 +2238,134 @@ test("51. an execution whose recorded index matches no template-matching candida
     await rm(base.root, { recursive: true, force: true });
   }
 });
+
+// --- answered-wait cursor relocation in the compiled replay -----------------
+
+/**
+ * Opens a wait at the given state with explicit declared actions (the
+ * reducer validates safe ids and journal coherence, not compiled graph
+ * existence), through the same reducer/dispatch helper every other test
+ * uses — no hand-built state.
+ */
+function enterWaitWithActions(
+  drive: Drive,
+  clock: { value: number },
+  stateId: string,
+  actions: ReadonlyArray<{ id: string; to: string }>,
+): void {
+  dispatchClock(drive, clock, {
+    kind: "run_waiting",
+    stateId,
+    reason: REASON,
+    requestSha256: hex("e"),
+    actions: actions.map((action) => ({ ...action })),
+  });
+}
+
+test("52. an answered wait relocating the cursor to another declared state is restorable", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    // the graph transition brings the cursor to check; the wait opens there
+    // and the chosen action routes to a DIFFERENT declared state (ship)
+    enterWaitWithActions(base.drive, base.clock, "check", [{ id: "continue_stage", to: "ship" }]);
+    respondWait(base.drive, base.clock, 1);
+    const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    expect(durable.status).toBe("active");
+    expect(durable.cursor).toEqual({ current_state: "ship", transition_count: 1 });
+    expect(durable.transitions).toHaveLength(1);
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, durable, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "ship", transition_count: 1 });
+    expect(context.next_execution_index).toBe(2);
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("53. the next graph transition after a wait relocation is verified from the relocated cursor", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    enterWaitWithActions(base.drive, base.clock, "check", [{ id: "continue_stage", to: "ship" }]);
+    respondWait(base.drive, base.clock, 1);
+    // a real execution and transition from the relocated cursor state
+    await runAgentActivation(base, base.drive, "ship", "unused");
+    const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    expect(durable.cursor).toEqual({ current_state: "done", transition_count: 2 });
+    expect(durable.transitions[1]).toMatchObject({ from: "ship", outcome: "completed", to: "done" });
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, durable, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "done", transition_count: 2 });
+    expect(context.next_execution_index).toBe(3);
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("54. several answered waits at one transition boundary replay in journal order", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    // check --(wait 1 response)--> ship --(wait 2 response)--> coder, both
+    // waits anchored at the same committed transition count
+    enterWaitWithActions(base.drive, base.clock, "check", [{ id: "continue_stage", to: "ship" }]);
+    respondWait(base.drive, base.clock, 1);
+    enterWaitWithActions(base.drive, base.clock, "ship", [{ id: "continue_stage", to: "coder" }]);
+    respondWait(base.drive, base.clock, 2);
+    const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    expect(durable.waits.map((wait) => [wait.index, wait.state_id, wait.response?.action_id])).toEqual([
+      [1, "check", "continue_stage"],
+      [2, "ship", "continue_stage"],
+    ]);
+    expect(durable.waits[0]?.transition_count).toBe(1);
+    expect(durable.waits[1]?.transition_count).toBe(1);
+    expect(durable.cursor).toEqual({ current_state: "coder", transition_count: 1 });
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, durable, base.runRoot);
+    expect(context.cursor).toEqual({ current_state: "coder", transition_count: 1 });
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("55. a selected action target outside the compiled pipeline refuses before any filesystem access", async () => {
+  // 55a: the selected target is not a declared state; the document stays
+  // loader-valid, and the restore refuses with the typed pipeline_mismatch
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    enterWaitWithActions(base.drive, base.clock, "check", [{ id: "continue_stage", to: "ghost_state" }]);
+    respondWait(base.drive, base.clock, 1);
+    const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    expect(durable.cursor).toEqual({ current_state: "ghost_state", transition_count: 1 });
+    const before = await fingerprint(base.root);
+    const cause = await restorePipelineV2RuntimeContext(base.pipeline, durable, base.runRoot).catch((error) => error);
+    expectRestoreError(cause, "pipeline_mismatch");
+    expect((cause as Error).message).toContain("which the compiled pipeline does not declare");
+    expect((cause as Error).message).not.toContain(CANARY_BODY);
+    expect((cause as Error).message).not.toContain("TASK-BODY");
+    expect(await fingerprint(base.root)).toBe(before);
+  } finally {
+    await dispose(base);
+  }
+
+  // 55b: an action targeting an undeclared state is fine while it is not
+  // the selected one — only the selected target is checked
+  const base2 = await setupBase();
+  try {
+    await runAgentActivation(base2, base2.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    enterWaitWithActions(base2.drive, base2.clock, "check", [
+      { id: "continue_stage", to: "ship" },
+      { id: "other_action", to: "ghost_state" },
+    ]);
+    respondWait(base2.drive, base2.clock, 1);
+    const durable = JSON.parse(JSON.stringify(base2.drive.state)) as PipelineV2RunState;
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    const context = await restorePipelineV2RuntimeContext(base2.pipeline, durable, base2.runRoot);
+    expect(context.cursor).toEqual({ current_state: "ship", transition_count: 1 });
+  } finally {
+    await dispose(base2);
+  }
+});

@@ -501,7 +501,12 @@ already loaded pipeline (no graph compilation, no executors) and resolves
 the declared transition to its exact frozen step
 (`from`/`outcome`/`to`/original `transition_index`); the engine loop
 resolves over the same resolver on the compiled snapshot, and the restore
-verifier replays the whole durable transition history through it — there
+verifier replays the whole durable transition history through it as the
+same joint graph-transition + answered-wait cursor replay the state
+loader proves positionally — on every boundary the wait journal is
+replayed in order before the boundary's graph transition, an answered
+wait moving the replay cursor to the selected action's declared target
+without consuming the transition budget — there
 is no second `outcome → {to, transition_index}` implementation. The
 orchestrator registers a transition-commit hook
 with the engine: after the callback's outcome is validated and before the
@@ -3366,7 +3371,13 @@ pipeline provenance gate first (before it the state is not read, the run
 root is not touched and no filesystem call happens), then the single state
 validator, the narrower resumable-boundary policy, the exact pipeline
 identity comparison plus the `basename(runRoot) === state.run_id` binding,
-the run-root layout (`project`, `data`, `data/inputs` with the
+the compiled-history verification (the durable journal replayed as the
+joint graph-transition + answered-wait cursor replay the state loader
+proves positionally, every transition resolved through the single
+`compiledTransitionFor` engine resolver, an answered wait moving the
+replay cursor to its selected action's declared target before the
+boundary's graph transition — all before any filesystem access), the
+run-root layout (`project`, `data`, `data/inputs` with the
 orchestrator-owned mode 0700 on the two data directories and no mode or
 content repair for worker-writable `project`), the run-input snapshot
 restoration, the accepted-history reconstruction from `state.executions`
