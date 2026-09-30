@@ -2773,13 +2773,25 @@ digest and `continue_stage` response), the exact single grant of the
 granted pair, and the granted last open generation bound to the intent's
 stage, the expected plan digest and the caller budget with the exact
 grant closure and the open successor. The coordinator's returned union is
-verified defensively (a well-formed discriminant, a non-empty reason,
-`refused` exactly `true` when present, a state that is null or exactly
-the sink snapshot) and returned unchanged by object identity without a
-new envelope — refusal, worker failure, signal failure and persistence
-failure stay coordinator-owned classifications. Hostile or malformed
-success results are the layer's own `invalid_result` with the last
-authoritative snapshot, never a leaked `TypeError`.
+verified defensively and accepts only the exact runtime shapes of
+`PipelineV2ResumeCoordinationResult`: a success carries exactly the own
+enumerable keys `ok`,`state` with a state record identical to the sink
+snapshot; a refusal carries exactly `ok`,`refused`,`reason`,`state` with
+`refused === true` and a reason from the coordinator's refusal
+vocabulary; an ordinary failure carries exactly `ok`,`reason`,`state`
+with no own `refused` field and a reason from the canonical
+`PIPELINE_V2_FAILURE_REASONS` (imported from `pipeline_v2_state.ts` —
+the only runtime state-module import; the refusal vocabulary is a typed
+literal list pinned to the coordinator's own type by compile-time
+validity and exhaustiveness assertions). Failure and refusal states are
+null or exactly the sink snapshot, and the verified union is returned
+unchanged by object identity without a new envelope — refusal, worker
+failure, signal failure and persistence failure stay coordinator-owned
+classifications. Hostile or malformed success results — foreign
+branches, unknown reasons, extra own fields, `refused` not exactly
+`true` — are the layer's own `invalid_result` with the last
+authoritative snapshot, never a leaked `TypeError`, and diagnostics
+never echo a hostile reason, key or value.
 
 Retry and crash windows (the honest boundaries only): C0 — the
 intervention has not started; the fresh call runs the exact five-command
@@ -2796,7 +2808,7 @@ contract stays the only owner of that semantics); unrecognized progressed
 states and downstream lifecycle errors pass through by identity.
 
 Tests: `orchestrator/tests/pipeline_v2_continue_stage_resume_controller.test.ts`
-(18 tests) cover the dedicated identity-contract proof against the real
+(19 tests) cover the dedicated identity-contract proof against the real
 facade, the C0 main proof through the new public facade on the reopened
 honest-prefix run (the exact suffix, the resumed successor execution with
 role `stage`/iteration 2/next global index, one session pair cleaned
@@ -2809,15 +2821,23 @@ the intervention failure identity with zero resume calls, the resume
 thrown-error identity, the typed invalid_result matrices (malformed
 intervention results over primitives/arrays/missing state/bindings/
 foreign intent and durable-binding mutations against the real completed
-boundary; malformed resume results over every union branch), the foreign
-caller budget refused by the composed layers with zero resume calls, the
+boundary; malformed resume results over every union branch — an ordinary
+reason in a refusal branch, a refusal-only reason in the ordinary
+branch, unknown reasons, extra fields on success/refusal/failure and a
+`refused: undefined` own field are all rejected), the foreign caller
+budget refused by the composed layers with zero resume calls, the
 mutation-after-await immunity of the captured policy/runtime/control, the
 exact capture order/read counts with hostile extras never read, invalid
 runtime/control before any facade call, pipeline/intent clone and Proxy
 provenance failures with zero facade calls, valid coordinator outcomes
-returned by `toBe` without reclassification, both export surfaces, and
-the source scan (only the two facades plus provenance/scalar/types; no
-reducer/writer/compiler/manifest loader/fs/CLI/runner imports; no second
+returned by `toBe` without reclassification, the table-driven
+exact-vocabulary proof (all nine refusal reasons and all
+`PIPELINE_V2_FAILURE_REASONS` values each with a null and with the
+authoritative state, plus the success union — every valid object
+returned by identity), both export surfaces, and the source scan (only
+the two facades plus provenance/scalar/state/types; the canonical
+failure-reason list is the single state-module import, no
+reducer/writer/compiler/manifest loader/fs/CLI/runner calls; no second
 parser/serializer, `JSON.stringify`, digest machinery or new registries).
 Still unwired: everything — the runner, the CLI, the default pipeline
 bundle, the action/`additional_iterations` selection policy, the

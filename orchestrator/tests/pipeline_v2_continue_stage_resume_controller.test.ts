@@ -28,7 +28,7 @@ import {
 import { loadPipelineV2, type ResolvedPipelineV2 } from "../src/pipeline_v2.ts";
 import { PipelineError } from "../src/pipeline.ts";
 import { pipelineV2RunPipelineIdentity } from "../src/pipeline_v2_digest.ts";
-import { parsePipelineV2RunState, type PipelineV2RunCommand, type PipelineV2RunState } from "../src/pipeline_v2_state.ts";
+import { parsePipelineV2RunState, PIPELINE_V2_FAILURE_REASONS, type PipelineV2RunCommand, type PipelineV2RunState } from "../src/pipeline_v2_state.ts";
 import { pipelineV2RunStatePath } from "../src/pipeline_v2_state_store.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import {
@@ -1077,30 +1077,40 @@ test("a foreign caller budget is refused by the composed layers with zero resume
 test("malformed resume coordinator results: the typed invalid_result matrix over all union branches", async () => {
   const ctx = await driveToWaitBoundary();
   const reopened = await reopenHarness(ctx);
-  const hostileResults: ReadonlyArray<readonly [string, unknown]> = [
-    ["a number", 42],
-    ["a string", "nope"],
-    ["null", null],
-    ["undefined", undefined],
-    ["an array", []],
-    ["an empty record", {}],
-    ["a non-boolean ok", { ok: "yes", state: null }],
-    ["an ok true with a null state", { ok: true, state: null }],
-    ["an ok true with a foreign state", { ok: true, state: { ...({} as PipelineV2RunState) } }],
-    ["an ok false with refused false", { ok: false, refused: false, reason: "worker_failed", state: null }],
-    ["an ok false with a non-boolean refused", { ok: false, refused: "yes", reason: "worker_failed", state: null }],
-    ["an ok false with an empty reason", { ok: false, reason: "", state: null }],
-    ["an ok false without a reason", { ok: false, state: null }],
-    ["an ok false with a missing state", { ok: false, reason: "worker_failed" }],
-    ["an ok false with a foreign state", { ok: false, reason: "worker_failed", state: foreignDigest("e") }],
+  const hostileBuilders: ReadonlyArray<readonly [string, (snapshot: PipelineV2RunState) => unknown]> = [
+    ["a number", () => 42],
+    ["a string", () => "nope"],
+    ["null", () => null],
+    ["undefined", () => undefined],
+    ["an array", () => []],
+    ["an empty record", () => {}],
+    ["a non-boolean ok", () => ({ ok: "yes", state: null })],
+    ["an ok true with a null state", () => ({ ok: true, state: null })],
+    ["an ok true with a foreign state", () => ({ ok: true, state: { ...({} as PipelineV2RunState) } })],
+    ["an ok false with refused false", () => ({ ok: false, refused: false, reason: "worker_failed", state: null })],
+    ["an ok false with a non-boolean refused", () => ({ ok: false, refused: "yes", reason: "worker_failed", state: null })],
+    ["an ok false with an empty reason", () => ({ ok: false, reason: "", state: null })],
+    ["an ok false without a reason", () => ({ ok: false, state: null })],
+    ["an ok false with a missing state", () => ({ ok: false, reason: "worker_failed" })],
+    ["an ok false with a foreign state", () => ({ ok: false, reason: "worker_failed", state: foreignDigest("e") })],
+    ["a refusal with an ordinary worker failure reason", () => ({ ok: false, refused: true, reason: "worker_failed", state: null })],
+    ["a refusal with an unknown reason", () => ({ ok: false, refused: true, reason: "canary_reason", state: null })],
+    ["an ordinary failure with a refusal-only reason", () => ({ ok: false, reason: "pipeline_mismatch", state: null })],
+    ["an ordinary failure with an unknown reason", () => ({ ok: false, reason: "canary_reason", state: null })],
+    ["a success with a reason field", (snapshot) => ({ ok: true, reason: "canary_reason", state: snapshot })],
+    ["a success with a refused field", (snapshot) => ({ ok: true, refused: true, state: snapshot })],
+    ["a success with a hostile extra field", (snapshot) => ({ ok: true, state: snapshot, hostile_extra: 1 })],
+    ["a refusal with a hostile extra field", () => ({ ok: false, refused: true, reason: "missing_state", state: null, hostile_extra: 1 })],
+    ["an ordinary failure with a hostile extra field", (snapshot) => ({ ok: false, reason: "worker_failed", state: snapshot, hostile_extra: 1 })],
+    ["a refused undefined as its own field", () => ({ ok: false, refused: undefined, reason: "worker_failed", state: null })],
   ];
-  for (const [name, hostile] of hostileResults) {
+  for (const [name, build] of hostileBuilders) {
     let resumeCalls = 0;
     const ops = {
       applyIntervention: applyPipelineV2ContinueStageIntervention,
-      resumeRun: () => {
+      resumeRun: (params: { sink: PipelineV2CoordinatorStateSink }) => {
         resumeCalls += 1;
-        return hostile as never;
+        return build(params.sink.snapshot as PipelineV2RunState) as never;
       },
     };
     const caught = await applyPipelineV2ContinueStageResumeWithIo(ops, {
@@ -1158,6 +1168,76 @@ test("valid coordinator outcomes are returned by object identity without reclass
     });
     expect(returned).toBe(built as PipelineV2ResumeCoordinationResult);
   }
+  expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
+});
+
+/**
+ * The exact coordinator union vocabulary: every refusal reason of the
+ * coordinator's refusal branch, every canonical failure reason of the
+ * state schema and the success union are accepted in their exact runtime
+ * shape and returned by object identity — with a null state and with the
+ * authoritative snapshot wherever the branch allows it.
+ */
+test("the exact coordinator union vocabulary: every valid reason is returned by identity", async () => {
+  const ctx = await driveToWaitBoundary();
+  const reopened = await reopenHarness(ctx);
+  const refusalReasons = [
+    "missing_state",
+    "sink_poisoned",
+    "run_id_mismatch",
+    "invalid_state",
+    "pipeline_mismatch",
+    "run_layout_invalid",
+    "run_input_modified",
+    "accepted_output_modified",
+    "internal_error",
+  ] as const;
+  const validBuilders: Array<readonly [string, (snapshot: PipelineV2RunState) => unknown]> = [];
+  for (const reason of refusalReasons) {
+    validBuilders.push([
+      `refusal ${reason} with a null state`,
+      () => ({ ok: false, refused: true, reason, state: null }),
+    ]);
+    validBuilders.push([
+      `refusal ${reason} with the authoritative state`,
+      (snapshot) => ({ ok: false, refused: true, reason, state: snapshot }),
+    ]);
+  }
+  for (const reason of PIPELINE_V2_FAILURE_REASONS) {
+    validBuilders.push([
+      `failure ${reason} with a null state`,
+      () => ({ ok: false, reason, state: null }),
+    ]);
+    validBuilders.push([
+      `failure ${reason} with the authoritative state`,
+      (snapshot) => ({ ok: false, reason, state: snapshot }),
+    ]);
+  }
+  validBuilders.push([
+    "the success union with the authoritative state",
+    (snapshot) => ({ ok: true, state: snapshot }),
+  ]);
+  for (const [name, build] of validBuilders) {
+    let built: unknown;
+    const ops = {
+      applyIntervention: applyPipelineV2ContinueStageIntervention,
+      resumeRun: (params: { sink: PipelineV2CoordinatorStateSink }) => {
+        built = build(params.sink.snapshot as PipelineV2RunState);
+        return built as never;
+      },
+    };
+    const returned = await applyPipelineV2ContinueStageResumeWithIo(ops, {
+      pipeline: ctx.pipeline,
+      runRoot: ctx.dirs.runRoot,
+      sink: reopened,
+      runtime: fakeRuntime([]).runtime,
+      control: neutralControl(),
+      intent: ctx.intent,
+      initialBudget: INITIAL_BUDGET,
+    });
+    expect(returned).toBe(built as PipelineV2ResumeCoordinationResult);
+  }
+  expect(validBuilders.length).toBe(2 * 9 + 2 * PIPELINE_V2_FAILURE_REASONS.length + 1);
   expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
 });
 

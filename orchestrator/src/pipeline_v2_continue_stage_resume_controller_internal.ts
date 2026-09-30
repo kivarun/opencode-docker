@@ -38,9 +38,14 @@
  * captured control functions; this layer interprets no signal itself.
  *
  * The successfully returned coordinator result is verified defensively —
- * a well-formed union discriminant (`ok` true with a state record; `ok`
- * false with a non-empty reason, `refused` exactly `true` when present and
- * a state that is null or exactly the authoritative sink snapshot) — and
+ * only the exact runtime shapes of the coordinator union are accepted:
+ * a success carries exactly the own enumerable keys `ok`,`state` with a
+ * state record identical to the authoritative sink snapshot; a refusal
+ * carries exactly `ok`,`refused`,`reason`,`state` with `refused === true`
+ * and a reason from the coordinator's refusal vocabulary; an ordinary
+ * failure carries exactly `ok`,`reason`,`state` with no own `refused` and
+ * a reason from the canonical `PIPELINE_V2_FAILURE_REASONS`; failure and
+ * refusal states are null or exactly the authoritative snapshot — and
  * returned unchanged by object identity: refusal, worker failure, signal
  * failure and persistence failure stay coordinator-owned
  * classifications. A malformed success result of either facade is this
@@ -98,6 +103,7 @@ import {
   type PipelineV2CoordinatorControl,
   type PipelineV2CoordinatorStateSink,
   type PipelineV2ResumeCoordinationResult,
+  type PipelineV2ResumeRefusalReason,
 } from "./pipeline_v2_coordinator.ts";
 import { hasPreparedRunPlanProvenance } from "./pipeline_v2_run_plan_provenance.ts";
 import {
@@ -111,7 +117,46 @@ import type {
   PreparedPipelineV2RunWaitIntent,
 } from "./pipeline_v2_run_plan_manifests.ts";
 import type { PipelineV2RunState } from "./pipeline_v2_state.ts";
+import { PIPELINE_V2_FAILURE_REASONS } from "./pipeline_v2_state.ts";
 import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
+
+/**
+ * The coordinator's refusal reason vocabulary, pinned to the coordinator's
+ * own `PipelineV2ResumeRefusalReason` type: the compile-time assertions
+ * below fail the build if the list is invalid or incomplete. There is no
+ * runtime export of the vocabulary from the coordinator, so this typed
+ * literal list is the vocabulary itself, never a weaker local subset of
+ * some other list.
+ */
+const PIPELINE_V2_RESUME_REFUSAL_REASONS = [
+  "missing_state",
+  "sink_poisoned",
+  "run_id_mismatch",
+  "invalid_state",
+  "pipeline_mismatch",
+  "run_layout_invalid",
+  "run_input_modified",
+  "accepted_output_modified",
+  "internal_error",
+] as const;
+
+type ListedRefusalReason = (typeof PIPELINE_V2_RESUME_REFUSAL_REASONS)[number];
+type ListedRefusalReasonsValid =
+  ListedRefusalReason extends PipelineV2ResumeRefusalReason ? true : never;
+const LISTED_REFUSAL_REASONS_VALID: ListedRefusalReasonsValid = true;
+void LISTED_REFUSAL_REASONS_VALID;
+type AllRefusalReasonsListed =
+  Exclude<PipelineV2ResumeRefusalReason, ListedRefusalReason> extends never ? true : never;
+const ALL_REFUSAL_REASONS_LISTED: AllRefusalReasonsListed = true;
+void ALL_REFUSAL_REASONS_LISTED;
+
+const PIPELINE_V2_RESUME_REFUSAL_REASON_SET: ReadonlySet<string> = new Set(
+  PIPELINE_V2_RESUME_REFUSAL_REASONS,
+);
+
+const PIPELINE_V2_RESUME_FAILURE_REASON_SET: ReadonlySet<string> = new Set(
+  PIPELINE_V2_FAILURE_REASONS,
+);
 
 export type PipelineV2ContinueStageResumeControllerFailureReason = "invalid_options" | "invalid_result";
 
@@ -477,6 +522,28 @@ function verifyHandoffBoundary(
  * identity — refusal, worker failure, signal failure and persistence
  * failure stay coordinator-owned classifications.
  */
+/**
+ * The defensive verification of one successfully returned coordinator
+ * result union: only the exact runtime shapes of the coordinator's
+ * `PipelineV2ResumeCoordinationResult` are accepted — a success carries
+ * exactly the own enumerable keys `ok`,`state` (state record identical to
+ * the authoritative snapshot); a refusal carries exactly
+ * `ok`,`refused`,`reason`,`state` with `refused === true` and a reason
+ * from the pinned refusal vocabulary; an ordinary failure carries exactly
+ * `ok`,`reason`,`state` with no own `refused` field and a reason from the
+ * canonical `PIPELINE_V2_FAILURE_REASONS` (the imported state-vocabulary
+ * list, never a local copy); failure and refusal states are null or
+ * exactly the authoritative sink snapshot. The verified result is
+ * returned unchanged by object identity — refusal, worker failure,
+ * signal failure and persistence failure stay coordinator-owned
+ * classifications, and diagnostics never echo a hostile reason, key or
+ * value.
+ */
+function hasExactOwnKeys(record: Record<string, unknown>, ...expected: string[]): boolean {
+  const keys = Object.keys(record);
+  return keys.length === expected.length && expected.every((key) => keys.includes(key));
+}
+
 function verifyResumeResult(
   resultValue: unknown,
   authoritative: PipelineV2RunState | null,
@@ -486,8 +553,12 @@ function verifyResumeResult(
       throw invalidResult("the resume coordinator result is not a record", authoritative);
     }
     const result = resultValue as Record<string, unknown>;
+    const keys = Object.keys(result);
     const ok = result["ok"];
     if (ok === true) {
+      if (!hasExactOwnKeys(result, "ok", "state")) {
+        throw invalidResult("the resume coordinator success result carries foreign fields", authoritative);
+      }
       const state = result["state"];
       if (state !== authoritative || !isRecord(state)) {
         throw invalidResult("the resume coordinator result does not carry the authoritative durable state", authoritative);
@@ -497,12 +568,29 @@ function verifyResumeResult(
     if (ok !== false) {
       throw invalidResult("the resume coordinator result carries no valid ok discriminant", authoritative);
     }
-    const refused = result["refused"];
-    if (refused !== undefined && refused !== true) {
-      throw invalidResult("the resume coordinator result carries a malformed refusal discriminant", authoritative);
+    if (keys.includes("refused")) {
+      if (!hasExactOwnKeys(result, "ok", "refused", "reason", "state")) {
+        throw invalidResult("the resume coordinator refusal result carries foreign fields", authoritative);
+      }
+      if (result["refused"] !== true) {
+        throw invalidResult("the resume coordinator result carries a malformed refusal discriminant", authoritative);
+      }
+      const reason = result["reason"];
+      if (!isString(reason) || !PIPELINE_V2_RESUME_REFUSAL_REASON_SET.has(reason)) {
+        throw invalidResult("the resume coordinator refusal result carries no valid refusal reason", authoritative);
+      }
+      const state = result["state"];
+      if (state !== null && state !== authoritative) {
+        throw invalidResult("the resume coordinator result does not carry the authoritative durable state", authoritative);
+      }
+      return resultValue as unknown as PipelineV2ResumeCoordinationResult;
     }
-    if (!isNonEmptyString(result["reason"])) {
-      throw invalidResult("the resume coordinator result carries no failure reason", authoritative);
+    if (!hasExactOwnKeys(result, "ok", "reason", "state")) {
+      throw invalidResult("the resume coordinator failure result carries foreign fields", authoritative);
+    }
+    const reason = result["reason"];
+    if (!isString(reason) || !PIPELINE_V2_RESUME_FAILURE_REASON_SET.has(reason)) {
+      throw invalidResult("the resume coordinator failure result carries no valid failure reason", authoritative);
     }
     const state = result["state"];
     if (state !== null && state !== authoritative) {
