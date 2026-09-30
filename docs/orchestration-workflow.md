@@ -3423,6 +3423,115 @@ initial-budget policy, the graph transition commit, automatic resume,
 coordinator/runner/CLI/default-pipeline wiring, schema changes,
 migrations/API/T3, multi-process locking.
 
+### Revise-task intervention controller (restart-aware, production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_revise_task_intervention_controller.ts`
+(public facade) +
+`pipeline_v2_revise_task_intervention_controller_internal.ts` (internal
+core) is the single layer that connects the first half of the
+`revise_task` user intervention into one full restart-aware
+composition — the read-only restoration of the last durably accepted
+plan (`restorePipelineV2AcceptedRunPlan`) on the single captured
+authoritative state, the derivation of the open generation's compiled
+stage, task pointer, next task revision and exact `revise_task_intent`
+(the caller passes only `{pipeline, runRoot, sink, runId, waitIndex,
+taskId, taskBody}` — the stage id, expected plan digest, budget,
+prepared candidate and intent are derived exclusively from durable data
+and the restored compiled plan), then the existing
+`acceptPipelineV2ReviseTaskIntent` and `completePipelineV2ReviseTask`
+with the fixed retry classification over the captured authoritative
+state. The acceptance owns R0 (the full `plan_intent_accepted →
+task_revision_accepted` sequence) and its conflicts
+(`intent_conflict`/`candidate_conflict`/R2 recognition); the exact
+progressed windows skip the acceptance entirely — R3 (the exact
+accepted prefix plus the exact `by: "replanned"` closure without a
+response) runs only the completion, and R4 (plus the exact
+`revise_task` response on the active run, journals exactly at the wait
+boundary, no progress beyond the boundary) is the exact completed retry
+with zero dispatch; a wrong caller body at R3/R4 is refused before any
+facade call (the derived candidate digest no longer matches the
+accepted prefix). An acceptance typed `invalid_state` continues only
+through the narrow racing reconciliation (its authoritative
+`error.state` must pass the same full exact-progressed verification
+pinned as the exact durable suffix progression of the verified base
+state); every other downstream typed error (restore/acceptance/
+completion, including publication/store classes) and every unexpected
+error is re-thrown unchanged by object identity, never classified from
+message text. Capture order: the options shape → the seven fields each
+read exactly once in the fixed order (hostile extras never read) → the
+ops record shape + its five members each exactly once with function
+checks → the pipeline provenance gate (before any field of the pipeline
+is read; Proxy traps never invoked) → non-empty `runRoot`/sink/safe
+ids/positive safe `waitIndex`/non-empty `taskBody` → ONE
+`before = sink.snapshot` capture → the restore fully verified unchanged
+on every schema-owned field → the derivation → the classification →
+the fixed sequence → the completion's full defensive verification
+(the exact flat fields, the exact contiguous `closure → response`
+progression, the cursor moved to the declared routing target without
+consuming the transition budget, the journals exactly at the wait
+boundary, the revision/timestamp accounting exact — the zero-step
+recognition preserving `updated_at`, every other durable region pinned
+field by field; malformed hostile results are the layer's own
+`invalid_result`, never a leaked `TypeError`, and the error carries
+the last verified authoritative state). Runtime export surface is
+exactly `PipelineV2ReviseTaskInterventionControllerError` (own reasons
+`invalid_options | invalid_state | invalid_result`, last verified
+authoritative `state`) and `applyPipelineV2ReviseTaskIntervention`; the
+internal core exports exactly the error, one frozen
+`productionReviseTaskInterventionOps` (`restorePlan`,
+`prepareTaskRevision`, `prepareIntent`, `acceptIntent`, `completeTask`
+— the five existing facades by identity) and
+`applyPipelineV2ReviseTaskInterventionWithIo`; no second parser/
+serializer/registry/digest builder and no mutable module-global seam.
+The deep-frozen content-free result is `{wait_index, intent_sha256,
+request_sha256, response_sha256, task_id, task_revision, task_sha256,
+generation_index, iteration_index, action_id: "revise_task",
+action_to, state}` — the task body, prepared manifests, canonical JSON,
+the pipeline, the compiled plan, paths and caller objects never enter
+it; diagnostics are content-free. Durability: every not-committed/
+durability-unknown window of the four intervention commands leaves the
+published artifacts as orphans for an exact retry that dispatches only
+the missing suffix (the failed attempt's already-committed commands
+stay durable and count toward the final revision), two identical racing
+interventions converge to one durable state with exactly one record of
+each step, and nothing is ever rolled back. The controller ends its
+work at the active/running planning boundary: the architect execution,
+the next plan revision, the replanned generation/stage/transition
+opening and the resume are later increments and stay unwired. Tests:
+`orchestrator/tests/pipeline_v2_revise_task_intervention_controller.test.ts`
+(47 tests) cover the honest C0 on a reopened run (the exact
+four-command suffix, revision +4, the loader round-trip), the R1–R4
+windows through the real primitives (exact suffixes/deltas, the R3/R4
+zero-acceptance and zero-dispatch skips), the task-b selection with the
+neighbor untouched, the C4 byte/inode/mtime-identical zero-dispatch
+retry, the wrong-body semantics per window, the near-miss matrix (a
+grant-closed iteration; an answered wait with another action built
+through the real wait controller; an open successor iteration after
+the response — all own `invalid_state`; loader-invalid hostile
+presentations — a mutated closure anchor, a shifted cursor — refused
+by the restoration's state validation before any effect), the
+post-boundary refusals (a new execution/transition/wait/accepted
+plan/generation, each never a retry), the derivation refusals (an
+absent task; a stale plan artifact as the restoration's typed
+`artifact_mismatch`), the hostile successful-result matrices (malformed
+restore/acceptance/completion results, healed deltas, forged and
+foreign compiled plans — every own `invalid_result` with zero
+downstream calls, never a `TypeError`), the hostile racing
+reconciliation, the provenance/capture battery (a spread-cloned
+pipeline and a Proxy pipeline with zero traps and zero effect; options
+read exactly once in the fixed contract order with hostile extras
+unread; ops members read exactly once; a missing ops member refusing
+before any sink read; caller mutation after a pending restore), the
+durability windows (all four not-committed faults and the
+task/response durability-unknown faults with fresh-retry suffix
+convergence to the same final revision, the adopted candidate and the
+poisoned sink pinned), publication pass-through by identity, identical
+concurrency convergence, the exact two-key public and three-key
+internal export surfaces with the frozen ops identities, the source
+scan (the five facades only; no reducer/validator/serializer/digest/
+fs/store/coordinator/runner/CLI imports; no message parsing; no
+mutable seam), and the invalid-options battery.
+
 ### Replanned-stage composition controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_replanned_stage_controller.ts` (public
