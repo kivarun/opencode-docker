@@ -1670,6 +1670,7 @@ function mutationList(): [string, StateMutation][] {
   };
   return [
     ["schema version", (state) => { (state as unknown as Record<string, unknown>)["schema_version"] = 6; }],
+    ["updated_at not a schema-v7 timestamp", (state) => { (state as unknown as Record<string, unknown>)["updated_at"] = 12345; }],
     ["revision delta", (state) => { (state as unknown as Record<string, unknown>)["revision"] = (state.revision as number) + 9; }],
     ["pipeline identity", (state) => { (state.pipeline as unknown as Record<string, unknown>)["execution_snapshot_sha256"] = hex("f"); }],
     ["input digest", (state) => { (state.inputs[0] as unknown as Record<string, unknown>)["digest"] = hex("9"); }],
@@ -1848,6 +1849,48 @@ test("22. the options fields and the ops members are read exactly once in the fi
     await rm(ctx.root, { recursive: true, force: true });
   }
 });
+
+test("48. a different canonical updated_at at a non-zero suffix delta is not refused for the timestamp difference", async () => {
+  // The acceptance result's state carries another schema-valid canonical
+  // timestamp with a non-zero suffix delta; the real restore and the
+  // composition proceed and the intervention succeeds.
+  const ctxA = await driveToSecondWait();
+  try {
+    const revisionBefore = (ctxA.reopened.snapshot as PipelineV2RunState).revision;
+    const result = await applyPipelineV2ContinueStageInterventionWithIo(healedAcceptanceOps((state) => {
+      state.updated_at = "1999-01-01T00:00:00.000Z";
+    }), {
+      pipeline: ctxA.pipeline,
+      runRoot: ctxA.runRoot,
+      sink: recordSink(ctxA.reopened),
+      intent: ctxA.intent,
+      initialBudget: INITIAL_BUDGET,
+    });
+    expect(result.closed_iteration_index).toBe(1);
+    expect(result.state.revision).toBe(revisionBefore + 5);
+    expect(result.state.updated_at).not.toBe("1999-01-01T00:00:00.000Z");
+  } finally {
+    await rm(ctxA.root, { recursive: true, force: true });
+  }
+  // The open result's final state carries another schema-valid canonical
+  // timestamp; the difference alone is never a refusal.
+  const ctxB = await driveToSecondWait();
+  try {
+    const result = await applyPipelineV2ContinueStageInterventionWithIo(healedOpenOps((state) => {
+      state.updated_at = "1999-01-01T00:00:00.000Z";
+    }), {
+      pipeline: ctxB.pipeline,
+      runRoot: ctxB.runRoot,
+      sink: recordSink(ctxB.reopened),
+      intent: ctxB.intent,
+      initialBudget: INITIAL_BUDGET,
+    });
+    expect(result.closed_iteration_index).toBe(1);
+    expect(result.state.updated_at).toBe("1999-01-01T00:00:00.000Z");
+  } finally {
+    await rm(ctxB.root, { recursive: true, force: true });
+  }
+}, 90000);
 
 test("23. forged intents and pipelines are rejected before any effect", async () => {
   const ctx = await driveToReopenedWait();

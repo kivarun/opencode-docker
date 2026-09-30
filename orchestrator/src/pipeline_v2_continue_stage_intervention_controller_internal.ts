@@ -286,6 +286,13 @@ export interface AppliedPipelineV2ContinueStageIntervention {
 
 const CONTINUE_STAGE_ACTION_ID = "continue_stage";
 
+/**
+ * The exact schema-v7 ISO-8601 UTC timestamp shape of the durable state's
+ * `updated_at`/`started_at` fields; a narrow local field predicate used
+ * by the composed-result delta comparison, not a state validator.
+ */
+const ISO_TIMESTAMP_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1129,7 +1136,15 @@ function compareSuffixDelta(
   if (after["revision"] !== (before["revision"] as number) + appended) {
     return -1;
   }
-  if (appended === 0 && after["updated_at"] !== before["updated_at"]) {
+  // The after state's `updated_at` must always be a schema-v7 ISO
+  // timestamp; with a zero delta it must additionally be exactly the
+  // before state's value (the zero-dispatch recognition preserves it),
+  // while a real dispatch may refresh it to any schema-valid timestamp.
+  const updatedAt = after["updated_at"];
+  if (!isString(updatedAt) || ISO_TIMESTAMP_SHAPE.exec(updatedAt) === null) {
+    return -1;
+  }
+  if (appended === 0 && updatedAt !== before["updated_at"]) {
     return -1;
   }
   if (
