@@ -2267,4 +2267,203 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
       await disposeRun(ctx.fixture);
     }
   });
+
+  // --- the racing reconciliation never recovers an acceptance window ----------
+
+  test("48. the racing reconciliation never recovers an acceptance window (R0/R1/R2)", async () => {
+    // One honest R0 fixture; the exact R1 and R2 states are built through
+    // the production reducer and the real manifest publisher. Each racing
+    // sentinel carries the exact state; a recovering facade would call the
+    // completion (the canary) instead of re-throwing the sentinel.
+    const ctx = await reviseReady({ window: "r0", reopen: false });
+    try {
+      const sink = ctx.sink;
+      const state0 = sink.snapshot as PipelineV2RunState;
+      await publishPipelineV2WaitIntent(ctx.fixture.runRoot, ctx.intent.manifest);
+      await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: ctx.intent.sha256 });
+      const state1 = sink.snapshot as PipelineV2RunState;
+      await publishPipelineV2TaskRevision(ctx.fixture.runRoot, ctx.candidate.manifest);
+      await sink.dispatch({
+        kind: "task_revision_accepted",
+        taskId: "task-a",
+        revision: ctx.candidate.manifest.revision,
+        taskSha256: ctx.candidate.sha256,
+        waitIndex: 1,
+        intentSha256: ctx.intent.sha256,
+      });
+      const state2 = sink.snapshot as PipelineV2RunState;
+      expect(state1.revision).toBe(state0.revision + 1);
+      expect(state2.revision).toBe(state0.revision + 2);
+
+      const scenarios: Array<[string, PipelineV2RunState]> = [
+        ["r0", state0],
+        ["r1", state1],
+        ["r2", state2],
+      ];
+      for (const [label, presented] of scenarios) {
+        let completeCalls = 0;
+        let dispatchCalls = 0;
+        const stub = {
+          get snapshot(): PipelineV2RunState | null {
+            return presented;
+          },
+          get poisoned(): boolean {
+            return false;
+          },
+          async dispatch(): Promise<void> {
+            dispatchCalls += 1;
+            throw new Error("CANARY-DISPATCH");
+          },
+        };
+        const sentinel = new PipelineV2ReviseTaskIntentControllerError(
+          "invalid_state",
+          `racing sentinel ${label}`,
+          presented,
+        );
+        const { ops, counts } = spyOps({
+          acceptIntent: ((): Promise<unknown> => Promise.reject(sentinel)) as unknown as PipelineV2ReviseTaskInterventionOps["acceptIntent"],
+          completeTask: (async (): Promise<unknown> => {
+            completeCalls += 1;
+            throw new Error("CANARY-COMPLETION");
+          }) as unknown as PipelineV2ReviseTaskInterventionOps["completeTask"],
+        });
+        const cause = await catchIntervention(() =>
+          applyPipelineV2ReviseTaskInterventionWithIo(ops, interventionOptionsOf(ctx, stub)),
+        );
+        expect(cause).toBe(sentinel);
+        expect(completeCalls).toBe(0);
+        expect(dispatchCalls).toBe(0);
+        expect(counts().restorePlan).toBe(1);
+        expect(counts().prepareTaskRevision).toBe(1);
+        expect(counts().prepareIntent).toBe(1);
+        expect(counts().acceptIntent).toBe(1);
+        expect(counts().completeTask).toBe(0);
+        expect((cause as PipelineV2ReviseTaskIntentControllerError).message).not.toContain("CANARY");
+        expect((cause as Error).name).not.toBe("TypeError");
+      }
+      // No durable writes: the real state file still sits at the honest R2.
+      const durable = await PipelineV2RunStateSink.open({ stateRoot: ctx.fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      expect((durable.snapshot as PipelineV2RunState).revision).toBe(state2.revision);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("49. the genuine racing progression still recovers: exact R3 records the response only", async () => {
+    const ctx = await reviseReady({ window: "r0", reopen: false });
+    try {
+      let facadeDispatches = 0;
+      let racingDone = false;
+      const live = {
+        get snapshot(): PipelineV2RunState | null {
+          return ctx.sink.snapshot;
+        },
+        get poisoned(): boolean {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand): Promise<void> {
+          if (racingDone) {
+            facadeDispatches += 1;
+          }
+          await ctx.sink.dispatch(command);
+        },
+      };
+      const { ops, counts } = spyOps({
+        acceptIntent: (async (options: unknown) => {
+          // The real acceptance through the production ops (intent + task).
+          await productionReviseTaskInterventionOps.acceptIntent(
+            options as Parameters<PipelineV2ReviseTaskInterventionOps["acceptIntent"]>[0],
+          );
+          // A concurrent durable step closes the iteration while the
+          // acceptance is pending; the acceptance's authoritative state is
+          // the exact R3 progression.
+          await ctx.sink.dispatch({
+            kind: "stage_iteration_closed",
+            generationIndex: 1,
+            iterationIndex: 1,
+            by: "replanned",
+            waitIndex: 1,
+          });
+          racingDone = true;
+          throw new PipelineV2ReviseTaskIntentControllerError(
+            "invalid_state",
+            "racing sentinel r3",
+            ctx.sink.snapshot as PipelineV2RunState,
+          );
+        }) as unknown as PipelineV2ReviseTaskInterventionOps["acceptIntent"],
+      });
+      const result = (await applyPipelineV2ReviseTaskInterventionWithIo(ops, interventionOptionsOf(ctx, live))) as AppliedPipelineV2ReviseTaskIntervention;
+      expect(result.wait_index).toBe(1);
+      expect(result.action_id).toBe("revise_task");
+      expect(result.state).toEqual(ctx.sink.snapshot as PipelineV2RunState);
+      // The recovery ran the completion and recorded only the response.
+      expect(counts().completeTask).toBe(1);
+      expect(facadeDispatches).toBe(1);
+      const state = result.state;
+      expect(state.revision).toBe(ctx.revisionAtWindow + 4);
+      expectCompletedProjection(state, "task-a", ctx);
+      expect(await validatePipelineV2RunState(result.state)).toEqual(result.state);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("50. the genuine racing progression still recovers: exact R4 is the zero-dispatch completed retry", async () => {
+    const ctx = await reviseReady({ window: "r0", reopen: false });
+    try {
+      let facadeDispatches = 0;
+      let racingDone = false;
+      const live = {
+        get snapshot(): PipelineV2RunState | null {
+          return ctx.sink.snapshot;
+        },
+        get poisoned(): boolean {
+          return ctx.sink.poisoned;
+        },
+        async dispatch(command: PipelineV2RunCommand): Promise<void> {
+          if (racingDone) {
+            facadeDispatches += 1;
+          }
+          await ctx.sink.dispatch(command);
+        },
+      };
+      const { ops, counts } = spyOps({
+        acceptIntent: (async (options: unknown) => {
+          await productionReviseTaskInterventionOps.acceptIntent(
+            options as Parameters<PipelineV2ReviseTaskInterventionOps["acceptIntent"]>[0],
+          );
+          // The concurrent progression closes the iteration and records the
+          // revise_task response through the real wait controller; the
+          // acceptance's authoritative state is the exact R4 progression.
+          await ctx.sink.dispatch({
+            kind: "stage_iteration_closed",
+            generationIndex: 1,
+            iterationIndex: 1,
+            by: "replanned",
+            waitIndex: 1,
+          });
+          await recordPipelineV2WaitAction({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, waitIndex: 1, actionId: "revise_task" });
+          racingDone = true;
+          throw new PipelineV2ReviseTaskIntentControllerError(
+            "invalid_state",
+            "racing sentinel r4",
+            ctx.sink.snapshot as PipelineV2RunState,
+          );
+        }) as unknown as PipelineV2ReviseTaskInterventionOps["acceptIntent"],
+      });
+      const result = (await applyPipelineV2ReviseTaskInterventionWithIo(ops, interventionOptionsOf(ctx, live))) as AppliedPipelineV2ReviseTaskIntervention;
+      expect(result.wait_index).toBe(1);
+      expect(result.action_id).toBe("revise_task");
+      expect(result.state).toEqual(ctx.sink.snapshot as PipelineV2RunState);
+      // The recovery recognized the completed boundary with zero dispatch.
+      expect(counts().completeTask).toBe(1);
+      expect(facadeDispatches).toBe(0);
+      const state = result.state;
+      expect(state.revision).toBe(ctx.revisionAtWindow + 4);
+      expectCompletedProjection(state, "task-a", ctx);
+      expect(await validatePipelineV2RunState(result.state)).toEqual(result.state);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
 });

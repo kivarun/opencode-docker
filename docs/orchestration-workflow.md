@@ -3452,9 +3452,11 @@ with zero dispatch; a wrong caller body at R3/R4 is refused before any
 facade call (the derived candidate digest no longer matches the
 accepted prefix). An acceptance typed `invalid_state` continues only
 through the narrow racing reconciliation (its authoritative
-`error.state` must pass the same full exact-progressed verification
-pinned as the exact durable suffix progression of the verified base
-state); every other downstream typed error (restore/acceptance/
+`error.state` must pass the same full exact-progressed verification —
+the retry-window classification gated to the completed boundary only;
+an unchanged R0, a durable-intent R1 or a durable-candidate R2 window
+is never a recovery — pinned as the exact durable suffix progression
+of the verified base state); every other downstream typed error (restore/acceptance/
 completion, including publication/store classes) and every unexpected
 error is re-thrown unchanged by object identity, never classified from
 message text. Capture order: the options shape → the seven fields each
@@ -3499,7 +3501,7 @@ work at the active/running planning boundary: the architect execution,
 the next plan revision, the replanned generation/stage/transition
 opening and the resume are later increments and stay unwired. Tests:
 `orchestrator/tests/pipeline_v2_revise_task_intervention_controller.test.ts`
-(47 tests) cover the honest C0 on a reopened run (the exact
+(50 tests) cover the honest C0 on a reopened run (the exact
 four-command suffix, revision +4, the loader round-trip), the R1–R4
 windows through the real primitives (exact suffixes/deltas, the R3/R4
 zero-acceptance and zero-dispatch skips), the task-b selection with the
@@ -3517,7 +3519,15 @@ absent task; a stale plan artifact as the restoration's typed
 restore/acceptance/completion results, healed deltas, forged and
 foreign compiled plans — every own `invalid_result` with zero
 downstream calls, never a `TypeError`), the hostile racing
-reconciliation, the provenance/capture battery (a spread-cloned
+reconciliation, the acceptance-window racing barrier (a table-driven
+R0/R1/R2 battery over honestly built exact states proving the racing
+recovery never accepts an acceptance window — the completion canary
+never fires and the original sentinel is re-thrown by object
+identity), the genuine racing positive controls (an exact R3
+progressed state runs the completion and records only the response;
+an exact R4 progressed state is the zero-dispatch completed retry;
+both converge to the same completed boundary), the
+provenance/capture battery (a spread-cloned
 pipeline and a Proxy pipeline with zero traps and zero effect; options
 read exactly once in the fixed contract order with hostile extras
 unread; ops members read exactly once; a missing ops member refusing

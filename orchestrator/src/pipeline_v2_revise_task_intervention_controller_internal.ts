@@ -1832,7 +1832,16 @@ function verifyProgressedState(
   policy: InterventionPolicy,
   base: PipelineV2RunState | null,
 ): void {
-  classifyRetryWindow(state, policy);
+  // Progressed recovery is only the completed boundary: the exact R3/R4
+  // windows classify as "completion". Any "acceptance" window (unchanged
+  // R0, the durable intent R1, the durable candidate R2) is NOT a
+  // progression past the acceptance boundary — recovering into the
+  // completion there would run it without the proven closure/response
+  // progression.
+  const window = classifyRetryWindow(state, policy);
+  if (window !== "completion") {
+    throw invalidState("the progressed state is still in the acceptance window; the racing reconciliation does not apply", state);
+  }
   if (base !== null) {
     const appended = compareDelta(base, state, policy, { intent: true, task: true, closure: true, response: true });
     if (appended < 0) {
