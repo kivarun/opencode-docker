@@ -763,68 +763,6 @@ export interface PipelineV2ResumeOptions {
  * the runner never reads the environment itself.
  */
 /**
- * The deps validation shared by both existing-run entrypoints: the same
- * checks and the same per-entrypoint wording (`contractName`), so every
- * message stays byte-identical for the resume contract.
- */
-function validateRunnerDeps(deps: PipelineV2RunnerDeps, contractName: string): void {
-  if (!isRecord(deps)) {
-    throw new Error(`${contractName} deps must be an object`);
-  }
-  if (typeof deps.cli !== "function") {
-    throw new Error(`${contractName} deps.cli must be a function`);
-  }
-  if (typeof deps.fetchAuth !== "function") {
-    throw new Error(`${contractName} deps.fetchAuth must be a function`);
-  }
-  if (!isRecord(deps.helperConfig)) {
-    throw new Error(`${contractName} deps.helperConfig must be an object`);
-  }
-  if (!isNonEmptyAbsolutePath(deps.helperConfig.socketPath)) {
-    throw new Error(`${contractName} deps.helperConfig.socketPath must be a non-empty absolute path`);
-  }
-  if (!isNonEmptyAbsolutePath(deps.helperConfig.credentialFile)) {
-    throw new Error(`${contractName} deps.helperConfig.credentialFile must be a non-empty absolute path`);
-  }
-  if (!isRecord(deps.baseEnv)) {
-    throw new Error(`${contractName} deps.baseEnv must be an object`);
-  }
-  if (!isRecord(deps.stateRootProjection)) {
-    throw new Error(`${contractName} deps.stateRootProjection must be an object`);
-  }
-  for (const field of ["localRoot", "daemonRoot"] as const) {
-    if (!isCleanAbsolutePath(deps.stateRootProjection[field])) {
-      throw new Error(
-        `${contractName} deps.stateRootProjection.${field} must be an absolute clean path`,
-      );
-    }
-  }
-  if (deps.now !== undefined && typeof deps.now !== "function") {
-    throw new Error(`${contractName} deps.now must be a function`);
-  }
-  if (deps.randomId !== undefined && typeof deps.randomId !== "function") {
-    throw new Error(`${contractName} deps.randomId must be a function`);
-  }
-}
-
-function validateResumeContract(
-  options: PipelineV2ResumeOptions,
-  deps: PipelineV2RunnerDeps,
-): void {
-  if (!isRecord(options)) {
-    throw new Error("pipeline v2 resume options must be an object");
-  }
-  expectSafeId(options.runId, "pipeline v2 resume run id");
-  if (!isNonEmptyAbsolutePath(options.configRoot)) {
-    throw new Error("pipeline v2 resume options.configRoot must be a non-empty absolute path");
-  }
-  if (options.launcherId !== undefined && !options.launcherId.startsWith("dhl_")) {
-    throw new Error("pipeline v2 resume options.launcherId must be a launcher ID (dhl_...)");
-  }
-  validateRunnerDeps(deps, "pipeline v2 resume");
-}
-
-/**
  * The caller contract of the dedicated continue-stage runner entrypoint.
  * The external parameters are exactly the run id, the wait journal index,
  * the one caller policy scalar `additionalIterations` (a positive safe
@@ -842,29 +780,159 @@ export interface PipelineV2ContinueStageOptions {
   readonly launcherId?: string;
 }
 
-function validateContinueStageContract(
-  options: PipelineV2ContinueStageOptions,
-  deps: PipelineV2RunnerDeps,
-): void {
-  if (!isRecord(options)) {
-    throw new Error("pipeline v2 continue-stage options must be an object");
+/**
+ * The captured existing-run contract: every top-level field of the caller
+ * options and dependencies is read exactly once, in the fixed capture
+ * order, and validated as a captured local. After the capture the
+ * original caller objects are never read again, so a hostile getter (or
+ * any later mutation of the caller objects) can neither change a
+ * validated value nor redirect the run selection, the policy, the
+ * configuration, the authority or the runtime. `baseEnv` stays an opaque
+ * captured reference: it is never enumerated or cloned.
+ */
+interface CapturedExistingRunContract {
+  readonly runId: string;
+  readonly configRoot: string;
+  readonly launcherId: string | undefined;
+  readonly waitIndex: number | undefined;
+  readonly additionalIterations: number | undefined;
+  /** The frozen captured caller policy of the continue-stage entrypoint. */
+  readonly callerPolicy: ContinueStageCallerPolicy | null;
+  readonly cli: CliRunner;
+  readonly fetchAuth: AuthFetcher;
+  readonly helperConfig: HelperConfig;
+  readonly baseEnv: Readonly<Record<string, string | undefined>>;
+  readonly localRoot: string;
+  readonly daemonRoot: string;
+  readonly onSignal: ((handler: (signal: "SIGINT" | "SIGTERM") => void) => void) | undefined;
+  readonly now: (() => Date) | undefined;
+  readonly randomId: (() => string) | undefined;
+}
+
+function captureExistingRunContract(
+  optionsValue: unknown,
+  depsValue: PipelineV2RunnerDeps,
+  contractName: string,
+  continueStage: boolean,
+): CapturedExistingRunContract {
+  if (!isRecord(optionsValue)) {
+    throw new Error(`${contractName} options must be an object`);
   }
-  expectSafeId(options.runId, "pipeline v2 continue-stage run id");
-  if (!isPositiveSafeInteger(options.waitIndex)) {
-    throw new Error("pipeline v2 continue-stage options.waitIndex must be a positive safe integer");
+  const options = optionsValue;
+  const runId = expectSafeId(options["runId"], `${contractName} run id`);
+  let waitIndex: number | undefined;
+  let additionalIterations: number | undefined;
+  if (continueStage) {
+    const waitValue = options["waitIndex"];
+    if (!isPositiveSafeInteger(waitValue)) {
+      throw new Error(`${contractName} options.waitIndex must be a positive safe integer`);
+    }
+    waitIndex = waitValue;
+    const additionalValue = options["additionalIterations"];
+    if (!isPositiveSafeInteger(additionalValue)) {
+      throw new Error(`${contractName} options.additionalIterations must be a positive safe integer`);
+    }
+    additionalIterations = additionalValue;
   }
-  if (!isPositiveSafeInteger(options.additionalIterations)) {
-    throw new Error(
-      "pipeline v2 continue-stage options.additionalIterations must be a positive safe integer",
-    );
+  const configValue = options["configRoot"];
+  if (!isNonEmptyAbsolutePath(configValue)) {
+    throw new Error(`${contractName} options.configRoot must be a non-empty absolute path`);
   }
-  if (!isNonEmptyAbsolutePath(options.configRoot)) {
-    throw new Error("pipeline v2 continue-stage options.configRoot must be a non-empty absolute path");
+  const launcherValue = options["launcherId"];
+  if (launcherValue !== undefined && (typeof launcherValue !== "string" || !launcherValue.startsWith("dhl_"))) {
+    throw new Error(`${contractName} options.launcherId must be a launcher ID (dhl_...)`);
   }
-  if (options.launcherId !== undefined && !options.launcherId.startsWith("dhl_")) {
-    throw new Error("pipeline v2 continue-stage options.launcherId must be a launcher ID (dhl_...)");
+  if (!isRecord(depsValue)) {
+    throw new Error(`${contractName} deps must be an object`);
   }
-  validateRunnerDeps(deps, "pipeline v2 continue-stage");
+  const deps = depsValue;
+  const cli = deps["cli"];
+  if (typeof cli !== "function") {
+    throw new Error(`${contractName} deps.cli must be a function`);
+  }
+  const fetchAuth = deps["fetchAuth"];
+  if (typeof fetchAuth !== "function") {
+    throw new Error(`${contractName} deps.fetchAuth must be a function`);
+  }
+  const helperConfig = deps["helperConfig"];
+  if (!isRecord(helperConfig)) {
+    throw new Error(`${contractName} deps.helperConfig must be an object`);
+  }
+  const socketPath = helperConfig["socketPath"];
+  if (!isNonEmptyAbsolutePath(socketPath)) {
+    throw new Error(`${contractName} deps.helperConfig.socketPath must be a non-empty absolute path`);
+  }
+  const credentialFile = helperConfig["credentialFile"];
+  if (!isNonEmptyAbsolutePath(credentialFile)) {
+    throw new Error(`${contractName} deps.helperConfig.credentialFile must be a non-empty absolute path`);
+  }
+  const baseEnv = deps["baseEnv"];
+  if (!isRecord(baseEnv)) {
+    throw new Error(`${contractName} deps.baseEnv must be an object`);
+  }
+  const projection = deps["stateRootProjection"];
+  if (!isRecord(projection)) {
+    throw new Error(`${contractName} deps.stateRootProjection must be an object`);
+  }
+  const localRoot = projection["localRoot"];
+  if (!isCleanAbsolutePath(localRoot)) {
+    throw new Error(`${contractName} deps.stateRootProjection.localRoot must be an absolute clean path`);
+  }
+  const daemonRoot = projection["daemonRoot"];
+  if (!isCleanAbsolutePath(daemonRoot)) {
+    throw new Error(`${contractName} deps.stateRootProjection.daemonRoot must be an absolute clean path`);
+  }
+  const now = deps["now"];
+  if (now !== undefined && typeof now !== "function") {
+    throw new Error(`${contractName} deps.now must be a function`);
+  }
+  const randomId = deps["randomId"];
+  if (randomId !== undefined && typeof randomId !== "function") {
+    throw new Error(`${contractName} deps.randomId must be a function`);
+  }
+  const onSignal = deps["onSignal"];
+  if (onSignal !== undefined && typeof onSignal !== "function") {
+    throw new Error(`${contractName} deps.onSignal must be a function`);
+  }
+  const callerPolicy: ContinueStageCallerPolicy | null = continueStage
+    ? deepFreeze({
+        runId,
+        waitIndex: waitIndex as number,
+        additionalIterations: additionalIterations as number,
+      })
+    : null;
+  // The captured record is frozen shallowly: the opaque captured
+  // references (`cli`, `fetchAuth`, `helperConfig`, `baseEnv`) are never
+  // enumerated, cloned or frozen, and the caller's objects are never
+  // modified.
+  return Object.freeze({
+    runId,
+    configRoot: configValue,
+    launcherId: typeof launcherValue === "string" ? launcherValue : undefined,
+    waitIndex,
+    additionalIterations,
+    callerPolicy,
+    cli: cli as CliRunner,
+    fetchAuth: fetchAuth as AuthFetcher,
+    helperConfig: helperConfig as unknown as HelperConfig,
+    baseEnv: baseEnv as Readonly<Record<string, string | undefined>>,
+    localRoot,
+    daemonRoot,
+    onSignal: onSignal as CapturedExistingRunContract["onSignal"],
+    now: now as (() => Date) | undefined,
+    randomId: randomId as (() => string) | undefined,
+  }) as CapturedExistingRunContract;
+}
+
+/**
+ * The frozen captured caller policy of the continue-stage entrypoint:
+ * the three captured scalars the derivation consumes (never the caller
+ * object).
+ */
+interface ContinueStageCallerPolicy {
+  readonly runId: string;
+  readonly waitIndex: number;
+  readonly additionalIterations: number;
 }
 
 /**
@@ -892,28 +960,28 @@ interface ContinueStageDerivedPolicy {
  */
 function deriveContinueStagePolicy(
   snapshot: PipelineV2RunState,
-  options: PipelineV2ContinueStageOptions,
+  policy: ContinueStageCallerPolicy,
 ): ContinueStageDerivedPolicy {
-  if (snapshot.run_id !== options.runId) {
+  if (snapshot.run_id !== policy.runId) {
     throw new Error("pipeline v2 continue-stage: the durable run id does not match the caller run id");
   }
   let target: PipelineV2RunState["waits"][number] | undefined;
   let matches = 0;
   for (const record of snapshot.waits) {
-    if (record.index === options.waitIndex) {
+    if (record.index === policy.waitIndex) {
       matches += 1;
       target = record;
     }
   }
   if (target === undefined || matches !== 1) {
     throw new Error(
-      `pipeline v2 continue-stage: the durable wait journal carries no single wait record at index ${options.waitIndex}`,
+      `pipeline v2 continue-stage: the durable wait journal carries no single wait record at index ${policy.waitIndex}`,
     );
   }
   const lastWait = snapshot.waits[snapshot.waits.length - 1];
   if (lastWait === undefined || lastWait.index !== target.index) {
     throw new Error(
-      `pipeline v2 continue-stage: the target wait record ${options.waitIndex} is not the last wait record`,
+      `pipeline v2 continue-stage: the target wait record ${policy.waitIndex} is not the last wait record`,
     );
   }
   // An already-answered target wait is the crash-retry boundary: the
@@ -923,7 +991,7 @@ function deriveContinueStagePolicy(
   const declared = target.actions.filter((action) => action.id === "continue_stage");
   if (declared.length !== 1) {
     throw new Error(
-      `pipeline v2 continue-stage: the target wait record ${options.waitIndex} does not declare exactly one continue_stage action`,
+      `pipeline v2 continue-stage: the target wait record ${policy.waitIndex} does not declare exactly one continue_stage action`,
     );
   }
   const openGenerations = snapshot.generations.filter((generation) => generation.closed === undefined);
@@ -941,11 +1009,11 @@ function deriveContinueStagePolicy(
   const intent = prepareWaitIntent({
     schema_version: 1,
     kind: "continue_stage_intent",
-    run_id: options.runId,
-    wait_index: options.waitIndex,
+    run_id: policy.runId,
+    wait_index: policy.waitIndex,
     stage_id: openGeneration.stage_id,
     expected_plan_sha256: openGeneration.plan_sha256,
-    additional_iterations: options.additionalIterations,
+    additional_iterations: policy.additionalIterations,
   });
   const durableIntent = target.intent;
   if (durableIntent !== undefined && durableIntent.intent_sha256 !== intent.sha256) {
@@ -1053,7 +1121,6 @@ async function verifyExistingRunRoot(
  * their optional derivation step and their single coordinator call.
  */
 interface ExistingRunCoordinatorContext {
-  readonly options: PipelineV2ResumeOptions | PipelineV2ContinueStageOptions;
   readonly runId: string;
   readonly runRoot: string;
   readonly sink: PipelineV2RunStateSink;
@@ -1067,20 +1134,21 @@ interface ExistingRunCoordinatorContext {
 interface ExistingRunFlow {
   /** The failure-log wording of this entrypoint (without the prefix). */
   readonly failureLogPrefix: string;
-  validateContract(
-    options: PipelineV2ResumeOptions | PipelineV2ContinueStageOptions,
-    deps: PipelineV2RunnerDeps,
-  ): void;
+  /** The per-entrypoint contract wording of the shared capture. */
+  readonly contractName: string;
+  /** Whether this entrypoint captures the continue-stage option fields. */
+  readonly continueStage: boolean;
   /**
    * The continue-only derivation: runs synchronously right after the
    * authoritative sink open, strictly before any pipeline, profile,
-   * authority or runtime work. A derivation failure is an ordinary
-   * post-run-root failure carrying the actual run id, the canonical run
-   * root and the last authoritative snapshot.
+   * authority or runtime work, over the frozen captured caller policy. A
+   * derivation failure is an ordinary post-run-root failure carrying the
+   * actual run id, the canonical run root and the last authoritative
+   * snapshot.
    */
   derivePolicy?(
     snapshot: PipelineV2RunState,
-    options: PipelineV2ContinueStageOptions,
+    policy: ContinueStageCallerPolicy,
   ): ContinueStageDerivedPolicy;
   runCoordinator(context: ExistingRunCoordinatorContext): Promise<PipelineV2ResumeCoordinationResult>;
 }
@@ -1111,13 +1179,10 @@ async function runExistingPipelineV2(
   };
 
   let gate: RunCauseGate;
+  let contract: CapturedExistingRunContract;
   try {
-    flow.validateContract(options, deps);
-    const capturedOnSignal = deps.onSignal;
-    if (capturedOnSignal !== undefined && typeof capturedOnSignal !== "function") {
-      throw new Error("pipeline v2 resume deps.onSignal must be a function");
-    }
-    gate = new RunCauseGate(capturedOnSignal);
+    contract = captureExistingRunContract(options, deps, flow.contractName, flow.continueStage);
+    gate = new RunCauseGate(contract.onSignal);
   } catch (cause) {
     return preflightFailure(cause);
   }
@@ -1145,10 +1210,13 @@ async function runExistingPipelineV2(
   // preflight shape. From the confirmed run root on, every outcome carries
   // the actual run id, the canonical run root and the last authoritative
   // state.
-  const runId = options.runId;
+  const runId = contract.runId;
   let runRoot: PreparedRunRoot;
   try {
-    runRoot = await verifyExistingRunRoot(deps.stateRootProjection, runId);
+    runRoot = await verifyExistingRunRoot(
+      { localRoot: contract.localRoot, daemonRoot: contract.daemonRoot },
+      runId,
+    );
   } catch (cause) {
     if (recordedSignal() !== null) {
       return signalOutcomeBeforeRunRoot();
@@ -1188,9 +1256,9 @@ async function runExistingPipelineV2(
   let sinkOrNull: PipelineV2RunStateSink | null = null;
   try {
     sinkOrNull = await PipelineV2RunStateSink.open({
-      stateRoot: deps.stateRootProjection.localRoot,
+      stateRoot: contract.localRoot,
       runId,
-      now: deps.now,
+      now: contract.now,
     });
   } catch (cause) {
     if (recordedSignal() !== null) {
@@ -1214,7 +1282,7 @@ async function runExistingPipelineV2(
   let derived: ContinueStageDerivedPolicy | null = null;
   if (flow.derivePolicy !== undefined) {
     try {
-      derived = flow.derivePolicy(sink.snapshot!, options as PipelineV2ContinueStageOptions);
+      derived = flow.derivePolicy(sink.snapshot!, contract.callerPolicy!);
     } catch (cause) {
       if (recordedSignal() !== null) {
         return postRunRootSignalOutcome(sink.snapshot);
@@ -1239,7 +1307,7 @@ async function runExistingPipelineV2(
   try {
     pipeline = await loadPipelineV2(sink.snapshot!.pipeline.bundle_root);
     for (const profileName of uniqueProfileNames(pipeline)) {
-      profiles.set(profileName, await loadProfile(options.configRoot, profileName, deps.baseEnv));
+      profiles.set(profileName, await loadProfile(contract.configRoot, profileName, contract.baseEnv));
     }
   } catch (cause) {
     if (recordedSignal() !== null) {
@@ -1254,8 +1322,8 @@ async function runExistingPipelineV2(
   let authority: Awaited<ReturnType<typeof lifecycleAuthority>>;
   try {
     authority = await lifecycleAuthority(
-      { cli: deps.cli, fetchAuth: deps.fetchAuth, config: deps.helperConfig, baseEnv: deps.baseEnv },
-      { launcherId: options.launcherId },
+      { cli: contract.cli, fetchAuth: contract.fetchAuth, config: contract.helperConfig, baseEnv: contract.baseEnv },
+      { launcherId: contract.launcherId },
     );
   } catch (cause) {
     if (recordedSignal() !== null) {
@@ -1272,8 +1340,8 @@ async function runExistingPipelineV2(
     runtime = createDockerHelperPipelineV2Runtime({
       pipeline,
       profiles,
-      cli: deps.cli,
-      helperConfig: deps.helperConfig,
+      cli: contract.cli,
+      helperConfig: contract.helperConfig,
       operatorEnv: authority.baseOperatorEnv,
       expectedLauncherId: authority.auth.launcher_id,
       runRootProjection: { localRoot: runRoot.localRunRoot, daemonRoot: runRoot.daemonRunRoot },
@@ -1296,7 +1364,6 @@ async function runExistingPipelineV2(
   let result;
   try {
     result = await flow.runCoordinator({
-      options,
       runId,
       runRoot: runRoot.localRunRoot,
       sink,
@@ -1376,7 +1443,8 @@ export async function resumePipelineV2(
 ): Promise<PipelineV2RunOutcome> {
   return runExistingPipelineV2(options, deps, {
     failureLogPrefix: "pipeline v2 resume failed",
-    validateContract: validateResumeContract,
+    contractName: "pipeline v2 resume",
+    continueStage: false,
     runCoordinator: (context) =>
       resumePipelineV2Run(
         {
@@ -1414,7 +1482,8 @@ export async function continuePipelineV2Stage(
 ): Promise<PipelineV2RunOutcome> {
   return runExistingPipelineV2(options, deps, {
     failureLogPrefix: "pipeline v2 continue-stage failed",
-    validateContract: validateContinueStageContract,
+    contractName: "pipeline v2 continue-stage",
+    continueStage: true,
     derivePolicy: deriveContinueStagePolicy,
     runCoordinator: (context) => {
       const derived = context.derived;

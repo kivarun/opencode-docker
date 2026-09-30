@@ -300,8 +300,16 @@ continuePipelineV2Stage(
   plan — is derived from the authoritative durable state after the reopen
   and is never a caller field.
 - No parallel resume runner exists: the two existing-run entrypoints share
-  one private internal core with the same options/deps capture and shape
-  validation, the single `RunCauseGate`, the read-only existing run-root
+  one private internal core with one capture boundary before the first
+  await (every top-level options/deps field is read exactly once in the
+  fixed order — continue options `runId,waitIndex,additionalIterations,
+  configRoot,launcherId`, resume options `runId,configRoot,launcherId`;
+  deps `cli,fetchAuth,helperConfig,baseEnv,stateRootProjection,
+  now,randomId,onSignal`; the projection scalars are pinned as captured
+  locals; `baseEnv` stays an opaque captured reference; hostile extra
+  fields are never read; the derivation receives the frozen captured
+  policy, never the caller object) with validation over the captured
+  locals only, the single `RunCauseGate`, the read-only existing run-root
   verification, the read-only `PipelineV2RunStateSink.open`, the pipeline
   loaded only from the durable bundle root, the profiles from the caller
   configuration root, the single Launcher authority check, the one runtime

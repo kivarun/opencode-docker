@@ -204,22 +204,26 @@ async function drivePrefix(
     { id: "continue_stage", to: "dev_entry" },
     { id: "revise_task", to: "architect" },
   ],
-  options: { bare?: boolean } = {},
+  options: { bare?: boolean; runId?: string } = {},
 ): Promise<void> {
+  const runId = options.runId ?? RUN_ID;
   clockValue = 0;
   const pipeline = await loadPipelineV2(harness.bundle);
-  const sink = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId: RUN_ID, now: nextTick });
+  await mkdir(join(harness.stateRoot, "pipeline-runs"), { recursive: true, mode: 0o700 });
+  const runRoot = join(harness.stateRoot, "pipeline-runs", runId);
+  await mkdir(runRoot, { recursive: true, mode: 0o700 });
+  const sink = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId, now: nextTick });
   const recording: Array<Record<string, unknown>> = [];
   const rec = commandSink(sink, recording);
-  await prepareRunProject(harness.projectSource, harness.runRoot);
+  await prepareRunProject(harness.projectSource, runRoot);
   const runInputs: RunInputsSnapshot = await snapshotRunInputs(
     pipeline,
     [{ id: "task", path: join(harness.sources, "task.md") }] as readonly RunInputBinding[],
-    harness.runRoot,
+    runRoot,
   );
   await rec.dispatch({
     kind: "create_run",
-    runId: RUN_ID,
+    runId,
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: runInputs.inputs.map((entry) => ({
       id: entry.id,
@@ -233,7 +237,7 @@ async function drivePrefix(
     // the bare waiting boundary: the run waits at the entry state with no
     // execution and no generation at all
     await enterPipelineV2Wait({
-      runRoot: harness.runRoot,
+      runRoot,
       sink: rec as never,
       reason: "stage_iteration_limit_exhausted",
       actions: waitActions,
@@ -271,7 +275,7 @@ async function drivePrefix(
   const taskA = prepareTaskRevisionManifest({
     schema_version: 1,
     kind: "task_revision",
-    run_id: RUN_ID,
+    run_id: runId,
     task_id: "task-a",
     revision: 1,
     previous_sha256: null,
@@ -281,7 +285,7 @@ async function drivePrefix(
   const plan1 = preparePlanRevisionManifest({
     schema_version: 1,
     kind: "plan_revision",
-    run_id: RUN_ID,
+    run_id: runId,
     revision: 1,
     previous_sha256: null,
     root_task: { input_id: "task", sha256: runInputs.inputs[0]?.digest ?? "" },
@@ -303,7 +307,7 @@ async function drivePrefix(
   });
   const acceptedPlan = await acceptPipelineV2RunPlanCandidate({
     pipeline,
-    runRoot: harness.runRoot,
+    runRoot,
     sink: rec as never,
     candidate,
   });
@@ -320,7 +324,7 @@ async function drivePrefix(
   });
   await runAgentStep("dev_entry", 2, true);
   await enterPipelineV2Wait({
-    runRoot: harness.runRoot,
+    runRoot,
     sink: rec as never,
     reason: "stage_iteration_limit_exhausted",
     actions: waitActions,
@@ -850,6 +854,161 @@ test("a signal accepted before the facade yields the signal outcome with zero in
   expect(outcome2.ok).toBe(false);
   expect(outcome2.exitCode).toBe(143);
   expect(outcome2.reason).toBe("signal_sigterm");
+});
+
+// --- capture contract -------------------------------------------------------
+
+test("capture contract: every continue option field is read exactly once in the fixed order", async () => {
+  const harness = await makeHarness("pipeline-v2-continue-runner-readcount-");
+  await drivePrefix(harness);
+  const readKeys: string[] = [];
+  const hostileOptions = new Proxy(
+    {
+      runId: RUN_ID,
+      waitIndex: 1,
+      additionalIterations: 2,
+      configRoot: harness.configRoot,
+      launcherId: EXPECTED_LAUNCHER_ID,
+    } as Record<string, unknown>,
+    {
+      get(target, property, receiver) {
+        readKeys.push(String(property));
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  );
+  const captured = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await continuePipelineV2Stage(hostileOptions as never, runnerDeps(harness));
+  } finally {
+    captured.restore();
+  }
+  expect(outcome.ok).toBe(false);
+  expect(outcome.reason).toBe("worker_failed");
+  // each of the five fields is read exactly once, in the contract order
+  expect(readKeys).toEqual(["runId", "waitIndex", "additionalIterations", "configRoot", "launcherId"]);
+});
+
+test("capture contract: a mutating additionalIterations getter cannot change the recorded grant", async () => {
+  const harness = await makeHarness("pipeline-v2-continue-runner-policy-mut-");
+  await drivePrefix(harness);
+  let policyReads = 0;
+  const hostileOptions = new Proxy(
+    {
+      runId: RUN_ID,
+      waitIndex: 1,
+      additionalIterations: 2,
+      configRoot: harness.configRoot,
+      launcherId: EXPECTED_LAUNCHER_ID,
+    } as Record<string, unknown>,
+    {
+      get(target, property, receiver) {
+        if (property === "additionalIterations") {
+          policyReads += 1;
+          return policyReads === 1 ? 2 : 3;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  );
+  const captured = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await continuePipelineV2Stage(hostileOptions as never, runnerDeps(harness));
+  } finally {
+    captured.restore();
+  }
+  expect(outcome.ok).toBe(false);
+  expect(outcome.reason).toBe("worker_failed");
+  const state = await readDurableState(harness);
+  // the validated policy (2) is the only value the run ever sees
+  expect(state.grants[0]?.additional_iterations).toBe(2);
+});
+
+test("capture contract: a mutating runId getter cannot redirect the continuation to another run", async () => {
+  const harness = await makeHarness("pipeline-v2-continue-runner-run-select-");
+  await drivePrefix(harness, undefined, { runId: "run-a" });
+  await drivePrefix(harness, undefined, { runId: "run-b" });
+  let runIdReads = 0;
+  const hostileOptions = new Proxy(
+    {
+      runId: RUN_ID,
+      waitIndex: 1,
+      additionalIterations: 2,
+      configRoot: harness.configRoot,
+      launcherId: EXPECTED_LAUNCHER_ID,
+    } as Record<string, unknown>,
+    {
+      get(target, property, receiver) {
+        if (property === "runId") {
+          runIdReads += 1;
+          return runIdReads === 1 ? "run-a" : "run-b";
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    },
+  );
+  const captured = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await continuePipelineV2Stage(hostileOptions as never, runnerDeps(harness));
+  } finally {
+    captured.restore();
+  }
+  expect(outcome.ok).toBe(false);
+  expect(outcome.reason).toBe("worker_failed");
+  // only the first validated run was continued
+  const stateA = parsePipelineV2RunState(await readFile(join(harness.stateRoot, "pipeline-runs", "run-a", "state.json"), "utf8"));
+  const stateB = parsePipelineV2RunState(await readFile(join(harness.stateRoot, "pipeline-runs", "run-b", "state.json"), "utf8"));
+  expect(stateA.status).toBe("failed");
+  expect(stateA.grants).toHaveLength(1);
+  expect(stateA.waits[0]?.response?.action_id).toBe("continue_stage");
+  // the second run stays untouched waiting
+  expect(stateB.status).toBe("waiting");
+  expect(stateB.waits[0]?.response).toBeUndefined();
+  expect(stateB.grants).toEqual([]);
+  expect(outcome.runId).toBe("run-a");
+});
+
+test("capture contract: a mutating deps.now getter cannot change the run clock", async () => {
+  const harness = await makeHarness("pipeline-v2-continue-runner-deps-mut-");
+  await drivePrefix(harness);
+  let nowReads = 0;
+  const validatedClock = nextTick;
+  const replacementClock = () => new Date(Date.UTC(2030, 0, 1));
+  const base = runnerDeps(harness);
+  const hostileDeps = new Proxy(base as unknown as Record<string, unknown>, {
+    get(target, property, receiver) {
+      if (property === "now") {
+        nowReads += 1;
+        return nowReads === 1 ? validatedClock : replacementClock;
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const captured = captureDiagnostics();
+  let outcome: PipelineV2RunOutcome;
+  try {
+    outcome = await continuePipelineV2Stage(
+      {
+        runId: RUN_ID,
+        waitIndex: 1,
+        additionalIterations: 2,
+        configRoot: harness.configRoot,
+        launcherId: EXPECTED_LAUNCHER_ID,
+      },
+      hostileDeps as never,
+    );
+  } finally {
+    captured.restore();
+  }
+  expect(outcome.ok).toBe(false);
+  expect(outcome.reason).toBe("worker_failed");
+  const state = await readDurableState(harness);
+  // every durable timestamp came from the validated clock
+  expect(state.updated_at.startsWith("2026-01-01")).toBe(true);
+  expect(nowReads).toBe(1);
 });
 
 // --- export surface and source scan ----------------------------------------
