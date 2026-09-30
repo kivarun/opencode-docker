@@ -275,6 +275,60 @@ orchestrator resume \
   helper output streamed to stderr; the exit code is the outcome's exit
   code.
 
+## The production continue-stage runner API (`continuePipelineV2Stage`, not wired into the CLI)
+
+`orchestrator/src/pipeline_v2_runner.ts` adds the dedicated `continue_stage`
+runner entrypoint `continuePipelineV2Stage(options, deps)`. It is
+implemented and tested against the real facades, but the CLI does not
+route to it yet — the generic `respond` command still fail-closes on the
+reserved intervention action ids, and `continue_stage` keeps its dedicated
+path unwired.
+
+```
+continuePipelineV2Stage(
+  { runId, waitIndex, additionalIterations, configRoot, launcherId? },
+  deps,   // the existing PipelineV2RunnerDeps
+) -> PipelineV2RunOutcome
+```
+
+- The external parameters are exactly the run id, the wait journal index,
+  the one caller policy scalar `additionalIterations` (a positive safe
+  integer with no default) and the standard resume configuration. The
+  action is fixed by the entrypoint as the reserved `continue_stage`. Every
+  internal intervention parameter — the stage id, the expected plan digest,
+  the initial budget, the prepared intent, the pipeline and the compiled
+  plan — is derived from the authoritative durable state after the reopen
+  and is never a caller field.
+- No parallel resume runner exists: the two existing-run entrypoints share
+  one private internal core with the same options/deps capture and shape
+  validation, the single `RunCauseGate`, the read-only existing run-root
+  verification, the read-only `PipelineV2RunStateSink.open`, the pipeline
+  loaded only from the durable bundle root, the profiles from the caller
+  configuration root, the single Launcher authority check, the one runtime
+  adapter, and the unified outcome mapping. `resumePipelineV2` keeps its
+  observable behavior, side-effect order, signal semantics, outcome shape
+  and tests byte-identical.
+- The continue-only policy derivation runs synchronously right after the
+  authoritative sink open and strictly before any pipeline, profile,
+  authority or runtime work: the run-id binding; the target wait located by
+  one full journal pass (exactly one record at the caller index; it must be
+  the last record and declare exactly one exact `continue_stage` action; an
+  already-answered target wait is the crash-retry boundary); exactly one
+  open generation that is also the current last generation (the sole source
+  of the stage id, the expected plan digest and the initial budget); the
+  intent built only through the public `prepareWaitIntent`, whose digest
+  must match the durable accepted intent exactly when one exists. No
+  manifest file is read directly and no compiled plan is restored here.
+- The single composed call is exactly
+  `resumePipelineV2RunAfterContinueStageIntervention({pipeline, runRoot,
+  sink, runtime, control, intent, initialBudget})` — no separate intent
+  acceptance, no restore, no continued-stage composition. Derivation
+  refusals are ordinary post-run-root failures carrying the actual run id,
+  the canonical run root and the last authoritative snapshot with no new
+  outcome reason; a signal accepted before the facade cannot allow any
+  intervention write; after the facade starts, signal ownership stays
+  coordinator-owned through the captured control functions.
+
 ## The production pipeline v2 wait-response CLI (`orchestrator respond`)
 
 `orchestrator respond` records the user's answer to one durably open wait.
