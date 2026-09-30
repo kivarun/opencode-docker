@@ -36,7 +36,14 @@
  *   6. the read-only `PipelineV2RunStateSink.open` (the single state
  *      validator; a missing or foreign document is a typed refusal);
  *   7. the normalized durable snapshot (the opened sink guarantees it);
- *   8. `recordPipelineV2WaitAction` — the single internal response chain
+ *   8. the early fail-closed guard for the reserved intervention action
+ *      ids: a response to a special intervention action can never be
+ *      recorded by the generic command, because the durable intervention
+ *      (the intent acceptance, the budget grant and the stage-iteration
+ *      closure) must run before the response and this command carries no
+ *      policy parameters to run it. The guard returns an ordinary
+ *      failure outcome before any publication or dispatch;
+ *   9. `recordPipelineV2WaitAction` — the single internal response chain
  *      shared with the raw-response API: durable request reconstruction,
  *      request-file verification or idempotent restoration, acceptance
  *      through the manifest module, response publication, and the durable
@@ -86,6 +93,24 @@ import {
 } from "./projection_fs.ts";
 import { isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import type { PipelineStateIo } from "./pipeline_state_store.ts";
+
+/**
+ * The reserved intervention action ids (an implementation detail, never a
+ * public export): both ids' durable interventions — the intent acceptance,
+ * the budget grant and the stage-iteration closure — must run before the
+ * response, and the generic response command carries no policy parameters
+ * (no intent, no budget, no runtime) to run them. Empirically confirmed on
+ * the honest stage-wait boundary: the reducer's schema-v7 invariant rejects
+ * any response while the stage iteration is still open, so the generic
+ * path can only fail closed after publishing an orphan response manifest.
+ * The guard below therefore rejects both ids before any publication or
+ * dispatch. Ordinary, non-reserved action ids keep the generic controller
+ * path unchanged.
+ */
+const RESERVED_INTERVENTION_ACTION_IDS: ReadonlySet<string> = new Set([
+  "continue_stage",
+  "revise_task",
+]);
 import {
   PipelineV2WaitControllerError,
   recordPipelineV2WaitAction,
@@ -340,6 +365,26 @@ export async function respondPipelineV2Wait(
       runRoot: canonicalRunRoot,
       state: null,
       reason: "missing_state",
+    });
+  }
+
+  // --- early fail-closed guard for the reserved intervention actions ------
+  // Strictly after the authoritative state is open (so missing-state and
+  // layout errors keep their precedence) and strictly before the response
+  // chain: no response manifest is published, no dispatch happens, the
+  // durable revision and state are untouched, and pre-existing files are
+  // never removed or rewritten. The diagnostics name no action values.
+  if (RESERVED_INTERVENTION_ACTION_IDS.has(validated.actionId)) {
+    console.error(
+      "orchestrator: pipeline v2 wait response failed: the special intervention action cannot be answered by the generic response command",
+    );
+    return deepFreeze<PipelineV2WaitResponseOutcome>({
+      ok: false,
+      exitCode: 1,
+      runId: validated.runId,
+      runRoot: canonicalRunRoot,
+      state: sink.snapshot,
+      reason: "invalid_state",
     });
   }
 

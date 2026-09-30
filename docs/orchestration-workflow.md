@@ -303,10 +303,20 @@ orchestrator respond \
   validation, read-only state-root verification, the fixed
   `<state-root>/pipeline-runs/<run-id>` layout, the local/daemon run-root
   projection as one real canonical 0700 object, the read-only
-  `PipelineV2RunStateSink.open`, and then the wait controller's structured
-  action path (`recordPipelineV2WaitAction`). The routing target is never
-  caller-supplied: it is the durable request's own `actions[].to` for the
-  chosen action id.
+  `PipelineV2RunStateSink.open`, then the early fail-closed guard for the
+  two reserved intervention action ids, and only then the wait controller's
+  structured action path (`recordPipelineV2WaitAction`). The routing target
+  is never caller-supplied: it is the durable request's own `actions[].to`
+  for the chosen action id.
+- The reserved intervention action ids (`continue_stage`, `revise_task`)
+  fail closed before any publication or dispatch: their durable
+  interventions (the intent acceptance, the budget grant and the
+  stage-iteration closure) must run before the response, and the generic
+  command carries no policy parameters to run them. The guard returns the
+  ordinary `invalid_state` failure carrying the authoritative snapshot,
+  leaves the revision and state untouched, publishes no response manifest,
+  and never removes or rewrites orphan files left by older versions.
+  Ordinary action ids keep the unchanged generic controller path.
 - Success requires exactly one situation: the run is `waiting`, the last
   wait is open, its index matches `--wait-index`, the durable request is
   coherent, and the action id is declared by that request. An

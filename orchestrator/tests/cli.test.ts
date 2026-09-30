@@ -104,6 +104,7 @@ test("usage documents the production pipeline v2 run command", () => {
   expect(text).toContain("pipeline-runs/<run-id>/outputs");
   expect(text).toContain("agent-smoke is the v1 diagnostic command");
   expect(text).toContain("run-owned directory");
+  expect(text).toContain("reserved for a future dedicated intervention path");
 });
 
 const RUN_BASE = ["--pipeline-root", "/abs/pipeline", "--config-root", "/abs/config", "--project", "/abs/project"];

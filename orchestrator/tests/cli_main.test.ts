@@ -1,9 +1,15 @@
 import { expect, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runCli, type CliIo } from "../src/main.ts";
 import type { CliResult, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
 import { resolveHelperConfig } from "../src/launcher.ts";
 import type { PipelineV2RunOutcome } from "../src/pipeline_v2_runner.ts";
-import type { PipelineV2WaitResponseOutcome } from "../src/pipeline_v2_wait_respond.ts";
+import { respondPipelineV2Wait, type PipelineV2WaitResponseOutcome } from "../src/pipeline_v2_wait_respond.ts";
+import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
+import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
 
 const CANARY_SECRET = "CANARY-SECRET-dhsec9f1";
 
@@ -757,6 +763,80 @@ test("respond human mode prints the content-free summary lines", async () => {
   expect(err3).toEqual([
     "orchestrator: respond failed (run rid-1, reason run_layout_invalid)",
   ]);
+});
+
+test("respond end-to-end with the real production module: a reserved intervention action exits 1 with no orphan file and no machinery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cli-respond-reserved-"));
+  const stateRoot = join(root, "state");
+  mkdirSync(stateRoot, { recursive: true });
+  const sink = new PipelineV2RunStateSink({
+    stateRoot,
+    runId: "rid-reserved",
+    now: () => new Date(0),
+  });
+  await sink.dispatch({
+    kind: "create_run",
+    runId: "rid-reserved",
+    pipeline: {
+      schema_version: 2,
+      bundle_root: join(root, "bundle"),
+      execution_snapshot_sha256: createHash("sha256").update("bundle").digest("hex"),
+      entry_state: "s01",
+      max_transitions: 20,
+    },
+    inputs: [],
+  });
+  const runRoot = join(stateRoot, "pipeline-runs", "rid-reserved");
+  chmodSync(runRoot, 0o700);
+  await enterPipelineV2Wait({
+    runRoot,
+    sink,
+    reason: "stage_iteration_limit_exhausted",
+    actions: [{ id: "continue_stage", to: "s01" }],
+  });
+  const stateBefore = await import("node:fs/promises").then((m) => m.readFile(join(runRoot, "state.json"), "utf8"));
+  let runnerCalls = 0;
+  let fetchAuthCalls = 0;
+  const { io, out, err } = makeIo();
+  io.runner.run = () => {
+    runnerCalls += 1;
+    return Promise.resolve({ code: 0 });
+  };
+  io.fetchAuth = () => {
+    fetchAuthCalls += 1;
+    return Promise.resolve({ status: 200, body: {} });
+  };
+  io.resolveStateRootProjection = () => ({ localRoot: stateRoot, daemonRoot: stateRoot });
+  io.respondPipelineV2Wait = respondPipelineV2Wait as unknown as CliIo["respondPipelineV2Wait"];
+  const exit = await runCli(
+    ["respond", "--run-id", "rid-reserved", "--wait-index", "1", "--action", "continue_stage", "--json"],
+    io,
+  );
+  expect(exit).toBe(1);
+  // exactly one JSON outcome document on stdout: the ordinary invalid_state failure
+  const documents = out.filter((line) => line.trim() !== "");
+  expect(documents).toHaveLength(1);
+  const parsed = JSON.parse(documents[0]!) as Record<string, unknown>;
+  expect(parsed["ok"]).toBe(false);
+  expect(parsed["exitCode"]).toBe(1);
+  expect(parsed["reason"]).toBe("invalid_state");
+  expect(parsed["runId"]).toBe("rid-reserved");
+  expect(parsed["runRoot"]).toBe(runRoot);
+  const failedState = parsed["state"] as Record<string, unknown>;
+  expect(failedState["status"]).toBe("waiting");
+  expect(failedState["failure"]).toBeUndefined();
+  // no response manifest was published and the durable state is untouched
+  const files = rmSync;
+  void files;
+  const { readdirSync: rds } = await import("node:fs");
+  expect(rds(join(runRoot, "waits")).filter((name) => name.includes("response"))).toEqual([]);
+  const stateAfter = await import("node:fs/promises").then((m) => m.readFile(join(runRoot, "state.json"), "utf8"));
+  expect(stateAfter).toBe(stateBefore);
+  // no runner subprocess, no auth machinery, no signal registration
+  expect(runnerCalls).toBe(0);
+  expect(fetchAuthCalls).toBe(0);
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+  rmSync(root, { recursive: true, force: true });
 });
 
 test("respond JSON mode prints exactly one outcome document on stdout", async () => {

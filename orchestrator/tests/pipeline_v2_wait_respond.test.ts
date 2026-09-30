@@ -1,4 +1,4 @@
-import { chmodSync } from "node:fs";
+import { chmodSync, readdirSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,8 @@ import { createHash } from "node:crypto";
 const RUN_ID = "respond-run-1";
 const REASON = "stage_iteration_limit_exhausted";
 const ACTIONS = [
+  { id: "ship_all", to: "ship" },
+  { id: "hold_all", to: "ship" },
   { id: "continue_stage", to: "ship" },
   { id: "revise_task", to: "ship" },
 ];
@@ -140,7 +142,7 @@ async function runRespond(
       {
         runId: options.runId ?? RUN_ID,
         waitIndex: options.waitIndex ?? 1,
-        actionId: options.actionId ?? "continue_stage",
+        actionId: options.actionId ?? "ship_all",
       },
       deps(harness, overrides),
     );
@@ -217,19 +219,19 @@ test("1. happy path: response file, durable wait_response_recorded, active curso
   expect(ok.runId).toBe(RUN_ID);
   expect(ok.runRoot).toBe(harness.runRoot);
   expect(ok.waitIndex).toBe(1);
-  expect(ok.actionId).toBe("continue_stage");
+  expect(ok.actionId).toBe("ship_all");
   expect(ok.actionTo).toBe("ship");
   const state = ok.state;
   expect(state.status).toBe("active");
   expect(state.phase).toBe("running");
   expect(state.cursor.current_state).toBe("ship");
   expect(state.cursor.transition_count).toBe(0);
-  expect(state.waits[0]?.response?.action_id).toBe("continue_stage");
+  expect(state.waits[0]?.response?.action_id).toBe("ship_all");
   expect(ok.responseSha256).toBe(state.waits[0]!.response!.response_sha256);
   expect(ok.requestSha256).toBe(state.waits[0]!.request_sha256);
   const responsePath = join(harness.waits, "1.response.json");
   const stored = JSON.parse(await readFile(responsePath, "utf8")) as Record<string, unknown>;
-  expect(stored["action_id"]).toBe("continue_stage");
+  expect(stored["action_id"]).toBe("ship_all");
   expect(stored["request_sha256"]).toBe(ok.requestSha256);
   expect((await lstat(responsePath)).mode & 0o777).toBe(0o600);
   expect((await lstat(harness.waits)).mode & 0o777).toBe(0o700);
@@ -264,8 +266,8 @@ test("4. different-action retry is a conflict; state and response bytes unchange
   const stateIdentity = await fileIdentity(harness.statePath);
   const responseIdentity = await fileIdentity(join(harness.waits, "1.response.json"));
   const renamesBefore = harness.counts.renames;
-  const refused = expectReason((await runRespond(harness, { actionId: "revise_task" })).outcome, "wait_conflict");
-  expect(refused.state?.waits[0]?.response?.action_id).toBe("continue_stage");
+  const refused = expectReason((await runRespond(harness, { actionId: "hold_all" })).outcome, "wait_conflict");
+  expect(refused.state?.waits[0]?.response?.action_id).toBe("ship_all");
   expect(harness.counts.renames).toBe(renamesBefore);
   expect(await fileIdentity(harness.statePath)).toEqual(stateIdentity);
   expect(await fileIdentity(join(harness.waits, "1.response.json"))).toEqual(responseIdentity);
@@ -279,7 +281,7 @@ test("5. not_committed after publication: waiting state + orphan response; exact
   expect(refused.state?.waits[0]?.response).toBeUndefined();
   // the orphan response file exists with the exact canonical bytes
   const orphanBytes = await readFile(join(harness.waits, "1.response.json"), "utf8");
-  expect(JSON.parse(orphanBytes).action_id).toBe("continue_stage");
+  expect(JSON.parse(orphanBytes).action_id).toBe("ship_all");
   // the exact retry reuses the orphan bytes and commits
   const retried = expectOk((await runRespond(harness)).outcome);
   expect(retried.state.status).toBe("active");
@@ -295,7 +297,7 @@ test("6. durability_unknown adopts the exact candidate and stops further operati
   );
   // the adopted candidate is the visible state with the recorded response
   expect(refused.state?.status).toBe("active");
-  expect(refused.state?.waits[0]!.response!.action_id).toBe("continue_stage");
+  expect(refused.state?.waits[0]!.response!.action_id).toBe("ship_all");
   const candidateBytes = await readFile(harness.statePath, "utf8");
   expect(JSON.parse(candidateBytes).waits[0].response).toBeDefined();
   // a fresh respond call recognizes the durable record as idempotent success
@@ -483,7 +485,7 @@ test("11. tampered, noncanonical, missing, symlinked and wrong-mode manifests", 
   const conflicting = await buildHarness();
   await writeFile(
     join(conflicting.waits, "1.response.json"),
-    JSON.stringify({ schema_version: 1, run_id: RUN_ID, wait_index: 1, request_sha256: "a".repeat(64), action_id: "revise_task" }),
+    JSON.stringify({ schema_version: 1, run_id: RUN_ID, wait_index: 1, request_sha256: "a".repeat(64), action_id: "hold_all" }),
     { mode: 0o600 },
   );
   const refusedConflicting = expectReason((await runRespond(conflicting)).outcome, "wait_conflict");
@@ -547,6 +549,70 @@ test("13. every pre-controller refusal leaves the run tree byte-identical", asyn
   expect(await fingerprint(harness.stateRoot)).toBe(fingerprintBefore);
 });
 
+test("12b. reserved intervention actions fail closed before any publication or dispatch", async () => {
+  for (const reservedId of ["continue_stage", "revise_task"]) {
+    const harness = await buildHarness();
+    const counted = countingIo();
+    const revisionBefore = JSON.parse(await readFile(harness.statePath, "utf8")).revision as number;
+    const fingerprintBefore = await fingerprint(harness.stateRoot);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const refused = expectReason(
+        (await runRespond(harness, { actionId: reservedId }, { io: counted.io })).outcome,
+        "invalid_state",
+      );
+      expect(refused.runId).toBe(RUN_ID);
+      expect(refused.runRoot).toBe(harness.runRoot);
+      // the authoritative snapshot, not null
+      expect(refused.state?.status).toBe("waiting");
+      expect(refused.state?.waits[0]?.index).toBe(1);
+      expect(refused.state?.waits[0]?.response).toBeUndefined();
+      expect(refused.state?.waits[0]?.intent).toBeUndefined();
+      expect(refused.state?.cursor).toEqual({ current_state: "s01", transition_count: 0 });
+      // the durable state is untouched: no revision bump, no response record
+      const after = JSON.parse(await readFile(harness.statePath, "utf8"));
+      expect(after.revision).toBe(revisionBefore);
+      expect(after.waits[0].response).toBeUndefined();
+      expect(after.waits[0].intent).toBeUndefined();
+      // no response manifest was published and the tree is byte-identical
+      expect(readdirSync(harness.waits).filter((name) => name.includes("response"))).toEqual([]);
+      expect(await fingerprint(harness.stateRoot)).toBe(fingerprintBefore);
+      // zero store commits (temp opens, renames, dir syncs) across both calls
+      expect(counted.counts.tempOpens).toBe(0);
+      expect(counted.counts.renames).toBe(0);
+      expect(counted.counts.dirSyncs).toBe(0);
+    }
+    await dispose(harness);
+  }
+});
+
+test("12c. similar but not exact ids are not reserved and keep the ordinary undeclared refusal", async () => {
+  const harness = await buildHarness();
+  const fingerprintBefore = await fingerprint(harness.stateRoot);
+  for (const lookalike of ["continue_stage_x", "continue_stage_1", "CONTINUE_STAGE", "revise_task2", "revise_task_x"]) {
+    expectReason((await runRespond(harness, { actionId: lookalike })).outcome, "invalid_response");
+  }
+  expect(await fingerprint(harness.stateRoot)).toBe(fingerprintBefore);
+  expect(readdirSync(harness.waits).filter((name) => name.includes("response"))).toEqual([]);
+});
+
+test("12d. missing state and unsafe layout keep their precedence over the reserved guard", async () => {
+  // missing state document with a reserved action: missing_state wins
+  const missing = await buildHarness();
+  await rm(missing.statePath, { force: true });
+  const refusedMissing = expectReason((await runRespond(missing, { actionId: "continue_stage" })).outcome, "missing_state");
+  expect(refusedMissing.state).toBeNull();
+
+  // unsafe run-root mode with a reserved action: run_layout_invalid wins
+  const unsafe = await buildHarness();
+  chmodSync(unsafe.runRoot, 0o755);
+  const refusedLayout = expectReason((await runRespond(unsafe, { actionId: "revise_task" })).outcome, "run_layout_invalid");
+  expect(refusedLayout.runRoot).toBeNull();
+  expect(refusedLayout.state).toBeNull();
+  chmodSync(unsafe.runRoot, 0o700);
+  await dispose(missing);
+  await dispose(unsafe);
+});
+
 test("14. the module carries no auth, Docker Helper, Session, profile or pipeline dependencies", async () => {
   const source = await readFile(
     new URL("../src/pipeline_v2_wait_respond.ts", import.meta.url).pathname,
@@ -604,7 +670,7 @@ test("16. hostile options and deps shapes are ordinary refusals with zero reads"
   const harness = await buildHarness();
   let trapHits = 0;
   const hostileOptions = new Proxy(
-    { runId: RUN_ID, waitIndex: 1, actionId: "continue_stage" },
+    { runId: RUN_ID, waitIndex: 1, actionId: "ship_all" },
     {
       get(target, property, receiver) {
         trapHits += 1;
@@ -623,14 +689,14 @@ test("16. hostile options and deps shapes are ordinary refusals with zero reads"
   // is byte-identical across them
   const fingerprintBefore = await fingerprint(harness.stateRoot);
   const badId = await respondPipelineV2Wait(
-    { runId: "../escape", waitIndex: 1, actionId: "continue_stage" },
+    { runId: "../escape", waitIndex: 1, actionId: "ship_all" },
     deps(harness),
   );
   expectReason(badId, "invalid_options");
   expect(badId.runId).toBe("");
   expect(badId.runRoot).toBeNull();
   const overflow = await respondPipelineV2Wait(
-    { runId: RUN_ID, waitIndex: Number.MAX_SAFE_INTEGER + 1, actionId: "continue_stage" },
+    { runId: RUN_ID, waitIndex: Number.MAX_SAFE_INTEGER + 1, actionId: "ship_all" },
     deps(harness),
   );
   expectReason(overflow, "invalid_options");
