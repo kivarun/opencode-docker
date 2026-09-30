@@ -104,7 +104,9 @@ test("usage documents the production pipeline v2 run command", () => {
   expect(text).toContain("pipeline-runs/<run-id>/outputs");
   expect(text).toContain("agent-smoke is the v1 diagnostic command");
   expect(text).toContain("run-owned directory");
-  expect(text).toContain("reserved for a future dedicated intervention path");
+  expect(text).toContain("handled by dedicated commands");
+  expect(text).toContain("'continue_stage' intervention runs via 'orchestrator continue-stage'");
+  expect(text).toContain("'revise_task' has no dedicated CLI path yet");
 });
 
 const RUN_BASE = ["--pipeline-root", "/abs/pipeline", "--config-root", "/abs/config", "--project", "/abs/project"];
@@ -423,6 +425,226 @@ test("usage documents the production pipeline v2 resume command", () => {
   expect(text).toContain("resume flags (production pipeline v2 continuation):");
   expect(text).toContain("resume continues only a clean active run");
   expect(text).toContain("the pipeline comes");
+});
+
+// --- continue-stage parser (red-before) -------------------------------------
+
+test("continue-stage parses the exact grammar with both flag forms", () => {
+  const base = ["--run-id", "run-1", "--wait-index", "2", "--additional-iterations", "3", "--config-root", "/abs/config"];
+  const parsed = parseCommand("continue-stage", [...base, "--launcher-id", "dhl_l1", "--json"]);
+  expect(parsed).toEqual({
+    kind: "continue-stage",
+    runId: "run-1",
+    waitIndex: 2,
+    additionalIterations: 3,
+    configRoot: "/abs/config",
+    launcherId: "dhl_l1",
+    json: true,
+  });
+  const inline = parseCommand("continue-stage", [
+    "--run-id=run-2",
+    "--wait-index=4",
+    "--additional-iterations=1",
+    "--config-root=/abs/config2",
+  ]);
+  expect(inline).toEqual({
+    kind: "continue-stage",
+    runId: "run-2",
+    waitIndex: 4,
+    additionalIterations: 1,
+    configRoot: "/abs/config2",
+    launcherId: undefined,
+    json: false,
+  });
+});
+
+test("continue-stage accepts MAX_SAFE_INTEGER for both numeric flags", () => {
+  const parsed = parseCommand("continue-stage", [
+    "--run-id", "run-1",
+    "--wait-index", "9007199254740991",
+    "--additional-iterations", "9007199254740991",
+    "--config-root", "/abs/config",
+  ]);
+  expect(parsed.kind).toBe("continue-stage");
+  if (parsed.kind !== "continue-stage") {
+    throw new Error("expected continue-stage");
+  }
+  expect(parsed.waitIndex).toBe(9007199254740991);
+  expect(parsed.additionalIterations).toBe(9007199254740991);
+});
+
+test("continue-stage rejects the full invalid-number matrix for both numeric flags", () => {
+  const invalid = [
+    "",
+    "0",
+    "-1",
+    "+1",
+    "01",
+    "1.5",
+    "1e2",
+    " 1",
+    "1 ",
+    "1_000",
+    "0x1",
+    "abc",
+    "١٢٣",
+    "9007199254740993",
+  ];
+  for (const flag of ["--wait-index", "--additional-iterations"]) {
+    for (const value of invalid) {
+      let message = "";
+      try {
+        parseCommand("continue-stage", [
+          "--run-id", "run-1",
+          "--wait-index", flag === "--wait-index" ? value : "1",
+          "--additional-iterations", flag === "--additional-iterations" ? value : "1",
+          "--config-root", "/abs/config",
+        ]);
+      } catch (cause) {
+        message = cause instanceof Error ? cause.message : String(cause);
+      }
+      expect(message).toContain(`${flag}`);
+    }
+    // overflow gets its own message
+    let message = "";
+    try {
+      parseCommand("continue-stage", [
+        "--run-id", "run-1",
+        "--wait-index", flag === "--wait-index" ? "9007199254740993" : "1",
+        "--additional-iterations", flag === "--additional-iterations" ? "9007199254740993" : "1",
+        "--config-root", "/abs/config",
+      ]);
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : String(cause);
+    }
+    expect(message).toBe(`${flag} exceeds the safe integer range`);
+  }
+});
+
+test("continue-stage rejects missing, duplicate and value-less required flags", () => {
+  for (const argv of [
+    [],
+    ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2"],
+    ["--run-id", "run-1", "--additional-iterations", "2", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--config-root", "/abs/config"],
+    ["--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--run-id", "run-2", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--wait-index", "2", "--additional-iterations", "2", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--additional-iterations", "3", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config", "--config-root", "/other"],
+    ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config", "--launcher-id", "dhl_a", "--launcher-id", "dhl_b"],
+    ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config", "--json", "--json"],
+    ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config", "--json=true"],
+  ]) {
+    expect(() => parseCommand("continue-stage", argv)).toThrow();
+  }
+  expect(() =>
+    parseCommand("continue-stage", ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--config-root"]),
+  ).toThrow("--config-root requires a value");
+  expect(() => parseCommand("continue-stage", ["--run-id", "run-1", "--wait-index"])).toThrow(
+    "--wait-index requires a value",
+  );
+  expect(() => parseCommand("continue-stage", ["--additional-iterations"])).toThrow(
+    "--additional-iterations requires a value",
+  );
+  expect(() => parseCommand("continue-stage", ["--run-id="])).toThrow("--run-id requires a value");
+});
+
+test("continue-stage rejects unsafe run ids, relative config roots and invalid launcher ids", () => {
+  expect(() =>
+    parseCommand("continue-stage", ["--run-id", "../escape", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config"]),
+  ).toThrow("--run-id must be a safe identifier");
+  expect(() =>
+    parseCommand("continue-stage", ["--run-id", "", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config"]),
+  ).toThrow();
+  expect(() =>
+    parseCommand("continue-stage", ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "relative/path"]),
+  ).toThrow("--config-root must be an absolute path");
+  expect(() =>
+    parseCommand("continue-stage", ["--run-id", "run-1", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/abs/config", "--launcher-id", "admin_l1"]),
+  ).toThrow("--launcher-id must be a launcher ID (dhl_...)");
+});
+
+test("continue-stage rejects respond, fresh-run, state-root and internal-policy flags", () => {
+  for (const argv of [
+    ["--action", "continue_stage"],
+    ["--action=continue_stage"],
+    ["--pipeline-root", "/abs/pipeline"],
+    ["--project", "/abs/project"],
+    ["--input", "spec=/abs/spec.md"],
+    ["--workspace", "/w"],
+    ["--image", "img:1"],
+    ["--profile", "coder"],
+    ["--task", "/abs/task.md"],
+    ["--state-root", "/state/root"],
+    ["--daemon-state-root", "/daemon/root"],
+    ["--stage-id", "stage-1"],
+    ["--plan-digest", "abc"],
+    ["--initial-budget", "2"],
+    ["--intent", "{}"],
+    ["--compiled-plan", "{}"],
+  ]) {
+    expect(() =>
+      parseCommand("continue-stage", [
+        "--run-id", "run-1",
+        "--wait-index", "1",
+        "--additional-iterations", "2",
+        "--config-root", "/abs/config",
+        ...argv,
+      ]),
+    ).toThrow();
+  }
+  expect(() =>
+    parseCommand("continue-stage", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--additional-iterations", "2",
+      "--config-root", "/abs/config",
+      "--action", "revise_task",
+    ]),
+  ).toThrow("continue-stage does not accept --action; the intervention action is fixed as continue_stage by the runner entrypoint");
+  expect(() =>
+    parseCommand("continue-stage", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--additional-iterations", "2",
+      "--config-root", "/abs/config",
+      "--pipeline-root", "/abs/pipeline",
+    ]),
+  ).toThrow("continue-stage does not accept --pipeline-root; the pipeline comes only from the durable state");
+});
+
+test("continue-stage rejects unknown flags and positional arguments", () => {
+  expect(() =>
+    parseCommand("continue-stage", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--additional-iterations", "2",
+      "--config-root", "/abs/config",
+      "--unknown",
+    ]),
+  ).toThrow("unknown argument: --unknown");
+  expect(() =>
+    parseCommand("continue-stage", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--additional-iterations", "2",
+      "--config-root", "/abs/config",
+      "positional",
+    ]),
+  ).toThrow("unknown argument: positional");
+});
+
+test("usage documents the production pipeline v2 continue-stage command", () => {
+  const text = usage();
+  expect(text).toContain("continue-stage flags (production pipeline v2 stage intervention)");
+  expect(text).toContain("--additional-iterations");
+  expect(text).toContain("no default");
+  expect(text).toContain("fixed as 'continue_stage'");
+  expect(text).toContain("(the command accepts no");
+  expect(text).toContain("--action flag) and never accepts");
+  expect(text).toContain("orchestrator continue-stage");
+  expect(text).toContain("performs the continue_stage stage intervention");
 });
 
 test("smoke and agent-smoke parsing is unchanged", () => {

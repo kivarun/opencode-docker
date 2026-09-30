@@ -275,14 +275,34 @@ orchestrator resume \
   helper output streamed to stderr; the exit code is the outcome's exit
   code.
 
-## The production continue-stage runner API (`continuePipelineV2Stage`, not wired into the CLI)
+## The production continue-stage runner API (`orchestrator continue-stage`)
 
 `orchestrator/src/pipeline_v2_runner.ts` adds the dedicated `continue_stage`
-runner entrypoint `continuePipelineV2Stage(options, deps)`. It is
-implemented and tested against the real facades, but the CLI does not
-route to it yet — the generic `respond` command still fail-closes on the
-reserved intervention action ids, and `continue_stage` keeps its dedicated
-path unwired.
+runner entrypoint `continuePipelineV2Stage(options, deps)`, and the CLI
+exposes it as the production command `orchestrator continue-stage`:
+
+```
+orchestrator continue-stage \
+  --run-id SAFE_ID \
+  --wait-index N \
+  --additional-iterations N \
+  --config-root ABSOLUTE_PATH \
+  [--launcher-id dhl_...] \
+  [--json]
+```
+
+The command is a thin exact-once routing layer: it parses the four external
+scalars, resolves the trusted CLI configuration through the same protected
+boundary as `run`/`resume` (the state-root projection first, then the helper
+configuration), assembles the same per-call dependencies and signal wiring,
+invokes `continuePipelineV2Stage` exactly once and reports through the
+shared outcome reporter with the label `continue-stage`. The intervention
+action is fixed by the runner entrypoint as `continue_stage`; the command
+accepts no `--action` flag, no fresh-run flags, no state-root flags and no
+internal intervention parameter (target state, stage id, plan digest,
+initial budget, prepared intent, compiled plan). The generic `respond`
+command still fail-closes on `continue_stage` and `revise_task` before any
+response publication; `revise_task` has no dedicated CLI path yet.
 
 ```
 continuePipelineV2Stage(

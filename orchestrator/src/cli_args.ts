@@ -46,12 +46,23 @@ export interface ParsedPipelineRespondArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineContinueStageArgs {
+  readonly kind: "continue-stage";
+  readonly runId: string;
+  readonly waitIndex: number;
+  readonly additionalIterations: number;
+  readonly configRoot: string;
+  readonly launcherId?: string;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
   | ParsedPipelineRunArgs
   | ParsedPipelineResumeArgs
-  | ParsedPipelineRespondArgs;
+  | ParsedPipelineRespondArgs
+  | ParsedPipelineContinueStageArgs;
 
 export function usage(): string {
   return [
@@ -78,6 +89,10 @@ export function usage(): string {
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
     "               continuation is the separate 'orchestrator resume' command",
+    "  continue-stage production pipeline v2 stage intervention: grant extra stage",
+    "               iterations and resume the run in one operation (the exact",
+    "               'continue_stage' intervention: intent -> grant -> iteration",
+    "               closure -> response -> reopened iteration -> immediate resume)",
     "",
     "common flags:",
     "  --workspace PATH        workspace passed to 'docker-helper session create'; must exist",
@@ -134,9 +149,11 @@ export function usage(): string {
   "  state, no digests and no JSON body. Repeating the same answer is an",
   "  idempotent success; repeating with a different action is a conflict.",
   "  The special intervention action ids ('continue_stage', 'revise_task') are",
-  "  reserved for a future dedicated intervention path: the generic respond",
-  "  command fail-closes on them (exit 1, reason invalid_state) before any",
-  "  response publication, and the durable state stays untouched.",
+  "  handled by dedicated commands and the generic respond fail-closes on them",
+  "  (exit 1, reason invalid_state) before any response publication: the",
+  "  'continue_stage' intervention runs via 'orchestrator continue-stage',",
+  "  while 'revise_task' has no dedicated CLI path yet. The durable state",
+  "  stays untouched by the fail-closed rejection.",
     "",
     "resume flags (production pipeline v2 continuation):",
     "  --run-id SAFE_ID        the run id of the already durable run; required; a safe",
@@ -162,6 +179,37 @@ export function usage(): string {
     "  --input, --workspace, --image, --profile or state-root flags: the pipeline comes",
     "  only from the durable state and the data only from the run-owned layout.",
     "",
+    "continue-stage flags (production pipeline v2 stage intervention):",
+    "  --run-id SAFE_ID        the run id of the durably waiting run; required; a safe",
+    "                          identifier (letters, digits, '_', '.', '-', at most 128",
+    "                          characters)",
+    "  --wait-index N          the wait journal index of the open 'continue_stage' wait;",
+    "                          required; a positive decimal integer without sign,",
+    "                          leading zeros, fraction, exponent or whitespace",
+    "  --additional-iterations N the number of additional stage iterations the",
+    "                          intervention grants; required; no default; the same",
+    "                          positive decimal integer grammar as --wait-index",
+    "  --config-root PATH      operator-controlled configuration root holding",
+    "                          profiles/<name>.yaml and the OpenCode configurations;",
+    "                          required; absolute path. Profiles are trusted operator",
+    "                          configuration and are loaded again by the intervention;",
+    "                          the pipeline execution identity is verified by the",
+    "                          durable digest.",
+    "  --launcher-id DHL_ID    fail unless the installed credential belongs to this launcher",
+    "  --json                  print exactly one JSON PipelineV2RunOutcome document on stdout",
+    "                          (no progress lines); worker and image-pull output is forwarded",
+    "                          to stderr; the exit code is the outcome's exit code.",
+    "",
+    "  continue-stage answers one open 'continue_stage' wait and immediately resumes",
+    "  the run as one operation: it accepts the user's intent, grants the requested",
+    "  additional stage iterations, closes the interrupted iteration, records the",
+    "  response, reopens the next iteration and continues with the successor stage",
+    "  execution. The action is fixed as 'continue_stage' (the command accepts no",
+    "  --action flag) and never accepts a target state, a stage id, a plan digest,",
+    "  the initial budget, a prepared intent or a compiled plan - every internal",
+    "  intervention parameter is derived from the authoritative durable state. It",
+    "  accepts no fresh-run flags and no state-root flags.",
+    "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
     "    <state-root>/pipeline-runs/<run-id>/state.json",
@@ -175,10 +223,10 @@ export function usage(): string {
     "                                     daemon sees; defaults to the local root (host mode)",
     "  Both variables must be non-empty absolute clean paths; nothing is created by",
     "  the resolver, and the runner itself verifies kind, canonical form, identity",
-    "  and mode 0700. The same resolution applies to 'resume', which additionally",
-    "  requires the existing run root <state-root>/pipeline-runs/<run-id> to exist",
-    "  unchanged (it is never created or chmodded by resume). The same resolution",
-    "  applies to 'respond'.",
+    "  and mode 0700. The same resolution applies to 'resume' and 'continue-stage',",
+    "  which additionally require the existing run root",
+    "  <state-root>/pipeline-runs/<run-id> to exist unchanged (it is never created",
+    "  or chmodded by them). The same resolution applies to 'respond'.",
     "",
     "run profiles and worker configuration:",
     "  The pipeline's agent states select the profiles; the worker image, the",
@@ -213,7 +261,10 @@ export function usage(): string {
     "from its clean active boundary (the run id and the configuration root are the",
     "only user inputs of a resume), and 'orchestrator respond' records the user's",
     "answer to one durably open wait (the run id, the wait index and the action id",
-    "are the only user inputs of a response).",
+    "are the only user inputs of a response), and 'orchestrator continue-stage'",
+    "performs the continue_stage stage intervention and resumes the run in one",
+    "operation (the run id, the wait index, the additional iteration count and the",
+    "configuration root are the only user inputs).",
     "",
     "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
     "input path come only from the pipeline's agent state, the worker image comes",
@@ -287,7 +338,7 @@ function parseValue(argv: string[], i: number, flag: string): { value: string; n
 }
 
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -298,6 +349,9 @@ export function parseCommand(
   }
   if (kind === "respond") {
     return parseRespondArgs(argv);
+  }
+  if (kind === "continue-stage") {
+    return parseContinueStageArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;
@@ -770,6 +824,150 @@ function parseRespondArgs(argv: string[]): ParsedPipelineRespondArgs {
     runId,
     waitIndex,
     actionId,
+    json,
+  };
+}
+
+/**
+ * Parses the production pipeline v2 continue-stage intervention command.
+ * The user-facing contract: `--run-id` (safe-id validated), `--wait-index`
+ * and `--additional-iterations` (both canonical positive decimal safe
+ * integers, the latter with no default) and `--config-root` (absolute) are
+ * required singletons; `--launcher-id` and `--json` are optional
+ * singletons. The intervention action is fixed by the runner entrypoint as
+ * `continue_stage`; the caller can never pass an action id, a target
+ * state, a stage id, a plan digest, the initial budget, a prepared intent
+ * or a compiled plan: every fresh-run, respond and state-root flag is
+ * rejected for `continue-stage`, as is every unknown flag or positional
+ * argument.
+ */
+function parseContinueStageArgs(argv: string[]): ParsedPipelineContinueStageArgs {
+  let runId: string | null = null;
+  let waitIndex: number | null = null;
+  let additionalIterations: number | null = null;
+  let configRoot: string | null = null;
+  let launcherId: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      if (runId !== null) {
+        throw new Error("--run-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      const { value, next } = parseValue(argv, i, "--wait-index");
+      if (waitIndex !== null) {
+        throw new Error("--wait-index may be given at most once");
+      }
+      waitIndex = parsePositiveDecimalSafeInteger(value, "--wait-index");
+      i = next;
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      const { value, next } = parseValue(argv, i, "--additional-iterations");
+      if (additionalIterations !== null) {
+        throw new Error("--additional-iterations may be given at most once");
+      }
+      additionalIterations = parsePositiveDecimalSafeInteger(value, "--additional-iterations");
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      if (configRoot !== null) {
+        throw new Error("--config-root may be given at most once");
+      }
+      if (!value.startsWith("/")) {
+        throw new Error("--config-root must be an absolute path");
+      }
+      configRoot = value;
+      i = next;
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      const { value, next } = parseValue(argv, i, "--launcher-id");
+      if (!value.startsWith("dhl_")) {
+        throw new Error("--launcher-id must be a launcher ID (dhl_...)");
+      }
+      if (launcherId !== undefined) {
+        throw new Error("--launcher-id may be given at most once");
+      }
+      launcherId = value;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "continue-stage does not accept --action; the intervention action is fixed as continue_stage by the runner entrypoint",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "continue-stage does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error(
+        "continue-stage does not accept --project; the run-owned project copy already exists in the run root",
+      );
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error(
+        "continue-stage does not accept --input; the run-owned input snapshot already exists in the run root",
+      );
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error(
+        "continue-stage does not accept --workspace; the run-owned project copy is mounted from the run root",
+      );
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error(
+        "continue-stage does not accept --image; the worker image comes only from the selected profile",
+      );
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error(
+        "continue-stage does not accept --profile; the execution profiles are selected by the pipeline's agent states",
+      );
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("continue-stage does not accept --task; there is no task input on an intervention");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "continue-stage does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "continue-stage does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for continue-stage");
+  }
+  if (waitIndex === null) {
+    throw new Error("--wait-index POSITIVE_INTEGER is required for continue-stage");
+  }
+  if (additionalIterations === null) {
+    throw new Error("--additional-iterations POSITIVE_INTEGER is required for continue-stage (no default)");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABSOLUTE_PATH is required for continue-stage");
+  }
+  return {
+    kind: "continue-stage",
+    runId,
+    waitIndex,
+    additionalIterations,
+    configRoot,
+    launcherId,
     json,
   };
 }

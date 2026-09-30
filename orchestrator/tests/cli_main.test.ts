@@ -6,10 +6,35 @@ import { join } from "node:path";
 import { runCli, type CliIo } from "../src/main.ts";
 import type { CliResult, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
 import { resolveHelperConfig } from "../src/launcher.ts";
-import type { PipelineV2RunOutcome } from "../src/pipeline_v2_runner.ts";
+import {
+  continuePipelineV2Stage,
+  type PipelineV2RunnerDeps,
+  type PipelineV2RunOutcome,
+} from "../src/pipeline_v2_runner.ts";
 import { respondPipelineV2Wait, type PipelineV2WaitResponseOutcome } from "../src/pipeline_v2_wait_respond.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
+import { loadPipelineV2 } from "../src/pipeline_v2.ts";
+import { pipelineV2RunPipelineIdentity } from "../src/pipeline_v2_digest.ts";
+import { parsePipelineV2RunState, type PipelineV2RunState } from "../src/pipeline_v2_state.ts";
+import {
+  preparePlanRevisionManifest,
+  prepareTaskRevisionManifest,
+} from "../src/pipeline_v2_run_plan_manifests.ts";
+import { preparePipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_candidate.ts";
+import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
+import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
+import {
+  acceptActivationOutputs,
+  prepareActivationData,
+  prepareRunProject,
+  snapshotRunInputs,
+  type AcceptedStateOutput,
+  type PreparedActivationData,
+  type RunInputBinding,
+  type RunInputsSnapshot,
+} from "../src/pipeline_v2_runtime.ts";
+import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
 const CANARY_SECRET = "CANARY-SECRET-dhsec9f1";
 
@@ -50,6 +75,9 @@ function makeIo(): Recorder {
     resumePipelineV2: (async () => {
       throw new Error("fake resumePipelineV2 not configured");
     }) as unknown as CliIo["resumePipelineV2"],
+    continuePipelineV2Stage: (async () => {
+      throw new Error("fake continuePipelineV2Stage not configured");
+    }) as unknown as CliIo["continuePipelineV2Stage"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake respondPipelineV2Wait not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -408,6 +436,240 @@ test("human mode keeps the adapter's inherit plumbing untouched", async () => {
 // --- resume dispatcher ---------------------------------------------------------
 
 const RESUME_ARGS = ["resume", "--run-id", "rid-1", "--config-root", "/abs/config", "--launcher-id", "dhl_l1"];
+
+const CONTINUE_STAGE_ARGS = [
+  "continue-stage",
+  "--run-id", "rid-1",
+  "--wait-index", "2",
+  "--additional-iterations", "3",
+  "--config-root", "/abs/config",
+  "--launcher-id", "dhl_l1",
+];
+
+test("runCli routes continue-stage to continuePipelineV2Stage exactly once", async () => {
+  const { io, out, err } = makeIo();
+  const calls: Array<{ options: unknown }> = [];
+  io.continuePipelineV2Stage = (async (options: unknown) => {
+    calls.push({ options });
+    return runOutcome({});
+  }) as unknown as CliIo["continuePipelineV2Stage"];
+  const exit = await runCli(CONTINUE_STAGE_ARGS, io);
+  expect(exit).toBe(0);
+  expect(calls.length).toBe(1);
+  expect(calls[0]!.options).toEqual({
+    runId: "rid-1",
+    waitIndex: 2,
+    additionalIterations: 3,
+    configRoot: "/abs/config",
+    launcherId: "dhl_l1",
+  });
+  // human mode: the summary line goes to stderr, stdout stays empty
+  expect(out).toEqual([]);
+  expect(err.join("\n")).toContain("orchestrator: continue-stage ok (run rid-1");
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+});
+
+test("continue-stage parse failures return exit 2 before any resolver, runner or facade call", async () => {
+  for (const argv of [
+    ["continue-stage"],
+    ["continue-stage", "--run-id", "rid"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1"],
+    ["continue-stage", "--run-id", "rid", "--additional-iterations", "2", "--config-root", "/c"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--config-root", "/c"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "2"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "0", "--additional-iterations", "2", "--config-root", "/c"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "0", "--config-root", "/c"],
+    ["continue-stage", "--run-id", "../x", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/c"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "relative"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/c", "--action", "continue_stage"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/c", "--launcher-id", "x"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/c", "--json", "--json"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/c", "positional"],
+    ["continue-stage", "--run-id", "rid", "--wait-index", "1", "--additional-iterations", "2", "--config-root", "/c", "--unknown"],
+  ]) {
+    const { io, err } = makeIo();
+    let resolverCalls = 0;
+    let runnerCalls = 0;
+    let facadeCalls = 0;
+    io.resolveStateRootProjection = () => {
+      resolverCalls += 1;
+      return { localRoot: "/state", daemonRoot: "/state" };
+    };
+    io.resolveHelperConfig = () => {
+      resolverCalls += 1;
+      return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+    };
+    io.runner.run = () => {
+      runnerCalls += 1;
+      return Promise.resolve({ code: 0 });
+    };
+    io.continuePipelineV2Stage = (async () => {
+      facadeCalls += 1;
+      return runOutcome({});
+    }) as unknown as CliIo["continuePipelineV2Stage"];
+    const exit = await runCli(argv, io);
+    expect(exit).toBe(2);
+    expect(resolverCalls).toBe(0);
+    expect(runnerCalls).toBe(0);
+    expect(facadeCalls).toBe(0);
+    expect(err.join("\n")).not.toContain(CANARY_SECRET);
+  }
+});
+
+test("continue-stage state-root and helper-config resolution failures are CLI configuration errors", async () => {
+  const { io, err } = makeIo();
+  let facadeCalls = 0;
+  io.continuePipelineV2Stage = (async () => {
+    facadeCalls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["continuePipelineV2Stage"];
+  io.resolveStateRootProjection = () => {
+    throw new Error("cannot build the orchestrator state root: set ORCHESTRATOR_STATE_ROOT (or XDG_STATE_HOME or HOME)");
+  };
+  const exit = await runCli(CONTINUE_STAGE_ARGS, io);
+  expect(exit).toBe(2);
+  expect(facadeCalls).toBe(0);
+  expect(err.join("\n")).toContain("cannot build the orchestrator state root");
+
+  const { io: io2, err: err2 } = makeIo();
+  io2.continuePipelineV2Stage = (async () => {
+    facadeCalls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["continuePipelineV2Stage"];
+  io2.resolveHelperConfig = () => {
+    throw new Error("helper configuration exploded");
+  };
+  const exit2 = await runCli(CONTINUE_STAGE_ARGS, io2);
+  expect(exit2).toBe(2);
+  expect(facadeCalls).toBe(0);
+  expect(err2.join("\n")).toContain("helper configuration exploded");
+});
+
+test("continue-stage resolves the state-root projection before the helper configuration", async () => {
+  const { io, err } = makeIo();
+  let helperResolverCalls = 0;
+  io.continuePipelineV2Stage = (async () => runOutcome({})) as unknown as CliIo["continuePipelineV2Stage"];
+  io.resolveStateRootProjection = () => {
+    if (helperResolverCalls > 0) {
+      throw new Error("the helper configuration was resolved before the state-root projection");
+    }
+    return { localRoot: "/state/root", daemonRoot: "/daemon/root" };
+  };
+  io.resolveHelperConfig = () => {
+    helperResolverCalls += 1;
+    return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+  };
+  const exit = await runCli(CONTINUE_STAGE_ARGS, io);
+  expect(exit).toBe(0);
+  expect(helperResolverCalls).toBe(1);
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+});
+
+test("continue-stage human mode prints the content-free summary lines", async () => {
+  const { io, err, out } = makeIo();
+  io.continuePipelineV2Stage = (async () => runOutcome({})) as unknown as CliIo["continuePipelineV2Stage"];
+  const exit = await runCli(CONTINUE_STAGE_ARGS, io);
+  expect(exit).toBe(0);
+  expect(out).toEqual([]);
+  expect(err).toEqual([
+    "orchestrator: continue-stage ok (run rid-1, state /state/root/pipeline-runs/rid-1/state.json, outputs /state/root/pipeline-runs/rid-1/outputs)",
+  ]);
+
+  const { io: io2, err: err2 } = makeIo();
+  io2.continuePipelineV2Stage = (async () =>
+    runOutcome({ ok: false, exitCode: 1, reason: "invalid_state" })) as unknown as CliIo["continuePipelineV2Stage"];
+  const exit2 = await runCli(CONTINUE_STAGE_ARGS, io2);
+  expect(exit2).toBe(1);
+  expect(err2).toEqual([
+    "orchestrator: continue-stage failed (run rid-1, reason invalid_state, state /state/root/pipeline-runs/rid-1/state.json)",
+  ]);
+
+  // a pre-run-root refusal prints no summary line
+  const { io: io3, err: err3 } = makeIo();
+  io3.continuePipelineV2Stage = (async () =>
+    runOutcome({ ok: false, exitCode: 1, runId: "", runRoot: null })) as unknown as CliIo["continuePipelineV2Stage"];
+  const exit3 = await runCli(CONTINUE_STAGE_ARGS, io3);
+  expect(exit3).toBe(1);
+  expect(err3).toEqual([]);
+});
+
+test("continue-stage JSON mode prints exactly one outcome document on stdout", async () => {
+  const { io, out, err } = makeIo();
+  const result = runOutcome({ ok: false, exitCode: 1, reason: "run_input_modified" });
+  io.continuePipelineV2Stage = (async () => {
+    io.writeError("orchestrator: launcher credential ok (launcher dhl_l1)");
+    return result;
+  }) as unknown as CliIo["continuePipelineV2Stage"];
+  const exit = await runCli([...CONTINUE_STAGE_ARGS, "--json"], io);
+  expect(exit).toBe(1);
+  expect(out).toEqual([`${JSON.stringify(result)}\n`]);
+  expect(err).toContain("orchestrator: launcher credential ok (launcher dhl_l1)");
+  expect(out.join("")).not.toContain(CANARY_SECRET);
+  const document = JSON.parse(out[0]!) as Record<string, unknown>;
+  expect(Object.keys(document).sort()).toEqual(
+    ["exitCode", "ok", "runId", "runRoot", "reason", "state"].sort(),
+  );
+  expect(document.reason).toBe("run_input_modified");
+});
+
+test("continue-stage JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
+  const { io, out, runnerCalls } = makeIo();
+  io.continuePipelineV2Stage = (async (_options: unknown, deps: unknown) => {
+    const cli = (deps as Record<string, unknown>).cli as (
+      args: string[],
+      env: Record<string, string>,
+      stdio: CliStdio,
+      opts?: CliRunOptions,
+    ) => Promise<CliResult>;
+    await cli(["pull", "--endpoint", "/sock", "img:1"], {}, "inherit");
+    await cli(["run", "--format", "json"], {}, "inherit", { signalOnAbort: true, timeoutSeconds: 60 });
+    await cli(["session", "create"], {}, "capture");
+    await cli(["session", "delete"], {}, "capture");
+    return runOutcome({});
+  }) as unknown as CliIo["continuePipelineV2Stage"];
+  await runCli([...CONTINUE_STAGE_ARGS, "--json"], io);
+  const inheritCalls = runnerCalls.filter((call) => call.args[0] === "pull" || call.args[0] === "run");
+  expect(inheritCalls.length).toBe(2);
+  for (const call of inheritCalls) {
+    expect(call.stdio).toBe("stderr");
+  }
+  const captureCalls = runnerCalls.filter((call) => call.args[0] === "session");
+  expect(captureCalls.length).toBe(2);
+  for (const call of captureCalls) {
+    expect(call.stdio).toBe("capture");
+  }
+  expect(out).toEqual([`${JSON.stringify(runOutcome({}))}\n`]);
+});
+
+test("continue-stage exit codes 0/1/130/143 pass through unchanged", async () => {
+  for (const code of [0, 1, 130, 143]) {
+    const { io } = makeIo();
+    io.continuePipelineV2Stage = (async () =>
+      runOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["continuePipelineV2Stage"];
+    const exit = await runCli(CONTINUE_STAGE_ARGS, io);
+    expect(exit).toBe(code);
+  }
+});
+
+test("continue-stage deps.cli is wired to the single runner instance", async () => {
+  const { io, runnerCalls } = makeIo();
+  let capturedCli: unknown;
+  io.continuePipelineV2Stage = (async (_options: unknown, deps: unknown) => {
+    capturedCli = (deps as Record<string, unknown>).cli;
+    return runOutcome({});
+  }) as unknown as CliIo["continuePipelineV2Stage"];
+  await runCli(CONTINUE_STAGE_ARGS, io);
+  const cli = capturedCli as (args: string[], env: Record<string, string>, stdio: CliStdio) => Promise<CliResult>;
+  await cli(["session", "list"], {}, "capture");
+  expect(runnerCalls).toEqual([{ args: ["session", "list"], env: {}, stdio: "capture", opts: undefined }]);
+});
+
+test("the continue-stage command appears in the command list and unknown commands are still rejected", async () => {
+  const { io, err } = makeIo();
+  const exit = await runCli(["deploy"], io);
+  expect(exit).toBe(2);
+  expect(err.join("\n")).toContain("'orchestrator continue-stage'");
+});
 
 test("resume dispatches exactly once to resumePipelineV2 with the exact options mapping", async () => {
   const { io, err } = makeIo();
@@ -913,4 +1175,329 @@ test("smoke and agent-smoke keep routing to their own runner functions", async (
     },
   ]);
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
+});
+
+// --- the real continue-stage CLI integration proof ---------------------------
+
+const STAGE_PIPELINE = `
+schema_version: 2
+entry_state: architect
+max_transitions: 20
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+    - state_id: dev_entry
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dev_entry
+  - id: dev_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: architect
+  - id: done
+    type: terminal
+    result: success
+`;
+
+test("continue-stage end-to-end with the real production runner: the honest waiting prefix, the full intervention suffix and the resumed successor execution", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cli-continue-stage-"));
+  try {
+    const bundle = join(root, "bundle");
+    mkdirSync(join(bundle, "prompts"), { recursive: true });
+    writeFileSync(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+    writeFileSync(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
+    const configRoot = join(root, "config");
+    mkdirSync(join(configRoot, "profiles"), { recursive: true });
+    mkdirSync(join(configRoot, "opencode"), { recursive: true });
+    writeFileSync(
+      join(configRoot, "profiles", "coder.yaml"),
+      [
+        "schema_version: 1",
+        "image: ghcr.io/example/worker:1",
+        "opencode_config: opencode/coder.json",
+        "env:",
+        "  MODEL_API_KEY:",
+        "    from_env: CODER_SOURCE_VAR_1",
+        "    required: true",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(configRoot, "opencode", "coder.json"), JSON.stringify({ model: "glm53-flash" }));
+    const sources = join(root, "userdata");
+    mkdirSync(sources, { recursive: true });
+    writeFileSync(join(sources, "task.md"), "TASK-BODY\n");
+    const projectSource = join(root, "project-source");
+    mkdirSync(projectSource, { recursive: true });
+    const stateRoot = join(root, "state");
+    mkdirSync(stateRoot, { recursive: true });
+    const credDir = join(root, "cred", "docker-helper");
+    mkdirSync(credDir, { recursive: true, mode: 0o700 });
+    const credentialFile = join(credDir, "credential.token");
+    writeFileSync(credentialFile, "cred-token-not-real\n", { mode: 0o600 });
+    const RUN_ID = "continue-run";
+    const runRoot = join(stateRoot, "pipeline-runs", RUN_ID);
+    mkdirSync(join(stateRoot, "pipeline-runs"), { mode: 0o700 });
+    mkdirSync(runRoot, { mode: 0o700 });
+
+    let clockValue = 0;
+    const nextTick = (): Date => {
+      clockValue += 1;
+      return new Date(Date.UTC(2026, 0, 1, 0, 0, clockValue));
+    };
+
+    // the honest waiting prefix through the production facades only
+    const pipeline = await loadPipelineV2(bundle);
+    const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
+    await prepareRunProject(projectSource, runRoot);
+    const runInputs: RunInputsSnapshot = await snapshotRunInputs(
+      pipeline,
+      [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
+      runRoot,
+    );
+    await sink.dispatch({
+      kind: "create_run",
+      runId: RUN_ID,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline),
+      inputs: runInputs.inputs.map((entry) => ({
+        id: entry.id,
+        type: entry.type,
+        protected: entry.protected,
+        digest: entry.digest,
+      })),
+    });
+    const accepted: AcceptedStateOutput[] = [];
+    const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {
+      const activation: PreparedActivationData = await prepareActivationData(
+        pipeline,
+        runInputs,
+        accepted,
+        stateId,
+        executionIndex,
+      );
+      await sink.dispatch({
+        kind: "start_agent_execution",
+        stateId,
+        profile: "coder",
+        ...startRoleArgs(pipeline, stateId, sink.snapshot),
+      });
+      await sink.dispatch({ kind: "agent_data_prepared" });
+      await sink.dispatch({ kind: "agent_execution_session_created", sessionId: `exec-${executionIndex}` });
+      await sink.dispatch({ kind: "agent_tool_session_created", sessionId: `tool-${executionIndex}` });
+      await sink.dispatch({ kind: "agent_running" });
+      const records = await acceptActivationOutputs(pipeline, activation);
+      await sink.dispatch({
+        kind: "agent_outputs_accepted",
+        outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+      });
+      await sink.dispatch({ kind: "agent_cleanup_completed" });
+      if (commit) {
+        await sink.dispatch({
+          kind: "transition_committed",
+          step: { from: stateId, outcome: "completed", to: stateId === "architect" ? "dev_entry" : "architect", transition_index: 0 },
+          executionIndex,
+        });
+      }
+      accepted.push(...records);
+    };
+    await runAgentStep("architect", 1, false);
+    const taskA = prepareTaskRevisionManifest({
+      schema_version: 1,
+      kind: "task_revision",
+      run_id: RUN_ID,
+      task_id: "task-a",
+      revision: 1,
+      previous_sha256: null,
+      origin: "planning_proposal",
+      body: "PLAN-TASK-BODY",
+    });
+    const plan1 = preparePlanRevisionManifest({
+      schema_version: 1,
+      kind: "plan_revision",
+      run_id: RUN_ID,
+      revision: 1,
+      previous_sha256: null,
+      root_task: { input_id: "task", sha256: runInputs.inputs[0]?.digest ?? "" },
+      origin_execution: 1,
+      stages: [
+        {
+          id: "stage-1",
+          template: "development",
+          tasks: [{ id: "task-a", revision: 1, sha256: taskA.sha256, depends_on: [] }],
+        },
+      ],
+    });
+    const candidate = preparePipelineV2RunPlanCandidate({
+      plan: plan1,
+      taskRevisions: [taskA],
+      previousPlan: null,
+      previousTaskRevisions: [],
+      protectedInputDigest: runInputs.inputs[0]?.digest ?? "",
+    });
+    const acceptedPlan = await acceptPipelineV2RunPlanCandidate({
+      pipeline,
+      runRoot,
+      sink,
+      candidate,
+    });
+    await ensurePipelineV2StageIteration({
+      compiledPlan: acceptedPlan.compiled_plan,
+      stageId: "stage-1",
+      initialBudget: 2,
+      sink,
+    });
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    await runAgentStep("dev_entry", 2, true);
+    await enterPipelineV2Wait({
+      runRoot,
+      sink,
+      reason: "stage_iteration_limit_exhausted",
+      actions: [
+        { id: "continue_stage", to: "dev_entry" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    const prefixState = parsePipelineV2RunState(
+      await import("node:fs/promises").then((m) => m.readFile(join(runRoot, "state.json"), "utf8")),
+    );
+
+    // the real CLI call: no in-memory pipeline, compiled plan or intent is
+    // passed - the four external scalars are the only inputs
+    const { io, out, err } = makeIo();
+    io.baseEnv = { ...io.baseEnv, CODER_SOURCE_VAR_1: "tester-secret" };
+    let sessionCreates = 0;
+    io.runner.run = async (args: string[]) => {
+      if (args[0] === "session" && args[1] === "create") {
+        sessionCreates += 1;
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            ok: true,
+            session: { id: `dhs_${sessionCreates}`, launcher_id: "dhl_continue" },
+            token: `dhc_${sessionCreates}`,
+          }),
+        };
+      }
+      if (args[0] === "session" && args[1] === "delete") {
+        return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+      }
+      if (args[0] === "pull") {
+        return { code: 1, stderr: "PULL-FAILED-BY-TEST" };
+      }
+      return { code: 0 };
+    };
+    io.resolveStateRootProjection = () => ({ localRoot: stateRoot, daemonRoot: stateRoot });
+    io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile });
+    io.fetchAuth = () =>
+      Promise.resolve({
+        status: 200,
+        body: { authority: "launcher", principal: "tester", launcher_id: "dhl_continue" },
+      });
+    io.continuePipelineV2Stage = continuePipelineV2Stage as unknown as CliIo["continuePipelineV2Stage"];
+    const exit = await runCli(
+      [
+        "continue-stage",
+        "--run-id", RUN_ID,
+        "--wait-index", "1",
+        "--additional-iterations", "2",
+        "--config-root", configRoot,
+        "--launcher-id", "dhl_continue",
+        "--json",
+      ],
+      io,
+    );
+
+    expect(exit).toBe(1);
+    const documents = out.filter((line) => line.trim() !== "");
+    expect(documents).toHaveLength(1);
+    const parsed = JSON.parse(documents[0]!) as Record<string, unknown>;
+    expect(parsed["ok"]).toBe(false);
+    expect(parsed["exitCode"]).toBe(1);
+    expect(parsed["reason"]).toBe("worker_failed");
+    expect(parsed["runId"]).toBe(RUN_ID);
+    expect(parsed["runRoot"]).toBe(runRoot);
+    expect(err.join("\n")).not.toContain("userdata");
+    expect(err.join("\n")).not.toContain("project-source");
+    expect(err.join("\n")).not.toContain(CANARY_SECRET);
+    expect(JSON.stringify(parsed)).not.toContain("TASK-BODY");
+
+    // the durable projection: the exact intervention suffix
+    // plan_intent_accepted -> iteration_grant_recorded -> stage_iteration_closed
+    // -> wait_response_recorded -> stage_iteration_opened, then the successor
+    // execution start in dev_entry (role stage, iteration 2) and the ordinary
+    // worker_failed failure finalization
+    const state = parsePipelineV2RunState(
+      await import("node:fs/promises").then((m) => m.readFile(join(runRoot, "state.json"), "utf8")),
+    );
+    const wait0 = state.waits[0]!;
+    expect(wait0.index).toBe(1);
+    expect(wait0.intent?.intent_sha256).toBeDefined();
+    expect(wait0.response?.action_id).toBe("continue_stage");
+    expect(state.grants).toHaveLength(1);
+    expect(state.grants[0]).toMatchObject({
+      generation_index: 1,
+      wait_index: 1,
+      additional_iterations: 2,
+      intent_sha256: wait0.intent?.intent_sha256,
+    });
+    const generation = state.generations[0]!;
+    expect(generation.stage_id).toBe("stage-1");
+    expect(generation.closed).toBeUndefined();
+    expect(generation.iterations[0]?.closed).toEqual({ by: "grant", wait_index: 1, closed_transition_count: 2 });
+    expect(generation.open_iteration).toEqual({ index: 2, opened_transition_count: 2 });
+    const execution3 = state.executions[2];
+    expect(execution3).toMatchObject({
+      index: 3,
+      state_id: "dev_entry",
+      execution_role: "stage",
+      iteration_index: 2,
+      phase: "failed",
+    });
+    expect(state.status).toBe("failed");
+    expect(state.failure).toEqual({ reason: "worker_failed" });
+    // exactly twelve durable commits: five intervention + seven resume
+    expect(state.revision).toBe(prefixState.revision + 12);
+    // the loader round-trip
+    expect(state).toEqual(
+      parsePipelineV2RunState(
+        await import("node:fs/promises").then((m) => m.readFile(join(runRoot, "state.json"), "utf8")),
+      ),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

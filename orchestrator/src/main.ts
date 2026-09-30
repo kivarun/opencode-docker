@@ -21,6 +21,13 @@
  *   invokes `respondPipelineV2Wait` exactly once. The run id, the wait
  *   index and the action id are the only user inputs; the routing target
  *   comes only from the durable wait request.
+ * - `continue-stage` — the production `continue_stage` stage intervention:
+ *   the same protected CLI-configuration boundary and per-call dependency
+ *   assembly, invoking `continuePipelineV2Stage` exactly once. The run id,
+ *   the wait index, the additional iteration count and the configuration
+ *   root are the only user inputs; the action is fixed by the runner
+ *   entrypoint and every internal intervention parameter is derived from
+ *   the authoritative durable state.
  *
  * The dispatcher is testable through per-call dependency injection
  * (`runCli(argv, io)`); no module-global mutable state exists.
@@ -42,6 +49,7 @@ import {
   resolvePipelineV2StateRootProjection,
 } from "./pipeline_v2_state_root.ts";
 import {
+  continuePipelineV2Stage,
   resumePipelineV2,
   runPipelineV2,
   type PipelineV2RunOutcome,
@@ -67,6 +75,7 @@ export interface CliIo {
   resolveStateRootProjection: typeof resolvePipelineV2StateRootProjection;
   runPipelineV2: typeof runPipelineV2;
   resumePipelineV2: typeof resumePipelineV2;
+  continuePipelineV2Stage: typeof continuePipelineV2Stage;
   respondPipelineV2Wait: typeof respondPipelineV2Wait;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
@@ -89,6 +98,7 @@ function productionCliIo(): CliIo {
     resolveStateRootProjection: resolvePipelineV2StateRootProjection,
     runPipelineV2,
     resumePipelineV2,
+    continuePipelineV2Stage,
     respondPipelineV2Wait,
     runSmoke,
     runAgentSmoke,
@@ -121,7 +131,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -131,7 +141,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "agent-smoke" &&
     command !== "run" &&
     command !== "resume" &&
-    command !== "respond"
+    command !== "respond" &&
+    command !== "continue-stage"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -169,6 +180,12 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // subprocess, no signal registration) and invokes the response
     // production API exactly once.
     return await runPipelineV2RespondCommand(parsed, io);
+  }
+  if (parsed.kind === "continue-stage") {
+    // The production pipeline v2 continue-stage intervention: the same
+    // protected CLI-configuration boundary and per-call dependency
+    // assembly, then exactly one `continuePipelineV2Stage` invocation.
+    return await runPipelineV2ContinueStageCommand(parsed, io);
   }
 
   const config = io.resolveHelperConfig(io.baseEnv);
@@ -331,6 +348,40 @@ async function runPipelineV2ResumeCommand(
 }
 
 /**
+ * The production pipeline v2 continue-stage intervention command: parse
+ * already done. The same protected CLI-configuration boundary (the
+ * state-root projection first, then the helper configuration) and the same
+ * per-call dependency assembly as `run`/`resume`, then exactly one
+ * `continuePipelineV2Stage` invocation. The intervention action is fixed
+ * by the runner entrypoint; the run id, the wait index, the additional
+ * iteration count and the configuration root are the only user inputs.
+ */
+async function runPipelineV2ContinueStageCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "continue-stage" }>,
+  io: CliIo,
+): Promise<number> {
+  const configuration = await resolvePipelineV2CliConfiguration(io);
+  if (configuration === null) {
+    return 2;
+  }
+
+  const deps = pipelineV2CommandDeps(parsed.json, configuration, io);
+
+  const outcome: PipelineV2RunOutcome = await io.continuePipelineV2Stage(
+    {
+      runId: parsed.runId,
+      waitIndex: parsed.waitIndex,
+      additionalIterations: parsed.additionalIterations,
+      configRoot: parsed.configRoot,
+      launcherId: parsed.launcherId,
+    },
+    deps,
+  );
+
+  return reportPipelineV2Outcome("continue-stage", parsed.json, outcome, io);
+}
+
+/**
  * The production pipeline v2 wait-response command: parse already done.
  * Only the state-root projection is resolved inside the protected
  * CLI-configuration boundary (the same env resolver `run` and `resume`
@@ -383,7 +434,7 @@ async function runPipelineV2RespondCommand(
 }
 
 function reportPipelineV2Outcome(
-  command: "run" | "resume",
+  command: "run" | "resume" | "continue-stage",
   json: boolean,
   outcome: PipelineV2RunOutcome,
   io: CliIo,
