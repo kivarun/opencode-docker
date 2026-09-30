@@ -1011,6 +1011,108 @@ test("capture contract: a mutating deps.now getter cannot change the run clock",
   expect(nowReads).toBe(1);
 });
 
+// --- captured helper config -------------------------------------------------
+
+test("capture contract: a mutating helperConfig getter cannot swap the socket or the credential after validation", async () => {
+  const resumePipelineV2 = (await import("../src/pipeline_v2_runner.ts")).resumePipelineV2;
+  const entries: ReadonlyArray<readonly [string, (harness: Harness, deps: PipelineV2RunnerDeps) => Promise<PipelineV2RunOutcome>]> = [
+    [
+      "resume",
+      (harness, deps) =>
+        resumePipelineV2(
+          { runId: RUN_ID, configRoot: harness.configRoot, launcherId: EXPECTED_LAUNCHER_ID },
+          deps,
+        ),
+    ],
+    [
+      "continue-stage",
+      (harness, deps) =>
+        continuePipelineV2Stage(
+          {
+            runId: RUN_ID,
+            waitIndex: 1,
+            additionalIterations: 2,
+            configRoot: harness.configRoot,
+            launcherId: EXPECTED_LAUNCHER_ID,
+          },
+          deps,
+        ),
+    ],
+  ];
+  for (const [name, runCall] of entries) {
+    const harness = await makeHarness(`pipeline-v2-capture-helper-${name}-`);
+    await drivePrefix(harness);
+    const credDirA = join(harness.root, "cred-a", "docker-helper");
+    await mkdir(credDirA, { recursive: true, mode: 0o700 });
+    const credA = join(credDirA, "credential.token");
+    await writeFile(credA, "token-a-canary\n", { mode: 0o600 });
+    const credDirB = join(harness.root, "cred-b", "docker-helper");
+    await mkdir(credDirB, { recursive: true, mode: 0o700 });
+    const credB = join(credDirB, "credential.token");
+    await writeFile(credB, "token-b-canary\n", { mode: 0o600 });
+    const socketA = "/run/socket-a.sock";
+    const socketB = "/run/socket-b.sock";
+    let socketReads = 0;
+    let credentialReads = 0;
+    const hostileHelperConfig = new Proxy(
+      { socketPath: socketA, credentialFile: credA } as Record<string, unknown>,
+      {
+        get(target, property, receiver) {
+          if (property === "socketPath") {
+            socketReads += 1;
+            return socketReads === 1 ? socketA : socketB;
+          }
+          if (property === "credentialFile") {
+            credentialReads += 1;
+            return credentialReads === 1 ? credA : credB;
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const authCalls: Array<{ socket: string; token: string }> = [];
+    const sessionCreates: string[] = [];
+    const captured = captureDiagnostics();
+    let outcome: PipelineV2RunOutcome;
+    try {
+      outcome = await runCall(harness, {
+        ...runnerDeps(harness, {}, sessionCreates),
+        fetchAuth: async (socket: string, token: string) => {
+          authCalls.push({ socket, token });
+          return {
+            status: 200,
+            body: { authority: "launcher", principal: "tester", launcher_id: EXPECTED_LAUNCHER_ID },
+          };
+        },
+        helperConfig: hostileHelperConfig as never,
+      });
+    } finally {
+      captured.restore();
+    }
+    expect(outcome.ok).toBe(false);
+    // the authority used the validated socket and the validated credential
+    expect(authCalls).toEqual([{ socket: socketA, token: "token-a-canary" }]);
+    // each nested field was read exactly once (at the capture)
+    expect(socketReads).toBe(1);
+    expect(credentialReads).toBe(1);
+    // the replacement B was never read, never called, never published
+    expect(captured.errors.join("\n")).not.toContain(socketB);
+    expect(captured.errors.join("\n")).not.toContain(credB);
+    expect(captured.errors.join("\n")).not.toContain("token-b-canary");
+    expect(JSON.stringify(outcome)).not.toContain(socketB);
+    // the session creates (continue-stage only) carry the validated endpoint
+    const endpoints = sessionCreates
+      .map((args) => {
+        const index = args.split(" ").indexOf("--endpoint");
+        return index >= 0 ? args.split(" ")[index + 1] : "";
+      })
+      .filter((endpoint) => endpoint !== "");
+    for (const endpoint of endpoints) {
+      expect(endpoint).toBe(socketA);
+    }
+  }
+});
+
 // --- export surface and source scan ----------------------------------------
 
 test("the export surface gains exactly one runtime key and the module implements no second machinery", async () => {

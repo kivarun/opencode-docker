@@ -306,9 +306,12 @@ continuePipelineV2Stage(
   configRoot,launcherId`, resume options `runId,configRoot,launcherId`;
   deps `cli,fetchAuth,helperConfig,baseEnv,stateRootProjection,
   now,randomId,onSignal`; the projection scalars are pinned as captured
-  locals; `baseEnv` stays an opaque captured reference; hostile extra
-  fields are never read; the derivation receives the frozen captured
-  policy, never the caller object) with validation over the captured
+  locals; `helperConfig` is captured as a new frozen record rebuilt once
+  from the validated `socketPath`/`credentialFile` scalars — a mutating
+  nested getter can no longer swap the socket or the credential between
+  validation and the authority/runtime; `baseEnv` stays an opaque captured
+  reference; hostile extra fields are never read; the derivation receives
+  the frozen captured policy, never the caller object) with validation over the captured
   locals only, the single `RunCauseGate`, the read-only existing run-root
   verification, the read-only `PipelineV2RunStateSink.open`, the pipeline
   loaded only from the durable bundle root, the profiles from the caller

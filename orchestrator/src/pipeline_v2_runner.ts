@@ -800,6 +800,7 @@ interface CapturedExistingRunContract {
   readonly callerPolicy: ContinueStageCallerPolicy | null;
   readonly cli: CliRunner;
   readonly fetchAuth: AuthFetcher;
+  /** A new frozen record built once from the validated scalars; the caller's helperConfig is never read again. */
   readonly helperConfig: HelperConfig;
   readonly baseEnv: Readonly<Record<string, string | undefined>>;
   readonly localRoot: string;
@@ -866,6 +867,10 @@ function captureExistingRunContract(
   if (!isNonEmptyAbsolutePath(credentialFile)) {
     throw new Error(`${contractName} deps.helperConfig.credentialFile must be a non-empty absolute path`);
   }
+  const capturedHelperConfig: HelperConfig = Object.freeze({
+    socketPath,
+    credentialFile,
+  });
   const baseEnv = deps["baseEnv"];
   if (!isRecord(baseEnv)) {
     throw new Error(`${contractName} deps.baseEnv must be an object`);
@@ -914,7 +919,7 @@ function captureExistingRunContract(
     callerPolicy,
     cli: cli as CliRunner,
     fetchAuth: fetchAuth as AuthFetcher,
-    helperConfig: helperConfig as unknown as HelperConfig,
+    helperConfig: capturedHelperConfig,
     baseEnv: baseEnv as Readonly<Record<string, string | undefined>>,
     localRoot,
     daemonRoot,
