@@ -3542,6 +3542,162 @@ scan (the five facades only; no reducer/validator/serializer/digest/
 fs/store/coordinator/runner/CLI imports; no message parsing; no
 mutable seam), and the invalid-options battery.
 
+### Revise-task intervention → resume handoff controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_revise_task_resume_controller.ts`
+(public, with the internal core
+`pipeline_v2_revise_task_resume_controller_internal.ts`) is the unwired
+composition of the full `revise_task` handoff — the restart-aware
+revise-task intervention followed by the coordinator's resume entrypoint
+in one fixed sequence:
+
+    applyPipelineV2ReviseTaskIntervention
+      → defensive verification of the completed handoff
+      → resumePipelineV2Run
+
+Options are exactly `{pipeline, runRoot, sink, runtime, control, runId,
+waitIndex, taskId, taskBody}` — no intent, candidate, digest, stage,
+plan or budget field is accepted from the caller: every one of them is
+derived from the durable data by the intervention facade (the stage id,
+the expected plan digest and the budget live in the restored plan and
+the durable generation; the intent and the candidate are prepared by the
+intervention's derivation). The controller owns no durable side effect
+of its own — it dispatches nothing, publishes nothing, loads nothing,
+never opens the sink and never calls the reducer, validator, store,
+manifest loader, serializer or digest machinery — and interprets no
+signal: acceptance and cutoff stay coordinator-owned through the
+captured control functions. The caller's `taskBody` is a captured
+content input passed unchanged to the intervention; its digest contract
+belongs to the intervention facade, the body is re-hashed nowhere here,
+and it never enters the result, the durable state or any diagnostic.
+
+Capture and preflight, all before the first await and before any durable
+intervention: the options shape → the nine fields each read exactly once
+(fixed order `pipeline, runRoot, sink, runtime, control, runId,
+waitIndex, taskId, taskBody`, hostile extras never read) → the ops
+record shape and its two members each read exactly once with function
+checks → the pipeline provenance gate (clones, casts, spreads and
+Proxies rejected before any field of a durable state is read; its typed
+error propagates unchanged) → the scalar/structural validations — a
+non-empty absolute run root, a structural sink (a record with a
+`dispatch` function; the `snapshot`/`poisoned` getters stay owned by the
+composed layers and the coordinator), a record runtime/control, a safe
+`runId`, a positive safe-integer `waitIndex`, a safe `taskId` and a
+non-empty string `taskBody` → the runtime and control contract functions
+(`createExecutionSession`/`createToolSession` and
+`currentSignal`/`freezeSignal`) read and bound exactly once into stable
+deep-frozen adapters the coordinator alone consumes, so a mutation of
+the caller-owned runtime/control objects during the pending intervention
+cannot change the resume. Invalid options are the layer's own
+`invalid_options` with state null and zero facade calls.
+
+The intervention facade always runs first: any of its typed errors
+passes through by object identity and the resume is never started after
+one. After a successful intervention the authoritative snapshot is read
+exactly once (the real intervention result carries it as the exact sink
+snapshot object, proven by identity against the real facade — the
+identity contract of the first-half intervention controller, re-proven
+by the handoff battery on both the C0 and the R4 zero-dispatch paths);
+a hostile or malformed success result — a wrong flat field, a
+structural-clone state or a hostile durable boundary — is the layer's
+own `invalid_result` carrying the last authoritative snapshot, never a
+leaked `TypeError`, and the resume never starts. The targeted
+completed-boundary bindings read only from that snapshot: `run_id`
+equal to the captured run id, active/running, the target wait the last
+and only record of its index carrying the exact request/intent/
+`revise_task` response digests, the declared action routing exactly to
+the result's `action_to`, the cursor on that target at the wait
+transition boundary with the transition/execution journals on the same
+boundary, exactly one wait-bound task revision of the intervention whose
+identity/digests/revisions match the flat result (and no later revision
+of the revised task), the last plan record still matching the open
+generation's plan binding, the generation the last and open one with the
+intervention's indexes and its last iteration closed by the exact
+`{by: "replanned", wait_index, closed_transition_count}` closure with no
+open iteration, and no new execution/transition/wait/plan/generation
+beyond the boundary.
+
+The coordinator's returned union is verified defensively and accepts
+only the exact runtime shapes of `PipelineV2ResumeCoordinationResult` —
+identically to the continue-stage sibling: a success carries exactly the
+own enumerable keys `ok`,`state` with a state record identical to the
+sink snapshot; a refusal carries exactly `ok`,`refused`,`reason`,`state`
+with `refused === true` and a reason from the coordinator's refusal
+vocabulary; an ordinary failure carries exactly `ok`,`reason`,`state`
+with no own `refused` field and a reason from the canonical
+`PIPELINE_V2_FAILURE_REASONS` (imported from `pipeline_v2_state.ts` —
+the only runtime state-module import; the refusal vocabulary is a typed
+literal list pinned to the coordinator's own type by compile-time
+validity and exhaustiveness assertions). Failure and refusal states are
+null or exactly the sink snapshot, and the verified union is returned
+unchanged by object identity without a new envelope — refusal, worker
+failure, signal failure and persistence failure stay coordinator-owned
+classifications. A thrown resume error passes through by object
+identity.
+
+Retry and crash windows (the honest boundaries only): C0 — the
+intervention has not started; the fresh call runs the exact four-command
+intervention suffix `plan_intent_accepted → task_revision_accepted →
+stage_iteration_closed → wait_response_recorded` on the reopened run and
+then the resumed planning execution. R4/crash seam — the intervention is
+already fully durable while the resume has not started (for example
+after a resume-side crash); a fresh call's intervention recognizes the
+exact completed boundary with zero dispatch through the intervention
+facade's own progressed-retry reconciliation and runs the resume exactly
+once, with the wait/task/plan/generation/closure projection never
+rewritten between the boundary and the final durable state. A resume
+that already began durable execution has no new convergence guarantee
+here (the coordinator's existing continuation contract stays the only
+owner of that semantics); unrecognized progressed states and downstream
+lifecycle errors pass through by identity. There is no reopen inside
+this layer: after a process crash the caller opens a fresh sink and
+repeats the whole facade.
+
+Tests: `orchestrator/tests/pipeline_v2_revise_task_resume_controller.test.ts`
+(13 tests) cover the honest C0 through the public facade on the reopened
+prefix run (the exact four-command suffix then the exact seven-command
+resume `start_agent_execution {architect, planning, no iterationIndex} →
+agent_data_prepared → agent_execution_session_created →
+agent_tool_session_created → agent_running → agent_failed → run_failed`,
+execution index 3, the ordinary `worker_failed` — never a refusal and
+never `pipeline_mismatch`, one session pair cleaned tool-first exactly
+once, revision +11 over the wait boundary, the exact durable projection
+and the loader round-trip), the crash seam/R4 window (the first call
+fully commits the four intervention commands on the completed boundary,
+the injected resume sentinel passes by identity before any resume
+effect, the ordinary reopen, the fresh call's zero-dispatch R4
+recognition and the recording of only the seven resume commands with
+the projection never rewritten), the intervention error identity with
+zero resume calls, the resume thrown-error identity, the malformed
+intervention-result matrix (the fake result carrying the authoritative
+snapshot with mutated flat fields plus the bare-record and
+structural-clone identity violations) and the durable-binding near-miss
+matrix through a hostile sink snapshot (foreign run id, waiting status,
+cursor off the target/boundary, `continue_stage`/foreign
+response/intent/request digests, shifted/duplicate/new wait records,
+mismatching/later task revisions, closed generation, grant-closed
+iteration, open successor iteration, foreign generation plan binding,
+new plan revision, new execution/transition, malformed shapes — every
+case the layer's own `invalid_result` with zero resume calls), the
+malformed resume-union matrix over every branch plus the positive
+vocabulary table (every refusal reason and every
+`PIPELINE_V2_FAILURE_REASONS` value with a null and with the
+authoritative state, plus the success union — every valid object
+returned by identity), the capture/read-order battery (the nine options
+then the two ops members, exactly once each, in order, hostile extras
+never read), the exactly-one-snapshot-read-per-verification-phase proof,
+the mutation-after-await immunity of the captured
+policy/runtime/control, the pipeline spread-clone/Proxy provenance
+failures with zero facade calls and zero traps, invalid runtime/control
+contracts with zero facade calls, both export surfaces, and the source
+scan over both files (the single imports of the two composed facades;
+no reducer/validator/store/filesystem/manifest machinery of its own; no
+second parser/serializer/digest builder/registry; no message parsing;
+no mutable module-global seam). Still unwired: everything — the runner,
+the CLI, the default pipeline bundle, the revise-task selection policy,
+the architect/replanning branch's production wiring, automatic resume,
+schema/reducer changes, migrations/API/T3 and multi-process locking.
+
 ### Replanned-stage composition controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_replanned_stage_controller.ts` (public
