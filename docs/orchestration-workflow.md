@@ -2720,6 +2720,110 @@ the next stage execution, automatic resume,
 coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
 migrations/API/T3 and multi-process locking.
 
+### Continue-stage intervention → resume handoff controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_continue_stage_resume_controller.ts`
+(public, with the internal core
+`pipeline_v2_continue_stage_resume_controller_internal.ts`) is the
+unwired composition of the full `continue_stage` handoff — the
+restart-aware intervention followed by the coordinator's resume
+entrypoint in one fixed sequence:
+
+    applyPipelineV2ContinueStageIntervention
+      → defensive verification of the successful handoff
+      → resumePipelineV2Run
+
+Options are exactly `{pipeline, runRoot, sink, runtime, control, intent,
+initialBudget}` — `runId` is never a caller field (derived exclusively
+from the verified intent), `compiledPlan` is not a caller field (only the
+restore obtains it), and no stage/action/budget policy is applied here.
+The controller owns no durable side effect of its own and interprets no
+signal: acceptance and cutoff stay coordinator-owned through the captured
+control functions.
+
+Capture and preflight, all before the first await and before any durable
+intervention: the options shape → the seven fields each read exactly once
+(fixed order, hostile extras never read) → the ops record shape and its
+two members each read exactly once with function checks → a non-empty
+absolute run root, a structural sink (a record with a `dispatch`
+function; the `snapshot`/`poisoned` getters stay owned by the composed
+layers and the coordinator), a record runtime/control, a prepared intent
+record and a positive safe-integer budget → the pipeline provenance gate
+and the intent provenance gate (strictly the `continue_stage_intent`
+kind) with the provenance gate's typed error propagating unchanged → the
+policy fixed as captured scalars → the runtime and control contract
+functions read and bound exactly once into stable deep-frozen adapters
+the coordinator alone consumes (a mutation of the caller-owned
+runtime/control objects during the pending intervention cannot change the
+resume). Invalid options are the layer's own `invalid_options` with state
+null and zero facade calls.
+
+The intervention facade always runs first: any of its typed errors passes
+through by object identity and the resume is never started after one.
+The authoritative snapshot is read exactly once per verification phase
+(immediately after the intervention, and after the resume); the real
+intervention result's state is the exact sink snapshot object by identity
+— the verification's binding anchor, proven by a dedicated test against
+the real facade. The handoff verification binds the flat result exactly
+to the captured intent and caller budget and to the authoritative
+snapshot: status/phase, the cursor at the declared action target on the
+wait anchor, the journals at the anchor, the answered target wait (the
+last and only record of its index with the exact accepted intent, request
+digest and `continue_stage` response), the exact single grant of the
+granted pair, and the granted last open generation bound to the intent's
+stage, the expected plan digest and the caller budget with the exact
+grant closure and the open successor. The coordinator's returned union is
+verified defensively (a well-formed discriminant, a non-empty reason,
+`refused` exactly `true` when present, a state that is null or exactly
+the sink snapshot) and returned unchanged by object identity without a
+new envelope — refusal, worker failure, signal failure and persistence
+failure stay coordinator-owned classifications. Hostile or malformed
+success results are the layer's own `invalid_result` with the last
+authoritative snapshot, never a leaked `TypeError`.
+
+Retry and crash windows (the honest boundaries only): C0 — the
+intervention has not started; the fresh call runs the exact five-command
+suffix and then the resumed successor execution. C5/crash seam — the
+intervention is already fully durable while the resume has not started
+(for example after a resume-side crash); a fresh call's intervention
+recognizes the exact completed boundary with zero dispatch through the
+intervention facade's own progressed-retry reconciliation and runs the
+resume exactly once, with the durable grant/wait/generation/closure/open
+projection never rewritten between the boundary and the final durable
+state. A resume that already began durable execution has no new
+convergence guarantee here (the coordinator's existing continuation
+contract stays the only owner of that semantics); unrecognized progressed
+states and downstream lifecycle errors pass through by identity.
+
+Tests: `orchestrator/tests/pipeline_v2_continue_stage_resume_controller.test.ts`
+(18 tests) cover the dedicated identity-contract proof against the real
+facade, the C0 main proof through the new public facade on the reopened
+honest-prefix run (the exact suffix, the resumed successor execution with
+role `stage`/iteration 2/next global index, one session pair cleaned
+tool-first exactly once, the ordinary `worker_failed`, untouched
+intervention records, no new transition, the loader round-trip), the
+crash seam with the real restart between intervention and resume (the
+injected pre-effect resume sentinel by identity, the fresh call
+recognizing the boundary with zero dispatch and running the resume once),
+the intervention failure identity with zero resume calls, the resume
+thrown-error identity, the typed invalid_result matrices (malformed
+intervention results over primitives/arrays/missing state/bindings/
+foreign intent and durable-binding mutations against the real completed
+boundary; malformed resume results over every union branch), the foreign
+caller budget refused by the composed layers with zero resume calls, the
+mutation-after-await immunity of the captured policy/runtime/control, the
+exact capture order/read counts with hostile extras never read, invalid
+runtime/control before any facade call, pipeline/intent clone and Proxy
+provenance failures with zero facade calls, valid coordinator outcomes
+returned by `toBe` without reclassification, both export surfaces, and
+the source scan (only the two facades plus provenance/scalar/types; no
+reducer/writer/compiler/manifest loader/fs/CLI/runner imports; no second
+parser/serializer, `JSON.stringify`, digest machinery or new registries).
+Still unwired: everything — the runner, the CLI, the default pipeline
+bundle, the action/`additional_iterations` selection policy, the
+revise-task branch, automatic resume, schema/reducer changes,
+migrations/API/T3 and multi-process locking.
+
 ### Revise-task intent acceptance controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_revise_task_intent_controller.ts`
