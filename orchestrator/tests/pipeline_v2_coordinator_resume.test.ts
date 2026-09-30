@@ -47,8 +47,8 @@ import {
 import { preparePipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_candidate.ts";
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
 import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
-import { acceptPipelineV2ContinueStageIntent } from "../src/pipeline_v2_continue_stage_intent_controller.ts";
-import { openPipelineV2ContinuedStage } from "../src/pipeline_v2_continued_stage_controller.ts";
+import { applyPipelineV2ContinueStageIntervention } from "../src/pipeline_v2_continue_stage_intervention_controller.ts";
+import { compiledPipelineV2RunPlanStageFor } from "../src/pipeline_v2_run_plan_compiled.ts";
 import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 import type { PipelineStateIo } from "../src/pipeline_state_store.ts";
@@ -2355,7 +2355,7 @@ states:
     result: success
 `;
 
-test("a real continued-stage composition reopens into the existing resume coordinator and starts the successor stage execution", async () => {
+test("the full continue-stage handoff survives two restarts: the restart-aware intervention facade restores the plan on the reopened run and the resume coordinator starts the successor stage execution", async () => {
   const harness = await setupHarness(PIPELINE_CONTINUED_STAGE_RESUME);
   const runInputs = await prefixCreateRun(harness);
   const protectedInput = runInputs.inputs[0];
@@ -2477,7 +2477,9 @@ test("a real continued-stage composition reopens into the existing resume coordi
   });
   await publishPipelineV2WaitRequest(harness.dirs.runRoot, request.manifest);
 
-  // 6. the real continue-stage intent acceptance
+  // the provenance-backed continue_stage intent is prepared before the
+  // first restart: pure in-memory normalization, and the intervention
+  // re-validates it against the reopened durable state
   const intent = prepareWaitIntent({
     schema_version: 1,
     kind: "continue_stage_intent",
@@ -2487,28 +2489,37 @@ test("a real continued-stage composition reopens into the existing resume coordi
     expected_plan_sha256: acceptedPlan.compiled_plan.plan_sha256,
     additional_iterations: 2,
   });
-  await acceptPipelineV2ContinueStageIntent({ runRoot: harness.dirs.runRoot, sink: harness.recording, intent });
 
-  // 7. the public continued-stage composition owns the whole intervention
-  //    suffix: the grant, the grant-bound closure, the response and the
-  //    successor opening — no suffix command is dispatched by hand
-  const commandsBeforeComposition = harness.recording.commands.length;
-  const composed = await openPipelineV2ContinuedStage({
+  // the first simulated process restart: the initial sink is closed and
+  // the run is reopened through the real loader/store path BEFORE any
+  // intent acceptance — the in-memory compiled plan of the pre-restart
+  // acceptance never reaches the intervention below
+  const preIntervention = await reopenHarness(harness);
+  expect((preIntervention.snapshot as PipelineV2RunState)).toEqual(harness.recording.snapshot as PipelineV2RunState);
+
+  // the single public restart-aware intervention facade owns the whole
+  // durable intervention suffix on the reopened run: the intent
+  // acceptance, the authoritative plan restoration (no in-memory
+  // compiled plan is passed in) and the continued-stage composition —
+  // no suffix command is dispatched by hand
+  const intervention = await applyPipelineV2ContinueStageIntervention({
+    pipeline: harness.pipeline,
     runRoot: harness.dirs.runRoot,
-    sink: harness.recording,
+    sink: preIntervention,
     intent,
-    compiledPlan: acceptedPlan.compiled_plan,
     initialBudget: 2,
   });
-  expect(kinds(harness.recording).slice(commandsBeforeComposition)).toEqual([
+  expect(kinds(preIntervention)).toEqual([
+    "plan_intent_accepted",
     "iteration_grant_recorded",
     "stage_iteration_closed",
     "wait_response_recorded",
     "stage_iteration_opened",
   ]);
 
-  // the completed boundary, checked against the real durable snapshot
-  const completedState = harness.recording.snapshot as PipelineV2RunState;
+  // the completed boundary, checked against the reopened authoritative
+  // snapshot
+  const completedState = preIntervention.snapshot as PipelineV2RunState;
   expect(completedState.status).toBe("active");
   expect(completedState.phase).toBe("running");
   expect(completedState.cursor).toEqual({ current_state: "dev_entry", transition_count: 2 });
@@ -2528,10 +2539,11 @@ test("a real continued-stage composition reopens into the existing resume coordi
   // the wait carries the exact accepted intent and the exact response
   expect(completedState.waits).toHaveLength(1);
   expect(completedState.waits[0]?.transition_count).toBe(2);
+  expect(completedState.waits[0]?.request_sha256).toBe(request.sha256);
   expect(completedState.waits[0]?.intent).toEqual({ intent_sha256: intent.sha256 });
   expect(completedState.waits[0]?.response).toEqual({
     action_id: "continue_stage",
-    response_sha256: composed.response_sha256,
+    response_sha256: intervention.response_sha256,
   });
   // exactly one grant of the pair
   expect(completedState.grants).toHaveLength(1);
@@ -2542,15 +2554,27 @@ test("a real continued-stage composition reopens into the existing resume coordi
     intent_sha256: intent.sha256,
     additional_iterations: 2,
   });
-  // the composition result and the durable snapshot agree
-  expect(composed.generation_index).toBe(1);
-  expect(composed.closed_iteration_index).toBe(1);
-  expect(composed.iteration_index).toBe(2);
-  expect(composed.action_to).toBe("dev_entry");
-  expect(composed.state).toEqual(completedState);
+  // the flat intervention result and the authoritative snapshot agree
+  expect(intervention.wait_index).toBe(1);
+  expect(intervention.intent_sha256).toBe(intent.sha256);
+  expect(intervention.request_sha256).toBe(request.sha256);
+  expect(intervention.action_id).toBe("continue_stage");
+  expect(intervention.action_to).toBe("dev_entry");
+  expect(intervention.additional_iterations).toBe(2);
+  expect(intervention.generation_index).toBe(1);
+  expect(intervention.closed_iteration_index).toBe(1);
+  expect(intervention.iteration_index).toBe(2);
+  expect(intervention.state).toEqual(completedState);
+  // the compiled stage was RESTORED from the durable ledger and the
+  // immutable manifests, not reused from the pre-restart in-memory
+  // compiled plan: structurally equal, a different object
+  const preRestartStage = compiledPipelineV2RunPlanStageFor(acceptedPlan.compiled_plan, "stage-1");
+  expect(intervention.compiled_stage).toEqual(preRestartStage);
+  expect(intervention.compiled_stage).not.toBe(preRestartStage);
 
-  // the simulated process restart: the initial sink is closed, the run is
-  // reopened through the real loader/store path
+  // the second simulated process restart: the intervention sink is
+  // closed and the run is reopened through the real loader/store path
+  // again before the resume
   const reopened = await reopenHarness(harness);
   expect((reopened.snapshot as PipelineV2RunState)).toEqual(completedState);
 

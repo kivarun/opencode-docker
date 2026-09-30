@@ -2565,6 +2565,27 @@ suffix:
 with revision +5, entirely through the reopened run and with the
 in-memory compiled plan unused after the restart.
 
+The full handoff is proven beyond the intervention itself in the
+strengthened coordinator-resume integration test
+(`orchestrator/tests/pipeline_v2_coordinator_resume.test.ts`): the same
+real continued-stage prefix through the production facades → the first
+simulated restart through the ordinary `PipelineV2RunStateSink.open` →
+`applyPipelineV2ContinueStageIntervention` on the reopened run with only
+`{pipeline, runRoot, sink, intent, initialBudget}` — the in-memory
+compiled plan is never passed (no manual intent acceptance, restore or
+composition and no suffix command), the facade restores the authoritative
+plan itself, and the result's `compiled_stage` is structurally equal to
+but a different object than the pre-restart plan's stage (restoration,
+not reuse) → the completed boundary (active/running, cursor at the action
+target on the wait anchor, one exact grant, the wait carrying the exact
+intent and `continue_stage` response, the granted generation still open,
+the grant-closed iteration and the open successor) → the second simulated
+restart → `resumePipelineV2Run` starts the successor stage execution as
+one ordinary `worker_failed` execution failure — never a refusal and
+never `pipeline_mismatch` — with no repeated intervention command, the
+intervention records untouched, no new transition and the final durable
+state loader-round-tripped.
+
 The controller dispatches nothing itself, performs no filesystem work of
 its own, never calls the reducer and never starts a worker; the three
 composed layers remain the only owners of durable side effects. Runtime
