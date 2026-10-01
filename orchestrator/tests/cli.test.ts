@@ -106,7 +106,8 @@ test("usage documents the production pipeline v2 run command", () => {
   expect(text).toContain("run-owned directory");
   expect(text).toContain("handled by dedicated commands");
   expect(text).toContain("'continue_stage' intervention runs via 'orchestrator continue-stage'");
-  expect(text).toContain("'revise_task' has no dedicated CLI path yet");
+  expect(text).toContain("'revise_task' intervention via 'orchestrator revise-task'");
+  expect(text).not.toContain("no dedicated CLI path");
 });
 
 const RUN_BASE = ["--pipeline-root", "/abs/pipeline", "--config-root", "/abs/config", "--project", "/abs/project"];
@@ -645,6 +646,285 @@ test("usage documents the production pipeline v2 continue-stage command", () => 
   expect(text).toContain("--action flag) and never accepts");
   expect(text).toContain("orchestrator continue-stage");
   expect(text).toContain("performs the continue_stage stage intervention");
+});
+
+// --- revise-task parser ------------------------------------------------------
+
+test("revise-task parses the exact grammar with both flag forms", () => {
+  const parsed = parseCommand("revise-task", [
+    "--run-id", "run-1",
+    "--wait-index", "2",
+    "--task-id", "task-a",
+    "--task-file", "/abs/body.md",
+    "--config-root", "/abs/config",
+    "--launcher-id", "dhl_l1",
+    "--json",
+  ]);
+  expect(parsed).toEqual({
+    kind: "revise-task",
+    runId: "run-1",
+    waitIndex: 2,
+    taskId: "task-a",
+    taskFile: "/abs/body.md",
+    configRoot: "/abs/config",
+    launcherId: "dhl_l1",
+    json: true,
+  });
+  const inline = parseCommand("revise-task", [
+    "--run-id=run-2",
+    "--wait-index=4",
+    "--task-id=task-b",
+    "--task-file=/abs/body2.md",
+    "--config-root=/abs/config2",
+  ]);
+  expect(inline).toEqual({
+    kind: "revise-task",
+    runId: "run-2",
+    waitIndex: 4,
+    taskId: "task-b",
+    taskFile: "/abs/body2.md",
+    configRoot: "/abs/config2",
+    launcherId: undefined,
+    json: false,
+  });
+  // '=' inside the task-file path is allowed by the shared value parser
+  const equals = parseCommand("revise-task", [
+    "--run-id", "run-3",
+    "--wait-index", "1",
+    "--task-id", "task-c",
+    "--task-file", "/abs/weird=name.md",
+    "--config-root", "/abs/config",
+  ]);
+  if (equals.kind !== "revise-task") {
+    throw new Error("expected revise-task");
+  }
+  expect(equals.taskFile).toBe("/abs/weird=name.md");
+});
+
+test("revise-task accepts MAX_SAFE_INTEGER for --wait-index", () => {
+  const parsed = parseCommand("revise-task", [
+    "--run-id", "run-1",
+    "--wait-index", "9007199254740991",
+    "--task-id", "task-a",
+    "--task-file", "/abs/body.md",
+    "--config-root", "/abs/config",
+  ]);
+  if (parsed.kind !== "revise-task") {
+    throw new Error("expected revise-task");
+  }
+  expect(parsed.waitIndex).toBe(9007199254740991);
+});
+
+test("revise-task rejects the full invalid-number matrix for --wait-index", () => {
+  const invalid = [
+    "",
+    "0",
+    "-1",
+    "+1",
+    "01",
+    "1.5",
+    "1e2",
+    " 1",
+    "1 ",
+    "1_000",
+    "0x1",
+    "abc",
+    "١٢٣",
+    "9007199254740993",
+  ];
+  for (const value of invalid) {
+    expect(() =>
+      parseCommand("revise-task", [
+        "--run-id", "run-1",
+        "--wait-index", value,
+        "--task-id", "task-a",
+        "--task-file", "/abs/body.md",
+        "--config-root", "/abs/config",
+      ]),
+    ).toThrow();
+  }
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root"]),
+  ).toThrow("--config-root requires a value");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index"]),
+  ).toThrow("--wait-index requires a value");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1"]),
+  ).toThrow("--wait-index POSITIVE_INTEGER is required for revise-task");
+  expect(() =>
+    parseCommand("revise-task", ["--task-id=task-a", "--wait-index=1", "--config-root=/c"]),
+  ).toThrow("--run-id SAFE_ID is required for revise-task");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-file", "/abs/body.md", "--config-root", "/abs/config"]),
+  ).toThrow("--task-id SAFE_ID is required for revise-task");
+  expect(() =>
+    parseCommand("revise-task", ["--task-file="]),
+  ).toThrow("--task-file requires a value");
+});
+
+test("revise-task rejects missing, duplicate and value-less required flags", () => {
+  for (const argv of [
+    [],
+    ["--run-id", "run-1", "--task-id", "task-a", "--task-file", "/abs/body.md"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-file", "/abs/body.md", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--config-root", "/abs/config"],
+    ["--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--run-id", "run-2", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--wait-index", "2", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-id", "task-b", "--task-file", "/abs/body.md", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--task-file", "/abs/other.md", "--config-root", "/abs/config"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config", "--config-root", "/other"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config", "--launcher-id", "dhl_a", "--launcher-id", "dhl_b"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config", "--json", "--json"],
+    ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config", "--json=true"],
+  ]) {
+    expect(() => parseCommand("revise-task", argv)).toThrow();
+  }
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config", "--task-id"]),
+  ).toThrow("--task-id requires a value");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--config-root", "/abs/config"]),
+  ).toThrow("--task-file ABSOLUTE_PATH is required for revise-task");
+});
+
+test("revise-task rejects unsafe ids, relative or empty paths and invalid launcher ids", () => {
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "../escape", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config"]),
+  ).toThrow("--run-id must be a safe identifier");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config"]),
+  ).toThrow();
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "../escape", "--task-file", "/abs/body.md", "--config-root", "/abs/config"]),
+  ).toThrow("--task-id must be a safe identifier");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "", "--task-file", "/abs/body.md", "--config-root", "/abs/config"]),
+  ).toThrow();
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "relative/body.md", "--config-root", "/abs/config"]),
+  ).toThrow("--task-file must be an absolute path");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "", "--config-root", "/abs/config"]),
+  ).toThrow("--task-file requires a value");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "relative/config"]),
+  ).toThrow("--config-root must be an absolute path");
+  expect(() =>
+    parseCommand("revise-task", ["--run-id", "run-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/body.md", "--config-root", "/abs/config", "--launcher-id", "admin_l1"]),
+  ).toThrow("--launcher-id must be a launcher ID (dhl_...)");
+});
+
+test("revise-task rejects respond, fresh-run, continue-stage, state-root, body and internal-policy flags", () => {
+  for (const argv of [
+    ["--action", "revise_task"],
+    ["--action=revise_task"],
+    ["--task-body", "inline body"],
+    ["--task-body=inline body"],
+    ["--additional-iterations", "2"],
+    ["--pipeline-root", "/abs/pipeline"],
+    ["--project", "/abs/project"],
+    ["--input", "spec=/abs/spec.md"],
+    ["--workspace", "/w"],
+    ["--image", "img:1"],
+    ["--profile", "coder"],
+    ["--task", "/abs/task.md"],
+    ["--state-root", "/state/root"],
+    ["--daemon-state-root", "/daemon/root"],
+    ["--stage-id", "stage-1"],
+    ["--plan-digest", "abc"],
+    ["--initial-budget", "2"],
+    ["--intent", "{}"],
+    ["--candidate-task-revision", "{}"],
+    ["--compiled-plan", "{}"],
+    ["--generation-index", "1"],
+    ["--iteration-index", "1"],
+  ]) {
+    expect(() =>
+      parseCommand("revise-task", [
+        "--run-id", "run-1",
+        "--wait-index", "1",
+        "--task-id", "task-a",
+        "--task-file", "/abs/body.md",
+        "--config-root", "/abs/config",
+        ...argv,
+      ]),
+    ).toThrow();
+  }
+  expect(() =>
+    parseCommand("revise-task", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--task-id", "task-a",
+      "--task-file", "/abs/body.md",
+      "--config-root", "/abs/config",
+      "--action", "continue_stage",
+    ]),
+  ).toThrow("revise-task does not accept --action; the intervention action is fixed as revise_task by the runner entrypoint");
+  expect(() =>
+    parseCommand("revise-task", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--task-id", "task-a",
+      "--task-file", "/abs/body.md",
+      "--config-root", "/abs/config",
+      "--task-body", "inline",
+    ]),
+  ).toThrow("revise-task does not accept --task-body; the revised task body is never passed inline or through argv - use --task-file");
+  expect(() =>
+    parseCommand("revise-task", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--task-id", "task-a",
+      "--task-file", "/abs/body.md",
+      "--config-root", "/abs/config",
+      "--pipeline-root", "/abs/pipeline",
+    ]),
+  ).toThrow("revise-task does not accept --pipeline-root; the pipeline comes only from the durable state");
+});
+
+test("revise-task rejects unknown flags and positional arguments", () => {
+  expect(() =>
+    parseCommand("revise-task", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--task-id", "task-a",
+      "--task-file", "/abs/body.md",
+      "--config-root", "/abs/config",
+      "--unknown",
+    ]),
+  ).toThrow("unknown argument: --unknown");
+  expect(() =>
+    parseCommand("revise-task", [
+      "--run-id", "run-1",
+      "--wait-index", "1",
+      "--task-id", "task-a",
+      "--task-file", "/abs/body.md",
+      "--config-root", "/abs/config",
+      "positional",
+    ]),
+  ).toThrow("unknown argument: positional");
+});
+
+test("usage documents the production pipeline v2 revise-task command and the file-only task body", () => {
+  const text = usage();
+  expect(text).toContain("revise-task  production pipeline v2 task revision intervention");
+  expect(text).toContain("revise-task flags (production pipeline v2 task revision intervention)");
+  expect(text).toContain("--task-id SAFE_ID");
+  expect(text).toContain("--task-file PATH");
+  expect(text).toContain("The body is never passed");
+  expect(text).toContain("inline or through argv (there is no --task-body flag)");
+  expect(text).toContain("an empty file is a CLI contract error");
+  expect(text).toContain("without trimming, normalizing line endings or adding a");
+  expect(text).toContain("trailing newline");
+  expect(text).toContain("fixed as 'revise_task'");
+  expect(text).toContain("orchestrator revise-task");
+  expect(text).toContain("performs the revise_task task revision intervention");
+  // the stale claim is removed; the generic respond stays fail-closed
+  expect(text).not.toContain("no dedicated CLI path");
+  expect(text).toContain("the 'revise_task' intervention via 'orchestrator revise-task'");
+  expect(text).toContain("generic respond fail-closes on them");
 });
 
 test("smoke and agent-smoke parsing is unchanged", () => {

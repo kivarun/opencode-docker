@@ -56,13 +56,25 @@ export interface ParsedPipelineContinueStageArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineReviseTaskArgs {
+  readonly kind: "revise-task";
+  readonly runId: string;
+  readonly waitIndex: number;
+  readonly taskId: string;
+  readonly taskFile: string;
+  readonly configRoot: string;
+  readonly launcherId?: string;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
   | ParsedPipelineRunArgs
   | ParsedPipelineResumeArgs
   | ParsedPipelineRespondArgs
-  | ParsedPipelineContinueStageArgs;
+  | ParsedPipelineContinueStageArgs
+  | ParsedPipelineReviseTaskArgs;
 
 export function usage(): string {
   return [
@@ -89,11 +101,16 @@ export function usage(): string {
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
     "               continuation is the separate 'orchestrator resume' command",
-    "  continue-stage production pipeline v2 stage intervention: grant extra stage",
-    "               iterations and resume the run in one operation (the exact",
-    "               'continue_stage' intervention: intent -> grant -> iteration",
-    "               closure -> response -> reopened iteration -> immediate resume)",
-    "",
+  "  continue-stage production pipeline v2 stage intervention: grant extra stage",
+  "               iterations and resume the run in one operation (the exact",
+  "               'continue_stage' intervention: intent -> grant -> iteration",
+  "               closure -> response -> reopened iteration -> immediate resume)",
+  "  revise-task  production pipeline v2 task revision intervention: replace one",
+  "               stage task with a new body and resume the run in one operation",
+  "               (the exact 'revise_task' intervention: intent -> task revision",
+  "               -> replanned iteration closure -> response -> planning",
+  "               execution -> new plan revision)",
+  "",
     "common flags:",
     "  --workspace PATH        workspace passed to 'docker-helper session create'; must exist",
     "                          and be visible to the orchestrator at the same absolute path",
@@ -151,9 +168,9 @@ export function usage(): string {
   "  The special intervention action ids ('continue_stage', 'revise_task') are",
   "  handled by dedicated commands and the generic respond fail-closes on them",
   "  (exit 1, reason invalid_state) before any response publication: the",
-  "  'continue_stage' intervention runs via 'orchestrator continue-stage',",
-  "  while 'revise_task' has no dedicated CLI path yet. The durable state",
-  "  stays untouched by the fail-closed rejection.",
+  "  'continue_stage' intervention runs via 'orchestrator continue-stage' and",
+  "  the 'revise_task' intervention via 'orchestrator revise-task'. The durable",
+  "  state stays untouched by the fail-closed rejection.",
     "",
     "resume flags (production pipeline v2 continuation):",
     "  --run-id SAFE_ID        the run id of the already durable run; required; a safe",
@@ -200,16 +217,57 @@ export function usage(): string {
     "                          (no progress lines); worker and image-pull output is forwarded",
     "                          to stderr; the exit code is the outcome's exit code.",
     "",
-    "  continue-stage answers one open 'continue_stage' wait and immediately resumes",
-    "  the run as one operation: it accepts the user's intent, grants the requested",
-    "  additional stage iterations, closes the interrupted iteration, records the",
-    "  response, reopens the next iteration and continues with the successor stage",
-    "  execution. The action is fixed as 'continue_stage' (the command accepts no",
-    "  --action flag) and never accepts a target state, a stage id, a plan digest,",
-    "  the initial budget, a prepared intent or a compiled plan - every internal",
-    "  intervention parameter is derived from the authoritative durable state. It",
-    "  accepts no fresh-run flags and no state-root flags.",
-    "",
+  "  continue-stage answers one open 'continue_stage' wait and immediately resumes",
+  "  the run as one operation: it accepts the user's intent, grants the requested",
+  "  additional stage iterations, closes the interrupted iteration, records the",
+  "  response, reopens the next iteration and continues with the successor stage",
+  "  execution. The action is fixed as 'continue_stage' (the command accepts no",
+  "  --action flag) and never accepts a target state, a stage id, a plan digest,",
+  "  the initial budget, a prepared intent or a compiled plan - every internal",
+  "  intervention parameter is derived from the authoritative durable state. It",
+  "  accepts no fresh-run flags and no state-root flags.",
+  "",
+  "revise-task flags (production pipeline v2 task revision intervention):",
+  "  --run-id SAFE_ID        the run id of the durably waiting run; required; a safe",
+  "                          identifier (letters, digits, '_', '.', '-', at most 128",
+  "                          characters)",
+  "  --wait-index N          the wait journal index of the open 'revise_task' wait;",
+  "                          required; a positive decimal integer without sign,",
+  "                          leading zeros, fraction, exponent or whitespace",
+  "  --task-id SAFE_ID       the task id to revise; required; a safe identifier.",
+  "                          The current task revision is derived from the durable",
+  "                          plan, never from the ledger tail.",
+  "  --task-file PATH        a file whose UTF-8 content is the revised task body;",
+  "                          required; absolute path. The body is never passed",
+  "                          inline or through argv (there is no --task-body flag):",
+  "                          the command reads the file exactly once as UTF-8 text",
+  "                          without trimming, normalizing line endings or adding a",
+  "                          trailing newline; an empty file is a CLI contract error",
+  "                          and the runner is never invoked. The file path and the",
+  "                          body never appear in the outcome, the durable state or",
+  "                          any diagnostic.",
+  "  --config-root PATH      operator-controlled configuration root holding",
+  "                          profiles/<name>.yaml and the OpenCode configurations;",
+  "                          required; absolute path. Profiles are trusted operator",
+  "                          configuration and are loaded again by the intervention;",
+  "                          the pipeline execution identity is verified by the",
+  "                          durable digest.",
+  "  --launcher-id DHL_ID    fail unless the installed credential belongs to this launcher",
+  "  --json                  print exactly one JSON PipelineV2RunOutcome document on stdout",
+  "                          (no progress lines); worker and image-pull output is forwarded",
+  "                          to stderr; the exit code is the outcome's exit code.",
+  "",
+  "  revise-task answers one open 'revise_task' wait and resumes the run as one",
+  "  operation: it accepts the user's intent, accepts the revised task body as a",
+  "  new durable task revision, closes the interrupted iteration as replanned,",
+  "  records the response and continues with the architect planning execution and",
+  "  the next plan revision. The action is fixed as 'revise_task' (the command",
+  "  accepts no --action flag) and never accepts a target state, a stage id, a",
+  "  plan digest, the initial budget, a prepared intent, a candidate task",
+  "  revision or a compiled plan - every internal intervention parameter is",
+  "  derived from the authoritative durable state. It accepts no fresh-run flags",
+  "  and no state-root flags.",
+  "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
     "    <state-root>/pipeline-runs/<run-id>/state.json",
@@ -256,17 +314,20 @@ export function usage(): string {
     "agent result contract. Any other structurally valid pipeline is rejected before",
     "Launcher authentication and before any child Session is created.",
     "",
-    "agent-smoke is the v1 diagnostic command; the production pipeline v2 path is",
-    "'orchestrator run', 'orchestrator resume' continues an already durable run",
-    "from its clean active boundary (the run id and the configuration root are the",
-    "only user inputs of a resume), and 'orchestrator respond' records the user's",
-    "answer to one durably open wait (the run id, the wait index and the action id",
-    "are the only user inputs of a response), and 'orchestrator continue-stage'",
-    "performs the continue_stage stage intervention and resumes the run in one",
-    "operation (the run id, the wait index, the additional iteration count and the",
-    "configuration root are the only user inputs).",
-    "",
-    "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
+  "agent-smoke is the v1 diagnostic command; the production pipeline v2 path is",
+  "'orchestrator run', 'orchestrator resume' continues an already durable run",
+  "from its clean active boundary (the run id and the configuration root are the",
+  "only user inputs of a resume), 'orchestrator respond' records the user's",
+  "answer to one durably open wait (the run id, the wait index and the action id",
+  "are the only user inputs of a response), 'orchestrator continue-stage'",
+  "performs the continue_stage stage intervention and resumes the run in one",
+  "operation (the run id, the wait index, the additional iteration count and the",
+  "configuration root are the only user inputs), and 'orchestrator revise-task'",
+  "performs the revise_task task revision intervention and resumes the run in",
+  "one operation (the run id, the wait index, the task id, the task-body file",
+  "and the configuration root are the only user inputs).",
+  "",
+  "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
     "input path come only from the pipeline's agent state, the worker image comes",
     "only from the selected profile.",
     "",
@@ -338,7 +399,7 @@ function parseValue(argv: string[], i: number, flag: string): { value: string; n
 }
 
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -352,6 +413,9 @@ export function parseCommand(
   }
   if (kind === "continue-stage") {
     return parseContinueStageArgs(argv);
+  }
+  if (kind === "revise-task") {
+    return parseReviseTaskArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;
@@ -974,4 +1038,188 @@ function parseContinueStageArgs(argv: string[]): ParsedPipelineContinueStageArgs
 
 function defaultWorkspace(): string {
   return process.env.SMOKE_WORKSPACE?.trim() || "/workspace";
+}
+
+/**
+ * Parses the production pipeline v2 revise-task intervention command. The
+ * user-facing contract: `--run-id` and `--task-id` (both safe-id
+ * validated), `--wait-index` (canonical positive decimal safe integer) and
+ * `--task-file` and `--config-root` (both absolute) are required
+ * singletons; `--launcher-id` and `--json` are optional singletons. The
+ * intervention action is fixed by the runner entrypoint as `revise_task`
+ * (no `--action` flag), and the revised task body is never passed inline
+ * or through argv (no `--task-body` flag): the dispatcher reads the file
+ * exactly once as UTF-8 text. The caller can never pass a target state, a
+ * stage id, a plan digest, the initial budget, a prepared intent, a
+ * candidate task revision or a compiled plan: every fresh-run, respond,
+ * continue-stage and state-root flag is rejected for `revise-task`, as is
+ * every unknown flag or positional argument.
+ */
+function parseReviseTaskArgs(argv: string[]): ParsedPipelineReviseTaskArgs {
+  let runId: string | null = null;
+  let waitIndex: number | null = null;
+  let taskId: string | null = null;
+  let taskFile: string | null = null;
+  let configRoot: string | null = null;
+  let launcherId: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      if (runId !== null) {
+        throw new Error("--run-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      const { value, next } = parseValue(argv, i, "--wait-index");
+      if (waitIndex !== null) {
+        throw new Error("--wait-index may be given at most once");
+      }
+      waitIndex = parsePositiveDecimalSafeInteger(value, "--wait-index");
+      i = next;
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      const { value, next } = parseValue(argv, i, "--task-id");
+      if (taskId !== null) {
+        throw new Error("--task-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--task-id");
+      } catch (cause) {
+        throw new Error(
+          `--task-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      taskId = value;
+      i = next;
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      const { value, next } = parseValue(argv, i, "--task-file");
+      if (taskFile !== null) {
+        throw new Error("--task-file may be given at most once");
+      }
+      if (value === "") {
+        throw new Error("--task-file must be an absolute path");
+      }
+      if (!value.startsWith("/")) {
+        throw new Error("--task-file must be an absolute path");
+      }
+      taskFile = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      if (configRoot !== null) {
+        throw new Error("--config-root may be given at most once");
+      }
+      if (!value.startsWith("/")) {
+        throw new Error("--config-root must be an absolute path");
+      }
+      configRoot = value;
+      i = next;
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      const { value, next } = parseValue(argv, i, "--launcher-id");
+      if (!value.startsWith("dhl_")) {
+        throw new Error("--launcher-id must be a launcher ID (dhl_...)");
+      }
+      if (launcherId !== undefined) {
+        throw new Error("--launcher-id may be given at most once");
+      }
+      launcherId = value;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "revise-task does not accept --action; the intervention action is fixed as revise_task by the runner entrypoint",
+      );
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error(
+        "revise-task does not accept --task-body; the revised task body is never passed inline or through argv - use --task-file",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "revise-task does not accept --additional-iterations; the task revision grants no stage iterations",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "revise-task does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error(
+        "revise-task does not accept --project; the run-owned project copy already exists in the run root",
+      );
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error(
+        "revise-task does not accept --input; the run-owned input snapshot already exists in the run root",
+      );
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error(
+        "revise-task does not accept --workspace; the run-owned project copy is mounted from the run root",
+      );
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error(
+        "revise-task does not accept --image; the worker image comes only from the selected profile",
+      );
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error(
+        "revise-task does not accept --profile; the execution profiles are selected by the pipeline's agent states",
+      );
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error(
+        "revise-task does not accept --task; the revised task body is passed only through --task-file",
+      );
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "revise-task does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "revise-task does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      // Every internal policy field (stage/plan/generation/iteration
+      // identifiers, digests, intent, candidate, compiled plan, budget)
+      // has no CLI flag: anything else is an unknown argument.
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for revise-task");
+  }
+  if (waitIndex === null) {
+    throw new Error("--wait-index POSITIVE_INTEGER is required for revise-task");
+  }
+  if (taskId === null) {
+    throw new Error("--task-id SAFE_ID is required for revise-task");
+  }
+  if (taskFile === null) {
+    throw new Error("--task-file ABSOLUTE_PATH is required for revise-task");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABSOLUTE_PATH is required for revise-task");
+  }
+  return {
+    kind: "revise-task",
+    runId,
+    waitIndex,
+    taskId,
+    taskFile,
+    configRoot,
+    launcherId,
+    json,
+  };
 }

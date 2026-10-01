@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import type { CliResult, CliRunOptions, CliStdio } from "../src/docker_helper.ts
 import { resolveHelperConfig } from "../src/launcher.ts";
 import {
   continuePipelineV2Stage,
+  revisePipelineV2Task,
   type PipelineV2RunnerDeps,
   type PipelineV2RunOutcome,
 } from "../src/pipeline_v2_runner.ts";
@@ -78,6 +80,9 @@ function makeIo(): Recorder {
     continuePipelineV2Stage: (async () => {
       throw new Error("fake continuePipelineV2Stage not configured");
     }) as unknown as CliIo["continuePipelineV2Stage"],
+    revisePipelineV2Task: (async () => {
+      throw new Error("fake revisePipelineV2Task not configured");
+    }) as unknown as CliIo["revisePipelineV2Task"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake respondPipelineV2Wait not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -87,6 +92,9 @@ function makeIo(): Recorder {
     runAgentSmoke: (async () => {
       throw new Error("fake runAgentSmoke not configured");
     }) as unknown as CliIo["runAgentSmoke"],
+    readTaskFile: async () => {
+      throw new Error("fake readTaskFile not configured");
+    },
     writeStdout: (text) => out.push(text),
     writeError: (text) => err.push(text),
   };
@@ -671,6 +679,381 @@ test("the continue-stage command appears in the command list and unknown command
   expect(err.join("\n")).toContain("'orchestrator continue-stage'");
 });
 
+// --- revise-task dispatcher --------------------------------------------------
+
+const REVISE_TASK_ARGS = [
+  "revise-task",
+  "--run-id", "rid-1",
+  "--wait-index", "2",
+  "--task-id", "task-a",
+  "--task-file", "/abs/body.md",
+  "--config-root", "/abs/config",
+  "--launcher-id", "dhl_l1",
+];
+
+test("runCli routes revise-task to revisePipelineV2Task exactly once with the task file read once", async () => {
+  const { io, out, err } = makeIo();
+  const calls: Array<{ options: unknown }> = [];
+  io.revisePipelineV2Task = (async (options: unknown) => {
+    calls.push({ options });
+    return runOutcome({});
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  let fileReads = 0;
+  io.readTaskFile = async () => {
+    fileReads += 1;
+    return "REVISED BODY\n";
+  };
+  const exit = await runCli(REVISE_TASK_ARGS, io);
+  expect(exit).toBe(0);
+  expect(calls.length).toBe(1);
+  expect(fileReads).toBe(1);
+  expect(calls[0]!.options).toEqual({
+    runId: "rid-1",
+    waitIndex: 2,
+    taskId: "task-a",
+    taskBody: "REVISED BODY\n",
+    configRoot: "/abs/config",
+    launcherId: "dhl_l1",
+  });
+  // human mode: the summary line goes to stderr, stdout stays empty
+  expect(out).toEqual([]);
+  expect(err.join("\n")).toContain("orchestrator: revise-task ok (run rid-1");
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+  // the body and the path never appear in any output or diagnostic
+  expect(JSON.stringify(err)).not.toContain("REVISED BODY");
+  expect(JSON.stringify(err)).not.toContain("/abs/body.md");
+  expect(JSON.stringify(out)).not.toContain("/abs/body.md");
+});
+
+test("revise-task passes the exact file content unchanged, including whitespace and the final newline", async () => {
+  const { io } = makeIo();
+  const bodies: string[] = [];
+  io.revisePipelineV2Task = (async (options: unknown) => {
+    bodies.push((options as Record<string, unknown>).taskBody as string);
+    return runOutcome({});
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  let fileReads = 0;
+  io.readTaskFile = async () => {
+    fileReads += 1;
+    return "\n  revised body with leading/trailing space  \t\n\n";
+  };
+  const exit = await runCli(REVISE_TASK_ARGS, io);
+  expect(exit).toBe(0);
+  expect(fileReads).toBe(1);
+  // no trim, no newline normalization, no added trailing newline
+  expect(bodies).toEqual(["\n  revised body with leading/trailing space  \t\n\n"]);
+});
+
+test("revise-task calls no other production API", async () => {
+  const { io } = makeIo();
+  for (const key of [
+    "runPipelineV2",
+    "resumePipelineV2",
+    "continuePipelineV2Stage",
+    "respondPipelineV2Wait",
+    "runSmoke",
+    "runAgentSmoke",
+  ] as const) {
+    io[key] = (async () => {
+      throw new Error(`${key} must not run`);
+    }) as never;
+  }
+  io.revisePipelineV2Task = (async () => runOutcome({})) as unknown as CliIo["revisePipelineV2Task"];
+  io.readTaskFile = async () => "BODY\n";
+  const exit = await runCli(REVISE_TASK_ARGS, io);
+  expect(exit).toBe(0);
+});
+
+test("revise-task parse failures return exit 2 before any resolver, file or runner call", async () => {
+  for (const argv of [
+    ["revise-task"],
+    ["revise-task", "--run-id", "rid"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--config-root", "/c"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "0", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "/c"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "relative", "--config-root", "/c"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "relative"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "/c", "--task-body", "inline"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "/c", "--action", "revise_task"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "/c", "--launcher-id", "x"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "/c", "--json", "--json"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "/c", "positional"],
+    ["revise-task", "--run-id", "rid", "--wait-index", "1", "--task-id", "task", "--task-file", "/abs/b.md", "--config-root", "/c", "--unknown"],
+  ]) {
+    const { io, err } = makeIo();
+    let resolverCalls = 0;
+    let fileReads = 0;
+    let runnerCalls = 0;
+    let facadeCalls = 0;
+    io.resolveStateRootProjection = () => {
+      resolverCalls += 1;
+      return { localRoot: "/state", daemonRoot: "/state" };
+    };
+    io.resolveHelperConfig = () => {
+      resolverCalls += 1;
+      return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+    };
+    io.readTaskFile = async () => {
+      fileReads += 1;
+      return "BODY";
+    };
+    io.runner.run = () => {
+      runnerCalls += 1;
+      return Promise.resolve({ code: 0 });
+    };
+    io.revisePipelineV2Task = (async () => {
+      facadeCalls += 1;
+      return runOutcome({});
+    }) as unknown as CliIo["revisePipelineV2Task"];
+    const exit = await runCli(argv, io);
+    expect(exit).toBe(2);
+    expect(resolverCalls).toBe(0);
+    expect(fileReads).toBe(0);
+    expect(runnerCalls).toBe(0);
+    expect(facadeCalls).toBe(0);
+    expect(err.join("\n")).not.toContain(CANARY_SECRET);
+  }
+});
+
+test("revise-task state-root and helper-config resolution failures are CLI configuration errors", async () => {
+  const { io, err } = makeIo();
+  let fileReads = 0;
+  let facadeCalls = 0;
+  io.revisePipelineV2Task = (async () => {
+    facadeCalls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  io.readTaskFile = async () => {
+    fileReads += 1;
+    return "BODY";
+  };
+  io.resolveStateRootProjection = () => {
+    throw new Error("cannot build the orchestrator state root: set ORCHESTRATOR_STATE_ROOT (or XDG_STATE_HOME or HOME)");
+  };
+  const exit = await runCli(REVISE_TASK_ARGS, io);
+  expect(exit).toBe(2);
+  expect(fileReads).toBe(0);
+  expect(facadeCalls).toBe(0);
+  expect(err.join("\n")).toContain("cannot build the orchestrator state root");
+
+  const { io: io2, err: err2 } = makeIo();
+  let fileReads2 = 0;
+  io2.revisePipelineV2Task = (async () => {
+    throw new Error("the runner must not run");
+  }) as never;
+  io2.readTaskFile = async () => {
+    fileReads2 += 1;
+    return "BODY";
+  };
+  io2.resolveHelperConfig = () => {
+    throw new Error("helper configuration exploded");
+  };
+  const exit2 = await runCli(REVISE_TASK_ARGS, io2);
+  expect(exit2).toBe(2);
+  expect(fileReads2).toBe(0);
+  expect(err2.join("\n")).toContain("helper configuration exploded");
+});
+
+test("revise-task resolves the state-root projection before the helper configuration", async () => {
+  const { io, err } = makeIo();
+  let helperResolverCalls = 0;
+  io.revisePipelineV2Task = (async () => runOutcome({})) as unknown as CliIo["revisePipelineV2Task"];
+  io.readTaskFile = async () => "BODY";
+  io.resolveStateRootProjection = () => {
+    if (helperResolverCalls > 0) {
+      throw new Error("the helper configuration was resolved before the state-root projection");
+    }
+    return { localRoot: "/state/root", daemonRoot: "/daemon/root" };
+  };
+  io.resolveHelperConfig = () => {
+    helperResolverCalls += 1;
+    return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+  };
+  const exit = await runCli(REVISE_TASK_ARGS, io);
+  expect(exit).toBe(0);
+  expect(helperResolverCalls).toBe(1);
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+});
+
+test("revise-task task-file read failures and an empty file are contract errors with content-free messages", async () => {
+  // a read failure: no path, no body, no hostile filesystem error echo
+  const { io, err } = makeIo();
+  let facadeCalls = 0;
+  let resolverCalls = 0;
+  io.revisePipelineV2Task = (async () => {
+    facadeCalls += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  io.resolveStateRootProjection = () => {
+    resolverCalls += 1;
+    return { localRoot: "/state", daemonRoot: "/state" };
+  };
+  io.resolveHelperConfig = () => {
+    resolverCalls += 1;
+    return { socketPath: "/run/dh.sock", credentialFile: "/creds/token" };
+  };
+  const hostilePath = "/abs/secret/body.md";
+  io.readTaskFile = async () => {
+    const cause = new Error("EACCES: permission denied, open '/hostile/machine/path/body.md'");
+    (cause as { code?: string }).code = "EACCES";
+    throw cause;
+  };
+  const exit = await runCli(
+    ["revise-task", "--run-id", "rid-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", hostilePath, "--config-root", "/abs/config"],
+    io,
+  );
+  expect(exit).toBe(2);
+  expect(facadeCalls).toBe(0);
+  expect(resolverCalls).toBe(2);
+  // the path, the hostile error text and the errno code are absent
+  expect(err.join("\n")).not.toContain(hostilePath);
+  expect(err.join("\n")).not.toContain("/hostile/machine/path");
+  expect(err.join("\n")).not.toContain("EACCES");
+  expect(err.join("\n")).not.toContain("permission denied");
+  expect(err.join("\n")).toContain("revise-task could not read the task file");
+  expect(err.join("\n")).toContain("usage: orchestrator");
+
+  // an empty file: the same contract-error shape, content-free
+  const { io: io2, err: err2 } = makeIo();
+  let facadeCalls2 = 0;
+  io2.revisePipelineV2Task = (async () => {
+    facadeCalls2 += 1;
+    return runOutcome({});
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  io2.readTaskFile = async () => "";
+  const exit2 = await runCli(
+    ["revise-task", "--run-id", "rid-1", "--wait-index", "1", "--task-id", "task-a", "--task-file", "/abs/empty.md", "--config-root", "/abs/config"],
+    io2,
+  );
+  expect(exit2).toBe(2);
+  expect(facadeCalls2).toBe(0);
+  expect(err2.join("\n")).not.toContain("/abs/empty.md");
+  expect(err2.join("\n")).toContain("revise-task requires a non-empty task body");
+  expect(err2.join("\n")).toContain("usage: orchestrator");
+});
+
+test("revise-task human mode prints the content-free summary lines", async () => {
+  const { io, err, out } = makeIo();
+  io.revisePipelineV2Task = (async () => runOutcome({})) as unknown as CliIo["revisePipelineV2Task"];
+  io.readTaskFile = async () => "BODY";
+  const exit = await runCli(REVISE_TASK_ARGS, io);
+  expect(exit).toBe(0);
+  expect(out).toEqual([]);
+  expect(err).toEqual([
+    "orchestrator: revise-task ok (run rid-1, state /state/root/pipeline-runs/rid-1/state.json, outputs /state/root/pipeline-runs/rid-1/outputs)",
+  ]);
+
+  const { io: io2, err: err2 } = makeIo();
+  io2.revisePipelineV2Task = (async () =>
+    runOutcome({ ok: false, exitCode: 1, reason: "invalid_state" })) as unknown as CliIo["revisePipelineV2Task"];
+  io2.readTaskFile = async () => "BODY";
+  const exit2 = await runCli(REVISE_TASK_ARGS, io2);
+  expect(exit2).toBe(1);
+  expect(err2).toEqual([
+    "orchestrator: revise-task failed (run rid-1, reason invalid_state, state /state/root/pipeline-runs/rid-1/state.json)",
+  ]);
+
+  // a pre-run-root refusal prints no summary line
+  const { io: io3, err: err3 } = makeIo();
+  io3.revisePipelineV2Task = (async () =>
+    runOutcome({ ok: false, exitCode: 1, runId: "", runRoot: null })) as unknown as CliIo["revisePipelineV2Task"];
+  io3.readTaskFile = async () => "BODY";
+  const exit3 = await runCli(REVISE_TASK_ARGS, io3);
+  expect(exit3).toBe(1);
+  expect(err3).toEqual([]);
+});
+
+test("revise-task JSON mode prints exactly one outcome document on stdout", async () => {
+  const { io, out, err } = makeIo();
+  const result = runOutcome({ ok: false, exitCode: 1, reason: "run_input_modified" });
+  io.revisePipelineV2Task = (async () => {
+    io.writeError("orchestrator: launcher credential ok (launcher dhl_l1)");
+    return result;
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  io.readTaskFile = async () => "BODY";
+  const exit = await runCli([...REVISE_TASK_ARGS, "--json"], io);
+  expect(exit).toBe(1);
+  expect(out).toEqual([`${JSON.stringify(result)}\n`]);
+  expect(err).toContain("orchestrator: launcher credential ok (launcher dhl_l1)");
+  expect(out.join("")).not.toContain(CANARY_SECRET);
+  const document = JSON.parse(out[0]!) as Record<string, unknown>;
+  expect(Object.keys(document).sort()).toEqual(
+    ["exitCode", "ok", "runId", "runRoot", "reason", "state"].sort(),
+  );
+  expect(document.reason).toBe("run_input_modified");
+});
+
+test("revise-task JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
+  const { io, out, runnerCalls } = makeIo();
+  io.revisePipelineV2Task = (async (_options: unknown, deps: unknown) => {
+    const cli = (deps as Record<string, unknown>).cli as (
+      args: string[],
+      env: Record<string, string>,
+      stdio: CliStdio,
+      opts?: CliRunOptions,
+    ) => Promise<CliResult>;
+    await cli(["pull", "--endpoint", "/sock", "img:1"], {}, "inherit");
+    await cli(["run", "--format", "json"], {}, "inherit", { signalOnAbort: true, timeoutSeconds: 60 });
+    await cli(["session", "create"], {}, "capture");
+    await cli(["session", "delete"], {}, "capture");
+    return runOutcome({});
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  io.readTaskFile = async () => "BODY";
+  await runCli([...REVISE_TASK_ARGS, "--json"], io);
+  const inheritCalls = runnerCalls.filter((call) => call.args[0] === "pull" || call.args[0] === "run");
+  expect(inheritCalls.length).toBe(2);
+  for (const call of inheritCalls) {
+    expect(call.stdio).toBe("stderr");
+  }
+  const captureCalls = runnerCalls.filter((call) => call.args[0] === "session");
+  expect(captureCalls.length).toBe(2);
+  for (const call of captureCalls) {
+    expect(call.stdio).toBe("capture");
+  }
+  expect(out).toEqual([`${JSON.stringify(runOutcome({}))}\n`]);
+});
+
+test("revise-task exit codes 0/1/130/143 pass through unchanged", async () => {
+  for (const code of [0, 1, 130, 143]) {
+    const { io } = makeIo();
+    io.revisePipelineV2Task = (async () =>
+      runOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["revisePipelineV2Task"];
+    io.readTaskFile = async () => "BODY";
+    const exit = await runCli(REVISE_TASK_ARGS, io);
+    expect(exit).toBe(code);
+  }
+});
+
+test("revise-task deps.cli is wired to the single runner instance", async () => {
+  const { io, out, err, runnerCalls } = makeIo();
+  io.revisePipelineV2Task = (async (_options: unknown, deps: unknown) => {
+    const cli = (deps as Record<string, unknown>).cli as (
+      args: string[],
+      env: Record<string, string>,
+      stdio: CliStdio,
+      opts?: CliRunOptions,
+    ) => Promise<CliResult>;
+    await cli(["session", "list"], {}, "capture");
+    return runOutcome({});
+  }) as unknown as CliIo["revisePipelineV2Task"];
+  io.readTaskFile = async () => "BODY";
+  const exit = await runCli(REVISE_TASK_ARGS, io);
+  expect(exit).toBe(0);
+  expect(runnerCalls).toHaveLength(1);
+  expect(runnerCalls[0]!.args).toEqual(["session", "list"]);
+  expect(err.join("\n")).not.toContain(CANARY_SECRET);
+  expect(out).toEqual([]);
+});
+
+test("the revise-task command appears in the command list and unknown commands are still rejected", async () => {
+  const { io, err } = makeIo();
+  const exit = await runCli(["deploy"], io);
+  expect(exit).toBe(2);
+  expect(err.join("\n")).toContain("'orchestrator revise-task'");
+});
+
 test("resume dispatches exactly once to resumePipelineV2 with the exact options mapping", async () => {
   const { io, err } = makeIo();
   const calls: Array<{ options: unknown; deps: unknown }> = [];
@@ -1229,6 +1612,313 @@ states:
     type: terminal
     result: success
 `;
+
+// --- the real revise-task end-to-end proof -----------------------------------
+
+test("revise-task end-to-end with the real production runner: the honest waiting prefix, the exact eleven-command suffix and the task revision digest of the exact file body", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cli-revise-task-"));
+  try {
+    const bundle = join(root, "bundle");
+    mkdirSync(join(bundle, "prompts"), { recursive: true });
+    writeFileSync(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+    writeFileSync(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
+    const configRoot = join(root, "config");
+    mkdirSync(join(configRoot, "profiles"), { recursive: true });
+    mkdirSync(join(configRoot, "opencode"), { recursive: true });
+    writeFileSync(
+      join(configRoot, "profiles", "coder.yaml"),
+      [
+        "schema_version: 1",
+        "image: ghcr.io/example/worker:1",
+        "opencode_config: opencode/coder.json",
+        "env:",
+        "  MODEL_API_KEY:",
+        "    from_env: CODER_SOURCE_VAR_1",
+        "    required: true",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(configRoot, "opencode", "coder.json"), JSON.stringify({ model: "glm53-flash" }));
+    const sources = join(root, "userdata");
+    mkdirSync(sources, { recursive: true });
+    writeFileSync(join(sources, "task.md"), "TASK-BODY\n");
+    const projectSource = join(root, "project-source");
+    mkdirSync(projectSource, { recursive: true });
+    const stateRoot = join(root, "state");
+    mkdirSync(stateRoot, { recursive: true });
+    const credDir = join(root, "cred", "docker-helper");
+    mkdirSync(credDir, { recursive: true, mode: 0o700 });
+    const credentialFile = join(credDir, "credential.token");
+    writeFileSync(credentialFile, "cred-token-not-real\n", { mode: 0o600 });
+    const RUN_ID = "revise-task-run";
+    const runRoot = join(stateRoot, "pipeline-runs", RUN_ID);
+    mkdirSync(join(stateRoot, "pipeline-runs"), { mode: 0o700 });
+    mkdirSync(runRoot, { mode: 0o700 });
+
+    // the real task-body file: exact content with whitespace and a final
+    // newline, passed to the runner byte-for-byte
+    const TASK_BODY_FILE = join(root, "revised-task.md");
+    const TASK_BODY = "REVISED-CLI-TASK-BODY\n\n  with trailing spaces  \n";
+    writeFileSync(TASK_BODY_FILE, TASK_BODY);
+
+    let clockValue = 0;
+    const nextTick = (): Date => {
+      clockValue += 1;
+      return new Date(Date.UTC(2026, 0, 1, 0, 0, clockValue));
+    };
+
+    // the honest waiting prefix through the production facades only
+    const pipeline = await loadPipelineV2(bundle);
+    const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
+    await prepareRunProject(projectSource, runRoot);
+    const runInputs: RunInputsSnapshot = await snapshotRunInputs(
+      pipeline,
+      [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
+      runRoot,
+    );
+    await sink.dispatch({
+      kind: "create_run",
+      runId: RUN_ID,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline),
+      inputs: runInputs.inputs.map((entry) => ({
+        id: entry.id,
+        type: entry.type,
+        protected: entry.protected,
+        digest: entry.digest,
+      })),
+    });
+    const accepted: AcceptedStateOutput[] = [];
+    const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {
+      const activation: PreparedActivationData = await prepareActivationData(
+        pipeline,
+        runInputs,
+        accepted,
+        stateId,
+        executionIndex,
+      );
+      await sink.dispatch({
+        kind: "start_agent_execution",
+        stateId,
+        profile: "coder",
+        ...startRoleArgs(pipeline, stateId, sink.snapshot),
+      });
+      await sink.dispatch({ kind: "agent_data_prepared" });
+      await sink.dispatch({ kind: "agent_execution_session_created", sessionId: `exec-${executionIndex}` });
+      await sink.dispatch({ kind: "agent_tool_session_created", sessionId: `tool-${executionIndex}` });
+      await sink.dispatch({ kind: "agent_running" });
+      const records = await acceptActivationOutputs(pipeline, activation);
+      await sink.dispatch({
+        kind: "agent_outputs_accepted",
+        outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+      });
+      await sink.dispatch({ kind: "agent_cleanup_completed" });
+      if (commit) {
+        await sink.dispatch({
+          kind: "transition_committed",
+          step: { from: stateId, outcome: "completed", to: stateId === "architect" ? "dev_entry" : "architect", transition_index: 0 },
+          executionIndex,
+        });
+      }
+      accepted.push(...records);
+    };
+    await runAgentStep("architect", 1, false);
+    const taskA = prepareTaskRevisionManifest({
+      schema_version: 1,
+      kind: "task_revision",
+      run_id: RUN_ID,
+      task_id: "task-a",
+      revision: 1,
+      previous_sha256: null,
+      origin: "planning_proposal",
+      body: "PLAN-TASK-BODY",
+    });
+    const plan1 = preparePlanRevisionManifest({
+      schema_version: 1,
+      kind: "plan_revision",
+      run_id: RUN_ID,
+      revision: 1,
+      previous_sha256: null,
+      root_task: { input_id: "task", sha256: runInputs.inputs[0]?.digest ?? "" },
+      origin_execution: 1,
+      stages: [
+        {
+          id: "stage-1",
+          template: "development",
+          tasks: [{ id: "task-a", revision: 1, sha256: taskA.sha256, depends_on: [] }],
+        },
+      ],
+    });
+    const candidate = preparePipelineV2RunPlanCandidate({
+      plan: plan1,
+      taskRevisions: [taskA],
+      previousPlan: null,
+      previousTaskRevisions: [],
+      protectedInputDigest: runInputs.inputs[0]?.digest ?? "",
+    });
+    const acceptedPlan = await acceptPipelineV2RunPlanCandidate({
+      pipeline,
+      runRoot,
+      sink,
+      candidate,
+    });
+    await ensurePipelineV2StageIteration({
+      compiledPlan: acceptedPlan.compiled_plan,
+      stageId: "stage-1",
+      initialBudget: 2,
+      sink,
+    });
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    await runAgentStep("dev_entry", 2, true);
+    await enterPipelineV2Wait({
+      runRoot,
+      sink,
+      reason: "stage_iteration_limit_exhausted",
+      actions: [
+        { id: "continue_stage", to: "dev_entry" },
+        { id: "revise_task", to: "architect" },
+      ],
+    });
+    const prefixState = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
+
+    // the real CLI call with the real production module and the real file
+    // read: no in-memory pipeline, compiled plan or intent is passed - the
+    // CLI options are the only inputs
+    const { io, out, err } = makeIo();
+    io.baseEnv = { ...io.baseEnv, CODER_SOURCE_VAR_1: "tester-secret" };
+    let sessionCreates = 0;
+    const sessionDeletes: string[] = [];
+    io.runner.run = async (args: string[]) => {
+      if (args[0] === "session" && args[1] === "create") {
+        sessionCreates += 1;
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            ok: true,
+            session: { id: `dhs_${sessionCreates}`, launcher_id: "dhl_revise" },
+            token: `dhc_${sessionCreates}`,
+          }),
+        };
+      }
+      if (args[0] === "session" && args[1] === "delete") {
+        sessionDeletes.push(args[args.length - 1] as string);
+        return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+      }
+      if (args[0] === "pull") {
+        return { code: 1, stderr: "PULL-FAILED-BY-TEST" };
+      }
+      return { code: 0 };
+    };
+    io.resolveStateRootProjection = () => ({ localRoot: stateRoot, daemonRoot: stateRoot });
+    io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile });
+    io.fetchAuth = () =>
+      Promise.resolve({
+        status: 200,
+        body: { authority: "launcher", principal: "tester", launcher_id: "dhl_revise" },
+      });
+    io.revisePipelineV2Task = revisePipelineV2Task as unknown as CliIo["revisePipelineV2Task"];
+    // the production default reader (one UTF-8 read of the file)
+    io.readTaskFile = (path: string) => readFile(path, "utf8");
+    const exit = await runCli(
+      [
+        "revise-task",
+        "--run-id", RUN_ID,
+        "--wait-index", "1",
+        "--task-id", "task-a",
+        "--task-file", TASK_BODY_FILE,
+        "--config-root", configRoot,
+        "--launcher-id", "dhl_revise",
+        "--json",
+      ],
+      io,
+    );
+
+    expect(exit).toBe(1);
+    // exactly one JSON outcome on stdout
+    const documents = out.filter((line) => line.trim() !== "");
+    expect(documents).toHaveLength(1);
+    const parsed = JSON.parse(documents[0]!) as Record<string, unknown>;
+    expect(parsed["ok"]).toBe(false);
+    expect(parsed["exitCode"]).toBe(1);
+    expect(parsed["reason"]).toBe("worker_failed");
+    expect(parsed["runId"]).toBe(RUN_ID);
+    expect(parsed["runRoot"]).toBe(runRoot);
+    // ordinary worker failure, never a refusal and never a pipeline mismatch
+    expect(parsed["reason"]).not.toBe("pipeline_mismatch");
+    expect(JSON.stringify(parsed)).not.toContain("refused");
+    // the body and the file path never appear in the outcome or diagnostics
+    expect(err.join("\n")).not.toContain("userdata");
+    expect(err.join("\n")).not.toContain("project-source");
+    expect(err.join("\n")).not.toContain(TASK_BODY);
+    expect(err.join("\n")).not.toContain(TASK_BODY_FILE);
+    expect(JSON.stringify(parsed)).not.toContain(TASK_BODY);
+    expect(JSON.stringify(parsed)).not.toContain(TASK_BODY_FILE);
+    expect(JSON.stringify(parsed)).not.toContain("revised-task.md");
+
+    // the durable projection of the exact eleven-command suffix:
+    // plan_intent_accepted -> task_revision_accepted -> stage_iteration_closed
+    // -> wait_response_recorded, then the resumed planning execution 3
+    // (architect, planning, no iteration index) and the ordinary worker_failed
+    // failure finalization
+    const state = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
+    const wait0 = state.waits[0]!;
+    expect(wait0.index).toBe(1);
+    expect(wait0.intent?.intent_sha256).toBeDefined();
+    expect(wait0.response?.action_id).toBe("revise_task");
+    // the task revision carries the digest of exactly the unchanged file
+    // body: the expected revision-2 manifest over the exact file content
+    const taskA2 = prepareTaskRevisionManifest({
+      schema_version: 1,
+      kind: "task_revision",
+      run_id: RUN_ID,
+      task_id: "task-a",
+      revision: 2,
+      previous_sha256: taskA.sha256,
+      origin: "user_response",
+      body: TASK_BODY,
+    });
+    expect(state.task_revisions.map((record) => `${record.task_id}@${record.revision}`)).toEqual(["task-a@1", "task-a@2"]);
+    expect(state.task_revisions[1]!.sha256).toBe(taskA2.sha256);
+    expect(state.task_revisions[1]!.previous_sha256).toBe(taskA.sha256);
+    const generation = state.generations[0]!;
+    expect(generation.stage_id).toBe("stage-1");
+    expect(generation.closed).toBeUndefined();
+    expect(generation.iterations[0]?.closed).toEqual({ by: "replanned", wait_index: 1, closed_transition_count: 2 });
+    expect(generation.open_iteration).toBeUndefined();
+    expect(state.cursor).toEqual({ current_state: "architect", transition_count: 2 });
+    expect(state.transitions).toHaveLength(2);
+    const execution3 = state.executions[2];
+    expect(execution3).toMatchObject({
+      index: 3,
+      state_id: "architect",
+      execution_role: "planning",
+      phase: "failed",
+      failure_reason: "worker_failed",
+    });
+    expect(execution3?.iteration_index).toBeUndefined();
+    if (execution3?.type !== "agent") {
+      throw new Error("expected the resumed execution to be an agent execution");
+    }
+    expect(execution3.session_cleanup).toEqual({ execution: "completed", tool: "completed" });
+    expect(state.status).toBe("failed");
+    expect(state.failure).toEqual({ reason: "worker_failed" });
+    // one session pair only (the resumed execution), cleaned exactly once
+    // each and tool-first
+    expect(sessionCreates).toBe(2);
+    expect(sessionDeletes).toEqual(["dhs_2", "dhs_1"]);
+    // the task body never enters the durable state
+    expect(JSON.stringify(state)).not.toContain(TASK_BODY);
+    // exactly eleven durable commits: four intervention + seven resume
+    expect(state.revision).toBe(prefixState.revision + 11);
+    // the loader round-trip
+    expect(state).toEqual(parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("continue-stage end-to-end with the real production runner: the honest waiting prefix, the full intervention suffix and the resumed successor execution", async () => {
   const root = mkdtempSync(join(tmpdir(), "cli-continue-stage-"));

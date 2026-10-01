@@ -28,6 +28,17 @@
  *   root are the only user inputs; the action is fixed by the runner
  *   entrypoint and every internal intervention parameter is derived from
  *   the authoritative durable state.
+ * - `revise-task` — the production `revise_task` task revision
+ *   intervention: the same protected CLI-configuration boundary, then
+ *   exactly one UTF-8 read of the `--task-file` (the revised task body is
+ *   never passed inline or through argv; an empty file is a CLI contract
+ *   error), the per-call dependency assembly and exactly one
+ *   `revisePipelineV2Task` invocation. The run id, the wait index, the
+ *   task id, the task-body file and the configuration root are the only
+ *   user inputs; the action is fixed by the runner entrypoint and every
+ *   internal intervention parameter is derived from the authoritative
+ *   durable state. The file path and the body never appear in the
+ *   outcome, the durable state or any diagnostic.
  *
  * The dispatcher is testable through per-call dependency injection
  * (`runCli(argv, io)`); no module-global mutable state exists.
@@ -51,10 +62,12 @@ import {
 import {
   continuePipelineV2Stage,
   resumePipelineV2,
+  revisePipelineV2Task,
   runPipelineV2,
   type PipelineV2RunOutcome,
   type PipelineV2RunnerDeps,
 } from "./pipeline_v2_runner.ts";
+import { readFile } from "node:fs/promises";
 import {
   respondPipelineV2Wait,
   type PipelineV2WaitResponseOutcome,
@@ -76,9 +89,17 @@ export interface CliIo {
   runPipelineV2: typeof runPipelineV2;
   resumePipelineV2: typeof resumePipelineV2;
   continuePipelineV2Stage: typeof continuePipelineV2Stage;
+  revisePipelineV2Task: typeof revisePipelineV2Task;
   respondPipelineV2Wait: typeof respondPipelineV2Wait;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
+  /**
+   * The one read-only seam the revise-task command needs: reading the
+   * task-body file as UTF-8 text. The production default reads the file
+   * exactly once; read errors surface content-free (no path, no body, no
+   * hostile filesystem message).
+   */
+  readTaskFile: (path: string) => Promise<string>;
   /** One raw write to the real stdout; the caller adds the trailing newline. */
   writeStdout: (text: string) => void;
   /** One line to the real stderr (a trailing newline is added). */
@@ -99,9 +120,11 @@ function productionCliIo(): CliIo {
     runPipelineV2,
     resumePipelineV2,
     continuePipelineV2Stage,
+    revisePipelineV2Task,
     respondPipelineV2Wait,
     runSmoke,
     runAgentSmoke,
+    readTaskFile: (path: string) => readFile(path, "utf8"),
     writeStdout: (text) => process.stdout.write(text),
     writeError: (text) => console.error(text),
   };
@@ -131,7 +154,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -142,7 +165,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "run" &&
     command !== "resume" &&
     command !== "respond" &&
-    command !== "continue-stage"
+    command !== "continue-stage" &&
+    command !== "revise-task"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -186,6 +210,14 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // protected CLI-configuration boundary and per-call dependency
     // assembly, then exactly one `continuePipelineV2Stage` invocation.
     return await runPipelineV2ContinueStageCommand(parsed, io);
+  }
+  if (parsed.kind === "revise-task") {
+    // The production pipeline v2 revise-task intervention: the same
+    // protected CLI-configuration boundary, then exactly one UTF-8 read
+    // of the task-body file (never inline or through argv), the per-call
+    // dependency assembly, and exactly one `revisePipelineV2Task`
+    // invocation.
+    return await runPipelineV2ReviseTaskCommand(parsed, io);
   }
 
   const config = io.resolveHelperConfig(io.baseEnv);
@@ -382,6 +414,58 @@ async function runPipelineV2ContinueStageCommand(
 }
 
 /**
+ * The production pipeline v2 revise-task intervention command: parse
+ * already done. The same protected CLI-configuration boundary (the
+ * state-root projection first, then the helper configuration), then
+ * exactly one UTF-8 read of the `--task-file` (the revised task body is
+ * never passed inline or through argv), the non-empty check, the same
+ * per-call dependency assembly as `run`/`resume`/`continue-stage`, and
+ * exactly one `revisePipelineV2Task` invocation. A read failure or an
+ * empty file is a CLI contract error (exit 2 with the usage text) whose
+ * message is content-free: no file path, no file body and no hostile
+ * filesystem error echo ever reaches a diagnostic.
+ */
+async function runPipelineV2ReviseTaskCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "revise-task" }>,
+  io: CliIo,
+): Promise<number> {
+  const configuration = await resolvePipelineV2CliConfiguration(io);
+  if (configuration === null) {
+    return 2;
+  }
+
+  let taskBody: string;
+  try {
+    taskBody = await io.readTaskFile(parsed.taskFile);
+  } catch {
+    io.writeError("error: revise-task could not read the task file");
+    io.writeError(usage());
+    return 2;
+  }
+  if (taskBody === "") {
+    io.writeError("error: revise-task requires a non-empty task body");
+    io.writeError(usage());
+    return 2;
+  }
+
+  const deps = pipelineV2CommandDeps(parsed.json, configuration, io);
+
+  const outcome: PipelineV2RunOutcome = await io.revisePipelineV2Task(
+    {
+      runId: parsed.runId,
+      waitIndex: parsed.waitIndex,
+      taskId: parsed.taskId,
+      taskBody,
+      configRoot: parsed.configRoot,
+      launcherId: parsed.launcherId,
+    },
+    deps,
+  );
+
+  return reportPipelineV2Outcome("revise-task", parsed.json, outcome, io);
+}
+
+/**
  * The production pipeline v2 wait-response command: parse already done.
  * Only the state-root projection is resolved inside the protected
  * CLI-configuration boundary (the same env resolver `run` and `resume`
@@ -434,7 +518,7 @@ async function runPipelineV2RespondCommand(
 }
 
 function reportPipelineV2Outcome(
-  command: "run" | "resume" | "continue-stage",
+  command: "run" | "resume" | "continue-stage" | "revise-task",
   json: boolean,
   outcome: PipelineV2RunOutcome,
   io: CliIo,

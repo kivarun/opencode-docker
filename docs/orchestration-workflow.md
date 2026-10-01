@@ -302,7 +302,7 @@ accepts no `--action` flag, no fresh-run flags, no state-root flags and no
 internal intervention parameter (target state, stage id, plan digest,
 initial budget, prepared intent, compiled plan). The generic `respond`
 command still fail-closes on `continue_stage` and `revise_task` before any
-response publication; `revise_task` has no dedicated CLI path yet.
+response publication; the `revise_task` intervention runs via 'orchestrator revise-task'.
 
 ```
 continuePipelineV2Stage(
@@ -360,14 +360,41 @@ continuePipelineV2Stage(
   intervention write; after the facade starts, signal ownership stays
   coordinator-owned through the captured control functions.
 
-## The production revise-task runner API (implemented, not wired into the CLI)
+## The production revise-task runner API and CLI (`orchestrator revise-task`)
 
 `orchestrator/src/pipeline_v2_runner.ts` adds the dedicated `revise_task`
-runner entrypoint `revisePipelineV2Task(options, deps)`. It is implemented
-but deliberately **not wired into the CLI** this increment: `main.ts`,
-`cli_args.ts` and `usage()` are untouched, and `revise_task` still has no
-dedicated CLI path (the generic `respond` command keeps failing closed on
-the reserved intervention action ids).
+runner entrypoint `revisePipelineV2Task(options, deps)`, and the CLI exposes
+it as the production command `orchestrator revise-task`:
+
+```
+orchestrator revise-task \
+  --run-id SAFE_ID \
+  --wait-index N \
+  --task-id SAFE_ID \
+  --task-file ABSOLUTE_PATH \
+  --config-root ABSOLUTE_PATH \
+  [--launcher-id dhl_...] \
+  [--json]
+```
+
+The command is a thin exact-once routing layer: it parses the five external
+scalars, resolves the trusted CLI configuration through the same protected
+boundary as `run`/`resume`/`continue-stage` (the state-root projection
+first, then the helper configuration), reads the task-body file exactly once
+as UTF-8 text (the body is never passed inline or through argv — there is no
+`--task-body` flag; the content travels without `trim`, newline
+normalization or an added trailing newline, and an empty file is a CLI
+contract error whose message is content-free — no path, no body, no hostile
+filesystem error echo), assembles the same per-call dependencies and signal
+wiring, invokes `revisePipelineV2Task` exactly once and reports through the
+shared outcome reporter with the label `revise-task`. The intervention
+action is fixed by the runner entrypoint as `revise_task`; the command
+accepts no `--action` flag, no fresh-run flags, no state-root flags and no
+internal intervention parameter (target state, stage id, plan digest,
+initial budget, prepared intent, candidate task revision, compiled plan).
+The generic `respond` command still fail-closes on `continue_stage` and
+`revise_task` before any response publication; it is never redirected to
+the intervention commands.
 
 ```
 revisePipelineV2Task(
