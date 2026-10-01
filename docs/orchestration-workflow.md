@@ -3384,12 +3384,13 @@ journal with an early duplicate of the target index), the unexpected
 direct `sink.snapshot` getter error kept by identity, the hostile
 response-result battery, the
 getter-count/mutation-isolation/throwing-getter batteries, content-free
-diagnostics, both export surfaces, and the source scan. Still unwired:
-the intent selection policy, the architect/replanning execution, the
-acceptance of the next plan revision, opening the next
-generation/iteration, automatic resume,
-coordinator/runner/CLI/default-pipeline wiring, schema changes,
-migrations/API/T3, multi-process locking.
+diagnostics, both export surfaces, and the source scan. Production-reachable
+transitively: the revise-task intervention controller invoked by the runner
+`revisePipelineV2Task` / CLI `orchestrator revise-task` calls this
+controller. Still unwired: the intent selection policy, the
+architect/replanning execution, the acceptance of the next plan revision,
+opening the next generation/iteration, automatic resume, default-pipeline
+wiring, schema changes, migrations/API/T3, multi-process locking.
 
 - Replanned-generation controller (production-neutral, implemented, **not
 wired**): `orchestrator/src/pipeline_v2_replanned_generation_controller.ts`

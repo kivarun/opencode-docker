@@ -31,8 +31,9 @@ const preparedProvenance = new WeakMap<object, PipelineV2RunPlanProvenanceKind>(
 
 /**
  * Registers the exact deep-frozen prepared object this substrate is about
- * to return, together with its manifest kind. Called only by the manifest
- * module immediately before a successful return.
+ * to return, together with its kind. Called by the manifest and intent
+ * preparers and by the proposal preparer, immediately before a successful
+ * return.
  */
 export function registerPreparedRunPlanObject(
   value: object,
@@ -42,9 +43,9 @@ export function registerPreparedRunPlanObject(
 }
 
 /**
- * Pure registry lookup for the binding module: the argument must be the
- * exact registered prepared object of the expected manifest kind. Getters
- * and Proxy traps of the argument are never invoked.
+ * Pure registry lookup for the binding and construction consumers: the
+ * argument must be the exact registered prepared object of the expected
+ * kind. Getters and Proxy traps of the argument are never invoked.
  */
 export function hasPreparedRunPlanProvenance(
   value: unknown,
