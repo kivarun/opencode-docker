@@ -10,7 +10,7 @@ import {
   type ResolvedPipelineV2,
   type ResolvedPipelineV2Orchestration,
 } from "../src/pipeline_v2.ts";
-import { pipelineV2ExecutionDigest } from "../src/pipeline_v2_digest.ts";
+import { pipelineV2ExecutionDigest, pipelineV2ExecutionSnapshot } from "../src/pipeline_v2_digest.ts";
 import {
   PipelineV2OrchestrationError,
   compiledExecutionRoleFor,
@@ -1821,7 +1821,7 @@ test("30. source scan: the resolver imports only the pipeline and scalar modules
   expect(source).not.toContain("WeakMap");
 });
 
-test("28. the planning plan_output binding matrix: only the exact JSON output of the planning state compiles", async () => {
+test("31. the planning plan_output binding matrix: only the exact JSON output of the planning state compiles", async () => {
   const base = `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION}${CANONICAL_STATES}`;
   // the canonical bundle (planning plan_output -> the architect's own json
   // output) is the single success
@@ -1871,7 +1871,7 @@ test("28. the planning plan_output binding matrix: only the exact JSON output of
   });
 });
 
-test("29. exact planning plan_output shape; no inference and no fallback", () => {
+test("32. exact planning plan_output shape; no inference and no fallback", () => {
   const base = `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION}${CANONICAL_STATES}`;
   // planning without plan_output is rejected even when the state declares
   // exactly one json output
@@ -1916,17 +1916,56 @@ test("29. exact planning plan_output shape; no inference and no fallback", () =>
   );
 });
 
-test("30. the plan_output value moves the existing pipeline digest; new hash machinery none", async () => {
-  const digestA = await loadPipelineV2BundleDigest(
-    `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION}${CANONICAL_STATES}`,
+test("33. the plan_output metadata value moves the existing pipeline digest; new hash machinery none", async () => {
+  // both bundles declare the identical two JSON output ports of the
+  // planning state; the only semantic difference is the plan_output value
+  const twoPorts = CANONICAL_STATES.replace(
+    "    outputs:\n      - id: plan\n        type: json\n        schema: schemas/plan.schema.json",
+    "    outputs:\n      - id: plan\n        type: json\n        schema: schemas/plan.schema.json\n      - id: alt\n        type: json\n        schema: schemas/plan.schema.json",
   );
-  const digestB = await loadPipelineV2BundleDigest(
-    `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION.replace("      plan_output: plan\n", "      plan_output: alt\n")}${CANONICAL_STATES.replace(
-      "    outputs:\n      - id: plan\n        type: json\n        schema: schemas/plan.schema.json",
-      "    outputs:\n      - id: alt\n        type: json\n        schema: schemas/plan.schema.json",
-    )}`,
-  );
+  const yamlA = `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION}${twoPorts}`;
+  const yamlB = `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION.replace("      plan_output: plan\n", "      plan_output: alt\n")}${twoPorts}`;
+
+  let digestA = "";
+  let digestB = "";
+  const snapshots: { a: Record<string, unknown>; b: Record<string, unknown> } = { a: {}, b: {} };
+  const captureSnapshot = (slot: "a" | "b", digestBox: { value: string }) =>
+    async (dirs: BundleDirs): Promise<void> => {
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      digestBox.value = pipelineV2ExecutionDigest(pipeline);
+      snapshots[slot] = JSON.parse(JSON.stringify(pipelineV2ExecutionSnapshot(pipeline))) as Record<string, unknown>;
+    };
+  const digestABox = { value: "" };
+  const digestBBox = { value: "" };
+  await withOrchestratedBundle(captureSnapshot("a", digestABox), yamlA);
+  await withOrchestratedBundle(captureSnapshot("b", digestBBox), yamlB);
+  digestA = digestABox.value;
+  digestB = digestBBox.value;
+
+  // both bundles load; the digest moves only because of the plan_output
+  expect(digestA).toMatch(/^[0-9a-f]{64}$/);
+  expect(digestB).toMatch(/^[0-9a-f]{64}$/);
   expect(digestA).not.toBe(digestB);
+
+  // the states and output declarations are structurally equal
+  expect(JSON.stringify(snapshots.a["states"]))
+    .toBe(JSON.stringify(snapshots.b["states"]));
+
+  // the whole execution snapshot is equal except the exact plan_output
+  // value inside the normalized orchestration metadata
+  const stripPlanOutput = (snapshot: Record<string, unknown>): Record<string, unknown> => {
+    const clone = JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown>;
+    const orchestration = clone["orchestration"] as { execution_roles: { role: string; plan_output?: string }[] };
+    for (const role of orchestration.execution_roles) {
+      delete role.plan_output;
+    }
+    return clone;
+  };
+  expect(stripPlanOutput(snapshots.a)).toEqual(stripPlanOutput(snapshots.b));
+  const rolesA = (snapshots.a["orchestration"] as { execution_roles: { state_id: string; plan_output?: string }[] }).execution_roles;
+  const rolesB = (snapshots.b["orchestration"] as { execution_roles: { state_id: string; plan_output?: string }[] }).execution_roles;
+  expect(rolesA.map((role) => role.plan_output)).toEqual(["plan"]);
+  expect(rolesB.map((role) => role.plan_output)).toEqual(["alt"]);
 });
 
 async function loadPipelineV2BundleDigest(yaml: string): Promise<string> {
