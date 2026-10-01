@@ -1332,7 +1332,13 @@ id and the `type: "decision"` check, then the canonical run/project root
 checks, then the full `verifyRunInputsSnapshot` of every run input (not
 only the decision's own input; the original user binding paths are never
 re-read), then the complete accepted history through the one shared
-`resolveAcceptedHistory` chain also used by `prepareActivationData` and
+`resolveAcceptedHistory` chain also used by `prepareActivationData`,
+`collectRunOutputs` and the exact-activation JSON reader
+(`readAcceptedJsonOutput`) — the single resolver for every consumer; when
+JSON revalidation runs, each record is physically read exactly once (the
+digest phase captures the raw bytes into a per-call cache), all records'
+digests are compared first, and only then are the cached bytes parsed and
+schema-validated (the digest-before-schema priority is preserved), and
 `collectRunOutputs` — parse, per-activation coherence, fixed-location
 resolution and digest recomputation of every record including old
 non-winning ones, and only then highest-index winner selection. The

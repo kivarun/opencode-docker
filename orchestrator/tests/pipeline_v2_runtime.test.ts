@@ -15,12 +15,17 @@ import {
   parsePipelineV2Spec,
   planActivationLayout,
 } from "../src/pipeline_v2.ts";
+import { compiledExecutionRoleFor } from "../src/pipeline_v2_orchestration.ts";
+import { preparePipelineV2RunPlanProposal } from "../src/pipeline_v2_run_plan_proposal.ts";
+import { readFileSync } from "node:fs";
 import {
   acceptActivationOutputs,
   acceptedOutputDigest,
   prepareActivationData,
   prepareActivationExecutionDocument,
+  readAcceptedJsonOutput,
   snapshotRunInputs,
+  verifyRestoredAcceptedHistory,
 } from "../src/pipeline_v2_runtime.ts";
 import { runAgentSmoke, type AgentSmokeDeps } from "../src/agent_smoke.ts";
 import {
@@ -184,6 +189,10 @@ async function writeRuntimeBundle(
   await writeFile(
     join(dirs.bundle, "schemas", "facts.schema.json"),
     JSON.stringify({ type: "object", required: ["revision"] }),
+  );
+  await writeFile(
+    join(dirs.bundle, "schemas", "plan.schema.json"),
+    JSON.stringify({ type: "object" }),
   );
 }
 
@@ -1813,5 +1822,353 @@ test("28. preplaced execution document objects are rejected and sentinels stay u
       expect(await readFile(prep.execution_document.host_path, "utf8")).toBe(originalDoc);
       expect(await readSentinel()).toBe("REAL");
     }
+  });
+});
+
+// --- the verified accepted-json-output reader (accepted plan bridge) ---------
+
+const BRIDGE_YAML = `
+schema_version: 2
+entry_state: coder
+max_transitions: 20
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+  - id: config
+    type: json
+    protected: true
+    schema: schemas/config.schema.json
+
+outputs: []
+
+orchestration:
+  stage_templates: []
+  execution_roles:
+    - state_id: coder
+      role: planning
+      plan_output: plan
+    - state_id: architect
+      role: planning
+      plan_output: plan
+
+states:
+  - id: coder
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
+      - id: patch
+        type: file
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: architect
+  - id: architect
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs:
+      - id: patch
+        source:
+          state_output:
+            state: coder
+            output: patch
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+  - id: done
+    type: terminal
+    result: success
+`;
+
+const PROPOSAL_DOC = {
+  schema_version: 1,
+  kind: "run_plan_proposal",
+  stages: [{ id: "implementation", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+  new_tasks: [{ id: "task-a", body: "PLAN-TASK-BODY" }],
+};
+
+async function withBridge(
+  fn: (dirs: BundleDirs, sources: string, pipeline: Awaited<ReturnType<typeof loadPipelineV2>>, runRoot: string) => Promise<void>,
+): Promise<void> {
+  const dirs = await makeBundleDirs();
+  await writeRuntimeBundle(dirs, BRIDGE_YAML);
+  const sources = await writeSources(dirs.root);
+  const pipeline = await loadPipelineV2(dirs.bundle);
+  const runRoot = await makeRunRoot(dirs.root);
+  try {
+    await fn(dirs, sources, pipeline, runRoot);
+  } finally {
+    await rm(dirs.root, { recursive: true, force: true });
+  }
+}
+
+/** The honest coder + architect activations of the bridge fixture. */
+async function bridgeHistory(
+  pipeline: Awaited<ReturnType<typeof loadPipelineV2>>,
+  sources: string,
+  runRoot: string,
+): Promise<{ snap: Awaited<ReturnType<typeof snapshotRunInputs>>; records: ReturnType<typeof Object.values> extends never ? never : Awaited<ReturnType<typeof acceptActivationOutputs>>; architectRecords: Awaited<ReturnType<typeof acceptActivationOutputs>> }> {
+  const snap = await snapshotRunInputs(pipeline, [
+    { id: "task", path: join(sources, "task.txt") },
+    { id: "config", path: join(sources, "config.json") },
+  ], runRoot);
+  const coderPrep = await prepareActivationData(pipeline, snap, [], "coder", 1);
+  await writeFile(join(coderPrep.outputs_root, "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+  await writeFile(join(coderPrep.outputs_root, "patch"), "PATCH-1", { mode: 0o600 });
+  const records = await acceptActivationOutputs(pipeline, coderPrep);
+  const architectPrep = await prepareActivationData(pipeline, snap, records, "architect", 2);
+  await writeFile(join(architectPrep.outputs_root, "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+  const architectRecords = await acceptActivationOutputs(pipeline, architectPrep);
+  return { snap, records, architectRecords };
+}
+
+test("29. the honest bridge: the compiled planning role's plan_output feeds the proposal substrate", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const role = compiledExecutionRoleFor(pipeline, "architect");
+    if (role.role !== "planning") {
+      throw new Error(`expected a planning role, got ${role.role}`);
+    }
+    const { snap, architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    void snap;
+    const read = await readAcceptedJsonOutput(
+      pipeline,
+      runRoot,
+      architectRecords,
+      "architect",
+      role.plan_output,
+      2,
+    );
+    expect(read.state).toBe("architect");
+    expect(read.output).toBe("plan");
+    expect(read.activation_index).toBe(2);
+    expect(read.digest).toMatch(/^[0-9a-f]{64}$/);
+    const proposal = preparePipelineV2RunPlanProposal(read.value);
+    expect(proposal.kind).toBe("run_plan_proposal");
+    expect(proposal.schema_version).toBe(1);
+  });
+});
+
+test("30. the verified json output result is an exact deep-frozen five-key record", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const { architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    const read = await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "plan", 2);
+    expect(Object.keys(read).sort()).toEqual([
+      "activation_index",
+      "digest",
+      "output",
+      "state",
+      "value",
+    ]);
+    const expectedDigest = architectRecords.find(
+      (record: { output: string }) => record.output === "plan",
+    );
+    if (expectedDigest === undefined) {
+      throw new Error("the accepted plan record is missing from the history");
+    }
+    expect(read).toEqual({
+      state: "architect",
+      output: "plan",
+      activation_index: 2,
+      digest: expectedDigest.digest,
+      value: PROPOSAL_DOC,
+    });
+    expect(Object.isFrozen(read)).toBe(true);
+    expect(Object.isFrozen(read.value as object)).toBe(true);
+    // no host path or raw bytes anywhere in the result; the exact key set
+    // above already proves there is no schema field
+    expect(JSON.stringify(read)).not.toContain(runRoot);
+    expect(JSON.stringify(read)).not.toContain("data/outputs");
+    // caller mutation is impossible: the value is frozen recursively and a
+    // second read returns an independently frozen equal result
+    const again = await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "plan", 2);
+    expect(again).toEqual(read);
+    expect(again).not.toBe(read);
+  });
+});
+
+test("31. the exact-target matrix refuses every wrong selection before any schema work", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const { architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    // missing output port of the state
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "facts", 2);
+    }, 'output "facts" is not declared by state "architect"');
+    // missing state
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "ghost", "plan", 2);
+    }, 'state "ghost" is not a declared agent state');
+    // a record newer than the requested activation is not below the bound
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "plan", 1);
+    }, /records activation index 2 which is not below the current activation index 2/);
+    // an index above every record: the winning record still exists below
+    // the bound and belongs to another activation
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "plan", 3);
+    }, /belongs to activation index 2, not 3/);
+    // a pair with no record at all (an empty history)
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, [], "architect", "plan", 1);
+    }, /no accepted record for output "plan"/);
+    // unsafe ids and invalid indexes are scalar errors
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "../escape", "plan", 2);
+    }, /accepted json output read state id "\.\.\/escape" is not a safe identifier/);
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "bad id!", 2);
+    }, /accepted json output read output port id "bad id!" is not a safe identifier/);
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "plan", 0);
+    }, /accepted json output read activation index must be a positive safe integer/);
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "plan", 1.5);
+    }, /accepted json output read activation index must be a positive safe integer/);
+  });
+});
+
+test("32. a corrupted accepted history never returns the target", async () => {
+  await withBridge(async (dirs, sources, pipeline, runRoot) => {
+    const { architectRecords, records } = await bridgeHistory(pipeline, sources, runRoot);
+    // corruption of an old non-winning record (coder.plan from activation 1)
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), "{}", { mode: 0o600 });
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, [...records, ...architectRecords], "architect", "plan", 2);
+    }, /digest mismatch/);
+    // restore the bytes for the next cases
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+
+    // corruption of another, non-target record (coder.patch)
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "patch"), "TAMPERED", { mode: 0o600 });
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, [...records, ...architectRecords], "architect", "plan", 2);
+    }, /digest mismatch/);
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "patch"), "PATCH-1", { mode: 0o600 });
+
+    // digest mismatch on the target itself
+    await writeFile(join(runRoot, "activations", "2-architect", "data", "outputs", "plan"), JSON.stringify({ tampered: true }), { mode: 0o600 });
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, [...records, ...architectRecords], "architect", "plan", 2);
+    }, /digest mismatch/);
+
+    // malformed JSON with the recorded digest intact
+    await writeFile(join(runRoot, "activations", "2-architect", "data", "outputs", "plan"), "{not-json", { mode: 0o600 });
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, [
+        ...records,
+        { state: "architect", output: "plan", activation_index: 2, digest: (await acceptedOutputDigest("json", join(runRoot, "activations", "2-architect", "data", "outputs", "plan"), "fixture")) },
+      ], "architect", "plan", 2);
+    }, /is not valid JSON/);
+
+    // schema-invalid JSON with a matching digest
+    await writeFile(join(runRoot, "activations", "2-architect", "data", "outputs", "plan"), "[1,2,3]", { mode: 0o600 });
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, [
+        ...records,
+        { state: "architect", output: "plan", activation_index: 2, digest: (await acceptedOutputDigest("json", join(runRoot, "activations", "2-architect", "data", "outputs", "plan"), "fixture")) },
+      ], "architect", "plan", 2);
+    }, /does not conform to its JSON schema/);
+  });
+});
+
+test("33. a digest mismatch anywhere in the history still wins over a schema failure", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const { records } = await bridgeHistory(pipeline, sources, runRoot);
+    // coder.plan (activation 1, an EARLIER record) is schema-invalid while
+    // architect.plan (activation 2, the target) has a digest mismatch: the
+    // digest phase runs to completion before the schema phase, so the
+    // mismatch — not the schema failure — is the observed failure
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), "[1,2,3]", { mode: 0o600 });
+    await writeFile(join(runRoot, "activations", "2-architect", "data", "outputs", "plan"), JSON.stringify({ tampered: true }), { mode: 0o600 });
+    let caught: unknown = null;
+    try {
+      await readAcceptedJsonOutput(pipeline, runRoot, records, "architect", "plan", 2);
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBeInstanceOf(PipelineError);
+    expect((caught as Error).message).toContain("digest mismatch");
+    expect((caught as Error).message).not.toContain("does not conform");
+  });
+});
+
+test("34. provenance: clones and proxies are rejected before any field is read", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const { architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    // a spread clone is not the trusted snapshot
+    const clone = { ...pipeline } as unknown as Awaited<ReturnType<typeof loadPipelineV2>>;
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(clone, runRoot, architectRecords, "architect", "plan", 2);
+    }, /readAcceptedJsonOutput requires the deep-frozen snapshot object/);
+    // a proxy pipeline causes no getter traps
+    let traps = 0;
+    const proxied = new Proxy(pipeline, {
+      get(target, property, receiver) {
+        traps += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    }) as unknown as Awaited<ReturnType<typeof loadPipelineV2>>;
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(proxied, runRoot, architectRecords, "architect", "plan", 2);
+    }, /readAcceptedJsonOutput requires the deep-frozen snapshot object/);
+    expect(traps).toBe(0);
+  });
+});
+
+test("35. source contract: the JSON revalidation consumes the captured bytes and no proposal import exists", () => {
+  const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_runtime.ts"), "utf8");
+  // the schema-revalidation phase never reopens a file: its body consumes
+  // the digest phase's cached bytes exclusively
+  const schemaStart = source.indexOf("async function verifyAcceptedOutputJsonSchemas");
+  const schemaEnd = source.indexOf("/**\n * The single accepted-history validation chain");
+  expect(schemaStart).toBeGreaterThan(0);
+  expect(schemaEnd).toBeGreaterThan(schemaStart);
+  const schemaPhase = source.slice(schemaStart, schemaEnd);
+  expect(schemaPhase).not.toContain("readRegularFileBytes");
+  expect(schemaPhase).not.toContain("readPortValueForDigest");
+  expect(schemaPhase).toContain("jsonBytesCache.get");
+  expect(schemaPhase).toContain("parseJsonRecordBytes");
+  // the runtime module stays generic: no proposal substrate import and no
+  // plan_output knowledge in production code
+  expect(source).not.toContain('from "./pipeline_v2_run_plan_proposal.ts"');
+  expect(source).not.toContain("preparePipelineV2RunPlanProposal");
+  expect(source).not.toContain("parsePipelineV2RunPlanProposal");
+  expect(source).not.toContain("plan_output");
+  expect(source).not.toContain('from "./pipeline_v2_state');
+  expect(source).not.toContain('from "./pipeline_v2_coordinator');
+  expect(source).not.toContain('from "./pipeline_v2_runner');
+  expect(source).not.toContain('from "./pipeline_v2_run_plan_candidate');
+});
+
+test("36. the restored accepted history stays on the single chain with one read per json record", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const { records, architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    const fullHistory = [...records, ...architectRecords];
+    // corrupting the OLD coder plan fails the restore exactly like the
+    // digest phase before it
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), "{}", { mode: 0o600 });
+    await expectReject(async () => {
+      await verifyRestoredAcceptedHistory(pipeline, runRoot, fullHistory);
+    }, /digest mismatch/);
+    // repairing the bytes restores the single-chain semantics: the full
+    // history validates and the typed failure never mints a target
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+    await expect(verifyRestoredAcceptedHistory(pipeline, runRoot, fullHistory)).resolves.toBeUndefined();
   });
 });

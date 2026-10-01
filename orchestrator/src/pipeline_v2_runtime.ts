@@ -853,6 +853,12 @@ interface ReadPortValue {
   readonly digest: string;
   /** Parsed JSON value; present exactly when requested and reading json. */
   readonly parsedJson?: unknown;
+  /**
+   * The raw file bytes; present exactly when the caller asked to capture
+   * them on the file/json branch, so one physical read feeds both the
+   * digest and a later parse without reopening the file.
+   */
+  readonly bytes?: Buffer;
 }
 
 /**
@@ -866,11 +872,23 @@ interface ReadPortValue {
  * or kind checks of its own beyond what reading/scanning requires; callers
  * establish type and containment first. It never writes anything.
  */
+/** Parse one JSON record's bytes with the stable content-free diagnostic. */
+function parseJsonRecordBytes(content: Buffer, what: string, path: string): unknown {
+  try {
+    return JSON.parse(content.toString("utf8"));
+  } catch {
+    // Stable, content-free diagnostic: the parser message can echo the
+    // offending token or an input fragment, so it is never included.
+    throw new PipelineError(`${what} ${path} is not valid JSON`);
+  }
+}
+
 async function readPortValueForDigest(
   type: PortType,
   path: string,
   what: string,
   parseJson: boolean,
+  captureBytes = false,
 ): Promise<ReadPortValue> {
   const hasher = outputDigestHasher(type);
   if (type !== "directory") {
@@ -878,15 +896,13 @@ async function readPortValueForDigest(
     hashBytes(hasher, content);
     let parsedJson: unknown;
     if (type === "json" && parseJson) {
-      try {
-        parsedJson = JSON.parse(content.toString("utf8"));
-      } catch {
-        // Stable, content-free diagnostic: the parser message can echo the
-        // offending token or an input fragment, so it is never included.
-        throw new PipelineError(`${what} ${path} is not valid JSON`);
-      }
+      parsedJson = parseJsonRecordBytes(content, what, path);
     }
-    return { digest: hasher.digest("hex"), ...(parsedJson !== undefined ? { parsedJson } : {}) };
+    return {
+      digest: hasher.digest("hex"),
+      ...(parsedJson !== undefined ? { parsedJson: parsedJson } : {}),
+      ...(captureBytes ? { bytes: content } : {}),
+    };
   }
   const tree = await scanDirectoryTree(path, what);
   for (const entry of tree) {
@@ -1838,8 +1854,18 @@ async function resolveAllAcceptedOutputs(
  * bytes) fails the whole preparation before the winning records are
  * selected and before any activation leaf is created.
  */
+/** The stable per-call key of one accepted-history record. */
+function acceptedRecordKey(
+  state: string,
+  output: string,
+  activationIndex: number,
+): string {
+  return `${state}\u0000${output}\u0000${activationIndex}`;
+}
+
 async function verifyAcceptedOutputDigests(
   fullyResolved: readonly FullyResolvedRecord[],
+  jsonBytesCache: Map<string, Buffer> | undefined,
 ): Promise<void> {
   /**
    * Digest recomputation of every record — including old, non-winning
@@ -1850,15 +1876,27 @@ async function verifyAcceptedOutputDigests(
   return await withRuntimeReason("accepted_output_modified", async () => {
     for (const resolvedRecord of fullyResolved) {
       const what = `accepted state output for ${JSON.stringify(resolvedRecord.record.state)}.${JSON.stringify(resolvedRecord.record.output)} at activation index ${resolvedRecord.record.activationIndex}`;
-      const recomputed = (await readPortValueForDigest(
+      const captureBytes = jsonBytesCache !== undefined && resolvedRecord.type === "json";
+      const read = await readPortValueForDigest(
         resolvedRecord.type,
         resolvedRecord.canonicalPath,
         what,
         false,
-      )).digest;
-      if (recomputed !== resolvedRecord.record.digest) {
+        captureBytes,
+      );
+      if (captureBytes && read.bytes !== undefined) {
+        jsonBytesCache?.set(
+          acceptedRecordKey(
+            resolvedRecord.record.state,
+            resolvedRecord.record.output,
+            resolvedRecord.record.activationIndex,
+          ),
+          read.bytes,
+        );
+      }
+      if (read.digest !== resolvedRecord.record.digest) {
         throw new PipelineError(
-          `${what} digest mismatch: recorded ${resolvedRecord.record.digest}, recomputed ${recomputed}`,
+          `${what} digest mismatch: recorded ${resolvedRecord.record.digest}, recomputed ${read.digest}`,
         );
       }
     }
@@ -1869,6 +1907,8 @@ interface ResolvedAcceptedOutput {
   readonly type: PortType;
   readonly canonicalPath: string;
   readonly activationIndex: number;
+  /** The recorded, verified digest of the winning record. */
+  readonly digest: string;
 }
 
 /**
@@ -1889,6 +1929,7 @@ function selectWinningAcceptedOutputs(
         type: resolvedRecord.type,
         canonicalPath: resolvedRecord.canonicalPath,
         activationIndex: resolvedRecord.record.activationIndex,
+        digest: resolvedRecord.record.digest,
       });
     }
   }
@@ -1910,6 +1951,8 @@ function selectWinningAcceptedOutputs(
 async function verifyAcceptedOutputJsonSchemas(
   pipeline: ResolvedPipelineV2,
   fullyResolved: readonly FullyResolvedRecord[],
+  jsonBytesCache: Map<string, Buffer>,
+  jsonValueCache?: Map<string, unknown>,
 ): Promise<void> {
   // Trusted-pipeline invariant resolution runs at a plain site outside the
   // typed region: a `json` record always names a declared agent output
@@ -1947,17 +1990,34 @@ async function verifyAcceptedOutputJsonSchemas(
   return await withRuntimeReason("accepted_output_modified", async () => {
     for (const binding of bindings) {
       const what = `accepted state output for ${JSON.stringify(binding.resolved.record.state)}.${JSON.stringify(binding.resolved.record.output)} at activation index ${binding.resolved.record.activationIndex}`;
-      const read = await readPortValueForDigest(
-        "json",
-        binding.resolved.canonicalPath,
-        what,
-        true,
+      // The bytes were captured during the digest phase of this same call;
+      // the JSON revalidation never reopens the file, so every record is
+      // physically read exactly once and a digest mismatch anywhere in the
+      // history still fails before any schema failure.
+      const bytes = jsonBytesCache.get(
+        acceptedRecordKey(
+          binding.resolved.record.state,
+          binding.resolved.record.output,
+          binding.resolved.record.activationIndex,
+        ),
       );
-      const parsedJson = read.parsedJson;
-      if (parsedJson === undefined) {
-        throw new PipelineError(`${what} is not valid JSON`);
+      if (bytes === undefined) {
+        throw new PipelineError(
+          `${what} was not captured during the digest phase of the same accepted-history validation`,
+        );
       }
+      const parsedJson = parseJsonRecordBytes(bytes, what, binding.resolved.canonicalPath);
       validatePipelineJson(binding.schema, parsedJson, what);
+      if (jsonValueCache !== undefined) {
+        jsonValueCache.set(
+          acceptedRecordKey(
+            binding.resolved.record.state,
+            binding.resolved.record.output,
+            binding.resolved.record.activationIndex,
+          ),
+          parsedJson,
+        );
+      }
     }
   });
 }
@@ -1993,6 +2053,7 @@ async function resolveAcceptedHistory(
   runRootCanonical: string,
   currentActivationIndex: number | undefined,
   jsonSchemaRevalidation = false,
+  jsonValueCache?: Map<string, unknown>,
 ): Promise<Map<string, ResolvedAcceptedOutput>> {
   const parsedAccepted = parseAcceptedStateOutputs(
     acceptedOutputs,
@@ -2000,9 +2061,14 @@ async function resolveAcceptedHistory(
     currentActivationIndex,
   );
   const fullyResolved = await resolveAllAcceptedOutputs(parsedAccepted, runRootCanonical);
-  await verifyAcceptedOutputDigests(fullyResolved);
-  if (jsonSchemaRevalidation) {
-    await verifyAcceptedOutputJsonSchemas(pipeline, fullyResolved);
+  // The per-call bytes cache exists exactly when the JSON revalidation
+  // runs: the digest phase then captures every json record's raw bytes on
+  // the single physical read, and the schema phase parses and validates
+  // those cached bytes — never reopening the file.
+  const jsonBytesCache = jsonSchemaRevalidation ? new Map<string, Buffer>() : undefined;
+  await verifyAcceptedOutputDigests(fullyResolved, jsonBytesCache);
+  if (jsonSchemaRevalidation && jsonBytesCache !== undefined) {
+    await verifyAcceptedOutputJsonSchemas(pipeline, fullyResolved, jsonBytesCache, jsonValueCache);
   }
   return selectWinningAcceptedOutputs(fullyResolved);
 }
@@ -3230,4 +3296,104 @@ export function evaluatePreparedDecisionState(
   // `invalid_facts` is a normal result, never an exception. Raw bytes,
   // parsed facts and fact values are not returned or recorded.
   return evaluatePipelineDecisionState(pipeline, stateId, parsedJson);
+}
+
+/**
+ * The verified JSON value of exactly one already-accepted state output for
+ * one completed activation. The generic runtime bridge between a verified
+ * accepted JSON output and a future consumer; the runtime owns no consumer
+ * semantics — the caller selects the state id, output id and activation
+ * index from its own trusted metadata.
+ *
+ * Fail-closed order: the trusted-pipeline provenance gate runs before any
+ * pipeline field is read; the scalar arguments are validated; the canonical
+ * run-root contract applies; the whole accepted history is verified through
+ * the single existing chain (every record resolved to its fixed location,
+ * every digest recomputed, every JSON record revalidated against its
+ * loader-compiled schema with the history bounded below
+ * `activationIndex + 1`, so the target activation's own records are the
+ * newest allowed); and only then the exact winning record for the pair must
+ * carry exactly the requested activation index. The JSON value comes from
+ * the bytes captured during that chain's single physical read — no second
+ * file read and no second digest. Diagnostics stay content-free.
+ */
+export interface VerifiedAcceptedJsonOutput {
+  readonly state: string;
+  readonly output: string;
+  readonly activation_index: number;
+  readonly digest: string;
+  readonly value: unknown;
+}
+
+export async function readAcceptedJsonOutput(
+  pipeline: ResolvedPipelineV2,
+  runRootCanonical: string,
+  acceptedOutputs: readonly unknown[],
+  stateId: string,
+  outputId: string,
+  activationIndex: number,
+): Promise<VerifiedAcceptedJsonOutput> {
+  requireResolvedPipelineV2Provenance(pipeline, "readAcceptedJsonOutput");
+  const safeStateId = validateSafeId(stateId, "accepted json output read state id");
+  const safeOutputId = validateSafeId(outputId, "accepted json output read output port id");
+  const boundedActivationIndex = expectPositiveSafeInteger(
+    activationIndex,
+    "accepted json output read activation index",
+  );
+  // Trusted-state resolution at a plain site: the requested port must be a
+  // declared JSON output of the requested agent state, and a `json` port
+  // always carries its loader-compiled schema.
+  const state = findStateById(pipeline, safeStateId);
+  if (state === undefined || state.type !== "agent") {
+    throw new PipelineError(
+      `state ${JSON.stringify(safeStateId)} is not a declared agent state`,
+    );
+  }
+  const port = state.outputs.find((candidate) => candidate.id === safeOutputId);
+  if (port === undefined) {
+    throw new PipelineError(
+      `output ${JSON.stringify(safeOutputId)} is not declared by state ${JSON.stringify(safeStateId)}`,
+    );
+  }
+  if (port.type !== "json" || port.schema === undefined) {
+    throw new PipelineError(
+      `output ${JSON.stringify(safeOutputId)} of state ${JSON.stringify(safeStateId)} is not a declared json output port with a compiled schema`,
+    );
+  }
+  const canonicalRunRoot = await requireCanonicalRunRoot(runRootCanonical, "run root");
+  const jsonValues = new Map<string, unknown>();
+  const winners = await resolveAcceptedHistory(
+    pipeline,
+    acceptedOutputs,
+    canonicalRunRoot,
+    boundedActivationIndex + 1,
+    true,
+    jsonValues,
+  );
+  const winner = winners.get(`${safeStateId}\u0000${safeOutputId}`);
+  if (winner === undefined) {
+    throw new PipelineError(
+      `no accepted record for output ${JSON.stringify(safeOutputId)} of state ${JSON.stringify(safeStateId)}`,
+    );
+  }
+  if (winner.activationIndex !== boundedActivationIndex) {
+    throw new PipelineError(
+      `the winning accepted record for output ${JSON.stringify(safeOutputId)} of state ${JSON.stringify(safeStateId)} belongs to activation index ${winner.activationIndex}, not ${boundedActivationIndex}`,
+    );
+  }
+  const value = jsonValues.get(
+    acceptedRecordKey(safeStateId, safeOutputId, boundedActivationIndex),
+  );
+  if (jsonValues.size === 0 || value === undefined) {
+    throw new PipelineError(
+      `the verified accepted record for output ${JSON.stringify(safeOutputId)} of state ${JSON.stringify(safeStateId)} did not produce a cached JSON value`,
+    );
+  }
+  return deepFreeze({
+    state: safeStateId,
+    output: safeOutputId,
+    activation_index: boundedActivationIndex,
+    digest: winner.digest,
+    value: value,
+  });
 }
