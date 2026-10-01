@@ -278,7 +278,8 @@ export const PIPELINE_V2_EXECUTION_ROLE_NAMES: readonly PipelineV2ExecutionRoleN
 ];
 
 export type PipelineV2ExecutionRoleSpec =
-  | { readonly state_id: string; readonly role: "planning" | "control" }
+  | { readonly state_id: string; readonly role: "planning"; readonly plan_output: string }
+  | { readonly state_id: string; readonly role: "control" }
   | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
 
 export interface PipelineV2StageTemplateSpec {
@@ -387,7 +388,8 @@ export interface ResolvedPipelineV2StageTemplate {
 }
 
 export type ResolvedPipelineV2ExecutionRole =
-  | { readonly state_id: string; readonly role: "planning" | "control" }
+  | { readonly state_id: string; readonly role: "planning"; readonly plan_output: string }
+  | { readonly state_id: string; readonly role: "control" }
   | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
 
 export interface ResolvedPipelineV2Orchestration {
@@ -549,7 +551,9 @@ function sortById<T>(entries: readonly T[], key: (entry: T) => string): T[] {
  * Parse the optional `orchestration` section: the single, complete and
  * trusted source of compiled execution roles and stage templates. Exact
  * fields at every level; safe ids from the shared v2 grammar; template ids,
- * template entry states and role state ids unique. Either list may be empty
+ * template entry states and role state ids unique; a planning role carries
+ * exactly one `plan_output` naming a JSON output port of its own agent
+ * state (validated once the states are known). Either list may be empty
  * (a pipeline without agent or decision states — e.g. a terminal-only
  * pipeline — carries no roles, and one without stage templates carries no
  * templates; the non-emptiness of a section's lists is a property of the
@@ -605,7 +609,11 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
     const role = entry.role as PipelineV2ExecutionRoleName;
     expectExactKeys(
       entry,
-      role === "stage" ? ["state_id", "role", "stage_template"] : ["state_id", "role"],
+      role === "stage"
+        ? ["state_id", "role", "stage_template"]
+        : role === "planning"
+          ? ["state_id", "role", "plan_output"]
+          : ["state_id", "role"],
       what,
     );
     const stateId = validateSafeId(entry.state_id, `${what} state_id`);
@@ -622,7 +630,13 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
             role,
             stage_template: validateSafeId(entry.stage_template, `${what} stage_template`),
           }
-        : { state_id: stateId, role },
+        : role === "planning"
+          ? {
+              state_id: stateId,
+              role,
+              plan_output: validateSafeId(entry.plan_output, `${what} plan_output`),
+            }
+          : { state_id: stateId, role },
     );
   }
   return {
@@ -635,17 +649,21 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
  * Structural orchestration invariants, checked once at trusted compile time
  * against the parsed states: every role names a declared non-terminal state
  * of a matching kind, every agent/decision state is listed exactly once,
- * every declared template owns at least one stage state, and every template
+ * a planning role's `plan_output` names exactly one declared JSON output
+ * port of its own agent state, every declared template owns at least one
+ * stage state, and every template
  * entry state exists, carries the stage role of exactly that template.
  * Compiled-state compatibility beyond these rules is not classified here.
  */
 function checkOrchestrationStructure(
-  states: readonly { id: string; type: string }[],
+  states: readonly { id: string; type: string; outputs?: readonly { id: string; type: string }[] }[],
   orchestration: PipelineV2OrchestrationSpec,
 ): void {
   const stateTypes = new Map<string, string>();
+  const stateViews = new Map<string, { id: string; type: string; outputs?: readonly { id: string; type: string }[] }>();
   for (const state of states) {
     stateTypes.set(state.id, state.type);
+    stateViews.set(state.id, state);
   }
   const roleOfState = new Map<string, PipelineV2ExecutionRoleSpec>();
   for (const role of orchestration.execution_roles) {
@@ -664,6 +682,20 @@ function checkOrchestrationStructure(
       throw new PipelineError(
         `pipeline orchestration declares role "planning" for ${stateType} state ${JSON.stringify(role.state_id)}; planning is an agent-state role`,
       );
+    }
+    if (role.role === "planning") {
+      const declared = stateViews.get(role.state_id);
+      const output = declared?.outputs?.find((port) => port.id === role.plan_output);
+      if (output === undefined) {
+        throw new PipelineError(
+          `pipeline orchestration declares planning role for state ${JSON.stringify(role.state_id)} with unknown output ${JSON.stringify(role.plan_output)}`,
+        );
+      }
+      if (output.type !== "json") {
+        throw new PipelineError(
+          `pipeline orchestration declares planning role for state ${JSON.stringify(role.state_id)} whose output ${JSON.stringify(role.plan_output)} has type ${JSON.stringify(output.type)}; the plan output must have type "json"`,
+        );
+      }
     }
     if (role.role === "control" && stateType !== "decision") {
       throw new PipelineError(

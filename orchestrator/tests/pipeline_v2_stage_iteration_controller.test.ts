@@ -109,6 +109,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: dev_entry
@@ -124,7 +125,10 @@ states:
     profile: architect
     prompt: prompts/architect.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -190,11 +194,14 @@ async function withPipeline(
     const bundle = join(root, "bundle");
     await mkdir(join(bundle, "prompts"), { recursive: true });
     await mkdir(join(bundle, "schemas"), { recursive: true });
+    await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
+    await mkdir(join(bundle, "schemas"), { recursive: true });
     await mkdir(join(bundle, "decisions"), { recursive: true });
     await writeFile(join(bundle, "pipeline.yaml"), TWO_TEMPLATES_YAML);
     await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
     await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
     await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+    await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
     await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
     await fn(await loadPipelineV2(bundle));
   } finally {
@@ -225,6 +232,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: gate_stage
       role: stage
       stage_template: development
@@ -235,7 +243,10 @@ states:
     profile: architect
     prompt: prompts/architect.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -281,6 +292,7 @@ async function withDecisionStagePipeline(
     await writeFile(join(bundle, "pipeline.yaml"), DECISION_STAGE_YAML);
     await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
     await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+    await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
     await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
     await fn(await loadPipelineV2(bundle));
   } finally {
@@ -1563,6 +1575,7 @@ describe("pipeline v2 stage iteration controller", () => {
       await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
       await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
       await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+      await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
       await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
       // pipeline B drives the durable run; the same bundle content is then
       // changed and re-loaded as pipeline A: identical bundle root, run id,
@@ -1616,6 +1629,7 @@ describe("pipeline v2 stage iteration controller", () => {
         "prompts/architect.md": "plan the work\n",
         "prompts/coder.md": "implement the task\n",
         "schemas/facts.schema.json": JSON.stringify(FACTS_SCHEMA),
+        "schemas/plan.schema.json": JSON.stringify({ type: "object" }),
         "decisions/dispatch.yaml": DISPATCH_MODEL_YAML,
       };
       for (const name of ["bundle-b", "bundle-a"]) {
@@ -2534,6 +2548,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
         await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
         await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+        await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
         await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_MODEL_YAML);
         const pipelineB = await loadPipelineV2(bundle);
         await appendFile(join(bundle, "prompts", "architect.md"), "updated guidance\n");

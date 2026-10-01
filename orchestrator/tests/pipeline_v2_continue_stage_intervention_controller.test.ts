@@ -97,6 +97,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -110,7 +111,10 @@ states:
     profile: architect
     prompt: prompts/architect.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -234,6 +238,7 @@ async function writeBundle(bundle: string): Promise<void> {
   await mkdir(join(bundle, "prompts"), { recursive: true });
   await mkdir(join(bundle, "decisions"), { recursive: true });
   await mkdir(join(bundle, "schemas"), { recursive: true });
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   await writeFile(join(bundle, "pipeline.yaml"), STAGE_YAML);
   await writeFile(join(bundle, "prompts", "architect.md"), "plan the work\n");
   await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");

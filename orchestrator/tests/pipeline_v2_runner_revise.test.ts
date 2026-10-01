@@ -74,6 +74,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -84,7 +85,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -142,7 +146,9 @@ async function makeHarness(prefix: string, runId: string = RUN_ID): Promise<Harn
   ROOTS_TO_DISPOSE.push(root);
   const bundle = join(root, "bundle");
   await mkdir(join(bundle, "prompts"), { recursive: true });
+  await mkdir(join(bundle, "schemas"), { recursive: true });
   await writeFile(join(bundle, "pipeline.yaml"), PIPELINE);
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   await writeFile(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
   const configRoot = join(root, "config");
   await mkdir(join(configRoot, "profiles"), { recursive: true });
@@ -252,6 +258,9 @@ async function drivePrefix(
     await rec.dispatch({ kind: "agent_execution_session_created", sessionId: `exec-${executionIndex}` });
     await rec.dispatch({ kind: "agent_tool_session_created", sessionId: `tool-${executionIndex}` });
     await rec.dispatch({ kind: "agent_running" });
+    if (stateId === "architect") {
+      await writeFile(join(activation.outputs_root, "plan"), "{}", { mode: 0o600 });
+    }
     const records = await acceptActivationOutputs(pipeline, activation);
     await rec.dispatch({
       kind: "agent_outputs_accepted",

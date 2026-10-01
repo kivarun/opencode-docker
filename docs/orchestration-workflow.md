@@ -947,13 +947,18 @@ A v2 pipeline may declare an optional top-level `orchestration` section —
 the single, complete and trusted compiled source for the execution role of
 every agent/decision state (`planning`, `control`, `stage`) and for stage
 templates (`stage_templates[]` with `id` and `entry_state`; `execution_roles[]`
-mapping each agent/decision state to its role, where the stage role carries
-exactly one `stage_template`). There is no default classification and no
-inference from profiles, state names, prompts, model paths or any other
-content; terminal states never carry a role. Every agent/decision state must
-be listed exactly once; template ids, template entry states and role state
-ids are unique; each template owns at least one stage state whose entry
-state exists and carries that template's stage role. Each template is one
+mapping each agent/decision state to its role, where a planning entry carries
+exactly one `plan_output` naming a declared JSON output port of its own agent
+state — implemented and compiled, but not yet consumed at runtime — and the
+stage role carries exactly one `stage_template`). There is no default
+classification and no inference from profiles, state names, prompts, model
+paths or any other content; terminal states never carry a role. Every
+agent/decision state must be listed exactly once; template ids, template
+entry states and role state ids are unique; a planning role's `plan_output`
+names exactly one declared JSON output port of its own agent state (unknown
+and non-JSON outputs are rejected at trusted load inside the same
+orchestration structural check); each template owns at least one stage state
+whose entry state exists and carries that template's stage role. Each template is one
 statically verified compiled subgraph, checked once at trusted load: every
 of its stage states is reachable from its entry state along transitions
 staying inside the template, transitions between stage states of different
@@ -963,8 +968,8 @@ exits to planning/control/terminal states are allowed. Declaration order of
 the section's entries is not semantic: the resolved metadata is normalized
 (stage templates sorted by id, execution roles sorted by state_id), so
 permuting equivalent entries yields the identical execution snapshot and
-digest, while changing a role, membership or template entry moves the
-digest. The resolved snapshot carries the metadata as the optional
+digest, while changing a role, membership, template entry or `plan_output`
+value moves the digest. The resolved snapshot carries the metadata as the optional
 deep-frozen `orchestration` field; bundles without the section compile
 exactly as before (the snapshot has no `orchestration` key). The pure
 read-only resolvers live in `orchestrator/src/pipeline_v2_orchestration.ts`
@@ -2272,9 +2277,8 @@ prepared by this layer is not therefore a valid plan.
 
 Still unwired: the trusted read of the proposal from a verified accepted
 JSON output (a narrow runtime helper), the derivation/construction
-layer, the `plan_output` orchestration metadata, the planning-transition
-hook, resume-boundary handling, coordinator/runner/CLI wiring,
-migrations/API/T3.
+layer, the planning-transition hook, resume-boundary handling,
+coordinator/runner/CLI wiring, migrations/API/T3.
 
 ### Run plan acceptance controller (production-neutral, not wired)
 

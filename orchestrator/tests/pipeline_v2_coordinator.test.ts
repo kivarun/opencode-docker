@@ -49,6 +49,8 @@ import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 
 const LOOSE_SCHEMA = {};
 
+const PLAN_OUTPUT_SCHEMA = { type: "object" };
+
 const MODEL_YAML = `
 schema_version: 1
 facts:
@@ -117,6 +119,7 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: report
     - state_id: check
       role: control
 states:
@@ -175,8 +178,10 @@ orchestration:
   execution_roles:
     - state_id: first
       role: planning
+      plan_output: plan
     - state_id: second
       role: planning
+      plan_output: plan
 states:
   - id: first
     type: agent
@@ -184,6 +189,9 @@ states:
     prompt: prompts/coder.md
     inputs: []
     outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
       - id: report
         type: file
     timeout_seconds: 60
@@ -196,7 +204,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -275,13 +286,17 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: plan
 states:
   - id: coder
     type: agent
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -306,15 +321,20 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: plan
     - state_id: coder2
       role: planning
+      plan_output: plan
 states:
   - id: coder
     type: agent
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -325,7 +345,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -351,6 +374,7 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: facts
     - state_id: check
       role: control
 states:
@@ -645,7 +669,7 @@ test("4. failed terminal publishes outputs, reports ok:false with the terminal f
   expect(kinds(harness.recording).filter((kind) => kind === "run_failed")).toHaveLength(1);
 });
 
-test("5. an agent with zero output ports accepts an empty output list", async () => {
+test("5. a planning agent accepts exactly its declared plan output", async () => {
   const harness = await setupHarness(PIPELINE_ZERO_PORTS);
   const fake = fakeRuntime([{}]);
   const result = await coordinate(harness, fake.runtime);
@@ -654,9 +678,9 @@ test("5. an agent with zero output ports accepts an empty output list", async ()
   expect(state.status).toBe("success");
   const agentExecution = agentAt(state, 0);
   expect(agentExecution.phase).toBe("cleanup_completed");
-  expect(agentExecution.outputs).toEqual([]);
-  const accepted = harness.recording.commands.find((command) => command.kind === "agent_outputs_accepted");
-  expect(accepted?.outputs).toEqual([]);
+  expect(agentExecution.outputs?.map((output) => output.id)).toEqual(["plan"]);
+  const accepted = harness.recording.commands.find((command) => command.kind === "agent_outputs_accepted") as { outputs: { id: string }[] } | undefined;
+  expect(accepted?.outputs.map((output) => output.id)).toEqual(["plan"]);
   expect(state.run_outputs).toEqual([]);
 });
 
@@ -2189,6 +2213,7 @@ async function writeBundle(
   await writeFile(join(dirs.bundle, "pipeline.yaml"), yaml);
   await writeFile(join(dirs.bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
   await writeFile(join(dirs.bundle, "schemas", "loose.schema.json"), JSON.stringify(LOOSE_SCHEMA));
+  await writeFile(join(dirs.bundle, "schemas", "plan.schema.json"), JSON.stringify(PLAN_OUTPUT_SCHEMA));
   await writeFile(join(dirs.bundle, "decisions", "model.yaml"), MODEL_YAML);
   await writeFile(
     join(dirs.sources, "facts.json"),
@@ -3060,6 +3085,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dispatch
       role: control
     - state_id: dev_entry
@@ -3072,7 +3098,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:

@@ -10,6 +10,7 @@ import {
   type ResolvedPipelineV2,
   type ResolvedPipelineV2Orchestration,
 } from "../src/pipeline_v2.ts";
+import { pipelineV2ExecutionDigest } from "../src/pipeline_v2_digest.ts";
 import {
   PipelineV2OrchestrationError,
   compiledExecutionRoleFor,
@@ -91,6 +92,8 @@ const FACTS_SCHEMA = {
   properties: { stage: { type: "string" } },
 };
 
+const PLAN_OUTPUT_SCHEMA = { type: "object" };
+
 const CANONICAL_HEADER = `schema_version: 2
 entry_state: architect
 max_transitions: 40
@@ -121,6 +124,7 @@ const CANONICAL_ORCHESTRATION = `orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -149,7 +153,8 @@ const CANONICAL_STATES = `states:
           pipeline_input: task
     outputs:
       - id: plan
-        type: file
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 1800
     max_attempts: 1
     transitions:
@@ -288,6 +293,7 @@ const TWO_TEMPLATES_ORCHESTRATION = `orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -317,7 +323,10 @@ const TWO_TEMPLATES_STATES = `states:
     profile: architect
     prompt: prompts/architect.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -463,6 +472,7 @@ async function writeOrchestratedBundle(
   await writeFile(join(dirs.bundle, "prompts", "coder.md"), "implement the task\n");
   await writeFile(join(dirs.bundle, "prompts", "reviewer.md"), "review the work\n");
   await writeFile(join(dirs.bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+  await writeFile(join(dirs.bundle, "schemas", "plan.schema.json"), JSON.stringify(PLAN_OUTPUT_SCHEMA));
   await writeFile(join(dirs.bundle, "decisions", "dispatch.yaml"), dispatchModelYaml);
   await writeFile(join(dirs.bundle, "decisions", "gate.yaml"), GATE_MODEL_YAML);
 }
@@ -503,7 +513,7 @@ function acceptCompile(yaml: string): void {
 const NORMALIZED_ORCHESTRATION: ResolvedPipelineV2Orchestration = {
   stage_templates: [{ id: "development", entry_state: "development_entry" }],
   execution_roles: [
-    { state_id: "architect", role: "planning" },
+    { state_id: "architect", role: "planning", plan_output: "plan" },
     { state_id: "coder", role: "stage", stage_template: "development" },
     { state_id: "development_entry", role: "stage", stage_template: "development" },
     { state_id: "iteration_gate", role: "stage", stage_template: "development" },
@@ -601,6 +611,7 @@ test("4. declaration-order permutation is not semantic: identical resolved metad
       stage_template: development
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: coder
       role: stage
       stage_template: development
@@ -669,6 +680,7 @@ test("6. exact-field rejection at every new level", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -694,6 +706,7 @@ test("6. exact-field rejection at every new level", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -747,6 +760,7 @@ test("6. exact-field rejection at every new level", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -808,6 +822,7 @@ test("6. exact-field rejection at every new level", () => {
   execution_roles:
     - state_id: bad id!
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -828,40 +843,54 @@ test("6. exact-field rejection at every new level", () => {
 });
 
 test("7. empty stage_templates with planning/control-only roles compile; empty roles fail coverage", () => {
-  acceptCompile(`${CANONICAL_HEADER}${CANONICAL_STATES}`
+  // every planning state must itself declare the JSON output its plan_output
+  // names, so the planning-only variants extend the canonical agents
+  const planningOnlyStates = `${CANONICAL_STATES}`
+    .replace("outputs:\n      - id: draft\n        type: file", "outputs:\n      - id: plan\n        type: json\n        schema: schemas/plan.schema.json\n      - id: draft\n        type: file")
+    .replace("outputs:\n      - id: report\n        type: file", "outputs:\n      - id: plan\n        type: json\n        schema: schemas/plan.schema.json\n      - id: report\n        type: file")
+    .replace("outputs:\n      - id: review\n        type: file", "outputs:\n      - id: plan\n        type: json\n        schema: schemas/plan.schema.json\n      - id: review\n        type: file");
+  acceptCompile(`${CANONICAL_HEADER}${planningOnlyStates}`
     .replace("states:", `orchestration:
   stage_templates: []
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
       role: planning
+      plan_output: plan
     - state_id: coder
       role: planning
+      plan_output: plan
     - state_id: stage_review
       role: planning
+      plan_output: plan
     - state_id: iteration_gate
       role: control
 states:`));
   acceptCompile(
-    withOrchestrationSection(`orchestration:
+    `${CANONICAL_HEADER}orchestration:
   stage_templates: []
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
       role: planning
+      plan_output: plan
     - state_id: coder
       role: planning
+      plan_output: plan
     - state_id: stage_review
       role: planning
+      plan_output: plan
     - state_id: iteration_gate
       role: control
-`),
+${planningOnlyStates}`,
   );
   rejectCompile(
     withOrchestrationSection(`orchestration:
@@ -883,6 +912,7 @@ test("8. duplicate template id is rejected", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -913,6 +943,7 @@ test("9. duplicate template entry state is rejected", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -942,6 +973,7 @@ test("10. duplicate and missing execution roles are rejected", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: coder
@@ -971,6 +1003,7 @@ test("10. duplicate and missing execution roles are rejected", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -996,6 +1029,7 @@ test("11. unknown and terminal states carry no execution role", () => {
   execution_roles:
     - state_id: ghost
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1021,6 +1055,7 @@ test("11. unknown and terminal states carry no execution role", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1051,8 +1086,10 @@ test("12. the planning role is an agent-state role only", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: planning
+      plan_output: plan
     - state_id: development_entry
       role: stage
       stage_template: development
@@ -1079,6 +1116,7 @@ test("13. the control role is a decision-state role only", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1106,6 +1144,7 @@ test("14. the stage role requires a stage_template", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1133,6 +1172,7 @@ test("15. planning and control roles must not carry stage_template", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
       stage_template: development
@@ -1162,6 +1202,7 @@ test("16. a stage role must reference a declared template", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1190,6 +1231,7 @@ test("17. a template entry_state must name a declared state", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1218,6 +1260,7 @@ test("18. a template entry_state must carry the stage role of that template", ()
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1253,6 +1296,7 @@ test("19. a template entry_state must belong to its own template", async () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1285,7 +1329,10 @@ test("20. a template without stage states is rejected", () => {
     profile: architect
     prompt: prompts/architect.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -1328,6 +1375,7 @@ test("20. a template without stage states is rejected", () => {
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
 ${minimalStates}`,
@@ -1441,6 +1489,7 @@ test("22. a transition between stage states of different templates is rejected",
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1532,8 +1581,8 @@ test("25. resolver results are exact, deep-frozen and deterministic", async () =
   await withOrchestratedBundle(async (dirs) => {
     const pipeline = await loadPipelineV2(dirs.bundle);
     const planning = compiledExecutionRoleFor(pipeline, "architect");
-    expect(planning).toEqual({ state_id: "architect", role: "planning" });
-    expect(Object.keys(planning)).toEqual(["state_id", "role"]);
+    expect(planning).toEqual({ state_id: "architect", role: "planning", plan_output: "plan" });
+    expect(Object.keys(planning)).toEqual(["state_id", "role", "plan_output"]);
     expect(Object.isFrozen(planning)).toBe(true);
     const control = compiledExecutionRoleFor(pipeline, "stage_dispatch");
     expect(control).toEqual({ state_id: "stage_dispatch", role: "control" });
@@ -1684,6 +1733,7 @@ test("27. the provenance gate runs before the id check, getter reads and Proxy t
     expect(compiledExecutionRoleFor(resolved, "architect")).toEqual({
       state_id: "architect",
       role: "planning",
+      plan_output: "plan",
     });
   });
 });
@@ -1770,3 +1820,123 @@ test("30. source scan: the resolver imports only the pipeline and scalar modules
   expect(source).not.toContain("WeakSet");
   expect(source).not.toContain("WeakMap");
 });
+
+test("28. the planning plan_output binding matrix: only the exact JSON output of the planning state compiles", async () => {
+  const base = `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION}${CANONICAL_STATES}`;
+  // the canonical bundle (planning plan_output -> the architect's own json
+  // output) is the single success
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    expect(pipeline.orchestration?.execution_roles[0]).toEqual({
+      state_id: "architect",
+      role: "planning",
+      plan_output: "plan",
+    });
+  });
+  // unknown output id on the planning state
+  await withOrchestratedBundle(
+    async () => {},
+    base.replace("      plan_output: plan\n", "      plan_output: missing\n"),
+  ).catch((error: unknown) => {
+    expect((error as Error).message).toBe(
+      'pipeline orchestration declares planning role for state "architect" with unknown output "missing"',
+    );
+  });
+  // an output that exists only on another state
+  await withOrchestratedBundle(
+    async () => {},
+    base.replace("      plan_output: plan\n", "      plan_output: report\n"),
+  ).catch((error: unknown) => {
+    expect((error as Error).message).toBe(
+      'pipeline orchestration declares planning role for state "architect" with unknown output "report"',
+    );
+  });
+  // a file output with the same id
+  await withOrchestratedBundle(
+    async () => {},
+    CANONICAL_YAML.replace("      - id: plan\n        type: json\n        schema: schemas/plan.schema.json", "      - id: plan\n        type: file"),
+  ).catch((error: unknown) => {
+    expect((error as Error).message).toBe(
+      'pipeline orchestration declares planning role for state "architect" whose output "plan" has type "file"; the plan output must have type "json"',
+    );
+  });
+  // the exact json output of the planning state is the only success
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const architect = pipeline.states.find((state) => state.id === "architect");
+    if (architect === undefined || architect.type !== "agent") {
+      throw new Error("the architect state is missing");
+    }
+    expect(architect.outputs.map((port) => [port.id, port.type])).toEqual([["plan", "json"]]);
+  });
+});
+
+test("29. exact planning plan_output shape; no inference and no fallback", () => {
+  const base = `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION}${CANONICAL_STATES}`;
+  // planning without plan_output is rejected even when the state declares
+  // exactly one json output
+  const without = base.replace("      plan_output: plan\n", "");
+  let caught: unknown = null;
+  try {
+    compilePipelineV2Spec(Bun.YAML.parse(without));
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(PipelineError);
+  expect((caught as Error).message).toBe(
+    'pipeline orchestration execution_roles 0 is missing required field "plan_output"',
+  );
+  // control/stage entries must not carry plan_output
+  rejectCompile(
+    base.replace(
+      "    - state_id: stage_dispatch\n      role: control\n",
+      "    - state_id: stage_dispatch\n      role: control\n      plan_output: plan\n",
+    ),
+    /pipeline orchestration execution_roles 1 has unknown field "plan_output"/,
+  );
+  rejectCompile(
+    base.replace(
+      "    - state_id: coder\n      role: stage\n      stage_template: development\n",
+      "    - state_id: coder\n      role: stage\n      stage_template: development\n      plan_output: plan\n",
+    ),
+    /pipeline orchestration execution_roles 3 has unknown field "plan_output"/,
+  );
+  // missing / value-less / non-string / unsafe plan_output
+  rejectCompile(
+    base.replace("      plan_output: plan\n", "      plan_output:\n"),
+    /pipeline orchestration execution_roles 0 plan_output/,
+  );
+  rejectCompile(
+    base.replace("      plan_output: plan\n", "      plan_output: 7\n"),
+    /pipeline orchestration execution_roles 0 plan_output/,
+  );
+  rejectCompile(
+    base.replace("      plan_output: plan\n", "      plan_output: bad id!\n"),
+    /pipeline orchestration execution_roles 0 plan_output/,
+  );
+});
+
+test("30. the plan_output value moves the existing pipeline digest; new hash machinery none", async () => {
+  const digestA = await loadPipelineV2BundleDigest(
+    `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION}${CANONICAL_STATES}`,
+  );
+  const digestB = await loadPipelineV2BundleDigest(
+    `${CANONICAL_HEADER}${CANONICAL_ORCHESTRATION.replace("      plan_output: plan\n", "      plan_output: alt\n")}${CANONICAL_STATES.replace(
+      "    outputs:\n      - id: plan\n        type: json\n        schema: schemas/plan.schema.json",
+      "    outputs:\n      - id: alt\n        type: json\n        schema: schemas/plan.schema.json",
+    )}`,
+  );
+  expect(digestA).not.toBe(digestB);
+});
+
+async function loadPipelineV2BundleDigest(yaml: string): Promise<string> {
+  let digest = "";
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    digest = pipelineV2ExecutionDigest(pipeline);
+  }, yaml);
+  if (digest === "") {
+    throw new Error("the bundle did not load");
+  }
+  return digest;
+}

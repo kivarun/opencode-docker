@@ -128,6 +128,7 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: plan
     - state_id: check
       role: control
 states:
@@ -136,7 +137,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -174,10 +178,12 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: facts
     - state_id: check
       role: control
     - state_id: probe
       role: planning
+      plan_output: plan
 states:
   - id: coder
     type: agent
@@ -224,6 +230,9 @@ states:
             state: coder
             output: facts
     outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
       - id: report
         type: file
     timeout_seconds: 60
@@ -254,15 +263,20 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: plan
     - state_id: coder2
       role: planning
+      plan_output: plan
 states:
   - id: coder
     type: agent
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -273,7 +287,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -323,6 +340,7 @@ async function writeBundle(
   await writeFile(join(dirs.bundle, "pipeline.yaml"), yaml);
   await writeFile(join(dirs.bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
   await writeFile(join(dirs.bundle, "schemas", "loose.schema.json"), JSON.stringify(LOOSE_SCHEMA));
+  await writeFile(join(dirs.bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   await writeFile(join(dirs.bundle, "decisions", "model.yaml"), MODEL_YAML);
   if (yaml.includes("facts_seed")) {
     await writeFile(join(dirs.sources, "facts.json"), options.facts ?? FACTS_ALPHA);
@@ -2153,6 +2171,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dispatch
       role: control
     - state_id: dev_entry
@@ -2165,7 +2184,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -2237,6 +2259,7 @@ test("the resumed stage execution carries the compiled role and the open iterati
   await harness.recording.dispatch({ kind: "agent_execution_session_created", sessionId: "exec-1" });
   await harness.recording.dispatch({ kind: "agent_tool_session_created", sessionId: "tool-1" });
   await harness.recording.dispatch({ kind: "agent_running" });
+  await writeFile(join(harness.dirs.runRoot, "activations", "1-architect", "data", "outputs", "plan"), JSON.stringify({ ok: true, port: "plan" }), { mode: 0o600 });
   const architectRecords = await acceptActivationOutputs(harness.pipeline, architectActivation);
   accepted.push(...architectRecords);
   await harness.recording.dispatch({
@@ -2323,6 +2346,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -2333,7 +2357,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -2380,6 +2407,7 @@ test("the full continue-stage handoff survives two restarts: the restart-aware i
   await harness.recording.dispatch({ kind: "agent_running" });
   const architectWorker = new PrefixWorker({}, architectActivation);
   await architectWorker.run();
+  await writeFile(join(harness.dirs.runRoot, "activations", "1-architect", "data", "outputs", "plan"), JSON.stringify({ ok: true, port: "plan" }), { mode: 0o600 });
   const architectRecords = await acceptActivationOutputs(harness.pipeline, architectActivation);
   accepted.push(...architectRecords);
   await harness.recording.dispatch({

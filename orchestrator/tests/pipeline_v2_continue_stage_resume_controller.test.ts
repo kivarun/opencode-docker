@@ -89,6 +89,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -99,7 +100,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -138,6 +142,8 @@ async function makeDirs(): Promise<BundleDirs> {
   const root = await mkdtemp(join(tmpdir(), "pipeline-v2-continue-resume-"));
   const bundle = join(root, "bundle");
   await mkdir(join(bundle, "prompts"), { recursive: true });
+  await mkdir(join(bundle, "schemas"), { recursive: true });
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   await writeFile(join(bundle, "pipeline.yaml"), PIPELINE_CONTINUED_STAGE_RESUME);
   await writeFile(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
   const sources = join(root, "userdata");
@@ -249,7 +255,11 @@ class PrefixWorker {
   async run(): Promise<PipelineV2WorkerRunResult> {
     this.runCount += 1;
     for (const port of this.activation.output_ports) {
-      await writeFile(port.path, `${port.id} body`);
+      if (port.type === "json") {
+        await writeFile(port.path, JSON.stringify({ ok: true, port: port.id }));
+      } else {
+        await writeFile(port.path, `${port.id} body`);
+      }
     }
     return { status: "completed" };
   }

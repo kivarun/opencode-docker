@@ -43,13 +43,16 @@ export class PipelineV2OrchestrationError extends Error {
 }
 
 /**
- * The compiled execution role of one state: a planning/control role with no
+ * The compiled execution role of one state: a planning role bound to
+ * exactly one declared JSON output port of its own agent state (the plan
+ * proposal output, not yet consumed at runtime), a control role with no
  * iteration concern, or a stage role bound to exactly one stage template.
  * Stage-template membership is carried by the stage role itself; a stage
  * state belongs to exactly one template by construction.
  */
 export type CompiledPipelineV2ExecutionRole =
-  | Readonly<{ state_id: string; role: "planning" | "control" }>
+  | Readonly<{ state_id: string; role: "planning"; plan_output: string }>
+  | Readonly<{ state_id: string; role: "control" }>
   | Readonly<{ state_id: string; role: "stage"; stage_template: string }>;
 
 export interface CompiledPipelineV2StageTemplate {
@@ -88,7 +91,9 @@ export function compiledExecutionRoleFor(
     if (entry.state_id === stateId) {
       return entry.role === "stage"
         ? Object.freeze({ state_id: stateId, role: "stage", stage_template: entry.stage_template })
-        : Object.freeze({ state_id: stateId, role: entry.role });
+        : entry.role === "planning"
+          ? Object.freeze({ state_id: stateId, role: "planning", plan_output: entry.plan_output })
+          : Object.freeze({ state_id: stateId, role: "control" });
     }
   }
   const declared = pipeline.states.find((state) => state.id === stateId);

@@ -82,6 +82,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -92,7 +93,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -133,6 +137,10 @@ async function makeDirs(prefix: string, runId: string): Promise<Dirs> {
   const root = await mkdtemp(join(tmpdir(), prefix));
   const bundle = join(root, "bundle");
   await mkdir(join(bundle, "prompts"), { recursive: true });
+  await mkdir(join(bundle, "schemas"), { recursive: true });
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
+  await mkdir(join(bundle, "schemas"), { recursive: true });
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   const sources = join(root, "userdata");
   await mkdir(sources, { recursive: true });
   const projectSource = join(root, "project-source");
@@ -1149,7 +1157,9 @@ test("6l. a foreign pipeline identity is a pipeline_mismatch before any store lo
   try {
     const foreignBundle = join(harness.dirs.root, "foreign-bundle");
     await mkdir(join(foreignBundle, "prompts"), { recursive: true });
+    await mkdir(join(foreignBundle, "schemas"), { recursive: true });
     await writeFile(join(foreignBundle, "pipeline.yaml"), RESTORE_PIPELINE);
+    await writeFile(join(foreignBundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
     await writeFile(join(foreignBundle, "prompts", "coder.md"), "DIFFERENT-PROMPT-BODY\n");
     const foreign = await loadPipelineV2(foreignBundle);
     const state = harness.recording.snapshot as PipelineV2RunState;
@@ -1617,6 +1627,7 @@ test("11. the bridge: the durable ledger and manifests restore the compiled plan
     for (const command of executionPhases(1)) {
       await dispatch(harness, command);
     }
+    await writeFile(join(harness.dirs.runRoot, "activations", `${architectIndex}-architect`, "data", "outputs", "plan"), "{}", { mode: 0o600 });
     const architectRecords = await acceptActivationOutputs(harness.pipeline, architectActivation);
     accepted.push(...architectRecords);
     await dispatch(harness, {

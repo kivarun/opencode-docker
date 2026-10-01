@@ -85,6 +85,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -95,7 +96,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -203,6 +207,8 @@ class PrefixWorker {
     for (const port of this.activation.output_ports) {
       if (port.type === "directory") {
         await mkdir(port.path, { recursive: true });
+      } else if (port.type === "json") {
+        await writeFile(port.path, JSON.stringify({ ok: true, port: port.id }));
       } else {
         await writeFile(port.path, `${port.id} body`);
       }
@@ -265,6 +271,8 @@ async function reviseResumeReady(options: { advance?: "r0" | "r4" } = {}): Promi
   try {
     const bundleRoot = join(root, "bundle");
     await mkdir(join(bundleRoot, "prompts"), { recursive: true });
+        await mkdir(join(bundleRoot, "schemas"), { recursive: true });
+    await writeFile(join(bundleRoot, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
     await writeFile(join(bundleRoot, "pipeline.yaml"), PIPELINE_YAML);
     await writeFile(join(bundleRoot, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
     const projectSource = join(root, "project-source");

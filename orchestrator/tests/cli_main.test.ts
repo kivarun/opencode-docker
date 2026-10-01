@@ -1581,6 +1581,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -1591,7 +1592,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -1620,7 +1624,9 @@ test("revise-task end-to-end with the real production runner: the honest waiting
   try {
     const bundle = join(root, "bundle");
     mkdirSync(join(bundle, "prompts"), { recursive: true });
+    mkdirSync(join(bundle, "schemas"), { recursive: true });
     writeFileSync(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+    writeFileSync(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
     writeFileSync(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
     const configRoot = join(root, "config");
     mkdirSync(join(configRoot, "profiles"), { recursive: true });
@@ -1706,6 +1712,9 @@ test("revise-task end-to-end with the real production runner: the honest waiting
       await sink.dispatch({ kind: "agent_execution_session_created", sessionId: `exec-${executionIndex}` });
       await sink.dispatch({ kind: "agent_tool_session_created", sessionId: `tool-${executionIndex}` });
       await sink.dispatch({ kind: "agent_running" });
+      if (stateId === "architect") {
+        writeFileSync(join(activation.outputs_root, "plan"), "{}", { mode: 0o600 });
+      }
       const records = await acceptActivationOutputs(pipeline, activation);
       await sink.dispatch({
         kind: "agent_outputs_accepted",
@@ -1925,7 +1934,9 @@ test("continue-stage end-to-end with the real production runner: the honest wait
   try {
     const bundle = join(root, "bundle");
     mkdirSync(join(bundle, "prompts"), { recursive: true });
+    mkdirSync(join(bundle, "schemas"), { recursive: true });
     writeFileSync(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+    writeFileSync(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
     writeFileSync(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
     const configRoot = join(root, "config");
     mkdirSync(join(configRoot, "profiles"), { recursive: true });
@@ -2005,6 +2016,9 @@ test("continue-stage end-to-end with the real production runner: the honest wait
       await sink.dispatch({ kind: "agent_execution_session_created", sessionId: `exec-${executionIndex}` });
       await sink.dispatch({ kind: "agent_tool_session_created", sessionId: `tool-${executionIndex}` });
       await sink.dispatch({ kind: "agent_running" });
+      if (stateId === "architect") {
+        writeFileSync(join(activation.outputs_root, "plan"), "{}", { mode: 0o600 });
+      }
       const records = await acceptActivationOutputs(pipeline, activation);
       await sink.dispatch({
         kind: "agent_outputs_accepted",

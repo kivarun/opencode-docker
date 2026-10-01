@@ -110,6 +110,7 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: report
     - state_id: check
       role: control
 states:
@@ -159,10 +160,12 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: facts
     - state_id: check
       role: control
     - state_id: probe
       role: planning
+      plan_output: plan
 states:
   - id: coder
     type: agent
@@ -209,6 +212,9 @@ states:
             state: coder
             output: facts
     outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
       - id: report
         type: file
     timeout_seconds: 60
@@ -239,15 +245,20 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: plan
     - state_id: coder2
       role: planning
+      plan_output: plan
 states:
   - id: coder
     type: agent
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -258,7 +269,10 @@ states:
     profile: coder
     prompt: prompts/coder.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -295,6 +309,7 @@ async function writeBundle(root: string, yaml: string): Promise<string> {
   await writeFile(join(bundle, "pipeline.yaml"), yaml);
   await writeFile(join(bundle, "prompts", "coder.md"), PROMPT_BODY);
   await writeFile(join(bundle, "schemas", "loose.schema.json"), JSON.stringify(LOOSE_SCHEMA));
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   await writeFile(join(bundle, "decisions", "model.yaml"), MODEL_YAML);
   return bundle;
 }
@@ -814,7 +829,7 @@ test("2. agent -> decision -> agent resume uses the global next execution index"
   await prefixAgentStep(prefix, "coder", 1, { facts: FACTS_ALPHA });
   await prefixDecisionStep(prefix, "check", 2); // alpha -> probe
   const captured = await runResume(harness, runId, {
-    workerOutputs: { probe: { report: "probe body" } },
+    workerOutputs: { probe: { plan: "{}", report: "probe body" } },
   });
   const outcome = captured.outcome;
   if (outcome === null || !outcome.ok || outcome.state === null) {
@@ -867,7 +882,7 @@ test("4. old and winning accepted outputs are restored and used", async () => {
     await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"),
   );
   const captured = await runResume(harness, runId, {
-    workerOutputs: { probe: { report: "probe body" } },
+    workerOutputs: { probe: { plan: "{}", report: "probe body" } },
   });
   const outcome = captured.outcome;
   if (outcome === null || !outcome.ok || outcome.state === null) {

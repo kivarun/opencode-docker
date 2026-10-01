@@ -992,6 +992,7 @@ const ORCHESTRATION_BLOCK = `orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1037,6 +1038,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1063,7 +1065,8 @@ states:
           pipeline_input: task
     outputs:
       - id: plan
-        type: file
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 1800
     max_attempts: 1
     transitions:
@@ -1225,6 +1228,7 @@ async function writeOrchestratedDigestBundle(
   await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
   await writeFile(join(bundle, "prompts", "architect.md"), "review the implementation\n");
   await writeFile(join(bundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   await writeFile(join(bundle, "decisions", "dispatch.yaml"), DISPATCH_DIGEST_MODEL_YAML);
   await writeFile(join(bundle, "decisions", "gate.yaml"), GATE_DIGEST_MODEL_YAML);
 }
@@ -1260,7 +1264,7 @@ test("an orchestrated bundle contributes the normalized orchestration to the sna
     expect(snapshot.orchestration).toEqual({
       stage_templates: [{ id: "development", entry_state: "development_entry" }],
       execution_roles: [
-        { state_id: "architect", role: "planning" },
+        { state_id: "architect", role: "planning", plan_output: "plan" },
         { state_id: "coder", role: "stage", stage_template: "development" },
         { state_id: "development_entry", role: "stage", stage_template: "development" },
         { state_id: "iteration_gate", role: "stage", stage_template: "development" },
@@ -1306,6 +1310,7 @@ test("orchestration declaration-order permutation does not change the snapshot o
       stage_template: development
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: coder
       role: stage
       stage_template: development
@@ -1378,12 +1383,25 @@ test("changing a template entry state changes the digest", async () => {
 `,
         `    - state_id: development_entry
       role: planning
+      plan_output: draft
+`,
+      )
+      // the planning role binds a JSON output port of its own state, so
+      // the converted planning state's draft output becomes json
+      .replace(
+        `      - id: draft
+        type: file
+`,
+        `      - id: draft
+        type: json
+        schema: schemas/draft.schema.json
 `,
       );
     if (changed === raw) {
       throw new Error("the entry mutation replacement did not apply");
     }
     await writeFile(join(bundle, "pipeline.yaml"), changed);
+    await writeFile(join(bundle, "schemas", "draft.schema.json"), JSON.stringify({ type: "object" }));
   });
   expect(after.json).not.toBe(before.json);
   expect(after.digest).not.toBe(before.digest);

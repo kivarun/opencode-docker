@@ -102,6 +102,7 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: report
     - state_id: check
       role: control
 states:
@@ -160,8 +161,10 @@ orchestration:
   execution_roles:
     - state_id: first
       role: planning
+      plan_output: plan
     - state_id: second
       role: planning
+      plan_output: plan
 states:
   - id: first
     type: agent
@@ -169,6 +172,9 @@ states:
     prompt: prompts/first.md
     inputs: []
     outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
       - id: report
         type: file
     timeout_seconds: 60
@@ -181,7 +187,10 @@ states:
     profile: beta
     prompt: prompts/second.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -218,6 +227,7 @@ async function writeBundle(root: string, yaml: string): Promise<string> {
   await writeFile(join(bundle, "prompts", "first.md"), PROMPT_BODY);
   await writeFile(join(bundle, "prompts", "second.md"), PROMPT_BODY);
   await writeFile(join(bundle, "schemas", "loose.schema.json"), JSON.stringify(LOOSE_SCHEMA));
+  await writeFile(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
   await writeFile(join(bundle, "decisions", "model.yaml"), MODEL_YAML);
   return bundle;
 }
@@ -712,7 +722,7 @@ test("3. two distinct profiles load before auth, in declaration order, and the r
   const runId = "66666666-7777-8888-9999-000000000000";
   const captured = await runScript(harness, {
     fixedRunId: runId,
-    workerOutputs: { first: { report: "REPORT-CONTENT" }, second: {} },
+    workerOutputs: { first: { plan: "{}", report: "REPORT-CONTENT" }, second: { plan: "{}" } },
     bindings: [{ id: "source", path: harness.sourceFile }],
   });
   const state = expectOk(captured);

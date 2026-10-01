@@ -90,10 +90,12 @@ orchestration:
   execution_roles:
     - state_id: coder
       role: planning
+      plan_output: plan
     - state_id: check
       role: control
     - state_id: ship
       role: planning
+      plan_output: plan
 states:
   - id: coder
     type: agent
@@ -141,7 +143,10 @@ states:
           state_output:
             state: coder
             output: plan
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/facts.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -263,6 +268,15 @@ async function writeAgentOutputs(
   await writeFile(join(outputsRoot, "report"), `report for ${stateId} ${activationIndex}\n`, { mode: 0o600 });
 }
 
+/** Writes exactly the declared ship ports (plan json only). */
+async function writeShipOutputs(
+  base: Base,
+  activationIndex: number,
+): Promise<void> {
+  const outputsRoot = join(base.runRoot, "activations", `${activationIndex}-ship`, "data", "outputs");
+  await writeFile(join(outputsRoot, "plan"), JSON.stringify({ f1: true, f2: false }), { mode: 0o600 });
+}
+
 async function runAgentActivation(
   base: Base,
   drive: Drive,
@@ -281,8 +295,10 @@ async function runAgentActivation(
     stateId,
     executionIndex,
   );
-  if (stateId === "coder") {
+  if (stateId !== "ship") {
     await writeAgentOutputs(base, stateId, executionIndex, planBytes);
+  } else {
+    await writeShipOutputs(base, executionIndex);
   }
   const accepted = await acceptActivationOutputs(base.pipeline, prepared);
   dispatchClock(drive, base.clock, {
@@ -1640,6 +1656,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dispatch
       role: control
     - state_id: dev
@@ -1655,7 +1672,10 @@ states:
     profile: coder
     prompt: prompts/architect.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/facts.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -1748,6 +1768,7 @@ orchestration:
   execution_roles:
     - state_id: architect
       role: planning
+      plan_output: plan
     - state_id: dispatch
       role: control
     - state_id: dev
@@ -1771,7 +1792,10 @@ states:
     profile: coder
     prompt: prompts/architect.md
     inputs: []
-    outputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/facts.schema.json
     timeout_seconds: 60
     max_attempts: 1
     transitions:
@@ -1934,7 +1958,7 @@ function dispatchStage(base: StageBase, command: PipelineV2RunCommand): void {
   dispatchClock(base.drive, base.clock, command);
 }
 
-function runStageAgentPhases(base: StageBase, stateId: string): number {
+async function runStageAgentPhases(base: StageBase, stateId: string): Promise<number> {
   const executionIndex = (base.drive.state as PipelineV2RunState).executions.length + 1;
   dispatchStage(base, {
     kind: "start_agent_execution",
@@ -1945,7 +1969,24 @@ function runStageAgentPhases(base: StageBase, stateId: string): number {
   for (const command of AGENT_PHASE_COMMANDS(`sess-${executionIndex}`, `tool-${executionIndex}`)) {
     dispatchStage(base, command);
   }
-  dispatchStage(base, { kind: "agent_outputs_accepted", outputs: [] });
+  const outputs: { id: string; digest: string }[] = [];
+  if (stateId === "architect") {
+    const prepared = await prepareActivationData(
+      base.pipeline,
+      base.runInputs,
+      base.drive.records,
+      stateId,
+      executionIndex,
+    );
+    const outputsRoot = join(base.runRoot, "activations", `${executionIndex}-${stateId}`, "data", "outputs");
+    await writeFile(join(outputsRoot, "plan"), JSON.stringify({ f1: true, f2: false }), { mode: 0o600 });
+    const accepted = await acceptActivationOutputs(base.pipeline, prepared);
+    for (const record of accepted) {
+      outputs.push({ id: record.output, digest: record.digest });
+    }
+    base.drive.records.push(...accepted);
+  }
+  dispatchStage(base, { kind: "agent_outputs_accepted", outputs });
   dispatchStage(base, { kind: "agent_cleanup_completed" });
   return executionIndex;
 }
@@ -1985,15 +2026,15 @@ function commitStageTransition(
  * transition. The run stops at the clean resumable boundary right after
  * the final transition.
  */
-function driveStageClosureBoundary(base: StageBase, closeBy: "normal_close" | "exhausted"): void {
-  runStageAgentPhases(base, "architect");
+async function driveStageClosureBoundary(base: StageBase, closeBy: "normal_close" | "exhausted"): Promise<void> {
+  await runStageAgentPhases(base, "architect");
   dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
   commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
   runStageDecision(base, "dispatch", "d_next_stage");
   dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
   dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
   commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
-  runStageAgentPhases(base, "dev");
+  await runStageAgentPhases(base, "dev");
   commitStageTransition(base, "dev", "completed", "gate", 3, 0);
   runStageDecision(base, "gate", "d_close_stage");
   dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: closeBy });
@@ -2008,8 +2049,8 @@ function driveStageClosureBoundary(base: StageBase, closeBy: "normal_close" | "e
  * (before its closure); otherwise the closure and reopening happen before
  * the dev execution starts inside the reopened iteration.
  */
-function driveStageTouching(base: StageBase, closedFirst: boolean): void {
-  runStageAgentPhases(base, "architect");
+async function driveStageTouching(base: StageBase, closedFirst: boolean): Promise<void> {
+  await runStageAgentPhases(base, "architect");
   dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
   commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
   runStageDecision(base, "dispatch", "d_next_stage");
@@ -2020,7 +2061,7 @@ function driveStageTouching(base: StageBase, closedFirst: boolean): void {
     dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
     dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 2 });
   }
-  runStageAgentPhases(base, "dev");
+  await runStageAgentPhases(base, "dev");
   if (closedFirst) {
     dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
     dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 2 });
@@ -2035,13 +2076,12 @@ function driveStageTouching(base: StageBase, closedFirst: boolean): void {
 test("44. the contract-order closure boundary with a same-boundary normal_close passes the loader and the real restore verifier", async () => {
   const base = await setupStageBase();
   try {
-    driveStageClosureBoundary(base, "normal_close");
+    await driveStageClosureBoundary(base, "normal_close");
     const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
     expect(context.cursor).toEqual({ current_state: "done", transition_count: 4 });
     expect(context.next_execution_index).toBe(5);
-    expect(context.accepted_outputs).toEqual([]);
   } finally {
     await rm(base.root, { recursive: true, force: true });
   }
@@ -2050,7 +2090,7 @@ test("44. the contract-order closure boundary with a same-boundary normal_close 
 test("45. the same-boundary exhausted closure is restorable the same way", async () => {
   const base = await setupStageBase();
   try {
-    driveStageClosureBoundary(base, "exhausted");
+    await driveStageClosureBoundary(base, "exhausted");
     const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
@@ -2063,7 +2103,7 @@ test("45. the same-boundary exhausted closure is restorable the same way", async
 test("46. the touching same-boundary pair restores by membership in the admissible candidate set (closed first)", async () => {
   const base = await setupStageBase();
   try {
-    driveStageTouching(base, true);
+    await driveStageTouching(base, true);
     const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
@@ -2076,7 +2116,7 @@ test("46. the touching same-boundary pair restores by membership in the admissib
 test("47. the touching same-boundary pair restores by membership when the execution started in the reopened iteration", async () => {
   const base = await setupStageBase();
   try {
-    driveStageTouching(base, false);
+    await driveStageTouching(base, false);
     const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
@@ -2091,15 +2131,15 @@ test("47. the touching same-boundary pair restores by membership when the execut
  * with the dev execution started inside the OLD generation at that same
  * boundary (scenario 3).
  */
-function driveStageCrossGenerationOldExec(base: StageBase): void {
-  runStageAgentPhases(base, "architect");
+async function driveStageCrossGenerationOldExec(base: StageBase): Promise<void> {
+  await runStageAgentPhases(base, "architect");
   dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
   commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
   runStageDecision(base, "dispatch", "d_next_stage");
   dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
   dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
   commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
-  runStageAgentPhases(base, "dev");
+  await runStageAgentPhases(base, "dev");
   dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
   dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
   dispatchStage(base, { kind: "stage_generation_opened", stageId: "testing", stagePosition: 2, templateId: "testing", planSha256: hex("1"), initialBudget: 2, transitionCount: 2 });
@@ -2114,15 +2154,15 @@ function driveStageCrossGenerationOldExec(base: StageBase): void {
  * the second stage's entry and its stage execution runs in the new
  * generation's iteration.
  */
-function driveStageCrossGenerationNewExec(base: StageBase): void {
-  runStageAgentPhases(base, "architect");
+async function driveStageCrossGenerationNewExec(base: StageBase): Promise<void> {
+  await runStageAgentPhases(base, "architect");
   dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
   commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
   runStageDecision(base, "dispatch", "d_next_stage");
   dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
   dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
   commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
-  runStageAgentPhases(base, "dev");
+  await runStageAgentPhases(base, "dev");
   commitStageTransition(base, "dev", "completed", "gate", 3, 0);
   runStageDecision(base, "gate", "d_close_stage");
   dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
@@ -2136,7 +2176,7 @@ function driveStageCrossGenerationNewExec(base: StageBase): void {
   });
   dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 2, iterationIndex: 1, transitionCount: 4 });
   commitStageTransition(base, "control2", "d_next_stage", "test", 5, 0);
-  runStageAgentPhases(base, "test");
+  await runStageAgentPhases(base, "test");
   commitStageTransition(base, "test", "completed", "testgate", 6, 0);
 }
 
@@ -2145,15 +2185,15 @@ function driveStageCrossGenerationNewExec(base: StageBase): void {
  * same template at the touching boundary; the dev execution started at that
  * boundary is a member of the admissible candidate set (scenario 5).
  */
-function driveStageReusedTemplate(base: StageBase): void {
-  runStageAgentPhases(base, "architect");
+async function driveStageReusedTemplate(base: StageBase): Promise<void> {
+  await runStageAgentPhases(base, "architect");
   dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
   commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
   runStageDecision(base, "dispatch", "d_next_stage");
   dispatchStage(base, { kind: "stage_generation_opened", stageId: "first_stage", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
   dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
   commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
-  runStageAgentPhases(base, "dev");
+  await runStageAgentPhases(base, "dev");
   dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
   dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
   dispatchStage(base, { kind: "stage_generation_opened", stageId: "second_stage", stagePosition: 2, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 2 });
@@ -2164,7 +2204,7 @@ function driveStageReusedTemplate(base: StageBase): void {
 test("48. the touching generations with different templates resolve the old generation's execution", async () => {
   const base = await setupStageBase(STAGE_TWO_PIPELINE);
   try {
-    driveStageCrossGenerationOldExec(base);
+    await driveStageCrossGenerationOldExec(base);
     const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
@@ -2178,7 +2218,7 @@ test("48. the touching generations with different templates resolve the old gene
 test("49. the touching generations with different templates resolve the new generation's execution", async () => {
   const base = await setupStageBase(STAGE_TWO_PIPELINE);
   try {
-    driveStageCrossGenerationNewExec(base);
+    await driveStageCrossGenerationNewExec(base);
     const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
@@ -2192,7 +2232,7 @@ test("49. the touching generations with different templates resolve the new gene
 test("50. a reused template at a touching boundary passes the real restore verifier", async () => {
   const base = await setupStageBase();
   try {
-    driveStageReusedTemplate(base);
+    await driveStageReusedTemplate(base);
     const state = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
     validatePipelineV2RunState(state);
     const context = await restorePipelineV2RuntimeContext(base.pipeline, state, base.runRoot);
@@ -2212,14 +2252,14 @@ test("51. an execution whose recorded index matches no template-matching candida
   // rejects it.
   const base = await setupStageBase(STAGE_TWO_PIPELINE);
   try {
-    runStageAgentPhases(base, "architect");
+    await runStageAgentPhases(base, "architect");
     dispatchStage(base, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
     commitStageTransition(base, "architect", "completed", "dispatch", 1, 0);
     runStageDecision(base, "dispatch", "d_next_stage");
     dispatchStage(base, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
     dispatchStage(base, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
     commitStageTransition(base, "dispatch", "d_next_stage", "dev", 2, 0);
-    runStageAgentPhases(base, "dev");
+    await runStageAgentPhases(base, "dev");
     dispatchStage(base, { kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "normal_close" });
     dispatchStage(base, { kind: "stage_generation_closed", generationIndex: 1, by: "next_stage" });
     commitStageTransition(base, "dev", "completed", "gate", 3, 0);
