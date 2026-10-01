@@ -2009,7 +2009,7 @@ test("30. the verified json output result is an exact deep-frozen five-key recor
 
 test("31. the exact-target matrix refuses every wrong selection before any schema work", async () => {
   await withBridge(async (_dirs, sources, pipeline, runRoot) => {
-    const { architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    const { records, architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
     // missing output port of the state
     await expectReject(async () => {
       await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "facts", 2);
@@ -2018,11 +2018,12 @@ test("31. the exact-target matrix refuses every wrong selection before any schem
     await expectReject(async () => {
       await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "ghost", "plan", 2);
     }, 'state "ghost" is not a declared agent state');
-    // a non-JSON target: `patch` is a declared FILE output of `coder` with
-    // an honest accepted record, so the refusal is exactly the json-port
-    // requirement, never the missing-output form
+    // a non-JSON target: `patch` is a declared FILE output of `coder` and
+    // the passed `records` carry its honest accepted record, so the
+    // refusal is exactly the json-port requirement, never the
+    // missing-output form
     await expectReject(async () => {
-      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "coder", "patch", 1);
+      await readAcceptedJsonOutput(pipeline, runRoot, records, "coder", "patch", 1);
     }, 'output "patch" of state "coder" is not a declared json output port with a compiled schema');
     // a record newer than the requested activation is not below the bound
     await expectReject(async () => {
@@ -2056,7 +2057,9 @@ test("31. the exact-target matrix refuses every wrong selection before any schem
 test("32. a corrupted accepted history never returns the target", async () => {
   await withBridge(async (dirs, sources, pipeline, runRoot) => {
     const { architectRecords, records } = await bridgeHistory(pipeline, sources, runRoot);
-    // corruption of an old non-winning record (coder.plan from activation 1)
+    // corruption of an old non-target record (coder.plan from activation 1
+    // — an old record of a different pair, not a non-winning record of its
+    // own; the genuine non-winning case is covered by test 37)
     await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), "{}", { mode: 0o600 });
     await expectReject(async () => {
       await readAcceptedJsonOutput(pipeline, runRoot, [...records, ...architectRecords], "architect", "plan", 2);
@@ -2269,10 +2272,17 @@ test("37. a corrupted OLD NON-WINNING record fails the whole read before the new
 
 test("38. the fail-fast order: an invalid target is refused before the run root and the history are touched", async () => {
   await withBridge(async (_dirs, sources, pipeline, runRoot) => {
-    const { architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
-    const countedHistoryProxy = (): { proxy: readonly unknown[]; traps: { count: number } } => {
+    const { records, architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    // The invalid run root the target-error cases are run against: a
+    // symlinked final component, so a wrong implementation that reached
+    // the run-root contract would fail there instead of with the target
+    // error.
+    await symlink(join(runRoot, "project"), join(runRoot, "root-link"));
+    const countedHistoryProxy = (
+      wrapped: readonly unknown[],
+    ): { proxy: readonly unknown[]; traps: { count: number } } => {
       const traps = { count: 0 };
-      const proxy = new Proxy(architectRecords, {
+      const proxy = new Proxy(wrapped, {
         get(target, property, receiver) {
           traps.count += 1;
           return Reflect.get(target, property, receiver);
@@ -2280,38 +2290,42 @@ test("38. the fail-fast order: an invalid target is refused before the run root 
       }) as unknown as readonly unknown[];
       return { proxy, traps };
     };
-    // 1. A missing state: the trusted-state resolution refuses before the
-    // run root is verified and before the accepted history is parsed.
-    const missingState = countedHistoryProxy();
+    // 1. A missing state against a poisoned run root: the trusted-state
+    // resolution refuses with the missing-state error BEFORE the run-root
+    // contract and the accepted history are ever touched.
+    const missingState = countedHistoryProxy(architectRecords);
     await expectReject(async () => {
-      await readAcceptedJsonOutput(pipeline, runRoot, missingState.proxy, "ghost", "plan", 2);
+      await readAcceptedJsonOutput(pipeline, join(runRoot, "root-link"), missingState.proxy, "ghost", "plan", 2);
     }, 'state "ghost" is not a declared agent state');
     expect(missingState.traps.count).toBe(0);
-    // 2. A non-JSON target: the same fail-fast boundary; the history Proxy
-    // is never read either.
-    const nonJson = countedHistoryProxy();
+    // 2. A declared non-JSON target (`records` really carry the honest
+    // coder.patch accepted record) against a poisoned run root: the
+    // json-port requirement is the observed refusal; the history Proxy is
+    // never read.
+    const nonJson = countedHistoryProxy(records);
     await expectReject(async () => {
-      await readAcceptedJsonOutput(pipeline, runRoot, nonJson.proxy, "coder", "patch", 1);
+      await readAcceptedJsonOutput(pipeline, join(runRoot, "root-link"), nonJson.proxy, "coder", "patch", 1);
     }, 'output "patch" of state "coder" is not a declared json output port with a compiled schema');
     expect(nonJson.traps.count).toBe(0);
-    // 3. An unsafe state id: the scalar validation is the first refusal.
-    const unsafe = countedHistoryProxy();
+    // 3. An unsafe state id against a poisoned run root: the scalar
+    // validation is the first refusal.
+    const unsafe = countedHistoryProxy(architectRecords);
     await expectReject(async () => {
-      await readAcceptedJsonOutput(pipeline, runRoot, unsafe.proxy, "../escape", "plan", 2);
-    }, /accepted json output read state id "\.\.\/escape" is not a safe identifier/);
+      await readAcceptedJsonOutput(pipeline, join(runRoot, "root-link"), unsafe.proxy, "../escape", "plan", 2);
+    }, /accepted json output read state id "..\/escape" is not a safe identifier/);
     expect(unsafe.traps.count).toBe(0);
     // 4. A valid JSON target with a MISSING run root: the canonical
     // run-root contract is verified before the accepted history is read,
-    // so the history Proxy stays untouched.
-    const missingRoot = countedHistoryProxy();
+    // so the history Proxy stays untouched — the next precedence
+    // boundary.
+    const missingRoot = countedHistoryProxy(architectRecords);
     await expectReject(async () => {
       await readAcceptedJsonOutput(pipeline, join(runRoot, "missing-root"), missingRoot.proxy, "architect", "plan", 2);
     }, /run root .*missing-root does not exist/);
     expect(missingRoot.traps.count).toBe(0);
     // 5. A valid JSON target with a POISONED run root (a symlinked final
     // component): the same canonical contract refuses before the history.
-    const poisonedRoot = countedHistoryProxy();
-    await symlink(join(runRoot, "project"), join(runRoot, "root-link"));
+    const poisonedRoot = countedHistoryProxy(architectRecords);
     await expectReject(async () => {
       await readAcceptedJsonOutput(pipeline, join(runRoot, "root-link"), poisonedRoot.proxy, "architect", "plan", 2);
     }, /run root .*root-link exists but is a symbolic link/);
