@@ -1334,7 +1334,10 @@ only the decision's own input; the original user binding paths are never
 re-read), then the complete accepted history through the one shared
 `resolveAcceptedHistory` chain also used by `prepareActivationData`,
 `collectRunOutputs` and the exact-activation JSON reader
-(`readAcceptedJsonOutput`) — the single resolver for every consumer; when
+(`readAcceptedJsonOutput`, whose own fail-closed order is: provenance gate,
+safe scalars, trusted declared-json-port resolution, canonical run-root
+verification, then the full history chain and the exact winning-record
+check) — the single resolver for every consumer; when
 JSON revalidation runs, each record is physically read exactly once (the
 digest phase captures the raw bytes into a per-call cache), all records'
 digests are compared first, and only then are the cached bytes parsed and

@@ -1924,7 +1924,11 @@ async function bridgeHistory(
   pipeline: Awaited<ReturnType<typeof loadPipelineV2>>,
   sources: string,
   runRoot: string,
-): Promise<{ snap: Awaited<ReturnType<typeof snapshotRunInputs>>; records: ReturnType<typeof Object.values> extends never ? never : Awaited<ReturnType<typeof acceptActivationOutputs>>; architectRecords: Awaited<ReturnType<typeof acceptActivationOutputs>> }> {
+): Promise<{
+  snap: Awaited<ReturnType<typeof snapshotRunInputs>>;
+  records: Awaited<ReturnType<typeof acceptActivationOutputs>>;
+  architectRecords: Awaited<ReturnType<typeof acceptActivationOutputs>>;
+}> {
   const snap = await snapshotRunInputs(pipeline, [
     { id: "task", path: join(sources, "task.txt") },
     { id: "config", path: join(sources, "config.json") },
@@ -2014,6 +2018,12 @@ test("31. the exact-target matrix refuses every wrong selection before any schem
     await expectReject(async () => {
       await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "ghost", "plan", 2);
     }, 'state "ghost" is not a declared agent state');
+    // a non-JSON target: `patch` is a declared FILE output of `coder` with
+    // an honest accepted record, so the refusal is exactly the json-port
+    // requirement, never the missing-output form
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "coder", "patch", 1);
+    }, 'output "patch" of state "coder" is not a declared json output port with a compiled schema');
     // a record newer than the requested activation is not below the bound
     await expectReject(async () => {
       await readAcceptedJsonOutput(pipeline, runRoot, architectRecords, "architect", "plan", 1);
@@ -2089,22 +2099,54 @@ test("32. a corrupted accepted history never returns the target", async () => {
 
 test("33. a digest mismatch anywhere in the history still wins over a schema failure", async () => {
   await withBridge(async (_dirs, sources, pipeline, runRoot) => {
-    const { records } = await bridgeHistory(pipeline, sources, runRoot);
-    // coder.plan (activation 1, an EARLIER record) is schema-invalid while
-    // architect.plan (activation 2, the target) has a digest mismatch: the
-    // digest phase runs to completion before the schema phase, so the
-    // mismatch — not the schema failure — is the observed failure
+    const { records, architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    // The exact combination: the EARLIER coder.plan record is schema
+    // invalid but carries an HONEST digest of the new bytes, while the
+    // TARGET architect.plan has a digest mismatch. The digest phase runs
+    // to completion before the schema phase, so the target's mismatch —
+    // never the earlier record's schema failure — is the observed failure.
     await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), "[1,2,3]", { mode: 0o600 });
+    const coderPlanDigest = await acceptedOutputDigest(
+      "json",
+      join(runRoot, "activations", "1-coder", "data", "outputs", "plan"),
+      "fixture",
+    );
     await writeFile(join(runRoot, "activations", "2-architect", "data", "outputs", "plan"), JSON.stringify({ tampered: true }), { mode: 0o600 });
+    const correctedCoderRecords = records.map((record) =>
+      record.output === "plan"
+        ? { state: record.state, output: record.output, activation_index: record.activation_index, digest: coderPlanDigest }
+        : record,
+    );
     let caught: unknown = null;
     try {
-      await readAcceptedJsonOutput(pipeline, runRoot, records, "architect", "plan", 2);
+      await readAcceptedJsonOutput(
+        pipeline,
+        runRoot,
+        [...correctedCoderRecords, ...architectRecords],
+        "architect",
+        "plan",
+        2,
+      );
     } catch (cause) {
       caught = cause;
     }
     expect(caught).toBeInstanceOf(PipelineError);
-    expect((caught as Error).message).toContain("digest mismatch");
+    expect((caught as Error).message).toContain('accepted state output for "architect"."plan" at activation index 2 digest mismatch');
     expect((caught as Error).message).not.toContain("does not conform");
+    // The earlier coder.plan record really had a matching digest and was
+    // really schema-invalid: reading it alone fails the schema phase
+    // (the digest phase passed), proving the combined failure above chose
+    // the digest mismatch by order, not by accident.
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(
+        pipeline,
+        runRoot,
+        correctedCoderRecords,
+        "coder",
+        "plan",
+        1,
+      );
+    }, 'accepted state output for "coder"."plan" at activation index 1 does not conform to its JSON schema: (root): must be object');
   });
 });
 
@@ -2170,5 +2212,109 @@ test("36. the restored accepted history stays on the single chain with one read 
     // history validates and the typed failure never mints a target
     await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
     await expect(verifyRestoredAcceptedHistory(pipeline, runRoot, fullHistory)).resolves.toBeUndefined();
+  });
+});
+
+test("37. a corrupted OLD NON-WINNING record fails the whole read before the newer winner is returned", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const { snap, records, architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    // A second HONEST coder activation with the full port set (index 3):
+    // only now does a newer record of the pair coder/plan exist in the
+    // history, so the activation-1 coder.plan record becomes genuinely
+    // non-winning for that pair.
+    const third = await prepareActivationData(
+      pipeline,
+      snap,
+      [...records, ...architectRecords],
+      "coder",
+      3,
+    );
+    await writeFile(join(third.outputs_root, "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+    await writeFile(join(third.outputs_root, "patch"), "PATCH-3", { mode: 0o600 });
+    const thirdRecords = await acceptActivationOutputs(pipeline, third);
+    expect(thirdRecords.map((record) => [record.output, record.activation_index])).toEqual([
+      ["plan", 3],
+      ["patch", 3],
+    ]);
+    const fullHistory = [...records, ...architectRecords, ...thirdRecords];
+    // After the newer acceptance: corrupt the OLD activation-1 coder.plan.
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), "{}", { mode: 0o600 });
+    // The reader for the NEW winning coder.plan must refuse the whole read
+    // because the old non-winning record no longer verifies — the winner
+    // is never returned while any part of the history is damaged.
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(
+        pipeline,
+        runRoot,
+        fullHistory,
+        "coder",
+        "plan",
+        3,
+      );
+    }, /accepted state output for "coder"\."plan" at activation index 1 digest mismatch/);
+    // The healthy full history returns the new winner.
+    await writeFile(join(runRoot, "activations", "1-coder", "data", "outputs", "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+    const read = await readAcceptedJsonOutput(pipeline, runRoot, fullHistory, "coder", "plan", 3);
+    expect(read.state).toBe("coder");
+    expect(read.output).toBe("plan");
+    expect(read.activation_index).toBe(3);
+    const winning = thirdRecords.find((record) => record.output === "plan");
+    if (winning === undefined) {
+      throw new Error("the winning coder.plan record is missing");
+    }
+    expect(winning.digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(read.digest).toBe(winning.digest);
+  });
+});
+
+test("38. the fail-fast order: an invalid target is refused before the run root and the history are touched", async () => {
+  await withBridge(async (_dirs, sources, pipeline, runRoot) => {
+    const { architectRecords } = await bridgeHistory(pipeline, sources, runRoot);
+    const countedHistoryProxy = (): { proxy: readonly unknown[]; traps: { count: number } } => {
+      const traps = { count: 0 };
+      const proxy = new Proxy(architectRecords, {
+        get(target, property, receiver) {
+          traps.count += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      }) as unknown as readonly unknown[];
+      return { proxy, traps };
+    };
+    // 1. A missing state: the trusted-state resolution refuses before the
+    // run root is verified and before the accepted history is parsed.
+    const missingState = countedHistoryProxy();
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, missingState.proxy, "ghost", "plan", 2);
+    }, 'state "ghost" is not a declared agent state');
+    expect(missingState.traps.count).toBe(0);
+    // 2. A non-JSON target: the same fail-fast boundary; the history Proxy
+    // is never read either.
+    const nonJson = countedHistoryProxy();
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, nonJson.proxy, "coder", "patch", 1);
+    }, 'output "patch" of state "coder" is not a declared json output port with a compiled schema');
+    expect(nonJson.traps.count).toBe(0);
+    // 3. An unsafe state id: the scalar validation is the first refusal.
+    const unsafe = countedHistoryProxy();
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, runRoot, unsafe.proxy, "../escape", "plan", 2);
+    }, /accepted json output read state id "\.\.\/escape" is not a safe identifier/);
+    expect(unsafe.traps.count).toBe(0);
+    // 4. A valid JSON target with a MISSING run root: the canonical
+    // run-root contract is verified before the accepted history is read,
+    // so the history Proxy stays untouched.
+    const missingRoot = countedHistoryProxy();
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, join(runRoot, "missing-root"), missingRoot.proxy, "architect", "plan", 2);
+    }, /run root .*missing-root does not exist/);
+    expect(missingRoot.traps.count).toBe(0);
+    // 5. A valid JSON target with a POISONED run root (a symlinked final
+    // component): the same canonical contract refuses before the history.
+    const poisonedRoot = countedHistoryProxy();
+    await symlink(join(runRoot, "project"), join(runRoot, "root-link"));
+    await expectReject(async () => {
+      await readAcceptedJsonOutput(pipeline, join(runRoot, "root-link"), poisonedRoot.proxy, "architect", "plan", 2);
+    }, /run root .*root-link exists but is a symbolic link/);
+    expect(poisonedRoot.traps.count).toBe(0);
   });
 });
