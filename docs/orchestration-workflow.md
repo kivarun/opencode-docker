@@ -360,6 +360,82 @@ continuePipelineV2Stage(
   intervention write; after the facade starts, signal ownership stays
   coordinator-owned through the captured control functions.
 
+## The production revise-task runner API (implemented, not wired into the CLI)
+
+`orchestrator/src/pipeline_v2_runner.ts` adds the dedicated `revise_task`
+runner entrypoint `revisePipelineV2Task(options, deps)`. It is implemented
+but deliberately **not wired into the CLI** this increment: `main.ts`,
+`cli_args.ts` and `usage()` are untouched, and `revise_task` still has no
+dedicated CLI path (the generic `respond` command keeps failing closed on
+the reserved intervention action ids).
+
+```
+revisePipelineV2Task(
+  { runId, waitIndex, taskId, taskBody, configRoot, launcherId? },
+  deps,   // the existing PipelineV2RunnerDeps
+) -> PipelineV2RunOutcome
+```
+
+- The external parameters are exactly the run id, the wait journal index,
+  the task id and the caller's revised task body (a non-empty string, the
+  only place the new body exists) plus the standard resume configuration.
+  The action is fixed by the entrypoint as the reserved `revise_task`.
+  Every internal intervention parameter — the stage id, the expected plan
+  digest, the initial budget, the prepared intent and candidate, the
+  pipeline and the compiled plan — is derived by the existing handoff
+  controller (`resumePipelineV2RunAfterReviseTaskIntervention`) from the
+  authoritative durable state after the reopen and is never a caller
+  field. Hostile options never read `pipeline`, `pipelineRoot`, `runRoot`,
+  `actionId`, any intent/candidate/manifest/digest field, any stage/plan/
+  generation/iteration identifier, the budget or any internal dependency.
+- No second runner or preflight exists: the boolean `continueStage` flag
+  of the shared private existing-run core was replaced by a minimal
+  discriminated flow/caller-policy model (`ExistingRunCallerPolicy`:
+  `resume` | `continue_stage` | `revise_task`), and all shared stages stay
+  single — capture and shape validation, the single `RunCauseGate`, the
+  read-only run-root verification, the read-only `PipelineV2RunStateSink
+  .open`, the pipeline load from durable `state.pipeline.bundle_root`,
+  profile loading, Launcher authority, the runtime adapter, and the
+  coordinator result → `PipelineV2RunOutcome` mapping.
+  `resumePipelineV2` and `continuePipelineV2Stage` keep their observable
+  behavior, texts, read orders, signal semantics and outcome mapping
+  unchanged (their suites are unmodified beyond the export-surface pin
+  gaining the fourth key).
+- Revise capture order: `runId, waitIndex, taskId, taskBody, configRoot,
+  launcherId` — each read exactly once; the deps order is unchanged
+  (`cli, fetchAuth, helperConfig.socketPath, helperConfig.credentialFile,
+  baseEnv, stateRootProjection.localRoot, stateRootProjection.daemonRoot,
+  now, randomId, onSignal`); `baseEnv` stays an opaque captured reference;
+  caller objects and Proxies are never frozen or enumerated.
+- The read-only routing derivation runs after the successful sink open and
+  strictly before any pipeline/profile/auth/runtime work: the durable
+  `run_id` must equal the captured run id; the target wait is located by
+  one full journal pass (never `waits[waitIndex - 1]`) and must be the
+  only record with that index and the last record of the journal; the
+  actions must declare exactly one `revise_task`; only the two
+  runner-routing boundaries are admitted — C0 (the wait open, the
+  intervention not yet started) and R4 (the exact action already answered
+  as `revise_task`, the crash/retry boundary after the completed
+  intervention). A mid-intervention window (an accepted intent without the
+  response) or a foreign answer is refused as an ordinary post-run-root
+  refusal with zero durable writes and zero Sessions. Loader-invalid wait
+  journals (a duplicate wait index, two `revise_task` declarations,
+  malformed actions) are refused earlier at the sink open.
+  `taskId` and `taskBody` stay caller policy — the runner never derives
+  them from the ledger, reads no manifest, prepares no intent and builds
+  no delta/retry machine; the deep exact-boundary verification and the
+  wrong-body ownership stay with the existing handoff controller, whose
+  typed errors pass through by identity (exit 1 without a reason field).
+- The single composed call is exactly
+  `resumePipelineV2RunAfterReviseTaskIntervention({pipeline, runRoot,
+  sink, runtime, control, runId, waitIndex, taskId, taskBody})` — the
+  pipeline is obtained only through `loadPipelineV2(state.pipeline.bundle
+  _root)` and no in-memory compiled plan, prepared intent or prior-process
+  result is passed. A signal accepted before the facade yields 130/143
+  with the actual run id/root/state and zero intervention/session
+  dispatch; late post-cutoff signals change nothing (shared with
+  resume/continue-stage).
+
 ## The production pipeline v2 wait-response CLI (`orchestrator respond`)
 
 `orchestrator respond` records the user's answer to one durably open wait.

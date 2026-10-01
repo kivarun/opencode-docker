@@ -1118,10 +1118,13 @@ test("capture contract: a mutating helperConfig getter cannot swap the socket or
 test("the export surface gains exactly one runtime key and the module implements no second machinery", async () => {
   const namespace = (await import("../src/pipeline_v2_runner.ts")) as Record<string, unknown>;
   // the runtime export surface: interfaces are types and invisible at
-  // runtime; the surface gains exactly one new function key
+  // runtime; the surface carries exactly three function keys (the fresh
+  // runner and the two existing-run entrypoints — resume and
+  // continue-stage) plus the revise-task entrypoint
   expect(Object.keys(namespace).sort()).toEqual([
     "continuePipelineV2Stage",
     "resumePipelineV2",
+    "revisePipelineV2Task",
     "runPipelineV2",
   ]);
   expect(Object.keys(namespace).filter((key) => key === "continuePipelineV2Stage")).toEqual(["continuePipelineV2Stage"]);

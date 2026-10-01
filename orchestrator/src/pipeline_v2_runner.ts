@@ -96,6 +96,23 @@
  * execution identity is verified by the durable digest, the run-owned
  * inputs/project/accepted outputs by the restore context, and durable
  * profile epochs are not implemented.
+ *
+ * The two intervention entrypoints (`continuePipelineV2Stage` and
+ * `revisePipelineV2Task`) share the exact same existing-run core — one
+ * protected capture of the caller contract (each option field read exactly
+ * once, in the fixed per-entrypoint order, through the discriminated
+ * caller-policy kind), the read-only existing run-root verification, the
+ * read-only sink open, the entrypoint-specific post-open derivation
+ * running strictly before any pipeline, profile, authority or runtime
+ * work, and the single composed intervention facade call. The revise-task
+ * entrypoint's derivation is a pure routing gate that admits exactly the
+ * two runner routing boundaries — the untouched open wait (C0) and the
+ * wait already answered with the exact `revise_task` action (R4) — and
+ * refuses every other shape before any downstream work; the deep C0/R4
+ * boundary verification, the wrong-body ownership and the derivation of
+ * every internal intervention parameter belong to the existing handoff
+ * controller, which receives the captured scalars and the durable state
+ * alone.
  */
 import { lstat, mkdir } from "node:fs/promises";
 import { isCleanAbsolutePath } from "./clean_path.ts";
@@ -124,6 +141,7 @@ import {
   type PipelineV2ResumeRefusalReason,
 } from "./pipeline_v2_coordinator.ts";
 import { resumePipelineV2RunAfterContinueStageIntervention } from "./pipeline_v2_continue_stage_resume_controller.ts";
+import { resumePipelineV2RunAfterReviseTaskIntervention } from "./pipeline_v2_revise_task_resume_controller.ts";
 import {
   prepareWaitIntent,
   type PreparedPipelineV2RunWaitIntent,
@@ -781,6 +799,52 @@ export interface PipelineV2ContinueStageOptions {
 }
 
 /**
+ * The caller contract of the dedicated revise-task runner entrypoint. The
+ * external parameters are exactly the run id, the wait journal index, the
+ * task id and the caller's revised task body (a non-empty string, the only
+ * place the new task body exists) plus the standard resume configuration.
+ * The action is fixed by this entrypoint as the reserved `revise_task`;
+ * every internal intervention parameter — the stage id, the expected plan
+ * digest, the initial budget, the prepared intent and candidate, the
+ * pipeline and the compiled plan — is derived by the existing handoff
+ * controller from the authoritative durable state after the reopen and is
+ * never a caller field.
+ */
+export interface PipelineV2ReviseTaskOptions {
+  readonly runId: string;
+  readonly waitIndex: number;
+  readonly taskId: string;
+  readonly taskBody: string;
+  readonly configRoot: string;
+  readonly launcherId?: string;
+}
+
+/**
+ * The captured caller policy of an existing-run entrypoint, discriminated
+ * by the entrypoint kind: plain `resume` carries no caller policy, the
+ * continue-stage entrypoint carries its three captured scalars (the
+ * derivation consumes them), and the revise-task entrypoint carries its
+ * four captured scalars (`taskId` and `taskBody` stay caller policy — the
+ * runner never derives them from the ledger). After the capture the
+ * original caller objects are never read again.
+ */
+type ExistingRunCallerPolicy =
+  | { readonly kind: "resume" }
+  | {
+      readonly kind: "continue_stage";
+      readonly runId: string;
+      readonly waitIndex: number;
+      readonly additionalIterations: number;
+    }
+  | {
+      readonly kind: "revise_task";
+      readonly runId: string;
+      readonly waitIndex: number;
+      readonly taskId: string;
+      readonly taskBody: string;
+    };
+
+/**
  * The captured existing-run contract: every top-level field of the caller
  * options and dependencies is read exactly once, in the fixed capture
  * order, and validated as a captured local. After the capture the
@@ -794,10 +858,8 @@ interface CapturedExistingRunContract {
   readonly runId: string;
   readonly configRoot: string;
   readonly launcherId: string | undefined;
-  readonly waitIndex: number | undefined;
-  readonly additionalIterations: number | undefined;
-  /** The frozen captured caller policy of the continue-stage entrypoint. */
-  readonly callerPolicy: ContinueStageCallerPolicy | null;
+  /** The frozen captured caller policy of the entrypoint. */
+  readonly callerPolicy: ExistingRunCallerPolicy;
   readonly cli: CliRunner;
   readonly fetchAuth: AuthFetcher;
   /** A new frozen record built once from the validated scalars; the caller's helperConfig is never read again. */
@@ -810,11 +872,14 @@ interface CapturedExistingRunContract {
   readonly randomId: (() => string) | undefined;
 }
 
+/** The caller-policy kind of an existing-run entrypoint. */
+type ExistingRunCallerPolicyKind = ExistingRunCallerPolicy["kind"];
+
 function captureExistingRunContract(
   optionsValue: unknown,
   depsValue: PipelineV2RunnerDeps,
   contractName: string,
-  continueStage: boolean,
+  callerPolicyKind: ExistingRunCallerPolicyKind,
 ): CapturedExistingRunContract {
   if (!isRecord(optionsValue)) {
     throw new Error(`${contractName} options must be an object`);
@@ -823,7 +888,9 @@ function captureExistingRunContract(
   const runId = expectSafeId(options["runId"], `${contractName} run id`);
   let waitIndex: number | undefined;
   let additionalIterations: number | undefined;
-  if (continueStage) {
+  let taskId: string | undefined;
+  let taskBody: string | undefined;
+  if (callerPolicyKind === "continue_stage") {
     const waitValue = options["waitIndex"];
     if (!isPositiveSafeInteger(waitValue)) {
       throw new Error(`${contractName} options.waitIndex must be a positive safe integer`);
@@ -834,6 +901,19 @@ function captureExistingRunContract(
       throw new Error(`${contractName} options.additionalIterations must be a positive safe integer`);
     }
     additionalIterations = additionalValue;
+  } else if (callerPolicyKind === "revise_task") {
+    const waitValue = options["waitIndex"];
+    if (!isPositiveSafeInteger(waitValue)) {
+      throw new Error(`${contractName} options.waitIndex must be a positive safe integer`);
+    }
+    waitIndex = waitValue;
+    const taskIdValue = expectSafeId(options["taskId"], `${contractName} task id`);
+    taskId = taskIdValue;
+    const taskBodyValue = options["taskBody"];
+    if (typeof taskBodyValue !== "string" || taskBodyValue === "") {
+      throw new Error(`${contractName} options.taskBody must be a non-empty string`);
+    }
+    taskBody = taskBodyValue;
   }
   const configValue = options["configRoot"];
   if (!isNonEmptyAbsolutePath(configValue)) {
@@ -899,13 +979,25 @@ function captureExistingRunContract(
   if (onSignal !== undefined && typeof onSignal !== "function") {
     throw new Error(`${contractName} deps.onSignal must be a function`);
   }
-  const callerPolicy: ContinueStageCallerPolicy | null = continueStage
-    ? deepFreeze({
-        runId,
-        waitIndex: waitIndex as number,
-        additionalIterations: additionalIterations as number,
-      })
-    : null;
+  let callerPolicy: ExistingRunCallerPolicy;
+  if (callerPolicyKind === "continue_stage") {
+    callerPolicy = deepFreeze({
+      kind: "continue_stage",
+      runId,
+      waitIndex: waitIndex as number,
+      additionalIterations: additionalIterations as number,
+    });
+  } else if (callerPolicyKind === "revise_task") {
+    callerPolicy = deepFreeze({
+      kind: "revise_task",
+      runId,
+      waitIndex: waitIndex as number,
+      taskId: taskId as string,
+      taskBody: taskBody as string,
+    });
+  } else {
+    callerPolicy = { kind: "resume" };
+  }
   // The captured record is frozen shallowly: the opaque captured
   // references (`cli`, `fetchAuth`, `helperConfig`, `baseEnv`) are never
   // enumerated, cloned or frozen, and the caller's objects are never
@@ -914,8 +1006,6 @@ function captureExistingRunContract(
     runId,
     configRoot: configValue,
     launcherId: typeof launcherValue === "string" ? launcherValue : undefined,
-    waitIndex,
-    additionalIterations,
     callerPolicy,
     cli: cli as CliRunner,
     fetchAuth: fetchAuth as AuthFetcher,
@@ -927,17 +1017,6 @@ function captureExistingRunContract(
     now: now as (() => Date) | undefined,
     randomId: randomId as (() => string) | undefined,
   }) as CapturedExistingRunContract;
-}
-
-/**
- * The frozen captured caller policy of the continue-stage entrypoint:
- * the three captured scalars the derivation consumes (never the caller
- * object).
- */
-interface ContinueStageCallerPolicy {
-  readonly runId: string;
-  readonly waitIndex: number;
-  readonly additionalIterations: number;
 }
 
 /**
@@ -965,8 +1044,11 @@ interface ContinueStageDerivedPolicy {
  */
 function deriveContinueStagePolicy(
   snapshot: PipelineV2RunState,
-  policy: ContinueStageCallerPolicy,
+  policy: ExistingRunCallerPolicy,
 ): ContinueStageDerivedPolicy {
+  if (policy.kind !== "continue_stage") {
+    throw new Error("pipeline v2 continue-stage: the captured caller policy is not a continue-stage policy");
+  }
   if (snapshot.run_id !== policy.runId) {
     throw new Error("pipeline v2 continue-stage: the durable run id does not match the caller run id");
   }
@@ -1027,6 +1109,79 @@ function deriveContinueStagePolicy(
     );
   }
   return { intent, initialBudget: openGeneration.initial_budget };
+}
+
+/**
+ * The read-only revise-task routing gate: strictly after the
+ * authoritative sink open and strictly before any pipeline, profile,
+ * authority or runtime work, it admits exactly one of the two runner
+ * routing boundaries and refuses everything else. It produces nothing:
+ * the handoff controller owns the deep boundary verification (the exact
+ * C0/R4 shape, cursor, journals and task-revision ledger) and derives
+ * every internal intervention parameter from the durable state. The gate
+ * reads no manifest, prepares no intent and dispatches nothing.
+ *
+ * The two admitted boundaries are:
+ * - C0: the target wait is untouched (no accepted intent, no response);
+ *   the intervention has not started.
+ * - R4: the exact action has already been answered as `revise_task` (the
+ *   crash/retry boundary after the completed intervention; the handoff
+ *   owns the exact answer semantics).
+ *
+ * The mid-intervention windows (an accepted intent without the response,
+ * or any response with another action id) are not runner-routing
+ * boundaries and are refused here before any downstream work.
+ */
+function gateReviseTaskRouting(
+  snapshot: PipelineV2RunState,
+  policy: ExistingRunCallerPolicy,
+): null {
+  if (policy.kind !== "revise_task") {
+    throw new Error("pipeline v2 revise-task: the captured caller policy is not a revise-task policy");
+  }
+  if (snapshot.run_id !== policy.runId) {
+    throw new Error("pipeline v2 revise-task: the durable run id does not match the caller run id");
+  }
+  let target: PipelineV2RunState["waits"][number] | undefined;
+  let matches = 0;
+  for (const record of snapshot.waits) {
+    if (record.index === policy.waitIndex) {
+      matches += 1;
+      target = record;
+    }
+  }
+  if (target === undefined || matches !== 1) {
+    throw new Error(
+      `pipeline v2 revise-task: the durable wait journal carries no single wait record at index ${policy.waitIndex}`,
+    );
+  }
+  const lastWait = snapshot.waits[snapshot.waits.length - 1];
+  if (lastWait === undefined || lastWait.index !== target.index) {
+    throw new Error(
+      `pipeline v2 revise-task: the target wait record ${policy.waitIndex} is not the last wait record`,
+    );
+  }
+  const declared = target.actions.filter((action) => action.id === "revise_task");
+  if (declared.length !== 1) {
+    throw new Error(
+      `pipeline v2 revise-task: the target wait record ${policy.waitIndex} does not declare exactly one revise_task action`,
+    );
+  }
+  const response = target.response;
+  if (response === undefined) {
+    if (target.intent !== undefined) {
+      throw new Error(
+        "pipeline v2 revise-task: the target wait carries an accepted intent without the response; the runner routes only an untouched open wait or the exact revise_task answer",
+      );
+    }
+    return null;
+  }
+  if (response.action_id === "revise_task") {
+    return null;
+  }
+  throw new Error(
+    "pipeline v2 revise-task: the target wait was answered with another action; the runner routes only an untouched open wait or the exact revise_task answer",
+  );
 }
 
 /**
@@ -1134,6 +1289,8 @@ interface ExistingRunCoordinatorContext {
   readonly runtime: ReturnType<typeof createDockerHelperPipelineV2Runtime>;
   readonly control: PipelineV2CoordinatorControl;
   readonly derived: ContinueStageDerivedPolicy | null;
+  /** The frozen captured caller policy of the entrypoint. */
+  readonly callerPolicy: ExistingRunCallerPolicy;
 }
 
 interface ExistingRunFlow {
@@ -1141,20 +1298,26 @@ interface ExistingRunFlow {
   readonly failureLogPrefix: string;
   /** The per-entrypoint contract wording of the shared capture. */
   readonly contractName: string;
-  /** Whether this entrypoint captures the continue-stage option fields. */
-  readonly continueStage: boolean;
   /**
-   * The continue-only derivation: runs synchronously right after the
+   * The entrypoint's caller-policy kind: it drives which option fields the
+   * shared capture reads (plain resume reads none beyond the shared
+   * configuration) and which post-open derivation runs.
+   */
+  readonly callerPolicyKind: ExistingRunCallerPolicyKind;
+  /**
+   * The entrypoint-specific derivation: runs synchronously right after the
    * authoritative sink open, strictly before any pipeline, profile,
-   * authority or runtime work, over the frozen captured caller policy. A
-   * derivation failure is an ordinary post-run-root failure carrying the
-   * actual run id, the canonical run root and the last authoritative
-   * snapshot.
+   * authority or runtime work, over the frozen captured caller policy. The
+   * continue-stage derivation returns the intervention policy; the
+   * revise-task routing gate returns `null` (the routing admits only — the
+   * handoff derives every internal parameter). A derivation failure is an
+   * ordinary post-run-root failure carrying the actual run id, the
+   * canonical run root and the last authoritative snapshot.
    */
   derivePolicy?(
     snapshot: PipelineV2RunState,
-    policy: ContinueStageCallerPolicy,
-  ): ContinueStageDerivedPolicy;
+    callerPolicy: ExistingRunCallerPolicy,
+  ): ContinueStageDerivedPolicy | null;
   runCoordinator(context: ExistingRunCoordinatorContext): Promise<PipelineV2ResumeCoordinationResult>;
 }
 
@@ -1186,7 +1349,7 @@ async function runExistingPipelineV2(
   let gate: RunCauseGate;
   let contract: CapturedExistingRunContract;
   try {
-    contract = captureExistingRunContract(options, deps, flow.contractName, flow.continueStage);
+    contract = captureExistingRunContract(options, deps, flow.contractName, flow.callerPolicyKind);
     gate = new RunCauseGate(contract.onSignal);
   } catch (cause) {
     return preflightFailure(cause);
@@ -1287,7 +1450,7 @@ async function runExistingPipelineV2(
   let derived: ContinueStageDerivedPolicy | null = null;
   if (flow.derivePolicy !== undefined) {
     try {
-      derived = flow.derivePolicy(sink.snapshot!, contract.callerPolicy!);
+      derived = flow.derivePolicy(sink.snapshot!, contract.callerPolicy);
     } catch (cause) {
       if (recordedSignal() !== null) {
         return postRunRootSignalOutcome(sink.snapshot);
@@ -1377,6 +1540,7 @@ async function runExistingPipelineV2(
       runtime,
       control,
       derived,
+      callerPolicy: contract.callerPolicy,
     });
   } catch (cause) {
     const state = sink.snapshot;
@@ -1449,7 +1613,7 @@ export async function resumePipelineV2(
   return runExistingPipelineV2(options, deps, {
     failureLogPrefix: "pipeline v2 resume failed",
     contractName: "pipeline v2 resume",
-    continueStage: false,
+    callerPolicyKind: "resume",
     runCoordinator: (context) =>
       resumePipelineV2Run(
         {
@@ -1488,7 +1652,7 @@ export async function continuePipelineV2Stage(
   return runExistingPipelineV2(options, deps, {
     failureLogPrefix: "pipeline v2 continue-stage failed",
     contractName: "pipeline v2 continue-stage",
-    continueStage: true,
+    callerPolicyKind: "continue_stage",
     derivePolicy: deriveContinueStagePolicy,
     runCoordinator: (context) => {
       const derived = context.derived;
@@ -1503,6 +1667,61 @@ export async function continuePipelineV2Stage(
         control: context.control,
         intent: derived.intent,
         initialBudget: derived.initialBudget,
+      });
+    },
+  });
+}
+
+/**
+ * Continues one durably waiting pipeline v2 run through the dedicated
+ * `revise_task` intervention path (implemented; still not wired into the
+ * CLI). The external parameters are exactly the run id, the wait journal
+ * index, the task id and the caller's revised task body (a non-empty
+ * string, the only place the new body exists) plus the standard resume
+ * configuration; the action is fixed by this entrypoint as the reserved
+ * `revise_task`, and every internal intervention parameter — the stage
+ * id, the expected plan digest, the initial budget, the prepared intent
+ * and candidate, the pipeline and the compiled plan — is derived by the
+ * existing handoff controller from the authoritative durable state after
+ * the reopen and is never a caller field. The read-only routing gate runs
+ * strictly after the authoritative sink open and strictly before any
+ * pipeline, profile, authority or runtime work: it admits exactly the two
+ * runner routing boundaries (C0 — the untouched open wait; R4 — the wait
+ * already answered with the exact `revise_task` action) and refuses every
+ * other shape (a missing, ambiguous or non-last wait index, no exact
+ * `revise_task` declaration, a mid-intervention window or a foreign
+ * answer) as an ordinary post-run-root refusal with zero durable writes
+ * and zero Sessions. The pipeline is loaded only from the durable
+ * `state.pipeline.bundle_root`; no manifest is read, no intent is
+ * prepared and no delta/retry machine exists here, and the single
+ * composed call is exactly `resumePipelineV2RunAfterReviseTaskIntervention`
+ * — the handoff owns the exact C0/R4 boundary verification and the
+ * wrong-body ownership.
+ */
+export async function revisePipelineV2Task(
+  options: PipelineV2ReviseTaskOptions,
+  deps: PipelineV2RunnerDeps,
+): Promise<PipelineV2RunOutcome> {
+  return runExistingPipelineV2(options, deps, {
+    failureLogPrefix: "pipeline v2 revise-task failed",
+    contractName: "pipeline v2 revise-task",
+    callerPolicyKind: "revise_task",
+    derivePolicy: gateReviseTaskRouting,
+    runCoordinator: (context) => {
+      const policy = context.callerPolicy;
+      if (policy.kind !== "revise_task") {
+        throw new Error("pipeline v2 revise-task: the captured caller policy is not a revise-task policy");
+      }
+      return resumePipelineV2RunAfterReviseTaskIntervention({
+        pipeline: context.pipeline,
+        runRoot: context.runRoot,
+        sink: context.sink,
+        runtime: context.runtime,
+        control: context.control,
+        runId: policy.runId,
+        waitIndex: policy.waitIndex,
+        taskId: policy.taskId,
+        taskBody: policy.taskBody,
       });
     },
   });
