@@ -2226,56 +2226,55 @@ policy/wiring increment.
 
 ### Agent-authored run plan proposal (pure substrate, not wired)
 
-`orchestrator/src/pipeline_v2_run_plan_proposal.ts` fixes the canonical
-content-free format of the semantic document a planning execution hands
-the orchestrator to describe the next run plan — deliberately NOT a
-durable manifest. The proposal carries no run id, no plan/task revision
-numbers, no predecessor or root-task digests, no origin execution, no
-task SHA-256 and no wait/generation/iteration bindings: every durable
-field is derived later by the construction layer from the durable state
-and the existing manifest preparers. The agent chooses only the
-sequential stage list (`stages[] {id, template, tasks[] {id, depends_on}}`)
-and the bodies of not-yet-existing tasks (`new_tasks[] {id, body}` — the
-only place a not-yet-existing task body exists before a task revision
-manifest is built).
+`orchestrator/src/pipeline_v2_run_plan_proposal.ts` is the snapshot
+substrate for the semantic document a planning execution hands the
+orchestrator to describe the next run plan — deliberately NOT a durable
+manifest and carrying **no digest of its own**: the accepted execution
+output that carries it is already bound by its own durable output
+digest, so a second proposal digest would create a parallel identity
+without adding authority. The proposal holds no run id, no plan/task
+revision numbers, no predecessor or root-task digests, no origin
+execution, no task SHA-256 and no wait/generation/iteration bindings;
+the agent chooses only the sequential stage list
+(`stages[] {id, template, tasks[] {id, depends_on}}`) and the bodies of
+not-yet-existing tasks (`new_tasks[] {id, body}`).
 
-Structural rules checked ledger-free: exact fields at every level
-(`schema_version: 1`, `kind: "run_plan_proposal"`), stage ids and task
-ids plan-unique safe identifiers (the shared scalar grammar), stage
-array order semantic, task order inside a stage and every `depends_on`
-list normalized (sorted by the single preparer — permuting equivalent
-tasks or dependencies never changes the canonical JSON or the digest),
-every stage carries at least one task reference, and dependencies are
-same-stage only with no self/duplicate/unknown edge and no cycle (the
-exact DAG rules of the plan revision manifest). `new_tasks` may be
-empty (a plan reusing only existing tasks), new-task ids are unique
-among `new_tasks`, and every entry must be referenced by exactly one
-stage task reference. A task reference naming an id that also appears in
-`new_tasks` is structural only — whether that id denotes an existing
-durable task (a silent rewrite attempt, rejected there) or a genuinely
-new task is a durable-ledger question the construction layer answers
-against the task ledger; this substrate never sees durable state.
-
-Digest: `SHA-256("pipeline-v2-run-plan-proposal\0"+canonicalJson(proposal))`
-— a domain separated from the plan/task/intent/wait/execution domains;
-serialization reuses the one shared `canonicalJson`, deep-freeze the
-shared neutral helper, and the prepared `{manifest, canonical_json,
-sha256}` snapshot is registered in the shared provenance registry under
-the additive `run_plan_proposal` kind (no second registry). The runtime
-export surface is exactly `PipelineV2RunPlanProposalError`,
+The runtime export surface is exactly `PipelineV2RunPlanProposalError`,
 `preparePipelineV2RunPlanProposal(value)` and
 `parsePipelineV2RunPlanProposal(raw)` — one `JSON.parse`, then the same
-validation/normalization chain; diagnostics are content-free (unknown
-property names, values and bodies never echoed; the malformed-JSON
-diagnostic carries no parser fragments). Tests live in
-`orchestrator/tests/pipeline_v2_run_plan_proposal.test.ts`.
+validation/snapshot chain; both return the DIRECT deep-frozen proposal
+document (no `{manifest, canonical_json, sha256}` envelope). The exact
+frozen object returned by either entrypoint is registered in the shared
+internal provenance registry under the additive `run_plan_proposal`
+kind.
+
+Responsibility boundary (owned here, only): the document representation
+with exact own enumerable fields at every level (required fields must be
+own enumerable properties — an inherited property never satisfies the
+shape — and unknown own fields are rejected without echoing their
+names), `schema_version === 1`, the exact `kind`, array/record/string
+shapes, the shared safe-id grammar for every id, `body` as a non-empty
+string, and duplicate `new_tasks[].id` rejection. DECLARED ORDER IS
+PRESERVED VERBATIM at all four array levels (stages, tasks, depends_on,
+new_tasks) — the proposal is a safe copy of the agent-authored document
+in declared order, never a canonical manifest.
+
+Deliberately NOT validated here: plan-wide unique stage/task ids,
+non-empty stage/plan policy, and every dependency graph semantic
+(self/duplicate/unknown/cross-stage edges and cycles) — the plan
+revision manifest layer (`preparePlanRevisionManifest`) owns task and
+dependency order normalization and those graph rejections; whether a
+reference naming an id that also appears in `new_tasks` denotes a
+durable task (a silent rewrite attempt, rejected there) or a genuinely
+new task is a construction-layer question against the durable task
+ledger; template existence is the compiler's. A shape-valid proposal
+prepared by this layer is not therefore a valid plan.
 
 Still unwired: the trusted read of the proposal from a verified accepted
 JSON output (a narrow runtime helper), the derivation/construction
 layer, the `plan_output` orchestration metadata, the planning-transition
 hook, resume-boundary handling, coordinator/runner/CLI wiring,
 migrations/API/T3.
-
 
 ### Run plan acceptance controller (production-neutral, not wired)
 
@@ -2775,10 +2774,10 @@ no reducer/validator/store/filesystem/coordinator/runner/CLI imports; no
 second parser/serializer/digest builder/registry; no message parsing).
 Still unwired: the action/`additional_iterations` selection policy, the
 graph transition on the opened iteration and the next stage execution,
-the architect/replanning branch (`revise_task_intent`), model profile
-replacement, automatic resume, coordinator/runner/CLI/default-pipeline
-wiring, schema/reducer changes, migrations/API/T3, multi-process
-locking.
+model profile replacement, automatic resume,
+coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
+migrations/API/T3, multi-process locking (the revise-task branch is
+wired separately through `orchestrator revise-task`).
 
 ### Restart-aware continue-stage intervention controller (production-neutral, not wired)
 
@@ -2965,11 +2964,12 @@ compiled/provenance/identity/scalar/state/freeze helpers; no
 reducer/validator/store/filesystem; no second
 parser/serializer/digest builder/registry; no coordinator/runner/CLI; no
 message parsing; no mutable seam). Still unwired: the
-action/`additional_iterations` selection policy, the revise-task branch
-(`revise_task_intent`), the graph transition on the opened iteration and
-the next stage execution, automatic resume,
-coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
-migrations/API/T3 and multi-process locking.
+action/`additional_iterations` selection policy, the graph transition on
+the opened iteration and the next stage execution, automatic resume,
+coordinator/runner/CLI/default-pipeline wiring (the revise-task branch
+is wired separately through `orchestrator revise-task`, not through
+this controller), schema/reducer changes, migrations/API/T3 and
+multi-process locking.
 
 ### Continue-stage intervention → resume handoff controller (production-neutral, not wired)
 
@@ -3090,10 +3090,12 @@ the two facades plus provenance/scalar/state/types; the canonical
 failure-reason list is the single state-module import, no
 reducer/writer/compiler/manifest loader/fs/CLI/runner calls; no second
 parser/serializer, `JSON.stringify`, digest machinery or new registries).
-Still unwired: everything — the runner, the CLI, the default pipeline
-bundle, the action/`additional_iterations` selection policy, the
-revise-task branch, automatic resume, schema/reducer changes,
-migrations/API/T3 and multi-process locking.
+Still unwired: the default pipeline bundle, the
+action/`additional_iterations` selection policy, automatic resume,
+schema/reducer changes, migrations/API/T3 and multi-process locking
+(the revise-task branch is wired separately through the revise-task
+runner entrypoint and `orchestrator revise-task`, not through this
+controller).
 
 ### Revise-task intent acceptance controller (production-neutral, not wired)
 
@@ -3182,11 +3184,13 @@ candidateTaskRevision})`; the internal core module exports exactly
 `acceptPipelineV2ReviseTaskIntentWithIo` and
 `productionReviseTaskIntentOps`; the deep-frozen content-free result is
 `{wait_index, intent_sha256, task_id, task_revision, task_sha256,
-state}`. Not implemented (stays unwired): the revise/continue action
-policy, the iteration closure, the wait response recording, task/plan
-replanning, the next plan revision, opening the next iteration,
-automatic resume, coordinator/runner/CLI wiring, schema changes,
-migrations/API/T3, multi-process locking.
+state}`. Production-reachable transitively: the revise-task intervention
+controller (called by the runner `revisePipelineV2Task` / CLI
+`orchestrator revise-task`) invokes this controller. Not implemented
+(stays unwired): the revise/continue action policy, the iteration
+closure, the wait response recording, task/plan replanning, the next
+plan revision, opening the next iteration, automatic resume, schema
+changes, migrations/API/T3, multi-process locking.
 
 ### Revise-task durable closure controller (production-neutral, not wired)
 
@@ -3272,10 +3276,13 @@ new task or plan revision, does not close the generation, does not open
 a new generation or iteration, does not run the architect/replanning
 execution, does not resume, does not change the action policy or select
 intents, and is not wired into the production coordinator/runner/CLI.
-Still unwired: the wait response publication, task/plan replanning, the
-next generation/iteration opening, the architect/replanning execution,
-resume, the action policy and intent selection, coordinator/runner/CLI
-wiring, schema changes, migrations/API/T3, multi-process locking.
+Production-reachable transitively: the revise-task completion controller
+(and through it the intervention controller invoked by the runner
+`revisePipelineV2Task` / CLI `orchestrator revise-task`) calls this
+controller. Still unwired: the wait response publication, task/plan
+replanning, the next generation/iteration opening, the
+architect/replanning execution, resume, the action policy and intent
+selection, schema changes, migrations/API/T3, multi-process locking.
 
 ### Revise-task completion controller (production-neutral, not wired)
 
@@ -3864,9 +3871,13 @@ scan over both files (the single imports of the two composed facades;
 no reducer/validator/store/filesystem/manifest machinery of its own; no
 second parser/serializer/digest builder/registry; no message parsing;
 no mutable module-global seam). Still unwired: everything — the runner,
-the CLI, the default pipeline bundle, the revise-task selection policy,
-the architect/replanning branch's production wiring, automatic resume,
-schema/reducer changes, migrations/API/T3 and multi-process locking.
+the default pipeline bundle, the revise-task selection policy (the
+runner passes the caller's taskId/taskBody), the architect/replanning
+branch beyond the intervention (the next plan revision, generation
+reopen, transition and successor start), automatic resume,
+schema/reducer changes, migrations/API/T3 and multi-process locking. The
+runner entrypoint `revisePipelineV2Task` and the CLI `orchestrator
+revise-task` ARE wired and call this facade.
 
 ### Replanned-stage composition controller (production-neutral, not wired)
 

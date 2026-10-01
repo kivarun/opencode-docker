@@ -1,14 +1,16 @@
 /**
  * Explicitly internal provenance substrate for the pipeline v2 run plan
- * manifest, binding and proposal modules (unwired).
+ * modules (unwired).
  *
  * The public modules (`pipeline_v2_run_plan_manifests.ts`,
- * `pipeline_v2_run_plan_bindings.ts` and `pipeline_v2_run_plan_proposal.ts`)
- * share this module-private registry:
- * the manifest module registers every deep-frozen prepared object it
- * returns together with its manifest kind, and the binding module gates
- * every validator on a registry lookup before any field of the argument
- * is read. The registry is keyed by object identity, so hand-built
+ * `pipeline_v2_run_plan_bindings.ts` and
+ * `pipeline_v2_run_plan_proposal.ts`) share this module-private registry:
+ * the manifest module registers every deep-frozen prepared manifest and
+ * intent it returns together with its kind, the proposal module registers
+ * the exact deep-frozen proposal document it returns, and the binding
+ * module gates every validator on a registry lookup before any field of
+ * the argument is read. The registry is keyed by object identity, so
+ * hand-built
  * look-alikes, casts, shallow or deep clones (e.g. `structuredClone`),
  * objects of another manifest kind and Proxies are all unregistered and
  * rejected with the argument's getters and Proxy traps never invoked.
