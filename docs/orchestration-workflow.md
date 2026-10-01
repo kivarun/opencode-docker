@@ -2224,6 +2224,59 @@ missing. The crash-safe boundary `plan acceptance ↔ transition` (what
 moves the run from plan acceptance into stage execution) stays a later
 policy/wiring increment.
 
+### Agent-authored run plan proposal (pure substrate, not wired)
+
+`orchestrator/src/pipeline_v2_run_plan_proposal.ts` fixes the canonical
+content-free format of the semantic document a planning execution hands
+the orchestrator to describe the next run plan — deliberately NOT a
+durable manifest. The proposal carries no run id, no plan/task revision
+numbers, no predecessor or root-task digests, no origin execution, no
+task SHA-256 and no wait/generation/iteration bindings: every durable
+field is derived later by the construction layer from the durable state
+and the existing manifest preparers. The agent chooses only the
+sequential stage list (`stages[] {id, template, tasks[] {id, depends_on}}`)
+and the bodies of not-yet-existing tasks (`new_tasks[] {id, body}` — the
+only place a not-yet-existing task body exists before a task revision
+manifest is built).
+
+Structural rules checked ledger-free: exact fields at every level
+(`schema_version: 1`, `kind: "run_plan_proposal"`), stage ids and task
+ids plan-unique safe identifiers (the shared scalar grammar), stage
+array order semantic, task order inside a stage and every `depends_on`
+list normalized (sorted by the single preparer — permuting equivalent
+tasks or dependencies never changes the canonical JSON or the digest),
+every stage carries at least one task reference, and dependencies are
+same-stage only with no self/duplicate/unknown edge and no cycle (the
+exact DAG rules of the plan revision manifest). `new_tasks` may be
+empty (a plan reusing only existing tasks), new-task ids are unique
+among `new_tasks`, and every entry must be referenced by exactly one
+stage task reference. A task reference naming an id that also appears in
+`new_tasks` is structural only — whether that id denotes an existing
+durable task (a silent rewrite attempt, rejected there) or a genuinely
+new task is a durable-ledger question the construction layer answers
+against the task ledger; this substrate never sees durable state.
+
+Digest: `SHA-256("pipeline-v2-run-plan-proposal\0"+canonicalJson(proposal))`
+— a domain separated from the plan/task/intent/wait/execution domains;
+serialization reuses the one shared `canonicalJson`, deep-freeze the
+shared neutral helper, and the prepared `{manifest, canonical_json,
+sha256}` snapshot is registered in the shared provenance registry under
+the additive `run_plan_proposal` kind (no second registry). The runtime
+export surface is exactly `PipelineV2RunPlanProposalError`,
+`preparePipelineV2RunPlanProposal(value)` and
+`parsePipelineV2RunPlanProposal(raw)` — one `JSON.parse`, then the same
+validation/normalization chain; diagnostics are content-free (unknown
+property names, values and bodies never echoed; the malformed-JSON
+diagnostic carries no parser fragments). Tests live in
+`orchestrator/tests/pipeline_v2_run_plan_proposal.test.ts`.
+
+Still unwired: the trusted read of the proposal from a verified accepted
+JSON output (a narrow runtime helper), the derivation/construction
+layer, the `plan_output` orchestration metadata, the planning-transition
+hook, resume-boundary handling, coordinator/runner/CLI wiring,
+migrations/API/T3.
+
+
 ### Run plan acceptance controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_run_plan_controller.ts` (public, with the

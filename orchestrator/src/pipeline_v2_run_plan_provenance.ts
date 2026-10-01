@@ -1,9 +1,10 @@
 /**
  * Explicitly internal provenance substrate for the pipeline v2 run plan
- * manifest and binding modules (unwired).
+ * manifest, binding and proposal modules (unwired).
  *
- * Both public modules (`pipeline_v2_run_plan_manifests.ts` and
- * `pipeline_v2_run_plan_bindings.ts`) share this module-private registry:
+ * The public modules (`pipeline_v2_run_plan_manifests.ts`,
+ * `pipeline_v2_run_plan_bindings.ts` and `pipeline_v2_run_plan_proposal.ts`)
+ * share this module-private registry:
  * the manifest module registers every deep-frozen prepared object it
  * returns together with its manifest kind, and the binding module gates
  * every validator on a registry lookup before any field of the argument
@@ -21,7 +22,8 @@ export type PipelineV2RunPlanProvenanceKind =
   | "plan_revision"
   | "task_revision"
   | "continue_stage_intent"
-  | "revise_task_intent";
+  | "revise_task_intent"
+  | "run_plan_proposal";
 
 const preparedProvenance = new WeakMap<object, PipelineV2RunPlanProvenanceKind>();
 
