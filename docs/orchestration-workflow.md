@@ -3609,8 +3609,14 @@ and only record of its index carrying the exact request/intent/
 the result's `action_to`, the cursor on that target at the wait
 transition boundary with the transition/execution journals on the same
 boundary, exactly one wait-bound task revision of the intervention whose
-identity/digests/revisions match the flat result (and no later revision
-of the revised task), the last plan record still matching the open
+identity/digests/revisions match the flat result with the exact own
+twelve-key result shape enforced before any value check (its
+schema-owned `index` at its actual append-only ledger position, a
+revision above one, exactly one predecessor revision of the same task
+at `revision - 1` whose recorded digest the record's `previous_sha256`
+chains to, no later revision of the revised task; the predecessor need
+not be the adjacent global record), the last plan record still matching
+the open
 generation's plan binding, the generation the last and open one with the
 intervention's indexes and its last iteration closed by the exact
 `{by: "replanned", wait_index, closed_transition_count}` closure with no
@@ -3654,7 +3660,7 @@ this layer: after a process crash the caller opens a fresh sink and
 repeats the whole facade.
 
 Tests: `orchestrator/tests/pipeline_v2_revise_task_resume_controller.test.ts`
-(13 tests) cover the honest C0 through the public facade on the reopened
+(14 tests) cover the honest C0 through the public facade on the reopened
 prefix run (the exact four-command suffix then the exact seven-command
 resume `start_agent_execution {architect, planning, no iterationIndex} →
 agent_data_prepared → agent_execution_session_created →
@@ -3679,7 +3685,15 @@ mismatching/later task revisions, closed generation, grant-closed
 iteration, open successor iteration, foreign generation plan binding,
 new plan revision, new execution/transition, malformed shapes — every
 case the layer's own `invalid_result` with zero resume calls), the
-malformed resume-union matrix over every branch plus the positive
+corrective battery (a correct result carrying one extra own enumerable
+field rejected by the exact twelve-key shape; the wait-bound task
+revision's mutated `previous_sha256` or ledger `index` rejected by the
+ledger-position/predecessor-chain checks — every case the layer's own
+`invalid_result` with zero resume calls, never a `TypeError`,
+content-free diagnostics), the positive multi-task control (a ledger
+where the revised task's predecessor is not the adjacent global record
+is accepted and the verified coordinator result returned by identity),
+the malformed resume-union matrix over every branch plus the positive
 vocabulary table (every refusal reason and every
 `PIPELINE_V2_FAILURE_REASONS` value with a null and with the
 authoritative state, plus the success union — every valid object

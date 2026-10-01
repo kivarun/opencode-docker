@@ -983,6 +983,121 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
         expect(resumeCalls).toBe(0);
         expect(label.length).toBeGreaterThan(0);
       }
+
+      // (c) the corrective battery: one extra own enumerable field on the
+      // flat result, and the wait-bound task revision's previous digest or
+      // ledger index mutated — every case the layer's own invalid_result
+      // with zero resume calls, never a TypeError, and content-free
+      // diagnostics (the fake resume would return a valid success if the
+      // verification let it through)
+      const correctiveCases: Array<[string, (options: unknown) => unknown, PipelineV2RunState, string]> = [
+        ["an extra own enumerable field",
+          (options: unknown) => ({ ...(fakeResultWith(snapshotOf(options)) as Record<string, unknown>), hostile_extra: "NEVER-READ" }),
+          completed,
+          "carries foreign fields"],
+        ["a mutated previous digest",
+          (options: unknown) => fakeResultWith(snapshotOf(options)),
+          mutate((record) => { ((record["task_revisions"] as Array<Record<string, unknown>>)[1] as Record<string, unknown>)["previous_sha256"] = "9".repeat(64); }),
+          "does not chain to its recorded predecessor"],
+        ["a mutated ledger index",
+          (options: unknown) => fakeResultWith(snapshotOf(options)),
+          mutate((record) => { ((record["task_revisions"] as Array<Record<string, unknown>>)[1] as Record<string, unknown>)["index"] = 9; }),
+          "does not carry its ledger position"],
+      ];
+      for (const [label, buildResult, hostileState, messagePart] of correctiveCases) {
+        let resumeCalls = 0;
+        const fakeOps: PipelineV2ReviseTaskResumeOps = {
+          applyIntervention: ((options: unknown) => Promise.resolve(buildResult(options))) as unknown as PipelineV2ReviseTaskResumeOps["applyIntervention"],
+          resumeRun: ((params: unknown): Promise<PipelineV2ResumeCoordinationResult> => {
+            resumeCalls += 1;
+            const successState = (params as { sink: { snapshot: unknown } }).sink.snapshot;
+            return Promise.resolve({ ok: true as const, state: successState }) as unknown as Promise<PipelineV2ResumeCoordinationResult>;
+          }) as unknown as PipelineV2ReviseTaskResumeOps["resumeRun"],
+        };
+        const cause = await catchHandoff(() =>
+          applyPipelineV2ReviseTaskResumeWithIo(fakeOps, interventionOptionsOf(ctx, pipeline, hostileSinkWith(hostileState))),
+        );
+        const error = expectHandoffError(cause, "invalid_result");
+        expect(error.state).toBe(hostileState);
+        expect(error.message).toContain(messagePart);
+        expect(resumeCalls).toBe(0);
+        expect(cause).not.toBeInstanceOf(TypeError);
+        expect(error.message).not.toContain("hostile_extra");
+        expect(error.message).not.toContain("9".repeat(64));
+        expect(label.length).toBeGreaterThan(0);
+      }
+    } finally {
+      await disposeReviseResume(ctx);
+    }
+  });
+
+  test("6. the honest multi-task ledger with a non-adjacent predecessor is accepted and returned by identity", async () => {
+    const ctx = await reviseResumeReady({ advance: "r4" });
+    try {
+      const { opened, pipeline } = await reopenAtR4(ctx);
+      const completed = ctx.completedState as PipelineV2RunState;
+      const mutate = (fn: (record: Record<string, unknown>) => void): PipelineV2RunState => {
+        const clone = structuredClone(completed) as unknown as Record<string, unknown>;
+        fn(clone);
+        return clone as unknown as PipelineV2RunState;
+      };
+      // task-a@2's predecessor task-a@1 sits two records back: an honest
+      // task-b revision was accepted in between; the ledger position and
+      // the same-task revision chain stay exact
+      const originalTaskRecord = completed.task_revisions[completed.task_revisions.length - 1] as unknown as Record<string, unknown>;
+      const firstRecord = completed.task_revisions[0] as unknown as Record<string, unknown>;
+      const multiTaskState = mutate((record) => {
+        record["task_revisions"] = [
+          firstRecord,
+          { index: 2, task_id: "task-b", revision: 1, sha256: "b".repeat(64), previous_sha256: null },
+          { ...originalTaskRecord, index: 3 },
+        ];
+      });
+      const flatFrom = (state: unknown): Record<string, unknown> => {
+        const record = state as PipelineV2RunState;
+        const wait = record.waits[0] as { intent: { intent_sha256: string }; request_sha256: string; response: { response_sha256: string } };
+        const taskRecord = record.task_revisions[record.task_revisions.length - 1] as { sha256: string };
+        return {
+          wait_index: 1,
+          intent_sha256: wait.intent.intent_sha256,
+          request_sha256: wait.request_sha256,
+          response_sha256: wait.response.response_sha256,
+          task_id: "task-a",
+          task_revision: 2,
+          task_sha256: taskRecord.sha256,
+          generation_index: 1,
+          iteration_index: 1,
+          action_id: "revise_task",
+          action_to: "architect",
+          state,
+        };
+      };
+      let resumeCalls = 0;
+      const fakeOps: PipelineV2ReviseTaskResumeOps = {
+        applyIntervention: ((options: unknown) =>
+          Promise.resolve(flatFrom((options as { sink: { snapshot: unknown } }).sink.snapshot))) as unknown as PipelineV2ReviseTaskResumeOps["applyIntervention"],
+        resumeRun: ((params: unknown): Promise<PipelineV2ResumeCoordinationResult> => {
+          resumeCalls += 1;
+          const successState = (params as { sink: { snapshot: unknown } }).sink.snapshot;
+          return Promise.resolve({ ok: true as const, state: successState }) as unknown as Promise<PipelineV2ResumeCoordinationResult>;
+        }) as unknown as PipelineV2ReviseTaskResumeOps["resumeRun"],
+      };
+      const hostileSink: PipelineV2CoordinatorStateSink = {
+        get snapshot(): PipelineV2RunState | null {
+          return multiTaskState;
+        },
+        get poisoned(): boolean {
+          return false;
+        },
+        dispatch: async (): Promise<void> => {
+          throw new Error("CANARY-DISPATCH");
+        },
+      };
+      const result = await applyPipelineV2ReviseTaskResumeWithIo(fakeOps, interventionOptionsOf(ctx, pipeline, hostileSink));
+      expect(result.ok).toBe(true);
+      expect((result as { state: unknown }).state).toBe(multiTaskState);
+      expect(resumeCalls).toBe(1);
+      expect((opened.snapshot as PipelineV2RunState).revision).toBe(completed.revision);
     } finally {
       await disposeReviseResume(ctx);
     }
@@ -990,7 +1105,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
 
   // --- the resume union contract -----------------------------------------------
 
-  test("6. the resume union is verified defensively and returned by identity", async () => {
+  test("7. the resume union is verified defensively and returned by identity", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
     try {
       const { opened, recording, pipeline } = await reopenAtR4(ctx);
@@ -1065,7 +1180,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
 
   // --- capture and provenance ---------------------------------------------------
 
-  test("7. capture boundary: options read once in the fixed order, hostile extras unread, ops members once", async () => {
+  test("8. capture boundary: options read once in the fixed order, hostile extras unread, ops members once", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
     try {
       const reads: string[] = [];
@@ -1176,7 +1291,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     }
   });
 
-  test("8. the controller reads the authoritative snapshot exactly once per verification phase", async () => {
+  test("9. the controller reads the authoritative snapshot exactly once per verification phase", async () => {
     const ctx = await reviseResumeReady();
     try {
       // the fake intervention dispatches the real four commands through the
@@ -1234,7 +1349,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     }
   });
 
-  test("9. caller mutation after the pending intervention cannot change the resume", async () => {
+  test("10. caller mutation after the pending intervention cannot change the resume", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
     try {
       let releaseIntervention!: () => void;
@@ -1300,7 +1415,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     }
   });
 
-  test("10. a forged pipeline fails the provenance gate before any facade call; a Proxy pipeline causes no traps", async () => {
+  test("11. a forged pipeline fails the provenance gate before any facade call; a Proxy pipeline causes no traps", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
     try {
       const { opened, recording, pipeline } = await reopenAtR4(ctx);
@@ -1343,7 +1458,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     }
   });
 
-  test("11. invalid runtime or control contract refuses before any facade call", async () => {
+  test("12. invalid runtime or control contract refuses before any facade call", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
     try {
       let facadeCalls = 0;
@@ -1385,7 +1500,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
 
   // --- export surfaces and source scan ------------------------------------------
 
-  test("12. the runtime export surfaces are exactly the contracted keys", async () => {
+  test("13. the runtime export surfaces are exactly the contracted keys", async () => {
     const publicModule = await import("../src/pipeline_v2_revise_task_resume_controller.ts");
     expect(Object.keys(publicModule).sort()).toEqual([
       "PipelineV2ReviseTaskResumeControllerError",
@@ -1402,7 +1517,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     expect(productionReviseTaskResumeOps.resumeRun).toBe(resumePipelineV2Run);
   });
 
-  test("13. the controller composes the two facades only (source scan)", async () => {
+  test("14. the controller composes the two facades only (source scan)", async () => {
     const { readFile: readSource } = await import("node:fs/promises");
     for (const name of [
       "pipeline_v2_revise_task_resume_controller.ts",

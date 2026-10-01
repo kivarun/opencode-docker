@@ -312,6 +312,25 @@ function verifyInterventionResult(
     }
     const result = resultValue as Record<string, unknown>;
     if (
+      !hasExactOwnKeys(
+        result,
+        "wait_index",
+        "intent_sha256",
+        "request_sha256",
+        "response_sha256",
+        "task_id",
+        "task_revision",
+        "task_sha256",
+        "generation_index",
+        "iteration_index",
+        "action_id",
+        "action_to",
+        "state",
+      )
+    ) {
+      throw invalidResult("the revise-task intervention result carries foreign fields", authoritative);
+    }
+    if (
       !isPositiveSafeInteger(result["wait_index"]) ||
       result["wait_index"] !== policy.waitIndex ||
       !isString(result["task_id"]) ||
@@ -439,7 +458,10 @@ function verifyHandoffBoundary(
     throw invalidResult("the handoff boundary carries no task revision ledger", authoritative);
   }
   let bound: Record<string, unknown> | undefined;
-  for (const entry of taskRevisions) {
+  let boundPosition = -1;
+  const revisionEntries = taskRevisions as Array<unknown>;
+  for (const [position, entryValue] of revisionEntries.entries()) {
+    const entry = entryValue as Record<string, unknown>;
     if (!isRecord(entry)) {
       throw invalidResult("the task revision ledger carries a malformed record", authoritative);
     }
@@ -448,6 +470,7 @@ function verifyHandoffBoundary(
         throw invalidResult("the target wait carries more than one wait-bound task revision", authoritative);
       }
       bound = entry;
+      boundPosition = position;
     }
     if (
       isString(entry["task_id"]) &&
@@ -466,6 +489,29 @@ function verifyHandoffBoundary(
     bound["intent_sha256"] !== result["intent_sha256"]
   ) {
     throw invalidResult("the wait-bound task revision does not match the intervention result", authoritative);
+  }
+  if (!isPositiveSafeInteger(bound["index"]) || (bound["index"] as number) !== boundPosition + 1) {
+    throw invalidResult("the wait-bound task revision does not carry its ledger position", authoritative);
+  }
+  if ((bound["revision"] as number) <= 1) {
+    throw invalidResult("the wait-bound task revision is not a revision above one", authoritative);
+  }
+  let predecessor: Record<string, unknown> | undefined;
+  for (const entryValue of revisionEntries) {
+    const entry = entryValue as Record<string, unknown>;
+    if (entry["task_id"] === bound["task_id"] && entry["revision"] === (bound["revision"] as number) - 1) {
+      if (predecessor !== undefined) {
+        throw invalidResult("the revised task carries more than one predecessor revision", authoritative);
+      }
+      predecessor = entry;
+    }
+  }
+  if (predecessor === undefined) {
+    throw invalidResult("the revised task carries no recorded predecessor revision", authoritative);
+  }
+  const previousSha256 = bound["previous_sha256"];
+  if (!isLowercaseSha256(previousSha256) || previousSha256 !== predecessor["sha256"]) {
+    throw invalidResult("the wait-bound task revision does not chain to its recorded predecessor", authoritative);
   }
   const planRevisions = state.plan_revisions as unknown;
   if (!Array.isArray(planRevisions) || planRevisions.length === 0) {
