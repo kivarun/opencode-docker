@@ -49,6 +49,21 @@ import {
  * not touched. The coordinator's `resumePipelineV2Run` consumes exactly
  * this context; the production runner and the CLI stay unwired.
  *
+ * Two public entrypoints share ONE core, differing only in the boundary
+ * policy they pass and in the final projection they build — there is no
+ * second restore mechanism:
+ *
+ *   - `restorePipelineV2RuntimeContext` — the resumable boundaries (clean
+ *     active running boundaries with every execution bound, and waiting
+ *     boundaries); the projection carries `next_execution_index`.
+ *   - `restorePipelineV2PlanningAcceptanceContext` — the settled-but-
+ *     unbound planning acceptance boundary (exactly one unbound settled
+ *     agent planning execution on the durable cursor); the projection
+ *     carries `planning_execution_index` instead. It classifies no plan
+ *     acceptance window (fresh, partial and completed task/plan ledgers
+ *     are all accepted the same way) and reads no plan artifacts or
+ *     stores.
+ *
  * Trust boundary and order (fail-closed):
  *
  *   1. `requireResolvedPipelineV2Provenance` — before any other action:
@@ -57,7 +72,7 @@ import {
  *      causes no getter or trap invocation;
  *   2. `validatePipelineV2RunState` — the single state validator; the
  *      result is the normalized deep-frozen snapshot the context carries;
- *   3. the resumable boundary check (a narrower resume policy on top of
+ *   3. the entrypoint's boundary check (a narrower policy on top of
  *      the validated state, never a second state validator);
  *   4. the pipeline identity comparison against
  *      `pipelineV2RunPipelineIdentity` (exact: nested schema version,
@@ -114,16 +129,30 @@ import {
  *     outputs or failure. The context of a waiting run is restorable, but
  *     the restore itself continues nothing.
  *
+ * The planning-acceptance entrypoint accepts exactly one additional
+ * boundary: the settled-but-unbound planning execution — active running,
+ * clean, all executions settled, `executions.length ===
+ * transitions.length + 1`, the unbound execution an agent planning
+ * execution (`cleanup_completed`, no iteration index) sitting exactly on
+ * the durable cursor, and the last wait (if any) already answered. The
+ * task and plan ledgers are not interpreted: fresh, partial and
+ * completed plan acceptance windows are all accepted the same way, and
+ * no plan artifact or store is read.
+ *
  * Rejected (typed `invalid_state`): any in-flight agent or decision
  * execution, a settled execution without its `transition_committed`,
  * `publishing_outputs`, a reached terminal, the `success`, `failed` and
  * `cleanup_failed` final states, and an incoherent wait/cursor/history
- * shape.
+ * shape. The planning-acceptance entrypoint additionally rejects every
+ * boundary whose unbound execution is not a settled planning agent
+ * execution on the cursor.
  *
  * `next_execution_index` is `executions.length + 1` — the global index
  * agent activations share with decision executions, so activation
- * directory numbers may skip after a decision. No future activation leaf
- * is checked or reserved here.
+ * directory numbers may skip after a decision; the planning-acceptance
+ * projection carries `planning_execution_index` (the unbound planning
+ * execution's global index) instead. No future activation leaf is
+ * checked or reserved here.
  *
  * Failure contract (closed, typed, classified by validation phase — never
  * by message text): `PipelineV2RuntimeContextRestoreError` carries the
@@ -166,6 +195,26 @@ export interface RestoredPipelineV2RuntimeContext {
     readonly transition_count: number;
   };
   readonly next_execution_index: number;
+}
+
+/**
+ * The read-only context restored at the settled-but-unbound planning
+ * acceptance boundary: the same trusted runtime objects as the resume
+ * context, with the unbound planning execution's global index instead of
+ * a next-execution index (at this boundary no further execution can
+ * start; the plan acceptance consumes the boundary). The restore
+ * classifies no acceptance window and reads no plan artifacts or stores
+ * — it only re-establishes the trusted data the acceptance layer needs.
+ */
+export interface RestoredPipelineV2PlanningAcceptanceContext {
+  readonly state: PipelineV2RunState;
+  readonly run_inputs: RunInputsSnapshot;
+  readonly accepted_outputs: readonly AcceptedStateOutput[];
+  readonly cursor: {
+    readonly current_state: string;
+    readonly transition_count: number;
+  };
+  readonly planning_execution_index: number;
 }
 
 function restoreError(
@@ -294,6 +343,76 @@ function checkResumableBoundary(state: PipelineV2RunState): void {
   throw fail(
     "the run is not on a resumable clean boundary; only an active running run without unfinished work or a waiting run is restorable",
   );
+}
+
+/**
+ * The planning-acceptance-boundary check: a narrower policy on top of the
+ * already validated state. The boundary is the settled-but-unbound
+ * planning execution the run plan acceptance consumes: the run is active
+ * and running, carries no terminal, run outputs or failure, every
+ * execution is settled, exactly one execution lacks its committed
+ * transition, that execution is an agent planning execution
+ * (`cleanup_completed`, no iteration index) sitting exactly on the
+ * durable cursor, and the last wait — if any — is already answered. The
+ * compiled correspondence of the recorded planning role is verified by
+ * the shared execution-role chain below (before any filesystem access),
+ * so this check stays a pure state-shape policy and no compiled-metadata
+ * query is duplicated. The task and plan ledgers are not interpreted:
+ * fresh, partial and completed plan acceptance windows are all accepted
+ * the same way.
+ */
+function checkPlanningAcceptanceBoundary(state: PipelineV2RunState): void {
+  const fail = (message: string): PipelineV2RuntimeContextRestoreError =>
+    restoreError("invalid_state", message);
+  const clean =
+    state.terminal === undefined && state.run_outputs === undefined && state.failure === undefined;
+  const settled = state.executions.every((execution) =>
+    execution.type === "agent"
+      ? execution.phase === "cleanup_completed"
+      : execution.phase === "evaluated",
+  );
+  if (state.status !== "active" || state.phase !== "running") {
+    throw fail(
+      "the run is not active and running; it is not on a planning acceptance boundary",
+    );
+  }
+  if (!clean) {
+    throw fail(
+      "the run carries a terminal, run outputs or a failure; it is not on a planning acceptance boundary",
+    );
+  }
+  if (!settled) {
+    throw fail(
+      "the run carries an in-flight or failed execution; it is not on a planning acceptance boundary",
+    );
+  }
+  if (state.executions.length !== state.transitions.length + 1) {
+    throw fail(
+      "the run does not carry exactly one settled execution without its committed transition; it is not on a planning acceptance boundary",
+    );
+  }
+  const last = state.executions[state.executions.length - 1]!;
+  if (last.type !== "agent" || last.phase !== "cleanup_completed" || last.execution_role !== "planning") {
+    throw fail(
+      "the unbound execution is not a settled planning agent execution; it is not on a planning acceptance boundary",
+    );
+  }
+  if (last.iteration_index !== undefined) {
+    throw fail(
+      "the unbound planning execution carries an iteration index; it is not on a planning acceptance boundary",
+    );
+  }
+  if (last.state_id !== state.cursor.current_state) {
+    throw fail(
+      "the unbound planning execution does not sit on the durable cursor; it is not on a planning acceptance boundary",
+    );
+  }
+  const lastWait = state.waits[state.waits.length - 1];
+  if (lastWait !== undefined && lastWait.response === undefined) {
+    throw fail(
+      "the last wait record is still open; the run is not on a planning acceptance boundary",
+    );
+  }
 }
 
 /**
@@ -658,11 +777,26 @@ function mapTypedRuntimeFailure(cause: PipelineV2RuntimeError): PipelineV2Runtim
   }
 }
 
-export async function restorePipelineV2RuntimeContext(
+/**
+ * The single shared restore core: one trust gate, one state validator,
+ * the parameterized boundary policy, one identity/run-root binding, one
+ * compiled transition replay, one execution-role verification, the
+ * read-only layout checks, the provenance-backed input restoration and
+ * the one accepted-history reconstruction and verification. Both public
+ * entrypoints differ only in the boundary policy they pass and in the
+ * final projection they build from the same core result — there is no
+ * second restore mechanism.
+ */
+async function restoreContextCore(
   pipeline: ResolvedPipelineV2,
   state: unknown,
   runRoot: string,
-): Promise<RestoredPipelineV2RuntimeContext> {
+  checkBoundary: (state: PipelineV2RunState) => void,
+): Promise<{
+  validated: PipelineV2RunState;
+  runInputs: RunInputsSnapshot;
+  acceptedOutputs: AcceptedStateOutput[];
+}> {
   // 1. The trust gate is the very first action: no state read, no run-root
   //    access, no filesystem call, no Proxy evaluation before it.
   requireResolvedPipelineV2Provenance(pipeline, "pipeline v2 runtime context restoration");
@@ -677,8 +811,8 @@ export async function restorePipelineV2RuntimeContext(
     }
     throw cause;
   }
-  // 3. The narrower resumable-boundary policy.
-  checkResumableBoundary(validated);
+  // 3. The narrower boundary policy of the calling entrypoint.
+  checkBoundary(validated);
   // 4. The exact pipeline identity plus the run-id binding.
   checkPipelineIdentity(pipeline, validated, runRoot);
   // 5. The compiled-history verification: every durable transition must
@@ -741,18 +875,48 @@ export async function restorePipelineV2RuntimeContext(
     }
     throw cause;
   }
-  // 9. The deep-frozen, content-free result. The cursor is a copy of the
-  //    validated durable cursor; the next execution index counts every
-  //    execution (agent activations share the global index with decision
-  //    executions, so activation directory numbers may skip).
+  return { validated, runInputs, acceptedOutputs };
+}
+
+export async function restorePipelineV2RuntimeContext(
+  pipeline: ResolvedPipelineV2,
+  state: unknown,
+  runRoot: string,
+): Promise<RestoredPipelineV2RuntimeContext> {
+  const core = await restoreContextCore(pipeline, state, runRoot, checkResumableBoundary);
+  // The deep-frozen, content-free result. The cursor is a copy of the
+  // validated durable cursor; the next execution index counts every
+  // execution (agent activations share the global index with decision
+  // executions, so activation directory numbers may skip).
   return deepFreeze({
-    state: validated,
-    run_inputs: runInputs,
-    accepted_outputs: acceptedOutputs,
+    state: core.validated,
+    run_inputs: core.runInputs,
+    accepted_outputs: core.acceptedOutputs,
     cursor: {
-      current_state: validated.cursor.current_state,
-      transition_count: validated.cursor.transition_count,
+      current_state: core.validated.cursor.current_state,
+      transition_count: core.validated.cursor.transition_count,
     },
-    next_execution_index: validated.executions.length + 1,
+    next_execution_index: core.validated.executions.length + 1,
+  });
+}
+
+export async function restorePipelineV2PlanningAcceptanceContext(
+  pipeline: ResolvedPipelineV2,
+  state: unknown,
+  runRoot: string,
+): Promise<RestoredPipelineV2PlanningAcceptanceContext> {
+  const core = await restoreContextCore(pipeline, state, runRoot, checkPlanningAcceptanceBoundary);
+  // The boundary check guarantees exactly one unbound execution and that
+  // it is the settled planning agent execution on the durable cursor.
+  const planningExecution = core.validated.executions[core.validated.executions.length - 1]!;
+  return deepFreeze({
+    state: core.validated,
+    run_inputs: core.runInputs,
+    accepted_outputs: core.acceptedOutputs,
+    cursor: {
+      current_state: core.validated.cursor.current_state,
+      transition_count: core.validated.cursor.transition_count,
+    },
+    planning_execution_index: planningExecution.index,
   });
 }

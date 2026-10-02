@@ -15,6 +15,7 @@ import { pipelineV2RunPipelineIdentity } from "../src/pipeline_v2_digest.ts";
 import {
   acceptActivationOutputs,
   acceptedOutputDigest,
+  readAcceptedJsonOutput,
   evaluateDecisionStateFromData,
   prepareActivationData,
   runInputSnapshotDigest,
@@ -1276,6 +1277,7 @@ test("35. the public export surface carries no registry, minter or test seams", 
   const namespace = (await import("../src/pipeline_v2_resume_context.ts")) as Record<string, unknown>;
   expect(Object.keys(namespace).sort()).toEqual([
     "PipelineV2RuntimeContextRestoreError",
+    "restorePipelineV2PlanningAcceptanceContext",
     "restorePipelineV2RuntimeContext",
   ]);
 });
@@ -2408,4 +2410,570 @@ test("55. a selected action target outside the compiled pipeline refuses before 
   } finally {
     await dispose(base2);
   }
+});
+
+// --- P. the planning-acceptance boundary restore (read-only) ------------------
+
+import {
+  restorePipelineV2PlanningAcceptanceContext,
+  type RestoredPipelineV2PlanningAcceptanceContext,
+} from "../src/pipeline_v2_resume_context.ts";
+
+const PLAN_BYTES = JSON.stringify({ f1: true, f2: false });
+
+/**
+ * The honest settled-but-unbound planning execution: the same real
+ * activation phases as `runAgentActivation` but no committed transition —
+ * exactly the boundary the plan acceptance consumes.
+ */
+async function runUnboundPlanningActivation(
+  base: Base,
+  drive: Drive,
+  stateId: string,
+  planBytes: string,
+): Promise<void> {
+  const executionIndex = (drive.state as PipelineV2RunState).executions.length + 1;
+  dispatchClock(drive, base.clock, {
+    kind: "start_agent_execution",
+    stateId,
+    profile: "coder",
+    ...startRoleArgs(base.pipeline, stateId, (drive.state as PipelineV2RunState)),
+  });
+  for (const command of AGENT_PHASE_COMMANDS(`sess-${executionIndex}`, `tool-${executionIndex}`)) {
+    dispatchClock(drive, base.clock, command);
+  }
+  const prepared = await prepareActivationData(
+    base.pipeline, base.runInputs, drive.records, stateId, executionIndex,
+  );
+  if (stateId !== "ship") {
+    await writeAgentOutputs(base, stateId, executionIndex, planBytes);
+  } else {
+    await writeShipOutputs(base, executionIndex);
+  }
+  const accepted = await acceptActivationOutputs(base.pipeline, prepared);
+  dispatchClock(drive, base.clock, {
+    kind: "agent_outputs_accepted",
+    outputs: accepted.map((record) => ({ id: record.output, digest: record.digest })),
+  });
+  drive.records.push(...accepted);
+  dispatchClock(drive, base.clock, { kind: "agent_cleanup_completed" });
+}
+
+function expectPlanningAccepted(
+  context: RestoredPipelineV2PlanningAcceptanceContext,
+  expectedIndex: number,
+  expectedCursor: { current_state: string; transition_count: number },
+): void {
+  expect(Object.keys(context).sort()).toEqual([
+    "accepted_outputs",
+    "cursor",
+    "planning_execution_index",
+    "run_inputs",
+    "state",
+  ]);
+  expect(Object.isFrozen(context)).toBe(true);
+  expect(Object.isFrozen(context.accepted_outputs)).toBe(true);
+  expect(context.cursor).toEqual(expectedCursor);
+  expect(context.planning_execution_index).toBe(expectedIndex);
+  expect(Object.isFrozen(context.state)).toBe(true);
+}
+
+test("P1. the honest initial planning acceptance boundary: the old restore refuses, the new restore accepts read-only", async () => {
+  const base = await setupBase();
+  try {
+    await runUnboundPlanningActivation(base, base.drive, "coder", PLAN_BYTES);
+    const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    // the ordinary resume restore keeps refusing the settled-unbound
+    // execution with its exact former message
+    const oldCause = await restorePipelineV2RuntimeContext(base.pipeline, durable, base.runRoot).catch((error) => error);
+    expectRestoreError(oldCause, "invalid_state");
+    expect((oldCause as Error).message).toBe(
+      "the run carries a settled execution without its committed transition; it is not resumable",
+    );
+    const before = await fingerprint(base.root);
+    const context = await restorePipelineV2PlanningAcceptanceContext(base.pipeline, durable, base.runRoot);
+    expectPlanningAccepted(context, 1, { current_state: "coder", transition_count: 0 });
+    // the accepted records are the exact execution-order × port-order
+    // projection of the durable executions, and the json output reader
+    // accepts them
+    const agentExecution = durable.executions[0];
+    if (agentExecution === undefined || agentExecution.type !== "agent" || agentExecution.outputs === undefined) {
+      throw new Error("the durable execution carries no agent outputs");
+    }
+    const digest = agentExecution.outputs[0]!.digest;
+    expect(context.accepted_outputs).toEqual([
+      { state: "coder", output: "plan", activation_index: 1, digest },
+      { state: "coder", output: "report", activation_index: 1, digest: agentExecution.outputs[1]!.digest },
+    ]);
+    const read = await readAcceptedJsonOutput(
+      base.pipeline, base.runRoot, context.accepted_outputs, "coder", "plan", 1,
+    );
+    expect(read.value).toEqual({ f1: true, f2: false });
+    // read-only on success
+    expect(await fingerprint(base.root)).toBe(before);
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("P2. the replanning boundary after a restart: bound prefix, unbound planning execution is accepted", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", PLAN_BYTES);
+    runDecisionActivation(base, base.drive, "check", "beta");
+    // coder re-entered through the decision's beta edge; the second
+    // planning execution settles without its transition
+    await runUnboundPlanningActivation(base, base.drive, "coder", PLAN_BYTES);
+    const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    expect(durable.executions.length).toBe(3);
+    expect(durable.transitions.length).toBe(2);
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    const before = await fingerprint(base.root);
+    const context = await restorePipelineV2PlanningAcceptanceContext(base.pipeline, durable, base.runRoot);
+    expectPlanningAccepted(context, 3, { current_state: "coder", transition_count: 2 });
+    expect(context.cursor).toEqual({ current_state: "coder", transition_count: 2 });
+    expect(context.accepted_outputs.length).toBe(4);
+    expect(await fingerprint(base.root)).toBe(before);
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("P3. partial acceptance windows: the durable task ledger is not interpreted by the restore", async () => {
+  for (const durableTasks of [0, 1, 2]) {
+    const base = await setupBase();
+    try {
+      await runUnboundPlanningActivation(base, base.drive, "coder", PLAN_BYTES);
+      for (let index = 0; index < durableTasks; index++) {
+        dispatchClock(base.drive, base.clock, {
+          kind: "task_revision_accepted",
+          taskId: index === 0 ? "task-a" : "task-b",
+          revision: 1,
+          taskSha256: hex(String(index + 1)),
+        });
+      }
+      const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+      expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+      const context = await restorePipelineV2PlanningAcceptanceContext(base.pipeline, durable, base.runRoot);
+      expectPlanningAccepted(context, 1, { current_state: "coder", transition_count: 0 });
+      expect(context.accepted_outputs.length).toBe(2);
+    } finally {
+      await dispose(base);
+    }
+  }
+});
+
+test("P4. the completed-result-lost boundary: the durable target plan revision is accepted", async () => {
+  const base = await setupBase();
+  try {
+    await runUnboundPlanningActivation(base, base.drive, "coder", PLAN_BYTES);
+    dispatchClock(base.drive, base.clock, {
+      kind: "task_revision_accepted", taskId: "task-a", revision: 1, taskSha256: hex("1"),
+    });
+    dispatchClock(base.drive, base.clock, {
+      kind: "task_revision_accepted", taskId: "task-b", revision: 1, taskSha256: hex("2"),
+    });
+    dispatchClock(base.drive, base.clock, {
+      kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("3"), originExecution: 1,
+    });
+    const durable = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    expect(() => validatePipelineV2RunState(durable)).not.toThrow();
+    const context = await restorePipelineV2PlanningAcceptanceContext(base.pipeline, durable, base.runRoot);
+    expectPlanningAccepted(context, 1, { current_state: "coder", transition_count: 0 });
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("P5. every non-planning boundary shape is a typed invalid_state", async () => {
+  const base = await setupBase();
+  try {
+    // in-flight last execution
+    await runUnboundPlanningActivation(base, base.drive, "coder", PLAN_BYTES);
+    const settled = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    const inFlight = JSON.parse(JSON.stringify(settled)) as PipelineV2RunState & {
+      executions: [Record<string, unknown>];
+    };
+    inFlight.executions[0].phase = "running";
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(base.pipeline, inFlight, base.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+    // failed last execution
+    const failed = JSON.parse(JSON.stringify(settled)) as PipelineV2RunState & {
+      executions: [Record<string, unknown>];
+    };
+    failed.executions[0].phase = "failed";
+    failed.executions[0].failure_reason = "worker_failed";
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(base.pipeline, failed, base.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+    // a settled-unbound decision execution (the honest reducer path)
+    const decisionBase = await setupBase();
+    try {
+      await runAgentActivation(decisionBase, decisionBase.drive, "coder", PLAN_BYTES);
+      runDecisionActivationNoTransition(decisionBase, decisionBase.drive, "check", "alpha");
+      const decisionDurable = JSON.parse(JSON.stringify(decisionBase.drive.state)) as PipelineV2RunState;
+      expect(() => validatePipelineV2RunState(decisionDurable)).not.toThrow();
+      expectRestoreError(
+        await restorePipelineV2PlanningAcceptanceContext(decisionBase.pipeline, decisionDurable, decisionBase.runRoot).catch((error) => error),
+        "invalid_state",
+      );
+    } finally {
+      await dispose(decisionBase);
+    }
+    // a settled-unbound stage execution (the honest stage path)
+    const stageBase = await setupStageBase();
+    try {
+      await runStageAgentPhases(stageBase, "architect");
+      dispatchStage(stageBase, { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("1"), originExecution: 1 });
+      commitStageTransition(stageBase, "architect", "completed", "dispatch", 1, 0);
+      runStageDecision(stageBase, "dispatch", "d_next_stage");
+      dispatchStage(stageBase, { kind: "stage_generation_opened", stageId: "development", stagePosition: 1, templateId: "development", planSha256: hex("1"), initialBudget: 2, transitionCount: 1 });
+      dispatchStage(stageBase, { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 });
+      commitStageTransition(stageBase, "dispatch", "d_next_stage", "dev", 2, 0);
+      await runStageAgentPhases(stageBase, "dev");
+      const stageDurable = JSON.parse(JSON.stringify(stageBase.drive.state)) as PipelineV2RunState;
+      expect(() => validatePipelineV2RunState(stageDurable)).not.toThrow();
+      expectRestoreError(
+        await restorePipelineV2PlanningAcceptanceContext(stageBase.pipeline, stageDurable, stageBase.runRoot).catch((error) => error),
+        "invalid_state",
+      );
+    } finally {
+      await rm(stageBase.root, { recursive: true, force: true });
+    }
+    // an open last wait at the boundary: the honest reducer path refuses
+    // to enter a wait before the unbound execution's transition is
+    // committed, so the shape is forged; the typed invalid_state comes
+    // from the loader or the boundary check, whichever fires first
+    const waitBase = await setupBase();
+    try {
+      await runUnboundPlanningActivation(waitBase, waitBase.drive, "coder", PLAN_BYTES);
+      const waitForged = JSON.parse(JSON.stringify(waitBase.drive.state)) as PipelineV2RunState;
+      (waitForged.waits as unknown[]).push({
+        index: 1,
+        transition_count: 0,
+        state_id: "coder",
+        reason: "stage_iteration_limit_exhausted",
+        request_sha256: hex("e"),
+        actions: [{ id: "continue_stage", to: "coder" }],
+      });
+      expectRestoreError(
+        await restorePipelineV2PlanningAcceptanceContext(waitBase.pipeline, waitForged, waitBase.runRoot).catch((error) => error),
+        "invalid_state",
+      );
+    } finally {
+      await dispose(waitBase);
+    }
+    // a reached terminal
+    const terminalBase = await setupBase();
+    try {
+      await runAgentActivation(terminalBase, terminalBase.drive, "coder", PLAN_BYTES);
+      runDecisionActivation(terminalBase, terminalBase.drive, "check", "alpha");
+      await runAgentActivation(terminalBase, terminalBase.drive, "ship", "unused");
+      dispatchClock(terminalBase.drive, terminalBase.clock, {
+        kind: "terminal_reached",
+        terminalStateId: "done",
+        terminalResult: "success",
+      });
+      const terminalDurable = JSON.parse(JSON.stringify(terminalBase.drive.state)) as PipelineV2RunState;
+      expect(() => validatePipelineV2RunState(terminalDurable)).not.toThrow();
+      expectRestoreError(
+        await restorePipelineV2PlanningAcceptanceContext(terminalBase.pipeline, terminalDurable, terminalBase.runRoot).catch((error) => error),
+        "invalid_state",
+      );
+    } finally {
+      await dispose(terminalBase);
+    }
+    // the final states
+    for (const finalize of ["run_succeeded", "run_failed"] as const) {
+      const finalBase = await setupBase();
+      try {
+        await runAgentActivation(finalBase, finalBase.drive, "coder", PLAN_BYTES);
+        if (finalize === "run_succeeded") {
+          runDecisionActivation(finalBase, finalBase.drive, "check", "alpha");
+          await runAgentActivation(finalBase, finalBase.drive, "ship", "unused");
+          dispatchClock(finalBase.drive, finalBase.clock, {
+            kind: "terminal_reached",
+            terminalStateId: "done",
+            terminalResult: "success",
+          });
+          dispatchClock(finalBase.drive, finalBase.clock, { kind: "run_outputs_published", outputs: [] });
+          dispatchClock(finalBase.drive, finalBase.clock, { kind: "run_succeeded" });
+        } else {
+          // the canonical failed-terminal finalization: the uncovered edge
+          // reaches the failed terminal, outputs publish, the run fails
+          dispatchClock(finalBase.drive, finalBase.clock, {
+            kind: "start_decision_execution",
+            stateId: "check",
+            inputDigest: hex("e"),
+            executionRole: "control",
+          });
+          dispatchClock(finalBase.drive, finalBase.clock, {
+            kind: "decision_evaluated",
+            result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
+          });
+          dispatchClock(finalBase.drive, finalBase.clock, {
+            kind: "transition_committed",
+            step: { from: "check", outcome: "uncovered", to: "failed_end", transition_index: 2 },
+            executionIndex: 2,
+          });
+          dispatchClock(finalBase.drive, finalBase.clock, {
+            kind: "terminal_reached",
+            terminalStateId: "failed_end",
+            terminalResult: "failed",
+          });
+          dispatchClock(finalBase.drive, finalBase.clock, { kind: "run_outputs_published", outputs: [] });
+          dispatchClock(finalBase.drive, finalBase.clock, {
+            kind: "run_failed",
+            reason: "terminal_failed",
+          });
+        }
+        const finalDurable = JSON.parse(JSON.stringify(finalBase.drive.state)) as PipelineV2RunState;
+        expect(() => validatePipelineV2RunState(finalDurable)).not.toThrow();
+        expectRestoreError(
+          await restorePipelineV2PlanningAcceptanceContext(finalBase.pipeline, finalDurable, finalBase.runRoot).catch((error) => error),
+          "invalid_state",
+        );
+      } finally {
+        await dispose(finalBase);
+      }
+    }
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("P6. forged cursor, two unbound executions and planning role stay typed invalid_state; compiled role mismatch keeps pipeline_mismatch", async () => {
+  const base = await setupBase();
+  try {
+    await runUnboundPlanningActivation(base, base.drive, "coder", PLAN_BYTES);
+    const settled = JSON.parse(JSON.stringify(base.drive.state)) as PipelineV2RunState;
+    // a forged cursor the durable executions do not sit on
+    const cursorForged = JSON.parse(JSON.stringify(settled)) as PipelineV2RunState;
+    (cursorForged.cursor as { current_state: string }).current_state = "ghost";
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(base.pipeline, cursorForged, base.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+    // two unbound executions
+    const twice = JSON.parse(JSON.stringify(settled)) as PipelineV2RunState & {
+      executions: Array<Record<string, unknown>>;
+    };
+    twice.executions.push({ ...twice.executions[0], index: 2 });
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(base.pipeline, twice, base.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+    // a durable non-planning role is refused by the boundary itself
+    const controlForged = JSON.parse(JSON.stringify(settled)) as PipelineV2RunState & {
+      executions: [Record<string, unknown>];
+    };
+    controlForged.executions[0].execution_role = "control";
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(base.pipeline, controlForged, base.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+    // a durable planning role against a compiled stage role keeps the
+    // former pipeline_mismatch classification
+    const stageCoderBundle = join(base.root, "bundle-stage-coder");
+    await mkdir(join(stageCoderBundle, "prompts"), { recursive: true });
+    await mkdir(join(stageCoderBundle, "schemas"), { recursive: true });
+    await mkdir(join(stageCoderBundle, "decisions"), { recursive: true });
+    await writeFile(join(stageCoderBundle, "pipeline.yaml"), MAIN_PIPELINE.replace(
+      "    - state_id: coder\n      role: planning\n      plan_output: plan\n",
+      "    - state_id: coder\n      role: stage\n      stage_template: development\n",
+    ).replace("  stage_templates: []\n", "  stage_templates:\n    - id: development\n      entry_state: coder\n"));
+    for (const prompt of ["coder.md", "ship.md"]) {
+      await writeFile(join(stageCoderBundle, "prompts", prompt), "plan\n");
+    }
+    await writeFile(join(stageCoderBundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+    await writeFile(join(stageCoderBundle, "decisions", "model.yaml"), MODEL_YAML);
+    const stageCoderPipeline = await loadPipelineV2(stageCoderBundle);
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(stageCoderPipeline, settled, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+    // an incompatible pipeline identity keeps pipeline_mismatch
+    const foreignBundle = join(base.root, "bundle-foreign");
+    await mkdir(join(foreignBundle, "prompts"), { recursive: true });
+    await mkdir(join(foreignBundle, "schemas"), { recursive: true });
+    await mkdir(join(foreignBundle, "decisions"), { recursive: true });
+    await writeFile(join(foreignBundle, "pipeline.yaml"), MAIN_PIPELINE);
+    await writeFile(join(foreignBundle, "prompts", "coder.md"), "implement the task\n");
+    await writeFile(join(foreignBundle, "prompts", "ship.md"), "ship the task\n");
+    await writeFile(join(foreignBundle, "schemas", "facts.schema.json"), JSON.stringify(FACTS_SCHEMA));
+    await writeFile(join(foreignBundle, "decisions", "model.yaml"), MODEL_YAML);
+    const foreignPipeline = await loadPipelineV2(foreignBundle);
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(foreignPipeline, settled, base.runRoot).catch((error) => error),
+      "pipeline_mismatch",
+    );
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("P7. damaged run layout, inputs and accepted outputs keep their typed reasons; everything stays read-only", async () => {
+  // a missing layout component
+  const layoutBase = await setupBase();
+  try {
+    await runUnboundPlanningActivation(layoutBase, layoutBase.drive, "coder", PLAN_BYTES);
+    const durable = JSON.parse(JSON.stringify(layoutBase.drive.state)) as PipelineV2RunState;
+    await rm(join(layoutBase.runRoot, "data", "inputs"), { recursive: true });
+    const before = await fingerprint(layoutBase.root);
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(layoutBase.pipeline, durable, layoutBase.runRoot).catch((error) => error),
+      "run_layout_invalid",
+    );
+    expect(await fingerprint(layoutBase.root)).toBe(before);
+  } finally {
+    await dispose(layoutBase);
+  }
+  // a corrupted run input
+  const inputBase = await setupBase();
+  try {
+    await runUnboundPlanningActivation(inputBase, inputBase.drive, "coder", PLAN_BYTES);
+    const durable = JSON.parse(JSON.stringify(inputBase.drive.state)) as PipelineV2RunState;
+    await writeFile(join(inputBase.runRoot, "data", "inputs", "task"), "TAMPERED\n", { mode: 0o600 });
+    const before = await fingerprint(inputBase.root);
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(inputBase.pipeline, durable, inputBase.runRoot).catch((error) => error),
+      "run_input_modified",
+    );
+    expect(await fingerprint(inputBase.root)).toBe(before);
+  } finally {
+    await dispose(inputBase);
+  }
+  // a corrupted accepted output
+  const outputBase = await setupBase();
+  try {
+    await runUnboundPlanningActivation(outputBase, outputBase.drive, "coder", PLAN_BYTES);
+    const durable = JSON.parse(JSON.stringify(outputBase.drive.state)) as PipelineV2RunState;
+    await writeFile(
+      join(outputBase.runRoot, "activations", "1-coder", "data", "outputs", "report"),
+      "TAMPERED\n", { mode: 0o600 },
+    );
+    const before = await fingerprint(outputBase.root);
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(outputBase.pipeline, durable, outputBase.runRoot).catch((error) => error),
+      "accepted_output_modified",
+    );
+    expect(await fingerprint(outputBase.root)).toBe(before);
+  } finally {
+    await dispose(outputBase);
+  }
+  // a representative compiled mismatch happens before any filesystem access
+  const mismatchBase = await setupBase();
+  try {
+    await runUnboundPlanningActivation(mismatchBase, mismatchBase.drive, "coder", PLAN_BYTES);
+    const settled = JSON.parse(JSON.stringify(mismatchBase.drive.state)) as PipelineV2RunState;
+    const forged = JSON.parse(JSON.stringify(settled)) as PipelineV2RunState & {
+      executions: [Record<string, unknown>];
+    };
+    forged.executions[0].execution_role = "control";
+    const before = await fingerprint(mismatchBase.root);
+    expectRestoreError(
+      await restorePipelineV2PlanningAcceptanceContext(mismatchBase.pipeline, forged, mismatchBase.runRoot).catch((error) => error),
+      "invalid_state",
+    );
+    expect(await fingerprint(mismatchBase.root)).toBe(before);
+  } finally {
+    await dispose(mismatchBase);
+  }
+});
+
+test("P8. a proxy pipeline is rejected before any state read or filesystem effect", async () => {
+  const base = await setupBase();
+  try {
+    await runUnboundPlanningActivation(base, base.drive, "coder", PLAN_BYTES);
+    let stateTraps = 0;
+    const stateProxy = new Proxy(base.drive.state!, {
+      get(target, prop, receiver) {
+        stateTraps += 1;
+        return Reflect.get(target as object, prop, receiver);
+      },
+    });
+    const sentinel = join(base.runRoot, "sentinel");
+    await writeFile(sentinel, "sentinel\n");
+    const cause = await restorePipelineV2PlanningAcceptanceContext(
+      new Proxy(base.pipeline, {}),
+      stateProxy,
+      base.runRoot,
+    ).catch((error) => error);
+    expect(cause).toBeInstanceOf(PipelineError);
+    expect(cause).not.toBeInstanceOf(PipelineV2RuntimeContextRestoreError);
+    expect((cause as Error).message).toContain("hand-built objects");
+    expect(stateTraps).toBe(0);
+    expect(await readFile(sentinel, "utf8")).toBe("sentinel\n");
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("P9. the runtime export surface carries the class and both restore functions", async () => {
+  const namespace = (await import("../src/pipeline_v2_resume_context.ts")) as Record<string, unknown>;
+  expect(Object.keys(namespace).sort()).toEqual([
+    "PipelineV2RuntimeContextRestoreError",
+    "restorePipelineV2PlanningAcceptanceContext",
+    "restorePipelineV2RuntimeContext",
+  ]);
+});
+
+/** A settled-unbound decision execution through the honest reducer path. */
+function runDecisionActivationNoTransition(
+  base: Base,
+  drive: Drive,
+  stateId: string,
+  outcome: "alpha" | "beta",
+): void {
+  const executionIndex = (drive.state as PipelineV2RunState).executions.length + 1;
+  dispatchClock(drive, base.clock, { kind: "start_decision_execution", stateId, inputDigest: hex("e"), ...startRoleArgs(base.pipeline, stateId, (drive.state as PipelineV2RunState)) });
+  dispatchClock(drive, base.clock, {
+    kind: "decision_evaluated",
+    result: {
+      status: "selected",
+      outcome,
+      decision: outcome,
+      rule_id: "R1",
+      active_constraint_ids: [],
+    },
+  });
+}
+
+test("P10. the planning restore shares the single core: no second mechanism, no foreign imports", async () => {
+  const source = await readFile(
+    join(import.meta.dir, "..", "src", "pipeline_v2_resume_context.ts"),
+    "utf8",
+  );
+  const count = (needle: string): number => source.split(needle).length - 1;
+  // one state-validation chain, one accepted-record reconstruction, one
+  // shared verification call — each defined and invoked exactly once
+  expect(count("validatePipelineV2RunState(")).toBe(1);
+  expect(count("function reconstructAcceptedRecords(")).toBe(1);
+  expect(count("reconstructAcceptedRecords(")).toBe(2);
+  expect(count("verifyRestoredAcceptedHistory(")).toBe(1);
+  expect(count("mintRestoredRunInputsSnapshot(")).toBe(1);
+  expect(count("requireResolvedPipelineV2Provenance(")).toBe(1);
+  // both entrypoints delegate to the one core; the two boundary policies
+  // are the only per-entrypoint difference
+  expect(count("restoreContextCore(")).toBe(3);
+  expect(count("checkResumableBoundary")).toBe(2);
+  expect(count("checkPlanningAcceptanceBoundary")).toBe(2);
+  // no second restore machinery and no foreign layer imports
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
+  expect(code).not.toContain("pipeline_v2_run_plan_store");
+  expect(code).not.toContain("pipeline_v2_run_plan_controller");
+  expect(code).not.toContain("pipeline_v2_coordinator");
+  expect(code).not.toContain("pipeline_v2_runner");
+  expect(code).not.toContain("preparePipelineV2RunPlanCandidate");
+  expect(code).not.toContain("loadPipelineV2PlanRevision");
+  expect(code).not.toContain("new WeakMap");
+  expect(code).not.toContain("new WeakSet");
 });
