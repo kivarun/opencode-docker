@@ -272,51 +272,113 @@ interface VerifiedBoundary {
   readonly targetWait: DurableWaitRecord;
 }
 
-/** One full durable wait-journal pass for the authoritative revise target. */
+/**
+ * The authoritative revise target: the latest durable iteration closure
+ * `{by: "replanned", wait_index}` names the current cycle's wait; the
+ * journal must carry exactly one wait with that index, that wait must be
+ * the last journal entry, answered `revise_task`, and carry its exact
+ * intent. Arbitrary unchanged historical waits and generations are
+ * allowed and never participate in the target uniqueness.
+ */
 function targetWaitOf(state: PipelineV2RunState): DurableWaitRecord {
+  const generations = state.generations as readonly unknown[];
+  if (!Array.isArray(generations)) {
+    throw handoffError("invalid_state", "the durable generation journal is malformed", state);
+  }
+  let latestWaitIndex: number | null = null;
+  for (const generation of generations) {
+    if (!isRecord(generation) || !Array.isArray(generation["iterations"])) {
+      throw handoffError("invalid_state", "the durable generation journal is malformed", state);
+    }
+    for (const iteration of generation["iterations"] as readonly unknown[]) {
+      if (!isRecord(iteration)) {
+        throw handoffError("invalid_state", "the durable generation journal is malformed", state);
+      }
+      const closed = iteration["closed"];
+      if (isRecord(closed) && closed["by"] === "replanned" && typeof closed["wait_index"] === "number") {
+        latestWaitIndex = closed["wait_index"];
+      }
+    }
+  }
+  if (latestWaitIndex === null) {
+    throw handoffError(
+      "invalid_state",
+      "the durable revise cycle carries no replanned iteration closure",
+      state,
+    );
+  }
   const journal = state.waits as readonly unknown[];
-  if (!Array.isArray(journal)) {
+  if (!Array.isArray(journal) || journal.length === 0) {
     throw handoffError("invalid_state", "the durable wait journal is malformed", state);
   }
-  const targets: DurableWaitRecord[] = [];
+  let target: DurableWaitRecord | null = null;
   for (const entry of journal) {
     if (!isRecord(entry)) {
       throw handoffError("invalid_state", "the durable wait journal is malformed", state);
     }
-    const intent = entry["intent"];
     const actions = entry["actions"];
     if (!Array.isArray(actions)) {
       throw handoffError("invalid_state", "the durable wait journal is malformed", state);
     }
-    let declaresRevise = false;
     for (const action of actions) {
       if (!isRecord(action) || typeof action["id"] !== "string") {
         throw handoffError("invalid_state", "the durable wait journal is malformed", state);
       }
-      if (action["id"] === "revise_task") {
-        declaresRevise = true;
+    }
+    if (entry["index"] === latestWaitIndex) {
+      if (target !== null) {
+        throw handoffError("invalid_state", "the durable wait journal carries the target wait index twice", state);
       }
-    }
-    if (declaresRevise && isRecord(intent) && typeof intent["intent_sha256"] === "string") {
-      targets.push(entry as unknown as DurableWaitRecord);
+      target = entry as unknown as DurableWaitRecord;
     }
   }
-  if (targets.length !== 1) {
+  if (target === null) {
     throw handoffError(
       "invalid_state",
-      "the durable run does not carry exactly one accepted revise_task wait",
+      "the durable run carries no wait for the latest replanned iteration closure",
       state,
     );
   }
-  const target = targets[0]!;
+  const lastEntry = journal[journal.length - 1]! as unknown as DurableWaitRecord;
+  if (lastEntry.index !== latestWaitIndex) {
+    throw handoffError("invalid_state", "the run has progressed past the revise boundary", state);
+  }
   if (target.response?.action_id !== "revise_task") {
-    throw handoffError(
-      "invalid_state",
-      "the durable revise_task wait is not answered",
-      state,
-    );
+    throw handoffError("invalid_state", "the durable revise_task wait is not answered", state);
+  }
+  if (target.intent === undefined || typeof target.intent.intent_sha256 !== "string") {
+    throw handoffError("invalid_state", "the durable revise_task wait carries no accepted intent", state);
   }
   return target;
+}
+
+/**
+ * The previous generation for the stage verification: the generation that
+ * carries the target wait's replanned iteration closure — the same
+ * generation every composed form (C0 fresh, C1, C2-bare, C2-open retry)
+ * closed or recognized.
+ */
+function previousGenerationIndexOf(state: PipelineV2RunState, targetWait: DurableWaitRecord): number {
+  const generations = state.generations as readonly unknown[];
+  let found: number | null = null;
+  for (const generation of generations) {
+    if (!isRecord(generation) || !Array.isArray(generation["iterations"])) {
+      throw handoffError("invalid_state", "the durable generation journal is malformed", state);
+    }
+    for (const iteration of generation["iterations"] as readonly unknown[]) {
+      if (!isRecord(iteration)) {
+        throw handoffError("invalid_state", "the durable generation journal is malformed", state);
+      }
+      const closed = iteration["closed"];
+      if (isRecord(closed) && closed["by"] === "replanned" && closed["wait_index"] === targetWait.index) {
+        found = (generation as Record<string, unknown>)["index"] as number;
+      }
+    }
+  }
+  if (found === null) {
+    throw handoffError("invalid_state", "the durable revise cycle carries no replanned iteration closure", state);
+  }
+  return found;
 }
 
 function lastPlanRecordOf(state: PipelineV2RunState): DurablePlanRecord {
@@ -392,36 +454,6 @@ function isPlanningAcceptanceBoundary(state: PipelineV2RunState): boolean {
   return state.executions.length === state.transitions.length + 1;
 }
 
-/** The answered revise cycle: exactly one replanned iteration closure bound to the target wait. */
-function replannedClosurePresent(state: PipelineV2RunState, targetWait: DurableWaitRecord): void {
-  const generations = state.generations as readonly unknown[];
-  if (!Array.isArray(generations) || generations.length === 0) {
-    throw handoffError("invalid_state", "the durable run carries no stage generation", state);
-  }
-  let found = 0;
-  for (const entry of generations) {
-    if (!isRecord(entry) || !Array.isArray(entry["iterations"])) {
-      throw handoffError("invalid_state", "the durable generation journal is malformed", state);
-    }
-    for (const iteration of entry["iterations"] as readonly unknown[]) {
-      if (!isRecord(iteration) || !isRecord(iteration["closed"])) {
-        continue;
-      }
-      const closed = iteration["closed"] as Record<string, unknown>;
-      if (closed["by"] === "replanned" && closed["wait_index"] === targetWait.index) {
-        found += 1;
-      }
-    }
-  }
-  if (found !== 1) {
-    throw handoffError(
-      "invalid_state",
-      "the durable revise cycle does not carry exactly one replanned iteration closure",
-      state,
-    );
-  }
-}
-
 /**
  * The exact branch classifier. Reads only the captured authoritative
  * snapshot and never a downstream result; returns the branch id or
@@ -445,7 +477,6 @@ function classifyHandoffBoundary(state: PipelineV2RunState): "branch_a" | "branc
     if (last.state_id !== state.cursor.current_state) {
       throw handoffError("invalid_state", "the planning execution is not on the run cursor", state);
     }
-    replannedClosurePresent(state, targetWait);
     if (state.cursor.transition_count !== state.transitions.length) {
       throw handoffError("invalid_state", "the durable cursor does not match the transition journal", state);
     }
@@ -465,7 +496,6 @@ function classifyHandoffBoundary(state: PipelineV2RunState): "branch_a" | "branc
     if (state.cursor.current_state !== lastTransition["to"]) {
       throw handoffError("invalid_state", "the durable cursor does not sit on the planning transition target", state);
     }
-    replannedClosurePresent(state, targetWait);
     const generations = state.generations as readonly unknown[];
     const lastGeneration = generations[generations.length - 1]! as unknown as DurableGenerationRecord;
     if (
@@ -490,6 +520,21 @@ function classifyHandoffBoundary(state: PipelineV2RunState): "branch_a" | "branc
     "the run is not on a planning handoff boundary",
     state,
   );
+}
+
+/**
+ * The structural sink shape check: a record carrying a dispatch function.
+ * Only the three contract members are ever read; hostile extras stay
+ * unread. Runs after the pipeline provenance gate and before the snapshot
+ * getter.
+ */
+function validateHandoffSinkShape(sink: unknown): void {
+  if (!isRecord(sink)) {
+    throw handoffError("invalid_options", "the handoff sink must be a structural record", null);
+  }
+  if (typeof sink["dispatch"] !== "function") {
+    throw handoffError("invalid_options", "the handoff sink must carry a dispatch function", null);
+  }
 }
 
 /** Probes compiled-plan provenance through the captured public stage selector. */
@@ -534,6 +579,20 @@ function compiledStagePosition(plan: unknown, stageId: string): number {
     }
   }
   throw handoffError("invalid_result", "the composed plan does not declare the caller stage", null);
+}
+
+/**
+ * Resolves the caller-selected stage through the exact public compiled
+ * resolver; the real `stage_not_found` and provenance errors pass through
+ * unchanged by identity. Separate from the provenance probe so the
+ * template/entry bindings are always taken from the SELECTED stage.
+ */
+function resolveCallerStage(
+  compiledStageFor: PipelineV2PlanningRunPlanHandoffOps["compiledStageFor"],
+  compiledPlan: unknown,
+  stageId: string,
+): CompiledPipelineV2RunPlanStage {
+  return compiledStageFor(compiledPlan as unknown as CompiledPipelineV2RunPlan, stageId);
 }
 
 interface VerifiedIntent {
@@ -590,19 +649,28 @@ function verifyAcceptanceResult(
   result: unknown,
   sink: PipelineV2PlanningRunPlanHandoffSink,
 ): VerifiedAcceptance {
-  if (!isRecord(result)) {
-    throw handoffError("invalid_result", "the plan acceptance returned an unexpected shape", null);
+  // The authoritative snapshot is read first so every post-call failure
+  // carries it, never a hostile presentation.
+  const snapshot = sink.snapshot;
+  if (!isRecord(snapshot)) {
+    throw handoffError("invalid_state", "the run lost its durable state", null);
   }
-  expectExactKeys(result, ["compiled_plan", "state"], "the plan acceptance result");
+  if (!isRecord(result)) {
+    throw handoffError("invalid_result", "the plan acceptance returned an unexpected shape", snapshot);
+  }
+  try {
+    expectExactKeys(result, ["compiled_plan", "state"], "the plan acceptance result");
+  } catch (cause) {
+    if (cause instanceof PipelineV2PlanningRunPlanHandoffControllerError) {
+      throw handoffError(cause.reason, cause.message, snapshot);
+    }
+    throw cause;
+  }
   const compiledPlan = result["compiled_plan"];
   probeCompiledPlan(compiledStageFor, compiledPlan);
   const plan = compiledPlan as Record<string, unknown>;
-  const snapshot = sink.snapshot;
-  if (snapshot === null) {
-    throw handoffError("invalid_state", "the run lost its durable state", null);
-  }
   if (result["state"] !== snapshot) {
-    throw handoffError("invalid_result", "the plan acceptance result does not carry the authoritative run state", null);
+    throw handoffError("invalid_result", "the plan acceptance result does not carry the authoritative run state", snapshot);
   }
   const lastPlan = lastPlanRecordOf(snapshot);
   if (
@@ -642,8 +710,8 @@ function verifyRestoreResult(
   if (plan["run_id"] !== state.run_id) {
     throw handoffError("invalid_result", "the restored plan does not bind to the run", state);
   }
-  if (!isRecord(result["state"])) {
-    throw handoffError("invalid_result", "the plan restore result does not carry a run state", state);
+  if (!isRecord(result["state"]) || !statesStructurallyEqual(result["state"], state)) {
+    throw handoffError("invalid_result", "the plan restore result does not carry the authoritative run state", state);
   }
   return compiledPlan as Record<string, unknown>;
 }
@@ -674,19 +742,27 @@ function verifyStageResult(
   compiledStage: CompiledPipelineV2RunPlanStage,
   stageId: string,
   initialBudget: number,
+  previousGenerationIndex: number,
   lastPlan: DurablePlanRecord,
   targetWait: DurableWaitRecord,
 ): PipelineV2RunState {
   const stagePosition = compiledStagePosition(compiledPlan, stageId);
   if (!isRecord(result)) {
-    throw handoffError("invalid_result", "the replanned stage returned an unexpected shape", state);
+    throw handoffError("invalid_result", "the replanned stage returned an unexpected shape", authoritativeState);
   }
-  expectExactKeys(result, STAGE_RESULT_KEYS, "the replanned stage result");
+  try {
+    expectExactKeys(result, STAGE_RESULT_KEYS, "the replanned stage result");
+  } catch (cause) {
+    if (cause instanceof PipelineV2PlanningRunPlanHandoffControllerError) {
+      throw handoffError(cause.reason, cause.message, authoritativeState);
+    }
+    throw cause;
+  }
   if (
     result["wait_index"] !== targetWait.index ||
     result["intent_sha256"] !== intentDigest
   ) {
-    throw handoffError("invalid_result", "the replanned stage result does not bind to the accepted intent", state);
+    throw handoffError("invalid_result", "the replanned stage result does not bind to the accepted intent", authoritativeState);
   }
   if (
     result["stage_id"] !== stageId ||
@@ -694,7 +770,13 @@ function verifyStageResult(
     result["stage_position"] !== stagePosition ||
     result["template_id"] !== compiledStage.template
   ) {
-    throw handoffError("invalid_result", "the replanned stage result does not match the caller policy", state);
+    throw handoffError("invalid_result", "the replanned stage result does not match the caller policy", authoritativeState);
+  }
+  if (
+    !isPositiveSafeInteger(result["previous_generation_index"]) ||
+    result["previous_generation_index"] !== previousGenerationIndex
+  ) {
+    throw handoffError("invalid_result", "the replanned stage result does not bind the previous generation", authoritativeState);
   }
   const plan = compiledPlan as Record<string, unknown>;
   if (
@@ -709,26 +791,33 @@ function verifyStageResult(
   }
   const resultState = result["state"];
   if (!isRecord(resultState) || !statesStructurallyEqual(resultState, authoritativeState)) {
-    throw handoffError("invalid_result", "the replanned stage result does not carry the authoritative run state", state);
+    throw handoffError("invalid_result", "the replanned stage result does not carry the authoritative run state", authoritativeState);
   }
   const resultGenerations = resultState["generations"];
   if (!Array.isArray(resultGenerations) || resultGenerations.length === 0) {
-    throw handoffError("invalid_result", "the replanned stage result carries no generation journal", state);
+    throw handoffError("invalid_result", "the replanned stage result carries no generation journal", authoritativeState);
   }
-  const newGeneration = resultGenerations[resultGenerations.length - 1]!;
+  const newGeneration = resultGenerations[resultGenerations.length - 1]! as Record<string, unknown>;
   if (
     !isRecord(newGeneration) ||
     newGeneration["stage_id"] !== stageId ||
+    newGeneration["stage_position"] !== stagePosition ||
+    newGeneration["template_id"] !== compiledStage.template ||
     newGeneration["initial_budget"] !== initialBudget ||
     newGeneration["plan_sha256"] !== lastPlan.sha256 ||
     newGeneration["opened_transition_count"] !== targetWait.transition_count ||
     newGeneration["closed"] !== undefined ||
     !isRecord(newGeneration["open_iteration"])
   ) {
-    throw handoffError("invalid_result", "the replanned stage result opened an unexpected generation", state);
+    throw handoffError("invalid_result", "the replanned stage result opened an unexpected generation", authoritativeState);
   }
-  if (typeof result["generation_index"] !== "number" || typeof result["iteration_index"] !== "number") {
-    throw handoffError("invalid_result", "the replanned stage result carries no generation bindings", state);
+  if (
+    !isPositiveSafeInteger(result["generation_index"]) ||
+    result["generation_index"] !== newGeneration["index"] ||
+    !isPositiveSafeInteger(result["iteration_index"]) ||
+    result["iteration_index"] !== (newGeneration["open_iteration"] as Record<string, unknown>)["index"]
+  ) {
+    throw handoffError("invalid_result", "the replanned stage result does not bind the opened generation and iteration", authoritativeState);
   }
   return resultState as unknown as PipelineV2RunState;
 }
@@ -765,22 +854,29 @@ function verifyTransitionResult(
 ): PipelineV2RunState {
   const stagePosition = compiledStagePosition(compiledPlan, stageId);
   if (!isRecord(result)) {
-    throw handoffError("invalid_result", "the planning transition returned an unexpected shape", state);
+    throw handoffError("invalid_result", "the planning transition returned an unexpected shape", authoritativeState);
   }
-  expectExactKeys(result, TRANSITION_RESULT_KEYS, "the planning transition result");
+  try {
+    expectExactKeys(result, TRANSITION_RESULT_KEYS, "the planning transition result");
+  } catch (cause) {
+    if (cause instanceof PipelineV2PlanningRunPlanHandoffControllerError) {
+      throw handoffError(cause.reason, cause.message, authoritativeState);
+    }
+    throw cause;
+  }
   if (result["wait_index"] !== targetWait.index) {
-    throw handoffError("invalid_result", "the planning transition result does not bind to the accepted intent", state);
+    throw handoffError("invalid_result", "the planning transition result does not bind to the accepted intent", authoritativeState);
   }
   if (typeof result["from_state"] !== "string" || typeof result["to_state"] !== "string") {
-    throw handoffError("invalid_result", "the planning transition result carries no transition binding", state);
+    throw handoffError("invalid_result", "the planning transition result carries no transition binding", authoritativeState);
   }
   const resultState = result["state"];
   if (!isRecord(resultState) || !statesStructurallyEqual(resultState, authoritativeState)) {
-    throw handoffError("invalid_result", "the planning transition result does not carry the authoritative run state", state);
+    throw handoffError("invalid_result", "the planning transition result does not carry the authoritative run state", authoritativeState);
   }
   const transitions = resultState["transitions"] as readonly unknown[];
   if (!Array.isArray(transitions) || transitions.length === 0) {
-    throw handoffError("invalid_result", "the planning transition result carries no transition journal", state);
+    throw handoffError("invalid_result", "the planning transition result carries no transition journal", authoritativeState);
   }
   const bound = transitions[transitions.length - 1]!;
   if (
@@ -790,10 +886,10 @@ function verifyTransitionResult(
     bound["outcome"] !== "completed" ||
     bound["execution_index"] !== result["execution_index"]
   ) {
-    throw handoffError("invalid_result", "the planning transition result does not bind the committed transition", state);
+    throw handoffError("invalid_result", "the planning transition result does not bind the committed transition", authoritativeState);
   }
   if (bound["index"] !== result["transition_index"]) {
-    throw handoffError("invalid_result", "the planning transition result does not bind the committed transition", state);
+    throw handoffError("invalid_result", "the planning transition result does not bind the committed transition", authoritativeState);
   }
   if (
     result["stage_id"] !== stageId ||
@@ -801,20 +897,47 @@ function verifyTransitionResult(
     result["stage_position"] !== stagePosition ||
     result["template_id"] !== compiledStage.template
   ) {
-    throw handoffError("invalid_result", "the planning transition result does not match the caller policy", state);
+    throw handoffError("invalid_result", "the planning transition result does not match the caller policy", authoritativeState);
   }
   if (
     result["plan_revision"] !== lastPlan.revision ||
     result["plan_sha256"] !== lastPlan.sha256
   ) {
-    throw handoffError("invalid_result", "the planning transition result does not bind to the accepted plan", state);
+    throw handoffError("invalid_result", "the planning transition result does not bind to the accepted plan", authoritativeState);
+  }
+  // The flat generation/iteration bindings are taken from the durable
+  // journal of the authoritative state, never trusted from the result.
+  const generations = authoritativeState["generations"] as readonly unknown[];
+  if (!Array.isArray(generations) || generations.length === 0) {
+    throw handoffError("invalid_result", "the planning transition result carries no generation journal", authoritativeState);
+  }
+  const openGeneration = generations[generations.length - 1]! as Record<string, unknown>;
+  if (
+    !isRecord(openGeneration) ||
+    openGeneration["stage_id"] !== stageId ||
+    openGeneration["stage_position"] !== stagePosition ||
+    openGeneration["template_id"] !== compiledStage.template ||
+    openGeneration["initial_budget"] !== initialBudget ||
+    openGeneration["plan_sha256"] !== lastPlan.sha256 ||
+    openGeneration["opened_transition_count"] !== targetWait.transition_count ||
+    openGeneration["closed"] !== undefined ||
+    !isRecord(openGeneration["open_iteration"])
+  ) {
+    throw handoffError("invalid_result", "the planning transition result does not bind the open generation", authoritativeState);
+  }
+  if (
+    !isPositiveSafeInteger(result["generation_index"]) ||
+    result["generation_index"] !== openGeneration["index"] ||
+    !isPositiveSafeInteger(result["iteration_index"]) ||
+    result["iteration_index"] !== (openGeneration["open_iteration"] as Record<string, unknown>)["index"]
+  ) {
+    throw handoffError("invalid_result", "the planning transition result does not bind the open generation and iteration", authoritativeState);
   }
   if (
     typeof result["execution_index"] !== "number" ||
-    typeof result["generation_index"] !== "number" ||
-    typeof result["iteration_index"] !== "number"
+    result["execution_index"] !== lastExecutionOf(authoritativeState).index
   ) {
-    throw handoffError("invalid_result", "the planning transition result carries no execution bindings", state);
+    throw handoffError("invalid_result", "the planning transition result does not bind the planning execution", authoritativeState);
   }
   return resultState as unknown as PipelineV2RunState;
 }
@@ -877,10 +1000,13 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
   // access and facade call.
   requireResolvedPipelineV2Provenance(pipeline as ResolvedPipelineV2, "pipeline v2 planning run plan handoff");
 
+  // The structural sink check precedes the snapshot getter; the pipeline
+  // provenance gate above precedes both.
+  validateHandoffSinkShape(sink);
   // One authoritative initial snapshot read, then the branch
   // classification — before any downstream call.
   const initialSnapshot = sink.snapshot;
-  if (initialSnapshot === null) {
+  if (!isRecord(initialSnapshot)) {
     throw handoffError("invalid_state", "the run has no durable state", null);
   }
   if (sink.poisoned) {
@@ -905,7 +1031,11 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
       throw handoffError("artifact_missing", "the accepted revise_task intent artifact is missing", acceptedState);
     }
     const intent = verifyIntentWrapper(intentWrapper, acceptedState, verifiedTargetWait);
-    const compiledStage = probeCompiledPlan(compiledStageFor, verifiedAcceptance.compiledPlan);
+    // The caller stage is resolved through the exact public resolver
+    // BEFORE any durable stage write; the provenance probe above stays
+    // separate.
+    const compiledStage = resolveCallerStage(compiledStageFor, verifiedAcceptance.compiledPlan, stageId);
+    const previousGenerationIndex = previousGenerationIndexOf(acceptedState, verifiedTargetWait);
     // 6. The replanned stage opens.
     const stage = await openReplannedStage({
       sink,
@@ -918,7 +1048,7 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
     if (postStageSnapshot === null) {
       throw handoffError("invalid_state", "the run lost its durable state", acceptedState);
     }
-    verifyStageResult(stage, acceptedState, postStageSnapshot, intent.digest, verifiedAcceptance.compiledPlan, compiledStage, stageId, initialBudget, lastPlan, verifiedTargetWait);
+    verifyStageResult(stage, acceptedState, postStageSnapshot, intent.digest, verifiedAcceptance.compiledPlan, compiledStage, stageId, initialBudget, previousGenerationIndex, lastPlan, verifiedTargetWait);
     // 8. The planning transition is committed.
     const transition = await openReplannedStageTransition({
       pipeline: pipeline as ResolvedPipelineV2,
@@ -961,7 +1091,7 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
     throw handoffError("artifact_missing", "the accepted revise_task intent artifact is missing", initialSnapshot);
   }
   const intent = verifyIntentWrapper(intentWrapper, initialSnapshot, verifiedTargetWait);
-  const compiledStage = probeCompiledPlan(compiledStageFor, restoredPlan);
+  const compiledStage = resolveCallerStage(compiledStageFor, restoredPlan, stageId);
   const transition = await openReplannedStageTransition({
     pipeline: pipeline as ResolvedPipelineV2,
     sink,

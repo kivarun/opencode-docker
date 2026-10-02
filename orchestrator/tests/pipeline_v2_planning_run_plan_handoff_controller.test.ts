@@ -348,6 +348,7 @@ async function buildPrefix(): Promise<Prefix> {
 async function runHandoff(
   fixture: Fixture,
   failFrom = Infinity,
+  stageId: string = STAGE_ID,
 ): Promise<{
   chainSuffix: string[];
   revisionBefore: number;
@@ -366,7 +367,7 @@ async function runHandoff(
     pipeline,
     runRoot: fixture.runRoot,
     sink: wrapped,
-    stageId: STAGE_ID,
+    stageId,
     initialBudget: INITIAL_BUDGET,
   });
   return {
@@ -1377,8 +1378,9 @@ test("19. diagnostics are content-free: no task bodies, output JSON, digest cana
 });
 
 test("18. source scan: only the listed facades; no reducer/store/fs/parser/serializer/digest/registry/runner", async () => {
-  const facadeSource = await readFile(join("src", "pipeline_v2_planning_run_plan_handoff_controller.ts"), "utf8");
-  const internalSource = await readFile(join("src", "pipeline_v2_planning_run_plan_handoff_controller_internal.ts"), "utf8");
+  const sourceRoot = join(import.meta.dir, "..", "src");
+  const facadeSource = await readFile(join(sourceRoot, "pipeline_v2_planning_run_plan_handoff_controller.ts"), "utf8");
+  const internalSource = await readFile(join(sourceRoot, "pipeline_v2_planning_run_plan_handoff_controller_internal.ts"), "utf8");
   for (const banned of [
     "reducePipelineV2RunCommand",
     "validatePipelineV2RunState",
@@ -1412,5 +1414,1015 @@ test("18. source scan: only the listed facades; no reducer/store/fs/parser/seria
     "requireResolvedPipelineV2Provenance",
   ]) {
     expect(internalSource.includes(required), `the internal core must import ${required}`).toBe(true);
+  }
+});
+
+const REVISED_TASKS = ["task-a", "task-b", "task-c"] as const;
+const REVISED_BODIES = ["Body A revised", "Body B revised", "Body C revised"] as const;
+
+function pointerProposal(taskIds: string[]): unknown {
+  return {
+    schema_version: 1,
+    kind: "run_plan_proposal",
+    stages: [
+      {
+        id: "stage-1",
+        template: "development",
+        tasks: taskIds.map((id) => (id === "task-c" ? { id, depends_on: ["task-a"] } : { id, depends_on: [] })),
+      },
+    ],
+    new_tasks: [],
+  };
+}
+
+let sessionCounter = 0;
+function nextSession(label: string): string {
+  sessionCounter += 1;
+  return `sess-${sessionCounter}-${label}`;
+}
+
+/**
+ * The honest prefix with N complete revise cycles: the first cycle uses
+ * buildPrefix's flow and ends with the first handoff (the facade), then
+ * every further cycle appends the stage execution, the transition, the
+ * wait, the real revise-task intervention, the restart, the standard
+ * resume restore and the planning execution through the runtime data
+ * plane, ending at the settled-unbound planning boundary.
+ */
+async function buildCycledPrefix(cycles: number): Promise<Prefix> {
+  const fixture = await setupFixture();
+  try {
+    const pipeline1 = await loadPipelineV2(fixture.bundle);
+    clockCounter = 0;
+    const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const recording = recordingSink(sink, Infinity);
+    await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+    const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
+    await recording.dispatch({
+      kind: "create_run",
+      runId: RUN_ID,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline1),
+      inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+    });
+    const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
+    await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+    for (const command of [
+      { kind: "agent_data_prepared" },
+      { kind: "agent_execution_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_tool_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_running" },
+    ] as PipelineV2RunCommand[]) {
+      await recording.dispatch(command);
+    }
+    await writeFile(join(prep1.outputs_root, "plan"), JSON.stringify(R1_PROPOSAL), { mode: 0o600 });
+    const records1: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline1, prep1);
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_cleanup_completed" });
+
+    const accepted1 = await acceptPipelineV2PlanningRunPlan({ pipeline: pipeline1, runRoot: fixture.runRoot, sink: recording });
+    await ensurePipelineV2StageIteration({ compiledPlan: accepted1.compiled_plan, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET, sink: recording });
+    await recording.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    await recording.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+    for (const command of [
+      { kind: "agent_data_prepared" },
+      { kind: "agent_execution_session_created", sessionId: nextSession("stage") },
+      { kind: "agent_tool_session_created", sessionId: nextSession("stage") },
+      { kind: "agent_running" },
+      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_cleanup_completed" },
+    ] as PipelineV2RunCommand[]) {
+      await recording.dispatch(command);
+    }
+    await recording.dispatch({
+      kind: "transition_committed",
+      step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+      executionIndex: 2,
+    });
+    const firstActions = [
+      { id: "continue_stage", to: "dev_entry" },
+      { id: "revise_task", to: "architect" },
+    ];
+    const firstRequest = preparePipelineV2WaitRequest({
+      schema_version: 1,
+      run_id: RUN_ID,
+      wait_index: 1,
+      transition_count: 2,
+      state_id: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      actions: firstActions,
+    });
+    await recording.dispatch({
+      kind: "run_waiting",
+      stateId: "architect",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: firstRequest.sha256,
+      actions: firstActions,
+    });
+    await publishPipelineV2WaitRequest(fixture.runRoot, firstRequest.manifest);
+    await applyPipelineV2ReviseTaskIntervention({
+      pipeline: pipeline1,
+      runRoot: fixture.runRoot,
+      sink: recording,
+      runId: RUN_ID,
+      waitIndex: 1,
+      taskId: "task-a",
+      taskBody: "Body A revised",
+    });
+
+    // The restart, the standard resume restore, and the second planning
+    // execution through the runtime data plane.
+    const reopenedAfterIntervention = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const stateAfterIntervention = reopenedAfterIntervention.snapshot;
+    if (stateAfterIntervention === null) {
+      throw new Error("the reopened run lost its durable state");
+    }
+    const pipelineAfterIntervention = await loadPipelineV2(stateAfterIntervention.pipeline.bundle_root);
+    const restoredPlanning = await restorePipelineV2RuntimeContext(pipelineAfterIntervention, stateAfterIntervention, fixture.runRoot);
+    const prep2 = await prepareActivationData(pipelineAfterIntervention, restoredPlanning.run_inputs, restoredPlanning.accepted_outputs, "architect", restoredPlanning.next_execution_index);
+    await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+    for (const command of [
+      { kind: "agent_data_prepared" },
+      { kind: "agent_execution_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_tool_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_running" },
+    ] as PipelineV2RunCommand[]) {
+      await recording.dispatch(command);
+    }
+    await writeFile(join(prep2.outputs_root, "plan"), JSON.stringify(R2_PROPOSAL), { mode: 0o600 });
+    const records2: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipelineAfterIntervention, prep2);
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_cleanup_completed" });
+
+    // The first handoff through the facade.
+    const firstReopen = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const firstState = firstReopen.snapshot;
+
+    if (firstState === null) {
+      throw new Error("the reopened run lost its durable state");
+    }
+    const pipelineAfterFirst = await loadPipelineV2(firstState.pipeline.bundle_root);
+    await applyPipelineV2PlanningRunPlanHandoff({
+      pipeline: pipelineAfterFirst,
+      runRoot: fixture.runRoot,
+      sink: recording,
+      stageId: STAGE_ID,
+      initialBudget: INITIAL_BUDGET,
+    });
+
+    let staleCompiledPlan1: unknown = accepted1.compiled_plan;
+    for (let cycle = 2; cycle <= cycles; cycle += 1) {
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const state = reopened.snapshot;
+      if (state === null) {
+        throw new Error("the reopened run lost its durable state");
+      }
+      const pipeline = await loadPipelineV2(state.pipeline.bundle_root);
+      const restored = await restorePipelineV2RuntimeContext(pipeline, state, fixture.runRoot);
+      const stageExecIndex = restored.next_execution_index;
+      await recording.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+      for (const command of [
+        { kind: "agent_data_prepared" },
+        { kind: "agent_execution_session_created", sessionId: nextSession("stage") },
+        { kind: "agent_tool_session_created", sessionId: nextSession("stage") },
+        { kind: "agent_running" },
+        { kind: "agent_outputs_accepted", outputs: [] },
+        { kind: "agent_cleanup_completed" },
+      ] as PipelineV2RunCommand[]) {
+        await recording.dispatch(command);
+      }
+      await recording.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: stageExecIndex,
+      });
+      const waitIndex = cycle;
+      const anchor = (reopened.snapshot as PipelineV2RunState).transitions.length + 1;
+      const actions = [
+        { id: "continue_stage", to: "dev_entry" },
+        { id: "revise_task", to: "architect" },
+      ];
+      const request = preparePipelineV2WaitRequest({
+        schema_version: 1,
+        run_id: RUN_ID,
+        wait_index: waitIndex,
+        transition_count: anchor,
+        state_id: "architect",
+        reason: "stage_iteration_limit_exhausted",
+        actions,
+      });
+      await recording.dispatch({
+        kind: "run_waiting",
+        stateId: "architect",
+        reason: "stage_iteration_limit_exhausted",
+        requestSha256: request.sha256,
+        actions,
+      });
+      await publishPipelineV2WaitRequest(fixture.runRoot, request.manifest);
+      const revisedTask = REVISED_TASKS[cycle - 1] ?? "task-a";
+      const revisedBody = REVISED_BODIES[cycle - 1] ?? "Body revised";
+      await applyPipelineV2ReviseTaskIntervention({
+        pipeline,
+        runRoot: fixture.runRoot,
+        sink: recording,
+        runId: RUN_ID,
+        waitIndex,
+        taskId: revisedTask,
+        taskBody: revisedBody,
+      });
+
+      const reopenedAfterIntervention = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const stateAfterIntervention = reopenedAfterIntervention.snapshot;
+      if (stateAfterIntervention === null) {
+        throw new Error("the reopened run lost its durable state");
+      }
+      const pipelineAfterIntervention = await loadPipelineV2(stateAfterIntervention.pipeline.bundle_root);
+      const restoredPlanning = await restorePipelineV2RuntimeContext(pipelineAfterIntervention, stateAfterIntervention, fixture.runRoot);
+      const planExecIndex = restoredPlanning.next_execution_index;
+      const prep = await prepareActivationData(pipelineAfterIntervention, restoredPlanning.run_inputs, restoredPlanning.accepted_outputs, "architect", planExecIndex);
+      await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+      for (const command of [
+        { kind: "agent_data_prepared" },
+        { kind: "agent_execution_session_created", sessionId: nextSession("planning") },
+        { kind: "agent_tool_session_created", sessionId: nextSession("planning") },
+        { kind: "agent_running" },
+      ] as PipelineV2RunCommand[]) {
+        await recording.dispatch(command);
+      }
+      await writeFile(join(prep.outputs_root, "plan"), JSON.stringify(pointerProposal(["task-a", "task-b", "task-c"])), { mode: 0o600 });
+      const records: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipelineAfterIntervention, prep);
+      await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records.map((r) => ({ id: r.output, digest: r.digest })) });
+      await recording.dispatch({ kind: "agent_cleanup_completed" });
+      void staleCompiledPlan1;
+      staleCompiledPlan1 = null;
+      // Every completed cycle except the last runs its own handoff; the
+      // last cycle's boundary stays settled-unbound for the proof.
+      if (cycle < cycles) {
+        const reopenForHandoff = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+        const stateForHandoff = reopenForHandoff.snapshot;
+        if (stateForHandoff === null) {
+          throw new Error("the reopened run lost its durable state");
+        }
+        const pipelineForHandoff = await loadPipelineV2(stateForHandoff.pipeline.bundle_root);
+        await applyPipelineV2PlanningRunPlanHandoff({
+          pipeline: pipelineForHandoff,
+          runRoot: fixture.runRoot,
+          sink: recording,
+          stageId: STAGE_ID,
+          initialBudget: INITIAL_BUDGET,
+        });
+      }
+    }
+    const state = sink.snapshot as PipelineV2RunState;
+    const validated = parsePipelineV2RunState(JSON.stringify(state));
+    if (validated.executions.length !== validated.transitions.length + 1) {
+      throw new Error("the cycled prefix did not reach the settled-unbound boundary");
+    }
+    return {
+      fixture,
+      recording,
+      pipeline1,
+      staleCompiledPlan1,
+      revisionAtBoundary: state.revision,
+    };
+  } catch (cause) {
+    await rm(fixture.root, { recursive: true, force: true });
+    throw cause;
+  }
+}
+
+const TWO_STAGE_YAML = `schema_version: 2
+entry_state: architect
+max_transitions: 40
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev_entry
+    - id: review
+      entry_state: review_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+      plan_output: plan
+    - state_id: planner2
+      role: planning
+      plan_output: plan2
+    - state_id: dev_entry
+      role: stage
+      stage_template: development
+    - state_id: review_entry
+      role: stage
+      stage_template: review
+
+states:
+  - id: architect
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dev_entry
+
+  - id: dev_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: planner2
+
+  - id: planner2
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs: []
+    outputs:
+      - id: plan2
+        type: json
+        schema: schemas/plan2.schema.json
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: review_entry
+
+  - id: review_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+
+  - id: done
+    type: terminal
+    result: success
+`;
+
+function twoStageProposal(stageCount: 2 | 3): unknown {
+  const stages: { id: string; template: string; tasks: { id: string; depends_on: string[] }[] }[] = [
+    { id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }, { id: "task-b", depends_on: [] }] },
+    { id: "stage-2", template: "review", tasks: [{ id: "task-c", depends_on: [] }, { id: "task-d", depends_on: ["task-c"] }] },
+  ];
+  const newTasks: { id: string; body: string }[] = [
+    { id: "task-c", body: "Body C" },
+    { id: "task-d", body: "Body D" },
+  ];
+  if (stageCount === 3) {
+    stages.push({ id: "stage-3", template: "review", tasks: [{ id: "task-e", depends_on: [] }] });
+    newTasks.push({ id: "task-e", body: "Body E" });
+  }
+  return {
+    schema_version: 1,
+    kind: "run_plan_proposal",
+    stages,
+    new_tasks: newTasks,
+  };
+}
+
+/**
+ * The honest prefix on the two-stage bundle: the first planning execution,
+ * plan r1 over stage-1 only, the development stage cycle, the wait with
+ * `revise_task → planner2`, the real intervention, the restart, the
+ * resume restore, and the second planning execution on planner2 whose
+ * runtime data plane accepts the multi-stage proposal.
+ */
+async function buildTwoStagePrefix(stageCount: 2 | 3): Promise<Omit<Prefix, "staleCompiledPlan1"> & { staleCompiledPlan1: unknown }> {
+  const fixture = await setupFixture();
+  try {
+    const bundle2 = join(fixture.root, "bundle2");
+    await mkdir(join(bundle2, "prompts"), { recursive: true });
+    await mkdir(join(bundle2, "schemas"), { recursive: true });
+    await writeFile(join(bundle2, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
+    await writeFile(join(bundle2, "schemas", "plan2.schema.json"), JSON.stringify({ type: "object" }));
+    await writeFile(join(bundle2, "pipeline.yaml"), TWO_STAGE_YAML);
+    await writeFile(join(bundle2, "prompts", "architect.md"), "plan the work\n");
+    await writeFile(join(bundle2, "prompts", "coder.md"), "implement the task\n");
+    const bundleForTest = bundle2;
+    const pipeline1 = await loadPipelineV2(bundleForTest);
+    clockCounter = 0;
+    const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const recording = recordingSink(sink, Infinity);
+    await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+    const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
+    await recording.dispatch({
+      kind: "create_run",
+      runId: RUN_ID,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline1),
+      inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+    });
+    const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
+    await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+    for (const command of [
+      { kind: "agent_data_prepared" },
+      { kind: "agent_execution_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_tool_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_running" },
+    ] as PipelineV2RunCommand[]) {
+      await recording.dispatch(command);
+    }
+    await writeFile(join(prep1.outputs_root, "plan"), JSON.stringify({
+      schema_version: 1,
+      kind: "run_plan_proposal",
+      stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }, { id: "task-b", depends_on: [] }] }],
+      new_tasks: [
+        { id: "task-a", body: "Body A" },
+        { id: "task-b", body: "Body B" },
+      ],
+    }), { mode: 0o600 });
+    const records1: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline1, prep1);
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_cleanup_completed" });
+
+    const accepted1 = await acceptPipelineV2PlanningRunPlan({ pipeline: pipeline1, runRoot: fixture.runRoot, sink: recording });
+    await ensurePipelineV2StageIteration({ compiledPlan: accepted1.compiled_plan, stageId: "stage-1", initialBudget: INITIAL_BUDGET, sink: recording });
+    await recording.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    await recording.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 });
+    for (const command of [
+      { kind: "agent_data_prepared" },
+      { kind: "agent_execution_session_created", sessionId: nextSession("stage") },
+      { kind: "agent_tool_session_created", sessionId: nextSession("stage") },
+      { kind: "agent_running" },
+      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_cleanup_completed" },
+    ] as PipelineV2RunCommand[]) {
+      await recording.dispatch(command);
+    }
+    await recording.dispatch({
+      kind: "transition_committed",
+      step: { from: "dev_entry", outcome: "completed", to: "planner2", transition_index: 0 },
+      executionIndex: 2,
+    });
+    const actions = [
+      { id: "continue_stage", to: "dev_entry" },
+      { id: "revise_task", to: "planner2" },
+    ];
+    const request = preparePipelineV2WaitRequest({
+      schema_version: 1,
+      run_id: RUN_ID,
+      wait_index: 1,
+      transition_count: 2,
+      state_id: "planner2",
+      reason: "stage_iteration_limit_exhausted",
+      actions,
+    });
+    await recording.dispatch({
+      kind: "run_waiting",
+      stateId: "planner2",
+      reason: "stage_iteration_limit_exhausted",
+      requestSha256: request.sha256,
+      actions,
+    });
+    await publishPipelineV2WaitRequest(fixture.runRoot, request.manifest);
+    await applyPipelineV2ReviseTaskIntervention({
+      pipeline: pipeline1,
+      runRoot: fixture.runRoot,
+      sink: recording,
+      runId: RUN_ID,
+      waitIndex: 1,
+      taskId: "task-a",
+      taskBody: "Body A revised",
+    });
+
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const stateAfterIntervention = reopened.snapshot;
+    if (stateAfterIntervention === null) {
+      throw new Error("the reopened run lost its durable state");
+    }
+    const pipeline2 = await loadPipelineV2(stateAfterIntervention.pipeline.bundle_root);
+    const restored = await restorePipelineV2RuntimeContext(pipeline2, stateAfterIntervention, fixture.runRoot);
+    const prep2 = await prepareActivationData(pipeline2, restored.run_inputs, restored.accepted_outputs, "planner2", restored.next_execution_index);
+    await recording.dispatch({ kind: "start_agent_execution", stateId: "planner2", profile: "architect", executionRole: "planning" });
+    for (const command of [
+      { kind: "agent_data_prepared" },
+      { kind: "agent_execution_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_tool_session_created", sessionId: nextSession("planning") },
+      { kind: "agent_running" },
+    ] as PipelineV2RunCommand[]) {
+      await recording.dispatch(command);
+    }
+    await writeFile(join(prep2.outputs_root, "plan2"), JSON.stringify(twoStageProposal(stageCount)), { mode: 0o600 });
+    const records2: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline2, prep2);
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_cleanup_completed" });
+    const state = sink.snapshot as PipelineV2RunState;
+    const validated = parsePipelineV2RunState(JSON.stringify(state));
+    if (validated.executions.length !== validated.transitions.length + 1) {
+      throw new Error("the two-stage prefix did not reach the settled-unbound boundary");
+    }
+    return {
+      fixture,
+      recording,
+      pipeline1,
+      staleCompiledPlan1: accepted1.compiled_plan,
+      revisionAtBoundary: state.revision,
+    };
+  } catch (cause) {
+    await rm(fixture.root, { recursive: true, force: true });
+    throw cause;
+  }
+}
+
+/** Captures the real downstream result by forwarding, then returns a hostile presentation. */
+function spyThenHostileOps(
+  fixture: Fixture,
+  captured: { value: unknown },
+  hostileOp: keyof PipelineV2PlanningRunPlanHandoffOps,
+  buildHostile: (real: unknown) => unknown,
+): PipelineV2PlanningRunPlanHandoffOps {
+  const realCall = async (name: keyof PipelineV2PlanningRunPlanHandoffOps, args: unknown[]): Promise<unknown> => {
+    const result = name === "acceptPlanningRunPlan"
+      ? await acceptPipelineV2PlanningRunPlan(...(args as Parameters<typeof acceptPipelineV2PlanningRunPlan>))
+      : name === "restoreAcceptedRunPlan"
+        ? await restorePipelineV2AcceptedRunPlan(...(args as Parameters<typeof restorePipelineV2AcceptedRunPlan>))
+        : name === "loadWaitIntent"
+          ? await loadPipelineV2WaitIntent(...(args as Parameters<typeof loadPipelineV2WaitIntent>))
+          : name === "openReplannedStage"
+            ? await openPipelineV2ReplannedStage(...(args as Parameters<typeof openPipelineV2ReplannedStage>))
+            : await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+    if (name === hostileOp) {
+      captured.value = result;
+      return buildHostile(result);
+    }
+    return result;
+  };
+  return {
+    acceptPlanningRunPlan: ((...args: unknown[]) => realCall("acceptPlanningRunPlan", args)) as typeof acceptPipelineV2PlanningRunPlan,
+    restoreAcceptedRunPlan: ((...args: unknown[]) => realCall("restoreAcceptedRunPlan", args)) as typeof restorePipelineV2AcceptedRunPlan,
+    loadWaitIntent: ((...args: unknown[]) => realCall("loadWaitIntent", args)) as typeof loadPipelineV2WaitIntent,
+    openReplannedStage: ((...args: unknown[]) => realCall("openReplannedStage", args)) as typeof openPipelineV2ReplannedStage,
+    openReplannedStageTransition: ((...args: unknown[]) => realCall("openReplannedStageTransition", args)) as typeof openPipelineV2ReplannedStageTransition,
+    compiledStageFor: compiledPipelineV2RunPlanStageFor,
+  };
+}
+
+test("20. RED1: a second honest revise cycle is currently refused by historical accepted revise waits", async () => {
+  const prefix = await buildCycledPrefix(2);
+  const { fixture } = prefix;
+  try {
+    const outcome = await runHandoff(fixture);
+    // GREEN TARGET: the suffix, delta +5, projection.
+    expect(outcome.chainSuffix).toEqual(["plan:3", "stage_generation_closed(replanned)", "stage_generation_opened", "stage_iteration_opened", "transition_committed"]);
+    expect(outcome.revisionAfter - outcome.revisionBefore).toBe(5);
+    const state = outcome.state;
+    expect(state.plan_revisions.map((p) => p.revision)).toEqual([1, 2, 3]);
+    expect(state.generations).toHaveLength(3);
+    expect(state.waits.map((w) => w.index)).toEqual([1, 2]);
+    const gen2 = state.generations[1]!;
+    expect(gen2.closed).toEqual({ by: "replanned", closed_transition_count: 4 });
+    const gen3 = state.generations[2]!;
+    expect(gen3.stage_id).toBe(STAGE_ID);
+    expect(gen3.initial_budget).toBe(INITIAL_BUDGET);
+    expect(gen3.opened_transition_count).toBe(4);
+    expect(gen3.open_iteration).toBeDefined();
+    expect(state.transitions).toHaveLength(5);
+    expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 5 });
+    expect(state.executions).toHaveLength(5);
+    // The first cycle is not rewritten.
+    expect(state.task_revisions.map((t) => ({ id: t.task_id, revision: t.revision, wait: t.wait_index }))).toEqual([
+      { id: "task-a", revision: 1, wait: undefined },
+      { id: "task-b", revision: 1, wait: undefined },
+      { id: "task-a", revision: 2, wait: 1 },
+      { id: "task-c", revision: 1, wait: undefined },
+      { id: "task-b", revision: 2, wait: 2 },
+    ]);
+    expect(parsePipelineV2RunState(JSON.stringify(state))).toEqual(state);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("21. RED1: a third honest revise cycle passes S0, and the second/third handoffs pass S5 branch B", async () => {
+  const prefix = await buildCycledPrefix(3);
+  const { fixture } = prefix;
+  try {
+    const outcome = await runHandoff(fixture);
+    expect(outcome.chainSuffix).toEqual(["plan:4", "stage_generation_closed(replanned)", "stage_generation_opened", "stage_iteration_opened", "transition_committed"]);
+    const state = outcome.state;
+    expect(state.plan_revisions).toHaveLength(4);
+    expect(state.generations).toHaveLength(4);
+    expect(state.waits.map((w) => w.index)).toEqual([1, 2, 3]);
+    expect(state.generations[2]!.closed).toEqual({ by: "replanned", closed_transition_count: 6 });
+    expect(state.generations[3]!.opened_transition_count).toBe(6);
+    // S5 branch B after the third handoff.
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const finalState = reopened.snapshot as PipelineV2RunState;
+    const pipeline = await loadPipelineV2(finalState.pipeline.bundle_root);
+    const calls = { restore: 0, load: 0, transition: 0 };
+    const ops: PipelineV2PlanningRunPlanHandoffOps = {
+      acceptPlanningRunPlan: acceptPipelineV2PlanningRunPlan,
+      restoreAcceptedRunPlan: (async (...args: unknown[]) => {
+        calls.restore += 1;
+        return await restorePipelineV2AcceptedRunPlan(...(args as Parameters<typeof restorePipelineV2AcceptedRunPlan>));
+      }) as typeof restorePipelineV2AcceptedRunPlan,
+      loadWaitIntent: (async (...args: unknown[]) => {
+        calls.load += 1;
+        return await loadPipelineV2WaitIntent(...(args as Parameters<typeof loadPipelineV2WaitIntent>));
+      }) as typeof loadPipelineV2WaitIntent,
+      openReplannedStage: openPipelineV2ReplannedStage,
+      openReplannedStageTransition: (async (...args: unknown[]) => {
+        calls.transition += 1;
+        return await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+      }) as typeof openPipelineV2ReplannedStageTransition,
+      compiledStageFor: compiledPipelineV2RunPlanStageFor,
+    };
+    const wrapped = recordingSink(reopened, Infinity);
+    const branchB = await applyPipelineV2PlanningRunPlanHandoffWithIo(
+      { pipeline, runRoot: fixture.runRoot, sink: wrapped, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+      ops,
+    );
+    expect(calls).toEqual({ restore: 1, load: 1, transition: 1 });
+    expect(wrapped.commands).toEqual([]);
+    expect(branchB.generation_index).toBe(4);
+    expect(branchB.wait_index).toBe(3);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("22. RED2: the caller stage-2 (different template) currently fails the outer verifier after durable writes", async () => {
+  const prefix = await buildTwoStagePrefix(2);
+  const { fixture } = prefix;
+  try {
+    const outcome = await runHandoff(fixture, Infinity, "stage-2");
+    expect(outcome.chainSuffix).toEqual(["task-c:1", "task-d:1", "plan:2", "stage_generation_closed(replanned)", "stage_generation_opened", "stage_iteration_opened", "transition_committed"]);
+    expect(outcome.revisionAfter - outcome.revisionBefore).toBe(7);
+    const state = outcome.state;
+    expect(state.plan_revisions.map((p) => p.revision)).toEqual([1, 2]);
+    const newGeneration = state.generations[1]!;
+    expect(newGeneration.stage_id).toBe("stage-2");
+    expect(newGeneration.template_id).toBe("review");
+    expect(newGeneration.stage_position).toBe(2);
+    expect(newGeneration.initial_budget).toBe(INITIAL_BUDGET);
+    expect(state.transitions[2]!.to).toBe("review_entry");
+    expect(state.transitions[2]!.from).toBe("planner2");
+    expect(state.cursor).toEqual({ current_state: "review_entry", transition_count: 3 });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("23. RED2 positive controls: the first stage, the shared-entry stage-3, and branch B with stage-2", async () => {
+  // The first stage's own-template binding is covered by the
+  // single-stage suite (tests 1-19); the two-stage fixture controls the
+  // non-first stages here.
+  // Two stages sharing one entry state: stage-3 resolves its own position/template.
+  {
+    const prefix = await buildTwoStagePrefix(3);
+    const { fixture } = prefix;
+    try {
+      console.log("DBG-SHARED-ENTRY start");
+      const outcome = await runHandoff(fixture, Infinity, "stage-3");
+      console.log("DBG-SHARED-ENTRY done");
+      const newGeneration = outcome.state.generations[1]!;
+      expect(newGeneration.stage_id).toBe("stage-3");
+      expect(newGeneration.template_id).toBe("review");
+      expect(newGeneration.stage_position).toBe(3);
+      expect(newGeneration.initial_budget).toBe(INITIAL_BUDGET);
+      expect(outcome.state.transitions[2]!.to).toBe("review_entry");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+  // Branch B with the caller stage-2.
+  {
+    const prefix = await buildTwoStagePrefix(2);
+    const { fixture } = prefix;
+    try {
+      await runHandoff(fixture, Infinity, "stage-2");
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const state = reopened.snapshot as PipelineV2RunState;
+      const pipeline = await loadPipelineV2(state.pipeline.bundle_root);
+      const wrapped = recordingSink(reopened, Infinity);
+      const branchB = await applyPipelineV2PlanningRunPlanHandoff({
+        pipeline,
+        runRoot: fixture.runRoot,
+        sink: wrapped,
+        stageId: "stage-2",
+        initialBudget: INITIAL_BUDGET,
+      });
+      console.log("DBG-BRANCHB done");
+      expect(wrapped.commands).toEqual([]);
+      expect(branchB.stage_id).toBe("stage-2");
+      expect(branchB.template_id).toBe("review");
+      expect(branchB.generation_index).toBe(2);
+      expect(branchB.wait_index).toBe(1);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("24. RED3: a hostile restore result state currently lets the transition run", async () => {
+  const prefix = await buildPrefix();
+  const { fixture } = prefix;
+  try {
+    await runHandoff(fixture);
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const state = reopened.snapshot as PipelineV2RunState;
+    const pipeline = await loadPipelineV2(state.pipeline.bundle_root);
+    const captured = { value: null as unknown };
+    const hostileOps = spyThenHostileOps(fixture, captured, "restoreAcceptedRunPlan", (real) => {
+      const record = real as { compiled_plan: unknown; state: PipelineV2RunState };
+      return {
+        compiled_plan: record.compiled_plan,
+        state: { ...record.state, revision: record.state.revision + 1 },
+      };
+    });
+    const error = await catchHandoff(() =>
+      applyPipelineV2PlanningRunPlanHandoffWithIo(
+        { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+        hostileOps,
+      ));
+    const handoffError = expectHandoffError(error, "invalid_result");
+    // GREEN TARGET: the transition was never called and the error carries
+    // the initial authoritative snapshot.
+    expect(handoffError.state).toBe(state);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("25. RED4: near-miss flat bindings currently reach the transition or return false success", async () => {
+  // The stage near-miss: the mutated stage result must stop the chain
+  // before the transition.
+  for (const field of ["previous_generation_index", "generation_index", "iteration_index"] as const) {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      const captured = { value: null as unknown };
+      const capturedStage = { value: null as unknown };
+      let transitionCalls = 0;
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
+      const stageCaptureOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStage: (async (...args: unknown[]) => {
+          capturedStage.value = await openPipelineV2ReplannedStage(...(args as Parameters<typeof openPipelineV2ReplannedStage>));
+          return capturedStage.value;
+        }) as typeof openPipelineV2ReplannedStage,
+      };
+      await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: recordingSink(reopened, 5), stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          stageCaptureOps,
+        ));
+      expect(capturedStage.value).not.toBeNull();
+      const hostileStageOps = spyThenHostileOps(fixture, captured, "openReplannedStage", (real) => ({
+        ...(real as Record<string, unknown>),
+        [field]: 99,
+      }));
+      const hostileOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...hostileStageOps,
+        openReplannedStageTransition: (async () => {
+          transitionCalls += 1;
+          throw new Error("the transition must not run after a hostile stage result");
+        }) as unknown as typeof openPipelineV2ReplannedStageTransition,
+      };
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      expectHandoffError(error, "invalid_result");
+      expect(transitionCalls).toBe(0);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+  // The transition near-miss: the mutated flat fields must be refused.
+  for (const field of ["generation_index", "iteration_index"] as const) {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      const captured = { value: null as unknown };
+      let realTransition: unknown = null;
+      const captureOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStageTransition: (async (...args: unknown[]) => {
+          realTransition = await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+          return realTransition;
+        }) as typeof openPipelineV2ReplannedStageTransition,
+      };
+      await applyPipelineV2PlanningRunPlanHandoffWithIo(
+        { pipeline: await loadPipelineV2((await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick })).snapshot!.pipeline.bundle_root), runRoot: fixture.runRoot, sink: await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick }), stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+        captureOps,
+      );
+      expect(realTransition).not.toBeNull();
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
+      const hostileOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStageTransition: (async () => ({ ...(realTransition as Record<string, unknown>), [field]: 99 })) as unknown as typeof openPipelineV2ReplannedStageTransition,
+      };
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      expectHandoffError(error, "invalid_result");
+      void captured;
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("26. RED5: a malformed sink currently produces a native TypeError or reads the snapshot through the gate", async () => {
+  const prefix = await buildPrefix();
+  const { fixture } = prefix;
+  try {
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const state = reopened.snapshot as PipelineV2RunState;
+    const pipeline = await loadPipelineV2(state.pipeline.bundle_root);
+    const cases: [string, unknown, PipelineV2PlanningRunPlanHandoffFailureReason][] = [
+      ["null", null, "invalid_options"],
+      ["undefined", undefined, "invalid_options"],
+      ["number", 42, "invalid_options"],
+      ["string", "sink", "invalid_options"],
+      ["array", [], "invalid_options"],
+      ["no-dispatch", { snapshot: state, poisoned: false }, "invalid_options"],
+      ["non-function-dispatch", { snapshot: state, poisoned: false, dispatch: 42 }, "invalid_options"],
+    ];
+    for (const [label, sink, reason] of cases) {
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoff({
+          pipeline,
+          runRoot: fixture.runRoot,
+          sink: sink as never,
+          stageId: STAGE_ID,
+          initialBudget: INITIAL_BUDGET,
+        }));
+      expectHandoffError(error, reason);
+      void label;
+    }
+    // A structural sink with an undefined or primitive snapshot: the
+    // controller's own invalid_state.
+    for (const broken of [{ snapshot: undefined, poisoned: false, dispatch: async () => undefined }, { snapshot: 42, poisoned: false, dispatch: async () => undefined }]) {
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoff({
+          pipeline,
+          runRoot: fixture.runRoot,
+          sink: broken as never,
+          stageId: STAGE_ID,
+          initialBudget: INITIAL_BUDGET,
+        }));
+      expectHandoffError(error, "invalid_state");
+    }
+    // Hostile extra sink members are never read.
+    const reads: string[] = [];
+    const hostileSink = new Proxy(
+      { get snapshot() { return reopened.snapshot; }, poisoned: false, dispatch: reopened.dispatch.bind(reopened), hostile: "never" },
+      {
+        get(target, property) {
+          reads.push(String(property));
+          return target[property as keyof typeof target];
+        },
+      },
+    );
+    await applyPipelineV2PlanningRunPlanHandoff({
+      pipeline,
+      runRoot: fixture.runRoot,
+      sink: hostileSink,
+      stageId: STAGE_ID,
+      initialBudget: INITIAL_BUDGET,
+    });
+    expect(reads.filter((entry) => entry === "hostile")).toHaveLength(0);
+    expect(await currentRevision(fixture)).toBe(40);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("27. RED6: hostile presentations after real durable writes currently carry non-authoritative error states", async () => {
+  // The real acceptance durable, the hostile acceptance presentation.
+  {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const state = reopened.snapshot as PipelineV2RunState;
+      const pipeline = await loadPipelineV2(state.pipeline.bundle_root);
+      const hostileOps = spyThenHostileOps(fixture, { value: null }, "acceptPlanningRunPlan", (real) => ({
+        compiled_plan: (real as { compiled_plan: unknown }).compiled_plan,
+        state: { ...(real as { state: PipelineV2RunState }).state, revision: (real as { state: PipelineV2RunState }).state.revision + 1 },
+      }));
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_result");
+      expect(handoffError.state).not.toBeNull();
+      expect((handoffError.state as PipelineV2RunState).revision).toBe(36);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+  // The real stage durable, the hostile flat stage result.
+  {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      const captureSink = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const pipeline = await loadPipelineV2((captureSink.snapshot as PipelineV2RunState).pipeline.bundle_root);
+      let realStage: unknown = null;
+      const captureOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStage: (async (...args: unknown[]) => {
+          realStage = await openPipelineV2ReplannedStage(...(args as Parameters<typeof openPipelineV2ReplannedStage>));
+          return realStage;
+        }) as typeof openPipelineV2ReplannedStage,
+      };
+      const faulty = recordingSink(captureSink, 5);
+      await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: faulty, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          captureOps,
+        ));
+      expect(realStage).not.toBeNull();
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const hostileOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStage: (async () => ({ ...(realStage as Record<string, unknown>), iteration_index: 99 })) as unknown as typeof openPipelineV2ReplannedStage,
+      };
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_result");
+      expect(handoffError.state).not.toBeNull();
+      expect((handoffError.state as PipelineV2RunState).revision).toBe(39);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+  // The real transition durable, the hostile flat transition result.
+  {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      const captureSink = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const pipeline = await loadPipelineV2((captureSink.snapshot as PipelineV2RunState).pipeline.bundle_root);
+      let realTransition: unknown = null;
+      const captureOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStageTransition: (async (...args: unknown[]) => {
+          realTransition = await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+          return realTransition;
+        }) as typeof openPipelineV2ReplannedStageTransition,
+      };
+      await applyPipelineV2PlanningRunPlanHandoffWithIo(
+        { pipeline, runRoot: fixture.runRoot, sink: captureSink, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+        captureOps,
+      );
+      expect(realTransition).not.toBeNull();
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const hostileOps: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStageTransition: (async () => ({ ...(realTransition as Record<string, unknown>), iteration_index: 99 })) as unknown as typeof openPipelineV2ReplannedStageTransition,
+      };
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_result");
+      expect(handoffError.state).not.toBeNull();
+      expect((handoffError.state as PipelineV2RunState).revision).toBe(40);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });

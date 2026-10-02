@@ -2746,29 +2746,45 @@ no second restore or retry mechanism. The branch is selected once from
 the captured authoritative snapshot, never from a caught downstream
 error. Branch A (the settled-but-unbound planning acceptance boundary)
 runs the planning composition → verification → the authoritative target
-wait (one full durable wait-journal pass) → `loadPipelineV2WaitIntent` →
+wait (derived from the latest durable iteration closure
+`{by: "replanned", wait_index}`; the wait must be the last journal
+entry, answered `revise_task`, with its exact intent; unchanged
+historical revise waits never participate; a later wait — even on the
+same anchor — is progressed state) → `loadPipelineV2WaitIntent` →
 the exact wrapper verification → `openPipelineV2ReplannedStage` →
 verification → `openPipelineV2ReplannedStageTransition` → verification →
-the identity return; the S0–S4 restart windows converge through the
-composed controllers' own idempotency. Branch B (the exact committed
+the exact caller-stage resolution (`compiledStageFor(compiledPlan,
+stageId)` before any durable stage write — separate from the provenance
+probe; the real `stage_not_found` passes by identity; the
+template/entry bindings come from the SELECTED stage) →
+`openPipelineV2ReplannedStage` → verification →
+`openPipelineV2ReplannedStageTransition` → verification → the identity
+return; the S0–S4 restart windows converge through the composed
+controllers' own idempotency. Branch B (the exact committed
 handoff boundary) runs `restorePipelineV2AcceptedRunPlan` → verification
 → the target wait → the intent load → verification → the transition
 controller alone, accepting only the exact C1 zero-dispatch result and
 returning it by identity. Every downstream result is verified
 defensively between the calls (exact key shapes, the caller
 stage/budget/position/template bindings derived from the compiled plan's
-declaration order, the plan/execution/generation/iteration bindings and
-the structural — never serialized — comparison of every result's
-`state` against the authoritative post-call snapshot read exactly once
-per phase; the production C1 result's state is deep-equal but not
+declaration order, the plan/execution/generation/iteration bindings — every flat
+`generation_index`/`iteration_index`/`previous_generation_index` bound
+to the durable predecessor/new generation/open iteration, never merely
+type-checked — and the structural (never serialized) comparison of every
+result's `state` against the authoritative post-call snapshot read
+exactly once per phase; the production C1 result's state is deep-equal but not
 identity-bound, and no false identity requirement is imposed). Hostile
 results are the controller's own `invalid_result` (never a
 `TypeError`), the next facade is never called, and the error carries the
-last verified authoritative state. Diagnostics are content-free; every
+last verified authoritative state: null before any authoritative
+snapshot is obtained, the post-acceptance/post-stage/post-transition
+`sink.snapshot` for the corresponding mismatches, the verified current
+state for a restore/intent mismatch — never the hostile
+`result.state`. Diagnostics are content-free; every
 composed layer's typed error and every unexpected error passes through
 unchanged by object identity. Tests:
 `orchestrator/tests/pipeline_v2_planning_run_plan_handoff_controller.test.ts`
-(25 tests) cover the honest prefix through the real
+(31 tests) cover the honest prefix through the real
 facades/reducer/runtime data plane ending at the settled-unbound
 planning boundary, the S0 full path with the exact six-command suffix
 `task-c:1 → plan:2 → stage_generation_closed(replanned) →
