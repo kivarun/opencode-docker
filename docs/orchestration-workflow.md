@@ -2712,6 +2712,83 @@ revision publication/acceptance, the continue/revise action policy,
 automatic resume, coordinator/runner/CLI wiring, schema changes,
 migrations/API/T3, multi-process locking.
 
+### Planning-run-plan handoff controller (restart-aware, production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_planning_run_plan_handoff_controller.ts`
+(public facade) with the internal core
+`pipeline_v2_planning_run_plan_handoff_controller_internal.ts` is the
+single restart-aware layer that moves an existing durable run from its
+planning boundary onto the caller-selected stage of the newly accepted
+plan and commits the planning transition — the full `revise_task` chain
+`accepted revise task → replanned closure → revise_task response →
+settled planning execution → accepted next plan revision → old
+generation closed by replanned → selected new-plan generation opened →
+iteration 1 opened → planning transition committed`, closing exactly the
+gap the proof-only increment identified. Public API is exactly
+`applyPipelineV2PlanningRunPlanHandoff({pipeline, runRoot, sink,
+stageId, initialBudget})` returning the exact
+`OpenedPipelineV2ReplannedStageTransition` downstream result by object
+identity (no new envelope); caller policy is exactly `stageId` and
+`initialBudget`, captured once before the first await and passed
+unchanged to every downstream call — the caller budget is not durably
+pinned until the new generation exists, so only the caller replay
+determines it. Runtime export surface is exactly
+`PipelineV2PlanningRunPlanHandoffControllerError` (own reasons
+`invalid_options | invalid_state | invalid_result | artifact_missing`)
+and `applyPipelineV2PlanningRunPlanHandoff`; the internal core carries
+the frozen `productionPlanningRunPlanHandoffOps` (six existing public
+facades/resolvers: the planning composition, the read-only accepted-plan
+restore, the wait-intent store loader, the replanned-stage controller,
+the replanned-stage transition controller and the compiled-stage
+selector) and `applyPipelineV2PlanningRunPlanHandoffWithIo`; no
+reducer/store/fs/parser/serializer/digest/registry implementations and
+no second restore or retry mechanism. The branch is selected once from
+the captured authoritative snapshot, never from a caught downstream
+error. Branch A (the settled-but-unbound planning acceptance boundary)
+runs the planning composition → verification → the authoritative target
+wait (one full durable wait-journal pass) → `loadPipelineV2WaitIntent` →
+the exact wrapper verification → `openPipelineV2ReplannedStage` →
+verification → `openPipelineV2ReplannedStageTransition` → verification →
+the identity return; the S0–S4 restart windows converge through the
+composed controllers' own idempotency. Branch B (the exact committed
+handoff boundary) runs `restorePipelineV2AcceptedRunPlan` → verification
+→ the target wait → the intent load → verification → the transition
+controller alone, accepting only the exact C1 zero-dispatch result and
+returning it by identity. Every downstream result is verified
+defensively between the calls (exact key shapes, the caller
+stage/budget/position/template bindings derived from the compiled plan's
+declaration order, the plan/execution/generation/iteration bindings and
+the structural — never serialized — comparison of every result's
+`state` against the authoritative post-call snapshot read exactly once
+per phase; the production C1 result's state is deep-equal but not
+identity-bound, and no false identity requirement is imposed). Hostile
+results are the controller's own `invalid_result` (never a
+`TypeError`), the next facade is never called, and the error carries the
+last verified authoritative state. Diagnostics are content-free; every
+composed layer's typed error and every unexpected error passes through
+unchanged by object identity. Tests:
+`orchestrator/tests/pipeline_v2_planning_run_plan_handoff_controller.test.ts`
+(25 tests) cover the honest prefix through the real
+facades/reducer/runtime data plane ending at the settled-unbound
+planning boundary, the S0 full path with the exact six-command suffix
+`task-c:1 → plan:2 → stage_generation_closed(replanned) →
+stage_generation_opened → stage_iteration_opened →
+transition_committed` (+6), the S1–S4 windows with only the missing
+suffix (+5/+4/+3/+1) and the artifact identity preservation, the S5
+Branch B with the exact call-count pin and the C1 zero dispatch, the
+catch-free branch selection, the S3 caller-policy pinning, the
+concurrent identical convergence and the budget 2-vs-3 race, the
+missing/damaged/foreign-kind intent battery, the
+stale-plan/foreign-stage/wrong-wait-binding refusals, the
+progressed-state battery, the malformed-result matrix, the forged flat
+bindings and the coherently forged state, the C1 state proof, the
+options/ops Proxy one-time-read batteries, the pipeline clone/Proxy
+provenance gate, the exact per-branch snapshot read counts, the
+content-free diagnostics canary scan, both export surfaces, and the
+source scan. Not wired: coordinator/runner/CLI/default-pipeline wiring,
+automatic resume, retries, migrations/API/T3.
+
+
 ### Continue-stage grant application controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_continue_stage_grant_controller.ts`
