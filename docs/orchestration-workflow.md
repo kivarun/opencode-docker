@@ -2570,6 +2570,86 @@ immutable manifests, and the existing continued-stage composition
 consuming exactly the restored compiled plan. Not wired: the CLI, the
 runner, the coordinator, automatic resume, retries and migrations.
 
+### Planning-output → accepted-run-plan composition controller (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_planning_run_plan_controller.ts` (public
+facade) with the internal core
+`pipeline_v2_planning_run_plan_controller_internal.ts` is the single
+restart-aware layer that turns the settled-but-unbound planning
+acceptance boundary of an existing durable run into the accepted run plan
+in one fixed sequence:
+
+    capture {pipeline, runRoot, sink} and the frozen production ops
+    → the pipeline provenance gate (before any state read or filesystem)
+    → ONE authoritative sink.snapshot read
+    → restorePipelineV2PlanningAcceptanceContext
+    → the exact last execution by the restored planning_execution_index
+    → compiledExecutionRoleFor (the exact planning role + plan_output)
+    → readAcceptedJsonOutput over the restored accepted history
+    → preparePipelineV2RunPlanProposal (the only validation of the value)
+    → constructPipelineV2RunPlanCandidateFromProposal (the anchored,
+      retry-aware construction)
+    → verifyPipelineV2RunPlanCandidateForAcceptance (only the
+      provenance/binding gate and the expected compiled projection)
+    → acceptPipelineV2RunPlanCandidate (the existing crash-safe
+      acceptance)
+    → defensive verification; the exact downstream result by identity —
+      no new envelope
+
+Public API:
+
+    acceptPipelineV2PlanningRunPlan({pipeline, runRoot, sink})
+
+The caller passes no state, no execution index, no state id, no output
+id, no proposal, no manifests, no candidate, no revision and no digest;
+everything is derived from the durable snapshot and the trusted
+pipeline. Own failure reasons are exactly `invalid_options |
+invalid_result`; every typed error of a composed layer and every
+unexpected error passes through by object identity. Production ops are
+exactly the eight existing public facades/resolvers in one frozen object
+(restore / compiled role / reader / proposal / construction / verifier /
+acceptance / compiled-stage selector), each read exactly once before the
+first await; there is no store/reducer/runtime internal access, no fs,
+and no second parser, compiler, digest builder, serializer, registry or
+minter.
+
+Defensive boundaries: the restored context's exact own-key shape with
+the planning index bound to the last durable execution, the cursor
+projection bound to the state's cursor and the run bound to the run root
+(never swapped); the compiled role bound to the execution's state id
+with `role === "planning"` and a safe `plan_output`; the reader result's
+exact five-key shape with the exact state/output/activation binding and
+a lowercase SHA-256 digest; the verifier's expectation verified before
+the acceptance is ever called; the acceptance result's exact two-key
+shape with the compiled projection equal to the verifier's expectation,
+the compiled plan's provenance through the existing public stage
+selector, and `state === sink.snapshot` by identity after the success.
+Malformed fake results are the layer's own `invalid_result` with the
+next facade never called and never a leaked `TypeError`; diagnostics
+are content-free. The controller's own snapshot reads are exactly one
+initial and one post-acceptance verification read; an acceptance
+failure performs no post-failure snapshot reads.
+
+Tests live in `orchestrator/tests/pipeline_v2_planning_run_plan_controller.test.ts`:
+the production-chain matrix after a real reopen (fresh / W1 / W2 / W3 /
+W4 with the exact dispatch suffixes, the pipeline loaded only from the
+durable bundle root, the exact proposal read from the restored output,
+the revision delta, the ledger projection, the artifact
+inode/mode/mtime/bytes preservation, the result identity and the loader
+round-trip), the pointer-only completed control (zero dispatch of the
+accepted revision; the next revision is never created), two identical
+concurrent compositions converging to one accepted plan with no ledger
+duplicates, the restore failure with zero downstream facade calls and
+the error by identity, the reader/proposal/construction/verifier/
+acceptance typed failures passing by identity, the malformed-result
+matrix for all five boundaries, the hostile sink/result battery, the
+one-time options/ops Proxy reads, mutation-after-await immunity, the
+pipeline clone/Proxy gate, both export surfaces and the source scan.
+
+Still unwired: the next planning transition, coordinator/runner/CLI
+wiring, resume integration, retries, migrations/API/T3.
+
+
 ### Continue-stage intent acceptance controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_continue_stage_intent_controller.ts`
