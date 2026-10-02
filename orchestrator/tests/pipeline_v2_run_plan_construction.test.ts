@@ -1914,9 +1914,12 @@ test("15a. the facade exports exactly the error class and the construction funct
 });
 
 test("15b. the construction layer is strictly read-only: one manifest preparer path, one candidate preparer, two store loaders, no second machinery", async () => {
-  const facade = await readFile("/workspace/orchestrator/src/pipeline_v2_run_plan_construction.ts", "utf8");
+  const facade = await readFile(
+    join(import.meta.dir, "..", "src", "pipeline_v2_run_plan_construction.ts"),
+    "utf8",
+  );
   const internal = await readFile(
-    "/workspace/orchestrator/src/pipeline_v2_run_plan_construction_internal.ts",
+    join(import.meta.dir, "..", "src", "pipeline_v2_run_plan_construction_internal.ts"),
     "utf8",
   );
   for (const [name, text] of [["facade", facade], ["internal", internal]] as const) {
