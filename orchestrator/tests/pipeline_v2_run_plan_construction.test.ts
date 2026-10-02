@@ -37,8 +37,18 @@ import {
   preparePipelineV2RunPlanCandidate,
   type PreparedPipelineV2RunPlanCandidate,
 } from "../src/pipeline_v2_run_plan_candidate.ts";
-import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
+import {
+  acceptPipelineV2RunPlanCandidate,
+  PipelineV2RunPlanControllerError,
+} from "../src/pipeline_v2_run_plan_controller.ts";
 import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
+import {
+  compiledExecutionRoleFor,
+} from "../src/pipeline_v2_orchestration.ts";
+import {
+  restorePipelineV2PlanningAcceptanceContext,
+} from "../src/pipeline_v2_resume_context.ts";
+import { PipelineV2RunStateStoreError } from "../src/pipeline_v2_state_store.ts";
 import { verifyPipelineV2RunPlanCandidateForAcceptance } from "../src/pipeline_v2_run_plan_acceptance.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { preparePipelineV2WaitRequest } from "../src/pipeline_v2_wait_manifest.ts";
@@ -456,6 +466,7 @@ async function setupRevisionOne(): Promise<RevisionOneFixture> {
 interface ReviseBoundaryFixture extends RevisionOneFixture {
   taskA2: PreparedPipelineV2RunTaskRevision;
   intent: ReturnType<typeof prepareWaitIntent>;
+  requestSha256: string;
 }
 
 async function setupReviseBoundary(): Promise<ReviseBoundaryFixture> {
@@ -536,7 +547,7 @@ async function setupReviseBoundary(): Promise<ReviseBoundaryFixture> {
     waitIndex: 1,
     intentSha256: intent.sha256,
   });
-  return { harness, plan1, taskA1, taskA2, intent };
+  return { harness, plan1, taskA1, taskA2, intent, requestSha256: request.sha256 };
 }
 
 // --- fixture: the honest runtime prefix (real accepted proposal output) ------
@@ -743,8 +754,9 @@ test("1. the real accepted planning JSON output becomes the exact candidate r1 w
       ops,
     );
 
-    // zero store loads: an empty plan ledger and only new task pointers
-    expect(calls).toEqual([]);
+    // the single store load: the target plan artifact by the computed
+    // revision (absent on an empty ledger — the fresh path)
+    expect(calls).toEqual(["plan:1"]);
     // construction publishes nothing: the run tree is byte-identical and
     // carries no run-plan store at all
     expect(await fingerprint(dirs.runRoot)).toBe(before);
@@ -843,9 +855,10 @@ test("2. after the restart an existing task r1 and a new task-c build the exact 
       ops,
     );
 
-    // the exact sequential load order: the previous plan, then the
+    // the exact sequential load order: the absent target plan artifact
+    // (the fresh path's first load), then the previous plan, then the
     // pointered existing task; the new task reads nothing
-    expect(calls).toEqual(["plan:1", "task:task-a:1"]);
+    expect(calls).toEqual(["plan:2", "plan:1", "task:task-a:1"]);
     // construction publishes nothing
     expect(await fingerprint(dirs.runRoot)).toBe(before);
 
@@ -892,11 +905,24 @@ test("2. after the restart an existing task r1 and a new task-c build the exact 
 
 // --- 3. the real revise boundary --------------------------------------------
 
-test("3. at the real revise boundary the proposal pointer selects the latest durable task-a@2, loads it and its predecessor, and the new plan r2 points task-a@2", async () => {
+test("3. after the honest revise flow the second planning execution's proposal pointer selects the latest durable task-a@2, loads it and its predecessor, and the new plan r2 points task-a@2", async () => {
   const fixture = await setupReviseBoundary();
   const { harness, plan1, taskA1, taskA2 } = fixture;
   const { dirs } = harness;
   try {
+    // The honest post-revise replanning boundary: the revise_task
+    // response closes the wait and the second settled planning
+    // execution runs on the declared action target.
+    await dispatch(harness, {
+      kind: "wait_response_recorded",
+      waitIndex: 1,
+      expectedRequestSha256: fixture.requestSha256,
+      actionId: "revise_task",
+      responseSha256: hex("7"),
+    });
+    const secondIndex = await playPlanningExecution(harness.recording);
+    expect(secondIndex).toBe(2);
+
     const proposal = preparePipelineV2RunPlanProposal({
       schema_version: 1,
       kind: "run_plan_proposal",
@@ -916,15 +942,16 @@ test("3. at the real revise boundary the proposal pointer selects the latest dur
       ops,
     );
 
-    // the exact load order: the previous plan, the ledger-selected current
-    // revision r2, then its immediate durable predecessor r1 — the newer
-    // pointer of the accepted plan r1 never wins
-    expect(calls).toEqual(["plan:1", "task:task-a:2", "task:task-a:1"]);
+    // the exact anchored load order: the absent target plan artifact
+    // (the fresh path's first load), the previous plan, then the
+    // ledger-selected current revision r2 and its immediate durable
+    // predecessor r1
+    expect(calls).toEqual(["plan:2", "plan:1", "task:task-a:2", "task:task-a:1"]);
     expect(await fingerprint(dirs.runRoot)).toBe(before);
 
     expect(candidate.plan.manifest.revision).toBe(2);
     expect(candidate.plan.manifest.previous_sha256).toBe(plan1.sha256);
-    expect(candidate.plan.manifest.origin_execution).toBe(1);
+    expect(candidate.plan.manifest.origin_execution).toBe(2);
     const pointer = candidate.plan.manifest.stages[0]?.tasks[0];
     expect(pointer).toMatchObject({ id: "task-a", revision: 2, sha256: taskA2.sha256 });
     // the loaded prepared objects are the exact durable revisions
@@ -937,7 +964,7 @@ test("3. at the real revise boundary the proposal pointer selects the latest dur
 
 // --- 4. the ledger ∩ new_tasks policy rule ----------------------------------
 
-test("4. a new task id already recorded in the durable task ledger is a construction conflict with zero loads", async () => {
+test("4. a new task id already recorded in the durable task ledger with a different body is an anchored conflict after the single target load", async () => {
   const fixture = await setupReviseBoundary();
   const { harness } = fixture;
   const { dirs } = harness;
@@ -960,9 +987,10 @@ test("4. a new task id already recorded in the durable task ledger is a construc
       ops,
     ).catch((error) => error);
     const error = expectConstructionError(cause, "construction_conflict");
-    expect((error as Error).message).toContain("already records");
+    expect((error as Error).message).toContain("differs from the restored proposal's new task body");
     expect(error.state).not.toBeNull();
-    expect(calls).toEqual([]);
+    // the single target plan artifact load preceded the conflict
+    expect(calls).toEqual(["plan:1"]);
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
@@ -970,7 +998,7 @@ test("4. a new task id already recorded in the durable task ledger is a construc
 
 // --- 5. the unused new_tasks policy rule ------------------------------------
 
-test("5. an unreferenced new task entry is a construction conflict with zero loads", async () => {
+test("5. an unreferenced new task entry is a construction conflict after the single target load", async () => {
   const harness = await setupHarness(CONSTRUCTION_PIPELINE);
   const { dirs } = harness;
   try {
@@ -1004,7 +1032,7 @@ test("5. an unreferenced new task entry is a construction conflict with zero loa
     const error = expectConstructionError(cause, "construction_conflict");
     expect((error as Error).message).toContain("no plan stage references");
     expect((error as Error).message).not.toContain("SILENTLY-DROPPED-BODY");
-    expect(calls).toEqual([]);
+    expect(calls).toEqual(["plan:1"]);
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
@@ -1012,7 +1040,7 @@ test("5. an unreferenced new task entry is a construction conflict with zero loa
 
 // --- 6. the unresolvable pointer policy rule --------------------------------
 
-test("6. a pointer absent from both the ledger and new_tasks is a construction conflict with zero loads", async () => {
+test("6. a pointer absent from both the ledger and new_tasks is a construction conflict after the single target load", async () => {
   const harness = await setupHarness(CONSTRUCTION_PIPELINE);
   const { dirs } = harness;
   try {
@@ -1042,7 +1070,7 @@ test("6. a pointer absent from both the ledger and new_tasks is a construction c
     ).catch((error) => error);
     const error = expectConstructionError(cause, "construction_conflict");
     expect((error as Error).message).toContain("neither the durable task ledger nor a proposed new task");
-    expect(calls).toEqual([]);
+    expect(calls).toEqual(["plan:1"]);
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
@@ -1144,7 +1172,9 @@ test("7. duplicate pointers, unknown/cross-stage dependencies, cycles and empty 
       ).catch((error) => error);
       expect(cause, item.name).toBeInstanceOf(PipelineV2RunPlanManifestError);
       expect(cause, item.name).not.toBeInstanceOf(PipelineV2RunPlanConstructionError);
-      expect(calls, item.name).toEqual([]);
+      // the absent target plan artifact is the first load, before the
+      // manifest validator rejects the proposal's graph
+      expect(calls, item.name).toEqual(["plan:1"]);
     }
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
@@ -1199,12 +1229,12 @@ test("8. missing current plan, current task and task predecessor manifests are t
     ).catch((error) => error);
     const error = expectConstructionError(cause, "artifact_missing");
     expect((error as Error).message).toContain("task revision 1 manifest of task \"task-a\" is missing");
-    expect(calls).toEqual(["plan:1", "task:task-a:1"]);
+    expect(calls).toEqual(["plan:2", "plan:1", "task:task-a:1"]);
   } finally {
     await rm(replanning.harness.dirs.root, { recursive: true, force: true });
   }
 
-  // (c) the immediate durable predecessor of a revised task
+  // (c) the anchor-bound current task manifest of a pointered existing task
   const boundary = await setupReviseBoundary();
   try {
     await rm(join(boundary.harness.dirs.runRoot, "run-plan", "tasks", "task-a", "1.json"));
@@ -1223,8 +1253,8 @@ test("8. missing current plan, current task and task predecessor manifests are t
       ops,
     ).catch((error) => error);
     const error = expectConstructionError(cause, "artifact_missing");
-    expect((error as Error).message).toContain("predecessor task revision 1 manifest");
-    expect(calls).toEqual(["plan:1", "task:task-a:2", "task:task-a:1"]);
+    expect((error as Error).message).toContain("task revision 1 manifest of task \"task-a\" is missing");
+    expect(calls).toEqual(["plan:1", "task:task-a:1"]);
   } finally {
     await rm(boundary.harness.dirs.root, { recursive: true, force: true });
   }
@@ -1298,14 +1328,71 @@ test("9. hostile loader results are typed construction failures, never TypeError
     );
     expect((malformedTask as Error).message).toContain("different manifest kind");
 
-    // a shape-OK fake projection passes the wrapper form and is rejected by
-    // the existing candidate provenance gate — the deep verification is
-    // delegated, never duplicated
-    const fakeProjection = await runWith({
-      loadPlanRevision: async () => ({ plan: { manifest: { kind: "plan_revision" }, sha256: hex("f") } }),
-    });
-    expect(fakeProjection).toBeInstanceOf(PipelineV2RunPlanBindingError);
-    expect(fakeProjection).not.toBeInstanceOf(PipelineV2RunPlanConstructionError);
+    // an unbound orphan-shaped fake wrapper is refused as the anchor's
+    // foreign origin — never delegated
+    const anchorConflict = expectConstructionError(
+      await runWith({
+        loadPlanRevision: async () => ({ plan: { manifest: { kind: "plan_revision" }, sha256: hex("f") } }),
+      }),
+      "construction_conflict",
+    );
+    expect((anchorConflict as Error).message).toContain("foreign origin execution");
+
+    // a fully anchor-bound fake projection passes the anchor binding and
+    // is rejected by the existing candidate provenance gate — the deep
+    // verification is delegated, never duplicated
+    const fixtureForFake = await setupReplanning();
+    try {
+      const stateForFake = fixtureForFake.state as PipelineV2RunState;
+      const plan1ForFake = fixtureForFake.plan1;
+      const taskA1ForFake = fixtureForFake.taskA1;
+      const fakeBound = await constructPipelineV2RunPlanCandidateFromProposalInternal(
+        {
+          runRoot: fixtureForFake.harness.dirs.runRoot,
+          state: stateForFake,
+          proposal: preparePipelineV2RunPlanProposal({
+            schema_version: 1,
+            kind: "run_plan_proposal",
+            stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+            new_tasks: [],
+          }),
+        },
+        {
+          loadPlanRevision: async () => ({
+            plan: {
+              manifest: {
+                kind: "plan_revision",
+                run_id: RUN_ID,
+                revision: 2,
+                previous_sha256: plan1ForFake.sha256,
+                root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+                origin_execution: 2,
+                stages: [stageSpec("stage-1", [{ id: "task-a", revision: 1, sha256: taskA1ForFake.sha256 }])],
+              },
+              sha256: hex("f"),
+            },
+          }),
+          loadTaskRevision: async () => ({
+            task: {
+              manifest: {
+                kind: "task_revision",
+                run_id: RUN_ID,
+                task_id: "task-a",
+                revision: 1,
+                previous_sha256: null,
+                origin: "planning_proposal",
+                body: "Body A one",
+              },
+              sha256: taskA1ForFake.sha256,
+            },
+          }),
+        },
+      ).catch((error) => error);
+      expect(fakeBound).toBeInstanceOf(PipelineV2RunPlanBindingError);
+      expect(fakeBound).not.toBeInstanceOf(PipelineV2RunPlanConstructionError);
+    } finally {
+      await rm(fixtureForFake.harness.dirs.root, { recursive: true, force: true });
+    }
 
     // an unexpected loader error keeps its identity
     const loaderFailure = new Error("LOADER-EXPLODED");
@@ -1329,12 +1416,13 @@ test("9. hostile loader results are typed construction failures, never TypeError
 
 // --- 10. the ledger, never the filesystem, selects the revision --------------
 
-test("10. newer orphan plan and task artifacts on disk are ignored in favor of the durable ledger with the exact load order", async () => {
+test("10. orphan artifacts at non-target revisions stay ignored; a foreign orphan at the target revision is an anchor conflict", async () => {
   const fixture = await setupReplanning();
   const { harness, state, plan1, taskA1 } = fixture;
   const { dirs } = harness;
   try {
-    // newer orphan artifacts the durable ledger never accepted
+    // a foreign orphan plan artifact exactly at the computed target
+    // revision (origin execution 1, not this boundary's 2)
     const orphanPlan = preparePlanRevisionManifest({
       schema_version: 1,
       kind: "plan_revision",
@@ -1346,14 +1434,56 @@ test("10. newer orphan plan and task artifacts on disk are ignored in favor of t
       stages: [stageSpec("stage-1", [{ id: "task-a", revision: 1, sha256: taskA1.sha256 }])],
     });
     await publishPipelineV2PlanRevision(dirs.runRoot, orphanPlan.manifest);
-    const orphanTask = preparedTask("task-a", 2, taskA1.sha256, "user_response", "ORPHAN-TASK-BODY");
-    await publishPipelineV2TaskRevision(dirs.runRoot, orphanTask.manifest);
+
+    const { ops, calls } = recordingOps();
+    const cause = await constructPipelineV2RunPlanCandidateFromProposalInternal(
+      {
+        runRoot: dirs.runRoot,
+        state,
+        proposal: preparePipelineV2RunPlanProposal({
+          schema_version: 1,
+          kind: "run_plan_proposal",
+          stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+          new_tasks: [],
+        }),
+      },
+      ops,
+    ).catch((error) => error);
+    expectConstructionError(cause, "construction_conflict");
+    expect((cause as Error).message).toContain("foreign origin execution");
+    expect(calls).toEqual(["plan:2"]);
+    expect(JSON.stringify(cause)).not.toContain("ORPHAN-TASK-BODY");
+  } finally {
+    await rm(dirs.root, { recursive: true, force: true });
+  }
+
+  // a second fixture: an orphan plan artifact at a revision the ledger
+  // never targets (3) and an orphan task artifact at a non-ledger
+  // revision (2) stay ignored; the fresh construction still selects the
+  // ledger-named revisions
+  const fixture2 = await setupReplanning();
+  const { harness: harness2, state: state2, plan1: plan1b, taskA1: taskA1b } = fixture2;
+  const { dirs: dirs2 } = harness2;
+  try {
+    const farOrphanPlan = preparePlanRevisionManifest({
+      schema_version: 1,
+      kind: "plan_revision",
+      run_id: RUN_ID,
+      revision: 3,
+      previous_sha256: hex("f"),
+      root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+      origin_execution: 9,
+      stages: [stageSpec("stage-1", [{ id: "task-a", revision: 1, sha256: taskA1b.sha256 }])],
+    });
+    await publishPipelineV2PlanRevision(dirs2.runRoot, farOrphanPlan.manifest);
+    const orphanTask = preparedTask("task-a", 2, taskA1b.sha256, "user_response", "ORPHAN-TASK-BODY");
+    await publishPipelineV2TaskRevision(dirs2.runRoot, orphanTask.manifest);
 
     const { ops, calls } = recordingOps();
     const candidate = await constructPipelineV2RunPlanCandidateFromProposalInternal(
       {
-        runRoot: dirs.runRoot,
-        state,
+        runRoot: dirs2.runRoot,
+        state: state2,
         proposal: preparePipelineV2RunPlanProposal({
           schema_version: 1,
           kind: "run_plan_proposal",
@@ -1366,18 +1496,18 @@ test("10. newer orphan plan and task artifacts on disk are ignored in favor of t
 
     // only the ledger-named revisions were read; the orphans were never
     // loaded and never selected the revision
-    expect(calls).toEqual(["plan:1", "task:task-a:1"]);
+    expect(calls).toEqual(["plan:2", "plan:1", "task:task-a:1"]);
     expect(candidate.plan.manifest.revision).toBe(2);
-    expect(candidate.plan.manifest.previous_sha256).toBe(plan1.sha256);
+    expect(candidate.plan.manifest.previous_sha256).toBe(plan1b.sha256);
     expect(candidate.plan.manifest.stages[0]?.tasks[0]).toMatchObject({
       id: "task-a",
       revision: 1,
-      sha256: taskA1.sha256,
+      sha256: taskA1b.sha256,
     });
     expect(candidate.task_revisions[0]?.manifest.body).toBe("Body A one");
     expect(JSON.stringify(candidate)).not.toContain("ORPHAN-TASK-BODY");
   } finally {
-    await rm(dirs.root, { recursive: true, force: true });
+    await rm(dirs2.root, { recursive: true, force: true });
   }
 });
 
@@ -1965,4 +2095,536 @@ test("15b. the construction layer is strictly read-only: one manifest preparer p
   // the facade delegates to the internal core with the frozen production ops
   expect(facade).toMatch(/constructPipelineV2RunPlanCandidateFromProposalInternal/);
   expect(facade).toMatch(/productionRunPlanConstructionOps/);
+});
+
+// --- 16. the anchored/retry-aware construction matrix ------------------------
+//
+// The production chain, restart after a faulted first attempt:
+//   PipelineV2RunStateSink.open → loadPipelineV2(durable bundle root)
+//   → restorePipelineV2PlanningAcceptanceContext → compiledExecutionRoleFor
+//   → readAcceptedJsonOutput → preparePipelineV2RunPlanProposal
+//   → constructPipelineV2RunPlanCandidateFromProposal
+//   → acceptPipelineV2RunPlanCandidate.
+//
+// RED-BEFORE (current code): the partial/completed windows with
+// `new_tasks` refuse as `construction_conflict` and the pointer-only
+// completed control builds r3 instead of recognizing r2.
+
+interface FaultySink {
+  snapshot: PipelineV2RunState | null;
+  poisoned: boolean;
+  dispatch: (command: PipelineV2RunCommand) => Promise<void>;
+  commands: PipelineV2RunCommand[];
+}
+
+/** Records every dispatch and forwards to the real sink; refuses from `failFrom` on. */
+function faultySinkRecording(inner: PipelineV2RunStateSink, failFrom: number): FaultySink {
+  const commands: PipelineV2RunCommand[] = [];
+  return {
+    get snapshot(): PipelineV2RunState | null {
+      return inner.snapshot;
+    },
+    get poisoned(): boolean {
+      return inner.poisoned;
+    },
+    commands,
+    async dispatch(command: PipelineV2RunCommand): Promise<void> {
+      commands.push({ ...command });
+      if (commands.length > failFrom) {
+        throw new PipelineV2RunStateStoreError(
+          "the injected store fault refused the pipeline v2 run state commit",
+        );
+      }
+      await inner.dispatch(command);
+    },
+  };
+}
+
+interface AnchoredFixture {
+  dirs: Dirs;
+  pipeline: ResolvedPipelineV2;
+  recording: RecordingSink;
+  referenceCandidate: PreparedPipelineV2RunPlanCandidate;
+}
+
+/** The honest runtime prefix plus the first attempt's fresh construction. */
+async function setupAnchoredRuntime(): Promise<AnchoredFixture> {
+  const dirs = await makeDirs("pipeline-v2-plan-construction-anchored-", RUN_ID);
+  await writeBundle(dirs, CONSTRUCTION_PIPELINE);
+  await writeFile(join(dirs.sources, "task.txt"), "TASK-BODY\n");
+  const pipeline = await loadPipelineV2(dirs.bundle);
+  resetClock();
+  const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: RUN_ID, now: nextTick });
+  const recording = new RecordingSink(sink);
+  await prepareRunProject(dirs.projectSource, dirs.runRoot);
+  const runInputs = await snapshotRunInputs(
+    pipeline,
+    [{ id: "task", path: join(dirs.sources, "task.txt") }],
+    dirs.runRoot,
+  );
+  const protectedInput = runInputs.inputs[0];
+  if (protectedInput === undefined) {
+    throw new Error("the anchored fixture lost its protected run input");
+  }
+  await recording.dispatch({
+    kind: "create_run",
+    runId: RUN_ID,
+    pipeline: pipelineV2RunPipelineIdentity(pipeline),
+    inputs: runInputs.inputs.map((entry) => ({
+      id: entry.id,
+      type: entry.type,
+      protected: entry.protected,
+      digest: entry.digest,
+    })),
+  });
+  const accepted: AcceptedStateOutput[] = [];
+  const prep = await prepareActivationData(pipeline, runInputs, accepted, "architect", 1);
+  await recording.dispatch({
+    kind: "start_agent_execution",
+    stateId: "architect",
+    profile: "architect",
+    executionRole: "planning",
+  });
+  for (const command of executionPhases(1)) {
+    await recording.dispatch(command);
+  }
+  await writeFile(join(prep.outputs_root, "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+  const records = await acceptActivationOutputs(pipeline, prep);
+  accepted.push(...records);
+  await recording.dispatch({
+    kind: "agent_outputs_accepted",
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+  });
+  await recording.dispatch({ kind: "agent_cleanup_completed" });
+
+  // The first attempt's fresh construction (the empty plan ledger).
+  const read = await readAcceptedJsonOutput(pipeline, dirs.runRoot, records, "architect", "plan", 1);
+  const proposal = preparePipelineV2RunPlanProposal(read.value);
+  const referenceCandidate = await constructPipelineV2RunPlanCandidateFromProposal({
+    runRoot: dirs.runRoot,
+    state: recording.snapshot,
+    proposal,
+  });
+  return { dirs, pipeline, recording, referenceCandidate };
+}
+
+/** The suffix projection of one acceptance recording. */
+function dispatchSuffix(recording: { commands: PipelineV2RunCommand[] }): string[] {
+  return recording.commands.map((command) => {
+    if (command.kind === "task_revision_accepted") {
+      return `${command.taskId}:${command.revision}`;
+    }
+    if (command.kind === "plan_revision_accepted") {
+      return `plan:${command.planRevision}`;
+    }
+    return command.kind;
+  });
+}
+
+/** inode/mode/mtime/bytes identity of the three plan-store artifacts. */
+async function artifactStats(runRoot: string): Promise<string> {
+  const files = [
+    join(runRoot, "run-plan", "tasks", "task-a", "1.json"),
+    join(runRoot, "run-plan", "tasks", "task-b", "1.json"),
+    join(runRoot, "run-plan", "plans", "1.json"),
+  ];
+  const lines: string[] = [];
+  for (const path of files) {
+    const info = await lstat(path);
+    lines.push(
+      `${path} ${info.ino} ${(info.mode & 0o777).toString(8)} ${info.mtimeMs} ${(await readFile(path)).toString("base64")}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+test("16. the anchored construction returns the exact candidate on fresh, partial and completed boundaries through the production chain", async () => {
+  const scenarios: ReadonlyArray<{
+    label: string;
+    failFrom: number;
+    artifacts: boolean;
+    retrySuffix: string[];
+    retryDelta: number;
+    retryLoads: string[];
+  }> = [
+    { label: "W1 all artifacts orphan", failFrom: 0, artifacts: true, retrySuffix: ["task-a:1", "task-b:1", "plan:1"], retryDelta: 3, retryLoads: ["plan:1", "task:task-a:1", "task:task-b:1"] },
+    { label: "W2 task-a durable", failFrom: 1, artifacts: true, retrySuffix: ["task-b:1", "plan:1"], retryDelta: 2, retryLoads: ["plan:1", "task:task-a:1", "task:task-b:1"] },
+    { label: "W3 both tasks durable", failFrom: 2, artifacts: true, retrySuffix: ["plan:1"], retryDelta: 1, retryLoads: ["plan:1", "task:task-a:1", "task:task-b:1"] },
+    { label: "W4 plan durable", failFrom: 3, artifacts: true, retrySuffix: [], retryDelta: 0, retryLoads: ["plan:1", "task:task-a:1", "task:task-b:1"] },
+  ];
+
+  for (const scenario of scenarios) {
+    const fixture = await setupAnchoredRuntime();
+    const { dirs, pipeline, recording, referenceCandidate } = fixture;
+    try {
+      // The faulted first attempt (W4 is the clean acceptance).
+      const openSink = await PipelineV2RunStateSink.open({
+        stateRoot: dirs.stateRoot,
+        runId: RUN_ID,
+        now: nextTick,
+      });
+      const faulty = faultySinkRecording(openSink, scenario.failFrom);
+      if (scenario.failFrom < 3) {
+        const cause = await acceptPipelineV2RunPlanCandidate({
+          pipeline,
+          runRoot: dirs.runRoot,
+          sink: faulty,
+          candidate: referenceCandidate,
+        }).catch((error) => error);
+        expect(cause, scenario.label).toBeInstanceOf(PipelineV2RunPlanControllerError);
+        expect((cause as PipelineV2RunPlanControllerError).reason, scenario.label).toBe("state_persist_failed");
+      } else {
+        await acceptPipelineV2RunPlanCandidate({
+          pipeline,
+          runRoot: dirs.runRoot,
+          sink: faulty,
+          candidate: referenceCandidate,
+        });
+      }
+      // Every task/plan artifact is published in every window.
+      expect(dispatchSuffix(faulty), scenario.label).toEqual(
+        scenario.failFrom >= 3 ? ["task-a:1", "task-b:1", "plan:1"] : ["task-a:1", "task-b:1", "plan:1"].slice(0, scenario.failFrom + 1),
+      );
+
+      // The production retry chain over the reopened run.
+      const reopened = await PipelineV2RunStateSink.open({
+        stateRoot: dirs.stateRoot,
+        runId: RUN_ID,
+        now: nextTick,
+      });
+      const state = reopened.snapshot;
+      if (state === null) {
+        throw new Error("the reopened anchored run lost its durable state");
+      }
+      const retryPipeline = await loadPipelineV2(state.pipeline.bundle_root);
+      const restored = await restorePipelineV2PlanningAcceptanceContext(retryPipeline, state, dirs.runRoot);
+      const role = compiledExecutionRoleFor(retryPipeline, "architect");
+      if (role.role !== "planning") {
+        throw new Error("the anchored fixture lost its planning role");
+      }
+      const read = await readAcceptedJsonOutput(
+        retryPipeline,
+        dirs.runRoot,
+        restored.accepted_outputs,
+        "architect",
+        role.plan_output,
+        restored.planning_execution_index,
+      );
+      const proposal = preparePipelineV2RunPlanProposal(read.value);
+      const loadLog: string[] = [];
+      const ops: PipelineV2RunPlanConstructionOps = {
+        loadPlanRevision: async (runRoot, revision) => {
+          loadLog.push(`plan:${revision}`);
+          return await productionRunPlanConstructionOps.loadPlanRevision(runRoot, revision);
+        },
+        loadTaskRevision: async (runRoot, taskId, revision) => {
+          loadLog.push(`task:${taskId}:${revision}`);
+          return await productionRunPlanConstructionOps.loadTaskRevision(runRoot, taskId, revision);
+        },
+      };
+      const anchored = await constructPipelineV2RunPlanCandidateFromProposalInternal(
+        { runRoot: dirs.runRoot, state, proposal },
+        ops,
+      );
+      expect(loadLog, scenario.label).toEqual(scenario.retryLoads);
+
+      // The exact candidate identity: the same plan digest, the same
+      // task digests, structural equality with the first attempt.
+      expect(anchored.plan.sha256, scenario.label).toBe(referenceCandidate.plan.sha256);
+      expect(anchored.plan.manifest, scenario.label).toEqual(referenceCandidate.plan.manifest);
+      expect(anchored.task_revisions.map((task) => task.sha256), scenario.label).toEqual(
+        referenceCandidate.task_revisions.map((task) => task.sha256),
+      );
+      expect(anchored, scenario.label).toEqual(referenceCandidate);
+
+      // The retry acceptance dispatches exactly the missing suffix.
+      const revisionBefore = state.revision;
+      const beforeArtifacts = scenario.artifacts ? await artifactStats(dirs.runRoot) : null;
+      const retryRecording = new RecordingSink(reopened);
+      const retryAccepted = await acceptPipelineV2RunPlanCandidate({
+        pipeline: retryPipeline,
+        runRoot: dirs.runRoot,
+        sink: retryRecording,
+        candidate: anchored,
+      });
+      expect(retryAccepted, scenario.label).toBeInstanceOf(Object);
+      expect(dispatchSuffix(retryRecording), scenario.label).toEqual(scenario.retrySuffix);
+      if (beforeArtifacts !== null) {
+        expect(await artifactStats(dirs.runRoot), scenario.label).toBe(beforeArtifacts);
+      }
+      const finalState = reopened.snapshot as PipelineV2RunState;
+      expect(finalState.revision - revisionBefore, scenario.label).toBe(scenario.retryDelta);
+      expect(finalState.revision, scenario.label).toBe(8 + Math.min(scenario.failFrom, 3) + scenario.retryDelta);
+      expect(finalState.plan_revisions.map((plan) => plan.revision), scenario.label).toEqual([1]);
+      expect(
+        finalState.task_revisions.map((task) => ({ id: task.task_id, revision: task.revision })),
+        scenario.label,
+      ).toEqual([
+        { id: "task-a", revision: 1 },
+        { id: "task-b", revision: 1 },
+      ]);
+      expect(parsePipelineV2RunState(JSON.stringify(finalState)), scenario.label).toEqual(finalState);
+    } finally {
+      await rm(dirs.root, { recursive: true, force: true });
+    }
+  }
+
+  // The fresh boundary itself: the fresh construction followed by the
+  // acceptance's full dispatch suffix.
+  const fixture = await setupAnchoredRuntime();
+  const { dirs, pipeline, recording, referenceCandidate } = fixture;
+  try {
+    const before = await fingerprint(dirs.runRoot);
+    const freshAccepted = await acceptPipelineV2RunPlanCandidate({
+      pipeline,
+      runRoot: dirs.runRoot,
+      sink: recording,
+      candidate: referenceCandidate,
+    });
+    expect(dispatchSuffix(recording).slice(-3)).toEqual(["task-a:1", "task-b:1", "plan:1"]);
+    const finalState = recording.snapshot as PipelineV2RunState;
+    expect(finalState.revision).toBe(11);
+    expect(finalState.plan_revisions.map((plan) => plan.revision)).toEqual([1]);
+    expect(
+      finalState.task_revisions.map((task) => ({ id: task.task_id, revision: task.revision })),
+    ).toEqual([
+      { id: "task-a", revision: 1 },
+      { id: "task-b", revision: 1 },
+    ]);
+    expect(parsePipelineV2RunState(JSON.stringify(finalState))).toEqual(finalState);
+    // The retry after the successful acceptance: the completed recognition
+    // (covered structurally by the W4 scenario).
+    void freshAccepted;
+    expect(await fingerprint(dirs.runRoot)).not.toBe(before);
+  } finally {
+    await rm(dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("16b. the pointer-only completed boundary recognizes the accepted plan instead of building the next revision", async () => {
+  const dirs = await makeDirs("pipeline-v2-plan-construction-anchored-ptr-", RUN_ID);
+  await writeBundle(dirs, TWO_PLANNING_PIPELINE);
+  await writeFile(join(dirs.sources, "task.txt"), "TASK-BODY\n");
+  try {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    resetClock();
+    const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: RUN_ID, now: nextTick });
+    const recording = new RecordingSink(sink);
+    await prepareRunProject(dirs.projectSource, dirs.runRoot);
+    const runInputs = await snapshotRunInputs(
+      pipeline,
+      [{ id: "task", path: join(dirs.sources, "task.txt") }],
+      dirs.runRoot,
+    );
+    await recording.dispatch({
+      kind: "create_run",
+      runId: RUN_ID,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline),
+      inputs: runInputs.inputs.map((entry) => ({
+        id: entry.id,
+        type: entry.type,
+        protected: entry.protected,
+        digest: entry.digest,
+      })),
+    });
+    // The first planning execution: the real plan r1 acceptance.
+    const prep = await prepareActivationData(pipeline, runInputs, [], "architect", 1);
+    await recording.dispatch({
+      kind: "start_agent_execution",
+      stateId: "architect",
+      profile: "architect",
+      executionRole: "planning",
+    });
+    for (const command of executionPhases(1)) {
+      await recording.dispatch(command);
+    }
+    await writeFile(join(prep.outputs_root, "plan"), JSON.stringify(PROPOSAL_DOC), { mode: 0o600 });
+    const records = await acceptActivationOutputs(pipeline, prep);
+    await recording.dispatch({
+      kind: "agent_outputs_accepted",
+      outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    });
+    await recording.dispatch({ kind: "agent_cleanup_completed" });
+    const firstProposal = preparePipelineV2RunPlanProposal(PROPOSAL_DOC);
+    const candidate1 = await constructPipelineV2RunPlanCandidateFromProposal({
+      runRoot: dirs.runRoot,
+      state: recording.snapshot,
+      proposal: firstProposal,
+    });
+    await acceptPipelineV2RunPlanCandidate({
+      pipeline,
+      runRoot: dirs.runRoot,
+      sink: recording,
+      candidate: candidate1,
+    });
+    await recording.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "implement", transition_index: 0 },
+      executionIndex: 1,
+    });
+    // The second settled planning execution on `implement`.
+    sessionCounter += 1;
+    const prep2 = await prepareActivationData(pipeline, runInputs, records, "implement", 2);
+    await recording.dispatch({
+      kind: "start_agent_execution",
+      stateId: "implement",
+      profile: "architect",
+      executionRole: "planning",
+    });
+    for (const command of executionPhases(sessionCounter)) {
+      await recording.dispatch(command);
+    }
+    await writeFile(
+      join(prep2.outputs_root, "plan"),
+      JSON.stringify({
+        schema_version: 1,
+        kind: "run_plan_proposal",
+        stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+        new_tasks: [],
+      }),
+      { mode: 0o600 },
+    );
+    const records2 = await acceptActivationOutputs(pipeline, prep2);
+    await recording.dispatch({
+      kind: "agent_outputs_accepted",
+      outputs: records2.map((record) => ({ id: record.output, digest: record.digest })),
+    });
+    await recording.dispatch({ kind: "agent_cleanup_completed" });
+
+    // The honest r2 construction and its full acceptance.
+    const secondProposal = preparePipelineV2RunPlanProposal({
+      schema_version: 1,
+      kind: "run_plan_proposal",
+      stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+      new_tasks: [],
+    });
+    const candidate2 = await constructPipelineV2RunPlanCandidateFromProposal({
+      runRoot: dirs.runRoot,
+      state: recording.snapshot,
+      proposal: secondProposal,
+    });
+    expect(candidate2.plan.manifest.revision).toBe(2);
+    expect(candidate2.plan.manifest.origin_execution).toBe(2);
+    await acceptPipelineV2RunPlanCandidate({
+      pipeline,
+      runRoot: dirs.runRoot,
+      sink: recording,
+      candidate: candidate2,
+    });
+    const revisionAfterAcceptance = (recording.snapshot as PipelineV2RunState).revision;
+
+    // The restart and the production retry chain: the completed
+    // recognition returns the exact r2 candidate; the acceptance
+    // dispatches nothing and r3 is never created.
+    const reopened = await PipelineV2RunStateSink.open({
+      stateRoot: dirs.stateRoot,
+      runId: RUN_ID,
+      now: nextTick,
+    });
+    const state = reopened.snapshot;
+    if (state === null) {
+      throw new Error("the reopened control run lost its durable state");
+    }
+    const retryPipeline = await loadPipelineV2(state.pipeline.bundle_root);
+    const restored = await restorePipelineV2PlanningAcceptanceContext(retryPipeline, state, dirs.runRoot);
+    const role = compiledExecutionRoleFor(retryPipeline, "implement");
+    if (role.role !== "planning") {
+      throw new Error("the control fixture lost its planning role");
+    }
+    const read = await readAcceptedJsonOutput(
+      retryPipeline,
+      dirs.runRoot,
+      restored.accepted_outputs,
+      "implement",
+      role.plan_output,
+      restored.planning_execution_index,
+    );
+    const retryProposal = preparePipelineV2RunPlanProposal(read.value);
+    const anchored = await constructPipelineV2RunPlanCandidateFromProposal({
+      runRoot: dirs.runRoot,
+      state,
+      proposal: retryProposal,
+    });
+    expect(anchored.plan.sha256).toBe(candidate2.plan.sha256);
+    expect(anchored.plan.manifest.revision).toBe(2);
+    expect(anchored, "the anchored candidate equals the accepted r2 exactly").toEqual(candidate2);
+
+    const retryRecording = new RecordingSink(reopened);
+    await acceptPipelineV2RunPlanCandidate({
+      pipeline: retryPipeline,
+      runRoot: dirs.runRoot,
+      sink: retryRecording,
+      candidate: anchored,
+    });
+    expect(retryRecording.commands).toEqual([]);
+    const finalState = reopened.snapshot as PipelineV2RunState;
+    expect(finalState.revision).toBe(revisionAfterAcceptance);
+    expect(finalState.plan_revisions.map((plan) => plan.revision)).toEqual([1, 2]);
+    expect(parsePipelineV2RunState(JSON.stringify(finalState))).toEqual(finalState);
+  } finally {
+    await rm(dirs.root, { recursive: true, force: true });
+  }
+});
+
+// --- 17. the anchored negative battery ----------------------------------------
+
+test("17. the anchored refusals: no-commit-marker evidence, incoherent target ledgers and never-matching durable records fail closed", async () => {
+  const pointerOnly = (): unknown => ({
+    schema_version: 1,
+    kind: "run_plan_proposal",
+    stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+    new_tasks: [],
+  });
+  const rewrite = (): unknown => ({
+    schema_version: 1,
+    kind: "run_plan_proposal",
+    stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+    new_tasks: [{ id: "task-a", body: "REWRITE-ATTEMPT" }],
+  });
+
+  // (a) durable task evidence for a proposed new task, target plan
+  // artifact absent — closed refusal, not a partial retry
+  const fixtureA = await setupReplanning();
+  try {
+    const { ops, calls } = recordingOps();
+    const cause = await constructPipelineV2RunPlanCandidateFromProposalInternal(
+      { runRoot: fixtureA.harness.dirs.runRoot, state: fixtureA.state, proposal: preparePipelineV2RunPlanProposal(rewrite()) },
+      ops,
+    ).catch((error) => error);
+    const error = expectConstructionError(cause, "artifact_missing");
+    expect((error as Error).message).toContain("commit-marker");
+    expect(calls).toEqual(["plan:2"]);
+  } finally {
+    await rm(fixtureA.harness.dirs.root, { recursive: true, force: true });
+  }
+
+  // (b) two durable plan records with one target origin — an incoherent
+  // ledger (the honest reducer cannot produce it; fail closed). A single
+  // non-last target-origin record is never constructible either: a later
+  // plan record needs more committed transitions than the boundary has,
+  // so the not-last branch is pure defense-in-depth.
+  const fixtureB = await setupReviseBoundary();
+  try {
+    const record = fixtureB.harness.recording.snapshot as PipelineV2RunState;
+    const forged = JSON.parse(JSON.stringify(record)) as Record<string, unknown>;
+    const plans = forged["plan_revisions"] as Array<Record<string, unknown>>;
+    plans.push({
+      index: 2,
+      revision: 2,
+      sha256: hex("e"),
+      previous_sha256: fixtureB.plan1.sha256,
+      origin_execution: 1,
+    });
+    validatePipelineV2RunState(forged);
+    const { ops, calls } = recordingOps();
+    const cause = await constructPipelineV2RunPlanCandidateFromProposalInternal(
+      { runRoot: fixtureB.harness.dirs.runRoot, state: forged, proposal: preparePipelineV2RunPlanProposal(pointerOnly()) },
+      ops,
+    ).catch((error) => error);
+    const error = expectConstructionError(cause, "invalid_state");
+    expect((error as Error).message).toContain("ambiguous");
+    expect(calls).toEqual([]);
+  } finally {
+    await rm(fixtureB.harness.dirs.root, { recursive: true, force: true });
+  }
 });

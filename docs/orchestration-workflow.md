@@ -2289,14 +2289,16 @@ JSON output (a narrow runtime helper), the derivation/construction
 layer, the planning-transition hook, resume-boundary handling,
 coordinator/runner/CLI wiring, migrations/API/T3.
 
-### Read-only proposal → candidate construction layer (production-neutral, not wired)
+### Read-only proposal → candidate construction layer (production-neutral, not wired; anchored/retry-aware)
 
 `orchestrator/src/pipeline_v2_run_plan_construction.ts` (public facade)
 with the internal core
 `pipeline_v2_run_plan_construction_internal.ts` is the single layer that
 builds one provenance-backed `PreparedPipelineV2RunPlanCandidate` from an
 agent-authored proposal and the durable state, using only the existing
-manifest, store and candidate chains:
+manifest, store and candidate chains. One construction call returns the
+same exact candidate on a fresh, a partial and a completed plan-acceptance
+boundary:
 
     constructPipelineV2RunPlanCandidateFromProposal({runRoot, state, proposal})
 
@@ -2304,53 +2306,70 @@ The caller passes no pipeline, no sink, no compiled plan, no digests, no
 revisions, no execution index and no prepared manifests — every durable
 field is derived from the validated state and the proposal. The layer is
 strictly read-only: it publishes nothing, dispatches nothing, and never
-compiles or accepts the candidate; the future planning-transition hook
-compiles it through the existing compiled layer and the acceptance
-controller accepts it.
+compiles or accepts the candidate; the acceptance controller stays the
+owner of dispatch reconciliation and publication adoption.
 
 Authoritative derivation (never a caller field): `run_id` from the
 validated state; the run-root binding `basename(runRoot) === state.run_id`
 before any store load (the canonical store contract stays with the
 loaders); `origin_execution` = the index of the last durable execution —
 the planning/settled/unbound acceptance boundary belongs to the
-acceptance controller and is deliberately not re-checked here; the root
-task is exactly one durable input named `task` with `protected: true`
-(its digest is the only root-task digest source); the next plan revision
-is `1` on an empty plan ledger, else the last record's revision + 1 with
-`previous_sha256` = that record's digest; the previous prepared plan is
-`null` or loaded at the authoritative ledger revision; an existing task
-is the latest durable revision of its id (the last ledger record) with
-its immediate durable predecessor loaded above revision 1; a new task is
-revision 1 with a null previous digest, the `planning_proposal` origin
-and the body taken only from the proposal. Stages, templates, task ids
-and dependencies are declared only by the proposal; the plan's
-normalization and graph semantics stay with the single existing
-`preparePlanRevisionManifest`.
+acceptance controller and is deliberately not re-checked here (the
+production chain runs `restorePipelineV2PlanningAcceptanceContext` before
+the construction); the root task is exactly one durable input named
+`task` with `protected: true` (its digest is the only root-task digest
+source). Stages, templates, task ids and dependencies are declared only
+by the proposal; the plan's normalization and graph semantics stay with
+the single existing `preparePlanRevisionManifest`.
 
-Two construction-policy rules are fixed here and checked before any
-store load: (1) every `new_tasks[].id` must be absent from the whole
-durable task ledger — the intersection is a typed construction conflict
-(a new task body can never silently replace a recorded task); (2) every
-`new_tasks` entry must be referenced by at least one plan pointer — an
-unused entry is a typed construction conflict (a task body can never be
-silently dropped); repeated plan task ids remain owned by the manifest
-validator. After these rules every plan task pointer must resolve to
-exactly one source — the latest durable task revision or the exact
-`new_tasks` entry; neither or both is a typed construction conflict.
+Anchored target resolution (zero loads): plan records whose
+`origin_execution` names this origin execution are the acceptance
+evidence of exactly this boundary — 0 records target the next revision
+(`1` on an empty plan ledger, else last+1) with the last plan record (or
+none) as the base; exactly 1 record is the completed target (it must be
+the last plan record; the base is its immediate predecessor); more than
+1, or a single record that is not the last, is an incoherent ledger
+(`invalid_state`). The FIRST store load is the target plan artifact by
+the computed revision.
 
-Loads are strictly sequential (no `Promise.all`): the previous plan,
-then only the pointered existing tasks in proposal traversal order, each
-current revision followed by its immediate durable predecessor. Orphan
-artifacts are never read: the durable ledgers are the only authority,
-and the filesystem is read only at the exact revisions the ledgers name.
-Loaded prepared plan and task objects are opaque — the internal layer
-checks only the safe form of the loader-result wrapper (so a hostile
-injected result can never produce a `TypeError`); their provenance and
-every run/task/revision/digest/chain correspondence is verified by the
-existing `preparePipelineV2RunPlanCandidate`, whose exact result the
-construction returns directly (never copied, never wrapped, no second
-provenance registry). Store, manifest and binding typed errors pass
-through unchanged by object identity.
+Absent target artifact: a completed ledger record, or durable task
+evidence intersecting `new_tasks`, fails closed as `artifact_missing` —
+partial ownership is never recognized without the plan commit-marker;
+otherwise the fresh construction runs the previous chain unchanged (the
+pointer resolution against the latest durable revisions, the
+unused-`new_tasks` rule, the new task manifests re-prepared from the
+proposal bodies, the plan manifest preparation, the loads: the base plan
+then the pointered existing tasks in proposal traversal order, each with
+its immediate durable predecessor above revision 1).
+
+Present target artifact: the single retry anchor. The loader binds run
+id/revision; the origin execution and the exact base predecessor digest
+are bound here; the proposal's normalized
+stage/template/task/dependency projection must equal the artifact's;
+every `new_tasks` entry re-prepares the expected revision-1 manifest from
+its body and binds it to the target pointer, the loaded artifact and a
+possible durable ledger record exactly (an exact durable record is a
+partial/completed retry; a mismatch is a conflict, never a rewrite);
+every pointered existing task resolves ONLY in the durable ledger exactly
+at the pointer's revision (current artifact + predecessor as before);
+every `new_tasks` entry must be referenced by the artifact's pointers.
+
+Loads are strictly sequential (no `Promise.all`). Anchored load order:
+target plan → base predecessor plan → target tasks in the artifact's
+semantic order, each with its immediate durable predecessor above
+revision 1. Fresh load order: the base plan, then the pointered existing
+tasks in proposal traversal order, each with its predecessor. Orphan
+artifacts at non-target revisions stay ignored (the durable ledgers are
+the only authority for the fresh path); a foreign orphan exactly at the
+target revision is an anchor conflict. Loaded prepared plan and task
+objects are opaque — the internal layer checks only the safe form of the
+loader-result wrapper (so a hostile injected result can never produce a
+`TypeError`); their provenance and every run/task/revision/digest/chain
+correspondence is verified by the existing
+`preparePipelineV2RunPlanCandidate`, whose exact result the construction
+returns directly (never copied, never wrapped, no second provenance
+registry). Store, manifest and binding typed errors pass through
+unchanged by object identity.
 
 Runtime export surface is exactly `PipelineV2RunPlanConstructionError`
 and `constructPipelineV2RunPlanCandidateFromProposal` (the internal core
@@ -2364,10 +2383,16 @@ typed manifest/binding/store errors are never re-classified. Diagnostics
 are content-free. Tests live in
 `orchestrator/tests/pipeline_v2_run_plan_construction.test.ts` (the
 initial-plan bridge through a real accepted planning JSON output, the
-replanning r2 construction after a restart, the real revise boundary
-selecting the ledger's latest revision, the three policy conflicts with
-zero loads, the manifest-graph pass-through battery, the missing/malformed
-artifact matrices, the orphan-artifact/load-order proof, the
+replanning r2 construction after a restart, the honest post-revise
+replanning boundary selecting the ledger's latest revision, the anchored
+digest-mismatch rewrite conflict, the policy conflicts, the
+manifest-graph pass-through battery, the missing/malformed artifact
+matrices, the anchored orphan battery, the anchored/retry-aware matrix
+through the production chain (fresh/W1/W2/W3/W4 and the pointer-only
+completed control recognizing the accepted revision instead of building
+the next one, with the exact candidate identity, the load log, the
+artifact inode/mode/mtime/bytes preservation, the revision deltas and the
+loader round-trip), the anchored negative battery, the
 capture/provenance/mutation batteries and the export/source scans).
 
 Still unwired: the trusted read of the proposal from the accepted
