@@ -29,13 +29,14 @@
  *
  * Runtime export surface is exactly `PipelineV2PlanningRunPlanHandoffControllerError`,
  * `applyPipelineV2PlanningRunPlanHandoffWithIo` and the frozen
- * `productionPlanningRunPlanHandoffOps` (the six existing public
+ * `productionPlanningRunPlanHandoffOps` (the seven existing public
  * facades/resolvers captured by identity — no reducer, store, filesystem,
  * parser, serializer, digest builder or registry capability is reachable).
  * Diagnostics are content-free; every composed layer's typed error and
  * every unexpected error passes through unchanged by object identity.
  */
 import { requireResolvedPipelineV2Provenance } from "./pipeline_v2.ts";
+import { compiledTransitionFor } from "./pipeline_engine.ts";
 import {
   acceptPipelineV2PlanningRunPlan,
 } from "./pipeline_v2_planning_run_plan_controller.ts";
@@ -201,6 +202,8 @@ export interface PipelineV2PlanningRunPlanHandoffOps {
   readonly openReplannedStage: typeof openPipelineV2ReplannedStage;
   readonly openReplannedStageTransition: typeof openPipelineV2ReplannedStageTransition;
   readonly compiledStageFor: typeof compiledPipelineV2RunPlanStageFor;
+  /** The engine-owned completed-edge resolver of the graph execution core. */
+  readonly compiledTransitionFor: typeof compiledTransitionFor;
 }
 
 /**
@@ -214,6 +217,7 @@ export const productionPlanningRunPlanHandoffOps: PipelineV2PlanningRunPlanHando
   openReplannedStage: openPipelineV2ReplannedStage,
   openReplannedStageTransition: openPipelineV2ReplannedStageTransition,
   compiledStageFor: compiledPipelineV2RunPlanStageFor,
+  compiledTransitionFor,
 }) as PipelineV2PlanningRunPlanHandoffOps;
 
 export interface ApplyPipelineV2PlanningRunPlanHandoffOptions {
@@ -545,6 +549,37 @@ function validateHandoffSinkShape(sink: unknown): void {
   if (typeof sink["dispatch"] !== "function") {
     throw handoffError("invalid_options", "the handoff sink must carry a dispatch function", null);
   }
+}
+
+/** The exact own-key shape of the engine's resolved transition step. */
+const RESOLVED_EDGE_KEYS = ["from", "outcome", "to", "transition_index"] as const;
+
+/**
+ * Defensive verification of the engine-owned completed-edge resolution.
+ * A malformed injected result is the controller's own `invalid_result`
+ * carrying the authoritative accepted snapshot; a thrown resolver error
+ * (the real `PipelineExecutionError` or any injected throw) propagates
+ * unchanged by object identity — the caller never wraps the call.
+ */
+function verifyResolvedEdge(
+  resolved: unknown,
+  acceptedState: PipelineV2RunState,
+): { from: string; outcome: string; to: string; transition_index: number } {
+  if (!isRecord(resolved)) {
+    throw handoffError("invalid_result", "the completed edge resolver returned no record", acceptedState);
+  }
+  expectExactKeys(resolved, RESOLVED_EDGE_KEYS, "the completed edge", acceptedState);
+  if (resolved["from"] !== acceptedState.cursor.current_state || resolved["outcome"] !== "completed") {
+    throw handoffError("invalid_result", "the completed edge resolver returned a foreign edge", acceptedState);
+  }
+  if (typeof resolved["to"] !== "string" || !isPipelineV2SafeId(resolved["to"])) {
+    throw handoffError("invalid_result", "the completed edge resolver returned no safe target state", acceptedState);
+  }
+  const index = resolved["transition_index"];
+  if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 0) {
+    throw handoffError("invalid_result", "the completed edge resolver returned an invalid transition index", acceptedState);
+  }
+  return resolved as { from: string; outcome: string; to: string; transition_index: number };
 }
 
 /** Probes compiled-plan provenance through the captured public stage selector. */
@@ -974,6 +1009,7 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
   const openReplannedStage = ops["openReplannedStage"];
   const openReplannedStageTransition = ops["openReplannedStageTransition"];
   const compiledStageFor = ops["compiledStageFor"];
+  const compiledTransitionForOp = ops["compiledTransitionFor"];
   for (const [name, value] of [
     ["acceptPlanningRunPlan", acceptPlanningRunPlan],
     ["restoreAcceptedRunPlan", restoreAcceptedRunPlan],
@@ -981,6 +1017,7 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
     ["openReplannedStage", openReplannedStage],
     ["openReplannedStageTransition", openReplannedStageTransition],
     ["compiledStageFor", compiledStageFor],
+    ["compiledTransitionFor", compiledTransitionForOp],
   ] as const) {
     if (typeof value !== "function") {
       throw handoffError("invalid_options", `the handoff ops member ${name} is not a function`, null);
@@ -1028,15 +1065,32 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
     const acceptedState = verifiedAcceptance.state;
     const verifiedTargetWait = targetWaitOf(acceptedState);
     const lastPlan = lastPlanRecordOf(acceptedState);
+    // The caller stage is resolved through the exact public resolver
+    // BEFORE any durable stage write; the provenance probe above stays
+    // separate.
+    const compiledStage = resolveCallerStage(compiledStageFor, verifiedAcceptance.compiledPlan, stageId);
+    // The planning-edge gate: the authoritative completed edge of the
+    // planning state is resolved through the engine-owned resolver and
+    // verified strictly BEFORE the intent load and before ANY
+    // generation/iteration/transition write, so an incompatible caller
+    // stage can never leave a durable replanned generation behind. The
+    // transition controller keeps its own edge check as defense-in-depth.
+    const resolvedEdge = verifyResolvedEdge(
+      compiledTransitionForOp(pipeline as ResolvedPipelineV2, acceptedState.cursor.current_state, "completed"),
+      acceptedState,
+    );
+    if (resolvedEdge.to !== compiledStage.entry_state) {
+      throw handoffError(
+        "invalid_state",
+        `the completed edge of the planning state does not lead to the entry state of the selected stage ${JSON.stringify(compiledStage.id)}`,
+        acceptedState,
+      );
+    }
     const intentWrapper = await loadWaitIntent(runRoot, verifiedTargetWait.index);
     if (intentWrapper === null) {
       throw handoffError("artifact_missing", "the accepted revise_task intent artifact is missing", acceptedState);
     }
     const intent = verifyIntentWrapper(intentWrapper, acceptedState, verifiedTargetWait);
-    // The caller stage is resolved through the exact public resolver
-    // BEFORE any durable stage write; the provenance probe above stays
-    // separate.
-    const compiledStage = resolveCallerStage(compiledStageFor, verifiedAcceptance.compiledPlan, stageId);
     const previousGenerationIndex = previousGenerationIndexOf(acceptedState, verifiedTargetWait);
     // 6. The replanned stage opens.
     const stage = await openReplannedStage({

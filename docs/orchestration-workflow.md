@@ -2873,11 +2873,12 @@ determines it. Runtime export surface is exactly
 `PipelineV2PlanningRunPlanHandoffControllerError` (own reasons
 `invalid_options | invalid_state | invalid_result | artifact_missing`)
 and `applyPipelineV2PlanningRunPlanHandoff`; the internal core carries
-the frozen `productionPlanningRunPlanHandoffOps` (six existing public
+the frozen `productionPlanningRunPlanHandoffOps` (seven existing public
 facades/resolvers: the planning composition, the read-only accepted-plan
 restore, the wait-intent store loader, the replanned-stage controller,
-the replanned-stage transition controller and the compiled-stage
-selector) and `applyPipelineV2PlanningRunPlanHandoffWithIo`; no
+the replanned-stage transition controller, the compiled-stage selector
+and the engine-owned completed-edge resolver `compiledTransitionFor`)
+and `applyPipelineV2PlanningRunPlanHandoffWithIo`; no
 reducer/store/fs/parser/serializer/digest/registry implementations and
 no second restore or retry mechanism. The branch is selected once from
 the captured authoritative snapshot, never from a caught downstream
@@ -2887,14 +2888,30 @@ wait (derived from the latest durable iteration closure
 `{by: "replanned", wait_index}`; the wait must be the last journal
 entry, answered `revise_task`, with its exact intent; unchanged
 historical revise waits never participate; a later wait — even on the
-same anchor — is progressed state) → `loadPipelineV2WaitIntent` →
-the exact wrapper verification → `openPipelineV2ReplannedStage` →
-verification → `openPipelineV2ReplannedStageTransition` → verification →
-the exact caller-stage resolution (`compiledStageFor(compiledPlan,
-stageId)` before any durable stage write — separate from the provenance
-probe; the real `stage_not_found` passes by identity; the
-template/entry bindings come from the SELECTED stage) →
-`openPipelineV2ReplannedStage` → verification →
+same anchor — is progressed state) → the exact caller-stage resolution
+(`compiledStageFor(compiledPlan, stageId)` before any durable stage
+write — separate from the provenance probe; the real `stage_not_found`
+passes by identity; the template/entry bindings come from the SELECTED
+stage) → the planning-edge gate, strictly before the intent load and
+before ANY generation/iteration/transition write: the authoritative
+completed edge of the planning state is resolved through the seventh ops
+member — the engine-owned
+`compiledTransitionFor(pipeline, acceptedState.cursor.current_state,
+"completed")` — and defensively verified (the exact
+`{from, outcome, to, transition_index}` own-key shape, `from` equal to
+the accepted cursor state, outcome `completed`, a safe `to`, a
+non-negative safe `transition_index`; a malformed injected result is the
+controller's own `invalid_result` carrying the accepted snapshot, a
+thrown resolver error passes by object identity), and an edge whose `to`
+differs from the selected stage's `entry_state` is the controller's own
+`invalid_state` carrying the accepted snapshot with `loadWaitIntent`,
+`openReplannedStage` and the transition facade never called and zero
+stage lifecycle writes — the write-before-validation hole the
+zero-candidate proof exposed is closed here, while the transition
+controller keeps its own edge check as defense-in-depth for direct
+callers and the C0/C1 verification, and Branch B never calls this
+resolver) → `loadPipelineV2WaitIntent` → the exact wrapper verification
+→ `openPipelineV2ReplannedStage` → verification →
 `openPipelineV2ReplannedStageTransition` → verification → the identity
 return; the S0–S4 restart windows converge through the composed
 controllers' own idempotency. Branch B (the exact committed
@@ -2925,7 +2942,7 @@ authoritative snapshot. Diagnostics are content-free; every
 composed layer's typed error and every unexpected error passes through
 unchanged by object identity. Tests:
 `orchestrator/tests/pipeline_v2_planning_run_plan_handoff_controller.test.ts`
-(36 tests) cover the honest prefix through the real
+(41 tests) cover the honest prefix through the real
 facades/reducer/runtime data plane ending at the settled-unbound
 planning boundary, the S0 full path with the exact six-command suffix
 `task-c:1 → plan:2 → stage_generation_closed(replanned) →
@@ -2939,16 +2956,27 @@ missing/damaged/foreign-kind intent battery, the
 stale-plan/foreign-stage/wrong-wait-binding refusals, the
 progressed-state battery, the malformed-result matrix, the forged flat
 bindings and the coherently forged state, the C1 state proof, the
-options/ops Proxy one-time-read batteries, the pipeline clone/Proxy
-provenance gate, the exact per-branch snapshot read counts, the
-content-free diagnostics canary scan, both export surfaces, and the
-source scan; the corrective battery proves the second and third revise
-cycles, the two-template caller stages, the near-miss flat bindings,
-the malformed-sink matrix and the authoritative error-state policy for
-hostile presentations, including the exact-key/provenance-probe
-verification failures and the non-record post-call snapshot guards.
-Not wired: coordinator/runner/CLI/default-pipeline wiring,
-automatic resume, retries, migrations/API/T3.
+options/ops Proxy one-time-read batteries (exactly seven member reads in
+the capture contract order), the pipeline clone/Proxy provenance gate,
+the exact per-branch snapshot read counts, the content-free diagnostics
+canary scan, both export surfaces, and the source scan (the
+`compiledTransitionFor` import required); the corrective battery proves
+the second and third revise cycles, the two-template caller stages, the
+near-miss flat bindings, the malformed-sink matrix and the authoritative
+error-state policy for hostile presentations, including the
+exact-key/provenance-probe verification failures and the non-record
+post-call snapshot guards; the third corrective battery proves the
+planning-edge gate on the real production chain (an incompatible caller
+stage refused before any stage write with the acceptance suffix alone
+durable on S0 and total zero dispatch on S2, a zero-candidate plan
+leaving no wrong durable generation, both same-entry stages accepted on
+independent prefixes, resolver errors by identity, the malformed
+edge-result matrix with zero facade calls).
+Production-reachable transitively through the composition controller
+(`resumePipelineV2RunAfterPlanningRunPlanHandoff`, the runner
+`resumePipelineV2PlanningRunPlan`, `orchestrator resume-plan`); not
+wired: the default-pipeline bundle, automatic resume, retries,
+migrations/API/T3.
 
 
 ### Planning-run-plan handoff → coordinator resume composition controller
