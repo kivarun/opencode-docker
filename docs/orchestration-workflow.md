@@ -1086,7 +1086,7 @@ every agent/decision state (`planning`, `control`, `stage`) and for stage
 templates (`stage_templates[]` with `id` and `entry_state`; `execution_roles[]`
 mapping each agent/decision state to its role, where a planning entry carries
 exactly one `plan_output` naming a declared JSON output port of its own agent
-state — implemented and compiled, but not yet consumed at runtime — and the
+state — implemented, compiled and consumed at runtime through the planning chain (`compiledExecutionRoleFor` → `readAcceptedJsonOutput` → the run-plan proposal) — and the
 stage role carries exactly one `stage_template`). There is no default
 classification and no inference from profiles, state names, prompts, model
 paths or any other content; terminal states never carry a role. Every
@@ -1114,11 +1114,11 @@ read-only resolvers live in `orchestrator/src/pipeline_v2_orchestration.ts`
 `PipelineV2OrchestrationError`; provenance-gated before any content read).
 No role or template registry is added to the durable pipeline identity —
 the existing `execution_snapshot_sha256` stays the single durable anchor.
-Durable state, the coordinator, the runner and the production dispatch are
+Durable state and the coordinator's state-type dispatch are untouched; the compiled roles/templates are consumed at runtime by the resume-restore verifier, the stage-iteration controller and the production planning chain; the
 untouched; a future controller will require this metadata before any
 schema-v7 dispatch.
 
-### Compiled run-plan projection over the orchestration metadata (pure substrate, not wired)
+### Compiled run-plan projection over the orchestration metadata (pure substrate, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_run_plan_compiled.ts` binds one prepared run
 plan candidate to the trusted compiled orchestration metadata of a resolved
@@ -1151,13 +1151,14 @@ is read, validates the stage id against the shared safe-id predicate
 without echoing an invalid value, and returns the exact frozen stage.
 Task bodies, canonical JSON, filesystem paths and prepared-object
 references never enter the projection; `origin_execution` is transferred as
-a normalized number only — its durable verification is the future
-controller's. Nothing here is wired into production: the stage lifecycle state (schema v7),
-execution roles in durable executions, lifecycle journals, controller/
-coordinator/runner/CLI wiring, filesystem publication, wait/replanning
-wiring, grants and effective budget remain later increments.
+a normalized number only — its durable verification lives in the
+acceptance and handoff layers. Out of scope (untouched): the stage
+lifecycle state (schema v7), execution roles in durable executions,
+lifecycle journals, filesystem publication (the run-plan store owns it);
+the acceptance/handoff/controller consumption is implemented; grants,
+effective budget and the wait/replanning policy remain later increments.
 
-### Compiled run-plan acceptance boundary (pure substrate, not wired)
+### Compiled run-plan acceptance boundary (pure substrate, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_run_plan_acceptance.ts` adds the
 controller-owned compiled validation that decides whether a prepared run
@@ -2175,7 +2176,7 @@ dispatch `wait_response_recorded(response_sha256)`. A manifest file
 published without the corresponding durable commit is an orphan, not
 part of the history, and an exact retry safely reuses it.
 
-#### Run-plan manifest filesystem store (pure substrate, not wired)
+#### Run-plan manifest filesystem store (pure substrate, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_run_plan_store.ts` publishes and loads the
 existing plan/task revision manifest substrate under the fixed layout
@@ -2220,8 +2221,9 @@ idempotency. Store responsibility ends at the immutable canonical
 artifacts; the candidate layer above assembles them into one coherent
 plan+task unit (task revisions published first, the plan revision as
 the filesystem commit marker, exact-retry adoption), and durable-state
-acceptance is the run plan acceptance controller's responsibility (no
-schema v7, no reducer commands, no production wiring here).
+acceptance is the run plan acceptance controller's responsibility
+(production-reachable transitively through the planning chain; schema
+v7 and the reducer commands are implemented).
 
 The production-neutral wait controller
 (`orchestrator/src/pipeline_v2_wait_controller.ts`) assembles these
@@ -2260,7 +2262,7 @@ content-free. Coordinator, runner and CLI wiring, reading the user
 response from a file, resume, P01 validation, and migrations stay out
 of scope.
 
-### Run plan manifests (pure substrate, not wired)
+### Run plan manifests (pure substrate, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_run_plan_manifests.ts` fixes the canonical
 content-free format of the three manifest kinds the user-intervention
@@ -2375,7 +2377,7 @@ missing. The crash-safe boundary `plan acceptance ↔ transition` (what
 moves the run from plan acceptance into stage execution) stays a later
 policy/wiring increment.
 
-### Agent-authored run plan proposal (pure substrate, not wired)
+### Agent-authored run plan proposal (pure substrate, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_run_plan_proposal.ts` is the snapshot
 substrate for the semantic document a planning execution hands the
@@ -2421,12 +2423,14 @@ new task is a construction-layer question against the durable task
 ledger; template existence is the compiler's. A shape-valid proposal
 prepared by this layer is not therefore a valid plan.
 
-Still unwired: the trusted read of the proposal from a verified accepted
-JSON output (a narrow runtime helper), the derivation/construction
-layer, the planning-transition hook, resume-boundary handling,
-coordinator/runner/CLI wiring, migrations/API/T3.
+Production-reachable transitively: the trusted read happens in the
+planning-output composition (`readAcceptedJsonOutput` →
+`preparePipelineV2RunPlanProposal`), the construction/acceptance layers
+consume the prepared proposal, and the planning transition is the
+handoff's committed planning transition. Still unwired:
+migrations/API/T3.
 
-### Read-only proposal → candidate construction layer (production-neutral, not wired; anchored/retry-aware)
+### Read-only proposal → candidate construction layer (production-neutral, production-reachable transitively; anchored/retry-aware)
 
 `orchestrator/src/pipeline_v2_run_plan_construction.ts` (public facade)
 with the internal core
@@ -2532,12 +2536,11 @@ artifact inode/mode/mtime/bytes preservation, the revision deltas and the
 loader round-trip), the anchored negative battery, the
 capture/provenance/mutation batteries and the export/source scans).
 
-Still unwired: the trusted read of the proposal from the accepted
-planning output inside the coordinator, the compile + acceptance wiring,
-the planning transition, coordinator/runner/CLI wiring,
-migrations/API/T3.
+Production-reachable transitively through the planning-output
+composition (the trusted proposal read and the compile + acceptance
+happen there). Still unwired: migrations/API/T3.
 
-### Run plan acceptance controller (production-neutral, not wired)
+### Run plan acceptance controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_run_plan_controller.ts` (public, with the
 internal core `pipeline_v2_run_plan_controller_internal.ts`) is the single
@@ -2626,12 +2629,12 @@ propagates unchanged. The result is
 deep-frozen `{compiled_plan, state}`: the exact provenance-backed
 compiled plan object and the last authoritative state; prepared
 manifests, canonical JSON, task bodies, paths and the caller candidate
-never enter the result or the content-free diagnostics. Not wired:
-coordinator, runner, CLI, the stage generation/iteration lifecycle
-controller, wait/replanning policy, automatic resume and multi-process
-locking.
+never enter the result or the content-free diagnostics.
+Production-reachable transitively through the planning-output
+composition (runner → handoff). Still unwired: wait/replanning policy,
+automatic resume and multi-process locking.
 
-### Run plan restoration after a restart (production-neutral, not wired)
+### Run plan restoration after a restart (production-neutral, production-reachable transitively)
 
 The compiled run plan exists in memory only immediately after the run plan
 acceptance controller compiled it; after a process restart the
@@ -2704,10 +2707,12 @@ proven end to end in `orchestrator/tests/pipeline_v2_run_plan_restore.test.ts`
 (29 tests): an honest continued-stage prefix through the real facades,
 the simulated restart, the restoration from the durable ledger plus the
 immutable manifests, and the existing continued-stage composition
-consuming exactly the restored compiled plan. Not wired: the CLI, the
-runner, the coordinator, automatic resume, retries and migrations.
+consuming exactly the restored compiled plan.
+Production-reachable transitively through the planning-run-plan handoff
+(Branch B) and the revise-task intervention. Still unwired: automatic
+resume, retries and migrations.
 
-### Planning-output → accepted-run-plan composition controller (production-neutral, not wired)
+### Planning-output → accepted-run-plan composition controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_planning_run_plan_controller.ts` (public
 facade) with the internal core
@@ -2783,8 +2788,10 @@ matrix for all five boundaries, the hostile sink/result battery, the
 one-time options/ops Proxy reads, mutation-after-await immunity, the
 pipeline clone/Proxy gate, both export surfaces and the source scan.
 
-Still unwired: the next planning transition, coordinator/runner/CLI
-wiring, resume integration, retries, migrations/API/T3.
+Production-reachable transitively through the planning-run-plan handoff
+(Branch A calls exactly this facade; the next planning transition is the
+handoff's committed planning transition). Still unwired: retries beyond
+the crash-retry windows, migrations/API/T3.
 
 
 ### Continue-stage intent acceptance controller (production-neutral, not wired)
@@ -2849,7 +2856,7 @@ revision publication/acceptance, the continue/revise action policy,
 automatic resume, coordinator/runner/CLI wiring, schema changes,
 migrations/API/T3, multi-process locking.
 
-### Planning-run-plan handoff controller (restart-aware, production-neutral, not wired)
+### Planning-run-plan handoff controller (restart-aware, production-neutral, not directly wired but production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_planning_run_plan_handoff_controller.ts`
 (public facade) with the internal core
@@ -2980,7 +2987,7 @@ migrations/API/T3.
 
 
 ### Planning-run-plan handoff → coordinator resume composition controller
-### (production-neutral, not wired)
+### (production-neutral, wired into the production runner)
 
 `orchestrator/src/pipeline_v2_planning_run_plan_resume_controller.ts`
 (public facade) with the internal core
@@ -3102,10 +3109,12 @@ read; malformed post-call snapshots refused with the verified state,
 never the hostile value), and both export surfaces plus the source scan
 (only the two facades plus the provenance/scalar/state/orchestration/
 freezer helpers; no reducer/validator/store/fs/parser/serializer/digest/
-registry/runner imports; no message parsing). Not wired: the runner,
-the CLI, the default pipeline bundle, the stage/budget selection policy,
-automatic resume, schema/reducer changes, migrations/API/T3 and
-multi-process locking.
+registry/runner imports; no message parsing).
+Production-reachable directly: the runner
+`resumePipelineV2PlanningRunPlan` (CLI `orchestrator resume-plan`) calls
+exactly this facade. Still unwired: the default pipeline bundle, the
+stage/budget selection policy, automatic resume, schema/reducer changes,
+migrations/API/T3 and multi-process locking.
 
 
 ### Continue-stage grant application controller (production-neutral, not wired)
@@ -4306,7 +4315,7 @@ scan (the five facades only; no reducer/validator/serializer/digest/
 fs/store/coordinator/runner/CLI imports; no message parsing; no
 mutable seam), and the invalid-options battery.
 
-### Revise-task intervention → resume handoff controller (production-neutral, not wired)
+### Revise-task intervention → resume handoff controller (production-neutral, wired into the production runner)
 
 `orchestrator/src/pipeline_v2_revise_task_resume_controller.ts`
 (public, with the internal core
@@ -4471,16 +4480,16 @@ contracts with zero facade calls, both export surfaces, and the source
 scan over both files (the single imports of the two composed facades;
 no reducer/validator/store/filesystem/manifest machinery of its own; no
 second parser/serializer/digest builder/registry; no message parsing;
-no mutable module-global seam). Still unwired: everything — the runner,
-the default pipeline bundle, the revise-task selection policy (the
-runner passes the caller's taskId/taskBody), the architect/replanning
-branch beyond the intervention (the next plan revision, generation
-reopen, transition and successor start), automatic resume,
-schema/reducer changes, migrations/API/T3 and multi-process locking. The
+no mutable module-global seam). Still unwired: the default pipeline
+bundle, the revise-task selection policy (the runner passes the
+caller's taskId/taskBody), the architect/replanning branch beyond the
+intervention (the next plan revision, generation reopen, transition and
+successor start), automatic resume, schema/reducer changes,
+migrations/API/T3 and multi-process locking. The
 runner entrypoint `revisePipelineV2Task` and the CLI `orchestrator
 revise-task` ARE wired and call this facade.
 
-### Replanned-stage composition controller (production-neutral, not wired)
+### Replanned-stage composition controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_replanned_stage_controller.ts` (public
 facade) + `pipeline_v2_replanned_stage_controller_internal.ts` (internal
@@ -4693,13 +4702,13 @@ composition, downstream/unexpected error identity, content-free
 diagnostics, both export surfaces, and the source scan (no
 reducer/validator/filesystem/store/publisher/serializer/registry/
 coordinator/runner/CLI imports; exactly the seven composed-layer
-imports including the schema-owned identity comparator). Still unwired: the architect output parsing, plan candidate
-construction and acceptance, the stage/budget selection policy, the
-graph transition commit, automatic resume,
-coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
-migrations/API/T3, multi-process locking.
+imports including the schema-owned identity comparator).
+Production-reachable transitively through the planning-run-plan handoff
+(Branch A). Still unwired: the stage/budget selection policy, automatic
+resume, the default-pipeline bundle, migrations/API/T3, multi-process
+locking.
 
-### Replanned-stage transition controller (production-neutral, not wired)
+### Replanned-stage transition controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_replanned_stage_transition_controller.ts`
 (public facade) +
@@ -4772,7 +4781,7 @@ real grant fixture, and hostile historical decision
 executions/results (an injected `iteration_index`, changed result
 scalar fields and both id lists) — every `invalid_state`.
 
-### Stage generation/iteration controller (production-neutral, not wired)
+### Stage generation/iteration controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_stage_iteration_controller.ts` is the
 production-neutral controller that guarantees, against the durable
@@ -4891,13 +4900,13 @@ closed while the call requested only the iteration closure, is a
 whole suffix is `invalid_state` with zero dispatch; the dispatch is
 strictly iteration close → optional generation close with per-dispatch
 authoritative verification; the durability mapping is the same as for
-the ensure API. Diagnostics are content-free. Not wired: stage
-selection/routing policy, the wait-bound `grant`/`replanned` closure and
-replanning, the wait/replanning/grant controllers, automatic resume,
-coordinator/runner/CLI wiring, filesystem, Docker Helper/Sessions,
+the ensure API. Diagnostics are content-free.
+Production-reachable transitively through the replanned-stage
+composition controller (reached from the planning-run-plan handoff).
+Still unwired: stage selection/routing policy, automatic resume,
 migrations/API/T3, multi-process locking.
 
-### Read-only runtime context restoration for a future resume (implemented, not wired)
+### Read-only runtime context restoration for a future resume (implemented, consumed by the coordinator resume entrypoint and the planning chain)
 
 `orchestrator/src/pipeline_v2_resume_context.ts` adds the read-only
 substrate a future resume needs. Two public entrypoints share ONE core,
