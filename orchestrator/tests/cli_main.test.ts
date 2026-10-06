@@ -9,6 +9,7 @@ import type { CliResult, CliRunOptions, CliStdio } from "../src/docker_helper.ts
 import { resolveHelperConfig } from "../src/launcher.ts";
 import {
   continuePipelineV2Stage,
+  resumePipelineV2,
   revisePipelineV2Task,
   resumePipelineV2PlanningRunPlan,
   type PipelineV2RunnerDeps,
@@ -2915,5 +2916,276 @@ test("resume-plan end-to-end with the real production runner: the two-cycle plan
     expect(state).toEqual(parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8")));
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- the real wait-entry CLI integration proof --------------------------------
+
+test("resume CLI reports the controlled stage-wait suspension: one JSON waiting outcome (exit 0) and one human waiting line", async () => {
+  const buildPrefix = async (runId: string) => {
+    const root = mkdtempSync(join(tmpdir(), "cli-wait-entry-"));
+    const bundle = join(root, "bundle");
+    mkdirSync(join(bundle, "prompts"), { recursive: true });
+    mkdirSync(join(bundle, "schemas"), { recursive: true });
+    writeFileSync(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+    writeFileSync(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
+    writeFileSync(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
+    const configRoot = join(root, "config");
+    mkdirSync(join(configRoot, "profiles"), { recursive: true });
+    mkdirSync(join(configRoot, "opencode"), { recursive: true });
+    writeFileSync(
+      join(configRoot, "profiles", "coder.yaml"),
+      [
+        "schema_version: 1",
+        "image: ghcr.io/example/worker:1",
+        "opencode_config: opencode/coder.json",
+        "env:",
+        "  MODEL_API_KEY:",
+        "    from_env: CODER_SOURCE_VAR_1",
+        "    required: true",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(configRoot, "opencode", "coder.json"), JSON.stringify({ model: "glm53-flash" }));
+    const sources = join(root, "userdata");
+    mkdirSync(sources, { recursive: true });
+    writeFileSync(join(sources, "task.md"), "TASK-BODY\n");
+    const projectSource = join(root, "project-source");
+    mkdirSync(projectSource, { recursive: true });
+    const stateRoot = join(root, "state");
+    mkdirSync(stateRoot, { recursive: true });
+    const credDir = join(root, "cred", "docker-helper");
+    mkdirSync(credDir, { recursive: true, mode: 0o700 });
+    const credentialFile = join(credDir, "credential.token");
+    writeFileSync(credentialFile, "cred-token-not-real\n", { mode: 0o600 });
+    const runRoot = join(stateRoot, "pipeline-runs", runId);
+    mkdirSync(join(stateRoot, "pipeline-runs"), { mode: 0o700 });
+    mkdirSync(runRoot, { mode: 0o700 });
+
+    let clockValue = 0;
+    const nextTick = (): Date => {
+      clockValue += 1;
+      return new Date(Date.UTC(2026, 0, 1, 0, 0, clockValue));
+    };
+    const pipeline = await loadPipelineV2(bundle);
+    const sink = new PipelineV2RunStateSink({ stateRoot, runId, now: nextTick });
+    await prepareRunProject(projectSource, runRoot);
+    const runInputs: RunInputsSnapshot = await snapshotRunInputs(
+      pipeline,
+      [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
+      runRoot,
+    );
+    await sink.dispatch({
+      kind: "create_run",
+      runId,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline),
+      inputs: runInputs.inputs.map((entry) => ({
+        id: entry.id,
+        type: entry.type,
+        protected: entry.protected,
+        digest: entry.digest,
+      })),
+    });
+    const activation: PreparedActivationData = await prepareActivationData(pipeline, runInputs, [], "architect", 1);
+    await sink.dispatch({
+      kind: "start_agent_execution",
+      stateId: "architect",
+      profile: "coder",
+      ...startRoleArgs(pipeline, "architect", sink.snapshot),
+    });
+    await sink.dispatch({ kind: "agent_data_prepared" });
+    await sink.dispatch({ kind: "agent_execution_session_created", sessionId: "plan-exec-1" });
+    await sink.dispatch({ kind: "agent_tool_session_created", sessionId: "plan-tool-1" });
+    await sink.dispatch({ kind: "agent_running" });
+    writeFileSync(join(activation.outputs_root, "plan"), "{}", { mode: 0o600 });
+    const records = await acceptActivationOutputs(pipeline, activation);
+    await sink.dispatch({
+      kind: "agent_outputs_accepted",
+      outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    });
+    await sink.dispatch({ kind: "agent_cleanup_completed" });
+    const taskA = prepareTaskRevisionManifest({
+      schema_version: 1,
+      kind: "task_revision",
+      run_id: runId,
+      task_id: "task-a",
+      revision: 1,
+      previous_sha256: null,
+      origin: "planning_proposal",
+      body: "PLAN-TASK-BODY",
+    });
+    const plan1 = preparePlanRevisionManifest({
+      schema_version: 1,
+      kind: "plan_revision",
+      run_id: runId,
+      revision: 1,
+      previous_sha256: null,
+      root_task: { input_id: "task", sha256: runInputs.inputs[0]?.digest ?? "" },
+      origin_execution: 1,
+      stages: [
+        {
+          id: "stage-1",
+          template: "development",
+          tasks: [{ id: "task-a", revision: 1, sha256: taskA.sha256, depends_on: [] }],
+        },
+      ],
+    });
+    const candidate = preparePipelineV2RunPlanCandidate({
+      plan: plan1,
+      taskRevisions: [taskA],
+      previousPlan: null,
+      previousTaskRevisions: [],
+      protectedInputDigest: runInputs.inputs[0]?.digest ?? "",
+    });
+    const acceptedPlan = await acceptPipelineV2RunPlanCandidate({ pipeline, runRoot, sink, candidate });
+    await ensurePipelineV2StageIteration({
+      compiledPlan: acceptedPlan.compiled_plan,
+      stageId: "stage-1",
+      initialBudget: 2,
+      sink,
+    });
+    await sink.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    return { root, configRoot, credentialFile, stateRoot, runRoot };
+  };
+
+  // JSON mode: the real resume runner reports the controlled suspension
+  {
+    const RUN_ID = "wait-entry-cli-json";
+    const parts = await buildPrefix(RUN_ID);
+    try {
+      const { io, out, err } = makeIo();
+      io.baseEnv = { ...io.baseEnv, CODER_SOURCE_VAR_1: "tester-secret" };
+      const sessionDeletes: string[] = [];
+      let sessionCreates = 0;
+      io.runner.run = async (args: string[]) => {
+        if (args[0] === "session" && args[1] === "create") {
+          sessionCreates += 1;
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              ok: true,
+              session: { id: `dhs_${sessionCreates}`, launcher_id: "dhl_resume" },
+              token: `dhc_${sessionCreates}`,
+            }),
+          };
+        }
+        if (args[0] === "session" && args[1] === "delete") {
+          sessionDeletes.push(args[args.length - 1] ?? "");
+          return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+        }
+        return { code: 0 };
+      };
+      io.resolveStateRootProjection = () => ({ localRoot: parts.stateRoot, daemonRoot: parts.stateRoot });
+      io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile: parts.credentialFile });
+      io.fetchAuth = () =>
+        Promise.resolve({
+          status: 200,
+          body: { authority: "launcher", principal: "tester", launcher_id: "dhl_resume" },
+        });
+      io.resumePipelineV2 = resumePipelineV2 as unknown as CliIo["resumePipelineV2"];
+      const exit = await runCli(
+        [
+          "resume",
+          "--run-id", RUN_ID,
+          "--config-root", parts.configRoot,
+          "--launcher-id", "dhl_resume",
+          "--json",
+        ],
+        io,
+      );
+      expect(exit).toBe(0);
+      const documents = out.filter((line) => line.trim() !== "");
+      expect(documents).toHaveLength(1);
+      const parsed = JSON.parse(documents[0]!) as Record<string, unknown>;
+      expect(Object.keys(parsed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state", "waiting"]);
+      expect(parsed["ok"]).toBe(false);
+      expect(parsed["waiting"]).toBe(true);
+      expect(parsed["exitCode"]).toBe(0);
+      expect(parsed["runId"]).toBe(RUN_ID);
+      expect(parsed["runRoot"]).toBe(parts.runRoot);
+      expect("reason" in parsed).toBe(false);
+      expect("refused" in parsed).toBe(false);
+      const state = parsed["state"] as Record<string, unknown>;
+      expect(state["status"]).toBe("waiting");
+      // no failure, no planning execution for the destination state
+      expect(state["failure"]).toBeUndefined();
+      expect(state["executions"]).toHaveLength(2);
+      // one session pair cleaned exactly once each, tool-first
+      expect(sessionCreates).toBe(2);
+      expect(sessionDeletes).toEqual(["dhs_2", "dhs_1"]);
+      // the request manifest was published from the trusted policy
+      const manifest = JSON.parse(await readFile(join(parts.runRoot, "waits", "1.request.json"), "utf8")) as Record<string, unknown>;
+      expect(manifest["reason"]).toBe("stage_iteration_completed");
+      expect(manifest["actions"]).toEqual([
+        { id: "continue_stage", to: "dev_entry" },
+        { id: "revise_task", to: "architect" },
+      ]);
+      // the durable state is waiting and round-trips
+      const durable = parsePipelineV2RunState(await readFile(join(parts.runRoot, "state.json"), "utf8"));
+      expect(durable.status).toBe("waiting");
+      expect(durable.waits).toHaveLength(1);
+    } finally {
+      rmSync(parts.root, { recursive: true, force: true });
+    }
+  }
+
+  // human mode: exactly one waiting summary line on stderr, exit 0
+  {
+    const RUN_ID = "wait-entry-cli-human";
+    const parts = await buildPrefix(RUN_ID);
+    try {
+      const { io, out, err } = makeIo();
+      io.baseEnv = { ...io.baseEnv, CODER_SOURCE_VAR_1: "tester-secret" };
+      let humanSessionCreates = 0;
+      io.runner.run = async (args: string[]) => {
+        if (args[0] === "session" && args[1] === "create") {
+          humanSessionCreates += 1;
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              ok: true,
+              session: { id: `dhs_${humanSessionCreates}`, launcher_id: "dhl_resume" },
+              token: `dhc_${humanSessionCreates}`,
+            }),
+          };
+        }
+        if (args[0] === "session" && args[1] === "delete") {
+          return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+        }
+        return { code: 0 };
+      };
+      io.resolveStateRootProjection = () => ({ localRoot: parts.stateRoot, daemonRoot: parts.stateRoot });
+      io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile: parts.credentialFile });
+      io.fetchAuth = () =>
+        Promise.resolve({
+          status: 200,
+          body: { authority: "launcher", principal: "tester", launcher_id: "dhl_resume" },
+        });
+      io.resumePipelineV2 = resumePipelineV2 as unknown as CliIo["resumePipelineV2"];
+      const exit = await runCli(
+        [
+          "resume",
+          "--run-id", RUN_ID,
+          "--config-root", parts.configRoot,
+          "--launcher-id", "dhl_resume",
+        ],
+        io,
+      );
+      expect(exit).toBe(0);
+      expect(out).toEqual([]);
+      const lines = err.filter((line) => line.trim() !== "");
+      expect(lines).toEqual([
+        `orchestrator: resume waiting (run ${RUN_ID}, state ${parts.runRoot}/state.json)`,
+      ]);
+      expect(lines[0]).not.toContain("failed");
+      expect(lines[0]).not.toContain("reason");
+      expect(lines[0]).not.toContain("outputs");
+    } finally {
+      rmSync(parts.root, { recursive: true, force: true });
+    }
   }
 });

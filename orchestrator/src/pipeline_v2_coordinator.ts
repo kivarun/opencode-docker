@@ -115,8 +115,10 @@
  * every typed restore failure) returns before any durable write, Session
  * or engine callback and leaves the state file untouched — a damaged or
  * incompatible run is not a new execution fact. This module is wired
- * through the production runner (`pipeline_v2_runner.ts`); `agent-smoke`,
- * the CLI and the default pipeline keep executing v1.
+ * through the production runner (`pipeline_v2_runner.ts`) and the CLI
+ * production commands (`orchestrator run`/`resume`/`continue-stage`/
+ * `revise-task`/`resume-plan`); `agent-smoke` and the default pipeline
+ * keep executing v1.
  */
 import { isAbsolute } from "node:path";
 import { validateSafeId } from "./pipeline.ts";
@@ -131,7 +133,10 @@ import {
   type V2DecisionExecutionView,
 } from "./pipeline_engine.ts";
 import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
-import { compiledExecutionRoleFor } from "./pipeline_v2_orchestration.ts";
+import { compiledExecutionRoleFor, type CompiledPipelineV2StageWait } from "./pipeline_v2_orchestration.ts";
+import { restorePipelineV2AcceptedRunPlan } from "./pipeline_v2_run_plan_restore.ts";
+import { enterPipelineV2Wait, PipelineV2WaitControllerError } from "./pipeline_v2_wait_controller.ts";
+import type { PipelineV2WaitManifestAction } from "./pipeline_v2_wait_manifest.ts";
 import { pipelineV2OpenStageIteration } from "./pipeline_v2_state.ts";
 import {
   acceptActivationOutputs,
@@ -308,11 +313,19 @@ export type PipelineV2ResumeRefusalReason =
  * modified, and a damaged or incompatible run is never finalized as
  * failed by a resume attempt. After a successful restore the ordinary
  * coordination result applies: execution failures carry their existing
- * durable semantics.
+ * durable semantics. A waiting result (`waiting: true`) reports the
+ * controlled suspension at the trusted stage-wait boundary — the run is
+ * durably waiting and every consumer must check it before the ordinary
+ * `ok:false` branches.
  */
 export type PipelineV2ResumeCoordinationResult =
   | {
       readonly ok: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly waiting: true;
       readonly state: PipelineV2RunState;
     }
   | {
@@ -344,9 +357,23 @@ export interface PipelineV2CoordinatorControl {
   readonly freezeSignal: () => "SIGINT" | "SIGTERM" | null;
 }
 
+/**
+ * Result of one coordination. `ok: true` means only a confirmed terminal
+ * `run_succeeded`; the waiting branch (`waiting: true`) reports the
+ * controlled suspension at the trusted stage-wait boundary (the durable
+ * state carries the committed `run_waiting`) and must be checked by every
+ * consumer before the ordinary `ok:false` failure branch; every other
+ * `ok: false` result is a durable or persistence failure classified into
+ * the closed failure-reason vocabulary.
+ */
 export type PipelineV2CoordinationResult =
   | {
       readonly ok: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly waiting: true;
       readonly state: PipelineV2RunState;
     }
   | {
@@ -360,6 +387,25 @@ class CoordinationAbortedError extends Error {
   constructor() {
     super("pipeline v2 coordination aborted: the failure was already recorded durably");
     this.name = "CoordinationAbortedError";
+  }
+}
+
+/**
+ * The private controlled-suspension marker of the trusted stage-wait
+ * entry. The class is never exported: the runtime, the worker and every
+ * downstream layer can neither obtain an instance nor construct a
+ * look-alike, so the coordinator's catch recognizes the exact private
+ * identity and nothing else. When `entryFailure` is defined the wait entry
+ * itself failed — the coordinator then reports the failure without any
+ * durable `run_failed`; when it is undefined the run is durably waiting
+ * and the coordination suspends with the waiting result branch.
+ */
+class CoordinatorWaitSuspension extends Error {
+  readonly entryFailure?: unknown;
+  constructor(entryFailure?: unknown) {
+    super("pipeline v2 coordination suspended at the trusted stage-wait boundary");
+    this.name = "CoordinatorWaitSuspension";
+    this.entryFailure = entryFailure;
   }
 }
 
@@ -542,6 +588,22 @@ function classifyCause(cause: unknown): PipelineV2FailureReason {
     return "state_persist_failed";
   }
   return "internal_error";
+}
+
+/**
+ * The failure reason of one failed wait-entry attempt, mapped by typed
+ * class and typed fields only — never by message text. A wait controller
+ * persistence failure keeps the existing `state_persist_failed` reason;
+ * every other wait-controller refusal/conflict and every unexpected
+ * downstream error falls to the existing `internal_error` catch-all. No
+ * new failure reason is introduced and no durable `run_failed` is written
+ * for any of them: the active boundary stays retryable.
+ */
+function waitEntryFailureReason(cause: unknown): PipelineV2FailureReason {
+  if (cause instanceof PipelineV2WaitControllerError) {
+    return cause.reason === "state_persist_failed" ? "state_persist_failed" : "internal_error";
+  }
+  return classifyCause(cause);
 }
 
 /**
@@ -961,6 +1023,7 @@ export async function coordinatePipelineV2Run(
   return await continuePipelineV2Coordination({
     pipeline,
     sink,
+    runRoot,
     runInputs,
     acceptedInitial: [],
     seed: null,
@@ -990,6 +1053,8 @@ export async function coordinatePipelineV2Run(
 interface PipelineV2ContinuationSetup {
   readonly pipeline: ResolvedPipelineV2;
   readonly sink: PipelineV2CoordinatorStateSink;
+  /** The canonical orchestrator-owned run root (the wait store's boundary). */
+  readonly runRoot: string;
   /** Fresh: the coordinator-built snapshot; resume: the restored one. */
   readonly runInputs: RunInputsSnapshot;
   /** Fresh: empty; resume: the restored accepted-output history. */
@@ -1008,6 +1073,7 @@ async function continuePipelineV2Coordination(
   setup: PipelineV2ContinuationSetup,
 ): Promise<PipelineV2CoordinationResult> {
   const { pipeline, sink } = setup;
+  const runRoot = setup.runRoot;
   const runInputs = setup.runInputs;
   const checkSignal = setup.checkSignal;
   const takeCutoff = setup.takeCutoff;
@@ -1300,6 +1366,219 @@ async function continuePipelineV2Coordination(
     return { executionRole: role.role };
   };
 
+  /**
+   * The exact stage→planning wait-entry boundary of the trusted
+   * `stage_wait` policy, recognized structurally on the authoritative
+   * snapshot — never by message text and never from caller policy. The
+   * destination state must resolve to the exact compiled planning role
+   * carrying the trusted stage-wait policy; the current open generation
+   * (never a historical one) must carry an open iteration the settled
+   * stage execution belongs to; the last committed transition must bind
+   * that execution and lead exactly to the cursor; and no wait may be
+   * open. Every other boundary — the initial planning boundary, a
+   * planning completion without an open iteration, a stage→control or
+   * stage→terminal edge, a failed or in-flight execution, a
+   * settled-but-unbound execution, a malformed or progressed boundary and
+   * an already waiting run — is not recognized, and the ordinary
+   * coordination semantics apply unchanged.
+   */
+  const stageWaitBoundary = (
+    state: PipelineV2RunState,
+  ):
+    | { readonly match: false }
+    | { readonly match: true; readonly open: NonNullable<ReturnType<typeof pipelineV2OpenStageIteration>>; readonly stageWait: CompiledPipelineV2StageWait } => {
+    if (state.status !== "active" || state.phase !== "running") {
+      return { match: false };
+    }
+    if (state.terminal !== undefined || state.failure !== undefined || state.run_outputs !== undefined) {
+      return { match: false };
+    }
+    // An open wait never coexists with the active boundary (the loader's
+    // biconditional); the defensive record check keeps the recognizer
+    // self-contained.
+    const lastWait = state.waits[state.waits.length - 1];
+    if (lastWait !== undefined && lastWait.response === undefined) {
+      return { match: false };
+    }
+    const open = pipelineV2OpenStageIteration(state);
+    if (open === null) {
+      return { match: false };
+    }
+    if (state.executions.length !== state.transitions.length) {
+      return { match: false };
+    }
+    if (state.cursor.transition_count !== state.transitions.length) {
+      return { match: false };
+    }
+    const lastExecution = state.executions[state.executions.length - 1];
+    if (lastExecution === undefined || lastExecution.type !== "agent") {
+      return { match: false };
+    }
+    if (lastExecution.execution_role !== "stage" || lastExecution.phase !== "cleanup_completed") {
+      return { match: false };
+    }
+    if (lastExecution.iteration_index !== open.iteration_index) {
+      return { match: false };
+    }
+    const lastTransition = state.transitions[state.transitions.length - 1];
+    if (lastTransition === undefined) {
+      return { match: false };
+    }
+    if (
+      lastTransition.execution_index !== lastExecution.index ||
+      lastTransition.from !== lastExecution.state_id ||
+      lastTransition.outcome !== "completed" ||
+      lastTransition.to !== state.cursor.current_state
+    ) {
+      return { match: false };
+    }
+    let role: ReturnType<typeof compiledExecutionRoleFor>;
+    try {
+      role = compiledExecutionRoleFor(pipeline, state.cursor.current_state);
+    } catch {
+      return { match: false };
+    }
+    if (role.role !== "planning") {
+      return { match: false };
+    }
+    // A compiled planning role always carries the trusted stage-wait
+    // policy; the defensive check keeps an ungrounded entry impossible.
+    if (role.stage_wait === undefined) {
+      return { match: false };
+    }
+    return { match: true, open, stageWait: role.stage_wait };
+  };
+
+  /**
+   * The wait-entry policy derivation without any caller policy: the
+   * trusted compiled `stage_wait` of the destination planning role
+   * provides the reason and the declared action order verbatim; the
+   * targets are derived from the durable run alone — `continue_stage`
+   * from the open generation's bound stage of the accepted compiled plan
+   * (its template entry state), `revise_task` from the destination
+   * planning state (the cursor). The accepted compiled plan is restored
+   * through the single existing public restore; no plan/task artifact is
+   * read manually, no manifest is parsed and no new compiled-plan cache
+   * or registry exists. Every binding of the open generation (template,
+   * declaration position, plan digest) must match the restored plan
+   * exactly, and an unknown action id — impossible after the trusted
+   * load — fails closed before any publication.
+   */
+  const deriveStageWaitRequest = async (
+    state: PipelineV2RunState,
+    open: NonNullable<ReturnType<typeof pipelineV2OpenStageIteration>>,
+    stageWait: CompiledPipelineV2StageWait,
+  ): Promise<{ readonly reason: string; readonly actions: readonly PipelineV2WaitManifestAction[] }> => {
+    const restored = await restorePipelineV2AcceptedRunPlan({ pipeline, runRoot, state });
+    const compiledPlan = restored.compiled_plan;
+    const violation = (detail: string): Error =>
+      new Error(`pipeline v2 stage-wait entry invariant violated: ${detail}`);
+    const generation = state.generations[open.generation_index - 1];
+    if (generation === undefined || generation.index !== open.generation_index) {
+      throw violation("the open generation is not the durable generation record");
+    }
+    if (generation.plan_sha256 !== compiledPlan.plan_sha256) {
+      throw violation("the open generation does not belong to the accepted plan revision");
+    }
+    const stageIndex = compiledPlan.stages.findIndex((stage) => stage.id === open.stage_id);
+    const stage = stageIndex >= 0 ? compiledPlan.stages[stageIndex] : undefined;
+    if (stageIndex < 0 || stage === undefined) {
+      throw violation("the open generation's stage is not part of the accepted plan revision");
+    }
+    if (stage.template !== open.template_id) {
+      throw violation("the open generation's stage template does not match the accepted plan");
+    }
+    if (stageIndex + 1 !== generation.stage_position) {
+      throw violation("the open generation's stage position does not match the accepted plan");
+    }
+    const actions: PipelineV2WaitManifestAction[] = [];
+    for (const actionId of stageWait.actions) {
+      if (actionId === "continue_stage") {
+        actions.push({ id: actionId, to: stage.entry_state });
+      } else if (actionId === "revise_task") {
+        actions.push({ id: actionId, to: state.cursor.current_state });
+      } else {
+        throw violation("the compiled stage-wait policy declares an unknown action id");
+      }
+    }
+    return { reason: stageWait.reason, actions };
+  };
+
+  /**
+   * The documented result shape of a successful `enterPipelineV2Wait`;
+   * verified defensively before the authoritative snapshot is returned —
+   * no false identity claim is ever made about the controller's own
+   * result object.
+   */
+  const verifyEnteredWaitResult = (entered: unknown): void => {
+    if (typeof entered !== "object" || entered === null || Array.isArray(entered)) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result is not a record");
+    }
+    const keys = Object.keys(entered);
+    if (
+      keys.length !== 3 ||
+      !keys.includes("wait_index") ||
+      !keys.includes("request_sha256") ||
+      !keys.includes("state")
+    ) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries foreign fields");
+    }
+    const record = entered as Record<string, unknown>;
+    const waitIndex = record.wait_index;
+    if (typeof waitIndex !== "number" || !Number.isSafeInteger(waitIndex) || waitIndex < 1) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries no valid wait index");
+    }
+    const digest = record.request_sha256;
+    if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries no valid request digest");
+    }
+    if (typeof record.state !== "object" || record.state === null || Array.isArray(record.state)) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries no durable state");
+    }
+  };
+
+  /**
+   * The one wait-entry attempt of both the live and the restart path: the
+   * exact boundary recognizer, the policy derivation and the single
+   * public `enterPipelineV2Wait`. The function never throws — the
+   * controlled suspension and every wait-entry failure are returned as
+   * typed outcomes; the caller maps them onto the private suspension
+   * marker or the failure result without any durable `run_failed`.
+   */
+  const attemptStageWaitEntry = async (): Promise<
+    | { readonly outcome: "not-boundary" }
+    | { readonly outcome: "suspended" }
+    | { readonly outcome: "failed"; readonly cause: unknown; readonly state: PipelineV2RunState | null }
+  > => {
+    try {
+      const state = sink.snapshot;
+      if (state === null) {
+        return { outcome: "not-boundary" };
+      }
+      const boundary = stageWaitBoundary(state);
+      if (!boundary.match) {
+        return { outcome: "not-boundary" };
+      }
+      const derived = await deriveStageWaitRequest(state, boundary.open, boundary.stageWait);
+      const entered = await enterPipelineV2Wait({
+        runRoot,
+        sink,
+        reason: derived.reason,
+        actions: derived.actions,
+      });
+      verifyEnteredWaitResult(entered);
+      return { outcome: "suspended" };
+    } catch (cause) {
+      // The sink is never re-read after it poisoned itself: a wait
+      // controller persistence error already carries the authoritative
+      // (adopted) snapshot; every other cause reads the sink's current
+      // snapshot exactly once here.
+      const failureState =
+        cause instanceof PipelineV2WaitControllerError ? cause.state : sink.snapshot;
+      return { outcome: "failed", cause, state: failureState };
+    }
+  };
+
   const executors: PipelineV2GraphExecutors = {
     executeAgent: async (view: V2AgentExecutionView): Promise<void> => {
       // Execution-start checkpoint: a signal accepted between states stops
@@ -1508,12 +1787,28 @@ async function continuePipelineV2Coordination(
    * dispatches `transition_committed` with the index of the last settled
    * execution and must complete before the engine moves the cursor. A
    * hook failure stops the graph before the next callback; the failure
-   * policy finalizes the run.
+   * policy finalizes the run — except the exact trusted stage-wait
+   * boundary recognized right after the committed transition: the wait
+   * entry suspends the coordination through the private sentinel and no
+   * planning callback ever starts.
    */
   const onTransitionCommit = async (step: TransitionStep): Promise<void> => {
     const executionIndex = requireLastExecutionIndex();
     await dispatchState({ kind: "transition_committed", step, executionIndex });
     tracking.unfinished = false;
+    // The post-commit checkpoint (previously owned by the next callback's
+    // start): a signal accepted during the worker run is caught here with
+    // the exact same durable semantics — the settled execution and its
+    // transition stay durable and the run finalizes with the signal
+    // reason. Only a quiet checkpoint proceeds to the wait-entry attempt.
+    checkSignal();
+    const attempt = await attemptStageWaitEntry();
+    if (attempt.outcome === "suspended") {
+      throw new CoordinatorWaitSuspension();
+    }
+    if (attempt.outcome === "failed") {
+      throw new CoordinatorWaitSuspension({ cause: attempt.cause, state: attempt.state });
+    }
   };
 
   try {
@@ -1522,6 +1817,26 @@ async function continuePipelineV2Coordination(
     // finalizes durably); resume it is after the successful restore. Every
     // execution is settled and its transition is durable in both cases.
     checkSignal();
+
+    // The restart path of the trusted stage-wait boundary: when the durable
+    // transition into a planning state is already committed while the wait
+    // is absent (a crash between the commit and the wait entry), the same
+    // exact recognizer enters the wait here — before the engine can start
+    // any planning callback. A fresh run carries no durable transition and
+    // never reaches this point.
+    if (setup.seed !== null) {
+      const restartAttempt = await attemptStageWaitEntry();
+      if (restartAttempt.outcome === "suspended") {
+        return deepFreeze({ ok: false as const, waiting: true as const, state: requireSnapshot() });
+      }
+      if (restartAttempt.outcome === "failed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: waitEntryFailureReason(restartAttempt.cause),
+          state: restartAttempt.state ?? sink.snapshot,
+        });
+      }
+    }
 
     // The single engine invocation of the chain: a fresh run enters the
     // loop at the entry state with transition count 0; a resumed run
@@ -1590,6 +1905,32 @@ async function continuePipelineV2Coordination(
       state,
     });
   } catch (cause) {
+    // The private controlled-suspension sentinel is recognized by exact
+    // identity first: the runtime, the worker and every downstream layer
+    // can neither obtain nor construct the private marker class, so no
+    // forged error can turn a real failure into a waiting result.
+    if (cause instanceof CoordinatorWaitSuspension) {
+      if (cause.entryFailure === undefined) {
+        // The run is durably waiting: the authoritative snapshot after the
+        // committed `run_waiting` is returned on the waiting branch — no
+        // failure finalization, no signal cutoff, no further dispatch.
+        const state = requireSnapshot();
+        return deepFreeze({ ok: false as const, waiting: true as const, state });
+      }
+      // A failed wait-entry attempt never writes a durable `run_failed`:
+      // the active stage→planning boundary stays retryable for a fresh
+      // resume (the same recognizer re-enters the wait there), a poisoned
+      // sink is never re-read (the failure already carries the adopted
+      // snapshot), and an actually durable `run_waiting` is visible to
+      // every fresh reopen. The reason mapping is the existing closed
+      // vocabulary — no new failure reason.
+      const failure = cause.entryFailure as { readonly cause: unknown; readonly state: PipelineV2RunState | null };
+      return deepFreeze({
+        ok: false as const,
+        reason: waitEntryFailureReason(failure.cause),
+        state: failure.state ?? sink.snapshot,
+      });
+    }
     await finalizeFailure(cause);
     if (stateAbandoned) {
       return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
@@ -1616,10 +1957,12 @@ function resumeRefusal(
 /**
  * Continues an already durable pipeline v2 run from its clean active
  * boundary through the same single continuation chain fresh coordination
- * uses. The resume is strictly production-neutral: it is not wired into
- * the runner or the CLI, and it never re-reads any original user source —
- * the project source, the input bindings, the original cursor and the
- * execution indexes are all derived from the durable state alone.
+ * uses. The entrypoint is wired into the production runner
+ * (`pipeline_v2_runner.ts`, the CLI commands `orchestrator run`, `orchestrator
+ * resume` and the composition controllers) and it never re-reads any
+ * original user source — the project source, the input bindings, the
+ * original cursor and the execution indexes are all derived from the
+ * durable state alone.
  *
  * Exact ordering (fail-closed, every refusal before any side effect):
  *
@@ -1774,6 +2117,7 @@ export async function resumePipelineV2Run(
   return await continuePipelineV2Coordination({
     pipeline,
     sink,
+    runRoot,
     runInputs: restored.run_inputs,
     acceptedInitial: restored.accepted_outputs,
     seed: restored.cursor,

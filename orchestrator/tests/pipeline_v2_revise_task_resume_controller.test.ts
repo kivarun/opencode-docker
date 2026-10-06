@@ -614,7 +614,7 @@ function expectHandoffError(
 function expectResumeFailedWorkerFailed(result: PipelineV2ResumeCoordinationResult): PipelineV2RunState {
   expect(result.ok).toBe(false);
   expect("refused" in result).toBe(false);
-  if ("refused" in result || result.ok) {
+  if ("refused" in result || result.ok || "waiting" in result) {
     throw new Error(`expected an ordinary worker failure, got ${JSON.stringify(result)}`);
   }
   expect(result.reason).toBe("worker_failed");
@@ -1004,6 +1004,18 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
       // diagnostics (the fake resume would return a valid success if the
       // verification let it through)
       const correctiveCases: Array<[string, (options: unknown) => unknown, PipelineV2RunState, string]> = [
+        ["a waiting result with an extra own field",
+          (options: unknown) => ({ ok: false, waiting: true, state: snapshotOf(options), hostile_extra: "NEVER-READ" }),
+          completed,
+          "carries foreign fields"],
+        ["a waiting result with a false discriminant",
+          (options: unknown) => ({ ok: false, waiting: false, state: snapshotOf(options) }),
+          completed,
+          "carries foreign fields"],
+        ["a waiting result without a state",
+          () => ({ ok: false, waiting: true }),
+          completed,
+          "carries foreign fields"],
         ["an extra own enumerable field",
           (options: unknown) => ({ ...(fakeResultWith(snapshotOf(options)) as Record<string, unknown>), hostile_extra: "NEVER-READ" }),
           completed,
@@ -1169,6 +1181,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
       // returned unchanged by identity
       const results: unknown[] = [
         { ok: true, state: authoritative },
+        { ok: false, waiting: true, state: authoritative },
       ];
       for (const reason of ["missing_state", "sink_poisoned", "run_id_mismatch", "invalid_state", "pipeline_mismatch", "run_layout_invalid", "run_input_modified", "accepted_output_modified", "internal_error"] as const) {
         results.push({ ok: false, refused: true, reason, state: null });

@@ -606,6 +606,22 @@ function verifyResumeResult(
     if (ok !== false) {
       throw invalidResult("the resume coordinator result carries no valid ok discriminant", authoritative);
     }
+    if (keys.includes("waiting")) {
+      // The exact controlled-suspension branch of the coordinator: the run
+      // is durably waiting at the trusted stage-wait boundary and is
+      // returned by identity — never reclassified as a failure or refusal.
+      if (!hasExactOwnKeys(result, "ok", "waiting", "state")) {
+        throw invalidResult("the resume coordinator waiting result carries foreign fields", authoritative);
+      }
+      if (result["waiting"] !== true) {
+        throw invalidResult("the resume coordinator result carries a malformed waiting discriminant", authoritative);
+      }
+      const state = result["state"];
+      if (state !== authoritative || !isRecord(state)) {
+        throw invalidResult("the resume coordinator result does not carry the authoritative durable state", authoritative);
+      }
+      return resultValue as unknown as PipelineV2ResumeCoordinationResult;
+    }
     if (keys.includes("refused")) {
       if (!hasExactOwnKeys(result, "ok", "refused", "reason", "state")) {
         throw invalidResult("the resume coordinator refusal result carries foreign fields", authoritative);

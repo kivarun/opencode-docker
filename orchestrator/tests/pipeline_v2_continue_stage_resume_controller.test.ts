@@ -629,7 +629,7 @@ test("crash seam: the durable intervention is recognized with zero dispatch afte
     initialBudget: INITIAL_BUDGET,
   });
   expect(result.ok).toBe(false);
-  if (result.ok || ("refused" in result && result.refused)) {
+  if (result.ok || ("refused" in result && result.refused) || "waiting" in result) {
     throw new Error(`expected an ordinary execution failure, got ${JSON.stringify(result)}`);
   }
   expect(result.reason).toBe("worker_failed");
@@ -699,7 +699,7 @@ test("C0: the full handoff through the new facade on the reopened run — interv
     initialBudget: INITIAL_BUDGET,
   });
   expect(result.ok).toBe(false);
-  if (result.ok || ("refused" in result && result.refused)) {
+  if (result.ok || ("refused" in result && result.refused) || "waiting" in result) {
     throw new Error(`expected an ordinary execution failure, got ${JSON.stringify(result)}`);
   }
   expect(result.reason).toBe("worker_failed");
@@ -1118,6 +1118,12 @@ test("malformed resume coordinator results: the typed invalid_result matrix over
     ["a refusal with a hostile extra field", () => ({ ok: false, refused: true, reason: "missing_state", state: null, hostile_extra: 1 })],
     ["an ordinary failure with a hostile extra field", (snapshot) => ({ ok: false, reason: "worker_failed", state: snapshot, hostile_extra: 1 })],
     ["a refused undefined as its own field", () => ({ ok: false, refused: undefined, reason: "worker_failed", state: null })],
+    ["a waiting branch with an extra own field", (snapshot) => ({ ok: false, waiting: true, state: snapshot, hostile_extra: 1 })],
+    ["a waiting branch with a false discriminant", (snapshot) => ({ ok: false, waiting: false, state: snapshot })],
+    ["a waiting branch without a state", () => ({ ok: false, waiting: true })],
+    ["a waiting branch with a foreign state", () => ({ ok: false, waiting: true, state: { status: "waiting" } })],
+    ["a waiting branch with a null state", () => ({ ok: false, waiting: true, state: null })],
+    ["a waiting branch with a reason field", (snapshot) => ({ ok: false, waiting: true, reason: "canary_reason", state: snapshot })],
   ];
   for (const [name, build] of hostileBuilders) {
     let resumeCalls = 0;
@@ -1229,6 +1235,10 @@ test("the exact coordinator union vocabulary: every valid reason is returned by 
     ]);
   }
   validBuilders.push([
+    "the waiting union with the authoritative state",
+    (snapshot) => ({ ok: false, waiting: true, state: snapshot }),
+  ]);
+  validBuilders.push([
     "the success union with the authoritative state",
     (snapshot) => ({ ok: true, state: snapshot }),
   ]);
@@ -1252,7 +1262,7 @@ test("the exact coordinator union vocabulary: every valid reason is returned by 
     });
     expect(returned).toBe(built as PipelineV2ResumeCoordinationResult);
   }
-  expect(validBuilders.length).toBe(2 * 9 + 2 * PIPELINE_V2_FAILURE_REASONS.length + 1);
+  expect(validBuilders.length).toBe(2 * 9 + 2 * PIPELINE_V2_FAILURE_REASONS.length + 2);
   expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
 });
 
@@ -1306,7 +1316,7 @@ test("mutation after await: the captured policy, runtime and control are immune 
   };
   const result = await callPromise;
   expect(result.ok).toBe(false);
-  if (result.ok || ("refused" in result && result.refused)) {
+  if (result.ok || ("refused" in result && result.refused) || "waiting" in result) {
     throw new Error(`expected an ordinary execution failure, got ${JSON.stringify(result)}`);
   }
   // the mutated signal never reached the coordinator: the failure stays the
@@ -1426,7 +1436,7 @@ test("the runtime and control contract functions are read exactly once and the c
     initialBudget: INITIAL_BUDGET,
   });
   expect(result.ok).toBe(false);
-  if (result.ok || ("refused" in result && result.refused)) {
+  if (result.ok || ("refused" in result && result.refused) || "waiting" in result) {
     throw new Error(`expected an ordinary execution failure, got ${JSON.stringify(result)}`);
   }
   expect(result.reason).toBe("worker_failed");

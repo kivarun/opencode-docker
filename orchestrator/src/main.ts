@@ -593,6 +593,13 @@ function reportPipelineV2Outcome(
     io.writeError(
       `orchestrator: ${command} ok (run ${outcome.runId}, state ${outcome.runRoot}/state.json, outputs ${outcome.runRoot}/outputs)`,
     );
+  } else if (outcome.waiting === true) {
+    // The controlled suspension at the trusted stage-wait boundary: one
+    // summary line, no failure/reason wording, exit 0 — the declared
+    // intervention commands are the operator's next step.
+    io.writeError(
+      `orchestrator: ${command} waiting (run ${outcome.runId}, state ${outcome.runRoot}/state.json)`,
+    );
   } else if (outcome.runRoot !== null) {
     const reasonPart = outcome.reason !== undefined ? ` reason ${outcome.reason},` : "";
     io.writeError(

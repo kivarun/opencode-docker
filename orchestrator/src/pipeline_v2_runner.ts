@@ -196,11 +196,22 @@ export interface PipelineV2RunOutcome {
   readonly runRoot: string | null;
   readonly state: PipelineV2RunState | null;
   /**
+   * The exact controlled-suspension branch: the run reached the trusted
+   * stage-wait boundary and is durably waiting. `ok: false` (the run is
+   * not complete), `waiting: true` (an ordinary suspension, not a
+   * failure or refusal), `exitCode: 0` (the command brought the run to
+   * the operator boundary successfully), the actual run id and run root
+   * and the authoritative state after the committed `run_waiting`; no
+   * `reason`, no `refused`, no extra envelope. Every consumer must check
+   * this branch before the ordinary `ok:false` failure/refusal shapes.
+   */
+  readonly waiting?: boolean;
+  /**
    * The durable failure reason, or the structured pre-resume refusal
    * reason of `resumePipelineV2` (a refusal is not a durable failure: the
    * state document is untouched). Omitted for preflight failures that
-   * happen before any state document could exist and for confirmed
-   * success.
+   * happen before any state document could exist, for confirmed success
+   * and for the waiting branch.
    */
   readonly reason?: PipelineV2FailureReason | PipelineV2ResumeRefusalReason;
 }
@@ -731,6 +742,19 @@ export async function runPipelineV2(
   if (result.ok) {
     return deepFreeze({
       ok: true,
+      exitCode: 0,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: result.state,
+    });
+  }
+  if ("waiting" in result) {
+    // The controlled suspension at the trusted stage-wait boundary: the
+    // run is durably waiting and the command brought it to the operator
+    // boundary successfully — exit 0, no failure reason, no refusal.
+    return deepFreeze({
+      ok: false,
+      waiting: true,
       exitCode: 0,
       runId,
       runRoot: runRoot.localRunRoot,
@@ -1587,6 +1611,20 @@ async function runExistingPipelineV2(
   if (result.ok) {
     return deepFreeze({
       ok: true,
+      exitCode: 0,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: result.state,
+    });
+  }
+  if ("waiting" in result) {
+    // The controlled suspension at the trusted stage-wait boundary: the
+    // run is durably waiting and the command brought it to the operator
+    // boundary successfully — exit 0, no failure reason, no refusal; the
+    // declared intervention commands remain the operator's next step.
+    return deepFreeze({
+      ok: false,
+      waiting: true,
       exitCode: 0,
       runId,
       runRoot: runRoot.localRunRoot,

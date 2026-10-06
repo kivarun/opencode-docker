@@ -681,7 +681,7 @@ test("4. failed terminal publishes outputs, reports ok:false with the terminal f
   const fake = fakeRuntime([]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("terminal_failed");
@@ -725,7 +725,7 @@ test("6. typed worker failures clean both sessions tool-first and fail the run",
     const fake = fakeRuntime([{ run: reason }]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe(reason);
@@ -760,7 +760,7 @@ test("7. a failure before any Session records not_required cleanup for both slot
   const fake = fakeRuntime([]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("activation_prepare_failed");
@@ -788,7 +788,7 @@ test("8. a failure after both Sessions were created still cleans both up exactly
   const fake = fakeRuntime([{}]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("state_persist_failed");
@@ -815,7 +815,7 @@ test("9. a failed tool cleanup finalizes as cleanup_failed with an exact cleanup
   ]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("session_cleanup_failed");
@@ -905,7 +905,7 @@ test("10. decision results produce exact content-free records and route through 
     } else {
       // a failed terminal is a durable failed run, never ok:true
       expect(result.ok).toBe(false);
-      if (result.ok || result.state === null) {
+      if (result.ok || result.state === null || "waiting" in result) {
         throw new Error("unexpected result shape");
       }
       expect(result.reason).toBe("terminal_failed");
@@ -976,7 +976,7 @@ test("11. decision input failures stay typed after start_decision_execution", as
   const fake = fakeRuntime([{}]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("state_persist_failed");
@@ -994,7 +994,7 @@ test("12. transition budget exhaustion fails before the next callback with both 
   const fake = fakeRuntime([{}, {}, {}]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("transition_budget_exhausted");
@@ -1023,7 +1023,7 @@ test("13. a transition-hook failure stops the graph before the next callback", a
   const fake = fakeRuntime([{}, {}]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("state_persist_failed");
@@ -1049,7 +1049,7 @@ test("14. typed data-plane failures keep their exact reason with both slots clea
   ]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("run_input_modified");
@@ -1078,7 +1078,7 @@ test("14. typed data-plane failures keep their exact reason with both slots clea
   ]);
   const result2 = await coordinate(harness2, fake2.runtime);
   expect(result2.ok).toBe(false);
-  if (result2.ok || result2.state === null) {
+  if (result2.ok || result2.state === null || "waiting" in result2) {
     throw new Error("unexpected result shape");
   }
   expect(result2.reason).toBe("accepted_output_modified");
@@ -1100,7 +1100,7 @@ test("15. plain unexpected errors normalize to internal_error", async () => {
     } as unknown as PipelineV2AgentRuntime;
     const result = await coordinate(harness, explodingRuntime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("internal_error");
@@ -1119,7 +1119,7 @@ test("15. plain unexpected errors normalize to internal_error", async () => {
     const fake = fakeRuntime([{ run: "throw" }]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("internal_error");
@@ -1143,7 +1143,7 @@ test("15. plain unexpected errors normalize to internal_error", async () => {
     const fake = fakeRuntime([{ run: "invalid" }]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("internal_error");
@@ -1170,7 +1170,7 @@ test("16. pre-rename state failures and post-rename durability unknown behave ex
     const fake = fakeRuntime([{}]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("state_persist_failed");
@@ -1199,7 +1199,7 @@ test("16. pre-rename state failures and post-rename durability unknown behave ex
     const fake = fakeRuntime([{}]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("state_persist_failed");
@@ -1225,7 +1225,7 @@ test("16. pre-rename state failures and post-rename durability unknown behave ex
     const fake = fakeRuntime([]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok) {
+    if (result.ok || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("state_persist_failed");
@@ -1242,7 +1242,7 @@ test("16. pre-rename state failures and post-rename durability unknown behave ex
     const fake = fakeRuntime([]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok) {
+    if (result.ok || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("state_persist_failed");
@@ -1257,7 +1257,7 @@ test("17. after a poisoned sink no further state writes or side effects happen",
   const fake = fakeRuntime([{}, {}]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("state_persist_failed");
@@ -1292,7 +1292,7 @@ test("18. run-output publication and terminal-write faults are contained", async
     const fake = fakeRuntime([{}]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("state_persist_failed");
@@ -1314,7 +1314,7 @@ test("18. run-output publication and terminal-write faults are contained", async
     const fake = fakeRuntime([]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("state_persist_failed");
@@ -1336,7 +1336,7 @@ test("18. run-output publication and terminal-write faults are contained", async
     const fake = fakeRuntime([]);
     const result = await coordinate(harness, fake.runtime);
     expect(result.ok).toBe(false);
-    if (result.ok || result.state === null) {
+    if (result.ok || result.state === null || "waiting" in result) {
       throw new Error("unexpected result shape");
     }
     expect(result.reason).toBe("state_persist_failed");
@@ -1400,7 +1400,7 @@ test("20. protected inputs and accepted outputs are re-verified through the exis
   ]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected result shape");
   }
   expect(result.reason).toBe("run_input_modified");
@@ -2586,8 +2586,8 @@ function kinds(recording: RecordingSink): string[] {
 }
 
 function expectOk(result: PipelineV2CoordinationResult): PipelineV2RunState {
-  if (!result.ok) {
-    throw new Error(`expected a successful coordination, got ${String(result.reason)}`);
+  if (!result.ok || "waiting" in result) {
+    throw new Error("expected a successful coordination");
   }
   return result.state;
 }
@@ -2597,7 +2597,7 @@ function expectFailedState(
   reason: PipelineV2FailureReason,
 ): PipelineV2RunState {
   expect(result.ok).toBe(false);
-  if (result.ok || result.state === null) {
+  if (result.ok || result.state === null || "waiting" in result) {
     throw new Error("unexpected coordination result shape");
   }
   expect(result.reason).toBe(reason);
@@ -2658,7 +2658,7 @@ test("34. a project preparation failure reaches no command and no session", asyn
     runtime: fake.runtime,
   }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("run_input_invalid");
   }
   expect(result.state).toBeNull();
@@ -2691,7 +2691,7 @@ test("35. a late run-input failure keeps the published project copy and an untou
     runtime: fake.runtime,
   }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("run_input_invalid");
   }
   expect(result.state).toBeNull();
@@ -2713,7 +2713,7 @@ test("36. a create_run store failure keeps the published project copy", async ()
   const fake = fakeRuntime([{}]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("state_persist_failed");
   }
   expect(result.state).toBeNull();
@@ -2835,7 +2835,7 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
       runtime: guardedRuntime,
     }, NEUTRAL_CONTROL);
     expect(result.ok).toBe(false);
-    if (!result.ok) {
+    if (!result.ok && !("waiting" in result)) {
       expect(result.reason).toBe("internal_error");
     }
     expect(result.state).toBeNull();
@@ -2866,7 +2866,7 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
     runtime: fake.runtime,
   }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("internal_error");
   }
   expect(result.state).toBeNull();
@@ -2916,7 +2916,7 @@ test("56. the cutoff freezes signal acceptance exactly once (sigint-then-throw c
   // The single cutoff froze with SIGINT; the second freezeSignal call —
   // which would throw — never happened, so the reason stays signal_sigint.
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("signal_sigint");
   }
   expect(result.state?.status).toBe("failed");
@@ -2944,7 +2944,7 @@ test("58. the cutoff runs exactly once for a normal failure", async () => {
   const control = cutoffControl("neutral");
   const result = await coordinate(harness, fake.runtime, { control });
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("worker_failed");
   }
   expect(result.state?.failure?.reason).toBe("worker_failed");
@@ -2960,7 +2960,7 @@ test("59. the cutoff runs exactly once for a failed terminal, which stays termin
   const control = cutoffControl("neutral");
   const result = await coordinate(harness, fake.runtime, { control });
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("terminal_failed");
   }
   expect(result.state?.terminal).toEqual({ state_id: "failed_end", result: "failed" });
@@ -2974,7 +2974,7 @@ test("60. a sigterm-then-sigint control observes exactly one freeze, so the firs
   const control = cutoffControl("sigterm-then-sigint");
   const result = await coordinate(harness, fake.runtime, { control });
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("signal_sigterm");
   }
   expect(result.state?.failure?.reason).toBe("signal_sigterm");
@@ -2989,7 +2989,7 @@ test("61. create_run durability-unknown takes the cutoff exactly once and keeps 
   const control = cutoffControl("neutral");
   const result = await coordinate(harness, fake.runtime, { control });
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("state_persist_failed");
   }
   const adopted = result.state;
@@ -3022,7 +3022,7 @@ test("62. create_run not_committed returns state null and takes no cutoff", asyn
   const control = cutoffControl("neutral");
   const result = await coordinate(harness, fake.runtime, { control });
   expect(result.ok).toBe(false);
-  if (!result.ok) {
+  if (!result.ok && !("waiting" in result)) {
     expect(result.reason).toBe("state_persist_failed");
   }
   expect(result.state).toBeNull();
@@ -3189,7 +3189,7 @@ test("31. a pipeline without orchestration metadata refuses the fresh run before
   const fake = fakeRuntime([{}]);
   const result = await coordinate(harness, fake.runtime);
   expect(result.ok).toBe(false);
-  if (result.ok) {
+  if (result.ok || "waiting" in result) {
     throw new Error("expected the orchestration gate refusal");
   }
   expect(result.reason).toBe("invalid_graph");

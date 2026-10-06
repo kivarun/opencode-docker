@@ -1139,10 +1139,14 @@ the existing `execution_snapshot_sha256` stays the single durable anchor.
 Durable state and the coordinator's state-type dispatch are untouched; the
 compiled roles/templates are consumed at runtime by the resume-restore
 verifier, the stage-iteration controller and the production planning chain
-(the compiled planning `plan_output` feeds the run-plan proposal), while
-the stage-wait policy is only compiled and digest-bound — no production
-path consumes it yet; a future controller will require this metadata before
-any schema-v7 dispatch.
+(the compiled planning `plan_output` feeds the run-plan proposal), and the
+stage-wait policy is consumed by the production wait entry: the
+coordinator recognizes the exact stage→planning boundary after its own
+committed transition (and on the restart path before the engine
+continues) and enters the wait through the public `enterPipelineV2Wait`
+with the policy-derived reason/actions — the coordination, the runner
+outcome and the CLI all report the controlled suspension as the exact
+waiting branch, and no automatic response or intervention loop exists.
 
 ### Compiled run-plan projection over the orchestration metadata (pure substrate, production-reachable transitively)
 
