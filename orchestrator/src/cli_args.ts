@@ -67,6 +67,16 @@ export interface ParsedPipelineReviseTaskArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineResumePlanArgs {
+  readonly kind: "resume-plan";
+  readonly runId: string;
+  readonly stageId: string;
+  readonly initialBudget: number;
+  readonly configRoot: string;
+  readonly launcherId?: string;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
@@ -74,7 +84,8 @@ export type ParsedCommand =
   | ParsedPipelineResumeArgs
   | ParsedPipelineRespondArgs
   | ParsedPipelineContinueStageArgs
-  | ParsedPipelineReviseTaskArgs;
+  | ParsedPipelineReviseTaskArgs
+  | ParsedPipelineResumePlanArgs;
 
 export function usage(): string {
   return [
@@ -110,6 +121,11 @@ export function usage(): string {
   "               (the exact 'revise_task' intervention: intent -> task revision",
   "               -> replanned iteration closure -> response -> planning",
   "               execution -> new plan revision)",
+  "  resume-plan  production pipeline v2 planning continuation: accept the settled",
+  "               planning output as the next plan revision, hand off onto the",
+  "               explicitly selected stage and resume the run in one operation",
+  "               (stage id and initial budget are explicit operator policy;",
+  "               there is no automatic planning loop)",
   "",
     "common flags:",
     "  --workspace PATH        workspace passed to 'docker-helper session create'; must exist",
@@ -268,6 +284,43 @@ export function usage(): string {
   "  derived from the authoritative durable state. It accepts no fresh-run flags",
   "  and no state-root flags.",
   "",
+  "resume-plan flags (production pipeline v2 planning continuation):",
+  "  --run-id SAFE_ID        the run id of the durable run sitting at its settled",
+  "                          planning boundary; required; a safe identifier",
+  "                          (letters, digits, '_', '.', '-', at most 128 characters)",
+  "  --stage-id SAFE_ID      the plan stage to hand the run onto; required; explicit",
+  "                          operator policy of this command (never derived from the",
+  "                          durable state); a safe identifier",
+  "  --initial-budget N      the initial iteration budget of the opened stage",
+  "                          generation; required; explicit operator policy of this",
+  "                          command (never derived from the durable state); a",
+  "                          positive decimal integer without sign, leading zeros,",
+  "                          fraction, exponent or whitespace; no default",
+  "  --config-root PATH      operator-controlled configuration root holding",
+  "                          profiles/<name>.yaml and the OpenCode configurations;",
+  "                          required; absolute path. Profiles are trusted operator",
+  "                          configuration and are loaded again by the continuation;",
+  "                          the pipeline execution identity is verified by the",
+  "                          durable digest.",
+  "  --launcher-id DHL_ID    fail unless the installed credential belongs to this launcher",
+  "  --json                  print exactly one JSON PipelineV2RunOutcome document on stdout",
+  "                          (no progress lines); worker and image-pull output is forwarded",
+  "                          to stderr; the exit code is the outcome's exit code.",
+  "",
+  "  resume-plan accepts the settled planning output as the next durable plan",
+  "  revision and hands the run onto the explicitly selected stage in one",
+  "  operation: task revisions -> plan revision -> old generation closed",
+  "  (replanned) -> new generation and iteration 1 opened -> planning",
+  "  transition committed -> the successor stage execution. The command is not",
+  "  a respond action and accepts no --action flag; it accepts no --wait-index,",
+  "  no --additional-iterations, no --task-id/--task-file/--task-body, no",
+  "  fresh-run flag and no state-root flag; every internal handoff parameter",
+  "  (the plan acceptance, the replanned stage opening, the committed planning",
+  "  transition and the resumed execution) is derived from the authoritative",
+  "  durable state by the composition controller. There is no automatic",
+  "  planning loop and no automatic stage/budget selection: both policy",
+  "  scalars are explicit operator decisions of each invocation.",
+  "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
     "    <state-root>/pipeline-runs/<run-id>/state.json",
@@ -322,10 +375,15 @@ export function usage(): string {
   "are the only user inputs of a response), 'orchestrator continue-stage'",
   "performs the continue_stage stage intervention and resumes the run in one",
   "operation (the run id, the wait index, the additional iteration count and the",
-  "configuration root are the only user inputs), and 'orchestrator revise-task'",
+  "configuration root are the only user inputs), 'orchestrator revise-task'",
   "performs the revise_task task revision intervention and resumes the run in",
   "one operation (the run id, the wait index, the task id, the task-body file",
-  "and the configuration root are the only user inputs).",
+  "and the configuration root are the only user inputs), and 'orchestrator",
+  "resume-plan' accepts the settled planning output as the next plan revision",
+  "and hands the run onto the explicitly selected stage in one operation (the",
+  "run id, the stage id, the initial budget and the configuration root are the",
+  "only user inputs; the stage id and the initial budget are explicit operator",
+  "policy and there is no automatic planning loop).",
   "",
   "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
     "input path come only from the pipeline's agent state, the worker image comes",
@@ -399,7 +457,7 @@ function parseValue(argv: string[], i: number, flag: string): { value: string; n
 }
 
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -416,6 +474,9 @@ export function parseCommand(
   }
   if (kind === "revise-task") {
     return parseReviseTaskArgs(argv);
+  }
+  if (kind === "resume-plan") {
+    return parseResumePlanArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;
@@ -1218,6 +1279,186 @@ function parseReviseTaskArgs(argv: string[]): ParsedPipelineReviseTaskArgs {
     waitIndex,
     taskId,
     taskFile,
+    configRoot,
+    launcherId,
+    json,
+  };
+}
+
+/**
+ * Parses the production pipeline v2 planning continuation command. The
+ * user-facing contract: `--run-id` and `--stage-id` (both safe-id
+ * validated), `--initial-budget` (canonical positive decimal safe
+ * integer, no default) and `--config-root` (absolute) are required
+ * singletons; `--launcher-id` and `--json` are optional singletons.
+ * `stageId` and `initialBudget` stay explicit operator policy: the CLI
+ * derives neither from the durable state, and no body or file is read.
+ * The command is not a `respond` action (no `--action` flag) and accepts
+ * no other intervention flag (`--wait-index`,
+ * `--additional-iterations`, `--task-id`, `--task-file`, `--task-body`),
+ * no fresh-run flag, no state-root flag and no internal proposal/plan/
+ * digest/intent/generation/iteration/transition/compiled-stage flag: every
+ * internal handoff parameter is derived by the composition controller from
+ * the authoritative durable state, and every unknown flag or positional
+ * argument is rejected.
+ */
+function parseResumePlanArgs(argv: string[]): ParsedPipelineResumePlanArgs {
+  let runId: string | null = null;
+  let stageId: string | null = null;
+  let initialBudget: number | null = null;
+  let configRoot: string | null = null;
+  let launcherId: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      if (runId !== null) {
+        throw new Error("--run-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      const { value, next } = parseValue(argv, i, "--stage-id");
+      if (stageId !== null) {
+        throw new Error("--stage-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--stage-id");
+      } catch (cause) {
+        throw new Error(
+          `--stage-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      stageId = value;
+      i = next;
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      const { value, next } = parseValue(argv, i, "--initial-budget");
+      if (initialBudget !== null) {
+        throw new Error("--initial-budget may be given at most once");
+      }
+      initialBudget = parsePositiveDecimalSafeInteger(value, "--initial-budget");
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      if (configRoot !== null) {
+        throw new Error("--config-root may be given at most once");
+      }
+      if (!value.startsWith("/")) {
+        throw new Error("--config-root must be an absolute path");
+      }
+      configRoot = value;
+      i = next;
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      const { value, next } = parseValue(argv, i, "--launcher-id");
+      if (!value.startsWith("dhl_")) {
+        throw new Error("--launcher-id must be a launcher ID (dhl_...)");
+      }
+      if (launcherId !== undefined) {
+        throw new Error("--launcher-id may be given at most once");
+      }
+      launcherId = value;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "resume-plan does not accept --action; the command is not a respond action and accepts no action id",
+      );
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      throw new Error(
+        "resume-plan does not accept --wait-index; the planning continuation is not a wait response",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "resume-plan does not accept --additional-iterations; the planning continuation grants no stage iterations",
+      );
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      throw new Error(
+        "resume-plan does not accept --task-id; the planning continuation revises no task",
+      );
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      throw new Error(
+        "resume-plan does not accept --task-file; the planning continuation reads no file",
+      );
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error(
+        "resume-plan does not accept --task-body; the planning continuation accepts no body",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "resume-plan does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error(
+        "resume-plan does not accept --project; the run-owned project copy already exists in the run root",
+      );
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error(
+        "resume-plan does not accept --input; the run-owned input snapshot already exists in the run root",
+      );
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error(
+        "resume-plan does not accept --workspace; the run-owned project copy is mounted from the run root",
+      );
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error(
+        "resume-plan does not accept --image; the worker image comes only from the selected profile",
+      );
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error(
+        "resume-plan does not accept --profile; the execution profiles are selected by the pipeline's agent states",
+      );
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error(
+        "resume-plan does not accept --task; there is no task input on a planning continuation",
+      );
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "resume-plan does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "resume-plan does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      // Every internal policy field (proposal/plan/digest/intent/
+      // generation/iteration/transition/compiled-stage identifiers) has no
+      // CLI flag: anything else is an unknown argument.
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for resume-plan");
+  }
+  if (stageId === null) {
+    throw new Error("--stage-id SAFE_ID is required for resume-plan");
+  }
+  if (initialBudget === null) {
+    throw new Error("--initial-budget POSITIVE_INTEGER is required for resume-plan (no default)");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABSOLUTE_PATH is required for resume-plan");
+  }
+  return {
+    kind: "resume-plan",
+    runId,
+    stageId,
+    initialBudget,
     configRoot,
     launcherId,
     json,

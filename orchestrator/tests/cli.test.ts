@@ -933,3 +933,194 @@ test("smoke and agent-smoke parsing is unchanged", () => {
   expect(() => parseCommand("smoke", ["--project=/p"])).toThrow("unknown argument: --project=/p");
   expect(() => parseCommand("agent-smoke", ["--config-root=/c", "--json"])).toThrow("unknown argument: --json");
 });
+
+// --- resume-plan (production pipeline v2 planning-run-plan continuation) -----
+
+test("resume-plan parses the exact grammar with both flag forms", () => {
+  const minimal = parseCommand("resume-plan", [
+    "--run-id", "planning-run",
+    "--stage-id", "stage-2",
+    "--initial-budget", "2",
+    "--config-root", "/cfg",
+  ]);
+  expect(minimal).toEqual({
+    kind: "resume-plan",
+    runId: "planning-run",
+    stageId: "stage-2",
+    initialBudget: 2,
+    configRoot: "/cfg",
+    launcherId: undefined,
+    json: false,
+  });
+  const full = parseCommand("resume-plan", [
+    "--run-id=planning-run",
+    "--stage-id=stage-2",
+    "--initial-budget=2",
+    "--config-root=/cfg",
+    "--launcher-id=dhl_x",
+    "--json",
+  ]);
+  expect(full).toEqual({
+    kind: "resume-plan",
+    runId: "planning-run",
+    stageId: "stage-2",
+    initialBudget: 2,
+    configRoot: "/cfg",
+    launcherId: "dhl_x",
+    json: true,
+  });
+  // both forms may be mixed per flag
+  const mixed = parseCommand("resume-plan", [
+    "--run-id", "planning-run",
+    "--stage-id=stage-2",
+    "--initial-budget", "2",
+    "--config-root=/cfg",
+  ]);
+  expect(mixed).toMatchObject({ runId: "planning-run", stageId: "stage-2", initialBudget: 2, configRoot: "/cfg" });
+});
+
+test("resume-plan accepts MAX_SAFE_INTEGER for --initial-budget", () => {
+  const parsed = parseCommand("resume-plan", [
+    "--run-id", "r",
+    "--stage-id", "s",
+    "--initial-budget", String(Number.MAX_SAFE_INTEGER),
+    "--config-root", "/cfg",
+  ]) as Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "resume-plan" }>;
+  expect(parsed.initialBudget).toBe(Number.MAX_SAFE_INTEGER);
+});
+
+test("resume-plan rejects the full invalid-number matrix for --initial-budget", () => {
+  for (const value of ["0", "-2", "+2", "02", "1.5", "1e2", " 2", "2 ", String(Number.MAX_SAFE_INTEGER + 1)]) {
+    expect(() =>
+      parseCommand("resume-plan", [
+        "--run-id", "r",
+        "--stage-id", "s",
+        "--initial-budget", value,
+        "--config-root", "/cfg",
+      ]),
+    ).toThrow(/--initial-budget/);
+  }
+});
+
+test("resume-plan rejects missing, duplicate and value-less required flags", () => {
+  const required = ["--run-id", "--stage-id", "--initial-budget", "--config-root"];
+  // every missing required flag
+  for (const missing of required) {
+    const argv = [
+      ["--run-id", "r"],
+      ["--stage-id", "s"],
+      ["--initial-budget", "2"],
+      ["--config-root", "/cfg"],
+    ]
+      .filter((pair) => pair[0] !== missing)
+      .flat();
+    expect(() => parseCommand("resume-plan", argv)).toThrow(new RegExp(missing.replace(/-/g, "\\-")));
+  }
+  // duplicates reject instead of silently last-wins
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "a", "--run-id", "b", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/cfg"]),
+  ).toThrow("--run-id may be given at most once");
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "a", "--stage-id", "b", "--initial-budget", "2", "--config-root", "/cfg"]),
+  ).toThrow("--stage-id may be given at most once");
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--initial-budget", "3", "--config-root", "/cfg"]),
+  ).toThrow("--initial-budget may be given at most once");
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/a", "--config-root", "/b"]),
+  ).toThrow("--config-root may be given at most once");
+  // a value-less required flag at the end
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root"]),
+  ).toThrow("--config-root requires a value");
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget"]),
+  ).toThrow("--initial-budget requires a value");
+});
+
+test("resume-plan rejects unsafe run/stage ids, relative or empty config roots and invalid launcher ids", () => {
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "../escape", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/cfg"]),
+  ).toThrow(/--run-id must be a safe identifier/);
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "../escape", "--initial-budget", "2", "--config-root", "/cfg"]),
+  ).toThrow(/--stage-id must be a safe identifier/);
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "..", "--initial-budget", "2", "--config-root", "/cfg"]),
+  ).toThrow(/--stage-id must be a safe identifier/);
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", "relative/config"]),
+  ).toThrow("--config-root must be an absolute path");
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", ""]),
+  ).toThrow();
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/cfg", "--launcher-id", "not-dhl"]),
+  ).toThrow("--launcher-id must be a launcher ID (dhl_...)");
+});
+
+test("resume-plan rejects --json with a value and duplicate --json", () => {
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/cfg", "--json=true"]),
+  ).toThrow("--json does not take a value");
+  expect(() =>
+    parseCommand("resume-plan", ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/cfg", "--json", "--json"]),
+  ).toThrow("--json may be given at most once");
+});
+
+test("resume-plan rejects respond, fresh-run, state-root and internal-policy flags", () => {
+  const base = ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/cfg"];
+  for (const [flag, value] of [
+    ["--action", "continue_stage"],
+    ["--wait-index", "1"],
+    ["--additional-iterations", "2"],
+    ["--task-id", "task-a"],
+    ["--task-file", "/tmp/task.md"],
+    ["--task-body", "BODY"],
+    ["--pipeline-root", "/pipelines"],
+    ["--project", "/project"],
+    ["--input", "task=/inputs/task.md"],
+    ["--workspace", "/workspace"],
+    ["--image", "ghcr.io/example/worker:1"],
+    ["--profile", "coder"],
+    ["--task", "x"],
+    ["--state-root", "/state"],
+    ["--daemon-state-root", "/daemon"],
+    ["--plan-digest", "a".repeat(64)],
+    ["--intent", "never"],
+    ["--generation-index", "1"],
+    ["--iteration-index", "1"],
+    ["--transition-index", "0"],
+    ["--compiled-stage", "stage-2"],
+  ] as ReadonlyArray<readonly [string, string]>) {
+    expect(() =>
+      parseCommand("resume-plan", [...base, flag, value]),
+      `${flag} must be rejected`,
+    ).toThrow();
+    expect(() =>
+      parseCommand("resume-plan", [...base, `${flag}=${value}`]),
+      `${flag}= form must be rejected`,
+    ).toThrow();
+  }
+});
+
+test("resume-plan rejects unknown flags and positional arguments", () => {
+  const base = ["--run-id", "r", "--stage-id", "s", "--initial-budget", "2", "--config-root", "/cfg"];
+  expect(() => parseCommand("resume-plan", [...base, "--stage"])).toThrow("unknown argument: --stage");
+  expect(() => parseCommand("resume-plan", [...base, "--stage-idx=1"])).toThrow("unknown argument: --stage-idx=1");
+  expect(() => parseCommand("resume-plan", [...base, "stray"])).toThrow("unknown argument: stray");
+});
+
+test("usage documents the production pipeline v2 resume-plan command", () => {
+  const text = usage();
+  expect(text).toContain("resume-plan  production pipeline v2 planning continuation: accept the settled");
+  expect(text).toContain("resume-plan flags (production pipeline v2 planning continuation)");
+  expect(text).toContain("--stage-id SAFE_ID");
+  expect(text).toContain("--initial-budget N");
+  expect(text).toContain("operator policy of this command");
+  expect(text).toContain("there is no automatic planning loop)");
+  expect(text).toContain("planning loop and no automatic stage/budget selection");
+  expect(text).toContain("a respond action and accepts no --action flag");
+  expect(text).toContain("resume-plan' accepts the settled planning output");
+  expect(text).toContain("the stage id and the initial budget are explicit operator");
+});

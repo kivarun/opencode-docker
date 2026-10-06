@@ -463,16 +463,18 @@ revisePipelineV2Task(
   dispatch; late post-cutoff signals change nothing (shared with
   resume/continue-stage).
 
-## The production planning-run-plan runner API (implemented, not wired)
+## The production planning-run-plan runner API (implemented, wired into the CLI as `orchestrator resume-plan`)
 
 `orchestrator/src/pipeline_v2_runner.ts` adds the dedicated planning-run-plan
 entrypoint `resumePipelineV2PlanningRunPlan(options, deps)`. It is the
 production-shaped way to drive an already durable run from its
 settled-but-unbound planning acceptance boundary through the composition of
-the planning-run-plan handoff and the coordinator resume — but it is still
-not wired into the CLI: `main.ts`, `cli_args.ts` and the default pipeline
-stay untouched, and there is no automatic planning loop anywhere in this
-entrypoint.
+the planning-run-plan handoff and the coordinator resume, and it is wired
+into the CLI as `orchestrator resume-plan` (see the next section). The
+automatic planning loop, the automatic stage/budget selection and the
+default-pipeline policy stay unwired: every invocation carries its two
+explicit policy scalars, and the composed controller runs exactly one
+handoff followed by exactly one coordinator resume.
 
 - The caller contract `PipelineV2PlanningRunPlanOptions` is exactly
   `{runId, stageId, initialBudget, configRoot, launcherId?}`. The two
@@ -534,6 +536,69 @@ entrypoint.
   SIGTERM 143 at the authority boundary with zero durable writes), and the
   export/source pins (exactly five runtime keys; one existing-run core
   with the single new composed call).
+
+## The production planning continuation CLI (`orchestrator resume-plan`)
+
+The CLI exposes `orchestrator resume-plan` — the production pipeline v2
+planning continuation command wired through `runCli`. It parses
+
+    resume-plan --run-id SAFE_ID --stage-id SAFE_ID --initial-budget N \
+                --config-root ABS [--launcher-id dhl_...] [--json]
+
+into `ParsedPipelineResumeArgs`-shaped `ParsedPipelineResumePlanArgs`
+(`kind: "resume-plan"`); all four value options are required singletons and
+support both the `--flag value` and `--flag=value` forms; `--json` is a
+flag-only singleton.
+
+- Grammar: `--run-id` and `--stage-id` against the shared safe-id grammar
+  (letters, digits, `_`, `.`, `-`, at most 128 characters), `--initial-budget`
+  against the same canonical positive decimal safe-integer grammar as
+  `--wait-index`/`--additional-iterations` (no sign, leading zeros, fraction,
+  exponent or whitespace; `Number.MAX_SAFE_INTEGER` accepted), `--config-root`
+  a non-empty absolute path, `--launcher-id` the `dhl_...` grammar.
+- `stageId` and `initialBudget` are explicit operator policy of every
+  invocation: the CLI derives neither from the durable state, reads no body
+  or file, and there is no automatic planning loop and no automatic
+  stage/budget selection.
+- The command is not a `respond` action and accepts no `--action` flag; it
+  also rejects `--wait-index`, `--additional-iterations`,
+  `--task-id`/`--task-file`/`--task-body`, every fresh-run flag
+  (`--pipeline-root`, `--project`, `--input`, `--workspace`, `--image`,
+  `--profile`, `--task`), the state-root flags and every internal
+  proposal/plan/digest/intent/generation/iteration/transition/compiled-stage
+  flag, plus every unknown flag or positional argument. Parse failures exit
+  2 with the usage text before any resolver, auth, filesystem or runner
+  side effect.
+- Dispatcher order (the existing production path only): parse →
+  `resolvePipelineV2CliConfiguration` (the state-root projection first,
+  then the helper configuration; any failure is exit 2 with the usage text
+  and the runner never called) → `pipelineV2CommandDeps` (the single
+  `SubprocessCliRunner` instance and the shared v1 signal wiring; in JSON
+  mode only the inherit-asked CLI calls are switched to the streaming
+  stderr mode) → exactly one `resumePipelineV2PlanningRunPlan` invocation
+  with the exact five-field options mapping → the shared
+  `reportPipelineV2Outcome` with the label `resume-plan`. No second
+  deps/runtime/signal/configuration path exists.
+- Reporting: human mode prints one content-free stderr summary line
+  (`orchestrator: resume-plan ok (...)` / `orchestrator: resume-plan failed
+  (...)` with the reason when the run root exists; no summary line before
+  the run root); `--json` writes exactly one `PipelineV2RunOutcome` document
+  plus a trailing newline to stdout; the process exits with the outcome's
+  exit code (0/1/130/143 pass through unchanged).
+- The pipeline comes only from the durable `state.pipeline.bundle_root`;
+  the CLI passes only the five runner option fields — no pipeline object,
+  compiled plan, proposal, accepted output, handoff result or snapshot ever
+  travels through the CLI.
+- Tests: `tests/cli.test.ts` gained the resume-plan parser battery (the
+  happy paths with both flag forms, the missing/duplicate/value-less
+  matrix, the invalid-number matrix, unsafe ids and roots, `--json=value`,
+  every banned flag in both forms, unknown flags and positionals, and the
+  usage pins); `tests/cli_main.test.ts` gained the dispatcher battery
+  (the exact single dispatch and options mapping, no other production API
+  called, the parse/config error precedence, the human/JSON reporting
+  matrix, exit-code passthrough, the command-list pin, and the end-to-end
+  proof through the real production runner over the two-cycle planning
+  prefix).
 
 ## The production pipeline v2 wait-response CLI (`orchestrator respond`)
 

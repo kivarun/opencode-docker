@@ -39,6 +39,16 @@
  *   internal intervention parameter is derived from the authoritative
  *   durable state. The file path and the body never appear in the
  *   outcome, the durable state or any diagnostic.
+ * - `resume-plan` — the production planning continuation: the same
+ *   protected CLI-configuration boundary and per-call dependency assembly,
+ *   invoking `resumePipelineV2PlanningRunPlan` exactly once. The run id,
+ *   the stage id, the initial budget and the configuration root are the
+ *   only user inputs; the stage id and the initial budget are explicit
+ *   operator policy (never derived from the durable state), the command is
+ *   not a respond action and accepts no `--action` flag, and every
+ *   internal handoff parameter is derived by the composition controller
+ *   from the authoritative durable state. There is no automatic planning
+ *   loop and no automatic stage/budget selection.
  *
  * The dispatcher is testable through per-call dependency injection
  * (`runCli(argv, io)`); no module-global mutable state exists.
@@ -62,6 +72,7 @@ import {
 import {
   continuePipelineV2Stage,
   resumePipelineV2,
+  resumePipelineV2PlanningRunPlan,
   revisePipelineV2Task,
   runPipelineV2,
   type PipelineV2RunOutcome,
@@ -90,6 +101,7 @@ export interface CliIo {
   resumePipelineV2: typeof resumePipelineV2;
   continuePipelineV2Stage: typeof continuePipelineV2Stage;
   revisePipelineV2Task: typeof revisePipelineV2Task;
+  resumePipelineV2PlanningRunPlan: typeof resumePipelineV2PlanningRunPlan;
   respondPipelineV2Wait: typeof respondPipelineV2Wait;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
@@ -121,6 +133,7 @@ function productionCliIo(): CliIo {
     resumePipelineV2,
     continuePipelineV2Stage,
     revisePipelineV2Task,
+    resumePipelineV2PlanningRunPlan,
     respondPipelineV2Wait,
     runSmoke,
     runAgentSmoke,
@@ -154,7 +167,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -166,7 +179,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "resume" &&
     command !== "respond" &&
     command !== "continue-stage" &&
-    command !== "revise-task"
+    command !== "revise-task" &&
+    command !== "resume-plan"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -218,6 +232,15 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // dependency assembly, and exactly one `revisePipelineV2Task`
     // invocation.
     return await runPipelineV2ReviseTaskCommand(parsed, io);
+  }
+  if (parsed.kind === "resume-plan") {
+    // The production pipeline v2 planning continuation: the same
+    // protected CLI-configuration boundary and per-call dependency
+    // assembly, then exactly one `resumePipelineV2PlanningRunPlan`
+    // invocation. The stage id and the initial budget stay explicit
+    // operator policy; every internal handoff parameter is derived by the
+    // composition controller.
+    return await runPipelineV2ResumePlanCommand(parsed, io);
   }
 
   const config = io.resolveHelperConfig(io.baseEnv);
@@ -466,6 +489,44 @@ async function runPipelineV2ReviseTaskCommand(
 }
 
 /**
+ * The production pipeline v2 planning continuation command: parse already
+ * done. The same protected CLI-configuration boundary (the state-root
+ * projection first, then the helper configuration) and the same per-call
+ * dependency assembly as `run`/`resume`/`continue-stage`/`revise-task`,
+ * then exactly one `resumePipelineV2PlanningRunPlan` invocation. The run
+ * id, the stage id, the initial budget and the configuration root are the
+ * only user inputs; the stage id and the initial budget stay explicit
+ * operator policy and are never derived from the durable state; the
+ * command is not a respond action and accepts no `--action` flag; every
+ * internal handoff parameter is derived by the composition controller from
+ * the authoritative durable state.
+ */
+async function runPipelineV2ResumePlanCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "resume-plan" }>,
+  io: CliIo,
+): Promise<number> {
+  const configuration = await resolvePipelineV2CliConfiguration(io);
+  if (configuration === null) {
+    return 2;
+  }
+
+  const deps = pipelineV2CommandDeps(parsed.json, configuration, io);
+
+  const outcome: PipelineV2RunOutcome = await io.resumePipelineV2PlanningRunPlan(
+    {
+      runId: parsed.runId,
+      stageId: parsed.stageId,
+      initialBudget: parsed.initialBudget,
+      configRoot: parsed.configRoot,
+      launcherId: parsed.launcherId,
+    },
+    deps,
+  );
+
+  return reportPipelineV2Outcome("resume-plan", parsed.json, outcome, io);
+}
+
+/**
  * The production pipeline v2 wait-response command: parse already done.
  * Only the state-root projection is resolved inside the protected
  * CLI-configuration boundary (the same env resolver `run` and `resume`
@@ -518,7 +579,7 @@ async function runPipelineV2RespondCommand(
 }
 
 function reportPipelineV2Outcome(
-  command: "run" | "resume" | "continue-stage" | "revise-task",
+  command: "run" | "resume" | "continue-stage" | "revise-task" | "resume-plan",
   json: boolean,
   outcome: PipelineV2RunOutcome,
   io: CliIo,
