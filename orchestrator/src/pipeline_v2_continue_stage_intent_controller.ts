@@ -11,7 +11,8 @@ import {
 
 /**
  * Production-neutral acceptance controller for `continue_stage_intent`
- * wait intents (unwired).
+ * wait intents (production-reachable transitively through the
+ * continue-stage intervention controller).
  *
  * The public API accepts one provenance-registered prepared
  * `continue_stage_intent` of the run-plan manifest substrate, binds it

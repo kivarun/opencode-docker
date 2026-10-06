@@ -33,7 +33,9 @@ import type { PipelineV2RunCommand, PipelineV2RunState } from "./pipeline_v2_sta
 
 /**
  * Production-neutral restart-aware composition controller for the first
- * half of the `revise_task` user intervention (unwired).
+ * half of the `revise_task` user intervention
+ * (production-reachable transitively through the revise-task resume
+ * handoff).
  *
  * The public API owns the minimal user-policy contract
  * `{runId, waitIndex, taskId, taskBody}` plus the runtime resources
@@ -107,11 +109,10 @@ import type { PipelineV2RunCommand, PipelineV2RunState } from "./pipeline_v2_sta
  * JSON, digest values, paths, environment values and credentials never
  * enter them; hostile extra options fields are never read.
  *
- * The controller ends its work at the active/running planning boundary:
- * the architect execution, the next plan revision, the replanned
- * generation/stage/transition opening and the resume are later increments
- * and stay unwired, as do coordinator/runner/CLI wiring, the second half
- * of the revise flow, migrations/API/T3 and multi-process locking.
+ * The controller ends its work at the active/running planning boundary;
+ * the architect execution, the next plan revision and the replanned
+ * generation/stage/transition opening and resume are the revise-task
+ * resume handoff's and `resume-plan`'s.
  */
 
 export type PipelineV2ReviseTaskInterventionControllerFailureReason =

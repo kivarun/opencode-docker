@@ -10,7 +10,8 @@ import {
 
 /**
  * Production-neutral completion controller for the continue-stage
- * intervention (unwired).
+ * intervention (production-reachable transitively through the
+ * continued-stage composition controller).
  *
  * The public API composes the two existing authoritative steps in the
  * fixed order — `applyPipelineV2ContinueStageGrant` (the grant and the

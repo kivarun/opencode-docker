@@ -2103,7 +2103,7 @@ validation stays unconnected, and no TASK/stage/profile/budget fields are
 added to the durable state to imitate a policy owner that does not exist
 yet.
 
-### Wait request/response manifests (pure substrate, not wired)
+### Wait request/response manifests (pure substrate; the response half production-reachable through `orchestrator respond` and the continue/revise compositions, the request-entry half still unwired)
 
 `orchestrator/src/pipeline_v2_wait_manifest.ts` fixes the canonical
 content-free format that binds user-facing wait requests and responses to
@@ -2134,7 +2134,7 @@ next substrate below; reading the user response from a file,
 coordinator/runner/CLI wiring, resume, P01 validation, and
 durable-state migrations stay out of scope.
 
-#### Wait manifest filesystem publication (pure substrate, not wired)
+#### Wait manifest filesystem publication (pure substrate; the response half production-reachable through the wait controller and `orchestrator respond`, the request-entry half still unwired)
 
 `orchestrator/src/pipeline_v2_wait_store.ts` publishes the manifests
 under the fixed flat layout
@@ -2794,7 +2794,7 @@ handoff's committed planning transition). Still unwired: retries beyond
 the crash-retry windows, migrations/API/T3.
 
 
-### Continue-stage intent acceptance controller (production-neutral, not wired)
+### Continue-stage intent acceptance controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_continue_stage_intent_controller.ts`
 (public, with the internal core
@@ -2849,12 +2849,13 @@ rolled back. Runtime export surface is exactly
 state_persist_failed`, last authoritative `state`) and
 `acceptPipelineV2ContinueStageIntent({runRoot, sink, intent})`; the
 deep-frozen content-free result is `{wait_index, intent_sha256,
-state}`. Not implemented (stays unwired): `iteration_grant_recorded`,
-the wait-bound `stage_iteration_closed {by: "grant"}`, the response
-manifest and `wait_response_recorded`, `revise_task_intent`, task
-revision publication/acceptance, the continue/revise action policy,
-automatic resume, coordinator/runner/CLI wiring, schema changes,
-migrations/API/T3, multi-process locking.
+state}`. Production-reachable transitively through the continue-stage
+intervention controller (reached from the runner `continuePipelineV2Stage`
+and `orchestrator continue-stage`); the grant, the wait-bound closure and
+the response completion are implemented by the controllers below.
+Still unwired: the automatic choice of the wait action and of
+`additional_iterations`, the automatic intervention loop, the
+default-pipeline bundle, migrations/API/T3 and multi-process locking.
 
 ### Planning-run-plan handoff controller (restart-aware, production-neutral, not directly wired but production-reachable transitively)
 
@@ -3117,7 +3118,7 @@ stage/budget selection policy, automatic resume, schema/reducer changes,
 migrations/API/T3 and multi-process locking.
 
 
-### Continue-stage grant application controller (production-neutral, not wired)
+### Continue-stage grant application controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_continue_stage_grant_controller.ts`
 (public, with the internal core
@@ -3174,14 +3175,15 @@ settled wait boundary); later graph progress (a started or fully
 executed and transitioned execution after the response, an open next
 iteration, a closed or foreign generation, another wait) is a typed
 `lifecycle_conflict`, never a retry of this boundary.
-Not implemented (stays unwired): the response completion policy (the
-completion controller below records the response through the existing
-generic wait controller), opening the next iteration, automatic resume,
-`revise_task_intent`, the task/plan revision replanning chain, the
-action policy, coordinator/runner/CLI wiring, schema changes,
-migrations/API/T3, multi-process locking.
+Production-reachable transitively through the continue-stage completion
+controller (reached from the runner `continuePipelineV2Stage` and
+`orchestrator continue-stage`); the response completion and the next
+iteration opening are implemented by the controllers below.
+Still unwired: the automatic choice of the wait action and of
+`additional_iterations`, the automatic intervention loop, the
+default-pipeline bundle, migrations/API/T3 and multi-process locking.
 
-### Continue-stage completion controller (production-neutral, not wired)
+### Continue-stage completion controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_continue_stage_completion_controller.ts`
 (public, with the internal core
@@ -3242,13 +3244,15 @@ file published but not durable — adopted and committed once) and C4
 active/answered S2 recognition and the wait controller's durable
 response recognition both return zero dispatch and restore the
 publications). Conflicts surface as the existing controllers' typed
-errors unchanged; nothing is ever rewritten or rolled back. Not
-implemented (stays unwired): the intent selection policy, the choice of
-`additional_iterations`, `revise_task_intent`, the task/plan revision
-replanning chain, automatic resume, coordinator/runner/CLI wiring,
-schema changes, migrations/API/T3, multi-process locking.
+errors unchanged; nothing is ever rewritten or rolled back.
+Production-reachable transitively through the continued-stage
+composition controller (reached from the runner `continuePipelineV2Stage`
+and `orchestrator continue-stage`). Still unwired: the automatic choice
+of the wait action and of `additional_iterations`, the automatic
+intervention loop, the default-pipeline bundle, migrations/API/T3 and
+multi-process locking.
 
-### Continued-stage composition controller (production-neutral, not wired)
+### Continued-stage composition controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_continued_stage_controller.ts` (public,
 with the internal core
@@ -3381,14 +3385,15 @@ scan (nine imports: the two composed facades, the grant error class,
 freeze, identity compare, compiled plan, manifests, provenance, state;
 no reducer/validator/store/filesystem/coordinator/runner/CLI imports; no
 second parser/serializer/digest builder/registry; no message parsing).
-Still unwired: the action/`additional_iterations` selection policy, the
-graph transition on the opened iteration and the next stage execution,
-model profile replacement, automatic resume,
-coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
-migrations/API/T3, multi-process locking (the revise-task branch is
-wired separately through `orchestrator revise-task`).
+Production-reachable transitively through the continue-stage
+intervention controller (reached from the runner `continuePipelineV2Stage`
+and `orchestrator continue-stage`); the graph transition and the next
+stage execution are the coordinator resume's. Still unwired: the
+action/`additional_iterations` selection policy, model profile
+replacement, the automatic intervention loop, the default-pipeline
+bundle, migrations/API/T3 and multi-process locking.
 
-### Restart-aware continue-stage intervention controller (production-neutral, not wired)
+### Restart-aware continue-stage intervention controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_continue_stage_intervention_controller.ts`
 (public, with the internal core
@@ -3572,20 +3577,22 @@ source scan (only the three facades plus the
 compiled/provenance/identity/scalar/state/freeze helpers; no
 reducer/validator/store/filesystem; no second
 parser/serializer/digest builder/registry; no coordinator/runner/CLI; no
-message parsing; no mutable seam). Still unwired: the
-action/`additional_iterations` selection policy, the graph transition on
-the opened iteration and the next stage execution, automatic resume,
-coordinator/runner/CLI/default-pipeline wiring (the revise-task branch
-is wired separately through `orchestrator revise-task`, not through
-this controller), schema/reducer changes, migrations/API/T3 and
-multi-process locking.
+message parsing; no mutable seam).
+Production-reachable transitively through the continue-stage resume
+handoff (`resumePipelineV2RunAfterContinueStageIntervention`, the runner
+`continuePipelineV2Stage`, CLI `orchestrator continue-stage`). Still
+unwired: the action/`additional_iterations` selection policy, the
+automatic intervention loop, the default-pipeline bundle,
+migrations/API/T3 and multi-process locking.
 
-### Continue-stage intervention → resume handoff controller (production-neutral, not wired)
+### Continue-stage intervention → resume handoff controller (production-neutral, wired into the production runner)
 
 `orchestrator/src/pipeline_v2_continue_stage_resume_controller.ts`
 (public, with the internal core
 `pipeline_v2_continue_stage_resume_controller_internal.ts`) is the
-unwired composition of the full `continue_stage` handoff — the
+wired composition of the full `continue_stage` handoff (the runner
+`continuePipelineV2Stage` and CLI `orchestrator continue-stage` call it
+directly) — the
 restart-aware intervention followed by the coordinator's resume
 entrypoint in one fixed sequence:
 
@@ -3699,14 +3706,16 @@ the two facades plus provenance/scalar/state/types; the canonical
 failure-reason list is the single state-module import, no
 reducer/writer/compiler/manifest loader/fs/CLI/runner calls; no second
 parser/serializer, `JSON.stringify`, digest machinery or new registries).
+Production-reachable directly: the runner `continuePipelineV2Stage`
+(CLI `orchestrator continue-stage`) calls exactly this facade.
 Still unwired: the default pipeline bundle, the
-action/`additional_iterations` selection policy, automatic resume,
-schema/reducer changes, migrations/API/T3 and multi-process locking
+action/`additional_iterations` selection policy, the automatic
+intervention loop, migrations/API/T3 and multi-process locking
 (the revise-task branch is wired separately through the revise-task
 runner entrypoint and `orchestrator revise-task`, not through this
 controller).
 
-### Revise-task intent acceptance controller (production-neutral, not wired)
+### Revise-task intent acceptance controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_revise_task_intent_controller.ts`
 (public, with the internal core
@@ -3795,13 +3804,14 @@ candidateTaskRevision})`; the internal core module exports exactly
 `{wait_index, intent_sha256, task_id, task_revision, task_sha256,
 state}`. Production-reachable transitively: the revise-task intervention
 controller (called by the runner `revisePipelineV2Task` / CLI
-`orchestrator revise-task`) invokes this controller. Not implemented
-(stays unwired): the revise/continue action policy, the iteration
-closure, the wait response recording, task/plan replanning, the next
-plan revision, opening the next iteration, automatic resume, schema
-changes, migrations/API/T3, multi-process locking.
+`orchestrator revise-task`) invokes this controller; the closure, the
+response recording and the replanning are implemented by the controllers
+below. Still unwired: the automatic choice of `revise_task` versus
+`continue_stage`, the automatic selection of the task id and the revised
+task body, the automatic intervention loop, the default-pipeline bundle,
+migrations/API/T3 and multi-process locking.
 
-### Revise-task durable closure controller (production-neutral, not wired)
+### Revise-task durable closure controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_revise_task_closure_controller.ts`
 (public facade) + `pipeline_v2_revise_task_closure_controller_internal.ts`
@@ -3883,17 +3893,16 @@ with one durable closure and exactly one revision increment. This
 increment does not publish or record a wait response, does not create a
 new task or plan revision, does not close the generation, does not open
 a new generation or iteration, does not run the architect/replanning
-execution, does not resume, does not change the action policy or select
-intents, and is not wired into the production coordinator/runner/CLI.
+execution, does not resume, and does not change the action policy or
+select intents; its only durable effect is the closure itself.
 Production-reachable transitively: the revise-task completion controller
 (and through it the intervention controller invoked by the runner
 `revisePipelineV2Task` / CLI `orchestrator revise-task`) calls this
-controller. Still unwired: the wait response publication, task/plan
-replanning, the next generation/iteration opening, the
-architect/replanning execution, resume, the action policy and intent
-selection, schema changes, migrations/API/T3, multi-process locking.
+controller. Still unwired: the automatic choice of the wait action, the
+automatic intervention loop, the default-pipeline bundle,
+migrations/API/T3 and multi-process locking.
 
-### Revise-task completion controller (production-neutral, not wired)
+### Revise-task completion controller (production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_revise_task_completion_controller.ts`
 (public facade) + `pipeline_v2_revise_task_completion_controller_internal.ts`
@@ -3996,13 +4005,13 @@ getter-count/mutation-isolation/throwing-getter batteries, content-free
 diagnostics, both export surfaces, and the source scan. Production-reachable
 transitively: the revise-task intervention controller invoked by the runner
 `revisePipelineV2Task` / CLI `orchestrator revise-task` calls this
-controller. Still unwired: the intent selection policy, the
-architect/replanning execution, the acceptance of the next plan revision,
-opening the next generation/iteration, automatic resume, default-pipeline
-wiring, schema changes, migrations/API/T3, multi-process locking.
+controller. Still unwired: the automatic choice of the wait action, the
+automatic task/body selection, the automatic intervention loop, the
+default-pipeline bundle, migrations/API/T3 and multi-process locking.
 
-- Replanned-generation controller (production-neutral, implemented, **not
-wired**): `orchestrator/src/pipeline_v2_replanned_generation_controller.ts`
+- Replanned-generation controller (production-neutral, implemented,
+**production-reachable transitively**):
+`orchestrator/src/pipeline_v2_replanned_generation_controller.ts`
 (public facade) + `pipeline_v2_replanned_generation_controller_internal.ts`
 (internal core) is the durable bridge that closes the previous stage
 generation after the next plan revision has been accepted — the full
@@ -4019,8 +4028,8 @@ authority. The controller performs no filesystem work: it never runs the
 architect, never builds or accepts a plan candidate, never publishes any
 manifest, never opens a new generation or iteration, never selects a
 stage or a budget, never commits a graph transition, never resumes the
-run, and is not wired into the coordinator, the runner, the CLI or the
-default pipeline. Capture and provenance ordering (fail-closed, tested):
+run; production reachability is through the replanned-stage composition
+controller. Capture and provenance ordering (fail-closed, tested):
 the options shape → `sink` → `intent` → `compiledPlan` each read exactly
 once → the sink's `poisoned`, `dispatch` and initial `snapshot` members
 each captured exactly once as opaque references with `dispatch` bound to
@@ -4187,16 +4196,14 @@ dispatch error identity, content-free diagnostics, both export surfaces,
 and the source scan (one validator called twice, the reducer only for
 the pre-check, no filesystem/store/publisher/serializer/digest-builder/
 coordinator/runner/CLI imports, no mutable seam and no new registry).
-Still unwired: the action/intent selection policy, the architect worker
-output parsing, plan candidate construction, the plan acceptance
-controller (already implemented, still not called from a policy layer),
-opening the next generation/iteration (the replanned-stage composition
-controller below), stage selection and the
-initial-budget policy, the graph transition commit, automatic resume,
-coordinator/runner/CLI/default-pipeline wiring, schema changes,
+Production-reachable transitively through the replanned-stage
+composition controller (reached from the planning-run-plan handoff, the
+runner and the CLI). Still unwired: the action/intent selection policy,
+the architect worker output parsing, stage selection and the
+initial-budget policy, automatic resume, the default-pipeline bundle,
 migrations/API/T3, multi-process locking.
 
-### Revise-task intervention controller (restart-aware, production-neutral, not wired)
+### Revise-task intervention controller (restart-aware, production-neutral, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_revise_task_intervention_controller.ts`
 (public facade) +
@@ -4270,9 +4277,10 @@ the missing suffix (the failed attempt's already-committed commands
 stay durable and count toward the final revision), two identical racing
 interventions converge to one durable state with exactly one record of
 each step, and nothing is ever rolled back. The controller ends its
-work at the active/running planning boundary: the architect execution,
+work at the active/running planning boundary; the architect execution,
 the next plan revision, the replanned generation/stage/transition
-opening and the resume are later increments and stay unwired. Tests:
+opening and the resume are the revise-task resume handoff's and
+`resume-plan`'s. Tests:
 `orchestrator/tests/pipeline_v2_revise_task_intervention_controller.test.ts`
 (50 tests) cover the honest C0 on a reopened run (the exact
 four-command suffix, revision +4, the loader round-trip), the R1–R4
@@ -4319,8 +4327,10 @@ mutable seam), and the invalid-options battery.
 
 `orchestrator/src/pipeline_v2_revise_task_resume_controller.ts`
 (public, with the internal core
-`pipeline_v2_revise_task_resume_controller_internal.ts`) is the unwired
-composition of the full `revise_task` handoff — the restart-aware
+`pipeline_v2_revise_task_resume_controller_internal.ts`) is the wired
+composition of the full `revise_task` handoff (the runner
+`revisePipelineV2Task` and CLI `orchestrator revise-task` call it
+directly) — the restart-aware
 revise-task intervention followed by the coordinator's resume entrypoint
 in one fixed sequence:
 

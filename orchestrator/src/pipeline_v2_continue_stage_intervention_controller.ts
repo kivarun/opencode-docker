@@ -7,7 +7,9 @@ import {
 
 /**
  * Production-neutral restart-aware continue-stage intervention controller
- * for the full `continue_stage` user intervention (unwired).
+ * for the full `continue_stage` user intervention
+ * (production-reachable transitively through the continue-stage resume
+ * handoff).
  *
  * The public API connects the three existing authoritative layers into
  * one intervention that survives a process restart: it accepts the
@@ -42,10 +44,10 @@ import {
  * `pipeline_v2_continue_stage_intervention_controller_internal.ts`.
  *
  * Not implemented (stays unwired): the action/`additional_iterations`
- * selection policy, the revise-task branch (`revise_task_intent`), the
- * graph transition on the opened iteration and the next stage execution,
- * automatic resume, coordinator/runner/CLI/default-pipeline wiring,
- * schema/reducer changes, migrations/API/T3 and multi-process locking.
+ * selection policy, the automatic intervention loop, the default-pipeline
+ * bundle, migrations/API/T3 and multi-process locking (the revise-task
+ * branch is the wired `orchestrator revise-task` command's; the graph
+ * transition and the next stage execution are the coordinator resume's).
  */
 export { PipelineV2ContinueStageInterventionControllerError } from "./pipeline_v2_continue_stage_intervention_controller_internal.ts";
 export type {

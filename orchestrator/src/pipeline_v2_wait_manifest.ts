@@ -1,5 +1,8 @@
 /**
- * Pure wait request/response manifest contract for pipeline v2 (unwired).
+ * Pure wait request/response manifest contract for pipeline v2 (the
+ * response half is production-reachable through `orchestrator respond`
+ * and the continue/revise compositions; the request-entry half stays
+ * unwired).
  *
  * This module fixes the canonical content-free format of the user-facing
  * wait request and the user's accepted response. The request is what a

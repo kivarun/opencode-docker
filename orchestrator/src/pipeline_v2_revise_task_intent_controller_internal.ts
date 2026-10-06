@@ -31,7 +31,8 @@ import type {
 
 /**
  * Production-neutral acceptance controller for `revise_task_intent` wait
- * intents (unwired).
+ * intents (production-reachable transitively through the revise-task
+ * intervention controller).
  *
  * The controller accepts one provenance-registered prepared wait intent
  * (the exact deep-frozen object of the run-plan manifest substrate, and
@@ -170,11 +171,10 @@ import type {
  * env values or credentials); errors are never classified from message
  * text; unexpected causes propagate unchanged.
  *
- * Not implemented (stays unwired): the revise/continue action policy,
- * the iteration closure, the wait response recording, task/plan
- * replanning, the next plan revision, opening the next iteration,
- * automatic resume, coordinator/runner/CLI wiring, schema changes,
- * migrations/API/T3 and multi-process locking.
+ * Not implemented (stays unwired): the automatic choice of `revise_task`
+ * versus `continue_stage`, the automatic selection of the task id and the
+ * revised task body, the automatic intervention loop, the default-pipeline
+ * bundle, migrations/API/T3 and multi-process locking.
  */
 
 export type PipelineV2ReviseTaskIntentControllerFailureReason =

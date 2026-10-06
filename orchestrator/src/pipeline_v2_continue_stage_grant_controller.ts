@@ -9,7 +9,8 @@ import {
 
 /**
  * Production-neutral application controller for the continue-stage
- * iteration grant (unwired).
+ * iteration grant (production-reachable transitively through the
+ * continue-stage completion controller).
  *
  * The public API is the durable step that follows
  * `acceptPipelineV2ContinueStageIntent`: for an already durably accepted

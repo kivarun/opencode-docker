@@ -1,6 +1,8 @@
 /**
  * Production-neutral composition of the full `continue_stage` handoff
- * (unwired): the restart-aware continue-stage intervention followed by the
+ * (wired into the production runner through `continuePipelineV2Stage`
+ * and `orchestrator continue-stage`): the restart-aware continue-stage
+ * intervention followed by the
  * coordinator's resume entrypoint.
  *
  * This controller is the single layer that binds the two existing
@@ -88,9 +90,9 @@
  * (types are not runtime keys).
  *
  * Not implemented (stays unwired): the action/`additional_iterations`
- * selection policy, the revise-task branch (`revise_task_intent`), the
- * runner, the CLI, the default pipeline bundle, automatic resume, schema/
- * reducer changes, migrations/API/T3 and multi-process locking.
+ * selection policy, the automatic intervention loop, the default pipeline
+ * bundle, migrations/API/T3 and multi-process locking (the revise-task
+ * branch is the wired `orchestrator revise-task` command's).
  */
 import { isAbsolute } from "node:path";
 import {

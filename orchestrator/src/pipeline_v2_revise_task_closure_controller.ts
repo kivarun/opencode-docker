@@ -9,7 +9,8 @@ import {
 
 /**
  * Production-neutral durable closure controller for an already accepted
- * `revise_task_intent` (unwired).
+ * `revise_task_intent` (production-reachable transitively through the
+ * revise-task completion controller).
  *
  * The public API is the durable step of the revise flow: for an already
  * durably accepted provenance-registered prepared `revise_task_intent`

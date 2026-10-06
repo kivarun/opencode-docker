@@ -25,7 +25,8 @@ import type { PipelineV2ContinueStageIntentManifest } from "./pipeline_v2_run_pl
 
 /**
  * Production-neutral acceptance controller for `continue_stage_intent`
- * wait intents (unwired).
+ * wait intents (production-reachable transitively through the
+ * continue-stage intervention controller).
  *
  * The controller accepts one provenance-registered prepared wait intent
  * (the exact deep-frozen object of the run-plan manifest substrate, and
@@ -86,12 +87,10 @@ import type { PipelineV2ContinueStageIntentManifest } from "./pipeline_v2_run_pl
  * JSON, paths, bodies, env values or credentials); unexpected causes
  * propagate unchanged without message parsing.
  *
- * Not implemented (stays unwired): `iteration_grant_recorded`, the
- * wait-bound `stage_iteration_closed {by: "grant"}`, the response
- * manifest and `wait_response_recorded`, `revise_task_intent`, task
- * revision publication/acceptance, the continue/revise action policy,
- * automatic resume, coordinator/runner/CLI wiring, schema changes,
- * migrations/API/T3 and multi-process locking.
+ * Not implemented (stays unwired): the automatic choice of the wait
+ * action and of `additional_iterations`, the automatic intervention loop,
+ * the default-pipeline bundle, migrations/API/T3 and multi-process
+ * locking.
  */
 
 export type PipelineV2ContinueStageIntentControllerFailureReason =

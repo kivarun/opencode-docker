@@ -7,7 +7,9 @@ import type { PipelineV2ResumeCoordinationResult } from "./pipeline_v2_coordinat
 
 /**
  * Production-neutral composition of the full `revise_task` handoff
- * (unwired): the restart-aware revise-task intervention followed by the
+ * (wired into the production runner through `revisePipelineV2Task` and
+ * `orchestrator revise-task`): the restart-aware revise-task
+ * intervention followed by the
  * coordinator's resume entrypoint.
  *
  * The public API composes exactly the two existing authoritative facades —
@@ -40,10 +42,9 @@ import type { PipelineV2ResumeCoordinationResult } from "./pipeline_v2_coordinat
  * capture order and verification contracts are documented in
  * `pipeline_v2_revise_task_resume_controller_internal.ts`.
  *
- * Not implemented (stays unwired): the revise-task intervention selection
- * policy, the runner, the CLI, the default pipeline bundle, automatic
- * resume, schema/reducer changes, migrations/API/T3 and multi-process
- * locking.
+ * Not implemented (stays unwired): the revise-task selection policy (the
+ * caller passes the taskId/taskBody), the default pipeline bundle,
+ * migrations/API/T3 and multi-process locking.
  */
 export { PipelineV2ReviseTaskResumeControllerError } from "./pipeline_v2_revise_task_resume_controller_internal.ts";
 export type {

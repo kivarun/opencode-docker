@@ -19,7 +19,8 @@ import type {
 
 /**
  * Production-neutral completion controller for the continue-stage
- * intervention (unwired).
+ * intervention (production-reachable transitively through the
+ * continued-stage composition controller).
  *
  * The controller completes an already durably accepted
  * `continue_stage_intent` by composing the two existing authoritative
@@ -110,11 +111,10 @@ import type {
  * text; unexpected errors and the downstream controllers' typed errors
  * keep their class and identity.
  *
- * Not implemented (stays unwired): the intent selection policy, the
- * choice of `additional_iterations`, `revise_task_intent`, the task/plan
- * revision replanning chain, opening the next iteration, automatic
- * resume, coordinator/runner/CLI wiring, schema changes,
- * migrations/API/T3 and multi-process locking.
+ * Not implemented (stays unwired): the automatic choice of the wait
+ * action and of `additional_iterations`, the automatic intervention loop,
+ * the default-pipeline bundle, migrations/API/T3 and multi-process
+ * locking.
  */
 
 export type PipelineV2ContinueStageCompletionControllerFailureReason = "invalid_options" | "invalid_result";

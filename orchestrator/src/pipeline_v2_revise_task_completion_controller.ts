@@ -10,7 +10,8 @@ import {
 
 /**
  * Production-neutral completion controller for the revise-task
- * intervention (unwired).
+ * intervention (production-reachable transitively through the
+ * revise-task intervention controller).
  *
  * The public API composes the two existing authoritative steps in the
  * fixed order — `applyPipelineV2ReviseTaskClosure` (the wait-bound

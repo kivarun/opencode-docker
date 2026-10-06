@@ -10,7 +10,9 @@ import {
 } from "./pipeline_v2_wait_store_internal.ts";
 
 /**
- * Filesystem publication of the wait request/response manifests (unwired).
+ * Filesystem publication of the wait request/response manifests (the
+ * response half is production-reachable through the wait controller and
+ * `orchestrator respond`; the request-entry half stays unwired).
  *
  * This module publishes the orchestrator-owned canonical manifests of the
  * pure `pipeline_v2_wait_manifest.ts` substrate under the fixed flat

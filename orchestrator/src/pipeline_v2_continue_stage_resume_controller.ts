@@ -7,7 +7,9 @@ import type { PipelineV2ResumeCoordinationResult } from "./pipeline_v2_coordinat
 
 /**
  * Production-neutral composition of the full `continue_stage` handoff
- * (unwired): the restart-aware continue-stage intervention followed by the
+ * (wired into the production runner through `continuePipelineV2Stage`
+ * and `orchestrator continue-stage`): the restart-aware continue-stage
+ * intervention followed by the
  * coordinator's resume entrypoint.
  *
  * The public API composes exactly the two existing authoritative facades —
@@ -38,9 +40,9 @@ import type { PipelineV2ResumeCoordinationResult } from "./pipeline_v2_coordinat
  * in `pipeline_v2_continue_stage_resume_controller_internal.ts`.
  *
  * Not implemented (stays unwired): the action/`additional_iterations`
- * selection policy, the revise-task branch (`revise_task_intent`), the
- * runner, the CLI, the default pipeline bundle, automatic resume,
- * schema/reducer changes, migrations/API/T3 and multi-process locking.
+ * selection policy, the automatic intervention loop, the default pipeline
+ * bundle, migrations/API/T3 and multi-process locking (the revise-task
+ * branch is the wired `orchestrator revise-task` command's).
  */
 export { PipelineV2ContinueStageResumeControllerError } from "./pipeline_v2_continue_stage_resume_controller_internal.ts";
 export type {

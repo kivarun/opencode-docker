@@ -22,7 +22,8 @@ import type {
 
 /**
  * Production-neutral durable closure controller for an already accepted
- * `revise_task_intent` (unwired).
+ * `revise_task_intent` (production-reachable transitively through the
+ * revise-task completion controller).
  *
  * The controller applies the durable closure step of the revise flow: the
  * exact boundary `accepted revise_task intent + accepted task revision →
@@ -161,12 +162,9 @@ import type {
  * canonical JSON, paths, env values or credentials); errors are never
  * classified from message text; unexpected causes propagate unchanged.
  *
- * Not implemented (stays unwired): the wait response publication and
- * `wait_response_recorded`, new task/plan revisions, the generation
- * closure, opening the next generation or iteration, the
- * architect/replanning execution, resume, the revise/continue action
- * policy and intent selection, coordinator/runner/CLI wiring, schema
- * changes, migrations/API/T3 and multi-process locking.
+ * Not implemented (stays unwired): the automatic choice of the wait
+ * action, the automatic intervention loop, the default-pipeline bundle,
+ * migrations/API/T3 and multi-process locking.
  */
 
 export type PipelineV2ReviseTaskClosureControllerFailureReason =

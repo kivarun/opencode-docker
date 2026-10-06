@@ -7,7 +7,8 @@ import {
 
 /**
  * Production-neutral continued-stage composition controller for the
- * continue-stage intervention (unwired).
+ * continue-stage intervention (production-reachable transitively through
+ * the continue-stage intervention controller).
  *
  * The public API closes exactly one gap of the durable continue-stage
  * flow: it runs `completePipelineV2ContinueStage` (the grant, the
@@ -60,11 +61,10 @@ import {
  * `pipeline_v2_continued_stage_controller_internal.ts`.
  *
  * Not implemented (stays unwired): the action/`additional_iterations`
- * selection policy, the graph transition on the opened iteration and the
- * next stage execution, the architect/replanning branch
- * (`revise_task_intent`), model profile replacement, automatic resume,
- * coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
- * migrations/API/T3 and multi-process locking.
+ * selection policy, model profile replacement, the automatic intervention
+ * loop, the default-pipeline bundle, migrations/API/T3 and multi-process
+ * locking (the graph transition and the next stage execution are the
+ * coordinator resume's).
  */
 export { PipelineV2ContinuedStageControllerError } from "./pipeline_v2_continued_stage_controller_internal.ts";
 export type {

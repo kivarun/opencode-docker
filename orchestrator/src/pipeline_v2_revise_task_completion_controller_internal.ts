@@ -19,7 +19,8 @@ import type {
 
 /**
  * Production-neutral completion controller for the revise-task
- * intervention (unwired).
+ * intervention (production-reachable transitively through the
+ * revise-task intervention controller).
  *
  * The controller completes an already durably accepted `revise_task`
  * intervention by composing the existing authoritative steps in the fixed
@@ -160,12 +161,10 @@ import type {
  * values, canonical JSON, paths, task bodies, response bodies, arbitrary
  * caller values, env values or credentials).
  *
- * Not implemented (stays unwired): the intent selection policy, the
- * architect/replanning execution, the acceptance of the next plan
- * revision, the closure of the old generation, the opening of the next
- * generation or iteration, automatic resume, coordinator/runner/CLI and
- * default-pipeline wiring, schema changes, migrations/API/T3 and
- * multi-process locking.
+ * Not implemented (stays unwired): the automatic choice of the wait
+ * action, the automatic task/body selection, the automatic intervention
+ * loop, the default-pipeline bundle, migrations/API/T3 and multi-process
+ * locking.
  */
 
 export type PipelineV2ReviseTaskCompletionControllerFailureReason = "invalid_options" | "invalid_result";

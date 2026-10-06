@@ -7,7 +7,9 @@ import {
 
 /**
  * Production-neutral restart-aware composition controller for the first
- * half of the `revise_task` user intervention (unwired).
+ * half of the `revise_task` user intervention
+ * (production-reachable transitively through the revise-task resume
+ * handoff).
  *
  * The public API owns the minimal user-policy contract
  * `{runId, waitIndex, taskId, taskBody}` plus the runtime resources
@@ -42,10 +44,10 @@ import {
  * body, prepared manifests, canonical JSON, the pipeline and the compiled
  * plan, paths and caller objects never enter it.
  *
- * The controller ends its work at the active/running planning boundary:
- * the architect execution, the next plan revision, the replanned
- * generation/stage/transition opening and the resume are later increments
- * and stay unwired.
+ * The controller ends its work at the active/running planning boundary;
+ * the architect execution, the next plan revision and the replanned
+ * generation/stage/transition opening and resume are the revise-task
+ * resume handoff's.
  *
  * Runtime export surface is exactly two keys:
  * `PipelineV2ReviseTaskInterventionControllerError` and

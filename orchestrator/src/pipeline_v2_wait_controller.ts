@@ -27,7 +27,9 @@ import {
 } from "./pipeline_v2_wait_store.ts";
 
 /**
- * Production-neutral wait controller for pipeline schema v2 (unwired).
+ * Production-neutral wait controller for pipeline schema v2 (the
+ * response-recording half is wired into production through
+ * `orchestrator respond`; the wait-entry half stays unwired).
  *
  * This module is the single layer that owns the agreed order between the
  * filesystem publication of the wait manifests and the durable state:
@@ -134,8 +136,9 @@ import {
  * Not implemented (stays unwired): the automatic continuation after a
  * recorded response (continuation is the separate `orchestrator resume`
  * command), the production mechanism that enters a wait, P01 validation,
- * TASK revision, iteration budgets, model-profile replacements, API/T3 and
- * migrations are later increments. There is no multi-process locking: two
+ * model-profile replacements, API/T3 and migrations are later increments;
+ * the TASK revision and iteration budgets go through the dedicated
+ * continue/revise intervention commands. There is no multi-process locking: two
  * concurrent responders race under the wait store's exclusive-link
  * idempotency (one wins, the loser conflicts) and under the sink's
  * in-process dispatch serialization; cross-process coordination remains a

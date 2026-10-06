@@ -10,7 +10,8 @@ import {
 
 /**
  * Production-neutral acceptance controller for `revise_task_intent` wait
- * intents (unwired).
+ * intents (production-reachable transitively through the revise-task
+ * intervention controller).
  *
  * The public API accepts one provenance-registered prepared
  * `revise_task_intent` together with one provenance-registered prepared

@@ -1,6 +1,7 @@
 /**
  * Production-neutral restart-aware continue-stage intervention controller
- * (unwired).
+ * (production-reachable transitively through the continue-stage resume
+ * handoff).
  *
  * This controller is the single layer that connects the three existing
  * authoritative layers into one full `continue_stage` intervention that
@@ -165,10 +166,10 @@
  * are not runtime keys).
  *
  * Not implemented (stays unwired): the action/`additional_iterations`
- * selection policy, the revise-task branch (`revise_task_intent`), the
- * graph transition on the opened iteration and the next stage execution,
- * automatic resume, coordinator/runner/CLI/default-pipeline wiring,
- * schema/reducer changes, migrations/API/T3 and multi-process locking.
+ * selection policy, the automatic intervention loop, the default-pipeline
+ * bundle, migrations/API/T3 and multi-process locking (the revise-task
+ * branch is the wired `orchestrator revise-task` command's; the graph
+ * transition and the next stage execution are the coordinator resume's).
  */
 import {
   acceptPipelineV2ContinueStageIntent,

@@ -32,7 +32,9 @@ import type {
 } from "./pipeline_v2_state.ts";
 
 /**
- * Production-neutral continued-stage composition controller (unwired).
+ * Production-neutral continued-stage composition controller
+ * (production-reachable transitively through the continue-stage
+ * intervention controller).
  *
  * This controller closes exactly one gap of the continue-stage branch:
  * after `completePipelineV2ContinueStage` has durably applied (or
@@ -197,11 +199,10 @@ import type {
  * `openPipelineV2ContinuedStage` (types are not runtime keys).
  *
  * Not implemented (stays unwired): the action/`additional_iterations`
- * selection policy, the graph transition on the opened iteration and the
- * next stage execution, the architect/replanning branch
- * (`revise_task_intent`), model profile replacement, automatic resume,
- * coordinator/runner/CLI/default-pipeline wiring, schema/reducer changes,
- * migrations/API/T3 and multi-process locking.
+ * selection policy, model profile replacement, the automatic intervention
+ * loop, the default-pipeline bundle, migrations/API/T3 and multi-process
+ * locking (the graph transition and the next stage execution are the
+ * coordinator resume's).
  */
 
 export type PipelineV2ContinuedStageControllerFailureReason = "invalid_options" | "invalid_result";

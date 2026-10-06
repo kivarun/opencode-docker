@@ -19,7 +19,8 @@ import type { PipelineV2ContinueStageIntentManifest } from "./pipeline_v2_run_pl
 
 /**
  * Production-neutral application controller for the continue-stage
- * iteration grant (unwired).
+ * iteration grant (production-reachable transitively through the
+ * continue-stage completion controller).
  *
  * The controller is the durable step that follows
  * `acceptPipelineV2ContinueStageIntent`: for an already durably accepted
@@ -119,11 +120,10 @@ import type { PipelineV2ContinueStageIntentManifest } from "./pipeline_v2_run_pl
  * (validated safe ids and indexes only); errors are never classified from
  * message text; unexpected causes propagate unchanged.
  *
- * Not implemented (stays unwired): the response manifest and
- * `wait_response_recorded`, opening the next iteration, automatic resume,
- * `revise_task_intent`, the task/plan revision replanning chain, the
- * continue/revise action policy, coordinator/runner/CLI wiring, schema
- * changes, migrations/API/T3 and multi-process locking.
+ * Not implemented (stays unwired): the automatic choice of the wait
+ * action and of `additional_iterations`, the automatic intervention loop,
+ * the default-pipeline bundle, migrations/API/T3 and multi-process
+ * locking.
  */
 
 export type PipelineV2ContinueStageGrantControllerFailureReason =
