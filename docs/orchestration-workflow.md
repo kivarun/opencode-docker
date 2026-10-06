@@ -2780,11 +2780,15 @@ last verified authoritative state: null before any authoritative
 snapshot is obtained, the post-acceptance/post-stage/post-transition
 `sink.snapshot` for the corresponding mismatches, the verified current
 state for a restore/intent mismatch — never the hostile
-`result.state`. Diagnostics are content-free; every
+`result.state`; the exact-key/provenance-probe verification failures
+carry the same state, and every post-call snapshot read requires a
+record — a non-record post-call value (not only `null`) is the
+controller's own `invalid_state` carrying the last previously verified
+authoritative snapshot. Diagnostics are content-free; every
 composed layer's typed error and every unexpected error passes through
 unchanged by object identity. Tests:
 `orchestrator/tests/pipeline_v2_planning_run_plan_handoff_controller.test.ts`
-(31 tests) cover the honest prefix through the real
+(36 tests) cover the honest prefix through the real
 facades/reducer/runtime data plane ending at the settled-unbound
 planning boundary, the S0 full path with the exact six-command suffix
 `task-c:1 → plan:2 → stage_generation_closed(replanned) →
@@ -2801,7 +2805,12 @@ bindings and the coherently forged state, the C1 state proof, the
 options/ops Proxy one-time-read batteries, the pipeline clone/Proxy
 provenance gate, the exact per-branch snapshot read counts, the
 content-free diagnostics canary scan, both export surfaces, and the
-source scan. Not wired: coordinator/runner/CLI/default-pipeline wiring,
+source scan; the corrective battery proves the second and third revise
+cycles, the two-template caller stages, the near-miss flat bindings,
+the malformed-sink matrix and the authoritative error-state policy for
+hostile presentations, including the exact-key/provenance-probe
+verification failures and the non-record post-call snapshot guards.
+Not wired: coordinator/runner/CLI/default-pipeline wiring,
 automatic resume, retries, migrations/API/T3.
 
 

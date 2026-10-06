@@ -2101,9 +2101,7 @@ test("23. RED2 positive controls: the first stage, the shared-entry stage-3, and
     const prefix = await buildTwoStagePrefix(3);
     const { fixture } = prefix;
     try {
-      console.log("DBG-SHARED-ENTRY start");
       const outcome = await runHandoff(fixture, Infinity, "stage-3");
-      console.log("DBG-SHARED-ENTRY done");
       const newGeneration = outcome.state.generations[1]!;
       expect(newGeneration.stage_id).toBe("stage-3");
       expect(newGeneration.template_id).toBe("review");
@@ -2131,7 +2129,6 @@ test("23. RED2 positive controls: the first stage, the shared-entry stage-3, and
         stageId: "stage-2",
         initialBudget: INITIAL_BUDGET,
       });
-      console.log("DBG-BRANCHB done");
       expect(wrapped.commands).toEqual([]);
       expect(branchB.stage_id).toBe("stage-2");
       expect(branchB.template_id).toBe("review");
@@ -2421,6 +2418,307 @@ test("27. RED6: hostile presentations after real durable writes currently carry 
       const handoffError = expectHandoffError(error, "invalid_result");
       expect(handoffError.state).not.toBeNull();
       expect((handoffError.state as PipelineV2RunState).revision).toBe(40);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("28. a hostile acceptance compiled plan carries the post-acceptance authoritative snapshot", async () => {
+  const prefix = await buildPrefix();
+  const { fixture } = prefix;
+  try {
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const boundaryState = reopened.snapshot as PipelineV2RunState;
+    const pipeline = await loadPipelineV2(boundaryState.pipeline.bundle_root);
+    // The real acceptance runs durably; the presentation swaps in a
+    // structural clone of the compiled plan whose provenance is lost.
+    const captured = { value: null as unknown };
+    const hostileOps = spyThenHostileOps(fixture, captured, "acceptPlanningRunPlan", (real) => {
+      const record = real as { compiled_plan: unknown; state: PipelineV2RunState };
+      return { compiled_plan: structuredClone(record.compiled_plan), state: record.state };
+    });
+    const error = await catchHandoff(() =>
+      applyPipelineV2PlanningRunPlanHandoffWithIo(
+        { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+        hostileOps,
+      ));
+    const handoffError = expectHandoffError(error, "invalid_result");
+    // GREEN TARGET: the error carries the post-acceptance authoritative
+    // snapshot (the real acceptance durably appended task-c:1 and plan:2),
+    // never a null state.
+    expect(handoffError.state).toBe(reopened.snapshot);
+    expect((handoffError.state as PipelineV2RunState).revision).toBe(boundaryState.revision + 2);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("29. a malformed intent wrapper keeps the verified current state", async () => {
+  const prefix = await buildPrefix();
+  const { fixture } = prefix;
+  try {
+    const cases: [string, (real: unknown) => unknown][] = [
+      ["extra-field", (real) => ({ ...(real as Record<string, unknown>), hostile: true })],
+      ["missing-field", (real) => {
+        const clone = { ...(real as Record<string, unknown>) };
+        delete clone.intent_path;
+        return clone;
+      }],
+    ];
+    for (const [label, build] of cases) {
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const boundaryState = reopened.snapshot as PipelineV2RunState;
+      const pipeline = await loadPipelineV2(boundaryState.pipeline.bundle_root);
+      const captured = { value: null as unknown };
+      const hostileOps = spyThenHostileOps(fixture, captured, "loadWaitIntent", build);
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_result");
+      // GREEN TARGET: the verified current state — the post-acceptance
+      // snapshot — never a null state. The first attempt's real acceptance
+      // moved the run to plan r2; the second attempt recognizes it
+      // idempotently with zero dispatch.
+      expect(handoffError.state).toBe(reopened.snapshot);
+      expect((handoffError.state as PipelineV2RunState).revision).toBe(boundaryState.revision + (label === "extra-field" ? 2 : 0));
+      void label;
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("30. a branch-B restore result with a broken key set or hostile compiled plan keeps the initial authoritative snapshot", async () => {
+  const prefix = await buildPrefix();
+  const { fixture } = prefix;
+  try {
+    await runHandoff(fixture);
+    const cases: [string, (real: unknown) => unknown][] = [
+      ["extra-key", (real) => ({ ...(real as Record<string, unknown>), hostile: true })],
+      ["hostile-plan", (real) => {
+        const record = real as { compiled_plan: unknown; state: unknown };
+        return { compiled_plan: structuredClone(record.compiled_plan), state: record.state };
+      }],
+    ];
+    for (const [label, build] of cases) {
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const committed = reopened.snapshot as PipelineV2RunState;
+      const pipeline = await loadPipelineV2(committed.pipeline.bundle_root);
+      const captured = { value: null as unknown };
+      const hostileOps = spyThenHostileOps(fixture, captured, "restoreAcceptedRunPlan", build);
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_result");
+      // GREEN TARGET: the initial authoritative snapshot of the committed
+      // handoff boundary; the restore is read-only, so the revision is
+      // unchanged across both attempts.
+      expect(handoffError.state).toBe(reopened.snapshot);
+      expect((handoffError.state as PipelineV2RunState).revision).toBe(committed.revision);
+      void label;
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("31. a stage plan-binding mismatch keeps the post-stage authoritative snapshot", async () => {
+  for (const field of ["plan_revision", "plan_sha256", "origin_execution"] as const) {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      // Drive the run to the S3 boundary (the old generation closed, the
+      // new generation not yet opened): the fresh chain faults at the
+      // generation-open dispatch.
+      const captureSink = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const pipeline = await loadPipelineV2((captureSink.snapshot as PipelineV2RunState).pipeline.bundle_root);
+      await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: recordingSink(captureSink, 3), stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          productionPlanningRunPlanHandoffOps,
+        ));
+      const preStageRevision = await currentRevision(fixture);
+      // The retry forwards to the real stage (it durably opens the new
+      // generation and its first iteration) and then presents a hostile
+      // flat plan binding.
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const captured = { value: null as unknown };
+      const hostileValue = field === "plan_revision" ? 99 : field === "plan_sha256" ? "hostile-digest" : 9999;
+      const hostileOps = spyThenHostileOps(fixture, captured, "openReplannedStage", (real) => ({
+        ...(real as Record<string, unknown>),
+        [field]: hostileValue,
+      }));
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          hostileOps,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_result");
+      // GREEN TARGET: the post-stage authoritative snapshot (the real
+      // stage appended the generation and the iteration, +2), never the
+      // pre-stage snapshot.
+      expect((handoffError.state as PipelineV2RunState).revision).toBe(preStageRevision + 2);
+      expect(handoffError.state).toBe(reopened.snapshot);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("32. non-record post-call snapshots fail closed with the last verified authoritative state", async () => {
+  const malformedValues: unknown[] = [null, undefined, 42, ["array"]];
+
+  interface PoisonState {
+    active: boolean;
+    values: unknown[];
+  }
+
+  function poisonableSink(inner: PipelineV2RunStateSink, poison: PoisonState): {
+    commands: PipelineV2RunCommand[];
+    readonly snapshot: unknown;
+    readonly poisoned: boolean;
+    dispatch: (command: PipelineV2RunCommand) => Promise<void>;
+  } {
+    const commands: PipelineV2RunCommand[] = [];
+    return {
+      commands,
+      get snapshot(): unknown {
+        if (poison.active) {
+          poison.active = false;
+          return poison.values.shift();
+        }
+        return inner.snapshot;
+      },
+      get poisoned() {
+        return inner.poisoned;
+      },
+      async dispatch(command) {
+        commands.push({ ...command });
+        await inner.dispatch(command);
+      },
+    };
+  }
+
+  /** The post-stage variant: the real stage runs, then the post-stage read is malformed. */
+  for (const value of malformedValues) {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      // Reach the S4 boundary: every stage dispatch durable, the planning
+      // transition not yet committed.
+      const captureSink = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const pipeline = await loadPipelineV2((captureSink.snapshot as PipelineV2RunState).pipeline.bundle_root);
+      await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: recordingSink(captureSink, 5), stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          productionPlanningRunPlanHandoffOps,
+        ));
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const boundaryState = reopened.snapshot as PipelineV2RunState;
+      const poison: PoisonState = { active: false, values: [value] };
+      const sink = poisonableSink(reopened, poison);
+      let transitionCalls = 0;
+      const ops: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStage: (async (...args: unknown[]) => {
+          const result = await openPipelineV2ReplannedStage(...(args as Parameters<typeof openPipelineV2ReplannedStage>));
+          poison.active = true;
+          return result;
+        }) as typeof openPipelineV2ReplannedStage,
+        openReplannedStageTransition: (async (...args: unknown[]) => {
+          transitionCalls += 1;
+          return await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+        }) as typeof openPipelineV2ReplannedStageTransition,
+      };
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: sink as never, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          ops,
+        ));
+      // GREEN TARGET: the controller's own invalid_state carrying the last
+      // verified authoritative snapshot; the hostile value appears nowhere.
+      const handoffError = expectHandoffError(error, "invalid_state");
+      expect(handoffError.message).toBe("the run lost its durable state");
+      expect(handoffError.state).toBe(boundaryState);
+      expect(transitionCalls).toBe(0);
+      expect(sink.commands).toEqual([]);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+
+  /** The post-transition variant (branch A): the transition dispatches, then the read is malformed. */
+  for (const value of malformedValues) {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      const captureSink = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const pipeline = await loadPipelineV2((captureSink.snapshot as PipelineV2RunState).pipeline.bundle_root);
+      await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: recordingSink(captureSink, 5), stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          productionPlanningRunPlanHandoffOps,
+        ));
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const boundaryState = reopened.snapshot as PipelineV2RunState;
+      const poison: PoisonState = { active: false, values: [value] };
+      const sink = poisonableSink(reopened, poison);
+      const ops: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStageTransition: (async (...args: unknown[]) => {
+          const result = await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+          poison.active = true;
+          return result;
+        }) as typeof openPipelineV2ReplannedStageTransition,
+      };
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: sink as never, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          ops,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_state");
+      expect(handoffError.message).toBe("the run lost its durable state");
+      // The post-stage snapshot is the last verified authoritative state.
+      expect(handoffError.state).toBe(boundaryState);
+      expect(sink.commands.map((command) => command.kind)).toEqual(["transition_committed"]);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+
+  /** The branch-B post-transition variant: the malformed value must never reach `.revision`. */
+  for (const value of malformedValues) {
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      await runHandoff(fixture);
+      const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+      const committed = reopened.snapshot as PipelineV2RunState;
+      const pipeline = await loadPipelineV2(committed.pipeline.bundle_root);
+      const poison: PoisonState = { active: false, values: [value] };
+      const sink = poisonableSink(reopened, poison);
+      const ops: PipelineV2PlanningRunPlanHandoffOps = {
+        ...productionPlanningRunPlanHandoffOps,
+        openReplannedStageTransition: (async (...args: unknown[]) => {
+          const result = await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+          poison.active = true;
+          return result;
+        }) as typeof openPipelineV2ReplannedStageTransition,
+      };
+      const error = await catchHandoff(() =>
+        applyPipelineV2PlanningRunPlanHandoffWithIo(
+          { pipeline, runRoot: fixture.runRoot, sink: sink as never, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+          ops,
+        ));
+      const handoffError = expectHandoffError(error, "invalid_state");
+      expect(handoffError.message).toBe("the run lost its durable state");
+      expect(handoffError.state).toBe(committed);
+      expect(sink.commands).toEqual([]);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

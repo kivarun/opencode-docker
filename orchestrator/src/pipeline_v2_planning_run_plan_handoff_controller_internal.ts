@@ -114,11 +114,21 @@ function ownKeySet(value: object): string[] {
   return Object.keys(value).sort();
 }
 
-function expectExactKeys(value: object, keys: readonly string[], what: string): void {
+/**
+ * The exact-key check of a verified-verification helper: a mismatch is the
+ * controller's own `invalid_result` carrying the authoritative state the
+ * caller has already established (never a lost `null`).
+ */
+function expectExactKeys(
+  value: object,
+  keys: readonly string[],
+  what: string,
+  state: PipelineV2RunState | null,
+): void {
   const actual = ownKeySet(value).join(",");
   const expected = [...keys].sort().join(",");
   if (actual !== expected) {
-    throw handoffError("invalid_result", `${what} does not carry the exact contract field set`, null);
+    throw handoffError("invalid_result", `${what} does not carry the exact contract field set`, state);
   }
 }
 
@@ -541,26 +551,44 @@ function validateHandoffSinkShape(sink: unknown): void {
 function probeCompiledPlan(
   compiledStageFor: PipelineV2PlanningRunPlanHandoffOps["compiledStageFor"],
   plan: unknown,
+  state: PipelineV2RunState | null,
 ): CompiledPipelineV2RunPlanStage {
   if (!isRecord(plan)) {
-    throw handoffError("invalid_result", "the composed plan is not a record", null);
+    throw handoffError("invalid_result", "the composed plan is not a record", state);
   }
   const stages = plan["stages"];
   if (!Array.isArray(stages) || stages.length === 0) {
-    throw handoffError("invalid_result", "the composed plan carries no stages", null);
+    throw handoffError("invalid_result", "the composed plan carries no stages", state);
   }
   const first = stages[0];
   if (!isRecord(first) || typeof first["id"] !== "string") {
-    throw handoffError("invalid_result", "the composed plan stages are malformed", null);
+    throw handoffError("invalid_result", "the composed plan stages are malformed", state);
   }
   try {
     return compiledStageFor(plan as unknown as CompiledPipelineV2RunPlan, first["id"]);
   } catch (cause) {
     if (cause instanceof PipelineV2CompiledRunPlanError) {
-      throw handoffError("invalid_result", "the composed plan is not a provenance-backed compiled run plan", null);
+      throw handoffError("invalid_result", "the composed plan is not a provenance-backed compiled run plan", state);
     }
     throw cause;
   }
+}
+
+/**
+ * The narrow post-call authoritative snapshot shape: after every composed
+ * call the snapshot must be a record — any non-record value (not only
+ * `null`) is the controller's own `invalid_state` carrying the last
+ * previously verified authoritative snapshot, and the hostile value never
+ * enters the diagnostics or the error state.
+ */
+function requirePostCallSnapshot(
+  value: unknown,
+  lastVerified: PipelineV2RunState | null,
+): PipelineV2RunState {
+  if (!isRecord(value)) {
+    throw handoffError("invalid_state", "the run lost its durable state", lastVerified);
+  }
+  return value as unknown as PipelineV2RunState;
 }
 
 /**
@@ -609,7 +637,7 @@ function verifyIntentWrapper(
   if (!isRecord(wrapper)) {
     throw handoffError("invalid_result", "the intent loader returned an unexpected shape", state);
   }
-  expectExactKeys(wrapper, ["intent", "intent_path"], "the intent loader wrapper");
+  expectExactKeys(wrapper, ["intent", "intent_path"], "the intent loader wrapper", state);
   if (typeof wrapper["intent_path"] !== "string") {
     throw handoffError("invalid_result", "the intent loader wrapper is malformed", state);
   }
@@ -651,23 +679,13 @@ function verifyAcceptanceResult(
 ): VerifiedAcceptance {
   // The authoritative snapshot is read first so every post-call failure
   // carries it, never a hostile presentation.
-  const snapshot = sink.snapshot;
-  if (!isRecord(snapshot)) {
-    throw handoffError("invalid_state", "the run lost its durable state", null);
-  }
+  const snapshot = requirePostCallSnapshot(sink.snapshot, null);
   if (!isRecord(result)) {
     throw handoffError("invalid_result", "the plan acceptance returned an unexpected shape", snapshot);
   }
-  try {
-    expectExactKeys(result, ["compiled_plan", "state"], "the plan acceptance result");
-  } catch (cause) {
-    if (cause instanceof PipelineV2PlanningRunPlanHandoffControllerError) {
-      throw handoffError(cause.reason, cause.message, snapshot);
-    }
-    throw cause;
-  }
+  expectExactKeys(result, ["compiled_plan", "state"], "the plan acceptance result", snapshot);
   const compiledPlan = result["compiled_plan"];
-  probeCompiledPlan(compiledStageFor, compiledPlan);
+  probeCompiledPlan(compiledStageFor, compiledPlan, snapshot);
   const plan = compiledPlan as Record<string, unknown>;
   if (result["state"] !== snapshot) {
     throw handoffError("invalid_result", "the plan acceptance result does not carry the authoritative run state", snapshot);
@@ -695,9 +713,9 @@ function verifyRestoreResult(
   if (!isRecord(result)) {
     throw handoffError("invalid_result", "the plan restore returned an unexpected shape", state);
   }
-  expectExactKeys(result, ["compiled_plan", "state"], "the plan restore result");
+  expectExactKeys(result, ["compiled_plan", "state"], "the plan restore result", state);
   const compiledPlan = result["compiled_plan"];
-  probeCompiledPlan(compiledStageFor, compiledPlan);
+  probeCompiledPlan(compiledStageFor, compiledPlan, state);
   const plan = compiledPlan as Record<string, unknown>;
   const lastPlan = lastPlanRecordOf(state);
   if (
@@ -735,7 +753,6 @@ const STAGE_RESULT_KEYS = [
 /** Verifies the replanned-stage result against the caller policy and the verified data. */
 function verifyStageResult(
   result: unknown,
-  state: PipelineV2RunState,
   authoritativeState: PipelineV2RunState,
   intentDigest: string,
   compiledPlan: unknown,
@@ -750,14 +767,7 @@ function verifyStageResult(
   if (!isRecord(result)) {
     throw handoffError("invalid_result", "the replanned stage returned an unexpected shape", authoritativeState);
   }
-  try {
-    expectExactKeys(result, STAGE_RESULT_KEYS, "the replanned stage result");
-  } catch (cause) {
-    if (cause instanceof PipelineV2PlanningRunPlanHandoffControllerError) {
-      throw handoffError(cause.reason, cause.message, authoritativeState);
-    }
-    throw cause;
-  }
+  expectExactKeys(result, STAGE_RESULT_KEYS, "the replanned stage result", authoritativeState);
   if (
     result["wait_index"] !== targetWait.index ||
     result["intent_sha256"] !== intentDigest
@@ -787,7 +797,7 @@ function verifyStageResult(
     result["plan_sha256"] !== lastPlan.sha256 ||
     result["origin_execution"] !== lastPlan.origin_execution
   ) {
-    throw handoffError("invalid_result", "the replanned stage result does not bind to the accepted plan", state);
+    throw handoffError("invalid_result", "the replanned stage result does not bind to the accepted plan", authoritativeState);
   }
   const resultState = result["state"];
   if (!isRecord(resultState) || !statesStructurallyEqual(resultState, authoritativeState)) {
@@ -842,7 +852,6 @@ const TRANSITION_RESULT_KEYS = [
 /** Verifies the transition result against the caller policy and the verified data. */
 function verifyTransitionResult(
   result: unknown,
-  state: PipelineV2RunState,
   authoritativeState: PipelineV2RunState,
   intentDigest: string,
   compiledPlan: unknown,
@@ -856,14 +865,7 @@ function verifyTransitionResult(
   if (!isRecord(result)) {
     throw handoffError("invalid_result", "the planning transition returned an unexpected shape", authoritativeState);
   }
-  try {
-    expectExactKeys(result, TRANSITION_RESULT_KEYS, "the planning transition result");
-  } catch (cause) {
-    if (cause instanceof PipelineV2PlanningRunPlanHandoffControllerError) {
-      throw handoffError(cause.reason, cause.message, authoritativeState);
-    }
-    throw cause;
-  }
+  expectExactKeys(result, TRANSITION_RESULT_KEYS, "the planning transition result", authoritativeState);
   if (result["wait_index"] !== targetWait.index) {
     throw handoffError("invalid_result", "the planning transition result does not bind to the accepted intent", authoritativeState);
   }
@@ -1044,11 +1046,8 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
       stageId,
       initialBudget,
     });
-    const postStageSnapshot = sink.snapshot;
-    if (postStageSnapshot === null) {
-      throw handoffError("invalid_state", "the run lost its durable state", acceptedState);
-    }
-    verifyStageResult(stage, acceptedState, postStageSnapshot, intent.digest, verifiedAcceptance.compiledPlan, compiledStage, stageId, initialBudget, previousGenerationIndex, lastPlan, verifiedTargetWait);
+    const postStageSnapshot = requirePostCallSnapshot(sink.snapshot, acceptedState);
+    verifyStageResult(stage, postStageSnapshot, intent.digest, verifiedAcceptance.compiledPlan, compiledStage, stageId, initialBudget, previousGenerationIndex, lastPlan, verifiedTargetWait);
     // 8. The planning transition is committed.
     const transition = await openReplannedStageTransition({
       pipeline: pipeline as ResolvedPipelineV2,
@@ -1058,13 +1057,9 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
       stageId,
       initialBudget,
     });
-    const postTransitionSnapshot = sink.snapshot;
-    if (postTransitionSnapshot === null) {
-      throw handoffError("invalid_state", "the run lost its durable state", postStageSnapshot);
-    }
+    const postTransitionSnapshot = requirePostCallSnapshot(sink.snapshot, postStageSnapshot);
     const postTransitionState = verifyTransitionResult(
       transition,
-      postStageSnapshot,
       postTransitionSnapshot,
       intent.digest,
       verifiedAcceptance.compiledPlan,
@@ -1102,16 +1097,12 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
   });
   // Only the exact C1 zero-dispatch boundary is accepted: the durable
   // revision must not have moved since the capture.
-  const postSnapshot = sink.snapshot;
-  if (postSnapshot === null) {
-    throw handoffError("invalid_state", "the run lost its durable state", initialSnapshot);
-  }
+  const postSnapshot = requirePostCallSnapshot(sink.snapshot, initialSnapshot);
   if (postSnapshot.revision !== initialSnapshot.revision) {
     throw handoffError("invalid_state", "the committed handoff boundary moved during the retry", initialSnapshot);
   }
   verifyTransitionResult(
     transition,
-    postSnapshot,
     postSnapshot,
     intent.digest,
     restoredPlan,
