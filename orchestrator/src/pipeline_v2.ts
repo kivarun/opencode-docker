@@ -23,6 +23,7 @@ import {
 } from "./bundle_file.ts";
 import { describeError } from "./docker_helper.ts";
 import { compilePipelineJsonSchema } from "./pipeline_v2_schema.ts";
+import { isPipelineV2SafeId } from "./pipeline_v2_scalar.ts";
 import {
   DecisionFactValidationError,
   evaluateDecision,
@@ -72,13 +73,19 @@ import {
  * complete and exact source for the role (`planning`, `control`, `stage`) of
  * every agent/decision state and for stage-template membership and template
  * entry states; there is no default classification and no inference from
- * profiles, state names, prompts, model paths or any other content. Each
+ * profiles, state names, prompts, model paths or any other content. Every
+ * planning role additionally carries the mandatory `stage_wait` policy (the
+ * wait `reason` and the declared intervention actions of the trusted
+ * stage-wait entry point, compiled with the role and bound into the
+ * execution digest; the production wait entry does not consume it yet).
+ * Each
  * template is one statically verified compiled subgraph (internal
  * reachability from its entry state, no cross-template transitions, and
  * external transitions into the template land only on its entry state).
  * Declaration order of the section's entries is not semantic, so the
  * resolved metadata is normalized (templates sorted by id, roles sorted by
- * state_id); permuting equivalent entries yields the identical snapshot and
+ * state_id); the stage-wait action order is semantic and preserved
+ * verbatim; permuting equivalent entries yields the identical snapshot and
  * digest. Bundles without the section compile exactly as before. The pure
  * read-only resolvers for the compiled metadata live in
  * `pipeline_v2_orchestration.ts`; durable state, the coordinator and the
@@ -277,8 +284,42 @@ export const PIPELINE_V2_EXECUTION_ROLE_NAMES: readonly PipelineV2ExecutionRoleN
   "stage",
 ];
 
+/**
+ * The closed action vocabulary of a planning role's `stage_wait` policy.
+ * The policy declares which user interventions the coordinator may offer
+ * when the planning state is re-entered after a completed stage execution
+ * while its iteration is still open; the routing targets are never part of
+ * the metadata (a `continue_stage` target is derived later from the open
+ * generation's compiled stage entry, a `revise_task` target from the
+ * planning cursor).
+ */
+export type PipelineV2StageWaitActionName = "continue_stage" | "revise_task";
+
+export const PIPELINE_V2_STAGE_WAIT_ACTION_NAMES: readonly PipelineV2StageWaitActionName[] = [
+  "continue_stage",
+  "revise_task",
+];
+
+/**
+ * The trusted stage-wait policy of one planning role: the wait `reason`
+ * (the same scalar contract the wait request manifest accepts) and the
+ * declared intervention actions in their preserved declaration order.
+ * Mandatory for every planning role; no other role accepts it; there are
+ * no defaults and no inference from `plan_output`, transitions, stage
+ * templates or stage order.
+ */
+export interface PipelineV2StageWaitSpec {
+  readonly reason: string;
+  readonly actions: readonly PipelineV2StageWaitActionName[];
+}
+
 export type PipelineV2ExecutionRoleSpec =
-  | { readonly state_id: string; readonly role: "planning"; readonly plan_output: string }
+  | {
+      readonly state_id: string;
+      readonly role: "planning";
+      readonly plan_output: string;
+      readonly stage_wait: PipelineV2StageWaitSpec;
+    }
   | { readonly state_id: string; readonly role: "control" }
   | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
 
@@ -387,8 +428,24 @@ export interface ResolvedPipelineV2StageTemplate {
   readonly entry_state: string;
 }
 
+/**
+ * The stage-wait policy of one resolved planning role: the exact,
+ * deep-frozen compiled form of the trusted `stage_wait` metadata. The
+ * reason carries the same scalar contract the wait request manifest
+ * accepts, and the actions keep their declared order verbatim.
+ */
+export interface ResolvedPipelineV2StageWait {
+  readonly reason: string;
+  readonly actions: readonly PipelineV2StageWaitActionName[];
+}
+
 export type ResolvedPipelineV2ExecutionRole =
-  | { readonly state_id: string; readonly role: "planning"; readonly plan_output: string }
+  | {
+      readonly state_id: string;
+      readonly role: "planning";
+      readonly plan_output: string;
+      readonly stage_wait: ResolvedPipelineV2StageWait;
+    }
   | { readonly state_id: string; readonly role: "control" }
   | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
 
@@ -548,18 +605,104 @@ function sortById<T>(entries: readonly T[], key: (entry: T) => string): T[] {
 }
 
 /**
+ * Exact-field check with own-property semantics for the orchestration
+ * execution-role entries: a required field must be an own enumerable
+ * property (an inherited property never satisfies the required shape).
+ * Messages match the shared `expectExactKeys` wording.
+ */
+function expectExactOwnKeys(
+  obj: Record<string, unknown>,
+  keys: readonly string[],
+  what: string,
+): void {
+  const own = new Set(Object.keys(obj));
+  const expected = new Set(keys);
+  for (const key of own) {
+    if (!expected.has(key)) {
+      throw new PipelineError(`${what} has unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of keys) {
+    if (!own.has(key)) {
+      throw new PipelineError(`${what} is missing required field ${JSON.stringify(key)}`);
+    }
+  }
+}
+
+function isPipelineV2StageWaitActionName(value: string): value is PipelineV2StageWaitActionName {
+  return (PIPELINE_V2_STAGE_WAIT_ACTION_NAMES as readonly string[]).includes(value);
+}
+
+/**
+ * Parse the mandatory `stage_wait` policy of one planning role: the wait
+ * `reason` and the declared intervention actions. The `reason` carries the
+ * same scalar contract the wait request manifest accepts — the shared
+ * `isPipelineV2SafeId` predicate of `pipeline_v2_scalar.ts` (the manifest's
+ * private `expectSafeId` is only its error-formatting wrapper) — so there is
+ * no second normalization and no wider grammar. Actions are a non-empty
+ * list of unique ids from the closed `PIPELINE_V2_STAGE_WAIT_ACTION_NAMES`
+ * vocabulary, preserved in declaration order (never sorted). Targets are
+ * not part of the policy and unknown fields are rejected. Diagnostics are
+ * content-free in the wait-manifest sense: unknown field names are never
+ * named (a canary can hide in a property name) and no hostile value is ever
+ * echoed; required-field names come from this contract and are safe to
+ * name.
+ */
+function parseStageWait(raw: unknown, what: string): PipelineV2StageWaitSpec {
+  const obj = expectObject(raw, what);
+  const ownKeys = new Set(Object.keys(obj));
+  for (const key of ownKeys) {
+    if (key !== "reason" && key !== "actions") {
+      throw new PipelineError(`${what} has unknown fields`);
+    }
+  }
+  if (!ownKeys.has("reason")) {
+    throw new PipelineError(`${what} is missing required field "reason"`);
+  }
+  if (!ownKeys.has("actions")) {
+    throw new PipelineError(`${what} is missing required field "actions"`);
+  }
+  if (!isPipelineV2SafeId(obj.reason)) {
+    throw new PipelineError(`${what} reason must be a safe non-empty identifier`);
+  }
+  const actionsRaw = expectArray(obj.actions, `${what} actions`);
+  if (actionsRaw.length === 0) {
+    throw new PipelineError(`${what} actions must not be empty`);
+  }
+  const seen = new Set<string>();
+  const actions: PipelineV2StageWaitActionName[] = [];
+  for (let index = 0; index < actionsRaw.length; index++) {
+    const action = actionsRaw[index];
+    if (typeof action !== "string" || !isPipelineV2StageWaitActionName(action)) {
+      throw new PipelineError(
+        `${what} action at position ${index} must be one of ${JSON.stringify(PIPELINE_V2_STAGE_WAIT_ACTION_NAMES)}`,
+      );
+    }
+    if (seen.has(action)) {
+      throw new PipelineError(`${what} declares a duplicate action id at position ${index}`);
+    }
+    seen.add(action);
+    actions.push(action);
+  }
+  return { reason: obj.reason, actions };
+}
+
+/**
  * Parse the optional `orchestration` section: the single, complete and
  * trusted source of compiled execution roles and stage templates. Exact
  * fields at every level; safe ids from the shared v2 grammar; template ids,
  * template entry states and role state ids unique; a planning role carries
  * exactly one `plan_output` naming a JSON output port of its own agent
- * state (validated once the states are known). Either list may be empty
+ * state and the mandatory `stage_wait` policy (validated once the states
+ * are known for the output; the policy itself is validated by
+ * `parseStageWait`). Either list may be empty
  * (a pipeline without agent or decision states — e.g. a terminal-only
  * pipeline — carries no roles, and one without stage templates carries no
  * templates; the non-emptiness of a section's lists is a property of the
  * pipeline's states, checked once the states are known). Declaration order
  * is not semantic, so the parsed result is normalized (templates sorted by
- * id, roles sorted by state_id); the parsed input object is never mutated.
+ * id, roles sorted by state_id); the stage-wait action order is semantic
+ * and is preserved verbatim; the parsed input object is never mutated.
  * Role semantics (which state may carry which role) and template topology
  * are checked later, once the states are known.
  */
@@ -607,12 +750,15 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
       );
     }
     const role = entry.role as PipelineV2ExecutionRoleName;
-    expectExactKeys(
+    // Exact own enumerable fields for every execution-role entry: an
+    // inherited property never satisfies the required shape (the planning
+    // role carries the mandatory `stage_wait` policy).
+    expectExactOwnKeys(
       entry,
       role === "stage"
         ? ["state_id", "role", "stage_template"]
         : role === "planning"
-          ? ["state_id", "role", "plan_output"]
+          ? ["state_id", "role", "plan_output", "stage_wait"]
           : ["state_id", "role"],
       what,
     );
@@ -635,6 +781,7 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
               state_id: stateId,
               role,
               plan_output: validateSafeId(entry.plan_output, `${what} plan_output`),
+              stage_wait: parseStageWait(entry.stage_wait, `${what} stage_wait`),
             }
           : { state_id: stateId, role },
     );

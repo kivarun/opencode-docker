@@ -1086,7 +1086,25 @@ every agent/decision state (`planning`, `control`, `stage`) and for stage
 templates (`stage_templates[]` with `id` and `entry_state`; `execution_roles[]`
 mapping each agent/decision state to its role, where a planning entry carries
 exactly one `plan_output` naming a declared JSON output port of its own agent
-state — implemented, compiled and consumed at runtime through the planning chain (`compiledExecutionRoleFor` → `readAcceptedJsonOutput` → the run-plan proposal) — and the
+state — implemented, compiled and consumed at runtime through the planning chain (`compiledExecutionRoleFor` → `readAcceptedJsonOutput` → the run-plan proposal) — plus the mandatory
+trusted `stage_wait` policy: `stage_wait: {reason, actions}` describing the
+intervention wait the coordinator may enter when it reaches this planning
+state after a completed stage execution while the iteration is still open.
+The `reason` carries the same scalar contract the wait request manifest
+accepts (the shared `isPipelineV2SafeId` predicate — no second
+normalization); `actions` is a non-empty list of unique ids from the closed
+`continue_stage | revise_task` vocabulary, preserved in declaration order;
+routing targets are never part of the metadata (a `continue_stage` target is
+derived later from the open generation's compiled stage entry, a
+`revise_task` target from the planning cursor). Exact own enumerable fields
+at every level; inherited properties never satisfy the required shape;
+control and stage roles reject `stage_wait` as an unknown field; there are
+no defaults and no inference from `plan_output`, transitions, stage
+templates or stage order; diagnostics are content-free (unknown field names
+are never named, no hostile value is ever echoed).
+**The policy is compiled and digest-bound but the production wait entry does
+not consume it yet** — wiring it into the coordinator is a later increment.
+The
 stage role carries exactly one `stage_template`). There is no default
 classification and no inference from profiles, state names, prompts, model
 paths or any other content; terminal states never carry a role. Every
@@ -1103,20 +1121,28 @@ templates are forbidden, and a transition from a state outside a template
 into a stage state is allowed only into that template's entry state, while
 exits to planning/control/terminal states are allowed. Declaration order of
 the section's entries is not semantic: the resolved metadata is normalized
-(stage templates sorted by id, execution roles sorted by state_id), so
+(stage templates sorted by id, execution roles sorted by state_id; the
+stage-wait action order is semantic and preserved verbatim), so
 permuting equivalent entries yields the identical execution snapshot and
-digest, while changing a role, membership, template entry or `plan_output`
-value moves the digest. The resolved snapshot carries the metadata as the optional
+digest, while changing a role, membership, template entry, `plan_output`
+value or any stage-wait policy field (reason, action set, action order)
+moves the digest. The resolved snapshot carries the metadata as the optional
 deep-frozen `orchestration` field; bundles without the section compile
 exactly as before (the snapshot has no `orchestration` key). The pure
 read-only resolvers live in `orchestrator/src/pipeline_v2_orchestration.ts`
-(`compiledExecutionRoleFor`, `compiledStageTemplateFor`, typed
+(`compiledExecutionRoleFor` — a planning role resolves to the exact
+deep-frozen `{state_id, role, plan_output, stage_wait}` —
+`compiledStageTemplateFor`, typed
 `PipelineV2OrchestrationError`; provenance-gated before any content read).
 No role or template registry is added to the durable pipeline identity —
 the existing `execution_snapshot_sha256` stays the single durable anchor.
-Durable state and the coordinator's state-type dispatch are untouched; the compiled roles/templates are consumed at runtime by the resume-restore verifier, the stage-iteration controller and the production planning chain; the
-untouched; a future controller will require this metadata before any
-schema-v7 dispatch.
+Durable state and the coordinator's state-type dispatch are untouched; the
+compiled roles/templates are consumed at runtime by the resume-restore
+verifier, the stage-iteration controller and the production planning chain
+(the compiled planning `plan_output` feeds the run-plan proposal), while
+the stage-wait policy is only compiled and digest-bound — no production
+path consumes it yet; a future controller will require this metadata before
+any schema-v7 dispatch.
 
 ### Compiled run-plan projection over the orchestration metadata (pure substrate, production-reachable transitively)
 

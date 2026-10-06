@@ -32,6 +32,7 @@
 import { isPipelineV2SafeId } from "./pipeline_v2_scalar.ts";
 import {
   requireResolvedPipelineV2Provenance,
+  type PipelineV2StageWaitActionName,
   type ResolvedPipelineV2,
 } from "./pipeline_v2.ts";
 
@@ -43,15 +44,35 @@ export class PipelineV2OrchestrationError extends Error {
 }
 
 /**
+ * The compiled stage-wait policy of one planning role: the trusted wait
+ * `reason` and the declared intervention actions in their preserved
+ * declaration order, read exclusively from the loader-owned resolved
+ * metadata. The routing targets are deliberately not part of the policy
+ * (a `continue_stage` target is derived later from the open generation's
+ * compiled stage entry, a `revise_task` target from the planning cursor).
+ */
+export interface CompiledPipelineV2StageWait {
+  readonly reason: string;
+  readonly actions: readonly PipelineV2StageWaitActionName[];
+}
+
+/**
  * The compiled execution role of one state: a planning role bound to
  * exactly one declared JSON output port of its own agent state (the plan
- * proposal output, not yet consumed at runtime), a control role with no
- * iteration concern, or a stage role bound to exactly one stage template.
+ * proposal output) plus the mandatory trusted stage-wait policy of its
+ * intervention wait (not yet consumed by the production wait entry), a
+ * control role with no iteration concern, or a stage role bound to exactly
+ * one stage template.
  * Stage-template membership is carried by the stage role itself; a stage
  * state belongs to exactly one template by construction.
  */
 export type CompiledPipelineV2ExecutionRole =
-  | Readonly<{ state_id: string; role: "planning"; plan_output: string }>
+  | Readonly<{
+      state_id: string;
+      role: "planning";
+      plan_output: string;
+      stage_wait: CompiledPipelineV2StageWait;
+    }>
   | Readonly<{ state_id: string; role: "control" }>
   | Readonly<{ state_id: string; role: "stage"; stage_template: string }>;
 
@@ -68,8 +89,9 @@ export interface CompiledPipelineV2StageTemplate {
 /**
  * The compiled execution role of one declared state of a trusted resolved
  * pipeline. Missing orchestration metadata and unknown states are typed
- * errors; the result is deep-frozen and repeated calls on the same trusted
- * snapshot are structurally identical.
+ * errors; the result is deep-frozen (a planning role's `stage_wait` and its
+ * actions array included) and repeated calls on the same trusted snapshot
+ * are structurally identical.
  */
 export function compiledExecutionRoleFor(
   pipeline: ResolvedPipelineV2,
@@ -92,7 +114,15 @@ export function compiledExecutionRoleFor(
       return entry.role === "stage"
         ? Object.freeze({ state_id: stateId, role: "stage", stage_template: entry.stage_template })
         : entry.role === "planning"
-          ? Object.freeze({ state_id: stateId, role: "planning", plan_output: entry.plan_output })
+          ? Object.freeze({
+              state_id: stateId,
+              role: "planning",
+              plan_output: entry.plan_output,
+              stage_wait: Object.freeze({
+                reason: entry.stage_wait.reason,
+                actions: Object.freeze([...entry.stage_wait.actions]),
+              }),
+            })
           : Object.freeze({ state_id: stateId, role: "control" });
     }
   }

@@ -1590,6 +1590,11 @@ orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: dev_entry
       role: stage
       stage_template: development
@@ -2451,9 +2456,19 @@ orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: planner2
       role: planning
       plan_output: plan2
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: dev_entry
       role: stage
       stage_template: development

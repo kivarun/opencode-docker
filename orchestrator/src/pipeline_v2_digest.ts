@@ -38,9 +38,11 @@ import type { PipelineV2RunPipelineIdentity } from "./pipeline_v2_state.ts";
  * snapshot; profile names are (profile content and secrets are not).
  *
  * A pipeline that declares an `orchestration` section contributes its
- * normalized compiled metadata (execution roles, stage templates and their
- * entry states — id-only, path-free) to the snapshot, so role/template
- * changes move the digest; a bundle without the section keeps the exact
+ * normalized compiled metadata (execution roles — including every planning
+ * role's `stage_wait` policy with its reason and declared action order —
+ * stage templates and their entry states, id-only and path-free) to the
+ * snapshot, so role/template/policy changes move the digest; a bundle
+ * without the section keeps the exact
  * pre-orchestration snapshot shape.
  *
  * The snapshot JSON itself is an internal execution artifact: durable

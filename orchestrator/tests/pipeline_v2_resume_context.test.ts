@@ -92,11 +92,21 @@ orchestration:
     - state_id: coder
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: check
       role: control
     - state_id: ship
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
 states:
   - id: coder
     type: agent
@@ -1659,6 +1669,11 @@ orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: dispatch
       role: control
     - state_id: dev
@@ -1771,6 +1786,11 @@ orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: dispatch
       role: control
     - state_id: dev
@@ -2783,7 +2803,7 @@ test("P6. forged cursor, two unbound executions and planning role stay typed inv
     await mkdir(join(stageCoderBundle, "schemas"), { recursive: true });
     await mkdir(join(stageCoderBundle, "decisions"), { recursive: true });
     await writeFile(join(stageCoderBundle, "pipeline.yaml"), MAIN_PIPELINE.replace(
-      "    - state_id: coder\n      role: planning\n      plan_output: plan\n",
+      "    - state_id: coder\n      role: planning\n      plan_output: plan\n      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n",
       "    - state_id: coder\n      role: stage\n      stage_template: development\n",
     ).replace("  stage_templates: []\n", "  stage_templates:\n    - id: development\n      entry_state: coder\n"));
     for (const prompt of ["coder.md", "ship.md"]) {

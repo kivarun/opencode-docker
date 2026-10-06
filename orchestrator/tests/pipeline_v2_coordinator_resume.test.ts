@@ -129,6 +129,11 @@ orchestration:
     - state_id: coder
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: check
       role: control
 states:
@@ -179,11 +184,21 @@ orchestration:
     - state_id: coder
       role: planning
       plan_output: facts
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: check
       role: control
     - state_id: probe
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
 states:
   - id: coder
     type: agent
@@ -264,9 +279,19 @@ orchestration:
     - state_id: coder
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: coder2
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
 states:
   - id: coder
     type: agent
@@ -2172,6 +2197,11 @@ orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: dispatch
       role: control
     - state_id: dev_entry
@@ -2347,6 +2377,11 @@ orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: dev_entry
       role: stage
       stage_template: development

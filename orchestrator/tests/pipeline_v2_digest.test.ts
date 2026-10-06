@@ -1,4 +1,5 @@
 import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -993,6 +994,11 @@ const ORCHESTRATION_BLOCK = `orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1039,6 +1045,11 @@ orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1264,7 +1275,15 @@ test("an orchestrated bundle contributes the normalized orchestration to the sna
     expect(snapshot.orchestration).toEqual({
       stage_templates: [{ id: "development", entry_state: "development_entry" }],
       execution_roles: [
-        { state_id: "architect", role: "planning", plan_output: "plan" },
+        {
+          state_id: "architect",
+          role: "planning",
+          plan_output: "plan",
+          stage_wait: {
+            reason: "stage_iteration_completed",
+            actions: ["continue_stage", "revise_task"],
+          },
+        },
         { state_id: "coder", role: "stage", stage_template: "development" },
         { state_id: "development_entry", role: "stage", stage_template: "development" },
         { state_id: "iteration_gate", role: "stage", stage_template: "development" },
@@ -1311,6 +1330,11 @@ test("orchestration declaration-order permutation does not change the snapshot o
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: coder
       role: stage
       stage_template: development
@@ -1384,6 +1408,11 @@ test("changing a template entry state changes the digest", async () => {
         `    - state_id: development_entry
       role: planning
       plan_output: draft
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
 `,
       )
       // the planning role binds a JSON output port of its own state, so
@@ -1405,4 +1434,122 @@ test("changing a template entry state changes the digest", async () => {
   });
   expect(after.json).not.toBe(before.json);
   expect(after.digest).not.toBe(before.digest);
+});
+
+test("changing only the stage-wait reason changes the digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const changed = raw.replace(
+      "        reason: stage_iteration_completed\n",
+      "        reason: stage_iteration_needs_user\n",
+    );
+    if (changed === raw) {
+      throw new Error("the stage-wait reason mutation replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), changed);
+  });
+  expect(after.json).not.toBe(before.json);
+  expect(after.digest).not.toBe(before.digest);
+  // the only snapshot difference is the reason inside the planning role
+  const rolesOf = (json: string) =>
+    (JSON.parse(json) as { orchestration: { execution_roles: { state_id: string; stage_wait?: { reason: string } }[] } })
+      .orchestration.execution_roles;
+  const beforeRoles = rolesOf(before.json);
+  const afterRoles = rolesOf(after.json);
+  expect(beforeRoles).toHaveLength(afterRoles.length);
+  for (let index = 0; index < beforeRoles.length; index++) {
+    const beforeRole = beforeRoles[index];
+    const afterRole = afterRoles[index];
+    if (!beforeRole || !afterRole) {
+      throw new Error("the role lists diverged");
+    }
+    if (beforeRole.state_id !== afterRole.state_id) {
+      throw new Error("the role order diverged");
+    }
+    const beforeReason = beforeRole.stage_wait?.reason;
+    const afterReason = afterRole.stage_wait?.reason;
+    if (beforeRole.state_id === "architect") {
+      expect(beforeReason).toBe("stage_iteration_completed");
+      expect(afterReason).toBe("stage_iteration_needs_user");
+    } else {
+      expect(afterRole).toEqual(beforeRole);
+    }
+  }
+});
+
+test("changing only the stage-wait action set changes the digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const changed = raw.replace(
+      "        actions:\n          - continue_stage\n          - revise_task\n",
+      "        actions:\n          - continue_stage\n",
+    );
+    if (changed === raw) {
+      throw new Error("the stage-wait action mutation replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), changed);
+  });
+  expect(after.json).not.toBe(before.json);
+  expect(after.digest).not.toBe(before.digest);
+});
+
+test("permuting the stage-wait action order changes the digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const changed = raw.replace(
+      "        actions:\n          - continue_stage\n          - revise_task\n",
+      "        actions:\n          - revise_task\n          - continue_stage\n",
+    );
+    if (changed === raw) {
+      throw new Error("the stage-wait order mutation replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), changed);
+  });
+  expect(after.json).not.toBe(before.json);
+  expect(after.digest).not.toBe(before.digest);
+});
+
+test("an identical stage-wait policy is digest-deterministic across loads and bundle locations", async () => {
+  const digests: string[] = [];
+  const snapshots: string[] = [];
+  for (let round = 0; round < 2; round++) {
+    await withTemp(async (root) => {
+      const bundle = join(root, "bundle");
+      await writeOrchestratedDigestBundle(bundle);
+      const pipeline = await loadPipelineV2(bundle);
+      digests.push(pipelineV2ExecutionDigest(pipeline));
+      snapshots.push(pipelineV2ExecutionSnapshotJson(pipeline));
+    });
+  }
+  expect(digests).toHaveLength(2);
+  expect(snapshots[0]).toBe(snapshots[1]);
+  expect(digests[0]).toBe(digests[1]);
+  expect(digests[0]).toMatch(/^[0-9a-f]{64}$/);
+  // the snapshot carries the policy exactly once, id-only
+  const snapshot = JSON.parse(snapshots[0] ?? "") as Record<string, unknown>;
+  const orchestration = snapshot["orchestration"] as { execution_roles: { stage_wait?: unknown }[] };
+  const planningEntries = orchestration.execution_roles.filter(
+    (entry) => (entry as { stage_wait?: unknown }).stage_wait !== undefined,
+  );
+  expect(planningEntries).toHaveLength(1);
+  expect(JSON.stringify(snapshot["orchestration"])).not.toContain("/");
+});
+
+test("the stage-wait policy adds no digest machinery of its own (source scan)", () => {
+  const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_digest.ts"), "utf8");
+  // exactly one digest domain constant and one hasher construction: the
+  // pre-existing execution-snapshot machinery, unchanged
+  expect((source.match(/DIGEST_DOMAIN = "/g) ?? []).length).toBe(1);
+  expect((source.match(/new Bun\.CryptoHasher\("sha256"\)/g) ?? []).length).toBe(1);
+  expect(source).toContain('import { canonicalJson } from "./canonical_json.ts"');
+  // no second serializer, no wait-manifest import, no registry
+  expect(source).not.toContain('from "./pipeline_v2_wait_manifest.ts"');
+  expect(source).not.toContain("WeakSet");
+  expect(source).not.toContain("WeakMap");
+  expect(source).not.toContain("pipeline-v2-wait");
+  // the stage-wait policy travels only inside the already-normalized
+  // resolved orchestration metadata — no dedicated snapshot builder, and
+  // the orchestration key is embedded exactly once
+  expect((source.match(/snapshot\.orchestration = pipeline\.orchestration/g) ?? []).length).toBe(1);
+  expect((source.match(/orchestration !== undefined/g) ?? []).length).toBe(1);
 });

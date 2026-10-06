@@ -7,6 +7,7 @@ import {
   compilePipelineV2Spec,
   loadPipelineV2,
   type PipelineV2OrchestrationSpec,
+  type PipelineV2StageWaitActionName,
   type ResolvedPipelineV2,
   type ResolvedPipelineV2Orchestration,
 } from "../src/pipeline_v2.ts";
@@ -125,6 +126,11 @@ const CANONICAL_ORCHESTRATION = `orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -294,6 +300,11 @@ const TWO_TEMPLATES_ORCHESTRATION = `orchestration:
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -513,7 +524,15 @@ function acceptCompile(yaml: string): void {
 const NORMALIZED_ORCHESTRATION: ResolvedPipelineV2Orchestration = {
   stage_templates: [{ id: "development", entry_state: "development_entry" }],
   execution_roles: [
-    { state_id: "architect", role: "planning", plan_output: "plan" },
+    {
+      state_id: "architect",
+      role: "planning",
+      plan_output: "plan",
+      stage_wait: {
+        reason: "stage_iteration_completed",
+        actions: ["continue_stage", "revise_task"],
+      },
+    },
     { state_id: "coder", role: "stage", stage_template: "development" },
     { state_id: "development_entry", role: "stage", stage_template: "development" },
     { state_id: "iteration_gate", role: "stage", stage_template: "development" },
@@ -612,6 +631,11 @@ test("4. declaration-order permutation is not semantic: identical resolved metad
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: coder
       role: stage
       stage_template: development
@@ -681,6 +705,11 @@ test("6. exact-field rejection at every new level", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -707,6 +736,11 @@ test("6. exact-field rejection at every new level", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -761,6 +795,11 @@ test("6. exact-field rejection at every new level", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -823,6 +862,11 @@ test("6. exact-field rejection at every new level", () => {
     - state_id: bad id!
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -856,17 +900,37 @@ test("7. empty stage_templates with planning/control-only roles compile; empty r
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: coder
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_review
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: iteration_gate
       role: control
 states:`));
@@ -877,17 +941,37 @@ states:`));
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: coder
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_review
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: iteration_gate
       role: control
 ${planningOnlyStates}`,
@@ -913,6 +997,11 @@ test("8. duplicate template id is rejected", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -944,6 +1033,11 @@ test("9. duplicate template entry state is rejected", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -974,6 +1068,11 @@ test("10. duplicate and missing execution roles are rejected", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: coder
@@ -1004,6 +1103,11 @@ test("10. duplicate and missing execution roles are rejected", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1030,6 +1134,11 @@ test("11. unknown and terminal states carry no execution role", () => {
     - state_id: ghost
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1056,6 +1165,11 @@ test("11. unknown and terminal states carry no execution role", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1087,9 +1201,19 @@ test("12. the planning role is an agent-state role only", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: development_entry
       role: stage
       stage_template: development
@@ -1117,6 +1241,11 @@ test("13. the control role is a decision-state role only", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1145,6 +1274,11 @@ test("14. the stage role requires a stage_template", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1173,6 +1307,11 @@ test("15. planning and control roles must not carry stage_template", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
       stage_template: development
@@ -1203,6 +1342,11 @@ test("16. a stage role must reference a declared template", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1232,6 +1376,11 @@ test("17. a template entry_state must name a declared state", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1261,6 +1410,11 @@ test("18. a template entry_state must carry the stage role of that template", ()
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1297,6 +1451,11 @@ test("19. a template entry_state must belong to its own template", async () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1376,6 +1535,11 @@ test("20. a template without stage states is rejected", () => {
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
 ${minimalStates}`,
@@ -1490,6 +1654,11 @@ test("22. a transition between stage states of different templates is rejected",
     - state_id: architect
       role: planning
       plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
     - state_id: stage_dispatch
       role: control
     - state_id: development_entry
@@ -1581,8 +1750,13 @@ test("25. resolver results are exact, deep-frozen and deterministic", async () =
   await withOrchestratedBundle(async (dirs) => {
     const pipeline = await loadPipelineV2(dirs.bundle);
     const planning = compiledExecutionRoleFor(pipeline, "architect");
-    expect(planning).toEqual({ state_id: "architect", role: "planning", plan_output: "plan" });
-    expect(Object.keys(planning)).toEqual(["state_id", "role", "plan_output"]);
+    expect(planning).toEqual({
+      state_id: "architect",
+      role: "planning",
+      plan_output: "plan",
+      stage_wait: { reason: "stage_iteration_completed", actions: ["continue_stage", "revise_task"] },
+    });
+    expect(Object.keys(planning)).toEqual(["state_id", "role", "plan_output", "stage_wait"]);
     expect(Object.isFrozen(planning)).toBe(true);
     const control = compiledExecutionRoleFor(pipeline, "stage_dispatch");
     expect(control).toEqual({ state_id: "stage_dispatch", role: "control" });
@@ -1734,6 +1908,7 @@ test("27. the provenance gate runs before the id check, getter reads and Proxy t
       state_id: "architect",
       role: "planning",
       plan_output: "plan",
+      stage_wait: { reason: "stage_iteration_completed", actions: ["continue_stage", "revise_task"] },
     });
   });
 });
@@ -1831,6 +2006,7 @@ test("31. the planning plan_output binding matrix: only the exact JSON output of
       state_id: "architect",
       role: "planning",
       plan_output: "plan",
+      stage_wait: { reason: "stage_iteration_completed", actions: ["continue_stage", "revise_task"] },
     });
   });
   // unknown output id on the planning state
@@ -1979,3 +2155,516 @@ async function loadPipelineV2BundleDigest(yaml: string): Promise<string> {
   }
   return digest;
 }
+
+/**
+ * The neutral fixture policy mechanically carried by every planning role of
+ * the v2 fixtures: only fixture policy — the production wait entry does not
+ * consume it in this increment.
+ */
+const NEUTRAL_STAGE_WAIT_YAML = `      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+`;
+
+/** Replace the planning entry's stage_wait block of the canonical bundle. */
+function withStageWait(stageWaitYaml: string): string {
+  return CANONICAL_YAML.replace(NEUTRAL_STAGE_WAIT_YAML, stageWaitYaml);
+}
+
+const NEUTRAL_STAGE_WAIT = {
+  reason: "stage_iteration_completed",
+  actions: ["continue_stage", "revise_task"],
+} as const;
+
+test("34. minimal and full stage-wait policies compile with the exact resolved policy", async () => {
+  // the single-action subsets and both permutations of the full set
+  const policies: PipelineV2StageWaitActionName[][] = [
+    ["continue_stage"],
+    ["revise_task"],
+    ["continue_stage", "revise_task"],
+    ["revise_task", "continue_stage"],
+  ];
+  for (const actions of policies) {
+    const yaml = withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+${actions.map((action) => `          - ${action}\n`).join("")}`);
+    await withOrchestratedBundle(async (dirs) => {
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      const orchestration = pipeline.orchestration;
+      if (orchestration === undefined) {
+        throw new Error("missing orchestration");
+      }
+      expect(orchestration.execution_roles[0]).toEqual({
+        state_id: "architect",
+        role: "planning",
+        plan_output: "plan",
+        stage_wait: { reason: "stage_iteration_completed", actions },
+      });
+      const compiled = compiledExecutionRoleFor(pipeline, "architect");
+      if (compiled.role !== "planning") {
+        throw new Error("the compiled role is not the planning role");
+      }
+      expect(compiled.stage_wait).toEqual({
+        reason: "stage_iteration_completed",
+        actions,
+      });
+    }, yaml);
+  }
+});
+
+test("35. exact-field battery at the stage_wait level; unknown field names are never echoed", () => {
+  // an unknown field inside stage_wait: value-free, name-free diagnostic
+  rejectCompile(
+    withStageWait(`${NEUTRAL_STAGE_WAIT_YAML}        target: coder\n`),
+    /pipeline orchestration execution_roles 0 stage_wait has unknown fields/,
+  );
+  // missing reason
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        actions:
+          - continue_stage
+`),
+    /pipeline orchestration execution_roles 0 stage_wait is missing required field "reason"/,
+  );
+  // missing actions
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+`),
+    /pipeline orchestration execution_roles 0 stage_wait is missing required field "actions"/,
+  );
+  // stage_wait is not a mapping
+  rejectCompile(
+    withStageWait(`      stage_wait: 7
+`),
+    /pipeline orchestration execution_roles 0 stage_wait is not a YAML mapping/,
+  );
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        - continue_stage
+`),
+    /pipeline orchestration execution_roles 0 stage_wait is not a YAML mapping/,
+  );
+});
+
+test("36. inherited properties never satisfy the required shape", () => {
+  const parsed = Bun.YAML.parse(CANONICAL_YAML) as Record<string, unknown>;
+  // a planning entry whose stage_wait comes from the prototype chain
+  const inheritedStageWait = Object.create({ stage_wait: NEUTRAL_STAGE_WAIT }) as Record<string, unknown>;
+  inheritedStageWait.state_id = "architect";
+  inheritedStageWait.role = "planning";
+  inheritedStageWait.plan_output = "plan";
+  const entryYaml = parsed as { orchestration: { execution_roles: Record<string, unknown>[] } };
+  const architectEntry = entryYaml.orchestration.execution_roles.find(
+    (entry) => (entry as { state_id: string }).state_id === "architect",
+  );
+  if (architectEntry === undefined) {
+    throw new Error("the architect planning entry is missing");
+  }
+  const original = { ...architectEntry };
+  Object.setPrototypeOf(architectEntry, inheritedStageWait);
+  delete architectEntry.stage_wait;
+  let caught: unknown = null;
+  try {
+    compilePipelineV2Spec(parsed);
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(PipelineError);
+  expect((caught as Error).message).toBe(
+    'pipeline orchestration execution_roles 0 is missing required field "stage_wait"',
+  );
+  // restore and prove the same own-property rule inside stage_wait itself
+  Object.setPrototypeOf(architectEntry, Object.prototype);
+  Object.assign(architectEntry, original);
+  const reasonProto = Object.create({ reason: "stage_iteration_completed" }) as Record<string, unknown>;
+  reasonProto.actions = ["continue_stage"];
+  architectEntry.stage_wait = reasonProto;
+  caught = null;
+  try {
+    compilePipelineV2Spec(parsed);
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(PipelineError);
+  expect((caught as Error).message).toBe(
+    'pipeline orchestration execution_roles 0 stage_wait is missing required field "reason"',
+  );
+  // and for actions
+  const actionsProto = Object.create({ actions: ["continue_stage"] }) as Record<string, unknown>;
+  actionsProto.reason = "stage_iteration_completed";
+  architectEntry.stage_wait = actionsProto;
+  caught = null;
+  try {
+    compilePipelineV2Spec(parsed);
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(PipelineError);
+  expect((caught as Error).message).toBe(
+    'pipeline orchestration execution_roles 0 stage_wait is missing required field "actions"',
+  );
+  // an inherited plan_output on the planning entry is likewise not a field
+  Object.setPrototypeOf(architectEntry, Object.prototype);
+  Object.assign(architectEntry, original);
+  const planProto = Object.create({ plan_output: "plan" }) as Record<string, unknown>;
+  planProto.state_id = "architect";
+  planProto.role = "planning";
+  planProto.stage_wait = NEUTRAL_STAGE_WAIT;
+  architectEntry.state_id = planProto.state_id;
+  architectEntry.role = planProto.role;
+  architectEntry.stage_wait = planProto.stage_wait;
+  delete architectEntry.plan_output;
+  Object.setPrototypeOf(architectEntry, planProto);
+  caught = null;
+  try {
+    compilePipelineV2Spec(parsed);
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(PipelineError);
+  expect((caught as Error).message).toBe(
+    'pipeline orchestration execution_roles 0 is missing required field "plan_output"',
+  );
+});
+
+test("37. reason validation: missing, value-less and wrong types are typed errors without echoing the value", () => {
+  const base = CANONICAL_YAML;
+  // value-less reason (YAML null)
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason:
+        actions:
+          - continue_stage
+          - revise_task
+`),
+    /pipeline orchestration execution_roles 0 stage_wait reason must be a safe non-empty identifier/,
+  );
+  for (const hostile of ["7", "{}", "true", '""', '"bad id!"', '"a..b"', '" stage_iteration_completed"']) {
+    const yaml = withStageWait(`      stage_wait:
+        reason: ${hostile}
+        actions:
+          - continue_stage
+          - revise_task
+`);
+    expect(() => compilePipelineV2Spec(Bun.YAML.parse(yaml))).toThrow(
+      PipelineError,
+    );
+    expect(() => compilePipelineV2Spec(Bun.YAML.parse(yaml))).toThrow(
+      /pipeline orchestration execution_roles 0 stage_wait reason must be a safe non-empty identifier/,
+    );
+  }
+  // the safe reason the wait manifest accepts compiles (same scalar semantics)
+  acceptCompile(base);
+});
+
+test("38. actions validation: missing, non-array, empty, duplicate, unknown and non-string entries", () => {
+  // non-array actions
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions: {}
+`),
+    /pipeline orchestration execution_roles 0 stage_wait actions must be a list, not a mapping or scalar/,
+  );
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions: continue_stage
+`),
+    /pipeline orchestration execution_roles 0 stage_wait actions must be a list, not a mapping or scalar/,
+  );
+  // empty actions
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions: []
+`),
+    /pipeline orchestration execution_roles 0 stage_wait actions must not be empty/,
+  );
+  // duplicate action ids: the second occurrence's position is named
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - continue_stage
+`),
+    /pipeline orchestration execution_roles 0 stage_wait declares a duplicate action id at position 1/,
+  );
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - revise_task
+          - revise_task
+`),
+    /pipeline orchestration execution_roles 0 stage_wait declares a duplicate action id at position 1/,
+  );
+  // an unknown action id: typed rejection without echoing the value
+  rejectCompile(
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - pause_stage
+`),
+    /pipeline orchestration execution_roles 0 stage_wait action at position 1 must be one of \["continue_stage","revise_task"\]/,
+  );
+  // non-string entries: typed rejection without echoing the value
+  for (const hostile of ["7", "null", "true", "{}", "id: continue_stage"]) {
+    const yaml = withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - ${hostile}
+`);
+    expect(() => compilePipelineV2Spec(Bun.YAML.parse(yaml))).toThrow(
+      /pipeline orchestration execution_roles 0 stage_wait action at position 1 must be one of \["continue_stage","revise_task"\]/,
+    );
+  }
+});
+
+test("39. control and stage roles do not accept stage_wait", () => {
+  rejectCompile(
+    CANONICAL_YAML.replace(
+      "    - state_id: stage_dispatch\n      role: control\n",
+      `    - state_id: stage_dispatch\n      role: control\n${NEUTRAL_STAGE_WAIT_YAML}`,
+    ),
+    /pipeline orchestration execution_roles 1 has unknown field "stage_wait"/,
+  );
+  rejectCompile(
+    CANONICAL_YAML.replace(
+      "    - state_id: coder\n      role: stage\n      stage_template: development\n",
+      `    - state_id: coder\n      role: stage\n      stage_template: development\n${NEUTRAL_STAGE_WAIT_YAML}`,
+    ),
+    /pipeline orchestration execution_roles 3 has unknown field "stage_wait"/,
+  );
+});
+
+test("40. the declared action order is preserved verbatim and never sorted", async () => {
+  await withOrchestratedBundle(
+    async (dirs) => {
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      const orchestration = pipeline.orchestration;
+      if (orchestration === undefined) {
+        throw new Error("missing orchestration");
+      }
+      const planning = orchestration.execution_roles[0];
+      if (planning === undefined || planning.role !== "planning") {
+        throw new Error("the planning entry is missing");
+      }
+      expect(planning.stage_wait.actions).toEqual(["revise_task", "continue_stage"]);
+      // repeated loads keep the declared order
+      const second = await loadPipelineV2(dirs.bundle);
+      const secondPlanning = second.orchestration?.execution_roles[0];
+      if (secondPlanning === undefined || secondPlanning.role !== "planning") {
+        throw new Error("the planning entry is missing");
+      }
+      expect(secondPlanning.stage_wait.actions).toEqual(["revise_task", "continue_stage"]);
+      const compiled = compiledExecutionRoleFor(pipeline, "architect");
+      if (compiled.role !== "planning") {
+        throw new Error("the compiled role is not the planning role");
+      }
+      expect(compiled.stage_wait.actions).toEqual(["revise_task", "continue_stage"]);
+    },
+    withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - revise_task
+          - continue_stage
+`),
+  );
+});
+
+test("41. the resolved policy is recursively frozen and isolated from the parsed input", async () => {
+  const parsed = Bun.YAML.parse(CANONICAL_YAML) as Record<string, unknown>;
+  const spec = compilePipelineV2Spec(parsed);
+  const orchestration = spec.orchestration;
+  if (orchestration === undefined) {
+    throw new Error("missing orchestration");
+  }
+  const planning = orchestration.execution_roles[0];
+  if (planning === undefined || planning.role !== "planning") {
+    throw new Error("the planning entry is missing");
+  }
+  // the spec's policy objects are parser-built fresh objects; freezing
+  // happens at load time, so only mutation isolation is asserted here
+  expect(planning.stage_wait).toEqual(NEUTRAL_STAGE_WAIT);
+  // the parsed input is not frozen and mutating it after the compile does
+  // not change the compiled metadata (the parser builds its own objects)
+  const inputRoles = (parsed as {
+    orchestration: {
+      execution_roles: { state_id: string; role: string; stage_wait?: { reason?: string; actions?: string[] } }[];
+    };
+  }).orchestration.execution_roles;
+  const inputPlanning = inputRoles.find((entry) => entry.state_id === "architect");
+  if (inputPlanning?.stage_wait === undefined) {
+    throw new Error("the parsed planning entry lost its stage_wait");
+  }
+  expect(Object.isFrozen(inputPlanning.stage_wait)).toBe(false);
+  inputPlanning.stage_wait.reason = "mutated_after_compile";
+  if (inputPlanning.stage_wait.actions) {
+    inputPlanning.stage_wait.actions.push("injected");
+  }
+  expect(planning.stage_wait).toEqual(NEUTRAL_STAGE_WAIT);
+  // and the resolved snapshot of a fresh load is equally frozen
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const resolvedPlanning = pipeline.orchestration?.execution_roles[0];
+    if (resolvedPlanning === undefined || resolvedPlanning.role !== "planning") {
+      throw new Error("the planning entry is missing");
+    }
+    expect(Object.isFrozen(resolvedPlanning)).toBe(true);
+    expect(Object.isFrozen(resolvedPlanning.stage_wait)).toBe(true);
+    expect(Object.isFrozen(resolvedPlanning.stage_wait.actions)).toBe(true);
+  });
+});
+
+test("42. the compiled planning role carries the exact policy shape; control and stage roles are unchanged", async () => {
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const planning = compiledExecutionRoleFor(pipeline, "architect");
+    expect(Object.keys(planning)).toEqual(["state_id", "role", "plan_output", "stage_wait"]);
+    if (planning.role !== "planning") {
+      throw new Error("the compiled role is not the planning role");
+    }
+    expect(Object.keys(planning.stage_wait)).toEqual(["reason", "actions"]);
+    expect(Object.isFrozen(planning)).toBe(true);
+    expect(Object.isFrozen(planning.stage_wait)).toBe(true);
+    expect(Object.isFrozen(planning.stage_wait.actions)).toBe(true);
+    expect(planning.stage_wait).toEqual(NEUTRAL_STAGE_WAIT);
+    // the compiled actions array is a fresh frozen copy, not an alias of
+    // the resolved metadata's array
+    const resolvedPlanning = pipeline.orchestration?.execution_roles[0];
+    if (resolvedPlanning === undefined || resolvedPlanning.role !== "planning") {
+      throw new Error("the planning entry is missing");
+    }
+    expect(planning.stage_wait.actions).not.toBe(resolvedPlanning.stage_wait.actions);
+    expect(planning.stage_wait).not.toBe(resolvedPlanning.stage_wait);
+    // control and stage compiled roles stay exactly as before
+    expect(compiledExecutionRoleFor(pipeline, "stage_dispatch")).toEqual({
+      state_id: "stage_dispatch",
+      role: "control",
+    });
+    expect(Object.keys(compiledExecutionRoleFor(pipeline, "stage_dispatch"))).toEqual([
+      "state_id",
+      "role",
+    ]);
+    expect(compiledExecutionRoleFor(pipeline, "coder")).toEqual({
+      state_id: "coder",
+      role: "stage",
+      stage_template: "development",
+    });
+    expect(Object.keys(compiledExecutionRoleFor(pipeline, "coder"))).toEqual([
+      "state_id",
+      "role",
+      "stage_template",
+    ]);
+  });
+});
+
+test("43. the provenance gate still fires before any policy read; caller mutation cannot reach the compiled policy", async () => {
+  await withOrchestratedBundle(async (dirs) => {
+    const resolved = await loadPipelineV2(dirs.bundle);
+    const UNTRUSTED =
+      "compiledExecutionRoleFor requires the deep-frozen snapshot object returned by loadPipelineV2; " +
+      "hand-built objects, casts, clones and Proxies are rejected before any content is read";
+    // a deep clone carrying the same policy bytes is still rejected before
+    // any field (including stage_wait) is read
+    const clone = structuredClone(resolved);
+    expect(clone).toEqual(resolved);
+    let trapCalls = 0;
+    const proxied = new Proxy(clone, {
+      get(target, property, receiver) {
+        trapCalls += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(() => compiledExecutionRoleFor(proxied, "architect")).toThrow(UNTRUSTED);
+    expect(trapCalls).toBe(0);
+    // mutating the trusted snapshot's frozen metadata is refused
+    const resolvedPlanning = resolved.orchestration?.execution_roles[0];
+    if (resolvedPlanning === undefined || resolvedPlanning.role !== "planning") {
+      throw new Error("the planning entry is missing");
+    }
+    expect(() => {
+      (resolvedPlanning.stage_wait.actions as string[]).push("injected");
+    }).toThrow();
+    expect(resolvedPlanning.stage_wait).toEqual(NEUTRAL_STAGE_WAIT);
+  });
+});
+
+test("44. content-free diagnostics: hostile policy values and field names are never echoed", async () => {
+  const canaryReason = "CANARY stage wait reason 9f3a!";
+  const canaryField = "CANARY_stage_wait_field_9f3a";
+  const canaryAction = "CANARY_stage_wait_action_9f3a";
+  const caught: string[] = [];
+  const capture = (yaml: string): void => {
+    try {
+      compilePipelineV2Spec(Bun.YAML.parse(yaml));
+      throw new Error("the hostile policy compiled");
+    } catch (error) {
+      if (error instanceof PipelineError) {
+        caught.push(error.message);
+        return;
+      }
+      throw error;
+    }
+  };
+  // hostile reason value
+  capture(withStageWait(`      stage_wait:
+        reason: ${canaryReason}
+        actions:
+          - continue_stage
+`));
+  // hostile unknown field name
+  capture(withStageWait(`${NEUTRAL_STAGE_WAIT_YAML}        ${canaryField}: 1\n`));
+  // hostile action entry
+  capture(withStageWait(`      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - ${canaryAction}
+`));
+  expect(caught.length).toBe(3);
+  for (const message of caught) {
+    expect(message).not.toContain(canaryReason);
+    expect(message).not.toContain(canaryField);
+    expect(message).not.toContain(canaryAction);
+  }
+});
+
+test("45. the stage-wait parsing is the single chain over the shared scalar predicate; no second serializer, digest or registry", () => {
+  const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2.ts"), "utf8");
+  // the stage-wait reason grammar is the shared scalar predicate of the
+  // wait manifest layer (no second reason validator, no wider grammar)
+  const reasonChecks = source.match(/reason must be a safe non-empty identifier/g) ?? [];
+  expect(reasonChecks.length).toBe(1);
+  expect(source).toContain('import { isPipelineV2SafeId } from "./pipeline_v2_scalar.ts"');
+  // the parseStageWait body owns one chain: no serializer, no digest
+  // machinery, no registry, no sorting of the declared actions
+  const start = source.indexOf("function parseStageWait");
+  const end = source.indexOf("function parseOrchestration");
+  if (start < 0 || end < 0 || end <= start) {
+    throw new Error("the parseStageWait body is missing");
+  }
+  const body = source.slice(start, end);
+  expect(body).not.toContain("canonicalJson");
+  expect(body).not.toContain("CryptoHasher");
+  expect(body).not.toContain("sortById");
+  expect(body).not.toContain("WeakSet");
+  expect(body).not.toContain("WeakMap");
+  expect(body).not.toContain("sort(");
+  // the parser is invoked exactly once per planning entry (single chain)
+  const callSites = source.match(/parseStageWait\(/g) ?? [];
+  expect(callSites.length).toBe(2);
+  // and the stage-wait policy never reaches the coordinator/runner/CLI or
+  // the durable state modules from the compiler
+  expect(source).not.toContain('from "./pipeline_v2_state.ts"');
+  expect(source).not.toContain('from "./pipeline_v2_coordinator.ts"');
+  expect(source).not.toContain('from "./pipeline_v2_runner.ts"');
+  expect(source).not.toContain('from "./pipeline_v2_wait_manifest.ts"');
+});
