@@ -142,6 +142,7 @@ import {
 } from "./pipeline_v2_coordinator.ts";
 import { resumePipelineV2RunAfterContinueStageIntervention } from "./pipeline_v2_continue_stage_resume_controller.ts";
 import { resumePipelineV2RunAfterReviseTaskIntervention } from "./pipeline_v2_revise_task_resume_controller.ts";
+import { resumePipelineV2RunAfterPlanningRunPlanHandoff } from "./pipeline_v2_planning_run_plan_resume_controller.ts";
 import {
   prepareWaitIntent,
   type PreparedPipelineV2RunWaitIntent,
@@ -842,6 +843,13 @@ type ExistingRunCallerPolicy =
       readonly waitIndex: number;
       readonly taskId: string;
       readonly taskBody: string;
+    }
+  | {
+      /** The caller policy of the planning-run-plan entrypoint. */
+      readonly kind: "planning_run_plan";
+      readonly runId: string;
+      readonly stageId: string;
+      readonly initialBudget: number;
     };
 
 /**
@@ -890,6 +898,8 @@ function captureExistingRunContract(
   let additionalIterations: number | undefined;
   let taskId: string | undefined;
   let taskBody: string | undefined;
+  let stageId: string | undefined;
+  let initialBudget: number | undefined;
   if (callerPolicyKind === "continue_stage") {
     const waitValue = options["waitIndex"];
     if (!isPositiveSafeInteger(waitValue)) {
@@ -914,6 +924,14 @@ function captureExistingRunContract(
       throw new Error(`${contractName} options.taskBody must be a non-empty string`);
     }
     taskBody = taskBodyValue;
+  } else if (callerPolicyKind === "planning_run_plan") {
+    const stageIdValue = expectSafeId(options["stageId"], `${contractName} stage id`);
+    stageId = stageIdValue;
+    const budgetValue = options["initialBudget"];
+    if (!isPositiveSafeInteger(budgetValue)) {
+      throw new Error(`${contractName} options.initialBudget must be a positive safe integer`);
+    }
+    initialBudget = budgetValue;
   }
   const configValue = options["configRoot"];
   if (!isNonEmptyAbsolutePath(configValue)) {
@@ -994,6 +1012,13 @@ function captureExistingRunContract(
       waitIndex: waitIndex as number,
       taskId: taskId as string,
       taskBody: taskBody as string,
+    });
+  } else if (callerPolicyKind === "planning_run_plan") {
+    callerPolicy = deepFreeze({
+      kind: "planning_run_plan",
+      runId,
+      stageId: stageId as string,
+      initialBudget: initialBudget as number,
     });
   } else {
     callerPolicy = { kind: "resume" };
@@ -1722,6 +1747,72 @@ export async function revisePipelineV2Task(
         waitIndex: policy.waitIndex,
         taskId: policy.taskId,
         taskBody: policy.taskBody,
+      });
+    },
+  });
+}
+
+/**
+ * The caller contract of the dedicated planning-run-plan runner entrypoint.
+ * The external parameters are exactly the run id, the two caller policy
+ * scalars `stageId` and `initialBudget` (an explicit caller decision of
+ * this API — the runner derives no stage, budget, plan digest or handoff
+ * parameter from the durable state) and the standard resume configuration.
+ * Automatic stage/budget selection, the default-pipeline policy and the
+ * CLI wiring are not part of this entrypoint, and no automatic planning
+ * loop exists: the composed controller runs exactly one handoff followed
+ * by exactly one coordinator resume.
+ */
+export interface PipelineV2PlanningRunPlanOptions {
+  /** The run id of the already durable run (safe-id validated). */
+  readonly runId: string;
+  /** The caller-selected stage of the newly accepted plan (safe-id validated). */
+  readonly stageId: string;
+  /** The caller-selected initial budget for the opened stage generation. */
+  readonly initialBudget: number;
+  readonly configRoot: string;
+  readonly launcherId?: string;
+}
+
+/**
+ * Continues one already durable pipeline v2 run from its settled-but-unbound
+ * planning acceptance boundary through the composition of the planning-run-plan
+ * handoff and the coordinator resume (implemented; still not wired into the
+ * CLI). The caller policy is exactly the two captured scalars `stageId` and
+ * `initialBudget`; every internal handoff parameter — the plan acceptance,
+ * the replanned stage opening, the committed planning transition, the
+ * restored cursor and the resumed execution — is owned by the existing
+ * composition controller, which classifies the planning boundary itself
+ * (Branch A/B, the latest replanned closure and the crash retry included).
+ * No runner-level planning-boundary classifier exists here: the shared
+ * preflight stays the single one (capture, gate, run-root verification,
+ * sink open, pipeline load from the durable bundle root, profiles, one
+ * Launcher authority, one runtime adapter), and the single composed call is
+ * exactly `resumePipelineV2RunAfterPlanningRunPlanHandoff` — no proposal,
+ * accepted output, compiled plan, wait index, intent, revision/digest,
+ * journal index or run root is ever passed through the runner.
+ */
+export async function resumePipelineV2PlanningRunPlan(
+  options: PipelineV2PlanningRunPlanOptions,
+  deps: PipelineV2RunnerDeps,
+): Promise<PipelineV2RunOutcome> {
+  return runExistingPipelineV2(options, deps, {
+    failureLogPrefix: "pipeline v2 planning-run-plan resume failed",
+    contractName: "pipeline v2 planning-run-plan resume",
+    callerPolicyKind: "planning_run_plan",
+    runCoordinator: (context) => {
+      const policy = context.callerPolicy;
+      if (policy.kind !== "planning_run_plan") {
+        throw new Error("pipeline v2 planning-run-plan resume: the captured caller policy is not a planning-run-plan policy");
+      }
+      return resumePipelineV2RunAfterPlanningRunPlanHandoff({
+        pipeline: context.pipeline,
+        runRoot: context.runRoot,
+        sink: context.sink,
+        runtime: context.runtime,
+        control: context.control,
+        stageId: policy.stageId,
+        initialBudget: policy.initialBudget,
       });
     },
   });

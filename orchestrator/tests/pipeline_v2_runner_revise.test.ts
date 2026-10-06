@@ -1032,6 +1032,7 @@ test("the runner export surface gains exactly one key for the revise-task entryp
   expect(Object.keys(namespace).sort()).toEqual([
     "continuePipelineV2Stage",
     "resumePipelineV2",
+    "resumePipelineV2PlanningRunPlan",
     "revisePipelineV2Task",
     "runPipelineV2",
   ]);

@@ -463,6 +463,78 @@ revisePipelineV2Task(
   dispatch; late post-cutoff signals change nothing (shared with
   resume/continue-stage).
 
+## The production planning-run-plan runner API (implemented, not wired)
+
+`orchestrator/src/pipeline_v2_runner.ts` adds the dedicated planning-run-plan
+entrypoint `resumePipelineV2PlanningRunPlan(options, deps)`. It is the
+production-shaped way to drive an already durable run from its
+settled-but-unbound planning acceptance boundary through the composition of
+the planning-run-plan handoff and the coordinator resume — but it is still
+not wired into the CLI: `main.ts`, `cli_args.ts` and the default pipeline
+stay untouched, and there is no automatic planning loop anywhere in this
+entrypoint.
+
+- The caller contract `PipelineV2PlanningRunPlanOptions` is exactly
+  `{runId, stageId, initialBudget, configRoot, launcherId?}`. The two
+  policy scalars `stageId` (safe id) and `initialBudget` (a positive safe
+  integer, no default) are explicit caller policy of this API: the runner
+  derives no stage, budget, plan digest or handoff parameter from the
+  durable state, and the automatic stage/budget selection policy stays a
+  later increment.
+- The entrypoint reuses the single existing private existing-run core
+  (`runExistingPipelineV2`) — no second runner and no second preflight.
+  The shared preflight order is unchanged: capture/validate options and
+  deps → one `RunCauseGate` → read-only state-root/run-root verification →
+  read-only `PipelineV2RunStateSink.open` → the pipeline loaded only from
+  `state.pipeline.bundle_root` → the profiles from the caller `configRoot`
+  → one Launcher authority check → one runtime adapter → one composed
+  controller call → the existing coordinator-result → `PipelineV2RunOutcome`
+  mapping.
+- `ExistingRunCallerPolicy` gained the fourth discriminant
+  `planning_run_plan {runId, stageId, initialBudget}`, frozen at capture;
+  the capture order is `runId → stageId → initialBudget → configRoot →
+  launcherId`, each read exactly once, and the original caller objects are
+  never read afterwards.
+- There is deliberately NO runner-level planning-boundary classifier and no
+  post-open derivation: the Branch A/B classification, the
+  latest-replanned-closure derivation, the selected-stage binding, the
+  budget ownership and the crash retry belong entirely to the existing
+  composition controller `resumePipelineV2RunAfterPlanningRunPlanHandoff`,
+  whose single call is the entrypoint's `runCoordinator` body. No proposal,
+  accepted output, compiled plan/stage, wait index, intent, plan
+  revision/digest, generation/iteration/transition index or run root is
+  ever passed through the runner.
+- A typed downstream error — including a wrong caller stage/budget on the
+  completed boundary — passes through by identity to the ordinary runner
+  mapping (exit 1 without a reason field, the durable state untouched, no
+  reclassification, no own retry logic).
+- `resumePipelineV2`, `continuePipelineV2Stage` and `revisePipelineV2Task`
+  keep their observable behavior, texts, capture orders, signal semantics
+  and outcome mapping unchanged.
+- Tests (`orchestrator/tests/pipeline_v2_runner_planning_run_plan.test.ts`,
+  13 tests) cover the C0 end-to-end after the reopen (the honest two-cycle
+  two-stage prefix ending at the settled-unbound planning boundary on the
+  non-first stage; the exact fourteen-command suffix — the seven handoff
+  commands then the seven resume commands, revision +14 — the successor
+  stage execution with role `stage`/iteration 1 and the ordinary
+  `worker_failed`), the C1 crash retry (the handoff durable, reopen,
+  Branch B/C1 zero dispatch, only the seven resume commands), the capture
+  battery (the options Proxy reading the five fields exactly once in
+  contract order with hostile extras unread; mutating
+  `stageId`/`initialBudget`/`runId` getters keeping the validated policy
+  and the first validated run only; a mutation delivered during the
+  pending auth and a replacement clock never reaching the composed call),
+  the invalid-options matrix (every refusal the ordinary pre-run-root
+  outcome with zero effects), the existing-run precedence battery (missing
+  state, an unsafe run-root mode rejected unchanged, a broken bundle, a
+  different bundle failing the durable identity inside the composed
+  controller, a missing profile root, a failing authority — all through
+  the shared boundaries with zero Sessions), the wrong-caller-policy
+  battery on the completed boundary, the signal battery (SIGINT 130 /
+  SIGTERM 143 at the authority boundary with zero durable writes), and the
+  export/source pins (exactly five runtime keys; one existing-run core
+  with the single new composed call).
+
 ## The production pipeline v2 wait-response CLI (`orchestrator respond`)
 
 `orchestrator respond` records the user's answer to one durably open wait.
