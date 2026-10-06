@@ -2814,6 +2814,135 @@ Not wired: coordinator/runner/CLI/default-pipeline wiring,
 automatic resume, retries, migrations/API/T3.
 
 
+### Planning-run-plan handoff → coordinator resume composition controller
+### (production-neutral, not wired)
+
+`orchestrator/src/pipeline_v2_planning_run_plan_resume_controller.ts`
+(public facade) with the internal core
+`pipeline_v2_planning_run_plan_resume_controller_internal.ts` composes
+the completed planning-run-plan handoff followed by the coordinator's
+resume entrypoint in one fixed sequence:
+`applyPipelineV2PlanningRunPlanHandoff` → the defensive verification of
+the successful handoff → `resumePipelineV2Run`. Public API is exactly
+`resumePipelineV2RunAfterPlanningRunPlanHandoff({pipeline, runRoot,
+sink, runtime, control, stageId, initialBudget})` returning the exact
+verified `PipelineV2ResumeCoordinationResult` by object identity (no new
+envelope); the run id is never a caller field (derived exclusively from
+the verified authoritative state), and no proposal, compiled
+plan/stage, wait intent, plan digest/revision,
+generation/iteration/transition index or entry state is accepted from
+the caller. Runtime export surface is exactly
+`PipelineV2PlanningRunPlanResumeControllerError` (own reasons
+`invalid_options | invalid_result`, last verified authoritative `state`)
+and `resumePipelineV2RunAfterPlanningRunPlanHandoff`; the internal core
+carries the frozen `productionPlanningRunPlanResumeOps` (exactly the two
+existing facades by identity) and
+`applyPipelineV2PlanningRunPlanResumeWithIo`; no reducer/state
+validator/store/fs/parser/serializer/digest/registry imports, no manual
+manifest/intent/proposal reconstruction, no second retry classifier and
+no mutable module-global seam. The controller owns no durable side
+effect of its own, never opens the sink and never loads the pipeline
+(the caller opens the sink and loads the pipeline from the durable
+`state.pipeline.bundle_root`; after a process crash the caller reopens
+and repeats the whole facade), and interprets no signal itself
+(acceptance/cutoff stay coordinator-owned through the captured control
+functions). Capture order before the first await: the options shape →
+the seven fields each exactly once in contract order (`pipeline`,
+`runRoot`, `sink`, `runtime`, `control`, `stageId`, `initialBudget`;
+hostile extras never read) → the ops record shape and its two members
+exactly once → the pipeline provenance gate (zero traps, before any
+scalar validation, sink read or facade call) → the scalars (absolute
+run root, a structural sink with a `dispatch` function, a safe stage id,
+a positive safe-integer budget) → the runtime/control contract functions
+bound exactly once into stable deep-frozen adapters the coordinator
+alone consumes (a mutation of the caller-owned runtime/control objects
+during the pending handoff cannot change the resume). The handoff result
+is verified defensively: the post-handoff snapshot is read exactly once
+and verified as the completed handoff boundary FIRST — active/running
+with no terminal/publication/failure projection, cursor and both
+journals exactly at the committed planning transition with
+`executions.length === transitions.length` (no successor started), the
+last transition bound to the last settled planning execution (role
+`planning`, `cleanup_completed`, no `iteration_index`) and leading to
+the selected stage's compiled template entry state through the trusted
+`compiledStageTemplateFor`, the last open generation bound to the caller
+stage/budget and the last accepted plan record and anchored to the
+answered wait, the actual last replanned iteration closure — never a
+historical one — anchoring the last `revise_task` wait, whose single
+declared `revise_task` action's target is the planning execution's
+state; a snapshot that is not a record or not a valid boundary yields
+the layer's own `invalid_result` with error state `null` and the resume
+never starts. Then the result's exact 14-key shape, the flat field
+types, the structural `state` equality (a local recursive own-key
+comparator, never a serialization; identity not required) and every flat
+binding (caller policy, the last plan record, the opened generation and
+its open iteration, the answered wait, the committed transition and its
+execution) are verified with the verified snapshot as the error state —
+a hostile or malformed result is the layer's own `invalid_result`, never
+a leaked `TypeError`, and the resume is never called. The coordinator's
+returned union is verified defensively, identically to the sibling
+resume controllers (success exactly `ok`,`state` with the state
+identical to the post-resume snapshot; refusal exactly
+`ok`,`refused`,`reason`,`state` with a reason from the pinned refusal
+vocabulary; ordinary failure exactly `ok`,`reason`,`state` with a reason
+from the canonical `PIPELINE_V2_FAILURE_REASONS`; failure and refusal
+states null or exactly the snapshot) and returned unchanged by object
+identity without reclassification; the post-resume snapshot is read
+exactly once and a malformed one never enters the error state (the
+verified post-handoff snapshot is reported instead). Retry/crash
+windows: C0 (the fresh handoff suffix + the resume) and the crash seam
+(the handoff fully durable while the resume has not started → the
+reopened call's handoff recognizes Branch B/C1 with zero dispatch, the
+handoff projection and the filesystem are never rewritten, and the
+resume runs exactly once). Tests:
+`orchestrator/tests/pipeline_v2_planning_run_plan_resume_controller.test.ts`
+(12 tests) cover the honest C0 after a real reopen on the two-cycle
+two-stage prefix (two historical revise-task cycles, the non-first stage
+selected: the exact seven-command handoff suffix
+`task_revision_accepted × 2 → plan_revision_accepted →
+stage_generation_closed(replanned) → stage_generation_opened →
+stage_iteration_opened → transition_committed` and the exactly seven
+resume commands `start_agent_execution → agent_data_prepared →
+agent_execution_session_created → agent_tool_session_created →
+agent_running → agent_failed → run_failed` with the successor execution
+on the selected stage's entry (`execution_role: "stage"`,
+`iteration_index: 1`, no index gap), the ordinary `worker_failed` —
+never a refusal — one session pair cleaned exactly once each tool-first,
+and the loader round-trip), the crash seam (the sentinel resume thrown
+before any effect and passing by identity, the reopen, the repeated
+public facade with Branch B/C1 zero dispatch, only the seven resume
+commands recorded, the handoff projection and the filesystem
+fingerprint never rewritten), the handoff error identity (resume calls
+0), the resume thrown-error identity, the malformed handoff-result
+matrix (primitives/lists, missing/extra own fields, hostile presentation
+states, foreign stage/budget/plan/generation/iteration/transition/
+execution/target bindings and a progressed state with an already started
+successor execution — every case the layer's own `invalid_result` with
+zero resume calls, never a `TypeError`, content-free diagnostics, the
+error state the post-handoff authoritative snapshot and `null` exactly
+when the snapshot itself is unusable), the malformed resume-union matrix
+plus the positive vocabulary table (every refusal reason and every
+`PIPELINE_V2_FAILURE_REASONS` value, each with null and with the
+authoritative state, plus the success union — every valid object
+returned by identity), the capture battery (the options Proxy reading
+the seven fields exactly once in contract order, the ops Proxy reading
+the two members exactly once, hostile extras never read,
+pending-handoff mutations of stage/budget/runRoot/runtime/control never
+redirecting, replacement runtime/control functions never called), the
+pipeline clone/Proxy provenance refusals with zero traps and zero facade
+calls, the invalid runtime/control/sink/options/scalar shapes as typed
+own errors without native `TypeError`s and zero facade calls, the
+snapshot-read counts (exactly one post-handoff and one post-resume
+read; malformed post-call snapshots refused with the verified state,
+never the hostile value), and both export surfaces plus the source scan
+(only the two facades plus the provenance/scalar/state/orchestration/
+freezer helpers; no reducer/validator/store/fs/parser/serializer/digest/
+registry/runner imports; no message parsing). Not wired: the runner,
+the CLI, the default pipeline bundle, the stage/budget selection policy,
+automatic resume, schema/reducer changes, migrations/API/T3 and
+multi-process locking.
+
+
 ### Continue-stage grant application controller (production-neutral, not wired)
 
 `orchestrator/src/pipeline_v2_continue_stage_grant_controller.ts`
