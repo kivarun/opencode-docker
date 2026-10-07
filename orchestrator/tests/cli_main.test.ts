@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import { resolveHelperConfig } from "../src/launcher.ts";
 import {
   continuePipelineV2Stage,
   resumePipelineV2,
+  runPipelineV2,
   revisePipelineV2Task,
   resumePipelineV2PlanningRunPlan,
   type PipelineV2RunnerDeps,
@@ -3182,6 +3183,198 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
         `orchestrator: resume waiting (run ${RUN_ID}, state ${parts.runRoot}/state.json)`,
       ]);
       expect(lines[0]).not.toContain("failed");
+      expect(lines[0]).not.toContain("reason");
+      expect(lines[0]).not.toContain("outputs");
+    } finally {
+      rmSync(parts.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (exit 0) and one human plan-ready line", async () => {
+  const buildFresh = async (runId: string) => {
+    const root = mkdtempSync(join(tmpdir(), "cli-plan-ready-"));
+    const bundle = join(root, "bundle");
+    mkdirSync(join(bundle, "prompts"), { recursive: true });
+    mkdirSync(join(bundle, "schemas"), { recursive: true });
+    writeFileSync(join(bundle, "pipeline.yaml"), STAGE_PIPELINE);
+    writeFileSync(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
+    writeFileSync(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
+    const configRoot = join(root, "config");
+    mkdirSync(join(configRoot, "profiles"), { recursive: true });
+    mkdirSync(join(configRoot, "opencode"), { recursive: true });
+    writeFileSync(
+      join(configRoot, "profiles", "coder.yaml"),
+      [
+        "schema_version: 1",
+        "image: ghcr.io/example/worker:1",
+        "opencode_config: opencode/coder.json",
+        "env:",
+        "  MODEL_API_KEY:",
+        "    from_env: CODER_SOURCE_VAR_1",
+        "    required: true",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(configRoot, "opencode", "coder.json"), JSON.stringify({ model: "glm53-flash" }));
+    const sources = join(root, "userdata");
+    mkdirSync(sources, { recursive: true });
+    writeFileSync(join(sources, "task.md"), "TASK-BODY\n");
+    const projectSource = join(root, "project-source");
+    mkdirSync(projectSource, { recursive: true });
+    const stateRoot = join(root, "state");
+    mkdirSync(stateRoot, { recursive: true });
+    const credDir = join(root, "cred", "docker-helper");
+    mkdirSync(credDir, { recursive: true, mode: 0o700 });
+    const credentialFile = join(credDir, "credential.token");
+    writeFileSync(credentialFile, "cred-token-not-real\n", { mode: 0o600 });
+    return { root, configRoot, credentialFile, stateRoot, bundle, sources, projectSource };
+  };
+
+  // The production CLI path builds the runner deps itself: no randomId or
+  // clock injection reaches the runner, so the fresh run id is a real
+  // random uuid and the fake CLI discovers the run root from the state
+  // root's single pipeline-runs entry.
+  const freshCli = (parts: Awaited<ReturnType<typeof buildFresh>>, sessionCreates: { count: number }, deletes: string[]) => {
+    const handler = async (args: readonly string[]) => {
+      if (args[0] === "session" && args[1] === "create") {
+        sessionCreates.count += 1;
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            ok: true,
+            session: { id: `dhs_${sessionCreates.count}`, launcher_id: "dhl_plan_ready" },
+            token: `dhc_${sessionCreates.count}`,
+          }),
+        };
+      }
+      if (args[0] === "session" && args[1] === "delete") {
+        deletes.push(args[args.length - 1] ?? "");
+        return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+      }
+      if (args[0] === "run") {
+        let mountStart = -1;
+        for (let i = 0; i < args.length; i += 1) {
+          if (args[i] === "--mount") {
+            mountStart = i;
+            break;
+          }
+        }
+        const runs = readdirSync(join(parts.stateRoot, "pipeline-runs"));
+        const runRoot = join(parts.stateRoot, "pipeline-runs", runs[0] ?? "");
+        for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
+          const spec = args[i + 1] ?? "";
+          const [source, target] = spec.split(":");
+          if (target === "/pipeline/outputs") {
+            const dir = join(runRoot, source ?? "");
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, "plan"), "{}", { mode: 0o600 });
+          }
+        }
+        return { code: 0 };
+      }
+      return { code: 0 };
+    };
+    return handler as unknown as CliIo["runner"]["run"];
+  };
+
+  const wireIo = (parts: Awaited<ReturnType<typeof buildFresh>>) => {
+    const { io, out, err } = makeIo();
+    io.baseEnv = { ...io.baseEnv, CODER_SOURCE_VAR_1: "tester-secret" };
+    const sessionCreates = { count: 0 };
+    const sessionDeletes: string[] = [];
+    io.runner.run = freshCli(parts, sessionCreates, sessionDeletes);
+    io.resolveStateRootProjection = () => ({ localRoot: parts.stateRoot, daemonRoot: parts.stateRoot });
+    io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile: parts.credentialFile });
+    io.fetchAuth = () =>
+      Promise.resolve({
+        status: 200,
+        body: { authority: "launcher", principal: "tester", launcher_id: "dhl_plan_ready" },
+      });
+    io.runPipelineV2 = runPipelineV2 as unknown as CliIo["runPipelineV2"];
+    return { io, out, err, sessionCreates, sessionDeletes };
+  };
+
+  // JSON mode: the real fresh runner reports the plan-ready suspension
+  {
+    const parts = await buildFresh("plan-ready-cli-json");
+    try {
+      const { io, out, sessionCreates, sessionDeletes } = wireIo(parts);
+      const exit = await runCli(
+        [
+          "run",
+          "--pipeline-root", parts.bundle,
+          "--config-root", parts.configRoot,
+          "--project", parts.projectSource,
+          "--input", `task=${join(parts.sources, "task.md")}`,
+          "--json",
+        ],
+        io,
+      );
+      expect(exit).toBe(0);
+      const documents = out.filter((line) => line.trim() !== "");
+      expect(documents).toHaveLength(1);
+      const parsed = JSON.parse(documents[0]!) as Record<string, unknown>;
+      expect(Object.keys(parsed).sort()).toEqual(["exitCode", "ok", "planReady", "runId", "runRoot", "state"]);
+      expect(parsed["ok"]).toBe(false);
+      expect(parsed["planReady"]).toBe(true);
+      expect(parsed["exitCode"]).toBe(0);
+      const runId = parsed["runId"] as string;
+      const runRoot = parsed["runRoot"] as string;
+      expect(runId).not.toBe("");
+      expect(runRoot).toBe(join(parts.stateRoot, "pipeline-runs", runId));
+      expect("waiting" in parsed).toBe(false);
+      expect("reason" in parsed).toBe(false);
+      expect("refused" in parsed).toBe(false);
+      const state = parsed["state"] as Record<string, unknown>;
+      expect(state["status"]).toBe("active");
+      expect(state["phase"]).toBe("running");
+      expect(state["transitions"]).toHaveLength(0);
+      expect(state["generations"]).toHaveLength(0);
+      expect(state["waits"]).toHaveLength(0);
+      expect(state["failure"]).toBeUndefined();
+      // one session pair cleaned exactly once each, tool-first
+      expect(sessionCreates.count).toBe(2);
+      expect(sessionDeletes).toEqual(["dhs_2", "dhs_1"]);
+      // the durable state round-trips; no wait manifest exists
+      const durable = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
+      expect(durable.status).toBe("active");
+      expect(durable.transitions).toHaveLength(0);
+      let hasWaitsDir = false;
+      try {
+        await (await import("node:fs/promises")).readdir(join(runRoot, "waits"));
+        hasWaitsDir = true;
+      } catch {
+        hasWaitsDir = false;
+      }
+      expect(hasWaitsDir).toBe(false);
+    } finally {
+      rmSync(parts.root, { recursive: true, force: true });
+    }
+  }
+
+  // human mode: exactly one plan-ready summary line on stderr, exit 0
+  {
+    const parts = await buildFresh("plan-ready-cli-human");
+    try {
+      const { io, out, err } = wireIo(parts);
+      const exit = await runCli(
+        [
+          "run",
+          "--pipeline-root", parts.bundle,
+          "--config-root", parts.configRoot,
+          "--project", parts.projectSource,
+          "--input", `task=${join(parts.sources, "task.md")}`,
+        ],
+        io,
+      );
+      expect(exit).toBe(0);
+      expect(out).toEqual([]);
+      const lines = err.filter((line) => line.trim() !== "");
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^orchestrator: run plan-ready \(run [0-9a-f-]+, state .*\/state\.json\)$/);
+      expect(lines[0]).not.toContain("failed");
+      expect(lines[0]).not.toContain("waiting");
       expect(lines[0]).not.toContain("reason");
       expect(lines[0]).not.toContain("outputs");
     } finally {

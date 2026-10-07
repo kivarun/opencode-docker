@@ -1148,6 +1148,23 @@ with the policy-derived reason/actions — the coordination, the runner
 outcome and the CLI all report the controlled suspension as the exact
 waiting branch, and no automatic response or intervention loop exists.
 
+The plan-ready suspension is the second trusted coordinator seam over the
+compiled orchestration metadata: a fully successful planning execution
+whose declared `completed` transition targets a stage state stops the
+coordination after the durable `agent_cleanup_completed` and before any
+transition commit, verified through the public
+`restorePipelineV2PlanningAcceptanceContext` and reported by the
+coordination, the runner and the CLI as the exact plan-ready branch. The
+operator chain stays manual — `orchestrator run` suspends at the initial
+plan-ready boundary (no wired CLI continuation for it yet: the handoff
+chain serves the revise-cycle planning boundary only), `orchestrator
+revise-task` runs the replanning planning execution to the same boundary,
+and `orchestrator resume-plan --stage-id ... --initial-budget ...` accepts
+the plan, opens the stage generation and resumes the stage execution to
+the automatic `run_waiting`. There is no automatic plan acceptance, no
+automatic stage/budget selection and no automatic planning loop;
+`stageId` and `initialBudget` remain explicit operator policy.
+
 ### Compiled run-plan projection over the orchestration metadata (pure substrate, production-reachable transitively)
 
 `orchestrator/src/pipeline_v2_run_plan_compiled.ts` binds one prepared run

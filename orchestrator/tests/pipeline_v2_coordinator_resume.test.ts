@@ -843,7 +843,7 @@ function expectResumeFailed(
   reason: PipelineV2FailureReason,
 ): PipelineV2RunState {
   expect(result.ok).toBe(false);
-  if (result.ok || ("refused" in result && result.refused) || "waiting" in result) {
+  if (result.ok || ("refused" in result && result.refused) || "waiting" in result || "planReady" in result) {
     throw new Error(`expected an ordinary execution failure, got ${JSON.stringify(result)}`);
   }
   expect(result.reason).toBe(reason);
@@ -1111,7 +1111,7 @@ test("5. uninterrupted run and pause/resume produce equivalent durable states", 
     sink: new RecordingSink(freshA),
     runtime: fakeA.runtime,
   }, NEUTRAL_CONTROL);
-  if (!resultA.ok || "waiting" in resultA) {
+  if (!resultA.ok || "waiting" in resultA || "planReady" in resultA) {
     throw new Error("variant A failed");
   }
   const stateA = resultA.state;

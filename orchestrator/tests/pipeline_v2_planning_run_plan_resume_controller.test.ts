@@ -651,7 +651,7 @@ test("1. honest C0 after restart on the two-cycle prefix: the handoff suffix the
     const readsAfterResume = counting.reads();
 
     // The ordinary worker failure, never a refusal.
-    if (result.ok || "waiting" in result) {
+    if (result.ok || "waiting" in result || "planReady" in result) {
       throw new Error("the composed resume was expected to fail with worker_failed");
     }
     expect("refused" in result).toBe(false);
@@ -751,7 +751,7 @@ test("2. crash seam: handoff durable, sentinel resume, C1 zero-dispatch retry, t
       stageId: "stage-2",
       initialBudget: INITIAL_BUDGET,
     });
-    if (result.ok || "waiting" in result) {
+    if (result.ok || "waiting" in result || "planReady" in result) {
       throw new Error("the composed resume was expected to fail with worker_failed");
     }
     expect("refused" in result).toBe(false);
@@ -1012,6 +1012,12 @@ test("6. malformed resume-union matrix and positive vocabulary table: valid resu
       ["waiting-missing-state", { ok: false, waiting: true }],
       ["waiting-foreign-state", { ok: false, waiting: true, state: { ...authoritative } }],
       ["waiting-own-reason-field", { ok: false, waiting: true, reason: "foreign_reason", state: authoritative }],
+      ["plan-ready-extra-field", { ok: false, planReady: true, state: authoritative, extra: 1 }],
+      ["plan-ready-false-discriminant", { ok: false, planReady: false, state: authoritative }],
+      ["plan-ready-missing-state", { ok: false, planReady: true }],
+      ["plan-ready-foreign-state", { ok: false, planReady: true, state: { ...authoritative } }],
+      ["plan-ready-own-waiting-field", { ok: false, planReady: true, waiting: true, state: authoritative }],
+      ["plan-ready-own-reason-field", { ok: false, planReady: true, reason: "worker_failed", state: authoritative }],
     ];
     for (const [label, hostile] of malformed) {
       const ops: PipelineV2PlanningRunPlanResumeOps = {
@@ -1092,6 +1098,23 @@ test("6. malformed resume-union matrix and positive vocabulary table: valid resu
         });
         expect(returned).toBe(valid);
       }
+    }
+    {
+      const valid = { ok: false, planReady: true, state: authoritative } as unknown as PipelineV2ResumeCoordinationResult;
+      const ops: PipelineV2PlanningRunPlanResumeOps = {
+        applyHandoff: applyPipelineV2PlanningRunPlanHandoff,
+        resumeRun: (async () => valid) as unknown as typeof resumePipelineV2Run,
+      };
+      const returned = await applyPipelineV2PlanningRunPlanResumeWithIo(ops, {
+        pipeline: postHandoff.pipeline,
+        runRoot: fixture.runRoot,
+        sink: postHandoff.sink as unknown as PipelineV2CoordinatorStateSink,
+        runtime: fakeWorkerFailedRuntime().runtime,
+        control: NEUTRAL_CONTROL,
+        stageId: "stage-2",
+        initialBudget: INITIAL_BUDGET,
+      });
+      expect(returned).toBe(valid);
     }
     {
       const valid = { ok: false, waiting: true, state: authoritative } as unknown as PipelineV2ResumeCoordinationResult;
@@ -1216,7 +1239,7 @@ test("7. capture battery: options and ops read exactly once in contract order; m
     expect(optionReads).toEqual(["pipeline", "runRoot", "sink", "runtime", "control", "stageId", "initialBudget"]);
     // The ops Proxy read exactly the two members in order.
     expect(opsReads).toEqual(["applyHandoff", "resumeRun"]);
-    if (result.ok || "waiting" in result) {
+    if (result.ok || "waiting" in result || "planReady" in result) {
       throw new Error("the composed resume was expected to fail with worker_failed");
     }
     expect("refused" in result).toBe(false);

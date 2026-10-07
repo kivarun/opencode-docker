@@ -570,6 +570,22 @@ function verifyResumeResult(
     if (ok !== false) {
       throw invalidResult("the resume coordinator result carries no valid ok discriminant", authoritative);
     }
+    if (keys.includes("planReady")) {
+      // The exact plan-ready suspension branch of the coordinator: the
+      // settled-but-unbound planning acceptance boundary is returned by
+      // identity — never reclassified as a failure or refusal.
+      if (!hasExactOwnKeys(result, "ok", "planReady", "state")) {
+        throw invalidResult("the resume coordinator plan-ready result carries foreign fields", authoritative);
+      }
+      if (result["planReady"] !== true) {
+        throw invalidResult("the resume coordinator result carries a malformed plan-ready discriminant", authoritative);
+      }
+      const state = result["state"];
+      if (state !== authoritative || !isRecord(state)) {
+        throw invalidResult("the resume coordinator result does not carry the authoritative durable state", authoritative);
+      }
+      return resultValue as unknown as PipelineV2ResumeCoordinationResult;
+    }
     if (keys.includes("waiting")) {
       // The exact controlled-suspension branch of the coordinator: the run
       // is durably waiting at the trusted stage-wait boundary and is

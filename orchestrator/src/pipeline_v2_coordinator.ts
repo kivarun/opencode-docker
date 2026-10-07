@@ -132,9 +132,11 @@ import {
   type V2AgentExecutionView,
   type V2DecisionExecutionView,
 } from "./pipeline_engine.ts";
+import { compiledTransitionFor } from "./pipeline_engine.ts";
 import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
 import { compiledExecutionRoleFor, type CompiledPipelineV2StageWait } from "./pipeline_v2_orchestration.ts";
 import { restorePipelineV2AcceptedRunPlan } from "./pipeline_v2_run_plan_restore.ts";
+import { restorePipelineV2PlanningAcceptanceContext } from "./pipeline_v2_resume_context.ts";
 import { enterPipelineV2Wait, PipelineV2WaitControllerError } from "./pipeline_v2_wait_controller.ts";
 import type { PipelineV2WaitManifestAction } from "./pipeline_v2_wait_manifest.ts";
 import { pipelineV2OpenStageIteration } from "./pipeline_v2_state.ts";
@@ -316,7 +318,11 @@ export type PipelineV2ResumeRefusalReason =
  * durable semantics. A waiting result (`waiting: true`) reports the
  * controlled suspension at the trusted stage-wait boundary — the run is
  * durably waiting and every consumer must check it before the ordinary
- * `ok:false` branches.
+ * `ok:false` branches. A plan-ready result (`planReady: true`) reports the
+ * controlled suspension after a fully successful planning execution — the
+ * settled-but-unbound planning boundary that `orchestrator resume-plan`
+ * consumes; it is checked together with the waiting branch before the
+ * ordinary `ok:false` branches.
  */
 export type PipelineV2ResumeCoordinationResult =
   | {
@@ -326,6 +332,11 @@ export type PipelineV2ResumeCoordinationResult =
   | {
       readonly ok: false;
       readonly waiting: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly planReady: true;
       readonly state: PipelineV2RunState;
     }
   | {
@@ -361,10 +372,13 @@ export interface PipelineV2CoordinatorControl {
  * Result of one coordination. `ok: true` means only a confirmed terminal
  * `run_succeeded`; the waiting branch (`waiting: true`) reports the
  * controlled suspension at the trusted stage-wait boundary (the durable
- * state carries the committed `run_waiting`) and must be checked by every
- * consumer before the ordinary `ok:false` failure branch; every other
- * `ok: false` result is a durable or persistence failure classified into
- * the closed failure-reason vocabulary.
+ * state carries the committed `run_waiting`); the plan-ready branch
+ * (`planReady: true`) reports the controlled suspension after a fully
+ * successful planning execution (settled but unbound — no transition, no
+ * accepted plan); every consumer must check both before the ordinary
+ * `ok:false` failure branch; every other `ok: false` result is a durable
+ * or persistence failure classified into the closed failure-reason
+ * vocabulary.
  */
 export type PipelineV2CoordinationResult =
   | {
@@ -374,6 +388,11 @@ export type PipelineV2CoordinationResult =
   | {
       readonly ok: false;
       readonly waiting: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly planReady: true;
       readonly state: PipelineV2RunState;
     }
   | {
@@ -391,20 +410,34 @@ class CoordinationAbortedError extends Error {
 }
 
 /**
- * The private controlled-suspension marker of the trusted stage-wait
- * entry. The class is never exported: the runtime, the worker and every
- * downstream layer can neither obtain an instance nor construct a
- * look-alike, so the coordinator's catch recognizes the exact private
- * identity and nothing else. When `entryFailure` is defined the wait entry
- * itself failed — the coordinator then reports the failure without any
- * durable `run_failed`; when it is undefined the run is durably waiting
- * and the coordination suspends with the waiting result branch.
+ * The private controlled-suspension marker of the coordinator. The class
+ * is never exported: the runtime, the worker and every downstream layer
+ * can neither obtain an instance nor construct a look-alike, so the
+ * coordinator's catch recognizes the exact private identity and nothing
+ * else. The closed suspension kinds:
+ *
+ * - `waiting` — the controlled suspension at the trusted stage-wait
+ *   boundary (the durable `run_waiting` is committed). When `entryFailure`
+ *   is defined the wait entry itself failed — the coordinator reports the
+ *   failure without any durable `run_failed`.
+ * - `plan_ready` — the controlled suspension after a fully successful
+ *   planning execution (durable `agent_cleanup_completed`, settled but
+ *   unbound): no transition is committed, no plan is accepted and the
+ *   operator applies `resume-plan` next.
  */
-class CoordinatorWaitSuspension extends Error {
-  readonly entryFailure?: unknown;
-  constructor(entryFailure?: unknown) {
-    super("pipeline v2 coordination suspended at the trusted stage-wait boundary");
-    this.name = "CoordinatorWaitSuspension";
+type CoordinatorSuspensionKind = "waiting" | "plan_ready";
+
+class CoordinatorSuspension extends Error {
+  readonly kind: CoordinatorSuspensionKind;
+  readonly entryFailure?: { readonly cause: unknown; readonly state: PipelineV2RunState | null };
+  constructor(kind: CoordinatorSuspensionKind, entryFailure?: { readonly cause: unknown; readonly state: PipelineV2RunState | null }) {
+    super(
+      kind === "waiting"
+        ? "pipeline v2 coordination suspended at the trusted stage-wait boundary"
+        : "pipeline v2 coordination suspended at the plan-ready planning boundary",
+    );
+    this.name = "CoordinatorSuspension";
+    this.kind = kind;
     this.entryFailure = entryFailure;
   }
 }
@@ -574,6 +607,16 @@ function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined
 function classifyCause(cause: unknown): PipelineV2FailureReason {
   if (cause instanceof CoordinatorSignalAbort) {
     return signalFailureReason(cause.signal);
+  }
+  if (cause instanceof PipelineV2RuntimeContextRestoreError) {
+    // A planning-acceptance verification failure of the plan-ready seam:
+    // the data-plane modification reasons keep their existing typed
+    // reasons (the same failure the next activation would have reported),
+    // every structural mismatch falls to the existing internal_error
+    // catch-all.
+    return cause.reason === "run_input_modified" || cause.reason === "accepted_output_modified"
+      ? cause.reason
+      : "internal_error";
   }
   if (cause instanceof PipelineV2RuntimeError) {
     return cause.reason;
@@ -1579,6 +1622,169 @@ async function continuePipelineV2Coordination(
     }
   };
 
+  /**
+   * The exact own-key shape and bindings of a successful
+   * `restorePipelineV2PlanningAcceptanceContext`, verified defensively
+   * before the plan-ready suspension: a malformed or hostile restore
+   * result never produces a suspension and never escapes as a native
+   * `TypeError`. `restored.state` is the validator's normalized copy, so
+   * the correspondence to the authoritative snapshot is structural (a
+   * local recursive own-key comparator, never serialization).
+   */
+  const verifyRestoredPlanningContext = (
+    restored: unknown,
+    authoritative: PipelineV2RunState,
+    stateId: string,
+    planOutput: string,
+  ): void => {
+    const violation = (detail: string): Error =>
+      new Error(`pipeline v2 plan-ready verification invariant violated: ${detail}`);
+    if (typeof restored !== "object" || restored === null || Array.isArray(restored)) {
+      throw violation("the planning acceptance context is not a record");
+    }
+    const keys = Object.keys(restored).sort();
+    if (
+      keys.length !== 5 ||
+      keys[0] !== "accepted_outputs" ||
+      keys[1] !== "cursor" ||
+      keys[2] !== "planning_execution_index" ||
+      keys[3] !== "run_inputs" ||
+      keys[4] !== "state"
+    ) {
+      throw violation("the planning acceptance context carries foreign or missing fields");
+    }
+    const record = restored as Record<string, unknown>;
+    const structurallyEqual = (left: unknown, right: unknown): boolean => {
+      if (left === right) {
+        return true;
+      }
+      if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
+        return false;
+      }
+      if (Array.isArray(left) !== Array.isArray(right)) {
+        return false;
+      }
+      const leftKeys = Object.keys(left as Record<string, unknown>);
+      const rightKeys = Object.keys(right as Record<string, unknown>);
+      if (leftKeys.length !== rightKeys.length) {
+        return false;
+      }
+      for (const key of leftKeys) {
+        if (!Object.prototype.hasOwnProperty.call(right, key)) {
+          return false;
+        }
+        if (!structurallyEqual((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key])) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!structurallyEqual(record.state, authoritative)) {
+      throw violation("the restored state does not structurally match the authoritative snapshot");
+    }
+    if (
+      typeof record.planning_execution_index !== "number" ||
+      !Number.isSafeInteger(record.planning_execution_index) ||
+      record.planning_execution_index !== authoritative.executions.length
+    ) {
+      throw violation("the restored planning execution index does not name the last execution");
+    }
+    if (
+      typeof record.cursor !== "object" ||
+      record.cursor === null ||
+      Array.isArray(record.cursor) ||
+      (record.cursor as Record<string, unknown>).current_state !== authoritative.cursor.current_state ||
+      (record.cursor as Record<string, unknown>).transition_count !== authoritative.cursor.transition_count
+    ) {
+      throw violation("the restored cursor does not match the authoritative cursor");
+    }
+    if (!Array.isArray(record.accepted_outputs)) {
+      throw violation("the restored accepted history is not a list");
+    }
+    const acceptedRecord = (record.accepted_outputs as readonly unknown[]).find(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        !Array.isArray(entry) &&
+        (entry as Record<string, unknown>)["state"] === stateId &&
+        (entry as Record<string, unknown>)["output"] === planOutput &&
+        (entry as Record<string, unknown>)["activation_index"] === record.planning_execution_index,
+    );
+    if (acceptedRecord === undefined) {
+      throw violation("the restored accepted history does not carry the planning execution's accepted output");
+    }
+    if (typeof record.run_inputs !== "object" || record.run_inputs === null || Array.isArray(record.run_inputs)) {
+      throw violation("the restored run-input snapshot is not a record");
+    }
+  };
+
+  /**
+   * The plan-ready suspension seam of a fully successful planning
+   * execution: after the durable `agent_cleanup_completed` the coordinator
+   * stops before the engine can apply the transition, when the planning
+   * state's declared `completed` transition targets a stage state — the
+   * exact shape whose stage start would otherwise fail `invalid_graph`
+   * because the plan has not been accepted yet. The boundary is verified
+   * through the single existing public
+   * `restorePipelineV2PlanningAcceptanceContext` before the suspension.
+   *
+   * Planning transitions into control or terminal states are not affected:
+   * those flows never need the accepted plan, so they keep committing
+   * their transition and continue exactly as before (control and stage
+   * executions are untouched by this seam). A failed planning execution
+   * never reaches this seam; a verification failure propagates through
+   * the existing failure-finalization chain (no transition, the existing
+   * typed reason mapping). No plan output is read and no
+   * proposal/acceptance machinery runs here — the plan acceptance belongs
+   * to the existing `resume-plan` controller.
+   */
+  const maybePlanReadySuspension = async (stateId: string): Promise<void> => {
+    const role = compiledExecutionRoleFor(pipeline, stateId);
+    if (role.role !== "planning") {
+      return;
+    }
+    const edge = compiledTransitionFor(pipeline, stateId, "completed");
+    // The target's compiled role read from the trusted resolved snapshot:
+    // terminal states carry no role entry, so the lookup stays terminal-safe.
+    const targetRole = pipeline.orchestration?.execution_roles.find(
+      (entry) => entry.state_id === edge.to,
+    )?.role;
+    if (targetRole !== "stage") {
+      return;
+    }
+    // The plan-ready signal checkpoint: a signal accepted up to this point
+    // wins with the previous 130/143 outcome and no transition is recorded.
+    checkSignal();
+    const state = requireSnapshot();
+    if (state.status !== "active" || state.phase !== "running") {
+      return;
+    }
+    if (state.terminal !== undefined || state.failure !== undefined || state.run_outputs !== undefined) {
+      return;
+    }
+    const lastWait = state.waits[state.waits.length - 1];
+    if (lastWait !== undefined && lastWait.response === undefined) {
+      return;
+    }
+    if (state.executions.length !== state.transitions.length + 1) {
+      return;
+    }
+    const last = state.executions[state.executions.length - 1];
+    if (
+      last === undefined ||
+      last.type !== "agent" ||
+      last.execution_role !== "planning" ||
+      last.iteration_index !== undefined ||
+      last.state_id !== stateId ||
+      last.state_id !== state.cursor.current_state
+    ) {
+      return;
+    }
+    const restored = await restorePipelineV2PlanningAcceptanceContext(pipeline, state, runRoot);
+    verifyRestoredPlanningContext(restored, state, stateId, role.plan_output);
+    throw new CoordinatorSuspension("plan_ready");
+  };
+
   const executors: PipelineV2GraphExecutors = {
     executeAgent: async (view: V2AgentExecutionView): Promise<void> => {
       // Execution-start checkpoint: a signal accepted between states stops
@@ -1731,6 +1937,12 @@ async function continuePipelineV2Coordination(
       await dispatchState({ kind: "agent_cleanup_completed" });
       tracking.unfinished = false;
 
+      // 15b. the plan-ready suspension seam: a fully successful planning
+      //      execution stops here — no transition is committed, no plan is
+      //      accepted; the operator applies `resume-plan` next. Non-
+      //      planning executions pass through untouched.
+      await maybePlanReadySuspension(view.id);
+
       // 16. the accepted records join the runner-owned history
       accepted.push(...records);
 
@@ -1804,10 +2016,10 @@ async function continuePipelineV2Coordination(
     checkSignal();
     const attempt = await attemptStageWaitEntry();
     if (attempt.outcome === "suspended") {
-      throw new CoordinatorWaitSuspension();
+      throw new CoordinatorSuspension("waiting");
     }
     if (attempt.outcome === "failed") {
-      throw new CoordinatorWaitSuspension({ cause: attempt.cause, state: attempt.state });
+      throw new CoordinatorSuspension("waiting", { cause: attempt.cause, state: attempt.state });
     }
   };
 
@@ -1908,28 +2120,36 @@ async function continuePipelineV2Coordination(
     // The private controlled-suspension sentinel is recognized by exact
     // identity first: the runtime, the worker and every downstream layer
     // can neither obtain nor construct the private marker class, so no
-    // forged error can turn a real failure into a waiting result.
-    if (cause instanceof CoordinatorWaitSuspension) {
-      if (cause.entryFailure === undefined) {
-        // The run is durably waiting: the authoritative snapshot after the
-        // committed `run_waiting` is returned on the waiting branch — no
-        // failure finalization, no signal cutoff, no further dispatch.
-        const state = requireSnapshot();
-        return deepFreeze({ ok: false as const, waiting: true as const, state });
+    // forged error can turn a real failure into a suspension result.
+    if (cause instanceof CoordinatorSuspension) {
+      if (cause.kind === "waiting") {
+        if (cause.entryFailure === undefined) {
+          // The run is durably waiting: the authoritative snapshot after the
+          // committed `run_waiting` is returned on the waiting branch — no
+          // failure finalization, no signal cutoff, no further dispatch.
+          const state = requireSnapshot();
+          return deepFreeze({ ok: false as const, waiting: true as const, state });
+        }
+        // A failed wait-entry attempt never writes a durable `run_failed`:
+        // the active stage→planning boundary stays retryable for a fresh
+        // resume (the same recognizer re-enters the wait there), a poisoned
+        // sink is never re-read (the failure already carries the adopted
+        // snapshot), and an actually durable `run_waiting` is visible to
+        // every fresh reopen. The reason mapping is the existing closed
+        // vocabulary — no new failure reason.
+        const failure = cause.entryFailure as { readonly cause: unknown; readonly state: PipelineV2RunState | null };
+        return deepFreeze({
+          ok: false as const,
+          reason: waitEntryFailureReason(failure.cause),
+          state: failure.state ?? sink.snapshot,
+        });
       }
-      // A failed wait-entry attempt never writes a durable `run_failed`:
-      // the active stage→planning boundary stays retryable for a fresh
-      // resume (the same recognizer re-enters the wait there), a poisoned
-      // sink is never re-read (the failure already carries the adopted
-      // snapshot), and an actually durable `run_waiting` is visible to
-      // every fresh reopen. The reason mapping is the existing closed
-      // vocabulary — no new failure reason.
-      const failure = cause.entryFailure as { readonly cause: unknown; readonly state: PipelineV2RunState | null };
-      return deepFreeze({
-        ok: false as const,
-        reason: waitEntryFailureReason(failure.cause),
-        state: failure.state ?? sink.snapshot,
-      });
+      // The plan-ready suspension: the settled-but-unbound planning
+      // boundary is fully durable (the cleanup committed, no transition);
+      // the operator applies `orchestrator resume-plan` next. No failure
+      // finalization, no signal cutoff, no further dispatch.
+      const state = requireSnapshot();
+      return deepFreeze({ ok: false as const, planReady: true as const, state });
     }
     await finalizeFailure(cause);
     if (stateAbandoned) {

@@ -207,6 +207,18 @@ export interface PipelineV2RunOutcome {
    */
   readonly waiting?: boolean;
   /**
+   * The exact plan-ready suspension branch: the run reached the
+   * settled-but-unbound planning acceptance boundary after a fully
+   * successful planning execution (the durable cleanup, no transition, no
+   * accepted plan). `ok: false` (the run is not complete),
+   * `planReady: true` (an ordinary suspension, not a failure or refusal),
+   * `exitCode: 0`, the actual run id and run root and the authoritative
+   * state; no `waiting`, no `reason`, no `refused`, no extra envelope.
+   * Every consumer must check this branch together with the waiting branch
+   * before the ordinary `ok:false` failure/refusal shapes.
+   */
+  readonly planReady?: boolean;
+  /**
    * The durable failure reason, or the structured pre-resume refusal
    * reason of `resumePipelineV2` (a refusal is not a durable failure: the
    * state document is untouched). Omitted for preflight failures that
@@ -755,6 +767,19 @@ export async function runPipelineV2(
     return deepFreeze({
       ok: false,
       waiting: true,
+      exitCode: 0,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: result.state,
+    });
+  }
+  if ("planReady" in result) {
+    // The controlled suspension at the settled-but-unbound planning
+    // boundary: the operator applies `orchestrator resume-plan` next —
+    // exit 0, no failure reason, no refusal.
+    return deepFreeze({
+      ok: false,
+      planReady: true,
       exitCode: 0,
       runId,
       runRoot: runRoot.localRunRoot,
@@ -1625,6 +1650,19 @@ async function runExistingPipelineV2(
     return deepFreeze({
       ok: false,
       waiting: true,
+      exitCode: 0,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: result.state,
+    });
+  }
+  if ("planReady" in result) {
+    // The controlled suspension at the settled-but-unbound planning
+    // boundary: the operator applies `orchestrator resume-plan` next —
+    // exit 0, no failure reason, no refusal.
+    return deepFreeze({
+      ok: false,
+      planReady: true,
       exitCode: 0,
       runId,
       runRoot: runRoot.localRunRoot,

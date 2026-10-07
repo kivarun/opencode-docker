@@ -614,7 +614,7 @@ function expectHandoffError(
 function expectResumeFailedWorkerFailed(result: PipelineV2ResumeCoordinationResult): PipelineV2RunState {
   expect(result.ok).toBe(false);
   expect("refused" in result).toBe(false);
-  if ("refused" in result || result.ok || "waiting" in result) {
+  if ("refused" in result || result.ok || "waiting" in result || "planReady" in result) {
     throw new Error(`expected an ordinary worker failure, got ${JSON.stringify(result)}`);
   }
   expect(result.reason).toBe("worker_failed");
@@ -1014,6 +1014,26 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
           "carries foreign fields"],
         ["a waiting result without a state",
           () => ({ ok: false, waiting: true }),
+          completed,
+          "carries foreign fields"],
+        ["a plan-ready result with an extra own field",
+          (options: unknown) => ({ ok: false, planReady: true, state: snapshotOf(options), hostile_extra: "NEVER-READ" }),
+          completed,
+          "carries foreign fields"],
+        ["a plan-ready result with a false discriminant",
+          (options: unknown) => ({ ok: false, planReady: false, state: snapshotOf(options) }),
+          completed,
+          "carries foreign fields"],
+        ["a plan-ready result without a state",
+          () => ({ ok: false, planReady: true }),
+          completed,
+          "carries foreign fields"],
+        ["a plan-ready result with a foreign state",
+          (options: unknown) => ({ ok: false, planReady: true, state: { ...(snapshotOf(options) as Record<string, unknown>), revision: 999999 } }),
+          completed,
+          "carries foreign fields"],
+        ["a plan-ready result with a waiting field",
+          (options: unknown) => ({ ok: false, planReady: true, waiting: true, state: snapshotOf(options) }),
           completed,
           "carries foreign fields"],
         ["an extra own enumerable field",

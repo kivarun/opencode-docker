@@ -600,6 +600,14 @@ function reportPipelineV2Outcome(
     io.writeError(
       `orchestrator: ${command} waiting (run ${outcome.runId}, state ${outcome.runRoot}/state.json)`,
     );
+  } else if (outcome.planReady === true) {
+    // The controlled suspension at the settled-but-unbound planning
+    // boundary: one summary line, no failure/reason wording, exit 0 —
+    // `orchestrator resume-plan` with the explicit stage/budget policy is
+    // the operator's next step (no automatic stage or budget exists).
+    io.writeError(
+      `orchestrator: ${command} plan-ready (run ${outcome.runId}, state ${outcome.runRoot}/state.json)`,
+    );
   } else if (outcome.runRoot !== null) {
     const reasonPart = outcome.reason !== undefined ? ` reason ${outcome.reason},` : "";
     io.writeError(

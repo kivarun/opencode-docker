@@ -946,14 +946,15 @@ test("11. a terminal edge from a stage state keeps the ordinary success path", a
   ]);
 });
 
-test("12. a fresh run never enters a wait: the initial planning boundary and the unopened stage start keep invalid_graph", async () => {
+test("12. a fresh planning run suspends plan-ready before any transition: no stage start, no wait, no run_failed", async () => {
   const runId = "wait-entry-fresh";
   const harness = await makeHarness("wait-entry-fresh", runId);
   const pipeline = await loadPipelineV2(harness.bundle);
   const raw = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId, now: nextTick });
   const recording = new RecordingSink(raw);
   // the fake worker writes the declared planning output for the architect
-  // (the entry state), so the fresh run reaches the unopened stage start
+  // (the entry state); the completed planning execution suspends at the
+  // plan-ready boundary instead of committing the stage-bound transition
   const freshRuntime: PipelineV2AgentRuntime = {
     createExecutionSession: async (_state: unknown, activation: PreparedActivationData) => ({
       sessionId: "fresh-exec-1",
@@ -982,9 +983,21 @@ test("12. a fresh run never enters a wait: the initial planning boundary and the
     CONTROL,
   );
   expect(result.ok).toBe(false);
-  const failure = result as Record<string, unknown>;
-  expect("waiting" in failure).toBe(false);
-  expect(failure.reason).toBe("invalid_graph");
+  const ready = result as Record<string, unknown>;
+  expect("waiting" in ready).toBe(false);
+  expect(ready.planReady).toBe(true);
+  const state = ready.state as PipelineV2RunState;
+  expect(state.status).toBe("active");
+  expect(state.phase).toBe("running");
+  expect(state.executions).toHaveLength(1);
+  expect(state.executions[0]?.state_id).toBe("architect");
+  expect(state.executions[0]?.execution_role).toBe("planning");
+  expect(state.executions[0]?.phase).toBe("cleanup_completed");
+  expect(state.transitions).toHaveLength(0);
+  expect(state.generations).toHaveLength(0);
+  expect(state.waits).toHaveLength(0);
+  expect(state.terminal).toBeUndefined();
+  expect(state.failure).toBeUndefined();
   expect(recording.commands.map((command) => command.kind)).toEqual([
     "create_run",
     "start_agent_execution",
@@ -994,10 +1007,10 @@ test("12. a fresh run never enters a wait: the initial planning boundary and the
     "agent_running",
     "agent_outputs_accepted",
     "agent_cleanup_completed",
-    "transition_committed",
-    "run_failed",
   ]);
   expect(recording.commands.every((command) => command.kind !== "run_waiting")).toBe(true);
+  expect(recording.commands.every((command) => command.kind !== "transition_committed")).toBe(true);
+  expect(recording.commands.every((command) => command.kind !== "run_failed")).toBe(true);
 });
 
 test("7+8. historical waits and generations: the current open generation is selected and the stage is bound by generation.stage_id", async () => {
@@ -1534,8 +1547,8 @@ test("source restrictions: no new machinery, the sentinel stays private, no wait
   const waitController = await readFile(join(import.meta.dir, "..", "src", "pipeline_v2_wait_controller.ts"), "utf8");
 
   // the private suspension sentinel never appears in the export surface
-  expect(coordinator).toContain("class CoordinatorWaitSuspension extends Error");
-  expect(coordinator).not.toMatch(/export[^]{0,80}CoordinatorWaitSuspension/);
+  expect(coordinator).toContain("class CoordinatorSuspension extends Error");
+  expect(coordinator).not.toMatch(/export[^]{0,80}CoordinatorSuspension/);
   // the single public wait controller entry; no store import and no
   // manual manifest parsing in the coordinator (the manifest module is
   // imported only for the action type)
@@ -1547,9 +1560,12 @@ test("source restrictions: no new machinery, the sentinel stays private, no wait
   expect(coordinator).not.toContain("reducePipelineV2RunCommand");
   expect(coordinator).not.toContain("publishPipelineV2WaitRequest");
   expect(coordinator).not.toContain("preparePipelineV2WaitRequest");
-  // the single compiled-plan restore; no second resume context
+  // the two single restores: the compiled plan of the wait derivation and
+  // the planning-acceptance context of the plan-ready seam — each exactly
+  // one import and one call, no second restore mechanism
   expect(coordinator.match(/restorePipelineV2AcceptedRunPlan/g)).toHaveLength(2);
-  expect(coordinator).not.toContain("restorePipelineV2PlanningAcceptanceContext");
+  expect(coordinator.match(/await restorePipelineV2PlanningAcceptanceContext\(/g)).toHaveLength(1);
+  expect(coordinator.match(/import \{ restorePipelineV2PlanningAcceptanceContext \}/g)).toHaveLength(1);
   // no new failure reason: the state vocabulary is untouched
   expect(state).toContain('"terminal_failed",\n] as const;');
   expect(state).not.toContain('"waiting",\n] as const;\nexport type PipelineV2FailureReason');
