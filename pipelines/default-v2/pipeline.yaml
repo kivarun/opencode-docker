@@ -28,6 +28,9 @@ orchestration:
         actions:
           - continue_stage
           - revise_task
+      plan_ready:
+        stage_position: 1
+        initial_budget: 1
     - state_id: execute
       role: stage
       stage_template: development

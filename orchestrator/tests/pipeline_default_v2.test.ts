@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 import { runCli, type CliIo } from "../src/main.ts";
 import type { CliResult } from "../src/docker_helper.ts";
 import { DEFAULT_PIPELINE_ROOT, DEFAULT_PIPELINE_V2_ROOT, parseCommand, usage } from "../src/cli_args.ts";
-import { runPipelineV2, resumePipelineV2PlanningRunPlan } from "../src/pipeline_v2_runner.ts";
+import { runPipelineV2, resumePipelineV2, resumePipelineV2PlanningRunPlan } from "../src/pipeline_v2_runner.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
 import { loadPipeline } from "../src/pipeline.ts";
 import { pipelineV2ExecutionDigest, pipelineV2ExecutionSnapshotJson, pipelineV2RunPipelineIdentity } from "../src/pipeline_v2_digest.ts";
@@ -22,6 +22,15 @@ import { compiledExecutionRoleFor, compiledStageTemplateFor } from "../src/pipel
 import { prepareRunProject, snapshotRunInputs, type RunInputBinding, type RunInputsSnapshot } from "../src/pipeline_v2_runtime.ts";
 import { parsePipelineV2RunState, type PipelineV2RunState } from "../src/pipeline_v2_state.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
+import {
+  coordinatePipelineV2Run,
+  type PipelineV2AgentRuntime,
+  type PipelineV2CoordinatorControl,
+} from "../src/pipeline_v2_coordinator.ts";
+import { acceptPipelineV2PlanningRunPlan } from "../src/pipeline_v2_planning_run_plan_controller.ts";
+import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
+import { restorePipelineV2AcceptedRunPlan } from "../src/pipeline_v2_run_plan_restore.ts";
+import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const V2_BUNDLE = join(REPO_ROOT, "pipelines", "default-v2");
@@ -415,7 +424,7 @@ async function chainCommand(
   return { exit, outcome: JSON.parse(documents[0]!) as Record<string, unknown> };
 }
 
-test("e2e: the tracked bundled v2 default runs planReady then succeeds through the public CLI", async () => {
+test("e2e: the tracked bundled v2 default runs to terminal success in one command through the automatic plan-ready continuation", async () => {
   const root = mkdtempSync(join(tmpdir(), "default-v2-e2e-"));
   try {
     const stateRoot = join(root, "state");
@@ -451,7 +460,10 @@ test("e2e: the tracked bundled v2 default runs planReady then succeeds through t
     };
     const resultBytes = `${JSON.stringify(resultBody)}\n`;
 
-    // step 1: the fresh run with the explicit tracked bundle path
+    // The whole public chain in one command: the run reaches the
+    // plan-ready boundary and continues automatically through the trusted
+    // plan_ready policy of the bundled default (no intermediate
+    // resume-plan); the pipeline comes only from the tracked bundle.
     writeFileSync(join(root, "cred.token"), "cred-token-not-real\n", { mode: 0o600 });
     const setup1 = makeChain(stateRoot, resultBody, join(root, "cred.token"));
     setup1.io.runPipelineV2 = runPipelineV2 as unknown as CliIo["runPipelineV2"];
@@ -465,32 +477,12 @@ test("e2e: the tracked bundled v2 default runs planReady then succeeds through t
       "--json",
     ]);
     expect(runRecord.exit).toBe(0);
-    expect(Object.keys(runRecord.outcome).sort()).toEqual(["exitCode", "ok", "planReady", "runId", "runRoot", "state"]);
-    expect(runRecord.outcome["planReady"]).toBe(true);
+    expect(Object.keys(runRecord.outcome).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+    expect(runRecord.outcome["ok"]).toBe(true);
+    expect(runRecord.outcome["planReady"]).toBeUndefined();
+    expect(runRecord.outcome["waiting"]).toBeUndefined();
     const runId = runRecord.outcome["runId"] as string;
     const runRoot = join(stateRoot, "pipeline-runs", runId);
-    const before: PipelineV2RunState = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
-    expect(before.revision).toBe(8);
-    expect(before.executions).toHaveLength(1);
-    expect(before.executions[0]).toMatchObject({ state_id: "architect", execution_role: "planning", phase: "cleanup_completed" });
-    expect(before.transitions).toHaveLength(0);
-    expect(before.waits).toHaveLength(0);
-
-    // step 2: full restart; the pipeline comes only from the durable root
-    const setup2 = makeChain(stateRoot, resultBody, join(root, "cred.token"));
-    setup2.io.resumePipelineV2PlanningRunPlan = resumePipelineV2PlanningRunPlan as unknown as CliIo["resumePipelineV2PlanningRunPlan"];
-    const resumeRecord = await chainCommand(setup2, [
-      "resume-plan",
-      "--run-id", runId,
-      "--stage-id", "stage-1",
-      "--initial-budget", "1",
-      "--config-root", configRoot,
-      "--launcher-id", LAUNCHER_ID,
-      "--json",
-    ]);
-    expect(resumeRecord.exit).toBe(0);
-    expect(Object.keys(resumeRecord.outcome).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
-    expect(resumeRecord.outcome["ok"]).toBe(true);
 
     const state: PipelineV2RunState = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
     expect(state.revision).toBe(24);
@@ -508,7 +500,12 @@ test("e2e: the tracked bundled v2 default runs planReady then succeeds through t
       initial_budget: 1,
       opened_transition_count: 0,
     });
-    // the stage execution and its accepted result
+    // the planning execution is bound by exactly the initial transition;
+    // the stage execution and its accepted result follow
+    expect(state.executions.map((execution) => [execution.state_id, execution.execution_role])).toEqual([
+      ["architect", "planning"],
+      ["execute", "stage"],
+    ]);
     const stageExecution = state.executions[1]!;
     expect(stageExecution).toMatchObject({ index: 2, state_id: "execute", execution_role: "stage", phase: "cleanup_completed" });
     const stageOutputs = (stageExecution as { outputs?: Array<{ id: string; digest: string }> }).outputs ?? [];
@@ -530,7 +527,7 @@ test("e2e: the tracked bundled v2 default runs planReady then succeeds through t
     // the planning proposal is never the user terminal result
     expect(existsSync(join(publishedDir, "plan"))).toBe(false);
     // the published result is reachable through the outcome coordinates
-    expect(resumeRecord.outcome["runRoot"]).toBe(runRoot);
+    expect(runRecord.outcome["runRoot"]).toBe(runRoot);
     expect(existsSync(join(runRoot, "outputs", "result"))).toBe(true);
     // no legacy result.json anywhere in the run tree
     const scanForLegacy = (dir: string): number => {
@@ -554,9 +551,15 @@ test("e2e: the tracked bundled v2 default runs planReady then succeeds through t
     expect(reloaded.bundleRoot).toBe(V2_BUNDLE);
     expect(pipelineV2RunPipelineIdentity(reloaded)).toEqual(state.pipeline);
     expect(state.waits).toHaveLength(0);
-    // two activations, each session pair deleted exactly once, tool first
-    expect(setup2.sessionIds).toHaveLength(2);
-    expect(setup2.sessionDeletes).toEqual([setup2.sessionIds[1]!, setup2.sessionIds[0]!]);
+    // two activations in the one command (an execution and a tool session
+    // each), every session deleted exactly once, tool first per pair
+    expect(setup1.sessionIds).toHaveLength(4);
+    expect(setup1.sessionDeletes).toEqual([
+      setup1.sessionIds[1]!,
+      setup1.sessionIds[0]!,
+      setup1.sessionIds[3]!,
+      setup1.sessionIds[2]!,
+    ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -621,5 +624,262 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
     expect(readdirSync(stateRoot)).toEqual([]);
   } finally {
     rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The durable restart windows (A0-A5) of the automatic plan-ready
+// continuation, continued through the plain public `orchestrator resume`
+// command; and the no-flag run over the materialized bundled default.
+// ---------------------------------------------------------------------------
+
+interface WindowFixture {
+  root: string;
+  stateRoot: string;
+  runId: string;
+  runRoot: string;
+  configRoot: string;
+  taskPath: string;
+  projectSource: string;
+  resultBody: Record<string, unknown>;
+  revision: number;
+}
+
+let windowClock = 0;
+let windowSessionCounter = 0;
+
+function windowRuntime(): PipelineV2AgentRuntime {
+  let outputsRoot = "";
+  let stateId = "";
+  const session = (kind: "execution" | "tool") => {
+    windowSessionCounter += 1;
+    const id = `win_${kind}_${windowSessionCounter}`;
+    return {
+      sessionId: id,
+      runAgent: async () => {
+        if (kind === "execution" && stateId === "architect" && outputsRoot !== "") {
+          writeFileSync(join(outputsRoot, "plan"), JSON.stringify(P1_PROPOSAL), { mode: 0o600 });
+        }
+        return { status: "completed" as const };
+      },
+      cleanup: async () => {},
+    };
+  };
+  return {
+    createExecutionSession: async (_state: unknown, activation: { outputs_root: string; state_id: string }) => {
+      outputsRoot = activation.outputs_root;
+      stateId = activation.state_id;
+      return session("execution") as never;
+    },
+    createToolSession: async () => session("tool") as never,
+  } as unknown as PipelineV2AgentRuntime;
+}
+
+function windowClockNow(): Date {
+  windowClock += 1;
+  return new Date(Date.UTC(2026, 0, 1, 0, 0, windowClock));
+}
+
+function windowSink(stateRoot: string, runId: string): PipelineV2RunStateSink {
+  return new PipelineV2RunStateSink({ stateRoot, runId, now: windowClockNow });
+}
+
+/**
+ * The honest plan-ready prefix through the real coordination plus the
+ * optional durable continuation steps; `faults` crash the named step after
+ * its predecessors committed.
+ */
+async function buildRestartWindow(
+  prefix: string,
+  runId: string,
+  steps: readonly ("accept" | "ensure" | "transition" | "start")[],
+  faults: Readonly<Record<string, () => Error>> = {},
+): Promise<WindowFixture> {
+  const root = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  const stateRoot = join(root, "state");
+  mkdirSync(join(stateRoot, "pipeline-runs"), { recursive: true, mode: 0o700 });
+  const runRoot = join(stateRoot, "pipeline-runs", runId);
+  mkdirSync(runRoot, { mode: 0o700 });
+  const sources = join(root, "userdata");
+  mkdirSync(sources, { recursive: true });
+  const taskPath = join(sources, "task.md");
+  writeFileSync(taskPath, "BUNDLED-DEFAULT-TASK\n", { mode: 0o600 });
+  const projectSource = join(root, "project-source");
+  mkdirSync(projectSource, { recursive: true });
+  const configRoot = join(root, "config");
+  mkdirSync(join(configRoot, "profiles"), { recursive: true });
+  mkdirSync(join(configRoot, "opencode"), { recursive: true });
+  writeFileSync(
+    join(configRoot, "profiles", "default.yaml"),
+    [
+      "schema_version: 1",
+      "image: ghcr.io/example/worker:1",
+      "opencode_config: opencode/default.json",
+      "env:",
+      "  MODEL_API_KEY:",
+      "    from_env: DEFAULT_SOURCE_VAR_1",
+      "    required: true",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(join(configRoot, "opencode", "default.json"), JSON.stringify({ model: "glm53-flash" }));
+  const resultBody = {
+    schema_version: 3,
+    status: "completed",
+    summary: `WINDOW-CANARY-${runId}`,
+    artifacts: ["work/product.txt"],
+  };
+
+  const pipeline = await loadPipelineV2(V2_BUNDLE);
+  const result = await coordinatePipelineV2Run(
+    {
+      pipeline,
+      runId,
+      runRoot,
+      projectSourcePath: projectSource,
+      inputBindings: [{ id: "task", path: taskPath }],
+      sink: windowSink(stateRoot, runId) as never,
+      runtime: windowRuntime(),
+    },
+    { currentSignal: () => null, freezeSignal: () => null },
+  );
+  expect(result.ok).toBe(false);
+  expect((result as { planReady?: boolean }).planReady).toBe(true);
+  let revision = 8;
+
+  for (const step of steps) {
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot, runId, now: windowClockNow });
+    if (step === "accept") {
+      const fault = faults["plan_revision_accepted"];
+      const sink = fault === undefined ? reopened : new FaultedSink(reopened, { plan_revision_accepted: fault });
+      try {
+        await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot, sink: sink as never });
+      } catch (cause) {
+        if (fault === undefined || (cause as Error).message !== "crash-task-window") {
+          throw cause;
+        }
+      }
+      revision += fault === undefined ? 2 : 1;
+    } else if (step === "ensure") {
+      const plan = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
+      const loaded = await loadPipelineV2(plan.pipeline.bundle_root);
+      const restored = await restorePipelineV2AcceptedRunPlan({ pipeline: loaded, runRoot, state: plan });
+      const fault = faults["stage_iteration_opened"];
+      const sink = fault === undefined ? reopened : new FaultedSink(reopened, { stage_iteration_opened: fault });
+      try {
+        await ensurePipelineV2StageIteration({
+          compiledPlan: restored.compiled_plan,
+          stageId: "stage-1",
+          initialBudget: 1,
+          sink: sink as never,
+        });
+      } catch (cause) {
+        if (fault === undefined || (cause as Error).message !== "crash-iteration-window") {
+          throw cause;
+        }
+      }
+      revision += fault === undefined ? 2 : 1;
+    } else if (step === "transition") {
+      await reopened.dispatch({
+        kind: "transition_committed",
+        step: { from: "architect", outcome: "completed", to: "execute", transition_index: 0 },
+        executionIndex: 1,
+      });
+      revision += 1;
+    } else if (step === "start") {
+      const snapshot = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
+      await reopened.dispatch({
+        kind: "start_agent_execution",
+        stateId: "execute",
+        profile: "default",
+        ...startRoleArgs(pipeline, "execute", snapshot),
+      });
+      revision += 1;
+    }
+  }
+  return { root, stateRoot, runId, runRoot, configRoot, taskPath, projectSource, resultBody, revision };
+}
+
+class FaultedSink {
+  constructor(
+    private readonly inner: PipelineV2RunStateSink,
+    private readonly faults: Readonly<Record<string, () => Error>>,
+  ) {}
+
+  get snapshot(): PipelineV2RunState | null {
+    return this.inner.snapshot;
+  }
+
+  get poisoned(): boolean {
+    return this.inner.poisoned;
+  }
+
+  async dispatch(command: Parameters<PipelineV2RunStateSink["dispatch"]>[0]): Promise<void> {
+    const fault = this.faults[command.kind];
+    if (fault !== undefined) {
+      throw fault();
+    }
+    await this.inner.dispatch(command);
+  }
+}
+
+test("e2e: plain orchestrator resume auto-continues every durable plan-ready restart window (A0-A5)", async () => {
+  const windows: Array<{ id: string; steps: Array<"accept" | "ensure" | "transition" | "start">; faults?: Record<string, () => Error> }> = [
+    { id: "a0", steps: [] },
+    { id: "a1", steps: ["accept"], faults: { plan_revision_accepted: () => new Error("crash-task-window") } },
+    { id: "a2", steps: ["accept"] },
+    { id: "a3", steps: ["accept", "ensure"], faults: { stage_iteration_opened: () => new Error("crash-iteration-window") } },
+    { id: "a4", steps: ["accept", "ensure"] },
+    { id: "a5", steps: ["accept", "ensure", "transition"] },
+  ];
+  const roots: string[] = [];
+  const expectedRevisions: Record<string, number> = { a0: 8, a1: 9, a2: 10, a3: 11, a4: 12, a5: 13 };
+  try {
+    for (const window of windows) {
+      const runId = `defv2-${window.id}`;
+      const fixture = await buildRestartWindow(`default-v2-window-${window.id}`, runId, window.steps, window.faults ?? {});
+      roots.push(fixture.root);
+      expect(fixture.revision, window.id).toBe(expectedRevisions[window.id]!);
+      const resultBody = fixture.resultBody;
+      const resultBytes = `${JSON.stringify(resultBody)}\n`;
+      writeFileSync(join(fixture.root, "cred.token"), "cred-token-not-real\n", { mode: 0o600 });
+      const setup = makeChain(fixture.stateRoot, resultBody, join(fixture.root, "cred.token"));
+      setup.io.resumePipelineV2 = resumePipelineV2 as unknown as CliIo["resumePipelineV2"];
+      const record = await chainCommand(setup, [
+        "resume",
+        "--run-id", runId,
+        "--config-root", fixture.configRoot,
+        "--launcher-id", LAUNCHER_ID,
+        "--json",
+      ]);
+      expect(record.exit, window.id).toBe(0);
+      expect(Object.keys(record.outcome).sort(), window.id).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+      expect(record.outcome["ok"], window.id).toBe(true);
+      expect(record.outcome["runId"], window.id).toBe(runId);
+      const state = parsePipelineV2RunState(await readFile(join(fixture.runRoot, "state.json"), "utf8"));
+      expect(state.revision, window.id).toBe(24);
+      expect(state.status, window.id).toBe("success");
+      expect(state.terminal, window.id).toEqual({ state_id: "done", result: "success" });
+      expect(state.task_revisions.map((r) => `${r.task_id}@${r.revision}`), window.id).toEqual(["task-1@1"]);
+      expect(state.plan_revisions.map((r) => r.revision), window.id).toEqual([1]);
+      expect(state.generations, window.id).toHaveLength(1);
+      expect(state.executions.map((e) => [e.state_id, e.execution_role]), window.id).toEqual([
+        ["architect", "planning"],
+        ["execute", "stage"],
+      ]);
+      expect(state.transitions, window.id).toEqual([
+        { index: 0, from: "architect", outcome: "completed", to: "execute", execution_index: 1 },
+        { index: 0, from: "execute", outcome: "completed", to: "done", execution_index: 2 },
+      ]);
+      const published = await readFile(join(fixture.runRoot, "outputs", "result"), "utf8");
+      expect(published, window.id).toBe(resultBytes);
+      // only the stage pair ran through this CLI process; deleted tool-first
+      expect(setup.sessionIds, window.id).toHaveLength(2);
+      expect(setup.sessionDeletes, window.id).toEqual([setup.sessionIds[1]!, setup.sessionIds[0]!]);
+    }
+  } finally {
+    for (const root of roots) {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });

@@ -1553,3 +1553,134 @@ test("the stage-wait policy adds no digest machinery of its own (source scan)", 
   expect((source.match(/snapshot\.orchestration = pipeline\.orchestration/g) ?? []).length).toBe(1);
   expect((source.match(/orchestration !== undefined/g) ?? []).length).toBe(1);
 });
+
+// ---------------------------------------------------------------------------
+// The trusted automatic plan-ready continuation policy in the digest.
+// ---------------------------------------------------------------------------
+
+test("changing only the plan_ready stage_position changes the digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const changed = raw.replace(
+      "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n",
+      "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n      plan_ready:\n        stage_position: 1\n        initial_budget: 1\n",
+    );
+    if (changed === raw) {
+      throw new Error("the plan_ready insertion replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), changed);
+  });
+  expect(after.json).not.toBe(before.json);
+  expect(after.digest).not.toBe(before.digest);
+  // the only snapshot difference is the plan_ready policy of the planning role
+  const rolesOf = (json: string) =>
+    (JSON.parse(json) as { orchestration: { execution_roles: Array<Record<string, unknown>> } })
+      .orchestration.execution_roles;
+  const beforeRoles = rolesOf(before.json);
+  const afterRoles = rolesOf(after.json);
+  expect(beforeRoles).toHaveLength(afterRoles.length);
+  for (let index = 0; index < beforeRoles.length; index++) {
+    const beforeRole = beforeRoles[index]!;
+    const afterRole = afterRoles[index]!;
+    if (beforeRole["state_id"] === "architect") {
+      expect(beforeRole["plan_ready"]).toBeUndefined();
+      expect(afterRole["plan_ready"]).toEqual({ stage_position: 1, initial_budget: 1 });
+    } else {
+      expect(afterRole).toEqual(beforeRole);
+    }
+  }
+});
+
+test("changing only the plan_ready initial_budget changes the digest", async () => {
+  const { before, after } = await orchestratedDigestAfterMutation(async (bundle) => {
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const inserted = raw.replace(
+      "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n",
+      "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n      plan_ready:\n        stage_position: 1\n        initial_budget: 1\n",
+    );
+    if (inserted === raw) {
+      throw new Error("the plan_ready insertion replacement did not apply");
+    }
+    const changed = inserted.replace("        initial_budget: 1\n", "        initial_budget: 5\n");
+    if (changed === inserted) {
+      throw new Error("the initial_budget mutation replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), changed);
+  });
+  expect(after.json).not.toBe(before.json);
+  expect(after.digest).not.toBe(before.digest);
+  const afterRoles = (JSON.parse(after.json) as { orchestration: { execution_roles: Array<Record<string, unknown>> } })
+    .orchestration.execution_roles;
+  const planning = afterRoles.find((role) => role["state_id"] === "architect");
+  expect(planning?.["plan_ready"]).toEqual({ stage_position: 1, initial_budget: 5 });
+});
+
+test("removing the plan_ready policy restores the pre-policy digest exactly", async () => {
+  let plainDigest = "";
+  let plainJson = "";
+  await withTemp(async (root) => {
+    const bundle = join(root, "plain");
+    await writeOrchestratedDigestBundle(bundle);
+    const pipeline = await loadPipelineV2(bundle);
+    plainDigest = pipelineV2ExecutionDigest(pipeline);
+    plainJson = pipelineV2ExecutionSnapshotJson(pipeline);
+  });
+  await withTemp(async (root) => {
+    const bundle = join(root, "with");
+    await writeOrchestratedDigestBundle(bundle);
+    const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+    const inserted = raw.replace(
+      "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n",
+      "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n      plan_ready:\n        stage_position: 1\n        initial_budget: 1\n",
+    );
+    if (inserted === raw) {
+      throw new Error("the plan_ready insertion replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), inserted);
+    const withPolicy = await loadPipelineV2(bundle);
+    expect(pipelineV2ExecutionDigest(withPolicy)).not.toBe(plainDigest);
+    const removed = inserted.replace(
+      "      plan_ready:\n        stage_position: 1\n        initial_budget: 1\n",
+      "",
+    );
+    if (removed === inserted) {
+      throw new Error("the plan_ready removal replacement did not apply");
+    }
+    await writeFile(join(bundle, "pipeline.yaml"), removed);
+    const restored = await loadPipelineV2(bundle);
+    expect(pipelineV2ExecutionDigest(restored)).toBe(plainDigest);
+    expect(pipelineV2ExecutionSnapshotJson(restored)).toBe(plainJson);
+  });
+});
+
+test("an identical plan_ready policy is digest-deterministic across loads and bundle locations", async () => {
+  const digests: string[] = [];
+  const snapshots: string[] = [];
+  for (let round = 0; round < 2; round++) {
+    await withTemp(async (root) => {
+      const bundle = join(root, "bundle");
+      await writeOrchestratedDigestBundle(bundle);
+      const raw = await readFile(join(bundle, "pipeline.yaml"), "utf8");
+      const inserted = raw.replace(
+        "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n",
+        "      stage_wait:\n        reason: stage_iteration_completed\n        actions:\n          - continue_stage\n          - revise_task\n      plan_ready:\n        stage_position: 1\n        initial_budget: 1\n",
+      );
+      if (inserted === raw) {
+        throw new Error("the plan_ready insertion replacement did not apply");
+      }
+      await writeFile(join(bundle, "pipeline.yaml"), inserted);
+      const pipeline = await loadPipelineV2(bundle);
+      digests.push(pipelineV2ExecutionDigest(pipeline));
+      snapshots.push(pipelineV2ExecutionSnapshotJson(pipeline));
+    });
+  }
+  expect(snapshots[0]).toBe(snapshots[1]);
+  expect(digests[0]).toBe(digests[1]);
+  expect(digests[0]).toMatch(/^[0-9a-f]{64}$/);
+  const snapshot = JSON.parse(snapshots[0] ?? "") as Record<string, unknown>;
+  const orchestration = snapshot["orchestration"] as { execution_roles: Array<Record<string, unknown>> };
+  const planningEntries = orchestration.execution_roles.filter((entry) => entry["plan_ready"] !== undefined);
+  expect(planningEntries).toHaveLength(1);
+  // id-only and path-free: no host path anywhere in the orchestration
+  expect(JSON.stringify(snapshot["orchestration"])).not.toContain("/");
+});

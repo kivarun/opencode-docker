@@ -1165,9 +1165,29 @@ and `orchestrator resume-plan --stage-id ... --initial-budget ...` accepts
 the plan (serving BOTH the initial plan-ready boundary of a fresh run and
 the replanned boundary after a revise cycle), opens the stage generation
 and resumes the stage execution to
-the automatic `run_waiting`. There is no automatic plan acceptance, no
-automatic stage/budget selection and no automatic planning loop;
-`stageId` and `initialBudget` remain explicit operator policy.
+the automatic `run_waiting`.
+
+A planning role may additionally declare the optional trusted policy
+`plan_ready: {stage_position, initial_budget}` in the bundle's
+orchestration section. When it is declared, the controlled plan-ready
+suspension becomes a checkpoint of one automatic continuation instead of a
+manual stop: the routing helper `pipelineV2PlanReadyPolicyFor` recognizes
+exactly the settled planning boundaries (the fresh unbound form and the
+committed form after a restart) that carry the policy, and the runner calls
+the single composition `applyPipelineV2PlanReadyContinuation` — acceptance
+(or its durable restart recognition), stage selection strictly from the
+trusted `stage_position`, and the planning-run-plan handoff with
+`initial_budget` from the policy. The bundled default-v2 carries the
+policy, so `orchestrator run` reaches the automatic `run_waiting` (and, on
+the plain two-state default, terminal success) in one command; the
+revise-task chain continues the replanned boundary automatically the same
+way, and every durable restart window of the continuation is continued by
+the plain `orchestrator resume`. Bundles without the policy — and the
+manual `resume-plan` command — keep the exact established manual chain
+byte for byte. There is still no automatic stage/budget selection beyond
+the declared policy, no automatic planning loop and no automatic
+wait-action or intervention selection; `stageId` and `initialBudget`
+remain explicit operator policy for the manual `resume-plan` contract.
 
 ### Compiled run-plan projection over the orchestration metadata (pure substrate, production-reachable transitively)
 
@@ -1754,9 +1774,15 @@ default: `orchestrator run` without an explicit `--pipeline-root` selects it
 contract naming stage `stage-1`, template `development` and new task
 `task-1`), the stage's JSON `result` output (a V2-native result schema with
 no legacy identity fields), and the run-level required output `result`. The
-first successful `run` stops with the `planReady` outcome; the next manual
-step is `orchestrator resume-plan --stage-id stage-1 --initial-budget 1`.
-There is no automatic stage/budget selection and no automatic resume.
+planning role carries the trusted `plan_ready` policy
+(`stage_position: 1`, `initial_budget: 1`), so the first `run` command
+continues through plan acceptance, the first generation/iteration and the
+stage execution automatically and stops only at the automatic
+`run_waiting` (on this two-state default the stage execution then
+completes to terminal success in the same command). A bundle without the
+policy stops with the `planReady` outcome and continues through the
+manual `orchestrator resume-plan --stage-id stage-1 --initial-budget 1`.
+There is no automatic stage/budget selection beyond the declared policy.
 
 The same loaders and validators accept an external pipeline directory selected by
 the user. Creating a custom pipeline must not require rebuilding the

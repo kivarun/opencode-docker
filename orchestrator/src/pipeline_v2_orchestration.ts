@@ -57,12 +57,24 @@ export interface CompiledPipelineV2StageWait {
 }
 
 /**
+ * The compiled automatic plan-ready continuation policy of one planning
+ * role: the trusted 1-based stage position and the initial budget of the
+ * opened stage generation, both positive safe integers. Present exactly
+ * when the bundle declares `plan_ready` on the planning role; its absence
+ * preserves the manual `planReady -> resume-plan` chain.
+ */
+export interface CompiledPipelineV2PlanReady {
+  readonly stage_position: number;
+  readonly initial_budget: number;
+}
+
+/**
  * The compiled execution role of one state: a planning role bound to
  * exactly one declared JSON output port of its own agent state (the plan
  * proposal output) plus the mandatory trusted stage-wait policy of its
- * intervention wait (not yet consumed by the production wait entry), a
- * control role with no iteration concern, or a stage role bound to exactly
- * one stage template.
+ * intervention wait and the optional automatic plan-ready continuation
+ * policy, a control role with no iteration concern, or a stage role bound
+ * to exactly one stage template.
  * Stage-template membership is carried by the stage role itself; a stage
  * state belongs to exactly one template by construction.
  */
@@ -72,6 +84,7 @@ export type CompiledPipelineV2ExecutionRole =
       role: "planning";
       plan_output: string;
       stage_wait: CompiledPipelineV2StageWait;
+      plan_ready?: CompiledPipelineV2PlanReady;
     }>
   | Readonly<{ state_id: string; role: "control" }>
   | Readonly<{ state_id: string; role: "stage"; stage_template: string }>;
@@ -89,8 +102,9 @@ export interface CompiledPipelineV2StageTemplate {
 /**
  * The compiled execution role of one declared state of a trusted resolved
  * pipeline. Missing orchestration metadata and unknown states are typed
- * errors; the result is deep-frozen (a planning role's `stage_wait` and its
- * actions array included) and repeated calls on the same trusted snapshot
+ * errors; the result is deep-frozen (a planning role's `stage_wait` and
+ * its actions array included, plus its optional `plan_ready` policy as a
+ * fresh frozen copy) and repeated calls on the same trusted snapshot
  * are structurally identical.
  */
 export function compiledExecutionRoleFor(
@@ -122,6 +136,17 @@ export function compiledExecutionRoleFor(
                 reason: entry.stage_wait.reason,
                 actions: Object.freeze([...entry.stage_wait.actions]),
               }),
+              // The optional trusted plan-ready continuation policy is
+              // returned as a fresh frozen copy per call, exactly like the
+              // stage-wait policy; the key is absent when undeclared.
+              ...(entry.plan_ready === undefined
+                ? {}
+                : {
+                    plan_ready: Object.freeze({
+                      stage_position: entry.plan_ready.stage_position,
+                      initial_budget: entry.plan_ready.initial_budget,
+                    }),
+                  }),
             })
           : Object.freeze({ state_id: stateId, role: "control" });
     }

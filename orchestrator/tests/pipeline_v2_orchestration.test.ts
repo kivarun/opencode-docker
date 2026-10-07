@@ -2643,7 +2643,9 @@ test("45. the stage-wait parsing is the single chain over the shared scalar pred
   // wait manifest layer (no second reason validator, no wider grammar)
   const reasonChecks = source.match(/reason must be a safe non-empty identifier/g) ?? [];
   expect(reasonChecks.length).toBe(1);
-  expect(source).toContain('import { isPipelineV2SafeId } from "./pipeline_v2_scalar.ts"');
+  expect(source).toContain(
+    'import { isPipelineV2SafeId, isPositiveSafeInteger } from "./pipeline_v2_scalar.ts"',
+  );
   // the parseStageWait body owns one chain: no serializer, no digest
   // machinery, no registry, no sorting of the declared actions
   const start = source.indexOf("function parseStageWait");
@@ -2667,4 +2669,354 @@ test("45. the stage-wait parsing is the single chain over the shared scalar pred
   expect(source).not.toContain('from "./pipeline_v2_coordinator.ts"');
   expect(source).not.toContain('from "./pipeline_v2_runner.ts"');
   expect(source).not.toContain('from "./pipeline_v2_wait_manifest.ts"');
+});
+
+// ---------------------------------------------------------------------------
+// The trusted automatic plan-ready continuation policy (planning roles only).
+// ---------------------------------------------------------------------------
+
+const NEUTRAL_PLAN_READY_YAML = `      plan_ready:
+        stage_position: 1
+        initial_budget: 1
+`;
+
+const NEUTRAL_PLAN_READY = { stage_position: 1, initial_budget: 1 } as const;
+
+/** Append a plan_ready block after the canonical planning entry's stage_wait. */
+function withPlanReady(planReadyYaml: string): string {
+  return CANONICAL_YAML.replace(NEUTRAL_STAGE_WAIT_YAML, `${NEUTRAL_STAGE_WAIT_YAML}${planReadyYaml}`);
+}
+
+test("46. a missing plan_ready policy is accepted and the resolved/compiled shapes stay exactly as before", async () => {
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const resolvedPlanning = pipeline.orchestration?.execution_roles[0];
+    if (resolvedPlanning === undefined || resolvedPlanning.role !== "planning") {
+      throw new Error("the planning entry is missing");
+    }
+    // the resolved role carries no plan_ready key at all (absent, never null)
+    expect(Object.keys(resolvedPlanning)).toEqual(["state_id", "role", "plan_output", "stage_wait"]);
+    expect("plan_ready" in resolvedPlanning).toBe(false);
+    const compiled = compiledExecutionRoleFor(pipeline, "architect");
+    expect(Object.keys(compiled)).toEqual(["state_id", "role", "plan_output", "stage_wait"]);
+    if (compiled.role !== "planning") {
+      throw new Error("the compiled role is not the planning role");
+    }
+    expect("plan_ready" in compiled).toBe(false);
+  });
+});
+
+test("47. the declared plan_ready policy compiles with identical spec/resolved/compiled shapes", async () => {
+  const spec = compilePipelineV2Spec(Bun.YAML.parse(withPlanReady(NEUTRAL_PLAN_READY_YAML)));
+  const planningSpec = spec.orchestration?.execution_roles[0];
+  if (planningSpec === undefined || planningSpec.role !== "planning") {
+    throw new Error("the planning entry is missing");
+  }
+  expect(planningSpec.plan_ready).toEqual(NEUTRAL_PLAN_READY);
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const resolvedPlanning = pipeline.orchestration?.execution_roles[0];
+    if (resolvedPlanning === undefined || resolvedPlanning.role !== "planning") {
+      throw new Error("the planning entry is missing");
+    }
+    expect(Object.keys(resolvedPlanning)).toEqual(["state_id", "role", "plan_output", "stage_wait", "plan_ready"]);
+    expect(resolvedPlanning.plan_ready).toEqual(NEUTRAL_PLAN_READY);
+    const compiled = compiledExecutionRoleFor(pipeline, "architect");
+    if (compiled.role !== "planning") {
+      throw new Error("the compiled role is not the planning role");
+    }
+    expect(Object.keys(compiled)).toEqual(["state_id", "role", "plan_output", "stage_wait", "plan_ready"]);
+    expect(compiled.plan_ready).toEqual(NEUTRAL_PLAN_READY);
+    // non-planning compiled roles stay exactly as before
+    expect(Object.keys(compiledExecutionRoleFor(pipeline, "stage_dispatch"))).toEqual(["state_id", "role"]);
+  }, withPlanReady(NEUTRAL_PLAN_READY_YAML));
+});
+
+test("48. the plan_ready policy accepts arbitrary positive safe integer positions and budgets", async () => {
+  const cases = [
+    { stage_position: 2, initial_budget: 1 },
+    { stage_position: 1, initial_budget: 7 },
+    { stage_position: 3, initial_budget: 1000 },
+    { stage_position: 9007199254740991, initial_budget: 9007199254740991 },
+  ];
+  for (const policy of cases) {
+    const yaml = withPlanReady(`      plan_ready:
+        stage_position: ${policy.stage_position}
+        initial_budget: ${policy.initial_budget}
+`);
+    acceptCompile(yaml);
+    const spec = compilePipelineV2Spec(Bun.YAML.parse(yaml));
+    const planningSpec = spec.orchestration?.execution_roles[0];
+    if (planningSpec === undefined || planningSpec.role !== "planning") {
+      throw new Error("the planning entry is missing");
+    }
+    expect(planningSpec.plan_ready).toEqual(policy);
+  }
+});
+
+test("49. exact-field battery at the plan_ready level; unknown field names are never echoed", () => {
+  const canaryField = "CANARY_plan_ready_field_9f3a";
+  // an unknown field inside plan_ready: value-free, name-free diagnostic
+  const unknown = withPlanReady(`${NEUTRAL_PLAN_READY_YAML}        target: coder\n`);
+  let caught = "";
+  try {
+    compilePipelineV2Spec(Bun.YAML.parse(unknown));
+  } catch (cause) {
+    if (cause instanceof PipelineError) {
+      caught = cause.message;
+    } else {
+      throw cause;
+    }
+  }
+  expect(caught).toMatch(/execution_roles 0 plan_ready has unknown fields/);
+  expect(caught).not.toContain(canaryField);
+  // missing stage_position / initial_budget name only the contract field
+  rejectCompile(
+    withPlanReady(`      plan_ready:
+        initial_budget: 1
+`),
+    /pipeline orchestration execution_roles 0 plan_ready is missing required field "stage_position"/,
+  );
+  rejectCompile(
+    withPlanReady(`      plan_ready:
+        stage_position: 1
+`),
+    /pipeline orchestration execution_roles 0 plan_ready is missing required field "initial_budget"/,
+  );
+  // plan_ready is not a mapping
+  rejectCompile(
+    withPlanReady(`      plan_ready: 7
+`),
+    /pipeline orchestration execution_roles 0 plan_ready is not a YAML mapping/,
+  );
+  rejectCompile(
+    withPlanReady(`      plan_ready:
+        - 1
+`),
+    /pipeline orchestration execution_roles 0 plan_ready is not a YAML mapping/,
+  );
+});
+
+test("50. plan_ready value battery: wrong types, zero, negative, fractional and overflow are rejected without echoing values", () => {
+  const wrongValues = [
+    `"1"`, `true`, `null`, `[1]`, `{}`, `0`, `-1`, `1.5`, `9007199254740992`, `-9007199254740992`, `.inf`, `.nan`,
+  ];
+  for (const value of wrongValues) {
+    rejectCompile(
+      withPlanReady(`      plan_ready:
+        stage_position: ${value}
+        initial_budget: 1
+`),
+      /plan_ready stage_position must be a positive safe integer/,
+    );
+    rejectCompile(
+      withPlanReady(`      plan_ready:
+        stage_position: 1
+        initial_budget: ${value}
+`),
+      /plan_ready initial_budget must be a positive safe integer/,
+    );
+  }
+});
+
+test("51. plan_ready is allowed only on planning roles; control and stage roles reject it as an unknown field", () => {
+  const controlYaml = withOrchestrationSection(
+    `orchestration:
+  stage_templates:
+    - id: development
+      entry_state: coder
+  execution_roles:
+    - state_id: stage_dispatch
+      role: control
+      plan_ready:
+        stage_position: 1
+        initial_budget: 1
+    - state_id: architect
+      role: planning
+      plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+    - state_id: coder
+      role: stage
+      stage_template: development
+`,
+  );
+  rejectCompile(controlYaml, /execution_roles 0 has unknown field "plan_ready"/);
+  const stageYaml = withOrchestrationSection(
+    `orchestration:
+  stage_templates:
+    - id: development
+      entry_state: coder
+  execution_roles:
+    - state_id: coder
+      role: stage
+      stage_template: development
+      plan_ready:
+        stage_position: 1
+        initial_budget: 1
+    - state_id: architect
+      role: planning
+      plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+    - state_id: stage_dispatch
+      role: control
+`,
+  );
+  rejectCompile(stageYaml, /execution_roles 0 has unknown field "plan_ready"/);
+});
+
+test("52. the resolved plan_ready policy is recursively frozen and isolated from the parsed input", async () => {
+  const parsed = Bun.YAML.parse(withPlanReady(NEUTRAL_PLAN_READY_YAML)) as {
+    orchestration: {
+      execution_roles: Array<{ state_id: string; plan_ready?: { stage_position?: number; initial_budget?: number } }>;
+    };
+  };
+  const spec = compilePipelineV2Spec(parsed);
+  const planningSpec = spec.orchestration?.execution_roles[0];
+  if (planningSpec === undefined || planningSpec.role !== "planning" || planningSpec.plan_ready === undefined) {
+    throw new Error("the planning entry lost its plan_ready");
+  }
+  // the parsed input is not frozen and mutating it after the compile does
+  // not change the compiled metadata (the parser builds its own objects)
+  const inputPlanning = parsed.orchestration.execution_roles.find((entry) => entry.state_id === "architect");
+  if (inputPlanning?.plan_ready === undefined) {
+    throw new Error("the parsed planning entry lost its plan_ready");
+  }
+  expect(Object.isFrozen(inputPlanning.plan_ready)).toBe(false);
+  inputPlanning.plan_ready.stage_position = 99;
+  inputPlanning.plan_ready.initial_budget = 99;
+  expect(planningSpec.plan_ready).toEqual(NEUTRAL_PLAN_READY);
+  // the resolved snapshot of a fresh load is recursively frozen
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const resolvedPlanning = pipeline.orchestration?.execution_roles[0];
+    if (resolvedPlanning === undefined || resolvedPlanning.role !== "planning" || resolvedPlanning.plan_ready === undefined) {
+      throw new Error("the planning entry lost its plan_ready");
+    }
+    expect(Object.isFrozen(resolvedPlanning.plan_ready)).toBe(true);
+    let threw = false;
+    try {
+      (resolvedPlanning.plan_ready as { stage_position: number }).stage_position = 42;
+    } catch {
+      threw = true;
+    }
+    expect(threw || resolvedPlanning.plan_ready.stage_position === 1).toBe(true);
+    expect(resolvedPlanning.plan_ready).toEqual(NEUTRAL_PLAN_READY);
+  }, withPlanReady(NEUTRAL_PLAN_READY_YAML));
+});
+
+test("53. the compiled plan_ready policy is a fresh frozen copy per call; caller mutation cannot reach it", async () => {
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const first = compiledExecutionRoleFor(pipeline, "architect");
+    if (first.role !== "planning" || first.plan_ready === undefined) {
+      throw new Error("the compiled planning role lost its plan_ready");
+    }
+    const second = compiledExecutionRoleFor(pipeline, "architect");
+    if (second.role !== "planning" || second.plan_ready === undefined) {
+      throw new Error("the compiled planning role lost its plan_ready");
+    }
+    const firstReady = first.role === "planning" ? first.plan_ready : undefined;
+    const secondReady = second.role === "planning" ? second.plan_ready : undefined;
+    if (firstReady === undefined || secondReady === undefined) {
+      throw new Error("the compiled planning role lost its plan_ready");
+    }
+    expect(first).toEqual(second);
+    expect(first).not.toBe(second);
+    expect(firstReady).not.toBe(secondReady);
+    const storedReady = (pipeline.orchestration?.execution_roles[0] as unknown as { plan_ready?: unknown }).plan_ready;
+    expect(firstReady).not.toBe(storedReady);
+    expect(Object.isFrozen(firstReady)).toBe(true);
+    // mutating the returned copy changes nothing for later calls
+    const mutable = firstReady as { stage_position: number };
+    try {
+      mutable.stage_position = 42;
+    } catch {
+      // frozen
+    }
+    expect(compiledExecutionRoleFor(pipeline, "architect")).toEqual(second);
+  }, withPlanReady(NEUTRAL_PLAN_READY_YAML));
+});
+
+test("54. the provenance gate fires before any plan_ready read; Proxy traps and getters never run", async () => {
+  let traps = 0;
+  let getters = 0;
+  const hostile = new Proxy(
+    { orchestration: { execution_roles: [{ state_id: "architect", role: "planning", plan_output: "plan", stage_wait: NEUTRAL_STAGE_WAIT, plan_ready: NEUTRAL_PLAN_READY }] } },
+    {
+      get(target, property) {
+        traps += 1;
+        getters += 1;
+        return Reflect.get(target, property);
+      },
+    },
+  ) as unknown as ResolvedPipelineV2;
+  expect(() => compiledExecutionRoleFor(hostile, "architect")).toThrow(PipelineError);
+  expect(traps).toBe(0);
+  expect(getters).toBe(0);
+  // a spread clone is equally rejected
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const cloned = { ...pipeline } as unknown as ResolvedPipelineV2;
+    expect(() => compiledExecutionRoleFor(cloned, "architect")).toThrow(PipelineError);
+  }, withPlanReady(NEUTRAL_PLAN_READY_YAML));
+});
+
+test("55. the plan_ready policy joins the execution snapshot and moves the digest separately for each field", async () => {
+  const without = await (async () => {
+    let digest = "";
+    await withOrchestratedBundle(async (dirs) => {
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      digest = pipelineV2ExecutionDigest(pipeline);
+    });
+    return digest;
+  })();
+  const withPolicy = await (async () => {
+    let digest = "";
+    await withOrchestratedBundle(async (dirs) => {
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      digest = pipelineV2ExecutionDigest(pipeline);
+    }, withPlanReady(NEUTRAL_PLAN_READY_YAML));
+    return digest;
+  })();
+  const positionMoved = await (async () => {
+    let digest = "";
+    await withOrchestratedBundle(async (dirs) => {
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      digest = pipelineV2ExecutionDigest(pipeline);
+    }, withPlanReady(`      plan_ready:
+        stage_position: 2
+        initial_budget: 1
+`));
+    return digest;
+  })();
+  const budgetMoved = await (async () => {
+    let digest = "";
+    await withOrchestratedBundle(async (dirs) => {
+      const pipeline = await loadPipelineV2(dirs.bundle);
+      digest = pipelineV2ExecutionDigest(pipeline);
+    }, withPlanReady(`      plan_ready:
+        stage_position: 1
+        initial_budget: 2
+`));
+    return digest;
+  })();
+  expect(withPolicy).not.toBe(without);
+  expect(positionMoved).not.toBe(withPolicy);
+  expect(budgetMoved).not.toBe(withPolicy);
+  expect(positionMoved).not.toBe(budgetMoved);
+  // and the snapshot carries the policy verbatim
+  await withOrchestratedBundle(async (dirs) => {
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    const snapshot = pipelineV2ExecutionSnapshot(pipeline) as { orchestration?: { execution_roles: Array<Record<string, unknown>> } };
+    const planning = snapshot.orchestration?.execution_roles[0];
+    expect(planning?.["plan_ready"]).toEqual(NEUTRAL_PLAN_READY);
+  }, withPlanReady(NEUTRAL_PLAN_READY_YAML));
 });

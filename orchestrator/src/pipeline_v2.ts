@@ -23,7 +23,7 @@ import {
 } from "./bundle_file.ts";
 import { describeError } from "./docker_helper.ts";
 import { compilePipelineJsonSchema } from "./pipeline_v2_schema.ts";
-import { isPipelineV2SafeId } from "./pipeline_v2_scalar.ts";
+import { isPipelineV2SafeId, isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import {
   DecisionFactValidationError,
   evaluateDecision,
@@ -77,7 +77,11 @@ import {
  * planning role additionally carries the mandatory `stage_wait` policy (the
  * wait `reason` and the declared intervention actions of the trusted
  * stage-wait entry point, compiled with the role and bound into the
- * execution digest; the production wait entry does not consume it yet).
+ * execution digest; the production wait entry does not consume it yet) and
+ * may carry the optional `plan_ready` continuation policy (the trusted
+ * 1-based `stage_position` and `initial_budget` of the automatic
+ * plan-ready continuation; its absence preserves the manual
+ * `planReady -> resume-plan` chain).
  * Each
  * template is one statically verified compiled subgraph (internal
  * reachability from its entry state, no cross-template transitions, and
@@ -313,12 +317,30 @@ export interface PipelineV2StageWaitSpec {
   readonly actions: readonly PipelineV2StageWaitActionName[];
 }
 
+/**
+ * The trusted automatic plan-ready continuation policy of one planning
+ * role: the 1-based `stage_position` of the stage of the accepted plan the
+ * run continues onto, and the `initial_budget` of the opened stage
+ * generation. Both are positive safe integers with no defaults and no
+ * inference; the field is allowed only on planning roles (a control or
+ * stage role carrying it is rejected as an unknown field), and its absence
+ * preserves the existing manual `planReady -> resume-plan` chain. The
+ * position is resolved against the CURRENT accepted plan revision at
+ * runtime (an out-of-range position fails closed) and is never guessed
+ * from stage templates, stage order or any other content.
+ */
+export interface PipelineV2PlanReadySpec {
+  readonly stage_position: number;
+  readonly initial_budget: number;
+}
+
 export type PipelineV2ExecutionRoleSpec =
   | {
       readonly state_id: string;
       readonly role: "planning";
       readonly plan_output: string;
       readonly stage_wait: PipelineV2StageWaitSpec;
+      readonly plan_ready?: PipelineV2PlanReadySpec;
     }
   | { readonly state_id: string; readonly role: "control" }
   | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
@@ -439,12 +461,23 @@ export interface ResolvedPipelineV2StageWait {
   readonly actions: readonly PipelineV2StageWaitActionName[];
 }
 
+/**
+ * The resolved automatic plan-ready continuation policy of one planning
+ * role: the exact deep-frozen compiled form of the trusted `plan_ready`
+ * metadata, structurally identical to its declared spec form.
+ */
+export interface ResolvedPipelineV2PlanReady {
+  readonly stage_position: number;
+  readonly initial_budget: number;
+}
+
 export type ResolvedPipelineV2ExecutionRole =
   | {
       readonly state_id: string;
       readonly role: "planning";
       readonly plan_output: string;
       readonly stage_wait: ResolvedPipelineV2StageWait;
+      readonly plan_ready?: ResolvedPipelineV2PlanReady;
     }
   | { readonly state_id: string; readonly role: "control" }
   | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
@@ -688,6 +721,37 @@ function parseStageWait(raw: unknown, what: string): PipelineV2StageWaitSpec {
 }
 
 /**
+ * Parse the optional automatic plan-ready continuation policy of one
+ * planning role: the exact own-key shape `{stage_position, initial_budget}`
+ * with both values positive safe integers. The style follows
+ * `parseStageWait`: unknown fields are rejected without naming them (a
+ * canary can hide in a property name), required-field names come from this
+ * contract and are safe to name, and no hostile value is ever echoed.
+ */
+function parsePlanReady(raw: unknown, what: string): PipelineV2PlanReadySpec {
+  const obj = expectObject(raw, what);
+  const ownKeys = new Set(Object.keys(obj));
+  for (const key of ownKeys) {
+    if (key !== "stage_position" && key !== "initial_budget") {
+      throw new PipelineError(`${what} has unknown fields`);
+    }
+  }
+  if (!ownKeys.has("stage_position")) {
+    throw new PipelineError(`${what} is missing required field "stage_position"`);
+  }
+  if (!ownKeys.has("initial_budget")) {
+    throw new PipelineError(`${what} is missing required field "initial_budget"`);
+  }
+  if (!isPositiveSafeInteger(obj.stage_position)) {
+    throw new PipelineError(`${what} stage_position must be a positive safe integer`);
+  }
+  if (!isPositiveSafeInteger(obj.initial_budget)) {
+    throw new PipelineError(`${what} initial_budget must be a positive safe integer`);
+  }
+  return { stage_position: obj.stage_position, initial_budget: obj.initial_budget };
+}
+
+/**
  * Parse the optional `orchestration` section: the single, complete and
  * trusted source of compiled execution roles and stage templates. Exact
  * fields at every level; safe ids from the shared v2 grammar; template ids,
@@ -695,7 +759,9 @@ function parseStageWait(raw: unknown, what: string): PipelineV2StageWaitSpec {
  * exactly one `plan_output` naming a JSON output port of its own agent
  * state and the mandatory `stage_wait` policy (validated once the states
  * are known for the output; the policy itself is validated by
- * `parseStageWait`). Either list may be empty
+ * `parseStageWait`) and may carry the optional `plan_ready` continuation
+ * policy (validated by `parsePlanReady`; no other role accepts it). Either
+ * list may be empty
  * (a pipeline without agent or decision states — e.g. a terminal-only
  * pipeline — carries no roles, and one without stage templates carries no
  * templates; the non-emptiness of a section's lists is a property of the
@@ -752,13 +818,18 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
     const role = entry.role as PipelineV2ExecutionRoleName;
     // Exact own enumerable fields for every execution-role entry: an
     // inherited property never satisfies the required shape (the planning
-    // role carries the mandatory `stage_wait` policy).
+    // role carries the mandatory `stage_wait` policy and may carry the
+    // optional `plan_ready` continuation policy; no other role accepts it).
+    const planningKeys =
+      role === "planning" && Object.prototype.hasOwnProperty.call(entry, "plan_ready")
+        ? ["state_id", "role", "plan_output", "stage_wait", "plan_ready"]
+        : ["state_id", "role", "plan_output", "stage_wait"];
     expectExactOwnKeys(
       entry,
       role === "stage"
         ? ["state_id", "role", "stage_template"]
         : role === "planning"
-          ? ["state_id", "role", "plan_output", "stage_wait"]
+          ? planningKeys
           : ["state_id", "role"],
       what,
     );
@@ -782,6 +853,9 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
               role,
               plan_output: validateSafeId(entry.plan_output, `${what} plan_output`),
               stage_wait: parseStageWait(entry.stage_wait, `${what} stage_wait`),
+              ...(Object.prototype.hasOwnProperty.call(entry, "plan_ready")
+                ? { plan_ready: parsePlanReady(entry.plan_ready, `${what} plan_ready`) }
+                : {}),
             }
           : { state_id: stateId, role },
     );

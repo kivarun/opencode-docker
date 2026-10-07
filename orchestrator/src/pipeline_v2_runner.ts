@@ -144,6 +144,10 @@ import { resumePipelineV2RunAfterContinueStageIntervention } from "./pipeline_v2
 import { resumePipelineV2RunAfterReviseTaskIntervention } from "./pipeline_v2_revise_task_resume_controller.ts";
 import { resumePipelineV2RunAfterPlanningRunPlanHandoff } from "./pipeline_v2_planning_run_plan_resume_controller.ts";
 import {
+  applyPipelineV2PlanReadyContinuation,
+  pipelineV2PlanReadyPolicyFor,
+} from "./pipeline_v2_plan_ready_auto_controller.ts";
+import {
   prepareWaitIntent,
   type PreparedPipelineV2RunWaitIntent,
 } from "./pipeline_v2_run_plan_manifests.ts";
@@ -720,7 +724,7 @@ export async function runPipelineV2(
     freezeSignal: () => gate.freezeSignalAcceptance()?.signal ?? null,
   };
 
-  let result;
+  let result: PipelineV2ResumeCoordinationResult;
   try {
     result = await coordinatePipelineV2Run(
       {
@@ -749,6 +753,26 @@ export async function runPipelineV2(
       runRoot: runRoot.localRunRoot,
       state,
     });
+  }
+
+  // The trusted automatic plan-ready continuation: when the compiled
+  // planning-role metadata of the suspended planning state carries the
+  // `plan_ready` policy, the controlled suspension is continued
+  // automatically through the composition controller (the plan acceptance,
+  // the trusted stage selection and the handoff followed by the
+  // coordinator resume). Without the policy the planReady result is
+  // returned unchanged — the manual `resume-plan` chain stays the only
+  // continuation and no extra durable write happens.
+  if (!result.ok && "planReady" in result) {
+    if (pipelineV2PlanReadyPolicyFor(pipeline, result.state) !== null) {
+      result = await applyPipelineV2PlanReadyContinuation({
+        pipeline,
+        runRoot: runRoot.localRunRoot,
+        sink,
+        runtime,
+        control,
+      });
+    }
   }
 
   if (result.ok) {
@@ -784,6 +808,20 @@ export async function runPipelineV2(
       runId,
       runRoot: runRoot.localRunRoot,
       state: result.state,
+    });
+  }
+  if ("refused" in result && result.refused) {
+    // A pre-resume refusal (reachable only through the automatic plan-ready
+    // continuation's coordinator resume) is not a durable failure: no
+    // dispatch, no Session, no callback happened, and the state document
+    // is untouched.
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: result.state,
+      reason: result.reason,
     });
   }
   const reason = result.reason;
@@ -1603,19 +1641,20 @@ async function runExistingPipelineV2(
     freezeSignal: () => gate.freezeSignalAcceptance()?.signal ?? null,
   };
 
-  let result;
+  const coordinatorContext: ExistingRunCoordinatorContext = {
+    runId,
+    runRoot: runRoot.localRunRoot,
+    sink,
+    pipeline,
+    profiles,
+    runtime,
+    control,
+    derived,
+    callerPolicy: contract.callerPolicy,
+  };
+  let result: PipelineV2ResumeCoordinationResult;
   try {
-    result = await flow.runCoordinator({
-      runId,
-      runRoot: runRoot.localRunRoot,
-      sink,
-      pipeline,
-      profiles,
-      runtime,
-      control,
-      derived,
-      callerPolicy: contract.callerPolicy,
-    });
+    result = await flow.runCoordinator(coordinatorContext);
   } catch (cause) {
     const state = sink.snapshot;
     if (recordedSignal() !== null) {
@@ -1631,6 +1670,26 @@ async function runExistingPipelineV2(
       runRoot: runRoot.localRunRoot,
       state,
     });
+  }
+
+  // The trusted automatic plan-ready continuation (the same uniform hook
+  // as the fresh runner): when the composed coordinator result reports the
+  // controlled plan-ready suspension and the compiled planning-role
+  // metadata of the suspended planning state carries the `plan_ready`
+  // policy, the suspension is continued automatically through the
+  // composition controller. Without the policy the planReady result is
+  // returned unchanged — the manual `resume-plan` chain stays the only
+  // continuation and no extra durable write happens.
+  if (!result.ok && "planReady" in result) {
+    if (pipelineV2PlanReadyPolicyFor(coordinatorContext.pipeline, result.state) !== null) {
+      result = await applyPipelineV2PlanReadyContinuation({
+        pipeline: coordinatorContext.pipeline,
+        runRoot: coordinatorContext.runRoot,
+        sink: coordinatorContext.sink,
+        runtime: coordinatorContext.runtime,
+        control: coordinatorContext.control,
+      });
+    }
   }
 
   if (result.ok) {
@@ -1715,8 +1774,27 @@ export async function resumePipelineV2(
     failureLogPrefix: "pipeline v2 resume failed",
     contractName: "pipeline v2 resume",
     callerPolicyKind: "resume",
-    runCoordinator: (context) =>
-      resumePipelineV2Run(
+    runCoordinator: (context) => {
+      // The trusted automatic plan-ready continuation routing: when the
+      // durable run sits on a settled planning execution whose compiled
+      // planning role carries the `plan_ready` policy, the restart window
+      // is continued through the composition controller (its structural
+      // bit routes the acceptance boundary versus the committed handoff
+      // boundary, and the handoff classifies the initial and replanned
+      // families itself). Every other boundary — the plan-ready boundary
+      // without the policy, any successor execution already started, and
+      // all non-planning states — takes the ordinary resume path with its
+      // exact established refusal and continuation semantics.
+      if (pipelineV2PlanReadyPolicyFor(context.pipeline, context.sink.snapshot) !== null) {
+        return applyPipelineV2PlanReadyContinuation({
+          pipeline: context.pipeline,
+          runRoot: context.runRoot,
+          sink: context.sink,
+          runtime: context.runtime,
+          control: context.control,
+        });
+      }
+      return resumePipelineV2Run(
         {
           pipeline: context.pipeline,
           runId: context.runId,
@@ -1725,7 +1803,8 @@ export async function resumePipelineV2(
           runtime: context.runtime,
         },
         context.control,
-      ),
+      );
+    },
   });
 }
 
