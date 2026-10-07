@@ -2,15 +2,10 @@ import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 import { compiledTransitionFor } from "./pipeline_engine.ts";
 import {
   PipelineV2StateError,
-  reducePipelineV2RunCommand,
   validatePipelineV2RunState,
   type PipelineV2RunCommand,
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
-import {
-  PipelineV2RunStateDurabilityError,
-  PipelineV2RunStateStoreError,
-} from "./pipeline_v2_state_store.ts";
 import { hasPreparedRunPlanProvenance } from "./pipeline_v2_run_plan_provenance.ts";
 import {
   compiledPipelineV2RunPlanStageFor,
@@ -23,6 +18,10 @@ import type {
   PreparedPipelineV2RunWaitIntent,
   PipelineV2ReviseTaskIntentManifest,
 } from "./pipeline_v2_run_plan_manifests.ts";
+import {
+  applyStageTransitionCommit,
+  type StageTransitionApplyFailureReason,
+} from "./pipeline_v2_stage_transition_apply_internal.ts";
 
 /**
  * Production-neutral replanned-stage transition controller (unwired).
@@ -646,473 +645,6 @@ function requireTransitionBindings(
 }
 
 /**
- * The reducer pre-check of the transition command on a local snapshot,
- * before the dispatch; a reducer rejection is a typed `invalid_state`
- * with zero dispatch and any other cause propagates unchanged. Internal
- * to this module: not a runtime export and not a test seam (the
- * pre-check-before-dispatch ordering is proven by the source-order test
- * of the flow).
- */
-function precheckTransition(
-  state: PipelineV2RunState,
-  command: PipelineV2RunCommand,
-  snapshot: PipelineV2RunState,
-): void {
-  try {
-    reducePipelineV2RunCommand(state, command, new Date());
-  } catch (cause) {
-    if (cause instanceof PipelineV2StateError) {
-      throw controllerError(
-        "invalid_state",
-        "the current run state does not accept the replanned stage transition",
-        snapshot,
-      );
-    }
-    throw cause;
-  }
-}
-
-/**
- * The per-position equality of one wait record: identity fields, ordered
- * `{id,to}` actions, the accepted intent and the response. Every viewed
- * entry is shape-checked before any field access.
- */
-function waitRecordBindingsMatch(before: PipelineV2RunState["waits"][number], after: unknown): boolean {
-  if (!isRecord(after)) {
-    return false;
-  }
-  if (
-    before.index !== after["index"] ||
-    before.transition_count !== after["transition_count"] ||
-    before.state_id !== after["state_id"] ||
-    before.reason !== after["reason"] ||
-    before.request_sha256 !== after["request_sha256"]
-  ) {
-    return false;
-  }
-  const afterActions = after["actions"];
-  if (!Array.isArray(afterActions) || before.actions.length !== afterActions.length) {
-    return false;
-  }
-  const actionsEqual = before.actions.every((action, position) => {
-    const other = afterActions[position];
-    return (
-      other !== undefined &&
-      isRecord(other) &&
-      other["id"] === action.id &&
-      other["to"] === action.to
-    );
-  });
-  if (!actionsEqual) {
-    return false;
-  }
-  const beforeIntent = before.intent;
-  const afterIntent = after["intent"];
-  const intentEqual =
-    beforeIntent === undefined
-      ? afterIntent === undefined
-      : isRecord(beforeIntent) && isRecord(afterIntent) && beforeIntent["intent_sha256"] === (afterIntent as Record<string, unknown>)["intent_sha256"];
-  if (!intentEqual) {
-    return false;
-  }
-  const beforeResponse = before.response;
-  const afterResponse = after["response"];
-  const responseEqual =
-    beforeResponse === undefined
-      ? afterResponse === undefined
-      : isRecord(beforeResponse) &&
-        isRecord(afterResponse) &&
-        beforeResponse["action_id"] === (afterResponse as Record<string, unknown>)["action_id"] &&
-        beforeResponse["response_sha256"] === (afterResponse as Record<string, unknown>)["response_sha256"];
-  return responseEqual;
-}
-
-/**
- * One generation record unchanged by position: identity bindings, the
- * closure (absence/presence with `by`/wait index/boundary) and every
- * iteration (index, opening anchor, exact closed projection).
- */
-function generationRecordUnchanged(before: PipelineV2RunState["generations"][number], after: unknown): boolean {
-  if (!isRecord(after)) {
-    return false;
-  }
-  if (
-    after["index"] !== before.index ||
-    after["stage_id"] !== before.stage_id ||
-    after["stage_position"] !== before.stage_position ||
-    after["template_id"] !== before.template_id ||
-    after["plan_sha256"] !== before.plan_sha256 ||
-    after["initial_budget"] !== before.initial_budget ||
-    after["opened_transition_count"] !== before.opened_transition_count ||
-    after["iteration_count"] !== before.iteration_count
-  ) {
-    return false;
-  }
-  const afterIterations = after["iterations"];
-  if (!Array.isArray(afterIterations) || afterIterations.length !== before.iterations.length) {
-    return false;
-  }
-  for (let position = 0; position < before.iterations.length; position += 1) {
-    const beforeIteration = before.iterations[position]!;
-    const entry = afterIterations[position];
-    if (entry === undefined || !isRecord(entry)) {
-      return false;
-    }
-    if (
-      entry["index"] !== beforeIteration.index ||
-      entry["opened_transition_count"] !== beforeIteration.opened_transition_count
-    ) {
-      return false;
-    }
-    const afterClosed = entry["closed"];
-    const beforeClosed = beforeIteration.closed;
-    const closedEqual =
-      beforeClosed === undefined
-        ? afterClosed === undefined
-        : isRecord(afterClosed) &&
-          afterClosed["by"] === beforeClosed.by &&
-          afterClosed["wait_index"] === beforeClosed.wait_index &&
-          afterClosed["closed_transition_count"] === beforeClosed.closed_transition_count;
-    if (!closedEqual) {
-      return false;
-    }
-  }
-  const afterOpenIteration = after["open_iteration"];
-  if (before.open_iteration === undefined) {
-    if (afterOpenIteration !== undefined) {
-      return false;
-    }
-  } else if (
-    !isRecord(afterOpenIteration) ||
-    afterOpenIteration["index"] !== before.open_iteration.index ||
-    afterOpenIteration["opened_transition_count"] !== before.open_iteration.opened_transition_count
-  ) {
-    return false;
-  }
-  const afterClosed = after["closed"];
-  if (before.closed === undefined) {
-    return afterClosed === undefined;
-  }
-  return (
-    isRecord(afterClosed) &&
-    afterClosed["by"] === before.closed.by &&
-    afterClosed["closed_transition_count"] === before.closed.closed_transition_count
-  );
-}
-
-/**
- * One execution record unchanged by position: every contract field the
- * transition is not allowed to touch.
- */
-function executionUnchanged(before: PipelineV2RunState["executions"][number], after: unknown): boolean {
-  if (!isRecord(after)) {
-    return false;
-  }
-  if (
-    after["index"] !== before.index ||
-    after["type"] !== before.type ||
-    after["state_id"] !== before.state_id ||
-    after["execution_role"] !== before.execution_role ||
-    after["phase"] !== before.phase
-  ) {
-    return false;
-  }
-  if (before.type === "agent") {
-    if (
-      after["attempt"] !== before.attempt ||
-      after["profile"] !== before.profile ||
-      after["iteration_index"] !== before.iteration_index ||
-      after["execution_session_id"] !== before.execution_session_id ||
-      after["tool_session_id"] !== before.tool_session_id ||
-      after["failure_reason"] !== before.failure_reason
-    ) {
-      return false;
-    }
-    const beforeCleanup = before.session_cleanup;
-    const afterCleanup = after["session_cleanup"];
-    const cleanupEqual =
-      beforeCleanup === undefined
-        ? afterCleanup === undefined
-        : isRecord(afterCleanup) &&
-          afterCleanup["execution"] === beforeCleanup.execution &&
-          afterCleanup["tool"] === beforeCleanup.tool;
-    if (!cleanupEqual) {
-      return false;
-    }
-    const beforeOutputs = before.outputs;
-    const afterOutputs = after["outputs"];
-    if (beforeOutputs === undefined) {
-      return afterOutputs === undefined;
-    }
-    if (!Array.isArray(afterOutputs) || afterOutputs.length !== beforeOutputs.length) {
-      return false;
-    }
-    return beforeOutputs.every(
-      (output, position) =>
-        afterOutputs[position] !== undefined &&
-        isRecord(afterOutputs[position]) &&
-        (afterOutputs[position] as Record<string, unknown>)["id"] === output.id &&
-        (afterOutputs[position] as Record<string, unknown>)["digest"] === output.digest,
-    );
-  }
-  return (
-    after["input_digest"] === before.input_digest &&
-    after["iteration_index"] === before.iteration_index &&
-    decisionResultUnchanged(before.result, after["result"]) &&
-    after["failure_reason"] === before.failure_reason
-  );
-}
-
-/**
- * The historical decision result unchanged by its schema-owned fields
- * (narrow per-field comparison; no deep comparator, no revalidation).
- */
-function decisionResultUnchanged(
-  before: unknown,
-  after: unknown,
-): boolean {
-  if (before === undefined) {
-    return after === undefined;
-  }
-  if (!isRecord(before) || !isRecord(after)) {
-    return false;
-  }
-  const scalarEqual = (field: string) => after[field] === before[field];
-  if (
-    !scalarEqual("status") ||
-    !scalarEqual("outcome") ||
-    !scalarEqual("decision") ||
-    !scalarEqual("rule_id") ||
-    !scalarEqual("reason") ||
-    !scalarEqual("fact_id") ||
-    !scalarEqual("actual_type")
-  ) {
-    return false;
-  }
-  const listEqual = (field: string) => {
-    const beforeList = before[field];
-    const afterList = after[field];
-    if (beforeList === undefined) {
-      return afterList === undefined;
-    }
-    return (
-      Array.isArray(beforeList) &&
-      Array.isArray(afterList) &&
-      afterList.length === beforeList.length &&
-      beforeList.every((entry, position) => afterList[position] === entry)
-    );
-  };
-  return listEqual("active_constraint_ids") && listEqual("violated_relation_ids");
-}
-
-/**
- * One committed transition record unchanged by position.
- */
-function transitionRecordUnchanged(
-  before: PipelineV2RunState["transitions"][number],
-  after: unknown,
-): boolean {
-  return (
-    isRecord(after) &&
-    after["index"] === before.index &&
-    after["from"] === before.from &&
-    after["outcome"] === before.outcome &&
-    after["to"] === before.to &&
-    after["execution_index"] === before.execution_index
-  );
-}
-
-/**
- * The exact post-transition verification: the only allowed changes are
- * the exact new transition record, the moved cursor and the expected
- * state revision increment; every other durable field is unchanged
- * except the routine `updated_at` refresh. Every array and nested entry
- * is shape-checked before any field read, so a hostile malformed
- * snapshot yields `false` and a typed error, never a `TypeError`.
- */
-function transitionAppliedExactly(
-  after: PipelineV2RunState,
-  before: PipelineV2RunState,
-  bindings: TransitionBindings,
-): boolean {
-  if (!isRecord(after)) {
-    return false;
-  }
-  if (
-    after.run_id !== before.run_id ||
-    after.revision !== before.revision + 1 ||
-    after.schema_version !== before.schema_version ||
-    after.status !== before.status ||
-    after.phase !== before.phase ||
-    after.started_at !== before.started_at
-  ) {
-    return false;
-  }
-  if (
-    after.terminal !== undefined ||
-    after.run_outputs !== undefined ||
-    after.failure !== undefined
-  ) {
-    return false;
-  }
-  if (comparePipelineV2RunIdentity(before.pipeline, after.pipeline).kind !== "match") {
-    return false;
-  }
-  if (!Array.isArray(after.inputs) || after.inputs.length !== before.inputs.length) {
-    return false;
-  }
-  for (let position = 0; position < before.inputs.length; position += 1) {
-    const beforeInput = before.inputs[position]!;
-    const afterEntry = after.inputs[position];
-    if (
-      afterEntry === undefined ||
-      !isRecord(afterEntry) ||
-      afterEntry["id"] !== beforeInput.id ||
-      afterEntry["type"] !== beforeInput.type ||
-      afterEntry["protected"] !== beforeInput.protected ||
-      afterEntry["digest"] !== beforeInput.digest
-    ) {
-      return false;
-    }
-  }
-  if (!Array.isArray(after.transitions) || after.transitions.length !== before.transitions.length + 1) {
-    return false;
-  }
-  for (let position = 0; position < before.transitions.length; position += 1) {
-    if (!transitionRecordUnchanged(before.transitions[position]!, after.transitions[position])) {
-      return false;
-    }
-  }
-  const last = after.transitions[after.transitions.length - 1]!;
-  if (
-    !isRecord(last) ||
-    last["index"] !== bindings.transitionIndex ||
-    last["from"] !== bindings.fromState ||
-    last["outcome"] !== AGENT_COMPLETED_OUTCOME ||
-    last["to"] !== bindings.toState ||
-    last["execution_index"] !== bindings.executionIndex
-  ) {
-    return false;
-  }
-  if (
-    !isRecord(after.cursor) ||
-    after.cursor["current_state"] !== bindings.toState ||
-    after.cursor["transition_count"] !== bindings.wait.transition_count + 1
-  ) {
-    return false;
-  }
-  if (!Array.isArray(after.executions) || after.executions.length !== before.executions.length) {
-    return false;
-  }
-  for (let position = 0; position < before.executions.length; position += 1) {
-    if (!executionUnchanged(before.executions[position]!, after.executions[position])) {
-      return false;
-    }
-  }
-  if (
-    !Array.isArray(after.waits) ||
-    after.waits.length !== before.waits.length ||
-    !before.waits.every((beforeEntry, position) => waitRecordBindingsMatch(beforeEntry, after.waits[position]))
-  ) {
-    return false;
-  }
-  if (
-    !Array.isArray(after.task_revisions) ||
-    after.task_revisions.length !== before.task_revisions.length ||
-    !before.task_revisions.every((beforeEntry, position) => {
-      const afterEntry = after.task_revisions[position];
-      return (
-        afterEntry !== undefined &&
-        isRecord(afterEntry) &&
-        afterEntry["index"] === beforeEntry.index &&
-        afterEntry["task_id"] === beforeEntry.task_id &&
-        afterEntry["revision"] === beforeEntry.revision &&
-        afterEntry["sha256"] === beforeEntry.sha256 &&
-        afterEntry["previous_sha256"] === beforeEntry.previous_sha256 &&
-        afterEntry["wait_index"] === beforeEntry.wait_index &&
-        afterEntry["intent_sha256"] === beforeEntry.intent_sha256
-      );
-    })
-  ) {
-    return false;
-  }
-  if (
-    !Array.isArray(after.plan_revisions) ||
-    after.plan_revisions.length !== before.plan_revisions.length ||
-    !before.plan_revisions.every((beforeEntry, position) => {
-      const afterEntry = after.plan_revisions[position];
-      return (
-        afterEntry !== undefined &&
-        isRecord(afterEntry) &&
-        afterEntry["index"] === beforeEntry.index &&
-        afterEntry["revision"] === beforeEntry.revision &&
-        afterEntry["sha256"] === beforeEntry.sha256 &&
-        afterEntry["previous_sha256"] === beforeEntry.previous_sha256 &&
-        afterEntry["origin_execution"] === beforeEntry.origin_execution
-      );
-    })
-  ) {
-    return false;
-  }
-  if (!Array.isArray(after.grants) || after.grants.length !== before.grants.length) {
-    return false;
-  }
-  for (let position = 0; position < before.grants.length; position += 1) {
-    const beforeGrant = before.grants[position]!;
-    const afterEntry = after.grants[position];
-    if (
-      afterEntry === undefined ||
-      !isRecord(afterEntry) ||
-      afterEntry["index"] !== beforeGrant.index ||
-      afterEntry["generation_index"] !== beforeGrant.generation_index ||
-      afterEntry["wait_index"] !== beforeGrant.wait_index ||
-      afterEntry["intent_sha256"] !== beforeGrant.intent_sha256 ||
-      afterEntry["additional_iterations"] !== beforeGrant.additional_iterations
-    ) {
-      return false;
-    }
-  }
-  if (
-    !Array.isArray(after.generations) ||
-    after.generations.length !== before.generations.length ||
-    !before.generations.every((beforeEntry, position) => generationRecordUnchanged(beforeEntry, after.generations[position]))
-  ) {
-    return false;
-  }
-  return true;
-}
-
-/**
- * The typed classification of a failed racing-dispatch verification: the
- * reducer rejected the command because another dispatch already moved the
- * run, so the presented snapshot is searched for a different committed
- * transition at the boundary. Used only on the racing `PipelineV2StateError`
- * path; the normal post-dispatch resolve path reports a mismatched
- * presentation as `invalid_state` directly (the controller's own dispatch
- * succeeded, so only the exact change or a lying presentation is possible).
- */
-function raceOrMismatch(
-  after: PipelineV2RunState | null,
-  bindings: TransitionBindings,
-): never {
-  if (after !== null && Array.isArray(after.transitions) && after.transitions.length === bindings.wait.transition_count + 1) {
-    const last = after.transitions[after.transitions.length - 1]!;
-    if (isRecord(last) && last["execution_index"] === bindings.executionIndex) {
-      throw controllerError(
-        "lifecycle_conflict",
-        "the durable planning transition does not match the exact step of the composition boundary",
-        after,
-      );
-    }
-  }
-  throw controllerError(
-    "invalid_state",
-    `the run state does not carry the committed planning transition of wait ${bindings.wait.index}`,
-    after,
-  );
-}
-
-/**
  * Validate, bind and commit the single planning transition through the
  * existing reducer (see the module docstring for the full order and
  * durability semantics).
@@ -1161,12 +693,6 @@ export async function openPipelineV2ReplannedStageTransitionInternal(
   if (typeof dispatch !== "function") {
     throw invalidOptions("the run state sink requires a dispatch function");
   }
-  const sinkRef = sink as unknown as PipelineV2ReplannedStageTransitionControllerSink;
-  // The dispatch is bound to the sink immediately at capture: a later
-  // reassignment of the sink's member cannot change the dispatch target,
-  // and the sink member is never read again.
-  const dispatchCommand = (command: PipelineV2RunCommand): Promise<unknown> =>
-    Promise.resolve((dispatch as (...args: unknown[]) => unknown).call(sink, command));
   // The fail-closed poison latch: a poisoned sink accepts no transition.
   if (poisoned) {
     throw controllerError(
@@ -1225,60 +751,35 @@ export async function openPipelineV2ReplannedStageTransitionInternal(
     // verified result — zero dispatch.
     return finishResult(state, bindings);
   }
-  // C0: the reducer pre-check of the single transition command precedes
-  // the dispatch; a rejection is typed `invalid_state` with zero
-  // dispatch.
-  const transitionCommand: PipelineV2RunCommand = {
-    kind: "transition_committed",
-    step: {
-      from: bindings.fromState,
-      outcome: AGENT_COMPLETED_OUTCOME,
-      to: bindings.toState,
-      transition_index: bindings.transitionIndex,
+  // C0: the single transition application through the shared kernel —
+  // the reducer pre-check, the one dispatch, the durability mapping,
+  // the racing classification and the exact post-transition
+  // verification are the kernel's; the wording keeps this controller's
+  // messages byte-identical.
+  const applied = await applyStageTransitionCommit(
+    sink,
+    {
+      preState: state,
+      step: {
+        from: bindings.fromState,
+        outcome: AGENT_COMPLETED_OUTCOME,
+        to: bindings.toState,
+        transition_index: bindings.transitionIndex,
+      },
+      executionIndex: bindings.executionIndex,
+      priorTransitionCount: bindings.wait.transition_count,
     },
-    executionIndex: bindings.executionIndex,
-  };
-  precheckTransition(state, transitionCommand, state);
-  try {
-    await dispatchCommand(transitionCommand);
-  } catch (cause) {
-    if (cause instanceof PipelineV2RunStateDurabilityError) {
-      throw controllerError(
-        "state_persist_failed",
-        "the replanned stage transition could not be confirmed durable",
-        sinkRef.snapshot,
-      );
-    }
-    if (cause instanceof PipelineV2RunStateStoreError) {
-      throw controllerError(
-        "state_persist_failed",
-        "the replanned stage transition could not be committed",
-        sinkRef.snapshot,
-      );
-    }
-    if (cause instanceof PipelineV2StateError) {
-      // A racing identical dispatch is idempotent success only on the
-      // full exact verification of the authoritative snapshot.
-      const after = sinkRef.snapshot;
-      if (after !== null && transitionAppliedExactly(after, state, bindings)) {
-        return finishResult(after, bindings);
-      }
-      raceOrMismatch(after, bindings);
-    }
-    throw cause;
-  }
-  const after = sinkRef.snapshot;
-  if (after === null || !transitionAppliedExactly(after, state, bindings)) {
-    // The dispatch itself just succeeded, so a full mismatch can only be
-    // a hostile or non-authoritative snapshot presentation: the exact
-    // change is missing, never a different lifecycle step.
-    throw controllerError(
-      "invalid_state",
-      `the run state does not carry the committed planning transition of wait ${bindings.wait.index}`,
-      after,
-    );
-  }
-  return finishResult(after, bindings);
+    (reason, message, failState) =>
+      controllerError(reason as PipelineV2ReplannedStageTransitionControllerFailureReason, message, failState),
+    {
+      precheckRejected: "the current run state does not accept the replanned stage transition",
+      notDurable: "the replanned stage transition could not be confirmed durable",
+      notCommitted: "the replanned stage transition could not be committed",
+      raceConflict: "the durable planning transition does not match the exact step of the composition boundary",
+      missingTransition: `the run state does not carry the committed planning transition of wait ${bindings.wait.index}`,
+    },
+  );
+  return finishResult(applied.state, bindings);
 }
 
 function finishResult(

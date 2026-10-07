@@ -983,9 +983,12 @@ test("12. the controller composes the existing layers only (source scan)", async
   const source = await readFile(join(import.meta.dir, "..", "src", "pipeline_v2_replanned_stage_transition_controller_internal.ts"), "utf8");
   const countOf = (pattern: string): number => source.split(pattern).length - 1;
   expect(countOf("validatePipelineV2RunState(")).toBe(1);
-  expect(countOf("reducePipelineV2RunCommand(")).toBe(1);
+  // The single transition dispatch lives in the shared kernel; the
+  // controller composes it instead of owning a reducer call.
+  expect(countOf("reducePipelineV2RunCommand(")).toBe(0);
+  expect(countOf("applyStageTransitionCommit(")).toBe(1);
   expect(countOf("const resolved = compiledTransitionFor(")).toBe(1);
-  expect(countOf("comparePipelineV2RunIdentity(")).toBe(2);
+  expect(countOf("comparePipelineV2RunIdentity(")).toBe(1);
   expect(countOf("compiledRunPlanOriginIdentity(")).toBe(1);
   expect(countOf("hasPreparedRunPlanProvenance(")).toBe(1);
   expect(countOf("compiledPipelineV2RunPlanStageFor(")).toBe(1);

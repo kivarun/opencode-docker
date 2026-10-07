@@ -1655,3 +1655,124 @@ test("12. source scan: only the two facades; no reducer/store/fs/parser/serializ
     expect(internalSource.includes(required), `the internal core must import ${required}`).toBe(true);
   }
 });
+
+/** The honest INITIAL plan-ready boundary: the settled unbound planning execution, no acceptance yet. */
+async function buildInitialReadyPrefix(): Promise<PrefixCoordinates> {
+  const fixture = await setupFixture();
+  const pipeline1 = await loadPipelineV2(fixture.bundle);
+  clockCounter = 0;
+  const sink1 = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+  const recording1 = recordingSink(sink1);
+  await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+  const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
+  await recording1.dispatch({
+    kind: "create_run",
+    runId: RUN_ID,
+    pipeline: pipelineV2RunPipelineIdentity(pipeline1),
+    inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+  });
+  await runPlanningActivation(pipeline1, runInputs, [], recording1, "architect", "architect", "plan", 1, P1_PROPOSAL, "planning-1");
+  return { fixture, runId: RUN_ID };
+}
+
+test("8. the initial plan-ready boundary: the initial handoff suffix then the resumed stage execution", async () => {
+  const prefix = await buildInitialReadyPrefix();
+  const { fixture } = prefix;
+  try {
+    const before = await reopen(fixture);
+    const boundary = before.state;
+    expect(boundary.executions).toHaveLength(1);
+    expect(boundary.transitions).toHaveLength(0);
+    expect(boundary.waits).toHaveLength(0);
+    const result = await resumePipelineV2RunAfterPlanningRunPlanHandoff({
+      pipeline: before.pipeline,
+      runRoot: fixture.runRoot,
+      sink: before.sink,
+      runtime: fakeWorkerFailedRuntime().runtime,
+      control: NEUTRAL_CONTROL,
+      stageId: "stage-1",
+      initialBudget: INITIAL_BUDGET,
+    });
+    if (result.ok || "waiting" in result || "planReady" in result) {
+      throw new Error("the composed resume was expected to fail with worker_failed");
+    }
+    expect("refused" in result).toBe(false);
+    expect(result.reason).toBe("worker_failed");
+    const finalState = before.sink.snapshot as PipelineV2RunState;
+    // The exact initial handoff suffix (task/plan acceptance, generation,
+    // iteration, planning transition) then the resumed stage execution.
+    expect(finalState.plan_revisions.map((plan) => plan.revision)).toEqual([1]);
+    expect(finalState.task_revisions.map((task) => task.task_id)).toEqual(["task-a", "task-b"]);
+    expect(finalState.generations).toHaveLength(1);
+    expect(finalState.generations[0]!.stage_id).toBe("stage-1");
+    expect(finalState.generations[0]!.opened_transition_count).toBe(0);
+    expect(finalState.executions).toHaveLength(2);
+    const successor = finalState.executions[1] as PipelineV2AgentExecutionState;
+    expect(successor.state_id).toBe("dev_entry");
+    expect(successor.execution_role).toBe("stage");
+    expect(successor.iteration_index).toBe(1);
+    expect(successor.phase).toBe("failed");
+    expect(finalState.transitions).toHaveLength(1);
+    expect(finalState.transitions[0]).toEqual({ index: 0, from: "architect", outcome: "completed", to: "dev_entry", execution_index: 1 });
+    expect(finalState.cursor).toEqual({ current_state: "dev_entry", transition_count: 1 });
+    expect(finalState.waits).toHaveLength(0);
+    expect(finalState.failure).toEqual({ reason: "worker_failed" });
+    expect(parsePipelineV2RunState(JSON.stringify(finalState))).toEqual(finalState);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("9. the initial crash seam: the committed initial boundary is the zero-dispatch handoff retry and the resume runs exactly once", async () => {
+  const prefix = await buildInitialReadyPrefix();
+  const { fixture } = prefix;
+  try {
+    // The crash window: the acceptance, the stage opening and the
+    // planning transition are durable; the resume never started.
+    const prepared = await reopen(fixture);
+    const accepted = await acceptPipelineV2PlanningRunPlan({ pipeline: prepared.pipeline, runRoot: fixture.runRoot, sink: prepared.recording });
+    await ensurePipelineV2StageIteration({ compiledPlan: accepted.compiled_plan, stageId: "stage-1", initialBudget: INITIAL_BUDGET, sink: prepared.recording });
+    await prepared.recording.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    const revisionAtSeam = (prepared.recording.snapshot as PipelineV2RunState).revision;
+
+    // The fresh call after the crash.
+    const reopened = await reopen(fixture);
+    const before = reopened.recording.commands.length;
+    const result = await resumePipelineV2RunAfterPlanningRunPlanHandoff({
+      pipeline: reopened.pipeline,
+      runRoot: fixture.runRoot,
+      sink: reopened.recording,
+      runtime: fakeWorkerFailedRuntime().runtime,
+      control: NEUTRAL_CONTROL,
+      stageId: "stage-1",
+      initialBudget: INITIAL_BUDGET,
+    });
+    if (result.ok || "waiting" in result || "planReady" in result) {
+      throw new Error("the composed resume was expected to fail with worker_failed");
+    }
+    expect(result.reason).toBe("worker_failed");
+    const appended = reopened.recording.commands.slice(before).map((command) => command.kind);
+    expect(appended).toEqual([
+      "start_agent_execution",
+      "agent_data_prepared",
+      "agent_execution_session_created",
+      "agent_tool_session_created",
+      "agent_running",
+      "agent_failed",
+      "run_failed",
+    ]);
+    const finalState = reopened.sink.snapshot as PipelineV2RunState;
+    expect(finalState.revision).toBe(revisionAtSeam + 7);
+    // The handoff projection was never rewritten.
+    expect(finalState.plan_revisions.map((plan) => plan.revision)).toEqual([1]);
+    expect(finalState.generations[0]!.opened_transition_count).toBe(0);
+    expect(finalState.transitions).toHaveLength(1);
+    expect(parsePipelineV2RunState(JSON.stringify(finalState))).toEqual(finalState);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});

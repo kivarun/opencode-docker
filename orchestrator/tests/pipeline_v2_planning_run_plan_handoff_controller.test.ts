@@ -21,7 +21,9 @@ import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { PipelineV2RunStateStoreError } from "../src/pipeline_v2_state_store.ts";
 import { acceptPipelineV2PlanningRunPlan, PipelineV2PlanningRunPlanControllerError } from "../src/pipeline_v2_planning_run_plan_controller.ts";
 import { restorePipelineV2RuntimeContext } from "../src/pipeline_v2_resume_context.ts";
-import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iteration_controller.ts";
+import { ensurePipelineV2StageIteration, PipelineV2StageIterationControllerError } from "../src/pipeline_v2_stage_iteration_controller.ts";
+import { openPipelineV2InitialStageTransition } from "../src/pipeline_v2_initial_stage_transition_controller.ts";
+import type { OpenedPipelineV2ReplannedStageTransition } from "../src/pipeline_v2_replanned_stage_transition_controller.ts";
 import { applyPipelineV2ReviseTaskIntervention } from "../src/pipeline_v2_revise_task_intervention_controller.ts";
 import { restorePipelineV2AcceptedRunPlan } from "../src/pipeline_v2_run_plan_restore.ts";
 import { openPipelineV2ReplannedStage } from "../src/pipeline_v2_replanned_stage_controller.ts";
@@ -486,7 +488,7 @@ test("1. honest S0 full path after restart: the exact six-command suffix, delta 
       "plan_revision", "plan_sha256", "stage_id", "stage_position", "state", "template_id",
       "to_state", "transition_index", "wait_index",
     ]);
-    expect(outcome.result.wait_index).toBe(1);
+    expect((outcome.result as OpenedPipelineV2ReplannedStageTransition).wait_index).toBe(1);
     expect(outcome.result.from_state).toBe("architect");
     expect(outcome.result.to_state).toBe("dev_entry");
     expect(outcome.result.transition_index).toBe(0);
@@ -577,6 +579,12 @@ test("3. S5 branch B: zero acceptance/stage calls; restore/load/transition exact
       }) as typeof openPipelineV2ReplannedStageTransition,
       compiledStageFor: compiledPipelineV2RunPlanStageFor,
       compiledTransitionFor,
+      ensureStageIteration: (async () => {
+        throw new Error("the stage iteration must not run on the replanned branch");
+      }) as typeof ensurePipelineV2StageIteration,
+      openInitialStageTransition: (async () => {
+        throw new Error("the initial transition must not run on the replanned branch");
+      }) as typeof openPipelineV2InitialStageTransition,
     };
     const wrapped = recordingSink(reopened, Infinity);
     const branchB = await applyPipelineV2PlanningRunPlanHandoffWithIo(
@@ -587,7 +595,7 @@ test("3. S5 branch B: zero acceptance/stage calls; restore/load/transition exact
     expect(wrapped.commands).toEqual([]);
     expect(branchB.generation_index).toBe(2);
     expect(branchB.iteration_index).toBe(1);
-    expect(branchB.wait_index).toBe(1);
+    expect((branchB as OpenedPipelineV2ReplannedStageTransition).wait_index).toBe(1);
     expect(branchB.state.revision).toBe(40);
     expectFinalProjection(branchB.state, INITIAL_BUDGET, 40);
   } finally {
@@ -627,6 +635,12 @@ test("4. branch selection never catches: an injected acceptance sentinel on bran
       }) as typeof openPipelineV2ReplannedStageTransition,
       compiledStageFor: compiledPipelineV2RunPlanStageFor,
       compiledTransitionFor,
+      ensureStageIteration: (async () => {
+        throw new Error("the stage iteration must not run");
+      }) as typeof ensurePipelineV2StageIteration,
+      openInitialStageTransition: (async () => {
+        throw new Error("the initial transition must not run");
+      }) as typeof openPipelineV2InitialStageTransition,
     };
     const caught = await catchHandoff(() =>
       applyPipelineV2PlanningRunPlanHandoffWithIo(
@@ -958,6 +972,12 @@ function chainOpsWithHostile(
     if (name === "openReplannedStage") {
       return await openPipelineV2ReplannedStage(...(args as Parameters<typeof openPipelineV2ReplannedStage>));
     }
+    if (name === "ensureStageIteration") {
+      return await ensurePipelineV2StageIteration(...(args as Parameters<typeof ensurePipelineV2StageIteration>));
+    }
+    if (name === "openInitialStageTransition") {
+      return await openPipelineV2InitialStageTransition(...(args as Parameters<typeof openPipelineV2InitialStageTransition>));
+    }
     return await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
   };
   return {
@@ -968,6 +988,8 @@ function chainOpsWithHostile(
     openReplannedStageTransition: ((...args: unknown[]) => realCall("openReplannedStageTransition", args)) as typeof openPipelineV2ReplannedStageTransition,
     compiledStageFor: compiledPipelineV2RunPlanStageFor,
     compiledTransitionFor,
+    ensureStageIteration: ((...args: unknown[]) => realCall("ensureStageIteration", args)) as typeof ensurePipelineV2StageIteration,
+    openInitialStageTransition: ((...args: unknown[]) => realCall("openInitialStageTransition", args)) as typeof openPipelineV2InitialStageTransition,
   };
 }
 
@@ -1170,7 +1192,7 @@ test("14. ops Proxy: each member read exactly once before the first await; later
       { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
       opsProxy,
     );
-    // exactly seven member reads in the capture contract order
+    // exactly nine member reads in the capture contract order
     expect(reads).toEqual([
       "acceptPlanningRunPlan",
       "restoreAcceptedRunPlan",
@@ -1179,6 +1201,8 @@ test("14. ops Proxy: each member read exactly once before the first await; later
       "openReplannedStageTransition",
       "compiledStageFor",
       "compiledTransitionFor",
+      "ensureStageIteration",
+      "openInitialStageTransition",
     ]);
     expect(transitionCalls).toBe(1);
     expect(await currentRevision(fixture)).toBe(40);
@@ -2009,7 +2033,11 @@ function spyThenHostileOps(
           ? await loadPipelineV2WaitIntent(...(args as Parameters<typeof loadPipelineV2WaitIntent>))
           : name === "openReplannedStage"
             ? await openPipelineV2ReplannedStage(...(args as Parameters<typeof openPipelineV2ReplannedStage>))
-            : await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
+            : name === "ensureStageIteration"
+              ? await ensurePipelineV2StageIteration(...(args as Parameters<typeof ensurePipelineV2StageIteration>))
+              : name === "openInitialStageTransition"
+                ? await openPipelineV2InitialStageTransition(...(args as Parameters<typeof openPipelineV2InitialStageTransition>))
+                : await openPipelineV2ReplannedStageTransition(...(args as Parameters<typeof openPipelineV2ReplannedStageTransition>));
     if (name === hostileOp) {
       captured.value = result;
       return buildHostile(result);
@@ -2024,6 +2052,8 @@ function spyThenHostileOps(
     openReplannedStageTransition: ((...args: unknown[]) => realCall("openReplannedStageTransition", args)) as typeof openPipelineV2ReplannedStageTransition,
     compiledStageFor: compiledPipelineV2RunPlanStageFor,
     compiledTransitionFor,
+    ensureStageIteration: ((...args: unknown[]) => realCall("ensureStageIteration", args)) as typeof ensurePipelineV2StageIteration,
+    openInitialStageTransition: ((...args: unknown[]) => realCall("openInitialStageTransition", args)) as typeof openPipelineV2InitialStageTransition,
   };
 }
 
@@ -2097,6 +2127,12 @@ test("21. RED1: a third honest revise cycle passes S0, and the second/third hand
       }) as typeof openPipelineV2ReplannedStageTransition,
       compiledStageFor: compiledPipelineV2RunPlanStageFor,
       compiledTransitionFor,
+      ensureStageIteration: (async () => {
+        throw new Error("the stage iteration must not run on the replanned branch");
+      }) as typeof ensurePipelineV2StageIteration,
+      openInitialStageTransition: (async () => {
+        throw new Error("the initial transition must not run on the replanned branch");
+      }) as typeof openPipelineV2InitialStageTransition,
     };
     const wrapped = recordingSink(reopened, Infinity);
     const branchB = await applyPipelineV2PlanningRunPlanHandoffWithIo(
@@ -2106,7 +2142,7 @@ test("21. RED1: a third honest revise cycle passes S0, and the second/third hand
     expect(calls).toEqual({ restore: 1, load: 1, transition: 1 });
     expect(wrapped.commands).toEqual([]);
     expect(branchB.generation_index).toBe(4);
-    expect(branchB.wait_index).toBe(3);
+    expect((branchB as OpenedPipelineV2ReplannedStageTransition).wait_index).toBe(3);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -2175,7 +2211,7 @@ test("23. RED2 positive controls: the first stage, the shared-entry stage-3, and
       expect(branchB.stage_id).toBe("stage-2");
       expect(branchB.template_id).toBe("review");
       expect(branchB.generation_index).toBe(2);
-      expect(branchB.wait_index).toBe(1);
+      expect((branchB as OpenedPipelineV2ReplannedStageTransition).wait_index).toBe(1);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -3057,6 +3093,196 @@ test("32. GREEN: the engine resolver errors pass by identity and the malformed e
     }
     expect(wrapped.commands.length).toBe(commandsBefore);
     expect((await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick })).snapshot!.revision).toBe(revisionBefore);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+/** The honest INITIAL plan-ready boundary: the settled unbound planning execution, no acceptance yet. */
+async function buildInitialPrefix(): Promise<Prefix> {
+  const fixture = await setupFixture();
+  const pipeline1 = await loadPipelineV2(fixture.bundle);
+  clockCounter = 0;
+  const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+  const recording = recordingSink(sink, Infinity);
+  await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+  const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
+  await recording.dispatch({
+    kind: "create_run",
+    runId: RUN_ID,
+    pipeline: pipelineV2RunPipelineIdentity(pipeline1),
+    inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+  });
+  const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
+  await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
+  for (const command of [
+    { kind: "agent_data_prepared" },
+    { kind: "agent_execution_session_created", sessionId: "sess-1-planning" },
+    { kind: "agent_tool_session_created", sessionId: "tool-1-planning" },
+    { kind: "agent_running" },
+  ] as PipelineV2RunCommand[]) {
+    await recording.dispatch(command);
+  }
+  await writeFile(join(prep1.outputs_root, "plan"), JSON.stringify(R1_PROPOSAL), { mode: 0o600 });
+  const records1: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline1, prep1);
+  await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })) });
+  await recording.dispatch({ kind: "agent_cleanup_completed" });
+  return { fixture, recording, pipeline1, staleCompiledPlan1: null, revisionAtBoundary: (recording.snapshot as PipelineV2RunState).revision };
+}
+
+const INITIAL_TRANSITION_KEYS = [
+  "stage_id", "stage_position", "template_id", "initial_budget", "plan_revision", "plan_sha256",
+  "origin_execution", "from_state", "to_state", "transition_index", "execution_index",
+  "generation_index", "iteration_index", "state",
+];
+
+test("IA. the initial boundary runs the full Initial A suffix through the shared kernel", async () => {
+  const prefix = await buildInitialPrefix();
+  const { fixture } = prefix;
+  try {
+    const outcome = await runHandoff(fixture);
+    expect(outcome.chainSuffix).toEqual([
+      "task-a:1",
+      "task-b:1",
+      "plan:1",
+      "stage_generation_opened",
+      "stage_iteration_opened",
+      "transition_committed",
+    ]);
+    expect(outcome.revisionAfter - outcome.revisionBefore).toBe(6);
+    expect(Object.keys(outcome.result as unknown as Record<string, unknown>).sort()).toEqual([...INITIAL_TRANSITION_KEYS].sort());
+    const result = outcome.result as unknown as Record<string, unknown>;
+    expect(result["wait_index"]).toBeUndefined();
+    expect(result["from_state"]).toBe("architect");
+    expect(result["to_state"]).toBe("dev_entry");
+    expect(result["execution_index"]).toBe(1);
+    expect(result["origin_execution"]).toBe(1);
+    expect(result["generation_index"]).toBe(1);
+    expect(result["iteration_index"]).toBe(1);
+    expect(result["stage_id"]).toBe(STAGE_ID);
+    expect(result["initial_budget"]).toBe(INITIAL_BUDGET);
+    const state = outcome.state;
+    expect(state.plan_revisions.map((p) => p.revision)).toEqual([1]);
+    expect(state.generations).toHaveLength(1);
+    expect(state.generations[0]!.stage_id).toBe(STAGE_ID);
+    expect(state.generations[0]!.opened_transition_count).toBe(0);
+    expect(state.generations[0]!.closed).toBeUndefined();
+    expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 1 });
+    expect(state.waits).toHaveLength(0);
+    expect(state.grants).toHaveLength(0);
+    expect(state.executions).toHaveLength(1);
+    expect(state.transitions).toHaveLength(1);
+    expect(parsePipelineV2RunState(JSON.stringify(state))).toEqual(state);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("IB. the committed initial boundary is the zero-dispatch retry", async () => {
+  const prefix = await buildInitialPrefix();
+  const { fixture } = prefix;
+  try {
+    // The crash window: the acceptance, the stage opening and the
+    // transition are durable; the handoff result was lost.
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
+    const accepted = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot: fixture.runRoot, sink: reopened });
+    await ensurePipelineV2StageIteration({ compiledPlan: accepted.compiled_plan, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET, sink: reopened });
+    await reopened.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    const revisionBefore = (reopened.snapshot as PipelineV2RunState).revision;
+    const outcome = await runHandoff(fixture);
+    expect(outcome.chainSuffix).toEqual([]);
+    expect(outcome.revisionAfter).toBe(revisionBefore);
+    const result = outcome.result as unknown as Record<string, unknown>;
+    expect(result["from_state"]).toBe("architect");
+    expect(result["to_state"]).toBe("dev_entry");
+    expect(result["generation_index"]).toBe(1);
+    expect(result["initial_budget"]).toBe(INITIAL_BUDGET);
+    expect(parsePipelineV2RunState(JSON.stringify(outcome.state))).toEqual(outcome.state);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("I4. the acceptance-and-stage window retry dispatches only the transition", async () => {
+  const prefix = await buildInitialPrefix();
+  const { fixture } = prefix;
+  try {
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
+    const accepted = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot: fixture.runRoot, sink: reopened });
+    await ensurePipelineV2StageIteration({ compiledPlan: accepted.compiled_plan, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET, sink: reopened });
+    const revisionBefore = (reopened.snapshot as PipelineV2RunState).revision;
+    const outcome = await runHandoff(fixture);
+    expect(outcome.chainSuffix).toEqual(["transition_committed"]);
+    expect(outcome.revisionAfter - revisionBefore).toBe(1);
+    expect(outcome.state.cursor).toEqual({ current_state: "dev_entry", transition_count: 1 });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("IW. an unknown caller stage refuses with the compiled resolver's error and no stage writes", async () => {
+  const prefix = await buildInitialPrefix();
+  const { fixture } = prefix;
+  try {
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
+    const wrapped = recordingSink(reopened, Infinity);
+    const cause = await catchHandoff(() =>
+      applyPipelineV2PlanningRunPlanHandoff({
+        pipeline,
+        runRoot: fixture.runRoot,
+        sink: wrapped,
+        stageId: "stage-9",
+        initialBudget: INITIAL_BUDGET,
+      }));
+    expect(cause).toBeInstanceOf(PipelineV2CompiledRunPlanError);
+    const state = wrapped.snapshot as PipelineV2RunState;
+    // The plan is durable, but no generation or transition was written.
+    expect(state.plan_revisions.map((p) => p.revision)).toEqual([1]);
+    expect(state.generations).toHaveLength(0);
+    expect(state.transitions).toHaveLength(0);
+    expect(state.cursor).toEqual({ current_state: "architect", transition_count: 0 });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("IB2. a conflicting caller budget on the committed initial boundary is a lifecycle_conflict with zero dispatch", async () => {
+  const prefix = await buildInitialPrefix();
+  const { fixture } = prefix;
+  try {
+    const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+    const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
+    const accepted = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot: fixture.runRoot, sink: reopened });
+    await ensurePipelineV2StageIteration({ compiledPlan: accepted.compiled_plan, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET, sink: reopened });
+    await reopened.dispatch({
+      kind: "transition_committed",
+      step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+      executionIndex: 1,
+    });
+    const revisionBefore = (reopened.snapshot as PipelineV2RunState).revision;
+    const wrapped = recordingSink(reopened, Infinity);
+    const cause = await catchHandoff(() =>
+      applyPipelineV2PlanningRunPlanHandoff({
+        pipeline,
+        runRoot: fixture.runRoot,
+        sink: wrapped,
+        stageId: STAGE_ID,
+        initialBudget: INITIAL_BUDGET + 1,
+      }));
+    // The conflicting budget is caught by the stage-iteration ensure
+    // (which runs before the transition in this branch); its typed error
+    // passes through by identity.
+    expect(cause).toBeInstanceOf(PipelineV2StageIterationControllerError);
+    expect((cause as Error).message).toContain("does not match");
+    expect(wrapped.commands).toEqual([]);
+    expect((wrapped.snapshot as PipelineV2RunState).revision).toBe(revisionBefore);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

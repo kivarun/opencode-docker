@@ -50,6 +50,11 @@ import {
   openPipelineV2ReplannedStageTransition,
   type OpenedPipelineV2ReplannedStageTransition,
 } from "./pipeline_v2_replanned_stage_transition_controller.ts";
+import { ensurePipelineV2StageIteration } from "./pipeline_v2_stage_iteration_controller.ts";
+import {
+  openPipelineV2InitialStageTransition,
+  type OpenedPipelineV2InitialStageTransition,
+} from "./pipeline_v2_initial_stage_transition_controller.ts";
 import {
   compiledPipelineV2RunPlanStageFor,
   PipelineV2CompiledRunPlanError,
@@ -204,6 +209,10 @@ export interface PipelineV2PlanningRunPlanHandoffOps {
   readonly compiledStageFor: typeof compiledPipelineV2RunPlanStageFor;
   /** The engine-owned completed-edge resolver of the graph execution core. */
   readonly compiledTransitionFor: typeof compiledTransitionFor;
+  /** The stage generation/iteration opener shared by both handoff forms. */
+  readonly ensureStageIteration: typeof ensurePipelineV2StageIteration;
+  /** The initial-boundary transition controller. */
+  readonly openInitialStageTransition: typeof openPipelineV2InitialStageTransition;
 }
 
 /**
@@ -218,6 +227,8 @@ export const productionPlanningRunPlanHandoffOps: PipelineV2PlanningRunPlanHando
   openReplannedStageTransition: openPipelineV2ReplannedStageTransition,
   compiledStageFor: compiledPipelineV2RunPlanStageFor,
   compiledTransitionFor,
+  ensureStageIteration: ensurePipelineV2StageIteration,
+  openInitialStageTransition: openPipelineV2InitialStageTransition,
 }) as PipelineV2PlanningRunPlanHandoffOps;
 
 export interface ApplyPipelineV2PlanningRunPlanHandoffOptions {
@@ -229,7 +240,9 @@ export interface ApplyPipelineV2PlanningRunPlanHandoffOptions {
 }
 
 /** The exact downstream transition result, returned by object identity. */
-export type AppliedPipelineV2PlanningRunPlanHandoff = OpenedPipelineV2ReplannedStageTransition;
+export type AppliedPipelineV2PlanningRunPlanHandoff =
+  | OpenedPipelineV2ReplannedStageTransition
+  | OpenedPipelineV2InitialStageTransition;
 
 interface DurableWaitRecord {
   readonly index: number;
@@ -469,14 +482,102 @@ function isPlanningAcceptanceBoundary(state: PipelineV2RunState): boolean {
 }
 
 /**
+ * The initial handoff family: no wait journal, no grants and no
+ * replanned iteration closure anywhere — the durable history of a run
+ * that has never entered a stage wait or a revise cycle. A malformed
+ * journal is never classified as initial; it falls through to the
+ * replanned classification and its own typed refusal.
+ */
+function isInitialHandoffBoundary(state: PipelineV2RunState): boolean {
+  if (!Array.isArray(state.waits) || state.waits.length !== 0) {
+    return false;
+  }
+  if (!Array.isArray(state.grants) || state.grants.length !== 0) {
+    return false;
+  }
+  const generations = state.generations as readonly unknown[];
+  for (const generation of generations) {
+    if (!isRecord(generation) || !Array.isArray(generation["iterations"])) {
+      return false;
+    }
+    for (const iteration of generation["iterations"] as readonly unknown[]) {
+      const closed = isRecord(iteration) ? iteration["closed"] : undefined;
+      if (isRecord(closed) && closed["by"] === "replanned") {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+type HandoffBranch = "initial_a" | "initial_b" | "branch_a" | "branch_b";
+
+/**
  * The exact branch classifier. Reads only the captured authoritative
  * snapshot and never a downstream result; returns the branch id or
- * refuses with the controller's own typed failure.
+ * refuses with the controller's own typed failure. The initial family
+ * (the first plan-ready boundary of a run, with and without the
+ * committed planning transition) is discriminated before the revise
+ * cycle is consulted, so a fresh run is never refused for carrying no
+ * replanned iteration closure.
  */
-function classifyHandoffBoundary(state: PipelineV2RunState): "branch_a" | "branch_b" {
+function classifyHandoffBoundary(state: PipelineV2RunState): HandoffBranch {
   commonRunBoundary(state);
-  const targetWait = targetWaitOf(state);
   settledPlanningExecution(state);
+  if (isInitialHandoffBoundary(state)) {
+    if (state.executions.length === state.transitions.length + 1) {
+      // Initial A: the planning execution is settled but unbound; the
+      // execution sits on the cursor and no plan-handoff history exists.
+      const last = lastExecutionOf(state);
+      if (last.state_id !== state.cursor.current_state) {
+        throw handoffError("invalid_state", "the planning execution is not on the run cursor", state);
+      }
+      if (state.cursor.transition_count !== state.transitions.length) {
+        throw handoffError("invalid_state", "the durable cursor does not match the transition journal", state);
+      }
+      return "initial_a";
+    }
+    if (state.executions.length === state.transitions.length) {
+      // Initial B: the exact committed initial handoff boundary.
+      const last = lastExecutionOf(state);
+      const transitions = state.transitions as readonly unknown[];
+      const lastTransition = transitions[transitions.length - 1]! as unknown as Record<string, unknown>;
+      if (!isRecord(lastTransition)) {
+        throw handoffError("invalid_state", "the durable transition journal is malformed", state);
+      }
+      if (lastTransition["execution_index"] !== last.index) {
+        throw handoffError("invalid_state", "the last transition does not bind the planning execution", state);
+      }
+      if (state.cursor.current_state !== lastTransition["to"]) {
+        throw handoffError("invalid_state", "the durable cursor does not sit on the planning transition target", state);
+      }
+      const generations = state.generations as readonly unknown[];
+      const lastGeneration = generations[generations.length - 1]! as unknown as DurableGenerationRecord;
+      if (
+        generations.length !== 1 ||
+        !isRecord(lastGeneration) ||
+        lastGeneration.closed !== undefined ||
+        !isRecord(lastGeneration.open_iteration) ||
+        lastGeneration.open_iteration["index"] !== lastGeneration.iterations.length
+      ) {
+        throw handoffError(
+          "invalid_state",
+          "the durable run does not carry the opened generation of the selected stage",
+          state,
+        );
+      }
+      if (state.cursor.transition_count !== state.transitions.length) {
+        throw handoffError("invalid_state", "the durable cursor does not match the transition journal", state);
+      }
+      return "initial_b";
+    }
+    throw handoffError(
+      "invalid_state",
+      "the run is not on a planning handoff boundary",
+      state,
+    );
+  }
+  const targetWait = targetWaitOf(state);
   // Nothing may have progressed past the revise boundary in the wait
   // journal: a newer wait is later progress, never a handoff window.
   const journal = state.waits as readonly unknown[];
@@ -979,6 +1080,181 @@ function verifyTransitionResult(
   return resultState as unknown as PipelineV2RunState;
 }
 
+const INITIAL_STAGE_RESULT_KEYS = [
+  "compiled_stage",
+  "generation_index",
+  "iteration_index",
+  "state",
+] as const;
+
+/** Verifies the initial stage-generation result against the caller policy and the verified data. */
+function verifyInitialStageResult(
+  result: unknown,
+  authoritativeState: PipelineV2RunState,
+  compiledPlan: unknown,
+  compiledStage: CompiledPipelineV2RunPlanStage,
+  stageId: string,
+  initialBudget: number,
+  lastPlan: DurablePlanRecord,
+): PipelineV2RunState {
+  const stagePosition = compiledStagePosition(compiledPlan, stageId);
+  if (!isRecord(result)) {
+    throw handoffError("invalid_result", "the initial stage returned an unexpected shape", authoritativeState);
+  }
+  expectExactKeys(result, INITIAL_STAGE_RESULT_KEYS, "the initial stage result", authoritativeState);
+  if (result["compiled_stage"] !== compiledStage) {
+    throw handoffError("invalid_result", "the initial stage result does not carry the resolved compiled stage", authoritativeState);
+  }
+  if (!isPositiveSafeInteger(result["generation_index"]) || !isPositiveSafeInteger(result["iteration_index"])) {
+    throw handoffError("invalid_result", "the initial stage result carries no generation and iteration binding", authoritativeState);
+  }
+  const resultState = result["state"];
+  if (!isRecord(resultState) || !statesStructurallyEqual(resultState, authoritativeState)) {
+    throw handoffError("invalid_result", "the initial stage result does not carry the authoritative run state", authoritativeState);
+  }
+  const resultGenerations = resultState["generations"];
+  if (!Array.isArray(resultGenerations) || resultGenerations.length === 0) {
+    throw handoffError("invalid_result", "the initial stage result carries no generation journal", authoritativeState);
+  }
+  const openGeneration = resultGenerations[resultGenerations.length - 1]! as Record<string, unknown>;
+  if (
+    !isRecord(openGeneration) ||
+    openGeneration["stage_id"] !== stageId ||
+    openGeneration["stage_position"] !== stagePosition ||
+    openGeneration["template_id"] !== compiledStage.template ||
+    openGeneration["initial_budget"] !== initialBudget ||
+    openGeneration["plan_sha256"] !== lastPlan.sha256 ||
+    openGeneration["closed"] !== undefined ||
+    !isRecord(openGeneration["open_iteration"])
+  ) {
+    throw handoffError("invalid_result", "the initial stage result opened an unexpected generation", authoritativeState);
+  }
+  if (
+    result["generation_index"] !== openGeneration["index"] ||
+    result["iteration_index"] !== (openGeneration["open_iteration"] as Record<string, unknown>)["index"]
+  ) {
+    throw handoffError("invalid_result", "the initial stage result does not bind the opened generation and iteration", authoritativeState);
+  }
+  return resultState as unknown as PipelineV2RunState;
+}
+
+const INITIAL_TRANSITION_RESULT_KEYS = [
+  "stage_id",
+  "stage_position",
+  "template_id",
+  "initial_budget",
+  "plan_revision",
+  "plan_sha256",
+  "origin_execution",
+  "from_state",
+  "to_state",
+  "transition_index",
+  "execution_index",
+  "generation_index",
+  "iteration_index",
+  "state",
+] as const;
+
+/** Verifies the initial transition result against the caller policy and the verified data. */
+function verifyInitialTransitionResult(
+  result: unknown,
+  authoritativeState: PipelineV2RunState,
+  compiledPlan: unknown,
+  compiledStage: CompiledPipelineV2RunPlanStage,
+  stageId: string,
+  initialBudget: number,
+  lastPlan: DurablePlanRecord,
+): PipelineV2RunState {
+  const stagePosition = compiledStagePosition(compiledPlan, stageId);
+  if (!isRecord(result)) {
+    throw handoffError("invalid_result", "the initial planning transition returned an unexpected shape", authoritativeState);
+  }
+  expectExactKeys(result, INITIAL_TRANSITION_RESULT_KEYS, "the initial planning transition result", authoritativeState);
+  if (typeof result["from_state"] !== "string" || typeof result["to_state"] !== "string") {
+    throw handoffError("invalid_result", "the initial planning transition result carries no transition binding", authoritativeState);
+  }
+  const resultState = result["state"];
+  if (!isRecord(resultState) || !statesStructurallyEqual(resultState, authoritativeState)) {
+    throw handoffError("invalid_result", "the initial planning transition result does not carry the authoritative run state", authoritativeState);
+  }
+  const transitions = resultState["transitions"] as readonly unknown[];
+  if (!Array.isArray(transitions) || transitions.length === 0) {
+    throw handoffError("invalid_result", "the initial planning transition result carries no transition journal", authoritativeState);
+  }
+  const bound = transitions[transitions.length - 1]!;
+  if (
+    !isRecord(bound) ||
+    bound["from"] !== result["from_state"] ||
+    bound["to"] !== result["to_state"] ||
+    bound["outcome"] !== "completed" ||
+    bound["execution_index"] !== result["execution_index"] ||
+    bound["index"] !== result["transition_index"]
+  ) {
+    throw handoffError("invalid_result", "the initial planning transition result does not bind the committed transition", authoritativeState);
+  }
+  if (
+    result["stage_id"] !== stageId ||
+    result["initial_budget"] !== initialBudget ||
+    result["stage_position"] !== stagePosition ||
+    result["template_id"] !== compiledStage.template
+  ) {
+    throw handoffError("invalid_result", "the initial planning transition result does not match the caller policy", authoritativeState);
+  }
+  const plan = compiledPlan as Record<string, unknown>;
+  if (
+    result["plan_revision"] !== plan["plan_revision"] ||
+    result["plan_sha256"] !== plan["plan_sha256"] ||
+    result["origin_execution"] !== plan["origin_execution"] ||
+    result["plan_revision"] !== lastPlan.revision ||
+    result["plan_sha256"] !== lastPlan.sha256 ||
+    result["origin_execution"] !== lastPlan.origin_execution
+  ) {
+    throw handoffError("invalid_result", "the initial planning transition result does not bind to the accepted plan", authoritativeState);
+  }
+  if (
+    typeof result["execution_index"] !== "number" ||
+    result["execution_index"] !== lastExecutionOf(authoritativeState).index ||
+    result["from_state"] !== lastExecutionOf(authoritativeState).state_id
+  ) {
+    throw handoffError("invalid_result", "the initial planning transition result does not bind the planning execution", authoritativeState);
+  }
+  // The flat generation/iteration bindings are taken from the durable
+  // journal of the authoritative state, never trusted from the result.
+  const generations = authoritativeState["generations"] as readonly unknown[];
+  if (!Array.isArray(generations) || generations.length === 0) {
+    throw handoffError("invalid_result", "the initial planning transition result carries no generation journal", authoritativeState);
+  }
+  const openGeneration = generations[generations.length - 1]! as Record<string, unknown>;
+  if (
+    !isRecord(openGeneration) ||
+    openGeneration["stage_id"] !== stageId ||
+    openGeneration["stage_position"] !== stagePosition ||
+    openGeneration["template_id"] !== compiledStage.template ||
+    openGeneration["initial_budget"] !== initialBudget ||
+    openGeneration["plan_sha256"] !== lastPlan.sha256 ||
+    // The generation opened on the boundary anchor: the transition count
+    // one behind the committed planning transition.
+    openGeneration["opened_transition_count"] !== (transitions.length as number) - 1 ||
+    openGeneration["closed"] !== undefined ||
+    !isRecord(openGeneration["open_iteration"])
+  ) {
+    throw handoffError("invalid_result", "the initial planning transition result does not bind the open generation", authoritativeState);
+  }
+  if (
+    !isPositiveSafeInteger(result["generation_index"]) ||
+    result["generation_index"] !== openGeneration["index"] ||
+    !isPositiveSafeInteger(result["iteration_index"]) ||
+    result["iteration_index"] !== (openGeneration["open_iteration"] as Record<string, unknown>)["index"]
+  ) {
+    throw handoffError("invalid_result", "the initial planning transition result does not bind the open generation and iteration", authoritativeState);
+  }
+  const cursor = authoritativeState["cursor"] as unknown as Record<string, unknown>;
+  if (!isRecord(cursor) || cursor["current_state"] !== result["to_state"]) {
+    throw handoffError("invalid_result", "the initial planning transition result does not bind the moved cursor", authoritativeState);
+  }
+  return resultState as unknown as PipelineV2RunState;
+}
+
 /**
  * The internal core. The caller hands over the five contract options and
  * the per-call ops; every options field and ops member is read exactly
@@ -1010,6 +1286,8 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
   const openReplannedStageTransition = ops["openReplannedStageTransition"];
   const compiledStageFor = ops["compiledStageFor"];
   const compiledTransitionForOp = ops["compiledTransitionFor"];
+  const ensureStageIteration = ops["ensureStageIteration"];
+  const openInitialStageTransition = ops["openInitialStageTransition"];
   for (const [name, value] of [
     ["acceptPlanningRunPlan", acceptPlanningRunPlan],
     ["restoreAcceptedRunPlan", restoreAcceptedRunPlan],
@@ -1018,6 +1296,8 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
     ["openReplannedStageTransition", openReplannedStageTransition],
     ["compiledStageFor", compiledStageFor],
     ["compiledTransitionFor", compiledTransitionForOp],
+    ["ensureStageIteration", ensureStageIteration],
+    ["openInitialStageTransition", openInitialStageTransition],
   ] as const) {
     if (typeof value !== "function") {
       throw handoffError("invalid_options", `the handoff ops member ${name} is not a function`, null);
@@ -1052,6 +1332,98 @@ export async function applyPipelineV2PlanningRunPlanHandoffWithIo(
     throw handoffError("invalid_state", "the run state sink is poisoned by a durability-unknown commit", null);
   }
   const branch = classifyHandoffBoundary(initialSnapshot);
+
+  if (branch === "initial_a") {
+    // Initial A: the planning-output composition accepts the initial
+    // run plan; no revise cycle exists yet, so no wait intent is
+    // consulted anywhere in this branch.
+    const accepted = await acceptPlanningRunPlan({
+      pipeline: pipeline as ResolvedPipelineV2,
+      runRoot,
+      sink,
+    });
+    const verifiedAcceptance = verifyAcceptanceResult(compiledStageFor, accepted, sink);
+    const acceptedState = verifiedAcceptance.state;
+    const lastPlan = lastPlanRecordOf(acceptedState);
+    // The caller stage is resolved through the exact public resolver
+    // BEFORE any durable stage write; the provenance probe above stays
+    // separate.
+    const compiledStage = resolveCallerStage(compiledStageFor, verifiedAcceptance.compiledPlan, stageId);
+    // The planning-edge gate: the authoritative completed edge of the
+    // planning state is resolved through the engine-owned resolver and
+    // verified strictly BEFORE any generation/iteration/transition
+    // write, so an incompatible caller stage can never leave a durable
+    // stage generation behind. The transition controller keeps its own
+    // edge check as defense-in-depth.
+    const resolvedEdge = verifyResolvedEdge(
+      compiledTransitionForOp(pipeline as ResolvedPipelineV2, acceptedState.cursor.current_state, "completed"),
+      acceptedState,
+    );
+    if (resolvedEdge.to !== compiledStage.entry_state) {
+      throw handoffError(
+        "invalid_state",
+        `the completed edge of the planning state does not lead to the entry state of the selected stage ${JSON.stringify(compiledStage.id)}`,
+        acceptedState,
+      );
+    }
+    // The stage generation/iteration of the selected stage opens (or is
+    // recognized zero-dispatch in the retry window after a crash between
+    // the acceptance and the transition).
+    const stage = await ensureStageIteration({
+      compiledPlan: verifiedAcceptance.compiledPlan as never,
+      stageId,
+      initialBudget,
+      sink,
+    });
+    const postStageSnapshot = requirePostCallSnapshot(sink.snapshot, acceptedState);
+    verifyInitialStageResult(stage, postStageSnapshot, verifiedAcceptance.compiledPlan, compiledStage, stageId, initialBudget, lastPlan);
+    // The initial planning transition is committed through the shared
+    // kernel.
+    const transition = await openInitialStageTransition({
+      pipeline: pipeline as ResolvedPipelineV2,
+      sink,
+      compiledPlan: verifiedAcceptance.compiledPlan as never,
+      stageId,
+      initialBudget,
+    });
+    const postTransitionSnapshot = requirePostCallSnapshot(sink.snapshot, postStageSnapshot);
+    verifyInitialTransitionResult(transition, postTransitionSnapshot, verifiedAcceptance.compiledPlan, compiledStage, stageId, initialBudget, lastPlan);
+    return transition;
+  }
+
+  if (branch === "initial_b") {
+    // Initial B: the exact committed initial handoff boundary (the
+    // crash/retry window after the transition); the accepted plan is
+    // restored read-only, the stage generation/iteration is recognized
+    // zero-dispatch and the transition controller recognizes the exact
+    // durable transition with zero dispatch.
+    const restored = await restoreAcceptedRunPlan({
+      pipeline: pipeline as ResolvedPipelineV2,
+      runRoot,
+      state: initialSnapshot,
+    });
+    const restoredPlan = verifyRestoreResult(compiledStageFor, restored, initialSnapshot);
+    const compiledStage = resolveCallerStage(compiledStageFor, restoredPlan, stageId);
+    const stage = await ensureStageIteration({
+      compiledPlan: restoredPlan as never,
+      stageId,
+      initialBudget,
+      sink,
+    });
+    const postStageSnapshot = requirePostCallSnapshot(sink.snapshot, initialSnapshot);
+    verifyInitialStageResult(stage, postStageSnapshot, restoredPlan, compiledStage, stageId, initialBudget, lastPlanRecordOf(initialSnapshot));
+    const transition = await openInitialStageTransition({
+      pipeline: pipeline as ResolvedPipelineV2,
+      sink,
+      compiledPlan: restoredPlan as never,
+      stageId,
+      initialBudget,
+    });
+    const postTransitionSnapshot = requirePostCallSnapshot(sink.snapshot, postStageSnapshot);
+    verifyInitialTransitionResult(transition, postTransitionSnapshot, restoredPlan, compiledStage, stageId, initialBudget, lastPlanRecordOf(initialSnapshot));
+    return transition;
+  }
+
   const targetWait = targetWaitOf(initialSnapshot);
 
   if (branch === "branch_a") {

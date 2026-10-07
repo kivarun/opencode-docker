@@ -375,10 +375,40 @@ interface HandoffBoundaryAnchors {
   readonly lastPlan: Record<string, unknown>;
   readonly lastGeneration: Record<string, unknown>;
   readonly openIteration: Record<string, unknown>;
-  readonly closureGeneration: Record<string, unknown>;
-  readonly closureIteration: Record<string, unknown>;
-  readonly closure: Record<string, unknown>;
-  readonly lastWait: Record<string, unknown>;
+  /** Replanned-form only: `null` on the initial boundary. */
+  readonly closureGeneration: Record<string, unknown> | null;
+  readonly closureIteration: Record<string, unknown> | null;
+  readonly closure: Record<string, unknown> | null;
+  readonly lastWait: Record<string, unknown> | null;
+}
+
+/**
+ * The handoff form of the boundary, discriminated exactly like the
+ * handoff controller's classifier: the initial family carries no wait
+ * journal, no grants and no replanned iteration closure anywhere; every
+ * other shape is the replanned family. A malformed journal is never
+ * classified as initial.
+ */
+function handoffBoundaryForm(state: PipelineV2RunState): "initial" | "replanned" {
+  if (!Array.isArray(state.waits) || state.waits.length !== 0) {
+    return "replanned";
+  }
+  if (!Array.isArray(state.grants) || state.grants.length !== 0) {
+    return "replanned";
+  }
+  const generations = state.generations as readonly unknown[];
+  for (const generation of generations) {
+    if (!isRecord(generation) || !Array.isArray(generation["iterations"])) {
+      return "replanned";
+    }
+    for (const iteration of generation["iterations"] as readonly unknown[]) {
+      const closed = isRecord(iteration) ? iteration["closed"] : undefined;
+      if (isRecord(closed) && closed["by"] === "replanned") {
+        return "replanned";
+      }
+    }
+  }
+  return "initial";
 }
 
 /**
@@ -395,6 +425,13 @@ interface HandoffBoundaryAnchors {
  * authoritative error state.
  */
 function verifyHandoffStateBoundary(state: PipelineV2RunState): HandoffBoundaryAnchors {
+  return verifyHandoffStateBoundaryForm(state, handoffBoundaryForm(state));
+}
+
+function verifyHandoffStateBoundaryForm(
+  state: PipelineV2RunState,
+  form: "initial" | "replanned",
+): HandoffBoundaryAnchors {
   if (!isNonEmptyString(state.run_id)) {
     throw invalidResult("the post-handoff durable state carries no run identity", null);
   }
@@ -529,6 +566,28 @@ function verifyHandoffStateBoundary(state: PipelineV2RunState): HandoffBoundaryA
   ) {
     throw invalidResult("the handoff boundary's last generation does not end at its open iteration", null);
   }
+  if (form === "initial") {
+    // The initial boundary carries exactly the one opened generation and
+    // no revise-cycle history at all (the form discriminator already
+    // proved the empty wait/grant journals and the absence of every
+    // replanned closure).
+    if (generations.length !== 1) {
+      throw invalidResult("the initial handoff boundary does not carry exactly one stage generation", null);
+    }
+    return {
+      cursorState: cursor["current_state"],
+      transitionCount,
+      lastTransition,
+      lastExecution,
+      lastPlan,
+      lastGeneration,
+      openIteration,
+      closureGeneration: null,
+      closureIteration: null,
+      closure: null,
+      lastWait: null,
+    };
+  }
   let closureGeneration: Record<string, unknown> | undefined;
   let closureIteration: Record<string, unknown> | undefined;
   let closure: Record<string, unknown> | undefined;
@@ -633,9 +692,9 @@ function verifyHandoffStateBoundary(state: PipelineV2RunState): HandoffBoundaryA
     lastPlan,
     lastGeneration,
     openIteration,
-    closureGeneration,
-    closureIteration,
-    closure,
+    closureGeneration: closureGeneration as Record<string, unknown>,
+    closureIteration: closureIteration as Record<string, unknown>,
+    closure: closure as Record<string, unknown>,
     lastWait,
   };
 }
@@ -655,6 +714,7 @@ function verifyHandoffResultShape(
   state: PipelineV2RunState,
   anchors: HandoffBoundaryAnchors,
   pipeline: ResolvedPipelineV2,
+  form: "initial" | "replanned" = "replanned",
 ): void {
   if (!isRecord(resultValue)) {
     throw invalidResult("the planning-run-plan handoff result is not a record", state);
@@ -663,26 +723,46 @@ function verifyHandoffResultShape(
   if (
     !hasExactOwnKeys(
       result,
-      "wait_index",
-      "from_state",
-      "to_state",
-      "transition_index",
-      "execution_index",
-      "generation_index",
-      "iteration_index",
-      "stage_id",
-      "stage_position",
-      "template_id",
-      "initial_budget",
-      "plan_revision",
-      "plan_sha256",
-      "state",
+      ...(form === "initial"
+        ? ([
+            "from_state",
+            "to_state",
+            "transition_index",
+            "execution_index",
+            "generation_index",
+            "iteration_index",
+            "stage_id",
+            "stage_position",
+            "template_id",
+            "initial_budget",
+            "plan_revision",
+            "plan_sha256",
+            "origin_execution",
+            "state",
+          ] as const)
+        : ([
+            "wait_index",
+            "from_state",
+            "to_state",
+            "transition_index",
+            "execution_index",
+            "generation_index",
+            "iteration_index",
+            "stage_id",
+            "stage_position",
+            "template_id",
+            "initial_budget",
+            "plan_revision",
+            "plan_sha256",
+            "state",
+          ] as const)),
     )
   ) {
     throw invalidResult("the planning-run-plan handoff result carries foreign fields", state);
   }
   if (
-    !isPositiveSafeInteger(result["wait_index"]) ||
+    (form === "replanned" && !isPositiveSafeInteger(result["wait_index"])) ||
+    (form === "initial" && !isPositiveSafeInteger(result["origin_execution"])) ||
     !isNonEmptyString(result["from_state"]) ||
     !isNonEmptyString(result["to_state"]) ||
     !isNonNegativeSafeInteger(result["transition_index"]) ||
@@ -724,11 +804,18 @@ function verifyHandoffResultShape(
   if (result["iteration_index"] !== anchors.openIteration["index"]) {
     throw invalidResult("the planning-run-plan handoff result does not bind to the open successor iteration", state);
   }
-  if (
-    result["wait_index"] !== anchors.closure["wait_index"] ||
-    result["wait_index"] !== anchors.lastWait["index"]
+  if (form === "replanned") {
+    if (
+      result["wait_index"] !== (anchors.closure as Record<string, unknown>)["wait_index"] ||
+      result["wait_index"] !== (anchors.lastWait as Record<string, unknown>)["index"]
+    ) {
+      throw invalidResult("the planning-run-plan handoff result does not bind to the answered revise task wait", state);
+    }
+  } else if (
+    result["origin_execution"] !== anchors.lastPlan["origin_execution"] ||
+    result["origin_execution"] !== anchors.lastExecution["index"]
   ) {
-    throw invalidResult("the planning-run-plan handoff result does not bind to the answered revise task wait", state);
+    throw invalidResult("the planning-run-plan handoff result does not bind to the accepted planning execution", state);
   }
   if (
     result["transition_index"] !== anchors.lastTransition["index"] ||
@@ -976,8 +1063,9 @@ export async function applyPipelineV2PlanningRunPlanResumeWithIo(
   }
   const postHandoffState = authoritativeBeforeResume as PipelineV2RunState;
   try {
-    const anchors = verifyHandoffStateBoundary(postHandoffState);
-    verifyHandoffResultShape(handoffResult, policy, postHandoffState, anchors, pipeline);
+    const form = handoffBoundaryForm(postHandoffState);
+    const anchors = verifyHandoffStateBoundaryForm(postHandoffState, form);
+    verifyHandoffResultShape(handoffResult, policy, postHandoffState, anchors, pipeline, form);
   } catch (cause) {
     if (cause instanceof PipelineV2PlanningRunPlanResumeControllerError) {
       throw cause;

@@ -1118,7 +1118,11 @@ test("usage documents the production pipeline v2 resume-plan command", () => {
   expect(text).toContain("--stage-id SAFE_ID");
   expect(text).toContain("--initial-budget N");
   expect(text).toContain("operator policy of this command");
-  expect(text).toContain("there is no automatic planning loop)");
+  expect(text).toContain("automatic planning loop)");
+  expect(text).toContain("serves the initial plan-ready boundary of a fresh run and");
+  expect(text).toContain("It serves both planning boundaries: the initial plan-ready");
+  expect(text).toContain("boundary of a fresh run (plan revision -> first generation and iteration");
+  expect(text).toContain("after a revise cycle (task revisions -> plan revision -> old generation");
   expect(text).toContain("planning loop and no automatic stage/budget selection");
   expect(text).toContain("a respond action and accepts no --action flag");
   expect(text).toContain("resume-plan' accepts the settled planning output");

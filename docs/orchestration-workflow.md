@@ -596,9 +596,12 @@ flag-only singleton.
   usage pins); `tests/cli_main.test.ts` gained the dispatcher battery
   (the exact single dispatch and options mapping, no other production API
   called, the parse/config error precedence, the human/JSON reporting
-  matrix, exit-code passthrough, the command-list pin, and the end-to-end
-  proof through the real production runner over the two-cycle planning
-  prefix).
+  matrix, exit-code passthrough, the command-list pin, and the two
+  end-to-end proofs through the real production runner: the two-cycle
+  planning prefix (the replanned boundary) and the initial plan-ready
+  boundary of a fresh run — each with its exact handoff suffix plus the
+  seven resume commands, the successor stage execution and the loader
+  round-trip).
 
 ## The production pipeline v2 wait-response CLI (`orchestrator respond`)
 
@@ -1156,11 +1159,12 @@ transition commit, verified through the public
 `restorePipelineV2PlanningAcceptanceContext` and reported by the
 coordination, the runner and the CLI as the exact plan-ready branch. The
 operator chain stays manual — `orchestrator run` suspends at the initial
-plan-ready boundary (no wired CLI continuation for it yet: the handoff
-chain serves the revise-cycle planning boundary only), `orchestrator
+plan-ready boundary, `orchestrator
 revise-task` runs the replanning planning execution to the same boundary,
 and `orchestrator resume-plan --stage-id ... --initial-budget ...` accepts
-the plan, opens the stage generation and resumes the stage execution to
+the plan (serving BOTH the initial plan-ready boundary of a fresh run and
+the replanned boundary after a revise cycle), opens the stage generation
+and resumes the stage execution to
 the automatic `run_waiting`. There is no automatic plan acceptance, no
 automatic stage/budget selection and no automatic planning loop;
 `stageId` and `initialBudget` remain explicit operator policy.
@@ -2915,12 +2919,20 @@ plan and commits the planning transition — the full `revise_task` chain
 `accepted revise task → replanned closure → revise_task response →
 settled planning execution → accepted next plan revision → old
 generation closed by replanned → selected new-plan generation opened →
-iteration 1 opened → planning transition committed`, closing exactly the
-gap the proof-only increment identified. Public API is exactly
+iteration 1 opened → planning transition committed`, plus the INITIAL
+branches over the initial stage transition controller
+(`openPipelineV2InitialStageTransition`, built on the shared
+transition-application kernel `applyStageTransitionCommit` that also
+serves the replanned transition controller): the initial chain is
+`accepted first plan revision → selected stage's generation 1 and
+iteration 1 opened → initial planning transition committed`. Public API
+is exactly
 `applyPipelineV2PlanningRunPlanHandoff({pipeline, runRoot, sink,
-stageId, initialBudget})` returning the exact
-`OpenedPipelineV2ReplannedStageTransition` downstream result by object
-identity (no new envelope); caller policy is exactly `stageId` and
+stageId, initialBudget})` returning the exact downstream transition
+result by object identity (`OpenedPipelineV2InitialStageTransition` or
+`OpenedPipelineV2ReplannedStageTransition`, the union
+`AppliedPipelineV2PlanningRunPlanHandoff`; no new envelope); caller
+policy is exactly `stageId` and
 `initialBudget`, captured once before the first await and passed
 unchanged to every downstream call — the caller budget is not durably
 pinned until the new generation exists, so only the caller replay
@@ -2928,16 +2940,35 @@ determines it. Runtime export surface is exactly
 `PipelineV2PlanningRunPlanHandoffControllerError` (own reasons
 `invalid_options | invalid_state | invalid_result | artifact_missing`)
 and `applyPipelineV2PlanningRunPlanHandoff`; the internal core carries
-the frozen `productionPlanningRunPlanHandoffOps` (seven existing public
+the frozen `productionPlanningRunPlanHandoffOps` (nine existing public
 facades/resolvers: the planning composition, the read-only accepted-plan
 restore, the wait-intent store loader, the replanned-stage controller,
-the replanned-stage transition controller, the compiled-stage selector
-and the engine-owned completed-edge resolver `compiledTransitionFor`)
+the replanned-stage transition controller, the compiled-stage selector,
+the engine-owned completed-edge resolver `compiledTransitionFor`, the
+stage-iteration controller `ensurePipelineV2StageIteration` and the
+initial stage transition controller `openPipelineV2InitialStageTransition`)
 and `applyPipelineV2PlanningRunPlanHandoffWithIo`; no
 reducer/store/fs/parser/serializer/digest/registry implementations and
 no second restore or retry mechanism. The branch is selected once from
 the captured authoritative snapshot, never from a caught downstream
-error. Branch A (the settled-but-unbound planning acceptance boundary)
+error; there are exactly four branches (the initial and the replanned
+form of the acceptance and the committed boundary). Initial Branch A
+(the initial plan-ready boundary of a fresh run: no wait journal, no
+grants, the settled-but-unbound first planning execution) runs the
+planning composition → verification → the exact caller-stage resolution
+→ the planning-edge gate (strictly before ANY generation/iteration/
+transition write) → `ensurePipelineV2StageIteration` (the fresh
+generation 1/iteration 1 on the caller budget) → verification →
+`openPipelineV2InitialStageTransition` → verification → the identity
+return; the I4 crash window (acceptance + ensure durable, the initial
+transition not) retries with only the transition dispatch. Initial
+Branch B (the exact committed initial boundary) runs the read-only
+plan restore → verification → the stage resolution → the ensure's
+zero-dispatch W3 recognition → verification → the initial transition
+controller alone (the exact C1 zero-dispatch result); a replayed
+different budget on the committed boundary is the ensure controller's
+typed `lifecycle_conflict` by identity. Branch A (the
+settled-but-unbound planning acceptance boundary)
 runs the planning composition → verification → the authoritative target
 wait (derived from the latest durable iteration closure
 `{by: "replanned", wait_index}`; the wait must be the last journal
@@ -2949,8 +2980,8 @@ write — separate from the provenance probe; the real `stage_not_found`
 passes by identity; the template/entry bindings come from the SELECTED
 stage) → the planning-edge gate, strictly before the intent load and
 before ANY generation/iteration/transition write: the authoritative
-completed edge of the planning state is resolved through the seventh ops
-member — the engine-owned
+completed edge of the planning state is resolved through
+the engine-owned
 `compiledTransitionFor(pipeline, acceptedState.cursor.current_state,
 "completed")` — and defensively verified (the exact
 `{from, outcome, to, transition_index}` own-key shape, `from` equal to
@@ -2997,7 +3028,7 @@ authoritative snapshot. Diagnostics are content-free; every
 composed layer's typed error and every unexpected error passes through
 unchanged by object identity. Tests:
 `orchestrator/tests/pipeline_v2_planning_run_plan_handoff_controller.test.ts`
-(41 tests) cover the honest prefix through the real
+(46 tests) cover the honest prefix through the real
 facades/reducer/runtime data plane ending at the settled-unbound
 planning boundary, the S0 full path with the exact six-command suffix
 `task-c:1 → plan:2 → stage_generation_closed(replanned) →
@@ -3011,7 +3042,7 @@ missing/damaged/foreign-kind intent battery, the
 stale-plan/foreign-stage/wrong-wait-binding refusals, the
 progressed-state battery, the malformed-result matrix, the forged flat
 bindings and the coherently forged state, the C1 state proof, the
-options/ops Proxy one-time-read batteries (exactly seven member reads in
+options/ops Proxy one-time-read batteries (exactly nine member reads in
 the capture contract order), the pipeline clone/Proxy provenance gate,
 the exact per-branch snapshot read counts, the content-free diagnostics
 canary scan, both export surfaces, and the source scan (the
@@ -3026,7 +3057,18 @@ stage refused before any stage write with the acceptance suffix alone
 durable on S0 and total zero dispatch on S2, a zero-candidate plan
 leaving no wrong durable generation, both same-entry stages accepted on
 independent prefixes, resolver errors by identity, the malformed
-edge-result matrix with zero facade calls).
+edge-result matrix with zero facade calls); the initial-branch battery
+proves the full Initial A suffix `task-a:1 → task-b:1 → plan:1 →
+stage_generation_opened → stage_iteration_opened → transition_committed`
+(delta +6 — the first plan carries two new tasks) with the generation
+bound to the caller stage/budget/template on the zero anchor and the
+successor execution reaching the stage entry, the Initial B
+zero-dispatch retry, the I4 crash window retrying with only the
+transition dispatch, the unknown caller stage refused by the compiled
+resolver error identity (the plan accepted, zero generations, zero
+transitions, zero stage writes), and a conflicting budget replayed on
+the committed initial boundary refused by the ensure controller's typed
+`lifecycle_conflict` by identity.
 Production-reachable transitively through the composition controller
 (`resumePipelineV2RunAfterPlanningRunPlanHandoff`, the runner
 `resumePipelineV2PlanningRunPlan`, `orchestrator resume-plan`); not
@@ -4837,6 +4879,85 @@ field (the protected input digest), a changed historical grant on a
 real grant fixture, and hostile historical decision
 executions/results (an injected `iteration_index`, changed result
 scalar fields and both id lists) — every `invalid_state`.
+
+### Initial stage transition controller (production-neutral, production-reachable transitively)
+
+`orchestrator/src/pipeline_v2_initial_stage_transition_controller.ts`
+(public facade) with the internal core
+`pipeline_v2_initial_stage_transition_controller_internal.ts` commits
+the single planning transition of the initial plan-ready handoff — the
+exact boundary `accepted first plan revision → the selected stage's
+generation 1/iteration 1 opened → transition_committed {from: the
+settled planning execution's state, outcome: "completed", to: the
+selected stage's entry state, transition_index: the declared edge's
+index, execution_index: the settled planning execution}`. Runtime
+export surface is exactly
+`PipelineV2InitialStageTransitionControllerError` (closed reasons
+`invalid_options | invalid_state | lifecycle_conflict |
+state_persist_failed`, last authoritative `state`) and
+`openPipelineV2InitialStageTransition({pipeline, sink, compiledPlan,
+stageId, initialBudget})`; the internal core exports exactly the error
+and `openPipelineV2InitialStageTransitionInternal`, and the single
+dispatch runs through the shared kernel
+`applyStageTransitionCommit` (the same kernel the replanned transition
+controller uses; per-call wording, no policy imports).
+
+- Capture order: options shape → the five fields each read exactly once
+  → the sink's `poisoned`/`dispatch`/`snapshot` members each once with
+  `dispatch` bound to the sink before the first await → poison latch →
+  compiled stage through the single trusted
+  `compiledPipelineV2RunPlanStageFor` → positive safe `initialBudget` →
+  the single `validatePipelineV2RunState` → the hidden
+  originating-identity comparison → the durable bindings.
+- C0/C1 bindings before any dispatch: active/running with no
+  terminal/publication/failure; NO wait journal, NO grants and no
+  historical replanned closure (this is the initial boundary, never a
+  revise cycle); the last execution the settled-but-unbound planning
+  execution (agent, role `planning`, phase `cleanup_completed`, no
+  `iteration_index`) with `executions.length === transitions.length + 1`
+  (C0) or `=== transitions.length` (C1); the anchor derived only from
+  the durable cursor (`transition_count` at C0, `transition_count − 1`
+  at C1); the plan record exactly revision 1 with
+  `origin_execution` = the last execution index; exactly the ONE open
+  generation bound to the selected stage's id/position/template/plan
+  digest/caller budget with `opened_transition_count === anchor`,
+  exactly one iteration (index 1, same anchor) and the exact
+  `open_iteration` projection — the handoff always ensures the stage
+  before the transition, so a fresh no-generation form is refused as
+  unrecoverable; and the compiled `completed` edge of the planning
+  state targeting exactly the selected stage's entry state (a wrong
+  caller stage never writes a generation).
+- C1 recognizes only the exact durable transition by every field with
+  the cursor at `to` and no started next execution; anything beyond the
+  boundary is `lifecycle_conflict`. Post-dispatch verification: revision
+  exactly +1 with the run identity pinned, the exact new transition
+  record and moved cursor, every other durable field unchanged except
+  the routine `updated_at` refresh. Durability: `not_committed` keeps
+  the previous snapshot authoritative (a fresh retry re-dispatches);
+  `durability_unknown` adopts the visible candidate, poisons the sink
+  and a fresh reopened sink recognizes the durable transition with zero
+  dispatch; nothing is ever rolled back.
+- Tests (`orchestrator/tests/pipeline_v2_initial_stage_transition_controller.test.ts`,
+  26 tests) cover the exact C0 command/result/loader round-trip, the C1
+  zero-dispatch retry, the fresh-form refusal (no generations, zero
+  writes), the control-prefix form refused, the provenance battery, the
+  invalid-options matrix, the poisoned sink, the missing snapshot, the
+  foreign compiled plan, the unknown stage, the honest boundary
+  refusals (failed run, pre-acceptance, in-flight, stage-role settled
+  execution, plan digest mismatch, generation budget mismatch, C1 wrong
+  target), the edge gate on a two-stage plan (the second stage's entry
+  differs from the committed edge; zero generation writes), both
+  durability windows with fresh-retry continuations, the racing
+  identical dispatch as idempotent success, the racing different/silent
+  dispatch classifications with the exact kernel wording, the hostile
+  post-dispatch per-field battery, the caller mutation after the
+  pending dispatch, both export surfaces, and the source scan.
+- Production-reachable transitively through the planning-run-plan
+  handoff (the runner `resumePipelineV2PlanningRunPlan` and CLI
+  `orchestrator resume-plan`). Still unwired: the stage/budget
+  selection policy, starting the next stage execution beyond the
+  coordinator's resume, automatic resume, the default-pipeline bundle,
+  migrations/API/T3, multi-process locking.
 
 ### Stage generation/iteration controller (production-neutral, production-reachable transitively)
 

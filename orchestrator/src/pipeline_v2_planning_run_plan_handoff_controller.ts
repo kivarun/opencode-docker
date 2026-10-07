@@ -1,6 +1,8 @@
 /**
  * Public facade of the restart-aware planning-run-plan handoff controller
- * for pipeline schema v2 (production-neutral, unwired).
+ * for pipeline schema v2 (production-neutral, production-reachable
+ * transitively through the runner `resumePipelineV2PlanningRunPlan` and
+ * CLI `orchestrator resume-plan`).
  *
  * `applyPipelineV2PlanningRunPlanHandoff({pipeline, runRoot, sink,
  * stageId, initialBudget})` composes the existing authoritative chain into
@@ -8,12 +10,23 @@
  * boundary onto the caller-selected stage of the newly accepted plan and
  * commits the planning transition:
  *
- * - Branch A (the settled-but-unbound planning acceptance boundary): the
- *   planning-output composition accepts the run plan, the accepted
- *   `revise_task` intent is restored from the durable run through the
- *   public loader, the replanned stage opens and the planning transition
- *   is committed — the S0–S4 restart windows converge through the
- *   idempotency of the composed controllers alone.
+ * - Initial Branch A (the initial plan-ready boundary of a fresh run:
+ *   the settled-but-unbound first planning execution with no wait
+ *   journal and no grants): the planning-output composition accepts the
+ *   run plan, the selected stage's generation and iteration 1 are opened,
+ *   and the initial stage transition controller commits the planning
+ *   transition.
+ * - Initial Branch B (the exact committed initial boundary, the crash
+ *   seam after the initial transition became durable while the result
+ *   was lost): the run plan is restored read-only, the ensure recognizes
+ *   the open generation/iteration with zero dispatch and the initial
+ *   transition controller recognizes the exact C1 zero-dispatch boundary.
+ * - Branch A (the settled-but-unbound planning acceptance boundary after
+ *   a revise cycle): the planning-output composition accepts the run
+ *   plan, the accepted `revise_task` intent is restored from the durable
+ *   run through the public loader, the replanned stage opens and the
+ *   planning transition is committed — the S0–S4 restart windows converge
+ *   through the idempotency of the composed controllers alone.
  * - Branch B (the exact committed handoff boundary, the crash seam after
  *   the planning transition became durable while the result was lost):
  *   the accepted run plan is restored read-only and the transition

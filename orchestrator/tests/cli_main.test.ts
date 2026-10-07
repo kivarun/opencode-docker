@@ -2920,6 +2920,214 @@ test("resume-plan end-to-end with the real production runner: the two-cycle plan
   }
 });
 
+test("resume-plan end-to-end with the real production runner: the initial plan-ready boundary, the initial handoff suffix and the resumed successor execution", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cli-initial-plan-"));
+  try {
+    const bundle = join(root, "bundle");
+    mkdirSync(join(bundle, "prompts"), { recursive: true });
+    mkdirSync(join(bundle, "schemas"), { recursive: true });
+    writeFileSync(join(bundle, "pipeline.yaml"), PLANNING_PIPELINE);
+    writeFileSync(join(bundle, "schemas", "plan.schema.json"), JSON.stringify({ type: "object" }));
+    writeFileSync(join(bundle, "schemas", "plan2.schema.json"), JSON.stringify({ type: "object" }));
+    writeFileSync(join(bundle, "prompts", "architect.md"), "PLAN-THE-WORK\n");
+    writeFileSync(join(bundle, "prompts", "coder.md"), "IMPLEMENT-THE-TASK\n");
+    const configRoot = join(root, "config");
+    mkdirSync(join(configRoot, "profiles"), { recursive: true });
+    mkdirSync(join(configRoot, "opencode"), { recursive: true });
+    for (const profile of ["architect", "coder"]) {
+      writeFileSync(
+        join(configRoot, "profiles", `${profile}.yaml`),
+        [
+          "schema_version: 1",
+          "image: ghcr.io/example/worker:1",
+          `opencode_config: opencode/${profile}.json`,
+          "env:",
+          "  MODEL_API_KEY:",
+          `    from_env: ${profile.toUpperCase()}_SOURCE_VAR_1`,
+          "    required: true",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(join(configRoot, "opencode", `${profile}.json`), JSON.stringify({ model: "glm53-flash" }));
+    }
+    const sources = join(root, "userdata");
+    mkdirSync(sources, { recursive: true });
+    writeFileSync(join(sources, "task.md"), "TASK-BODY\n");
+    const projectSource = join(root, "project-source");
+    mkdirSync(projectSource, { recursive: true });
+    const stateRoot = join(root, "state");
+    mkdirSync(stateRoot, { recursive: true });
+    const credDir = join(root, "cred", "docker-helper");
+    mkdirSync(credDir, { recursive: true, mode: 0o700 });
+    const credentialFile = join(credDir, "credential.token");
+    writeFileSync(credentialFile, "cred-token-not-real\n", { mode: 0o600 });
+    const RUN_ID = "initial-plan-run";
+    const runRoot = join(stateRoot, "pipeline-runs", RUN_ID);
+    mkdirSync(join(stateRoot, "pipeline-runs"), { mode: 0o700 });
+    mkdirSync(runRoot, { mode: 0o700 });
+
+    let clockValue = 0;
+    const nextTick = (): Date => {
+      clockValue += 1;
+      return new Date(Date.UTC(2026, 0, 1, 0, 0, clockValue));
+    };
+
+    // the honest initial prefix through the production facades only: the
+    // fresh run's first planning execution settles unbound - the initial
+    // plan-ready boundary is the CLI's only durable input (no accepted plan,
+    // no generation, no wait, no committed transition)
+    const pipeline = await loadPipelineV2(bundle);
+    const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
+    await prepareRunProject(projectSource, runRoot);
+    const runInputs: RunInputsSnapshot = await snapshotRunInputs(
+      pipeline,
+      [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
+      runRoot,
+    );
+    await sink.dispatch({
+      kind: "create_run",
+      runId: RUN_ID,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline),
+      inputs: runInputs.inputs.map((entry) => ({
+        id: entry.id,
+        type: entry.type,
+        protected: entry.protected,
+        digest: entry.digest,
+      })),
+    });
+    await cliPlanningActivation(pipeline, runInputs, [], sink, "architect", "architect", "plan", 1, P1_PROPOSAL);
+    const prefixState = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
+    expect(prefixState.executions).toHaveLength(1);
+    expect(prefixState.transitions).toHaveLength(0);
+    expect(prefixState.status).toBe("active");
+
+    // the real CLI call: only the five external scalars travel through the
+    // CLI - no in-memory pipeline, compiled plan, proposal, output or
+    // handoff result is ever passed
+    const { io, out, err } = makeIo();
+    io.baseEnv = {
+      ...io.baseEnv,
+      CODER_SOURCE_VAR_1: "coder-secret",
+      ARCHITECT_SOURCE_VAR_1: "architect-secret",
+    };
+    const sessionCreates: string[] = [];
+    const sessionDeletes: string[] = [];
+    io.runner.run = async (args: string[]) => {
+      if (args[0] === "session" && args[1] === "create") {
+        sessionCreates.push(args.join(" "));
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            ok: true,
+            session: { id: `dhs_${sessionCreates.length}`, launcher_id: "dhl_planning" },
+            token: `dhc_${sessionCreates.length}`,
+          }),
+        };
+      }
+      if (args[0] === "session" && args[1] === "delete") {
+        sessionDeletes.push(args[args.length - 1] ?? "");
+        return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+      }
+      if (args[0] === "pull") {
+        return { code: 1, stderr: "PULL-FAILED-BY-TEST" };
+      }
+      return { code: 0 };
+    };
+    io.resolveStateRootProjection = () => ({ localRoot: stateRoot, daemonRoot: stateRoot });
+    io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile });
+    io.fetchAuth = () =>
+      Promise.resolve({
+        status: 200,
+        body: { authority: "launcher", principal: "tester", launcher_id: "dhl_planning" },
+      });
+    io.resumePipelineV2PlanningRunPlan = resumePipelineV2PlanningRunPlan as unknown as CliIo["resumePipelineV2PlanningRunPlan"];
+    const exit = await runCli(
+      [
+        "resume-plan",
+        "--run-id", RUN_ID,
+        "--stage-id", "stage-1",
+        "--initial-budget", "2",
+        "--config-root", configRoot,
+        "--launcher-id", "dhl_planning",
+        "--json",
+      ],
+      io,
+    );
+
+    expect(exit).toBe(1);
+    const documents = out.filter((line) => line.trim() !== "");
+    expect(documents).toHaveLength(1);
+    const parsed = JSON.parse(documents[0]!) as Record<string, unknown>;
+    expect(parsed["ok"]).toBe(false);
+    expect(parsed["exitCode"]).toBe(1);
+    expect(parsed["reason"]).toBe("worker_failed");
+    expect(parsed["runId"]).toBe(RUN_ID);
+    expect(parsed["runRoot"]).toBe(runRoot);
+    expect(err.join("\n")).not.toContain("userdata");
+    expect(err.join("\n")).not.toContain("project-source");
+    expect(err.join("\n")).not.toContain(CANARY_SECRET);
+    expect(JSON.stringify(parsed)).not.toContain("Body ");
+
+    // the durable projection: the exact thirteen-command sequence - the six
+    // initial handoff commands (two task revisions, the plan revision, the
+    // generation, the iteration, the planning transition), then the seven
+    // resume commands
+    const state = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
+    expect(state.revision).toBe(prefixState.revision + 13);
+    expect(state.task_revisions.map((record) => `${record.task_id}@${record.revision}`)).toEqual([
+      "task-a@1",
+      "task-b@1",
+    ]);
+    expect(state.plan_revisions.map((record) => record.revision)).toEqual([1]);
+    expect(state.waits).toHaveLength(0);
+    expect(state.generations).toHaveLength(1);
+    expect(state.generations[0]).toMatchObject({
+      index: 1,
+      stage_id: "stage-1",
+      stage_position: 1,
+      template_id: "development",
+      initial_budget: 2,
+      opened_transition_count: 0,
+    });
+    expect(state.generations[0]?.closed).toBeUndefined();
+    expect(state.generations[0]?.open_iteration).toEqual({ index: 1, opened_transition_count: 0 });
+    expect(state.cursor).toEqual({ current_state: "dev_entry", transition_count: 1 });
+    expect(state.transitions).toHaveLength(1);
+    expect(state.transitions[0]).toEqual({
+      index: 0,
+      from: "architect",
+      outcome: "completed",
+      to: "dev_entry",
+      execution_index: 1,
+    });
+    expect(state.executions).toHaveLength(2);
+    const successor = state.executions[1]!;
+    expect(successor).toMatchObject({
+      index: 2,
+      state_id: "dev_entry",
+      execution_role: "stage",
+      iteration_index: 1,
+      phase: "failed",
+      failure_reason: "worker_failed",
+    });
+    if (successor.type !== "agent") {
+      throw new Error("expected the successor execution to be an agent execution");
+    }
+    expect(successor.session_cleanup).toEqual({ execution: "completed", tool: "completed" });
+    expect(state.status).toBe("failed");
+    expect(state.failure).toEqual({ reason: "worker_failed" });
+    expect(state.pipeline.bundle_root).toBe(bundle);
+    // one new session pair only (the resumed execution), cleaned exactly
+    // once each and tool-first
+    expect(sessionCreates).toHaveLength(2);
+    expect(sessionDeletes).toEqual(["dhs_2", "dhs_1"]);
+    // the loader round-trip
+    expect(state).toEqual(parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // --- the real wait-entry CLI integration proof --------------------------------
 
 test("resume CLI reports the controlled stage-wait suspension: one JSON waiting outcome (exit 0) and one human waiting line", async () => {

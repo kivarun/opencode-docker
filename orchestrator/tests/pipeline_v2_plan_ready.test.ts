@@ -1083,13 +1083,7 @@ test("20/21. the ordinary resume refuses the plan-ready boundary with zero durab
   expect(await fingerprint(harness.runRoot)).toBe(before);
 });
 
-test("7div. the documented divergence: resume-plan on the INITIAL plan-ready boundary refuses with zero durable writes", async () => {
-  // The existing handoff chain serves the revise-cycle planning boundary
-  // only (the answered revise_task wait plus the replanned iteration
-  // closure); the initial settled-but-unbound planning boundary of a fresh
-  // run is refused. This is the documented first exact divergence of this
-  // increment: the suspension is durable and clean, but no CLI command
-  // continues it yet.
+test("7div. the initial plan-ready boundary continues through resume-plan: acceptance, generation, planning transition, stage execution and the stage wait", async () => {
   const runId = "runner-plan-ready-initial";
   const harness = await makeHarness("runner-plan-ready-initial", runId, "cycle", { createRunRoot: false });
   const ready = await runPipelineV2(
@@ -1102,6 +1096,37 @@ test("7div. the documented divergence: resume-plan on the INITIAL plan-ready bou
     { ...runnerDeps(harness, runId), randomId: () => runId },
   );
   expectPlanReadyOutcome(ready);
+  const outcome = await resumePipelineV2PlanningRunPlan(
+    { runId, stageId: "stage-1", initialBudget: INITIAL_BUDGET, configRoot: harness.configRoot },
+    runnerDeps(harness, runId),
+  );
+  const state = expectWaitingOutcome(outcome);
+  expect(outcome.runId).toBe(runId);
+  expect(outcome.runRoot).toBe(harness.runRoot);
+  // The exact durable initial handoff suffix: the accepted plan, the
+  // opened generation/iteration of the selected stage, the committed
+  // planning transition, the stage execution and the trusted stage wait.
+  expect(state.plan_revisions).toHaveLength(1);
+  expect(state.plan_revisions[0]?.revision).toBe(1);
+  expect(state.task_revisions.map((task) => [task.task_id, task.revision])).toEqual([["task-a", 1]]);
+  expect(state.generations).toHaveLength(1);
+  expect(state.generations[0]?.stage_id).toBe("stage-1");
+  expect(state.generations[0]?.initial_budget).toBe(INITIAL_BUDGET);
+  expect(state.generations[0]?.opened_transition_count).toBe(0);
+  expect(state.executions.map((execution) => [execution.state_id, execution.execution_role, execution.iteration_index ?? null])).toEqual([
+    ["architect", "planning", null],
+    ["dev_entry", "stage", 1],
+  ]);
+  expect(state.transitions.map((transition) => [transition.from, transition.to])).toEqual([
+    ["architect", "dev_entry"],
+    ["dev_entry", "planner2"],
+  ]);
+  expect(state.waits).toHaveLength(1);
+  await stat(join(harness.runRoot, "waits", "1.request.json"));
+  expect(parsePipelineV2RunState(JSON.stringify(state))).toEqual(state);
+  // The lost-result retry: the run is waiting (the handoff boundary has
+  // been passed by the resumed stage execution), so a repeated resume-plan
+  // refuses with zero durable writes and the run tree byte-identical.
   const before = await fingerprint(harness.runRoot);
   const refused = await resumePipelineV2PlanningRunPlan(
     { runId, stageId: "stage-1", initialBudget: INITIAL_BUDGET, configRoot: harness.configRoot },
@@ -1113,9 +1138,7 @@ test("7div. the documented divergence: resume-plan on the INITIAL plan-ready bou
   expect(refused.exitCode).toBe(1);
   expect("reason" in refused).toBe(false);
   expect(refused.runId).toBe(runId);
-  expect(refused.state?.status).toBe("active");
-  expect(refused.state?.transitions).toHaveLength(0);
-  expect(refused.state?.waits).toHaveLength(0);
+  expect(refused.state?.status).toBe("waiting");
   expect(await fingerprint(harness.runRoot)).toBe(before);
 });
 
