@@ -1730,16 +1730,35 @@ the child Session capability required for its step.
 
 ## Pipeline bundles
 
-The project ships a default pipeline as data under:
+The project ships two default pipeline bundles as data under:
 
 ```text
 pipelines/default/
   pipeline.yaml
   prompts/
   schemas/
+
+pipelines/default-v2/
+  pipeline.yaml
+  prompts/
+  schemas/
 ```
 
-The same loader and validator accept an external pipeline directory selected by
+`pipelines/default` is the v1 diagnostic bundle and the production input of
+`orchestrator agent-smoke`. `pipelines/default-v2` is the bundled pipeline v2
+default: `orchestrator run` without an explicit `--pipeline-root` selects it
+(`/opt/orchestrator/pipelines/default-v2`). Its graph is
+`architect` (planning) `--completed-->` `execute` (stage, template
+`development`) `--completed-->` `done` (success terminal) with the protected
+`task` input, the planner's JSON `plan` output (the run-plan-proposal
+contract naming stage `stage-1`, template `development` and new task
+`task-1`), the stage's JSON `result` output (a V2-native result schema with
+no legacy identity fields), and the run-level required output `result`. The
+first successful `run` stops with the `planReady` outcome; the next manual
+step is `orchestrator resume-plan --stage-id stage-1 --initial-budget 1`.
+There is no automatic stage/budget selection and no automatic resume.
+
+The same loaders and validators accept an external pipeline directory selected by
 the user. Creating a custom pipeline must not require rebuilding the
 orchestrator or changing project code.
 

@@ -299,7 +299,7 @@ test("a parse error happens before both configuration resolvers", async () => {
   expect(exit).toBe(2);
   expect(projectionCalls).toBe(0);
   expect(helperConfigCalls).toBe(0);
-  expect(err.join("\n")).toContain("--pipeline-root ABSOLUTE_PATH is required for run");
+  expect(err.join("\n")).toContain("--config-root ABSOLUTE_PATH is required for run");
 });
 
 test("state-root resolver failure is a CLI configuration error (exit 2, no runner call)", async () => {

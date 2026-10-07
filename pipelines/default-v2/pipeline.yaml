@@ -1,0 +1,74 @@
+schema_version: 2
+entry_state: architect
+max_transitions: 40
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+
+outputs:
+  - id: result
+    required: true
+    source:
+      state_output:
+        state: execute
+        output: result
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: execute
+  execution_roles:
+    - state_id: architect
+      role: planning
+      plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+    - state_id: execute
+      role: stage
+      stage_template: development
+
+states:
+  - id: architect
+    type: agent
+    profile: default
+    prompt: prompts/architect.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
+    timeout_seconds: 3600
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: execute
+
+  - id: execute
+    type: agent
+    profile: default
+    prompt: prompts/execute.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: result
+        type: json
+        schema: schemas/agent-result-v2.schema.json
+    timeout_seconds: 3600
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+
+  - id: done
+    type: terminal
+    result: success

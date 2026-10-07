@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { DEFAULT_PIPELINE_ROOT, parseCommand, usage } from "../src/cli_args.ts";
+import { DEFAULT_PIPELINE_ROOT, DEFAULT_PIPELINE_V2_ROOT, parseCommand, usage } from "../src/cli_args.ts";
 
 test("agent-smoke defaults to the bundled default pipeline root", () => {
   const parsed = parseCommand("agent-smoke", ["--config-root", "/abs/config"]);
@@ -158,10 +158,18 @@ test("run accepts zero inputs and an empty state", () => {
   expect(parsed.kind).toBe("run");
 });
 
+test("run without --pipeline-root defaults to the bundled v2 pipeline", () => {
+  const parsed = parseCommand("run", ["--config-root=/c", "--project=/pr"]);
+  expect(parsed.kind).toBe("run");
+  if (parsed.kind !== "run") {
+    throw new Error("unreachable");
+  }
+  expect(parsed.pipelineRoot).toBe(DEFAULT_PIPELINE_V2_ROOT);
+});
+
 test("run rejects missing required flags", () => {
-  expectRunError(["--config-root=/c", "--project=/pr"], "--pipeline-root ABSOLUTE_PATH is required for run");
-  expectRunError(["--pipeline-root=/p", "--project=/pr"], "--config-root ABSOLUTE_PATH is required for run");
-  expectRunError(["--pipeline-root=/p", "--config-root=/c"], "--project ABSOLUTE_PATH is required for run");
+  expectRunError(["--project=/pr"], "--config-root ABSOLUTE_PATH is required for run");
+  expectRunError(["--config-root=/c"], "--project ABSOLUTE_PATH is required for run");
 });
 
 test("run rejects duplicate singleton flags", () => {

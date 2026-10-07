@@ -295,6 +295,17 @@ count, the reached terminal, and an ordered event journal. It never records
 credentials, environment values, prompt or input bodies, or the OpenCode
 configuration.
 
+The production pipeline v2 path is `orchestrator run`. Without an explicit
+`--pipeline-root` it uses the bundled pipeline v2 default
+(`/opt/orchestrator/pipelines/default-v2`): the planner publishes the
+operator-visible run plan proposal (stage `stage-1`, template `development`,
+new task `task-1` from the protected task input), the first successful run
+stops with the `planReady` outcome, and the next manual step is
+`orchestrator resume-plan --stage-id stage-1 --initial-budget 1`. The
+default stage publishes the V2-native result at
+`<run-root>/outputs/result`; `agent-smoke` stays on the v1 default bundle.
+There is no automatic stage/budget selection and no automatic resume.
+
 ### Orchestrator runtime requirements
 
 The orchestrator needs:

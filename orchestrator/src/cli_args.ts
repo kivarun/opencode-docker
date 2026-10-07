@@ -5,6 +5,11 @@ import { DEFAULT_WORKER_IMAGE } from "./worker.ts";
 
 export const DEFAULT_PIPELINE_ROOT = "/opt/orchestrator/pipelines/default";
 
+/** The bundled pipeline v2 default selected by `orchestrator run` when no
+ * `--pipeline-root` is given. The v1 `DEFAULT_PIPELINE_ROOT` stays the
+ * `agent-smoke` default; the two defaults never cross. */
+export const DEFAULT_PIPELINE_V2_ROOT = "/opt/orchestrator/pipelines/default-v2";
+
 export interface ParsedSmokeArgs {
   kind: "smoke";
   workspace: string;
@@ -139,9 +144,19 @@ export function usage(): string {
     `  --image WORKER_IMAGE    worker container image (default: ${DEFAULT_WORKER_IMAGE})`,
     "",
     "run flags (production pipeline v2):",
-    "  --pipeline-root PATH    pipeline bundle root with schema_version 2; required; absolute path.",
-    "                          There is no default: the bundled pipeline is still the v1 diagnostic",
-    "                          pipeline and is never used by 'run'.",
+    "  [--pipeline-root ABS]   optional pipeline bundle root with schema_version 2; an",
+    "                          explicitly given value must be an absolute path. Without",
+    `                          the flag 'run' uses the bundled pipeline v2 default`,
+    `                          (${DEFAULT_PIPELINE_V2_ROOT}): the planner writes the`,
+    "                          operator-visible run plan proposal (stage-1, template",
+    "                          development, new task task-1 from the protected task",
+    "                          input), the first successful run stops with the",
+    "                          planReady outcome, and the next manual step is",
+    "                          'orchestrator resume-plan --stage-id stage-1",
+    "                          --initial-budget 1'. The default stage publishes the",
+    "                          V2-native result at <run-root>/outputs/result. There is",
+    "                          no automatic stage/budget selection and no automatic",
+    "                          resume.",
     "  --config-root PATH      operator-controlled configuration root holding",
     "                          profiles/<name>.yaml and the OpenCode configurations; required;",
     "                          absolute path",
@@ -692,9 +707,6 @@ function parseRunArgs(argv: string[]): ParsedPipelineRunArgs {
     }
   }
 
-  if (pipelineRoot === null) {
-    throw new Error("--pipeline-root ABSOLUTE_PATH is required for run");
-  }
   if (configRoot === null) {
     throw new Error("--config-root ABSOLUTE_PATH is required for run");
   }
@@ -703,7 +715,7 @@ function parseRunArgs(argv: string[]): ParsedPipelineRunArgs {
   }
   return {
     kind: "run",
-    pipelineRoot,
+    pipelineRoot: pipelineRoot ?? DEFAULT_PIPELINE_V2_ROOT,
     configRoot,
     projectSourcePath,
     inputBindings,
