@@ -2421,3 +2421,64 @@ test("41. the intervention module composes only the three existing facades (sour
   expect(countOf("cause.message")).toBe(0);
   expect(countOf(".message.includes")).toBe(0);
 });
+
+test("A. an unsafe MAX_SAFE_INTEGER intent is refused fail-fast through the whole facade with zero writes", async () => {
+    const ctx = await driveToReopenedWait();
+    try {
+      const before = ctx.reopened.snapshot as PipelineV2RunState;
+      const unsafeIntent = prepareWaitIntent({
+        schema_version: 1,
+        kind: "continue_stage_intent",
+        run_id: RUN_ID,
+        wait_index: 1,
+        stage_id: "stage-1",
+        expected_plan_sha256: ctx.plan1!.sha256,
+        additional_iterations: Number.MAX_SAFE_INTEGER,
+      });
+      const recording = recordSink(ctx.reopened);
+      const cause = await catchApply(() => callIntervention({ ...ctx, intent: unsafeIntent }, recording));
+      // the intent acceptance layer's typed error passes through by identity
+      expect(cause).toBeInstanceOf(PipelineV2ContinueStageIntentControllerError);
+      expect((cause as PipelineV2ContinueStageIntentControllerError).reason).toBe("invalid_state");
+      expect((cause as Error).message).toBe(
+        "the requested additional iterations would make the cumulative stage iteration budget unrepresentable",
+      );
+      expect(recording.commands).toEqual([]);
+      const after = await PipelineV2RunStateSink.open({ stateRoot: ctx.stateRoot, runId: RUN_ID, now: nextTick });
+      expect(after.snapshot?.revision).toBe(before.revision);
+      expect(after.snapshot?.status).toBe("waiting");
+      expect(after.snapshot?.waits[0]?.intent).toBeUndefined();
+      expect(after.snapshot?.grants).toEqual([]);
+    } finally {
+      await rm(ctx.root, { recursive: true, force: true });
+    }
+  });
+
+test("B. the exact representable boundary value runs the full five-command suffix and opens the successor iteration", async () => {
+    const ctx = await driveToReopenedWait();
+    try {
+      const boundary = Number.MAX_SAFE_INTEGER - INITIAL_BUDGET;
+      expect(boundary).toBe(9007199254740989);
+      const boundaryIntent = prepareWaitIntent({
+        schema_version: 1,
+        kind: "continue_stage_intent",
+        run_id: RUN_ID,
+        wait_index: 1,
+        stage_id: "stage-1",
+        expected_plan_sha256: ctx.plan1!.sha256,
+        additional_iterations: boundary,
+      });
+      const recording = recordSink(ctx.reopened);
+      const result = await callIntervention({ ...ctx, intent: boundaryIntent }, recording);
+      expect(recording.commands.map((command) => command.kind)).toEqual([...SUFFIX]);
+      const state = result.state;
+      expect(state.status).toBe("active");
+      expect(state.generations[0]?.open_iteration?.index).toBe(2);
+      expect(state.grants).toEqual([
+        { index: 1, generation_index: 1, wait_index: 1, intent_sha256: boundaryIntent.sha256, additional_iterations: boundary },
+      ]);
+      expect(state.waits[0]?.response?.action_id).toBe("continue_stage");
+    } finally {
+      await rm(ctx.root, { recursive: true, force: true });
+    }
+  });

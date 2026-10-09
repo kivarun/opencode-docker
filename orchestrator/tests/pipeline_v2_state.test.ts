@@ -10,6 +10,7 @@ import {
   PIPELINE_V2_TERMINAL_FAILURE_REASON,
   PipelineV2StateError,
   parsePipelineV2RunState,
+  pipelineV2StageIterationEffectiveBudget,
   pipelineV2OpenStageIteration,
   pipelineV2StageIterationAt,
   pipelineV2StageIterationMembershipAt,
@@ -5321,11 +5322,75 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
       "parsePipelineV2RunState",
       "pipelineV2OpenStageIteration",
       "pipelineV2StageIterationAt",
+      "pipelineV2StageIterationEffectiveBudget",
       "pipelineV2StageIterationMembershipAt",
       "reducePipelineV2RunCommand",
       "validatePipelineIdentityV2",
       "validatePipelineV2RunState",
       "validateRunInputState",
     ]);
+  });
+});
+describe("pipelineV2StageIterationEffectiveBudget (the single budget formula)", () => {
+  const grantsOf = (...values: number[]): Array<{ generation_index: number; additional_iterations: number }> =>
+    values.map((additional_iterations) => ({ generation_index: 1, additional_iterations }));
+
+  test("the exact production formula: initial budget plus the passed grants", () => {
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, [])).toEqual({
+      representable: true,
+      effective_budget: 2,
+    });
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, grantsOf(1, 2))).toEqual({
+      representable: true,
+      effective_budget: 5,
+    });
+  });
+
+  test("the exact representable boundary and the first overflow follow the safe-integer range", () => {
+    const max = Number.MAX_SAFE_INTEGER;
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, grantsOf(max - 2))).toEqual({
+      representable: true,
+      effective_budget: max,
+    });
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, grantsOf(max - 1))).toEqual({
+      representable: false,
+    });
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, grantsOf(max))).toEqual({
+      representable: false,
+    });
+    // the accumulated history participates: initial 2 + prior grant 1
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, grantsOf(1, max - 3))).toEqual({
+      representable: true,
+      effective_budget: max,
+    });
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, grantsOf(1, max - 2))).toEqual({
+      representable: false,
+    });
+  });
+
+  test("a grant of another generation does not silently change the budget", () => {
+    const foreign = [{ generation_index: 2, additional_iterations: 5 }];
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, foreign)).toEqual({
+      representable: false,
+    });
+    // the callers filter; a mixed list is refused fail-closed, never skipped
+    expect(
+      pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, [
+        { generation_index: 2, additional_iterations: 5 },
+        ...grantsOf(1),
+      ]),
+    ).toEqual({ representable: false });
+  });
+
+  test("non-integer components are refused, never rounded", () => {
+    expect(pipelineV2StageIterationEffectiveBudget({ index: 1, initial_budget: 2 }, grantsOf(1.5))).toEqual({
+      representable: false,
+    });
+    expect(
+      pipelineV2StageIterationEffectiveBudget(
+        { index: 1, initial_budget: 2.5 },
+        [] as Array<{ generation_index: number; additional_iterations: number }>,
+      ),
+    ).toEqual({ representable: false });
   });
 });

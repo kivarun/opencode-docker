@@ -2,6 +2,7 @@ import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 import { hasPreparedRunPlanProvenance } from "./pipeline_v2_run_plan_provenance.ts";
 import {
   PipelineV2StateError,
+  pipelineV2StageIterationEffectiveBudget,
   reducePipelineV2RunCommand,
   validatePipelineV2RunState,
   type PipelineV2RunCommand,
@@ -491,6 +492,26 @@ export async function acceptPipelineV2ContinueStageIntentWithIo(
     intentSha256: preparedIntent.sha256,
   };
   if (wait.intent === undefined) {
+    // The cumulative-budget preflight, before any filesystem side effect
+    // and before the first dispatch: the caller-selected additional
+    // iterations extend the open generation's effective budget, and that
+    // cumulative budget must stay a representable safe integer. The single
+    // shared budget calculator of the durable state module is the only
+    // formula; the caller's grant is appended as the hypothetical next
+    // record. A deterministic impossibility is a state-relative typed
+    // refusal with zero writes — never a late lifecycle failure after the
+    // intervention already landed.
+    const budget = pipelineV2StageIterationEffectiveBudget(generation, [
+      ...state.grants.filter((grant) => grant.generation_index === generation.index),
+      { generation_index: generation.index, additional_iterations: manifest.additional_iterations },
+    ]);
+    if (!budget.representable) {
+      throw controllerError(
+        "invalid_state",
+        "the requested additional iterations would make the cumulative stage iteration budget unrepresentable",
+        state,
+      );
+    }
     // The reducer pre-check on the local snapshot, before any filesystem
     // side effect.
     precheckPlanIntentAcceptance(state, command, state);

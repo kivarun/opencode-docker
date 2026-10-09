@@ -766,6 +766,52 @@ function additionSafe(a: number, b: number, what: string): number {
   return sum;
 }
 
+/**
+ * The result of the single effective-stage-iteration-budget formula. A
+ * non-representable result means the cumulative arithmetic left the safe
+ * integer range; the value is then unusable and no rounding may occur.
+ */
+export type PipelineV2StageIterationBudget =
+  | { readonly representable: true; readonly effective_budget: number }
+  | { readonly representable: false };
+
+/**
+ * The single production formula of the effective stage iteration budget of
+ * one stage generation: `generation.initial_budget + Σ
+ * grants.additional_iterations` over exactly the grants passed by the
+ * caller, with every accumulation step kept a representable safe integer.
+ * The reducer's iteration-opening rule, the loader's replay verification
+ * and the continue-stage preflight all read the budget only through this
+ * calculator — there is no second budget formula. The caller filters the
+ * grant list to the grants it considers recorded (the reducer passes every
+ * durable grant of the generation, the loader replay passes the grants
+ * processed up to the replayed boundary, and the continue-stage preflight
+ * appends the caller's hypothetical grant before calling).
+ */
+export function pipelineV2StageIterationEffectiveBudget(
+  generation: { readonly index: number; readonly initial_budget: number },
+  grants: readonly { readonly generation_index: number; readonly additional_iterations: number }[],
+): PipelineV2StageIterationBudget {
+  if (!isNonNegativeSafeInteger(generation.initial_budget)) {
+    return { representable: false };
+  }
+  let grantsSum = 0;
+  for (const grant of grants) {
+    if (grant.generation_index !== generation.index || !isNonNegativeSafeInteger(grant.additional_iterations)) {
+      return { representable: false };
+    }
+    grantsSum += grant.additional_iterations;
+    if (!Number.isSafeInteger(grantsSum)) {
+      return { representable: false };
+    }
+  }
+  const effectiveBudget = generation.initial_budget + grantsSum;
+  if (!Number.isSafeInteger(effectiveBudget)) {
+    return { representable: false };
+  }
+  return { representable: true, effective_budget: effectiveBudget };
+}
+
 function isIsoTimestamp(value: unknown): value is string {
   return typeof value === "string" && ISO_TIMESTAMP_PATTERN.test(value);
 }
@@ -2472,25 +2518,18 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         // The effective-budget safety checks mirror the reducer's opening
         // rule exactly: the accumulated grant sum and the initial-budget
         // sum must both stay representable, so no rounded value can reach
-        // the comparison below.
-        let grantsSum = 0;
-        for (const grant of grants) {
-          if (grant.generation_index !== generation.index || !processedGrants.has(grant.index)) {
-            continue;
-          }
-          grantsSum += grant.additional_iterations;
-          if (!Number.isSafeInteger(grantsSum)) {
-            throw new PipelineV2StateError(
-              `the effective iteration budget of generation ${generation.index} is unrepresentable`,
-            );
-          }
-        }
-        const effectiveBudget = generation.initial_budget + grantsSum;
-        if (!Number.isSafeInteger(effectiveBudget)) {
+        // the comparison below. Both sums are owned by the single shared
+        // budget calculator.
+        const budget = pipelineV2StageIterationEffectiveBudget(
+          generation,
+          grants.filter((grant) => grant.generation_index === generation.index && processedGrants.has(grant.index)),
+        );
+        if (!budget.representable) {
           throw new PipelineV2StateError(
             `the effective iteration budget of generation ${generation.index} is unrepresentable`,
           );
         }
+        const effectiveBudget = budget.effective_budget;
         if (iteration.index > effectiveBudget) {
           throw new PipelineV2StateError(
             `iteration ${iteration.index} of generation ${generation.index} exceeds the effective iteration budget ${effectiveBudget} (initial budget ${generation.initial_budget} plus recorded grants)`,
@@ -4772,22 +4811,14 @@ export function reducePipelineV2RunCommand(
         );
       }
       requireNoInFlightExecution(current, "opening a stage iteration");
-      let grantsSum = 0;
-      for (const grant of current.grants) {
-        if (grant.generation_index === generation.index) {
-          grantsSum += grant.additional_iterations;
-          if (!Number.isSafeInteger(grantsSum)) {
-            fail(
-              current,
-              `the effective iteration budget of generation ${generation.index} is unrepresentable`,
-            );
-          }
-        }
-      }
-      const effectiveBudget = generation.initial_budget + grantsSum;
-      if (!Number.isSafeInteger(effectiveBudget)) {
+      const budget = pipelineV2StageIterationEffectiveBudget(
+        generation,
+        current.grants.filter((grant) => grant.generation_index === generation.index),
+      );
+      if (!budget.representable) {
         fail(current, `the effective iteration budget of generation ${generation.index} is unrepresentable`);
       }
+      const effectiveBudget = budget.effective_budget;
       if (generation.iteration_count + 1 > effectiveBudget) {
         fail(
           current,

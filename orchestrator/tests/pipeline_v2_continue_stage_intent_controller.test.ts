@@ -1429,6 +1429,11 @@ test("37. the controller reuses the existing layers only (source scan)", async (
   expect(countOf("loadPipelineV2PlanRevision(")).toBe(1);
   expect(countOf("publishPipelineV2WaitIntent(")).toBe(1);
   expect(countOf("hasPreparedRunPlanProvenance(")).toBe(1);
+  // the single shared budget calculator of the durable state module is the
+  // only cumulative-budget formula; no second validator exists here
+  expect(countOf("pipelineV2StageIterationEffectiveBudget(")).toBe(1);
+  expect(countOf("Number.isSafeInteger")).toBe(0);
+  expect(countOf("initial_budget +")).toBe(0);
   expect(countOf("prepareWaitIntent(")).toBe(0);
   expect(countOf("parseWaitIntent(")).toBe(0);
   expect(countOf("canonicalJson(")).toBe(0);
@@ -1448,4 +1453,166 @@ test("37. the controller reuses the existing layers only (source scan)", async (
   for (const banned of ["pipeline_v2_coordinator", "pipeline_v2_runner", "main.ts", "cli_", "docker", "launcher", "pipeline_v2_wait_store", "pipeline_v2_wait_controller"]) {
     expect(source).not.toContain(banned);
   }
+});
+
+describe("cumulative stage iteration budget (fail-fast preflight)", () => {
+  test("38. an unsafe MAX_SAFE_INTEGER request is refused before any dispatch with zero writes", async () => {
+    const ctx = await waitingReady();
+    try {
+      const before = ctx.sink.snapshot as PipelineV2RunState;
+      const intent = preparedIntent(ctx, { additional_iterations: Number.MAX_SAFE_INTEGER });
+      const recording = recordingSink(ctx.sink);
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ContinueStageIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent }),
+      );
+      const error = expectControllerError(cause, "invalid_state");
+      expect(error.message).toBe(
+        "the requested additional iterations would make the cumulative stage iteration budget unrepresentable",
+      );
+      expect(recording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).revision).toBe(before.revision);
+      // no intent artifact was published
+      await expect(readFile(join(ctx.fixture.runRoot, "run-plan", "intents", "1.json"), "utf8")).rejects.toThrow();
+      // the state is loader-valid and byte-identical in content
+      validatePipelineV2RunState(JSON.parse(JSON.stringify(ctx.sink.snapshot)) as never);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("39. the formula-derived minimum overflow value is refused identically", async () => {
+    const ctx = await waitingReady();
+    try {
+      const before = ctx.sink.snapshot as PipelineV2RunState;
+      // effective = initial_budget (2) + X must stay a safe integer: the
+      // first unsafe value is MAX_SAFE_INTEGER - initial_budget + 1
+      const minimumOverflow = Number.MAX_SAFE_INTEGER - (before.generations[0]?.initial_budget ?? 0) + 1;
+      expect(minimumOverflow).toBe(9007199254740990);
+      const intent = preparedIntent(ctx, { additional_iterations: minimumOverflow });
+      const recording = recordingSink(ctx.sink);
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ContinueStageIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent }),
+      );
+      expectControllerError(cause, "invalid_state");
+      expect(recording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).revision).toBe(before.revision);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("40. the exact representable boundary value is accepted and dispatched", async () => {
+    const ctx = await waitingReady();
+    try {
+      const before = ctx.sink.snapshot as PipelineV2RunState;
+      const boundary = Number.MAX_SAFE_INTEGER - (before.generations[0]?.initial_budget ?? 0);
+      expect(boundary).toBe(9007199254740989);
+      const intent = preparedIntent(ctx, { additional_iterations: boundary });
+      const recording = recordingSink(ctx.sink);
+      const result = await acceptPipelineV2ContinueStageIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent });
+      expect(recording.commands).toEqual([
+        { kind: "plan_intent_accepted", waitIndex: 1, intentSha256: intent.sha256 },
+      ]);
+      expect(result.state.revision).toBe(before.revision + 1);
+      expect(result.state.waits[0]?.intent?.intent_sha256).toBe(intent.sha256);
+      validatePipelineV2RunState(JSON.parse(JSON.stringify(result.state)) as never);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("41. the boundary accounts for the whole accumulated grant history", async () => {
+    const ctx = await waitingReady();
+    try {
+      // an honest prior continue cycle on the same generation: intent,
+      // grant of 1, grant-bound closure, response, iteration 2, stage
+      // execution, transition, second wait
+      const firstIntent = preparedIntent(ctx, { additional_iterations: 1 });
+      await acceptPipelineV2ContinueStageIntent({ runRoot: ctx.fixture.runRoot, sink: ctx.sink, intent: firstIntent });
+      await ctx.sink.dispatch({
+        kind: "iteration_grant_recorded",
+        generationIndex: 1,
+        waitIndex: 1,
+        intentSha256: firstIntent.sha256,
+        additionalIterations: 1,
+      });
+      await ctx.sink.dispatch({ kind: "stage_iteration_closed", generationIndex: 1, iterationIndex: 1, by: "grant", waitIndex: 1 });
+      await ctx.sink.dispatch({
+        kind: "wait_response_recorded",
+        waitIndex: 1,
+        expectedRequestSha256: (ctx.sink.snapshot as PipelineV2RunState).waits[0]!.request_sha256,
+        actionId: "continue_stage",
+        responseSha256: hex("7"),
+      });
+      await ctx.sink.dispatch({ kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 2, transitionCount: 2 });
+      await ctx.sink.dispatch({ kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 2 });
+      for (const command of agentPhases("second-stage")) {
+        await ctx.sink.dispatch(command);
+      }
+      await ctx.sink.dispatch({
+        kind: "transition_committed",
+        step: { from: "dev_entry", outcome: "completed", to: "architect", transition_index: 0 },
+        executionIndex: 3,
+      });
+      const open = ctx.sink.snapshot as PipelineV2RunState;
+      await ctx.sink.dispatch({
+        kind: "run_waiting",
+        stateId: "architect",
+        reason: "stage_iteration_completed",
+        requestSha256: hex("2"),
+        actions: [
+          { id: "continue_stage", to: "dev_entry" },
+          { id: "revise_task", to: "architect" },
+        ],
+      });
+      const waiting = ctx.sink.snapshot as PipelineV2RunState;
+      expect(waiting.waits).toHaveLength(2);
+      // the effective budget is now initial 2 + prior grant 1 = 3
+      const safeBoundary = Number.MAX_SAFE_INTEGER - 3;
+      const unsafeValue = safeBoundary + 1;
+      // the unsafe probe runs first: one intent belongs to one wait, so a
+      // refused request must leave the wait open for the valid value
+      const unsafeIntent = preparedIntent(ctx, { wait_index: 2, additional_iterations: unsafeValue });
+      const unsafeRecording = recordingSink(ctx.sink);
+      const cause = await catchAccept(() =>
+        acceptPipelineV2ContinueStageIntent({ runRoot: ctx.fixture.runRoot, sink: unsafeRecording, intent: unsafeIntent }),
+      );
+      expectControllerError(cause, "invalid_state");
+      expect(unsafeRecording.commands).toEqual([]);
+      expect((ctx.sink.snapshot as PipelineV2RunState).revision).toBe(waiting.revision);
+      expect((ctx.sink.snapshot as PipelineV2RunState).waits[1]?.intent).toBeUndefined();
+      // the exact representable boundary value is then accepted on the
+      // same untouched wait
+      const safeIntent = preparedIntent(ctx, { wait_index: 2, additional_iterations: safeBoundary });
+      const recording = recordingSink(ctx.sink);
+      const accepted = await acceptPipelineV2ContinueStageIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent: safeIntent });
+      expect(recording.commands).toEqual([
+        { kind: "plan_intent_accepted", waitIndex: 2, intentSha256: safeIntent.sha256 },
+      ]);
+      expect(accepted.state.waits[1]?.intent?.intent_sha256).toBe(safeIntent.sha256);
+      void open;
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
+
+  test("42. the preflight is scoped to the fresh path: an already durable intent stays an idempotent retry", async () => {
+    const ctx = await waitingReady();
+    try {
+      // a legacy damaged history: the unsafe intent was accepted before
+      // the preflight existed (the reducer still accepts the grant-less
+      // intent command); the exact durable intent must stay an idempotent
+      // retry, never re-classified
+      const intent = preparedIntent(ctx, { additional_iterations: Number.MAX_SAFE_INTEGER });
+      await ctx.sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: intent.sha256 });
+      const before = ctx.sink.snapshot as PipelineV2RunState;
+      const recording = recordingSink(ctx.sink);
+      const result = await acceptPipelineV2ContinueStageIntent({ runRoot: ctx.fixture.runRoot, sink: recording, intent });
+      expect(recording.commands).toEqual([]);
+      expect(result.intent_sha256).toBe(intent.sha256);
+      expect(result.state.revision).toBe(before.revision);
+    } finally {
+      await disposeRun(ctx.fixture);
+    }
+  });
 });

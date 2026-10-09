@@ -2905,7 +2905,19 @@ the declared action decides), the same run id and wait index, the last
 open stage generation with its open iteration, the generation's stage id
 and the generation's plan binding to the last durable plan revision, and
 a different already-accepted digest rejected as a typed conflict before
-any filesystem read — loads the authoritative plan revision manifest
+any filesystem read — and enforces the cumulative stage iteration
+budget fail-fast on the fresh path: before the reducer pre-check, the
+publication and the first dispatch, the shared budget calculator of the
+durable state module evaluates the open generation's effective budget
+(`initial_budget + Σ grants`, the caller's `additional_iterations`
+appended as the hypothetical next grant), and an unrepresentable
+cumulative budget is a typed `invalid_state` refusal with zero writes —
+a deterministic impossibility can never partially apply the intervention
+(the caller policy of `additional_iterations` is unchanged; only its
+arithmetic feasibility relative to the durable history is checked
+before the first write). The preflight is scoped to the fresh path: an
+already durable intent stays an idempotent retry without re-running the
+check. It then loads the authoritative plan revision manifest
 only from the durable ledger through the existing run-plan store
 (`null` is `invalid_state`; the loaded manifest must match the durable
 record exactly on run id, revision, digest, chain digest and origin

@@ -15,12 +15,13 @@
  * real one (the fake CLI transport is the only fake). No LLM, no Docker
  * Helper, no launcher credential, no sleeps.
  */
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "bun:test";
-import type { AuthFetcher, CliRunner, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
+import type { AuthFetcher, CliResult, CliRunner, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
+import { runCli, type CliIo } from "../src/main.ts";
 import {
   continuePipelineV2Stage,
   type PipelineV2RunnerDeps,
@@ -755,6 +756,8 @@ test("contract battery: malformed options, additionalIterations bounds and hosti
     { runId: RUN_ID, waitIndex: 1, additionalIterations: -2, configRoot: harness.configRoot },
     { runId: RUN_ID, waitIndex: 1, additionalIterations: 1.5, configRoot: harness.configRoot },
     { runId: RUN_ID, waitIndex: 1, additionalIterations: Number.MAX_SAFE_INTEGER + 1, configRoot: harness.configRoot },
+    { runId: RUN_ID, waitIndex: 1, additionalIterations: Number.POSITIVE_INFINITY, configRoot: harness.configRoot },
+    { runId: RUN_ID, waitIndex: 1, additionalIterations: Number.NaN, configRoot: harness.configRoot },
     { runId: RUN_ID, waitIndex: 1, additionalIterations: undefined, configRoot: harness.configRoot },
     { runId: "../escape", waitIndex: 1, additionalIterations: 2, configRoot: harness.configRoot },
     { runId: RUN_ID, waitIndex: 1, additionalIterations: 2, configRoot: "relative/config" },
@@ -1171,4 +1174,163 @@ test("the export surface gains exactly one runtime key and the module implements
   ]) {
     expect(source.includes(banned)).toBe(false);
   }
+});
+
+// --- cumulative stage iteration budget (fail-fast preflight) -----------------
+
+test("cumulative budget: an unsafe MAX_SAFE_INTEGER request is a fail-fast refusal with zero durable writes and zero sessions", async () => {
+  const harness = await makeHarness("pipeline-v2-continue-runner-budget-max-");
+  await drivePrefix(harness);
+  const before = await readDurableState(harness);
+  const sessionCreates: string[] = [];
+  const { outcome, sessionCreates: created } = await runContinue(harness, { additionalIterations: Number.MAX_SAFE_INTEGER }, {}, {});
+  expectPostRunRootFailure(outcome, harness);
+  expect(created).toEqual([]);
+  void sessionCreates;
+  const after = await readDurableState(harness);
+  expect(after.revision).toBe(before.revision);
+  expect(after.status).toBe("waiting");
+  expect(after.waits[0]?.intent).toBeUndefined();
+  expect(after.waits[0]?.response).toBeUndefined();
+  expect(after.grants).toEqual([]);
+  // the run-tree is untouched apart from nothing: the diagnostics carry the
+  // typed refusal, the durable state is byte-identical in content
+  expect(JSON.parse(JSON.stringify(after))).toEqual(JSON.parse(JSON.stringify(before)));
+});
+
+test("cumulative budget: after the fail-fast refusal the valid value continues the same untouched run (restart semantics)", async () => {
+  const harness = await makeHarness("pipeline-v2-continue-runner-budget-restart-");
+  await drivePrefix(harness);
+  const before = await readDurableState(harness);
+  const refused = await runContinue(harness, { additionalIterations: Number.MAX_SAFE_INTEGER - (before.generations[0]?.initial_budget ?? 0) + 1 });
+  expectPostRunRootFailure(refused.outcome, harness);
+  expect(refused.sessionCreates).toEqual([]);
+  expect((await readDurableState(harness)).revision).toBe(before.revision);
+  // the fresh runner call reopens the sink and continues the same boundary
+  const succeedingSessions: string[] = [];
+  const succeedingCli: CliRunner = async (args) => {
+    if (args[0] === "session" && args[1] === "create") {
+      succeedingSessions.push(`dhs_s_${succeedingSessions.length + 1}`);
+      return { code: 0, stdout: JSON.stringify({ ok: true, session: { id: succeedingSessions[succeedingSessions.length - 1], launcher_id: EXPECTED_LAUNCHER_ID }, token: "dhc_s" }) };
+    }
+    if (args[0] === "session" && args[1] === "delete") {
+      return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+    }
+    return { code: 0 };
+  };
+  const valid = await runContinue(harness, { additionalIterations: 1 }, {}, { cli: succeedingCli });
+  expect(valid.outcome.ok).toBe(false);
+  expect((valid.outcome as unknown as Record<string, unknown>).waiting).toBe(true);
+  expect(succeedingSessions).toHaveLength(2);
+  const after = await readDurableState(harness);
+  expect(after.status).toBe("waiting");
+  expect(after.grants).toHaveLength(1);
+  expect(after.grants[0]?.additional_iterations).toBe(1);
+  expect(after.waits).toHaveLength(2);
+});
+
+test("cumulative budget through the CLI: the unsafe request exits 1 without writes and the valid request succeeds", async () => {
+  const harness = await makeHarness("pipeline-v2-continue-runner-budget-cli-");
+  await drivePrefix(harness);
+  const before = await readDurableState(harness);
+  writeFileSync(join(harness.root, "cred.token"), "cred-token-not-real\n", { mode: 0o600 });
+  const stdout: string[] = [];
+  const errors: string[] = [];
+  let cliSessions = 0;
+  const io: CliIo = {
+    baseEnv: { HOME: "/home/u", CODER_SOURCE_VAR_1: "tester-secret" },
+    runner: {
+      run: async (args: string[]): Promise<CliResult> => {
+        if (args[0] === "session" && args[1] === "create") {
+          cliSessions += 1;
+          return { code: 0, stdout: JSON.stringify({ ok: true, session: { id: `dhs_cli_${cliSessions}`, launcher_id: EXPECTED_LAUNCHER_ID }, token: `dhc_${cliSessions}` }) };
+        }
+        if (args[0] === "session" && args[1] === "delete") {
+          return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
+        }
+        if (args[0] === "pull") {
+          return { code: 0 };
+        }
+        return { code: 0 };
+      },
+      killActive: () => false,
+    },
+    fetchAuth: async () => ({ status: 200, body: { authority: "launcher", principal: "tester", launcher_id: EXPECTED_LAUNCHER_ID } }),
+    resolveHelperConfig: () => ({ socketPath: "/run/dh.sock", credentialFile: join(harness.root, "cred.token") }),
+    resolveStateRootProjection: () => ({ localRoot: harness.stateRoot, daemonRoot: harness.stateRoot }),
+    runSmoke: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["runSmoke"],
+    runAgentSmoke: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["runAgentSmoke"],
+    runPipelineV2: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["runPipelineV2"],
+    resumePipelineV2: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["resumePipelineV2"],
+    continuePipelineV2Stage: continuePipelineV2Stage as unknown as CliIo["continuePipelineV2Stage"],
+    revisePipelineV2Task: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["revisePipelineV2Task"],
+    resumePipelineV2PlanningRunPlan: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["resumePipelineV2PlanningRunPlan"],
+    respondPipelineV2Wait: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["respondPipelineV2Wait"],
+    readTaskFile: (async () => {
+      throw new Error("fake not configured");
+    }) as unknown as CliIo["readTaskFile"],
+    writeStdout: (text: string) => {
+      stdout.push(text);
+    },
+    writeError: (text: string) => {
+      errors.push(text);
+    },
+  };
+  const unsafeExit = await runCli(
+    [
+      "continue-stage",
+      "--run-id", RUN_ID,
+      "--wait-index", "1",
+      "--additional-iterations", String(Number.MAX_SAFE_INTEGER),
+      "--config-root", harness.configRoot,
+      "--launcher-id", EXPECTED_LAUNCHER_ID,
+      "--json",
+    ],
+    io,
+  );
+  expect(unsafeExit).toBe(1);
+  const documents = stdout.filter((line) => line.trim() !== "");
+  expect(documents).toHaveLength(1);
+  const unsafeOutcome = JSON.parse(documents[0]!) as Record<string, unknown>;
+  expect(unsafeOutcome["ok"]).toBe(false);
+  expect(unsafeOutcome["exitCode"]).toBe(1);
+  expect(unsafeOutcome["runId"]).toBe(RUN_ID);
+  expect(Object.keys(unsafeOutcome).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect((await readDurableState(harness)).revision).toBe(before.revision);
+  // the valid request succeeds on the same untouched run
+  stdout.length = 0;
+  const validExit = await runCli(
+    [
+      "continue-stage",
+      "--run-id", RUN_ID,
+      "--wait-index", "1",
+      "--additional-iterations", "1",
+      "--config-root", harness.configRoot,
+      "--launcher-id", EXPECTED_LAUNCHER_ID,
+      "--json",
+    ],
+    io,
+  );
+  const validDocuments = stdout.filter((line) => line.trim() !== "");
+  const validOutcome = JSON.parse(validDocuments[0]!) as Record<string, unknown>;
+  expect(validExit).toBe(0);
+  expect(validOutcome["waiting"]).toBe(true);
+  expect(validOutcome["exitCode"]).toBe(0);
+  const after = await readDurableState(harness);
+  expect(after.status).toBe("waiting");
+  expect(after.grants[0]?.additional_iterations).toBe(1);
 });
