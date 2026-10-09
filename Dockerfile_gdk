@@ -3,8 +3,8 @@
 
 FROM registry.gitlab.com/gitlab-org/gitlab-development-kit/gitlab-gdk-in-a-box:latest
 
-ARG DOCKER_HELPER_VERSION=2.3.0
-ARG DOCKER_HELPER_SHA256=e2a24a7d01025a9d1269b8edbea7a2d94607efec08a06f5a93935b20d141a0f1
+ARG DOCKER_HELPER_VERSION=2.3.1
+ARG DOCKER_HELPER_SHA256=78798f5b85e78b210fb4b2cb57b3f4f9c18a6e49f5f3c39670170f147bb191e1
 
 USER root
 
