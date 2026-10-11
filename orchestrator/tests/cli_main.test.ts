@@ -139,6 +139,10 @@ function runOutcome(overrides: Partial<PipelineV2RunOutcome>): PipelineV2RunOutc
   } as PipelineV2RunOutcome;
 }
 
+function runOutcomeWithExitCode(overrides: Record<string, unknown>, code: number): PipelineV2RunOutcome {
+  return runOutcome({ ...overrides, exitCode: code } as Partial<PipelineV2RunOutcome>);
+}
+
 test("run dispatches exactly once to runPipelineV2 with the exact options mapping", async () => {
   const { io, err } = makeIo();
   const calls: Array<{ options: unknown; deps: unknown }> = [];
@@ -193,7 +197,7 @@ test("run deps.cli is wired to the single runner instance", async () => {
 test("exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const code of [0, 1, 130, 143]) {
     const { io } = makeIo();
-    io.runPipelineV2 = (async () => runOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["runPipelineV2"];
+    io.runPipelineV2 = (async () => runOutcomeWithExitCode({ ok: code === 0 }, code)) as unknown as CliIo["runPipelineV2"];
     const exit = await runCli(["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr"], io);
     expect(exit).toBe(code);
   }
@@ -733,7 +737,7 @@ test("continue-stage exit codes 0/1/130/143 pass through unchanged", async () =>
   for (const code of [0, 1, 130, 143]) {
     const { io } = makeIo();
     io.continuePipelineV2Stage = (async () =>
-      runOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["continuePipelineV2Stage"];
+      runOutcomeWithExitCode({ ok: code === 0 }, code)) as unknown as CliIo["continuePipelineV2Stage"];
     const exit = await runCli(CONTINUE_STAGE_ARGS, io);
     expect(exit).toBe(code);
   }
@@ -1099,7 +1103,7 @@ test("revise-task exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const code of [0, 1, 130, 143]) {
     const { io } = makeIo();
     io.revisePipelineV2Task = (async () =>
-      runOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["revisePipelineV2Task"];
+      runOutcomeWithExitCode({ ok: code === 0 }, code)) as unknown as CliIo["revisePipelineV2Task"];
     io.readTaskFile = async () => "BODY";
     const exit = await runCli(REVISE_TASK_ARGS, io);
     expect(exit).toBe(code);
@@ -1321,7 +1325,7 @@ test("resume exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const code of [0, 1, 130, 143]) {
     const { io } = makeIo();
     io.resumePipelineV2 = (async () =>
-      runOutcome({ ok: code === 0, exitCode: code })) as unknown as CliIo["resumePipelineV2"];
+      runOutcomeWithExitCode({ ok: code === 0 }, code)) as unknown as CliIo["resumePipelineV2"];
     const exit = await runCli(RESUME_ARGS, io);
     expect(exit).toBe(code);
   }
@@ -2477,12 +2481,14 @@ test("resume-plan exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const exitCode of [0, 1, 130, 143]) {
     const { io } = makeIo();
     io.resumePipelineV2PlanningRunPlan = (async () =>
-      runOutcome({
-        ok: exitCode === 0,
+      runOutcomeWithExitCode(
+        {
+          ok: exitCode === 0,
+          runId: "planning-run",
+          runRoot: exitCode === 0 ? "/state/root/pipeline-runs/planning-run" : null,
+        },
         exitCode,
-        runId: "planning-run",
-        runRoot: exitCode === 0 ? "/state/root/pipeline-runs/planning-run" : null,
-      })) as unknown as CliIo["resumePipelineV2PlanningRunPlan"];
+      )) as unknown as CliIo["resumePipelineV2PlanningRunPlan"];
     expect(await runCli(RESUME_PLAN_ARGS, io)).toBe(exitCode);
   }
 });

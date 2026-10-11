@@ -761,7 +761,7 @@ test("preflight failures reserve nothing: the id stays free for a corrected retr
     expect(outcome.exitCode).toBe(1);
     expect(outcome.runRoot).toBeNull();
     expect(outcome.state).toBeNull();
-    expect(outcome.reason).toBeUndefined();
+    expect(outcome.reason).toBe("invalid_options");
     expect(await lstat(join(harness.stateRoot, "pipeline-runs", runId)).then(
       () => true,
       () => false,
@@ -1112,6 +1112,22 @@ test("source restrictions: one generator site, one exclusive claim, no discovery
   // no discovery scan and no process-local registry in the runner
   expect(runner).not.toContain("readdir");
   expect(runner).not.toContain("new Map<string, PipelineV2RunState>");
-  // the collision error is exported for typed detection only
-  expect(runner).toContain("export class PipelineV2RunRootCollisionError");
+  // the collision error is owned by the public reason module and re-exported
+  expect(runner).toContain('export { PipelineV2RunRootCollisionError }');
+  const publicReasonSource = await readFile(
+    new URL("../src/pipeline_v2_public_reason.ts", import.meta.url),
+    "utf8",
+  );
+  expect(publicReasonSource).toContain("export class PipelineV2RunRootCollisionError");
+  expect(publicReasonSource).toContain("export const PIPELINE_V2_PUBLIC_REASONS");
+  expect(publicReasonSource).toContain("export function publicReasonFor");
+  // one reason mapper and one vocabulary; classification never uses
+  // substring matching, regular expressions or message text
+  expect(publicReasonSource).not.toContain(".includes(");
+  expect(publicReasonSource).not.toContain("RegExp");
+  expect(publicReasonSource).not.toContain(".match(");
+  expect(publicReasonSource).not.toContain(".test(");
+  // the runner classifies only through the mapper
+  expect(runner.split("publicReasonFor(").length - 1).toBeGreaterThan(0);
+  expect(runner).not.toContain('.message.includes');
 });

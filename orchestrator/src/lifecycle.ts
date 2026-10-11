@@ -20,7 +20,7 @@ export class SignalAbort extends Error {
   }
 }
 
-export function signalExitCode(signal: "SIGINT" | "SIGTERM"): number {
+export function signalExitCode(signal: "SIGINT" | "SIGTERM"): 130 | 143 {
   return signal === "SIGINT" ? 130 : 143;
 }
 

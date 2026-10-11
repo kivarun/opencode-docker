@@ -471,7 +471,7 @@ function expectPostRunRootFailure(
   expect(failed.runId).toBe(RUN_ID);
   expect(failed.runRoot).toBe(harness.runRoot);
   // the post-run-root failure shape carries no reason field
-  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
   expect(failed.state?.status).toBe(expectedStatus);
   return failed;
 }
@@ -481,7 +481,7 @@ function expectPreflightFailure(outcome: PipelineV2RunOutcome): void {
   expect(failed.runId).toBe("");
   expect(failed.runRoot).toBeNull();
   expect(failed.state).toBeNull();
-  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
 }
 
 /** Drives the revise intervention through the public first-half facade on a reopened run. */
@@ -770,7 +770,7 @@ test("loader-invalid wait journals are refused at the sink open, before any rout
     expect(failed.runId).toBe(RUN_ID);
     expect(failed.runRoot).toBe(harness.runRoot);
     expect(failed.state).toBeNull();
-    expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+    expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
     expect(authCalls).toBe(0);
     // the malformed document is never repaired
     const raw = JSON.parse(await readFile(harness.statePath, "utf8")) as Record<string, unknown>;
@@ -790,7 +790,7 @@ test("wrong-body R4: the handoff refuses with its own typed error; the durable t
   const failed = expectFailure(outcome);
   // the handoff's typed refusal passes through unclassified: no reason
   // field, the actual run identity and the completed boundary state
-  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
   expect(failed.runId).toBe(RUN_ID);
   expect(failed.runRoot).toBe(harness.runRoot);
   expect(failed.state?.status).toBe("active");

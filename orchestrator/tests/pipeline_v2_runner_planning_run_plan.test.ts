@@ -616,7 +616,7 @@ function expectPreflightFailure(outcome: PipelineV2RunOutcome): void {
   expect(failed.runId).toBe("");
   expect(failed.runRoot).toBeNull();
   expect(failed.state).toBeNull();
-  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
 }
 
 function expectPostRunRootFailure(
@@ -628,7 +628,7 @@ function expectPostRunRootFailure(
   expect(failed.runId).toBe(RUN_ID);
   expect(failed.runRoot).toBe(harness.runRoot);
   // the post-run-root failure shape carries no reason field
-  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
   expect(failed.state?.status).toBe(expectedStatus);
   return failed;
 }
@@ -1026,7 +1026,7 @@ test("existing-run precedence: missing state and an invalid run-root layout are 
   const missing = expectFailure((await runPlanning(harness)).outcome);
   expect(missing.runId).toBe(RUN_ID);
   expect(missing.runRoot).toBe(harness.runRoot);
-  expect(Object.keys(missing).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(missing).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
   expect(missing.state).toBeNull();
   expect((await runPlanning(harness)).sessionCreates).toEqual([]);
 

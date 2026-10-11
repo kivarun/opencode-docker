@@ -220,6 +220,37 @@ orchestrator run \
   inherit-asked CLI call (image pull, worker run) is captured and its output
   is forwarded to stderr, so stdout stays a single JSON document; argv, env,
   and every runtime decision stay untouched.
+- Every pipeline v2 JSON outcome with a nonzero exit code carries a REQUIRED
+  own `reason` property drawn from the one closed public vocabulary
+  (`PIPELINE_V2_PUBLIC_REASONS` in `orchestrator/src/pipeline_v2_public_reason.ts`):
+  the durable failure reasons of the run-state schema, the coordinator's
+  pre-resume refusal reasons, plus `run_already_exists`, `run_not_found`,
+  `invalid_options`, `invalid_result`, `run_cleanup_failed`,
+  `artifact_missing`, and `artifact_modified`. Success, the controlled
+  waiting suspension and the controlled plan-ready suspension carry exit
+  code 0 and no `reason`. The mapping is owned once by `publicReasonFor`:
+  typed error classes contribute their own closed reason (validated against
+  the vocabulary or translated through one explicit internal table, e.g.
+  lifecycle/grant/intent/candidate/revision/plan/wait conflicts and stale
+  progressed retries → `invalid_state`, invalid caller material →
+  `invalid_options`, storage failures → `state_persist_failed`, a modified
+  artifact → `artifact_modified`), and untyped causes fall back to the
+  category the failure site owns (`invalid_options` for caller
+  configuration, `internal_error` for unexpected failures). Classification
+  never reads error messages and never uses substring matching; the CLI only
+  serializes the outcome. The reason is safe-identifier shaped and
+  content-free: it is for machine handling, stderr stays the human
+  diagnostic.
+- Lost-result flow: the caller stores its run id before `run` → on a lost
+  result `orchestrator inspect --run-id R` shows the actual boundary
+  (`in_flight`, `resumable`, `plan_ready`, `waiting`, `succeeded`, `failed`)
+  → the caller applies the boundary-specific command (`resume`,
+  `continue-stage`, `revise-task`, `resume-plan`). A repeated command on a
+  progressed state is not an error to recover by hand: the outcome carries
+  the machine-readable reason (`invalid_state` for a stale retry) with zero
+  durable writes, and the caller calls `inspect` next. A successful inspect
+  of a failed run is an inspect success, not a command failure. One mutating
+  caller per run is still required (no multi-process locking).
 - The signal wiring is shared with v1: the first SIGINT/SIGTERM is forwarded
   to a running worker `run` CLI process through `killActive` (first-wins),
   and the lifecycle records a user abort only when the signal may still be

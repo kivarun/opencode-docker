@@ -1325,7 +1325,26 @@ async function runHostileDeps(
 }
 
 function expectPreflightOutcome(outcome: PipelineV2RunOutcome): void {
-  expect(outcome).toEqual({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
+  expect(outcome).toEqual({
+    ok: false,
+    exitCode: 1,
+    runId: "",
+    runRoot: null,
+    state: null,
+    reason: "invalid_options",
+  });
+  expect(Object.isFrozen(outcome)).toBe(true);
+}
+
+function expectRunLayoutRefusal(outcome: PipelineV2RunOutcome): void {
+  expect(outcome).toEqual({
+    ok: false,
+    exitCode: 1,
+    runId: "",
+    runRoot: null,
+    state: null,
+    reason: "run_layout_invalid",
+  });
   expect(Object.isFrozen(outcome)).toBe(true);
 }
 
@@ -1432,7 +1451,14 @@ test("F1g. unclean projection paths are rejected by the shared clean-path contra
       };
       (deps as { stateRootProjection: PipelineV2StateRootProjection }).stateRootProjection = projection;
       const { outcome, authCalls } = await runHostileDeps(harness, deps);
-      expect(outcome).toEqual({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
+      expect(outcome).toEqual({
+        ok: false,
+        exitCode: 1,
+        runId: "",
+        runRoot: null,
+        state: null,
+        reason: "invalid_options",
+      });
       expect(authCalls).toBe(0);
       expect(cliCalls).toBe(0);
     }
@@ -1623,7 +1649,7 @@ test("F4b. an existing pipeline-runs with mode 0755 is rejected unchanged", asyn
   const before = await lstat(runsDir);
   const runId = "unsafe-755-0000-0000-000000000000";
   const captured = await runScript(harness, { fixedRunId: runId });
-  expectPreflightOutcome(captured.outcome!);
+  expectRunLayoutRefusal(captured.outcome!);
   expect(createCount(captured.transport)).toBe(0);
   const after = await lstat(runsDir);
   expect(modeOf(after)).toBe(0o755);
@@ -1642,7 +1668,7 @@ test("F4c. an existing pipeline-runs with mode 0777 is rejected unchanged", asyn
   const before = await lstat(runsDir);
   const runId = "unsafe-777-0000-0000-000000000000";
   const captured = await runScript(harness, { fixedRunId: runId });
-  expectPreflightOutcome(captured.outcome!);
+  expectRunLayoutRefusal(captured.outcome!);
   const after = await lstat(runsDir);
   expect(modeOf(after)).toBe(0o777);
   expect(after.ino).toBe(before.ino);

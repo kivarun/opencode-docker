@@ -131,6 +131,13 @@ import {
   type PipelineV2FailureReason,
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
+import {
+  isPipelineV2RunStateStoreError,
+  PipelineV2PublicReasonError,
+  PipelineV2RunRootCollisionError,
+  publicReasonFor,
+  type PipelineV2PublicReason,
+} from "./pipeline_v2_public_reason.ts";
 import { loadPipelineV2, type ResolvedPipelineV2 } from "./pipeline_v2.ts";
 import { PipelineV2RunStateSink } from "./pipeline_v2_state_sink.ts";
 import {
@@ -138,7 +145,6 @@ import {
   resumePipelineV2Run,
   type PipelineV2CoordinatorControl,
   type PipelineV2ResumeCoordinationResult,
-  type PipelineV2ResumeRefusalReason,
 } from "./pipeline_v2_coordinator.ts";
 import { resumePipelineV2RunAfterContinueStageIntervention } from "./pipeline_v2_continue_stage_resume_controller.ts";
 import { resumePipelineV2RunAfterReviseTaskIntervention } from "./pipeline_v2_revise_task_resume_controller.ts";
@@ -192,6 +198,7 @@ export interface PipelineV2RunOptions {
  * disclosed — the caller must use `orchestrator inspect --run-id R`.
  */
 export type PipelineV2RunCollisionReason = "run_already_exists";
+export { PipelineV2RunRootCollisionError };
 
 /**
  * Trusted runtime configuration mapping the orchestrator-side state root
@@ -215,44 +222,83 @@ export interface PipelineV2RunnerDeps {
   readonly randomId?: () => string;
 }
 
-export interface PipelineV2RunOutcome {
-  readonly ok: boolean;
-  readonly exitCode: number;
+/**
+ * The exact discriminated union of the pipeline v2 run outcomes. Every
+ * branch carries its own exact own-key shape at runtime:
+ *
+ * - success (`ok: true`, `exitCode: 0`) — the run reached a success
+ *   terminal and published its outputs; no `reason`.
+ * - waiting (`waiting: true`, `exitCode: 0`) — the controlled suspension
+ *   at the trusted stage-wait boundary; no `reason`.
+ * - plan-ready (`planReady: true`, `exitCode: 0`) — the controlled
+ *   suspension at the settled-but-unbound planning acceptance boundary;
+ *   no `reason`.
+ * - failure (`exitCode: 1 | 130 | 143`) — every other completion,
+ *   including the pre-resume refusals: `reason` is a REQUIRED own
+ *   property drawn from the closed public vocabulary
+ *   (`PipelineV2PublicReason`); a machine consumer never parses stderr.
+ *
+ * The `waiting?`/`planReady?`/`reason?` markers on the non-owning branches
+ * are type-level narrowing aids only (`false`/`never`): they are never set
+ * at runtime, and the exact-key tests pin every branch's own-key shape.
+ */
+export type PipelineV2RunOutcome =
+  | PipelineV2RunSuccessOutcome
+  | PipelineV2RunWaitingOutcome
+  | PipelineV2RunPlanReadyOutcome
+  | PipelineV2RunFailureOutcome;
+
+export interface PipelineV2RunSuccessOutcome {
+  readonly ok: true;
+  readonly exitCode: 0;
   readonly runId: string;
   /** The canonical local run root once it was exclusively created. */
+  readonly runRoot: string;
+  readonly state: PipelineV2RunState;
+  readonly waiting?: false;
+  readonly planReady?: false;
+  readonly reason?: never;
+}
+
+export interface PipelineV2RunWaitingOutcome {
+  readonly ok: false;
+  readonly waiting: true;
+  readonly exitCode: 0;
+  readonly runId: string;
+  readonly runRoot: string;
+  readonly state: PipelineV2RunState;
+  readonly planReady?: false;
+  readonly reason?: never;
+}
+
+export interface PipelineV2RunPlanReadyOutcome {
+  readonly ok: false;
+  readonly planReady: true;
+  readonly exitCode: 0;
+  readonly runId: string;
+  readonly runRoot: string;
+  readonly state: PipelineV2RunState;
+  readonly waiting?: false;
+  readonly reason?: never;
+}
+
+export interface PipelineV2RunFailureOutcome {
+  readonly ok: false;
+  readonly exitCode: 1 | 130 | 143;
+  readonly runId: string;
   readonly runRoot: string | null;
   readonly state: PipelineV2RunState | null;
   /**
-   * The exact controlled-suspension branch: the run reached the trusted
-   * stage-wait boundary and is durably waiting. `ok: false` (the run is
-   * not complete), `waiting: true` (an ordinary suspension, not a
-   * failure or refusal), `exitCode: 0` (the command brought the run to
-   * the operator boundary successfully), the actual run id and run root
-   * and the authoritative state after the committed `run_waiting`; no
-   * `reason`, no `refused`, no extra envelope. Every consumer must check
-   * this branch before the ordinary `ok:false` failure/refusal shapes.
+   * The REQUIRED machine-readable reason of every nonzero-exit outcome:
+   * the durable failure reason, the structured pre-resume refusal reason
+   * of `resumePipelineV2`, or one of the runner-boundary categories
+   * (`invalid_options`, `run_not_found`, `run_already_exists`,
+   * `internal_error`, ...). Never parsed from stderr, never an internal
+   * reason outside the closed public vocabulary.
    */
-  readonly waiting?: boolean;
-  /**
-   * The exact plan-ready suspension branch: the run reached the
-   * settled-but-unbound planning acceptance boundary after a fully
-   * successful planning execution (the durable cleanup, no transition, no
-   * accepted plan). `ok: false` (the run is not complete),
-   * `planReady: true` (an ordinary suspension, not a failure or refusal),
-   * `exitCode: 0`, the actual run id and run root and the authoritative
-   * state; no `waiting`, no `reason`, no `refused`, no extra envelope.
-   * Every consumer must check this branch together with the waiting branch
-   * before the ordinary `ok:false` failure/refusal shapes.
-   */
-  readonly planReady?: boolean;
-  /**
-   * The durable failure reason, or the structured pre-resume refusal
-   * reason of `resumePipelineV2` (a refusal is not a durable failure: the
-   * state document is untouched). Omitted for preflight failures that
-   * happen before any state document could exist, for confirmed success
-   * and for the waiting branch.
-   */
-  readonly reason?: PipelineV2FailureReason | PipelineV2ResumeRefusalReason | PipelineV2RunCollisionReason;
+  readonly reason: PipelineV2PublicReason;
+  readonly waiting?: false;
+  readonly planReady?: false;
 }
 
 function isNonEmptyAbsolutePath(value: unknown): value is string {
@@ -261,29 +307,6 @@ function isNonEmptyAbsolutePath(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * Thrown only by the authoritative exclusive run-leaf claim when the run
- * id already names an existing object at
- * `<state-root>/pipeline-runs/<run-id>` (a valid run, an incomplete
- * directory, a symlink, a regular file or any other layout — the claim
- * never inspects the object and never follows a symlink). The fresh-run
- * collision path maps this error to the typed `run_already_exists`
- * outcome; the existing object's state is never opened, read or
- * disclosed.
- */
-export class PipelineV2RunRootCollisionError extends Error {
-  readonly runId: string;
-  readonly localRunRoot: string;
-  constructor(runId: string, localRunRoot: string) {
-    super(
-      `pipeline v2 runner: refusing to reuse an existing object at ${JSON.stringify(localRunRoot)}`,
-    );
-    this.name = "PipelineV2RunRootCollisionError";
-    this.runId = runId;
-    this.localRunRoot = localRunRoot;
-  }
 }
 
 /**
@@ -490,7 +513,12 @@ async function prepareRunRoot(
   // The mode belongs to the runner-owned layout, not to the shared
   // inspection primitives: created and pre-existing directories are held
   // to the same exact 0700 contract.
-  await assertExactDirectoryMode0700(pipelineRunsLocal, "pipeline-runs");
+  try {
+    await assertExactDirectoryMode0700(pipelineRunsLocal, "pipeline-runs");
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    throw new PipelineV2PublicReasonError("run_layout_invalid", message);
+  }
   const runsFailure = await verifyPair(pipelineRunsLocal, pipelineRunsDaemon, "pipeline-runs");
   if (runsFailure !== null) {
     throw runsFailure;
@@ -602,7 +630,14 @@ export async function runPipelineV2(
   const preflightFailure = (cause: unknown): PipelineV2RunOutcome => {
     const message = cause instanceof Error ? cause.message : String(cause);
     console.error(`orchestrator: pipeline v2 run failed: ${message}`);
-    return deepFreeze({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId: "",
+      runRoot: null,
+      state: null,
+      reason: publicReasonFor(cause, "invalid_options"),
+    });
   };
 
   let gate: RunCauseGate;
@@ -719,10 +754,11 @@ export async function runPipelineV2(
     cause: unknown,
     runRootPath: string,
     state: PipelineV2RunState | null,
+    reason: PipelineV2PublicReason,
   ): PipelineV2RunOutcome => {
     const message = cause instanceof Error ? cause.message : String(cause);
     console.error(`orchestrator: pipeline v2 run failed: ${message}`);
-    return deepFreeze({ ok: false, exitCode: 1, runId, runRoot: runRootPath, state });
+    return deepFreeze({ ok: false, exitCode: 1, runId, runRoot: runRootPath, state, reason });
   };
 
   // The run-root boundary: from the successful exclusive creation of the
@@ -755,7 +791,7 @@ export async function runPipelineV2(
       });
     }
     if (leaf.created && leaf.localRunRoot !== null) {
-      return postRunRootFailure(cause, leaf.localRunRoot, null);
+      return postRunRootFailure(cause, leaf.localRunRoot, null, publicReasonFor(cause, "invalid_options"));
     }
     return preflightFailure(cause);
   }
@@ -789,7 +825,7 @@ export async function runPipelineV2(
     if (recordedSignal() !== null) {
       return postRunRootSignalOutcome(runRoot.localRunRoot, state);
     }
-    return postRunRootFailure(cause, runRoot.localRunRoot, state);
+    return postRunRootFailure(cause, runRoot.localRunRoot, state, publicReasonFor(cause, "invalid_options"));
   }
   const sink = sinkOrNull;
   const preCoordinatorSignal = recordedSignal();
@@ -830,6 +866,7 @@ export async function runPipelineV2(
       runId,
       runRoot: runRoot.localRunRoot,
       state,
+      reason: publicReasonFor(cause, "internal_error"),
     });
   }
 
@@ -1410,56 +1447,85 @@ async function verifyExistingRunRoot(
     );
   }
 
+  // A missing runs directory means no run with this id exists; every other
+  // runs-directory divergence is a run-layout refusal.
   const pipelineRunsLocal = `${localStateRoot.replace(/\/+$/, "")}/pipeline-runs`;
   const pipelineRunsDaemon = `${daemonStateRoot.replace(/\/+$/, "")}/pipeline-runs`;
   const existing = await inspectProjectionObject(pipelineRunsLocal, "directory");
+  if (existing.failure === "missing") {
+    throw new PipelineV2PublicReasonError(
+      "run_not_found",
+      `pipeline v2 resume: no pipeline v2 runs directory at ${JSON.stringify(pipelineRunsLocal)}`,
+    );
+  }
   if (existing.failure !== null) {
-    throw new Error(
+    throw new PipelineV2PublicReasonError(
+      "run_layout_invalid",
       `pipeline v2 resume: ${JSON.stringify(pipelineRunsLocal)} is not a real non-symlink directory`,
     );
   }
-  await assertExactDirectoryMode0700(pipelineRunsLocal, "pipeline-runs");
+  try {
+    await assertExactDirectoryMode0700(pipelineRunsLocal, "pipeline-runs");
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    throw new PipelineV2PublicReasonError("run_layout_invalid", message);
+  }
   const runsFailure = await verifyPair(pipelineRunsLocal, pipelineRunsDaemon, "pipeline-runs");
   if (runsFailure !== null) {
-    throw runsFailure;
+    throw new PipelineV2PublicReasonError("run_layout_invalid", runsFailure.message);
   }
 
-  const localRunRoot = `${pipelineRunsLocal}/${runId}`;
-  const runRootInfo = await inspectProjectionObject(localRunRoot, "directory");
-  if (runRootInfo.failure === "missing") {
-    throw new Error(
-      `pipeline v2 resume: no existing run root at ${JSON.stringify(localRunRoot)}`,
-    );
+  // The run-root section carries typed public reasons: a missing run is
+  // `run_not_found`, every other run-root layout divergence is the
+  // established `run_layout_invalid` refusal reason.
+  try {
+    const localRunRoot = `${pipelineRunsLocal}/${runId}`;
+    const runRootInfo = await inspectProjectionObject(localRunRoot, "directory");
+    if (runRootInfo.failure === "missing") {
+      throw new PipelineV2PublicReasonError(
+        "run_not_found",
+        `pipeline v2 resume: no existing run root at ${JSON.stringify(localRunRoot)}`,
+      );
+    }
+    if (runRootInfo.failure !== null || runRootInfo.identity === null) {
+      throw new PipelineV2PublicReasonError(
+        "run_layout_invalid",
+        `pipeline v2 resume: ${JSON.stringify(localRunRoot)} is not a real non-symlink directory`,
+      );
+    }
+    await assertExactDirectoryMode0700(localRunRoot, "run directory");
+    const translation = translateProjectionPath(localStateRoot, daemonStateRoot, localRunRoot);
+    if (!translation.ok) {
+      throw new PipelineV2PublicReasonError(
+        "run_layout_invalid",
+        `pipeline v2 resume: the run root ${JSON.stringify(localRunRoot)} has no clean projection suffix under the state root`,
+      );
+    }
+    const daemonRunRoot = translation.daemonPath;
+    const runRootFailure = await verifyPair(localRunRoot, daemonRunRoot, "run directory");
+    if (runRootFailure !== null) {
+      throw new PipelineV2PublicReasonError("run_layout_invalid", runRootFailure.message);
+    }
+    const runRootIdentity = runRootInfo.identity;
+    const daemonRunRootInfo = await inspectProjectionObject(daemonRunRoot, "directory");
+    if (
+      daemonRunRootInfo.failure !== null ||
+      daemonRunRootInfo.identity === null ||
+      !sameProjectionIdentity(runRootIdentity, daemonRunRootInfo.identity)
+    ) {
+      throw new PipelineV2PublicReasonError(
+        "run_layout_invalid",
+        `pipeline v2 resume: the daemon-side run root ${JSON.stringify(daemonRunRoot)} is not the same real object as ${JSON.stringify(localRunRoot)} (dev/ino differ)`,
+      );
+    }
+    return { localRunRoot, daemonRunRoot };
+  } catch (cause) {
+    if (cause instanceof PipelineV2PublicReasonError) {
+      throw cause;
+    }
+    const message = cause instanceof Error ? cause.message : String(cause);
+    throw new PipelineV2PublicReasonError("run_layout_invalid", message);
   }
-  if (runRootInfo.failure !== null || runRootInfo.identity === null) {
-    throw new Error(
-      `pipeline v2 resume: ${JSON.stringify(localRunRoot)} is not a real non-symlink directory`,
-    );
-  }
-  await assertExactDirectoryMode0700(localRunRoot, "run directory");
-  const translation = translateProjectionPath(localStateRoot, daemonStateRoot, localRunRoot);
-  if (!translation.ok) {
-    throw new Error(
-      `pipeline v2 resume: the run root ${JSON.stringify(localRunRoot)} has no clean projection suffix under the state root`,
-    );
-  }
-  const daemonRunRoot = translation.daemonPath;
-  const runRootFailure = await verifyPair(localRunRoot, daemonRunRoot, "run directory");
-  if (runRootFailure !== null) {
-    throw runRootFailure;
-  }
-  const runRootIdentity = runRootInfo.identity;
-  const daemonRunRootInfo = await inspectProjectionObject(daemonRunRoot, "directory");
-  if (
-    daemonRunRootInfo.failure !== null ||
-    daemonRunRootInfo.identity === null ||
-    !sameProjectionIdentity(runRootIdentity, daemonRunRootInfo.identity)
-  ) {
-    throw new Error(
-      `pipeline v2 resume: the daemon-side run root ${JSON.stringify(daemonRunRoot)} is not the same real object as ${JSON.stringify(localRunRoot)} (dev/ino differ)`,
-    );
-  }
-  return { localRunRoot, daemonRunRoot };
 }
 
 /**
@@ -1533,7 +1599,14 @@ async function runExistingPipelineV2(
   const preflightFailure = (cause: unknown): PipelineV2RunOutcome => {
     const message = cause instanceof Error ? cause.message : String(cause);
     console.error(`orchestrator: ${flow.failureLogPrefix}: ${message}`);
-    return deepFreeze({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null });
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId: "",
+      runRoot: null,
+      state: null,
+      reason: publicReasonFor(cause, "invalid_options"),
+    });
   };
 
   let gate: RunCauseGate;
@@ -1579,7 +1652,16 @@ async function runExistingPipelineV2(
     if (recordedSignal() !== null) {
       return signalOutcomeBeforeRunRoot();
     }
-    return preflightFailure(cause);
+    const message = cause instanceof Error ? cause.message : String(cause);
+    console.error(`orchestrator: ${flow.failureLogPrefix}: ${message}`);
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId: "",
+      runRoot: null,
+      state: null,
+      reason: publicReasonFor(cause, "invalid_options"),
+    });
   }
   if (recordedSignal() !== null) {
     return signalOutcomeBeforeRunRoot();
@@ -1603,10 +1685,11 @@ async function runExistingPipelineV2(
   const postRunRootFailure = (
     cause: unknown,
     state: PipelineV2RunState | null,
+    reason: PipelineV2PublicReason,
   ): PipelineV2RunOutcome => {
     const message = cause instanceof Error ? cause.message : String(cause);
     console.error(`orchestrator: ${flow.failureLogPrefix}: ${message}`);
-    return deepFreeze({ ok: false, exitCode: 1, runId, runRoot: runRoot.localRunRoot, state });
+    return deepFreeze({ ok: false, exitCode: 1, runId, runRoot: runRoot.localRunRoot, state, reason });
   };
 
   // --- sink open (read-only), then the durable snapshot --------------------
@@ -1622,7 +1705,14 @@ async function runExistingPipelineV2(
     if (recordedSignal() !== null) {
       return postRunRootSignalOutcome(null);
     }
-    return postRunRootFailure(cause, null);
+    // An open-time store error means the state document bound to this run
+    // is not loadable; the state-schema validation errors keep their own
+    // typed reason; everything else is unexpected.
+    const reason: PipelineV2PublicReason =
+      isPipelineV2RunStateStoreError(cause)
+        ? "missing_state"
+        : publicReasonFor(cause, "internal_error");
+    return postRunRootFailure(cause, null, reason);
   }
   const sink = sinkOrNull;
   if (recordedSignal() !== null) {
@@ -1645,7 +1735,7 @@ async function runExistingPipelineV2(
       if (recordedSignal() !== null) {
         return postRunRootSignalOutcome(sink.snapshot);
       }
-      return postRunRootFailure(cause, sink.snapshot);
+      return postRunRootFailure(cause, sink.snapshot, publicReasonFor(cause, "invalid_state"));
     }
     if (recordedSignal() !== null) {
       return postRunRootSignalOutcome(sink.snapshot);
@@ -1671,7 +1761,7 @@ async function runExistingPipelineV2(
     if (recordedSignal() !== null) {
       return postRunRootSignalOutcome(sink.snapshot);
     }
-    return postRunRootFailure(cause, sink.snapshot);
+    return postRunRootFailure(cause, sink.snapshot, publicReasonFor(cause, "invalid_options"));
   }
   if (recordedSignal() !== null) {
     return postRunRootSignalOutcome(sink.snapshot);
@@ -1687,7 +1777,7 @@ async function runExistingPipelineV2(
     if (recordedSignal() !== null) {
       return postRunRootSignalOutcome(sink.snapshot);
     }
-    return postRunRootFailure(cause, sink.snapshot);
+    return postRunRootFailure(cause, sink.snapshot, publicReasonFor(cause, "invalid_options"));
   }
   if (recordedSignal() !== null) {
     return postRunRootSignalOutcome(sink.snapshot);
@@ -1708,7 +1798,7 @@ async function runExistingPipelineV2(
     if (recordedSignal() !== null) {
       return postRunRootSignalOutcome(sink.snapshot);
     }
-    return postRunRootFailure(cause, sink.snapshot);
+    return postRunRootFailure(cause, sink.snapshot, publicReasonFor(cause, "invalid_options"));
   }
   if (recordedSignal() !== null) {
     return postRunRootSignalOutcome(sink.snapshot);
@@ -1747,6 +1837,7 @@ async function runExistingPipelineV2(
       runId,
       runRoot: runRoot.localRunRoot,
       state,
+      reason: publicReasonFor(cause, "internal_error"),
     });
   }
 

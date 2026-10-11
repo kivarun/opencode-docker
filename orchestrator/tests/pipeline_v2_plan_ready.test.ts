@@ -1136,7 +1136,8 @@ test("7div. the initial plan-ready boundary continues through resume-plan: accep
   expect(refused.planReady).toBeUndefined();
   expect(refused.waiting).toBeUndefined();
   expect(refused.exitCode).toBe(1);
-  expect("reason" in refused).toBe(false);
+  // the progressed boundary is the established typed invalid_state refusal
+  expect(refused.reason).toBe("invalid_state");
   expect(refused.runId).toBe(runId);
   expect(refused.state?.status).toBe("waiting");
   expect(await fingerprint(harness.runRoot)).toBe(before);

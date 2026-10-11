@@ -468,8 +468,8 @@ function expectPostRunRootFailure(
   const failed = expectFailure(outcome);
   expect(failed.runId).toBe(RUN_ID);
   expect(failed.runRoot).toBe(harness.runRoot);
-  // the post-run-root failure shape carries no reason field
-  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  // the post-run-root failure shape carries the required public reason
+  expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
   expect(failed.state?.status).toBe(expectedStatus);
   return failed;
 }
@@ -606,7 +606,7 @@ test("derivation refusals happen before any pipeline, profile, authority or runt
   expect(zero.runId).toBe("");
   expect(zero.runRoot).toBeNull();
   expect(zero.state).toBeNull();
-  expect(Object.keys(zero).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(zero).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
 
   // the target wait is not the last: a second wait was entered later
   const twoWaits = await makeHarness("pipeline-v2-continue-runner-two-waits-");
@@ -749,7 +749,7 @@ test("contract battery: malformed options, additionalIterations bounds and hosti
     expect(failed.runId).toBe("");
     expect(failed.runRoot).toBeNull();
     expect(failed.state).toBeNull();
-    expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+    expect(Object.keys(failed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
   };
   for (const options of [
     { runId: RUN_ID, waitIndex: 1, additionalIterations: 0, configRoot: harness.configRoot },
@@ -1313,7 +1313,7 @@ test("cumulative budget through the CLI: the unsafe request exits 1 without writ
   expect(unsafeOutcome["ok"]).toBe(false);
   expect(unsafeOutcome["exitCode"]).toBe(1);
   expect(unsafeOutcome["runId"]).toBe(RUN_ID);
-  expect(Object.keys(unsafeOutcome).sort()).toEqual(["exitCode", "ok", "runId", "runRoot", "state"]);
+  expect(Object.keys(unsafeOutcome).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot", "state"]);
   expect((await readDurableState(harness)).revision).toBe(before.revision);
   // the valid request succeeds on the same untouched run
   stdout.length = 0;
