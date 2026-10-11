@@ -1,5 +1,5 @@
 import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { loadPipelineV2, type ResolvedPipelineV2 } from "./pipeline_v2.ts";
 import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
 import { comparePipelineV2RunIdentity } from "./pipeline_v2_identity_compare.ts";
@@ -17,6 +17,12 @@ import {
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
 import { PipelineV2RunStateStore } from "./pipeline_v2_state_store.ts";
+import {
+  verifyPublishedRunOutputs,
+  verifyPublishedRunOutputsAgainstRecord,
+  PipelineV2RunOutputTreeDefectError,
+  type PipelineV2PublishedRunOutputRecord,
+} from "./pipeline_v2_runtime.ts";
 import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 
 /**
@@ -209,6 +215,126 @@ function mapRestoreReason(
 }
 
 /**
+ * Maps one published-tree verification defect onto the closed inspect
+ * vocabulary: a missing durably-present artifact is `artifact_missing`,
+ * every modification, substitution, extra entry, digest or schema
+ * mismatch is `artifact_modified`. The verifier's own typed defect is the
+ * only input — never its message text.
+ */
+function mapPublishedTreeDefect(
+  cause: unknown,
+): PipelineV2InspectPostRootReason | null {
+  if (!(cause instanceof PipelineV2RunOutputTreeDefectError)) {
+    return null;
+  }
+  return cause.defect === "missing" ? "artifact_missing" : "artifact_modified";
+}
+
+/**
+ * The read-only published-output verification of one finalized run: a
+ * durable `run_outputs` record obliges the published tree to exist and
+ * match the record exactly (the success boundary always carries the
+ * record; a failed run without one never published and is not required
+ * to). Nothing is created, moved or removed; the returned reason is
+ * the inspect's own closed vocabulary, `null` on a verified boundary.
+ */
+async function verifyFinalizedRunOutputs(
+  pipeline: ResolvedPipelineV2,
+  state: PipelineV2RunState,
+  runRoot: string,
+): Promise<PipelineV2InspectPostRootReason | null> {
+  const record = state.run_outputs;
+  if (record === undefined) {
+    // The loader guarantees the publication record on the success
+    // boundary; a missing record there is a damaged run, not a clean one.
+    return state.status === "success" ? "artifact_missing" : null;
+  }
+  const outputsPath = join(runRoot, "outputs");
+  let info;
+  try {
+    info = await lstat(outputsPath);
+  } catch {
+    return "artifact_missing";
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    return "artifact_modified";
+  }
+  try {
+    await verifyPublishedRunOutputsAgainstRecord(
+      pipeline,
+      outputsPath,
+      record as readonly PipelineV2PublishedRunOutputRecord[],
+    );
+  } catch (cause) {
+    return mapPublishedTreeDefect(cause) ?? "internal_error";
+  }
+  return null;
+}
+
+/**
+ * The read-only published-output verification of one terminal recovery
+ * window. The publication phase is distinguished from the expectation:
+ * before the publication has begun (no durable record, no tree) the
+ * boundary is the ordinary resumable terminal chain; an existing tree
+ * without the durable record is the T2 orphan and must be exactly the
+ * publication the trusted sources determine; a durable record obliges
+ * the tree to exist and match it exactly.
+ */
+async function verifyTerminalPublication(
+  pipeline: ResolvedPipelineV2,
+  state: PipelineV2RunState,
+  runRoot: string,
+  runInputs: unknown,
+  acceptedOutputs: readonly unknown[],
+): Promise<PipelineV2InspectPostRootReason | null> {
+  const outputsPath = join(runRoot, "outputs");
+  let info;
+  try {
+    info = await lstat(outputsPath);
+  } catch {
+    info = null;
+  }
+  if (state.run_outputs === undefined) {
+    if (info === null) {
+      // The publication has not begun: the ordinary resumable terminal
+      // chain (the recovery records and publishes it at resume).
+      return null;
+    }
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      return "artifact_modified";
+    }
+    // The T2 orphan: the tree exists before its durable record; it must
+    // be exactly the publication the trusted sources determine.
+    try {
+      await verifyPublishedRunOutputs(
+        pipeline,
+        runInputs as Parameters<typeof verifyPublishedRunOutputs>[1],
+        acceptedOutputs,
+      );
+    } catch (cause) {
+      return mapPublishedTreeDefect(cause) ?? "internal_error";
+    }
+    return null;
+  }
+  if (info === null) {
+    return "artifact_missing";
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    return "artifact_modified";
+  }
+  try {
+    await verifyPublishedRunOutputsAgainstRecord(
+      pipeline,
+      outputsPath,
+      state.run_outputs as readonly PipelineV2PublishedRunOutputRecord[],
+    );
+  } catch (cause) {
+    return mapPublishedTreeDefect(cause) ?? "internal_error";
+  }
+  return null;
+}
+
+/**
  * Inspects one durable pipeline v2 run and returns the versioned external
  * projection, or exactly one typed failure. Every path is read-only: the
  * run state is loaded through the read-only snapshot store, the pipeline
@@ -332,16 +458,30 @@ async function classifyInspectBoundary(
   state: PipelineV2RunState,
   runRoot: string,
 ): Promise<PipelineV2InspectBoundary | PipelineV2InspectPostRootReason> {
-  // 1. Finalized runs inspect successfully with their terminal boundary.
+  // 1. Finalized runs inspect successfully with their terminal boundary —
+  //    but only when the published outputs they claim are intact: a
+  //    durable `run_outputs` record obliges the published tree to exist
+  //    and match it exactly (a failed run without a publication record
+  //    never published and is not required to).
   if (state.status === "success") {
     if (state.terminal === undefined) {
       return "run_state_invalid";
+    }
+    const outputsReason = await verifyFinalizedRunOutputs(pipeline, state, runRoot);
+    if (outputsReason !== null) {
+      return outputsReason;
     }
     return deepFreezeValue({ kind: "succeeded" as const, terminalStateId: state.terminal.state_id });
   }
   if (state.status === "failed" || state.status === "cleanup_failed") {
     if (state.failure === undefined) {
       return "run_state_invalid";
+    }
+    if (state.run_outputs !== undefined) {
+      const outputsReason = await verifyFinalizedRunOutputs(pipeline, state, runRoot);
+      if (outputsReason !== null) {
+        return outputsReason;
+      }
     }
     return deepFreezeValue({ kind: "failed" as const, reason: state.failure.reason });
   }
@@ -386,9 +526,14 @@ async function classifyInspectBoundary(
   // 4. The single authoritative recovery classifier: every post-commit
   //    crash window is externally `resumable` (the one safe action is
   //    `orchestrator resume`); a classifier pipeline mismatch is a typed
-  //    inspect failure.
+  //    inspect failure. A terminal-recovery window additionally verifies
+  //    the published outputs it will adopt or has already recorded: the
+  //    publication phase decides the expectation (before the publication
+  //    a missing tree is the ordinary terminal chain; an existing tree is
+  //    the T2 orphan and must be exact; a durable record obliges the tree
+  //    to exist and match it).
   const recovery = classifyPipelineV2ResumeRecovery(pipeline, state);
-  if (recovery.kind === "transition" || recovery.kind === "run-finalization" || recovery.kind === "terminal") {
+  if (recovery.kind === "transition" || recovery.kind === "run-finalization") {
     return deepFreezeValue({
       kind: "resumable" as const,
       stateId: state.cursor.current_state,
@@ -397,6 +542,32 @@ async function classifyInspectBoundary(
   }
   if (recovery.kind === "pipeline-mismatch") {
     return "pipeline_mismatch";
+  }
+  if (recovery.kind === "terminal") {
+    let restored: Awaited<ReturnType<typeof restorePipelineV2RuntimeContext>>;
+    try {
+      restored = await restorePipelineV2RuntimeContext(pipeline, state, runRoot);
+    } catch (cause) {
+      if (cause instanceof PipelineV2RuntimeContextRestoreError) {
+        return mapRestoreReason(cause.reason);
+      }
+      return "internal_error";
+    }
+    const outputsReason = await verifyTerminalPublication(
+      pipeline,
+      state,
+      runRoot,
+      restored.run_inputs,
+      restored.accepted_outputs,
+    );
+    if (outputsReason !== null) {
+      return outputsReason;
+    }
+    return deepFreezeValue({
+      kind: "resumable" as const,
+      stateId: state.cursor.current_state,
+      transitionCount: state.cursor.transition_count,
+    });
   }
 
   // 5. A genuinely in-flight execution (never a settled recovery window).

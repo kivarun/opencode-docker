@@ -3095,37 +3095,86 @@ async function collectRunOutputsInternal(
  * `run_outputs_published` record is identical across a crash and its
  * recovery.
  */
-async function adoptPublishedRunOutputs(
-  pipeline: ResolvedPipelineV2,
-  runInputs: RunInputsSnapshot,
-  acceptedOutputs: readonly unknown[],
-  provenance: RunInputSnapshotProvenance,
-  runRootCanonical: string,
-  outputsPath: string,
-): Promise<RunOutputsSnapshot> {
-  // The published root must still be a real non-symlink directory
-  // resolving exactly to its fixed path (a substituted or symlinked root
-  // is a typed publish failure, never an adoption).
-  await withRuntimeReason("run_output_publish_failed", async () => {
-    await requireRealDirectory(outputsPath, "run outputs root");
-    const resolved = await realpath(outputsPath);
-    if (resolved !== outputsPath) {
-      throw fail(`run outputs root ${outputsPath} does not resolve to its canonical path`);
+/**
+ * The stable defect classification of one published-run-output-tree
+ * verification failure. The single read-only verifier that owns the
+ * published-tree contract reports its discrepancies through this class so
+ * both owners can map them without message parsing: the recovery
+ * adoption rebuilds the exact existing runtime error (byte-identical
+ * reason and message), and the read-only inspect maps the defect onto its
+ * own closed reason vocabulary. The class carries no content: messages
+ * name declared output ids and fixed layout facts only.
+ */
+export type PipelineV2RunOutputTreeDefect = "missing" | "modified" | "layout";
+
+export class PipelineV2RunOutputTreeDefectError extends Error {
+  readonly defect: PipelineV2RunOutputTreeDefect;
+  readonly runtimeReason: "run_output_invalid" | "run_output_publish_failed";
+
+  constructor(defect: PipelineV2RunOutputTreeDefect, runtimeReason: "run_output_invalid" | "run_output_publish_failed", message: string) {
+    super(message);
+    this.name = "PipelineV2RunOutputTreeDefectError";
+    this.defect = defect;
+    this.runtimeReason = runtimeReason;
+  }
+}
+
+/**
+ * The structural shape of one durable run-output record the record-bound
+ * verifier binds to: the same fields the durable `run_outputs` journal
+ * carries, declared structurally so the runtime module stays decoupled
+ * from the durable-state module.
+ */
+export type PipelineV2PublishedRunOutputRecord =
+  | { readonly id: string; readonly type: PortType; readonly required: boolean; readonly present: true; readonly digest: string }
+  | { readonly id: string; readonly type: PortType; readonly required: boolean; readonly present: false };
+
+/** The authoritative expectation for one declared run output. */
+interface PublishedRunOutputExpectation {
+  readonly id: string;
+  readonly type: PortType;
+  readonly required: boolean;
+  readonly present: boolean;
+  readonly digest?: string;
+}
+
+/**
+ * Maps one operation's plain pipeline failures onto the `modified` defect
+ * with the message preserved byte-for-byte — the verifier's equivalent of
+ * the adoption path's `withRuntimeReason("run_output_invalid", ...)`.
+ */
+async function defectModified<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (cause) {
+    if (cause instanceof PipelineV2RunOutputTreeDefectError) {
+      throw cause;
     }
-  });
+    if (cause instanceof PipelineError) {
+      throw new PipelineV2RunOutputTreeDefectError("modified", "run_output_invalid", cause.message);
+    }
+    throw cause;
+  }
+}
 
-  // The same prologue as the fresh path: the run-owned snapshot and the
-  // whole accepted history must still be intact before anything is
-  // verified.
-  await verifyRunInputsSnapshot(runInputs, provenance);
-  const acceptedByRef = await resolveAcceptedHistory(
-    pipeline,
-    acceptedOutputs,
-    runRootCanonical,
-    undefined,
-  );
-
-  const publishedNames = await withRuntimeReason("run_output_publish_failed", async () => {
+/**
+ * The single shared published-tree verification: the declared outputs are
+ * checked against the authoritative expectation in declaration order —
+ * exact presence, real non-symlink kind, the recomputed
+ * `pipeline-v2-run-output` digest over the published bytes, the JSON
+ * schema of every json output, and no extra top-level entry. The
+ * verification is strictly read-only: it creates, renames and deletes
+ * nothing and reuses the existing canonical readers, schema validation
+ * and digest helpers. Every discrepancy is a typed
+ * `PipelineV2RunOutputTreeDefectError` carrying the exact message the
+ * adoption path has always produced.
+ */
+async function verifyPublishedRunOutputsTree(
+  pipeline: ResolvedPipelineV2,
+  outputsPath: string,
+  expectations: readonly PublishedRunOutputExpectation[],
+): Promise<RunOutputSnapshotEntry[]> {
+  const publishedNames = await defectModified(async () => {
     try {
       return await readdir(outputsPath);
     } catch (cause) {
@@ -3134,85 +3183,47 @@ async function adoptPublishedRunOutputs(
   });
 
   const entries: RunOutputSnapshotEntry[] = [];
-  for (const output of pipeline.outputs) {
-    const what = `run output ${JSON.stringify(output.id)}`;
-    const source = resolveRunOutputSource(output, runInputs, acceptedByRef);
-    const publishedPath = join(outputsPath, output.id);
-    const publishedInfo = await withRuntimeReason("run_output_publish_failed", () =>
-      lstatOrNull(publishedPath),
-    );
-    if (!source.present) {
-      // An absent optional source must have no published entry.
+  for (const expectation of expectations) {
+    const what = `run output ${JSON.stringify(expectation.id)}`;
+    const publishedPath = join(outputsPath, expectation.id);
+    const publishedInfo = await defectModified(() => lstatOrNull(publishedPath));
+    if (!expectation.present) {
+      // An absent optional output must have no published entry.
       if (publishedInfo !== null) {
-        throw runtimeFailure(
+        throw new PipelineV2RunOutputTreeDefectError(
+          "modified",
           "run_output_invalid",
           `${what} has no present source but the published outputs tree carries an entry for it`,
         );
       }
       entries.push({
-        id: output.id,
-        type: output.type,
+        id: expectation.id,
+        type: expectation.type,
         required: false,
         present: false,
       });
       continue;
     }
     if (publishedInfo === null) {
-      throw runtimeFailure(
+      throw new PipelineV2RunOutputTreeDefectError(
+        "missing",
         "run_output_invalid",
         `${what} is missing from the published outputs tree`,
       );
     }
-    if (publishedInfo.isSymbolicLink() || (output.type === "directory" ? !publishedInfo.isDirectory() : !publishedInfo.isFile())) {
-      throw runtimeFailure(
+    if (publishedInfo.isSymbolicLink() || (expectation.type === "directory" ? !publishedInfo.isDirectory() : !publishedInfo.isFile())) {
+      throw new PipelineV2RunOutputTreeDefectError(
+        "modified",
         "run_output_invalid",
         `${what} exists in the published outputs tree but is ${describeEntry(publishedInfo)}`,
       );
     }
 
-    // The expected digest is computed from the trusted source with the
-    // same framing as the fresh publication; the published object must
-    // carry exactly those bytes.
-    const expectedHasher = runOutputDigestHasher(output.type);
-    if (output.type === "directory") {
-      const tree = await withRuntimeReason("run_output_invalid", () =>
-        scanDirectoryTree(source.sourcePath, source.sourceWhat),
-      );
-      for (const treeEntry of tree) {
-        if (treeEntry.kind === "directory") {
-          hashDirectoryEntry(expectedHasher, treeEntry, undefined);
-          continue;
-        }
-        const content = await withRuntimeReason("run_output_invalid", () =>
-          readRegularFileBytes(
-            treeEntry.absolutePath,
-            `${source.sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
-          ),
-        );
-        hashDirectoryEntry(expectedHasher, treeEntry, content);
-      }
-    } else {
-      const content = await withRuntimeReason("run_output_invalid", () =>
-        readRegularFileBytes(source.sourcePath, source.sourceWhat),
-      );
-      hashBytes(expectedHasher, content);
-      if (output.type === "json") {
-        try {
-          JSON.parse(content.toString("utf8"));
-        } catch {
-          throw runtimeFailure(
-            "run_output_invalid",
-            `${source.sourceWhat} ${source.sourcePath} is not valid JSON`,
-          );
-        }
-      }
-    }
-
     // The published object's own digest, recomputed with the same domain
     // and framing over its real bytes.
-    const publishedHasher = runOutputDigestHasher(output.type);
-    if (output.type === "directory") {
-      const tree = await withRuntimeReason("run_output_invalid", () =>
+    const publishedHasher = runOutputDigestHasher(expectation.type);
+    if (expectation.type === "directory") {
+      const tree = await defectModified(() =>
         scanDirectoryTree(publishedPath, `${what} published copy`),
       );
       for (const treeEntry of tree) {
@@ -3220,7 +3231,7 @@ async function adoptPublishedRunOutputs(
           hashDirectoryEntry(publishedHasher, treeEntry, undefined);
           continue;
         }
-        const content = await withRuntimeReason("run_output_invalid", () =>
+        const content = await defectModified(() =>
           readRegularFileBytes(
             treeEntry.absolutePath,
             `${what} published copy file entry ${JSON.stringify(treeEntry.relativePath)}`,
@@ -3229,49 +3240,51 @@ async function adoptPublishedRunOutputs(
         hashDirectoryEntry(publishedHasher, treeEntry, content);
       }
     } else {
-      const content = await withRuntimeReason("run_output_invalid", () =>
+      const content = await defectModified(() =>
         readRegularFileBytes(publishedPath, `${what} published copy`),
       );
       hashBytes(publishedHasher, content);
-      if (output.type === "json") {
+      if (expectation.type === "json") {
         // The same schema validation the fresh publication applies to the
-        // staged bytes, applied to the published bytes: the adopted value
+        // staged bytes, applied to the published bytes: the verified value
         // must satisfy the declared loader-compiled contract. The digest
         // comparison below is the byte-level authority; the schema check
-        // keeps the adopted value honest against the compiled contract.
-        if (output.schema === undefined) {
+        // keeps the verified value honest against the compiled contract.
+        const declared = pipeline.outputs.find((output) => output.id === expectation.id);
+        if (declared === undefined || declared.schema === undefined) {
           throw new PipelineError(`${what} has no compiled JSON schema`);
         }
-        const runOutputSchema = output.schema;
+        const runOutputSchema = declared.schema;
         let publishedJson: unknown;
         try {
           publishedJson = JSON.parse(content.toString("utf8"));
         } catch {
-          throw runtimeFailure(
+          throw new PipelineV2RunOutputTreeDefectError(
+            "modified",
             "run_output_invalid",
             `${what} ${publishedPath} is not valid JSON`,
           );
         }
-        await withRuntimeReason("run_output_invalid", async () =>
-          validatePipelineJson(runOutputSchema, publishedJson, `${what} published copy`),
-        );
+        await defectModified(async () => {
+          await validatePipelineJson(runOutputSchema, publishedJson, `${what} published copy`);
+        });
       }
     }
-    const expectedDigest = expectedHasher.digest("hex");
     const publishedDigest = publishedHasher.digest("hex");
-    if (expectedDigest !== publishedDigest) {
-      throw runtimeFailure(
+    if (expectation.digest !== undefined && expectation.digest !== publishedDigest) {
+      throw new PipelineV2RunOutputTreeDefectError(
+        "modified",
         "run_output_invalid",
         `${what} published copy does not match the trusted source content`,
       );
     }
     entries.push({
-      id: output.id,
-      type: output.type,
-      required: output.required,
+      id: expectation.id,
+      type: expectation.type,
+      required: expectation.required,
       present: true,
       snapshot_path: publishedPath,
-      digest: expectedDigest,
+      digest: publishedDigest,
     });
   }
 
@@ -3280,13 +3293,197 @@ async function adoptPublishedRunOutputs(
   const expectedNames = new Set(entries.filter((entry) => entry.present).map((entry) => entry.id));
   for (const name of publishedNames) {
     if (!expectedNames.has(name)) {
-      throw runtimeFailure(
+      throw new PipelineV2RunOutputTreeDefectError(
+        "modified",
         "run_output_invalid",
         `the published outputs tree carries the undeclared entry ${JSON.stringify(name)}`,
       );
     }
   }
 
+  return entries;
+}
+
+/**
+ * The root-layout prologue shared by both verifier faces: the published
+ * root must be a real non-symlink directory resolving exactly to its
+ * fixed path (a substituted or symlinked root is a typed `layout`
+ * defect, never a verification success).
+ */
+async function verifyPublishedOutputsRoot(outputsPath: string): Promise<void> {
+  try {
+    await requireRealDirectory(outputsPath, "run outputs root");
+    const resolved = await realpath(outputsPath);
+    if (resolved !== outputsPath) {
+      throw fail(`run outputs root ${outputsPath} does not resolve to its canonical path`);
+    }
+  } catch (cause) {
+    if (cause instanceof PipelineV2RunOutputTreeDefectError) {
+      throw cause;
+    }
+    if (cause instanceof PipelineError) {
+      throw new PipelineV2RunOutputTreeDefectError("layout", "run_output_publish_failed", cause.message);
+    }
+    throw cause;
+  }
+}
+
+/**
+ * The source-derived verifier face: the published tree must be exactly
+ * the publication the trusted run-input snapshot and the accepted
+ * history determine — the same authority the recovery adoption enforces.
+ * Strictly read-only; discrepancies are typed defects.
+ */
+export async function verifyPublishedRunOutputs(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+): Promise<readonly RunOutputSnapshotEntry[]> {
+  requireResolvedPipelineV2Provenance(pipeline, "published run outputs verification");
+  const provenance = runInputSnapshotProvenance.get(runInputs);
+  if (provenance === undefined || provenance.pipeline !== pipeline) {
+    throw new PipelineError(UNTRUSTED_RUN_INPUT_SNAPSHOT_MESSAGE);
+  }
+  const runRootCanonical = provenance.runRootCanonical;
+  const outputsPath = join(runRootCanonical, "outputs");
+  return await verifyPublishedRunOutputsInternal(
+    pipeline,
+    runInputs,
+    acceptedOutputs,
+    provenance,
+    runRootCanonical,
+    outputsPath,
+  );
+}
+
+/** The full source-derived verification chain shared by both callers. */
+async function verifyPublishedRunOutputsInternal(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+  provenance: RunInputSnapshotProvenance,
+  runRootCanonical: string,
+  outputsPath: string,
+): Promise<readonly RunOutputSnapshotEntry[]> {
+  await verifyPublishedOutputsRoot(outputsPath);
+  await verifyRunInputsSnapshot(runInputs, provenance);
+  const acceptedByRef = await resolveAcceptedHistory(
+    pipeline,
+    acceptedOutputs,
+    runRootCanonical,
+    undefined,
+  );
+
+  const expectations: PublishedRunOutputExpectation[] = [];
+  for (const output of pipeline.outputs) {
+    const what = `run output ${JSON.stringify(output.id)}`;
+    const source = resolveRunOutputSource(output, runInputs, acceptedByRef);
+    if (!source.present) {
+      expectations.push({ id: output.id, type: output.type, required: false, present: false });
+      continue;
+    }
+    const expectedHasher = runOutputDigestHasher(output.type);
+    if (output.type === "directory") {
+      const tree = await defectModified(() =>
+        scanDirectoryTree(source.sourcePath, source.sourceWhat),
+      );
+      for (const treeEntry of tree) {
+        if (treeEntry.kind === "directory") {
+          hashDirectoryEntry(expectedHasher, treeEntry, undefined);
+          continue;
+        }
+        const content = await defectModified(() =>
+          readRegularFileBytes(
+            treeEntry.absolutePath,
+            `${source.sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          ),
+        );
+        hashDirectoryEntry(expectedHasher, treeEntry, content);
+      }
+    } else {
+      const content = await defectModified(() =>
+        readRegularFileBytes(source.sourcePath, source.sourceWhat),
+      );
+      hashBytes(expectedHasher, content);
+      if (output.type === "json") {
+        try {
+          JSON.parse(content.toString("utf8"));
+        } catch {
+          throw new PipelineV2RunOutputTreeDefectError(
+            "modified",
+            "run_output_invalid",
+            `${source.sourceWhat} ${source.sourcePath} is not valid JSON`,
+          );
+        }
+      }
+    }
+    expectations.push({
+      id: output.id,
+      type: output.type,
+      required: output.required,
+      present: true,
+      digest: expectedHasher.digest("hex"),
+    });
+  }
+
+  return await verifyPublishedRunOutputsTree(pipeline, outputsPath, expectations);
+}
+
+/**
+ * The record-bound verifier face: the published tree must exist and match
+ * the durable `run_outputs` record exactly — every present record entry
+ * a real object of its declared kind carrying exactly the durable
+ * digest, every json output satisfying its loader-compiled schema, every
+ * absent optional output without a published entry, and no extra
+ * top-level entry. Strictly read-only; discrepancies are typed defects.
+ */
+export async function verifyPublishedRunOutputsAgainstRecord(
+  pipeline: ResolvedPipelineV2,
+  outputsPath: string,
+  record: readonly PipelineV2PublishedRunOutputRecord[],
+): Promise<readonly RunOutputSnapshotEntry[]> {
+  requireResolvedPipelineV2Provenance(pipeline, "published run outputs verification");
+  await verifyPublishedOutputsRoot(outputsPath);
+  const expectations: PublishedRunOutputExpectation[] = record.map((entry) => ({
+    id: entry.id,
+    type: entry.type,
+    required: entry.required,
+    present: entry.present,
+    ...(entry.present ? { digest: entry.digest } : {}),
+  }));
+  return await verifyPublishedRunOutputsTree(pipeline, outputsPath, expectations);
+}
+
+async function adoptPublishedRunOutputs(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+  provenance: RunInputSnapshotProvenance,
+  runRootCanonical: string,
+  outputsPath: string,
+): Promise<RunOutputsSnapshot> {
+  // The single read-only verifier owns the published-tree contract; the
+  // adoption rebuilds the exact existing runtime errors from its typed
+  // defect classification (byte-identical reasons and messages), then
+  // registers the verified snapshot exactly as before.
+  let entries: RunOutputSnapshotEntry[];
+  try {
+    entries = [
+      ...(await verifyPublishedRunOutputsInternal(
+        pipeline,
+        runInputs,
+        acceptedOutputs,
+        provenance,
+        runRootCanonical,
+        outputsPath,
+      )),
+    ];
+  } catch (cause) {
+    if (cause instanceof PipelineV2RunOutputTreeDefectError) {
+      throw runtimeFailure(cause.runtimeReason, cause.message);
+    }
+    throw cause;
+  }
   const snapshot = deepFreeze({
     run_root: runRootCanonical,
     outputs_root: outputsPath,

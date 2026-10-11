@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "bun:test";
@@ -1358,7 +1358,7 @@ test("Q2: a modified accepted output at the plan-ready boundary is artifact_modi
   }
 });
 
-test("Q3: a modified published artifact at the terminal window stays resumable; the recovery detects it", async () => {
+test("Q3: a modified published artifact at the terminal window is artifact_modified; the recovery detects it too", async () => {
   const harness = await setupHarness(controlPipelineYaml(true), "insp-q3", { facts: FACTS_ALPHA });
   try {
     const runInputs = await prefixCreateRun(harness);
@@ -1370,11 +1370,10 @@ test("Q3: a modified published artifact at the terminal window stays resumable; 
     await collectRunOutputs(harness.pipeline, runInputs, accepted);
     await writeFile(join(harness.dirs.runRoot, "outputs", "report"), "TAMPERED");
     const { before, after, outcome } = await inspectRun(harness);
-    const report = expectReport(outcome);
-    expect(report.boundary).toEqual({ kind: "resumable", stateId: "done", transitionCount: 2 });
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
     expect(before).toBe(after);
-    // the corresponding recovery verification detects the damage at the
-    // mutating step: the adoption refuses and the run finalizes failed
+    // the corresponding recovery verification detects the same damage at
+    // the mutating step: the adoption refuses and the run finalizes failed
     const reopened = await reopenHarness(harness);
     const result = await resumePipelineV2Run({
       pipeline: harness.pipeline,
@@ -1520,8 +1519,12 @@ test("source scan: one classifier call, read-only store load only, no sink/dispa
   // exactly one authoritative recovery classifier call
   const classifierUses = source.split("classifyPipelineV2ResumeRecovery(").length - 1;
   expect(classifierUses).toBe(1);
+  // the single shared published-tree verifier is used by both inspect faces
+  expect(source.includes("verifyPublishedRunOutputs(")).toBe(true);
+  expect(source.includes("verifyPublishedRunOutputsAgainstRecord(")).toBe(true);
   // no mutable sink, no reducer dispatch, no publisher, no runtime adapter,
-  // no Launcher/Docker Helper machinery
+  // no Launcher/Docker Helper machinery (the verifier faces from the
+  // runtime module are the one sanctioned import)
   for (const banned of [
     "pipeline_v2_state_sink",
     "reducePipelineV2RunCommand",
@@ -1534,6 +1537,8 @@ test("source scan: one classifier call, read-only store load only, no sink/dispa
     "createExecutionSession",
     "createToolSession",
     "openChildSession",
+    "collectRunOutputs",
+    "collectOrAdoptRunOutputs",
   ]) {
     expect(source.includes(banned)).toBe(false);
   }
@@ -1545,5 +1550,304 @@ test("source scan: one classifier call, read-only store load only, no sink/dispa
   // no mutation primitives anywhere in the module
   for (const mutation of ["rename", "unlink", "chmod", "mkdir", "writeFile", "rmdir"]) {
     expect(source.includes(mutation)).toBe(false);
+  }
+});
+
+test("the runtime module keeps one published-tree verifier shared by the adoption and the inspect", async () => {
+  const source = await readFile(new URL("../src/pipeline_v2_runtime.ts", import.meta.url), "utf8");
+  // exactly one defect classification and one tree verification body
+  expect(source.split("new PipelineV2RunOutputTreeDefectError(").length - 1).toBeGreaterThan(0);
+  expect(source.split("async function verifyPublishedRunOutputsTree(").length - 1).toBe(1);
+  // the adoption consumes the verifier: no second inline per-output check loop
+  const adoptStart = source.indexOf("async function adoptPublishedRunOutputs(");
+  const adoptEnd = source.indexOf("/**\n * Compatibility wrapper over the two-phase decision-data adapter:");
+  expect(adoptStart).toBeGreaterThan(0);
+  expect(adoptEnd).toBeGreaterThan(adoptStart);
+  const adoptBody = source.slice(adoptStart, adoptEnd);
+  expect(adoptBody).toContain("verifyPublishedRunOutputsInternal");
+  expect(adoptBody).not.toContain("scanDirectoryTree");
+  expect(adoptBody).not.toContain("runOutputDigestHasher");
+  // one digest domain owner: the published hashing helpers stay singular
+  expect(source.split("function runOutputDigestHasher(").length - 1).toBe(1);
+  expect(source.split("function hashDirectoryEntry(").length - 1).toBe(1);
+  // the verifier never writes: no creation, rename or removal inside it
+  const verifyStart = source.indexOf("async function verifyPublishedRunOutputsTree(");
+  const verifyEnd = source.indexOf("async function adoptPublishedRunOutputs(");
+  const verifyBody = source.slice(verifyStart, verifyEnd);
+  for (const banned of ["rename(", "mkdir(", "unlink(", "rmdir(", "writeFile", "link("]) {
+    expect(verifyBody.includes(banned)).toBe(false);
+  }
+});
+
+// --- published-output integrity battery -------------------------------------
+
+function expectResumeSuccess(result: unknown): PipelineV2RunState {
+  if (
+    typeof result !== "object" || result === null ||
+    (result as { ok?: unknown }).ok !== true
+  ) {
+    throw new Error(`expected a successful resume, got ${JSON.stringify(result)}`);
+  }
+  return (result as { state: PipelineV2RunState }).state;
+}
+
+function commandKinds(recording: RecordingSink): string[] {
+  return recording.commands.map((command) => command.kind as string);
+}
+
+/** The control pipeline whose report output carries a strict JSON schema. */
+function strictReportPipelineYaml(): string {
+  return controlPipelineYaml(true).replace(
+    `      - id: report
+        type: json
+        schema: schemas/loose.schema.json`,
+    `      - id: report
+        type: json
+        schema: schemas/report.schema.json`,
+  );
+}
+
+/**
+ * Builds a terminal-window run with an honest publication (the T2 orphan
+ * shape when `commit` is false, the T3 shape when the record is durably
+ * committed) and returns the harness plus the accepted records.
+ */
+async function buildPublishedWindow(
+  prefix: string,
+  options: { commitRecord?: boolean; yaml?: string } = {},
+): Promise<{ harness: Harness; outputsRoot: string }> {
+  const harness = await setupHarness(options.yaml ?? controlPipelineYaml(true), prefix, { facts: FACTS_ALPHA });
+  const runInputs = await prefixCreateRun(harness);
+  const accepted = await runAgentActivation(harness, runInputs, [], "coder", 1, {
+    outputs: { report: JSON.stringify({ ok: true }) },
+  });
+  await runDecisionActivation(harness, runInputs, accepted, "check", 2);
+  await harness.recording.dispatch({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" } as never);
+  const published = await collectRunOutputs(harness.pipeline, runInputs, accepted);
+  if (options.commitRecord !== false) {
+    await harness.recording.dispatch({
+      kind: "run_outputs_published",
+      outputs: published.outputs.map((entry) =>
+        entry.present
+          ? { id: entry.id, type: entry.type, required: entry.required, present: true, digest: entry.digest }
+          : { id: entry.id, type: entry.type, required: entry.required, present: false },
+      ),
+    } as never);
+  }
+  return { harness, outputsRoot: join(harness.dirs.runRoot, "outputs") };
+}
+
+test("the correct T2 orphan is resumable and the resume adoption keeps the artifact identity", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-t2-ok", { commitRecord: false });
+  try {
+    const publishedPath = join(outputsRoot, "report");
+    const beforeStat = await stat(publishedPath);
+    const beforeBytes = await readFile(publishedPath);
+    const { before, after, outcome } = await inspectRun(harness);
+    const report = expectReport(outcome);
+    expect(report.boundary).toEqual({ kind: "resumable", stateId: "done", transitionCount: 2 });
+    expect(report.outputs).toEqual([]);
+    expect(before).toBe(after);
+    // the promised resume adoption keeps inode, mode, mtime and bytes
+    const reopened = await reopenHarness(harness);
+    const result = await resumePipelineV2Run({
+      pipeline: harness.pipeline,
+      runId: RUN_ID,
+      runRoot: harness.dirs.runRoot,
+      sink: reopened as never,
+      runtime: fakeRuntime().runtime,
+    }, NEUTRAL_CONTROL);
+    const state = expectResumeSuccess(result);
+    expect(commandKinds(reopened)).toEqual(["run_outputs_published", "run_succeeded"]);
+    const afterStat = await stat(publishedPath);
+    expect(afterStat.ino).toBe(beforeStat.ino);
+    expect(afterStat.mode).toBe(beforeStat.mode);
+    expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs);
+    expect(await readFile(publishedPath)).toEqual(beforeBytes);
+    expect(state.run_outputs?.[0]?.present).toBe(true);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a T2 orphan with modified bytes is artifact_modified", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-t2-mod", { commitRecord: false });
+  try {
+    await writeFile(join(outputsRoot, "report"), "TAMPERED");
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a T2 orphan with a missing required artifact is artifact_missing", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-t2-miss", { commitRecord: false });
+  try {
+    await rm(join(outputsRoot, "report"));
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_missing", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a T2 orphan with an extra undeclared entry is artifact_modified", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-t2-extra", { commitRecord: false });
+  try {
+    await writeFile(join(outputsRoot, "smuggled"), "extra");
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a T3 record with modified bytes is artifact_modified", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-t3-mod");
+  try {
+    await writeFile(join(outputsRoot, "report"), "TAMPERED");
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a T3 record with a missing durably-present artifact is artifact_missing", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-t3-miss");
+  try {
+    await rm(join(outputsRoot, "report"));
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_missing", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a finalized succeeded run with modified bytes is artifact_modified", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-fin-mod");
+  try {
+    await harness.recording.dispatch({ kind: "run_succeeded" } as never);
+    await writeFile(join(outputsRoot, "report"), "TAMPERED");
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a finalized succeeded run with a missing durably-present artifact is artifact_missing", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-fin-miss");
+  try {
+    await harness.recording.dispatch({ kind: "run_succeeded" } as never);
+    await rm(join(outputsRoot, "report"));
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_missing", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a finalized succeeded run with an intact publication keeps the succeeded projection", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-fin-ok");
+  try {
+    await harness.recording.dispatch({ kind: "run_succeeded" } as never);
+    const { before, after, outcome } = await inspectRun(harness);
+    const report = expectReport(outcome);
+    expect(report.status).toBe("succeeded");
+    expect(report.boundary).toEqual({ kind: "succeeded", terminalStateId: "done" });
+    expect(report.outputs).toHaveLength(1);
+    expect(report.outputs[0]?.present).toBe(true);
+    expect(before).toBe(after);
+    void outputsRoot;
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a symlinked published artifact is artifact_modified", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-symlink");
+  try {
+    await rm(join(outputsRoot, "report"));
+    await writeFile(join(harness.dirs.root, "outside-target"), "elsewhere");
+    await symlink(join(harness.dirs.root, "outside-target"), join(outputsRoot, "report"));
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a malformed published JSON artifact is artifact_modified", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-badjson");
+  try {
+    await writeFile(join(outputsRoot, "report"), "{not json");
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("a schema-violating published JSON artifact is artifact_modified", async () => {
+  const dirs = await makeDirs("insp-pub-schema");
+  try {
+    const strictYaml = strictReportPipelineYaml();
+    await writeBundle(dirs, strictYaml, { facts: FACTS_ALPHA });
+    await writeFile(
+      join(dirs.bundle, "schemas", "report.schema.json"),
+      JSON.stringify({ type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false }),
+    );
+    const pipeline = await loadPipelineV2(dirs.bundle);
+    resetClock();
+    const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: RUN_ID, now: nextTick });
+    const harness: Harness = { dirs, pipeline, recording: new RecordingSink(sink) };
+    const runInputs = await prefixCreateRun(harness);
+    const accepted = await runAgentActivation(harness, runInputs, [], "coder", 1, {
+      outputs: { report: JSON.stringify({ ok: true }) },
+    });
+    await runDecisionActivation(harness, runInputs, accepted, "check", 2);
+    await harness.recording.dispatch({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" } as never);
+    const published = await collectRunOutputs(harness.pipeline, runInputs, accepted);
+    await harness.recording.dispatch({
+      kind: "run_outputs_published",
+      outputs: published.outputs.map((entry) =>
+        entry.present
+          ? { id: entry.id, type: entry.type, required: entry.required, present: true, digest: entry.digest }
+          : { id: entry.id, type: entry.type, required: entry.required, present: false },
+      ),
+    } as never);
+    await harness.recording.dispatch({ kind: "run_succeeded" } as never);
+    // schema-valid at publication, violating after a post-publication change
+    await writeFile(join(harness.dirs.runRoot, "outputs", "report"), JSON.stringify({ ok: "nope" }));
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("the repeated inspect over a damaged publication returns byte-identical errors", async () => {
+  const { harness, outputsRoot } = await buildPublishedWindow("insp-pub-repeat");
+  try {
+    await writeFile(join(outputsRoot, "report"), "TAMPERED");
+    const first = await inspectPipelineV2Run({ runId: RUN_ID, stateRoot: harness.dirs.stateRoot });
+    const second = await inspectPipelineV2Run({ runId: RUN_ID, stateRoot: harness.dirs.stateRoot });
+    expectFailure(first, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    expect(Object.isFrozen(first)).toBe(true);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
   }
 });

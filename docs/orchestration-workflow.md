@@ -350,7 +350,13 @@ orchestrator inspect --run-id SAFE_ID --config-root ABS [--json]
     every durable post-commit recovery window (a settled stage or control
     execution awaiting its transition, a failed execution awaiting its
     run-level finalization, and the incomplete terminal lifecycle). The
-    internal recovery subtype is never exported.
+    internal recovery subtype is never exported. A terminal window with
+    an already published tree is reported as `resumable` only after a
+    read-only verification: an exact orphan publication stays resumable,
+    while a modified, missing, extra or substituted one is a typed
+    inspect failure (`artifact_modified`/`artifact_missing`); a durable
+    `run_outputs` record obliges the tree to exist and match it
+    exactly.
   - `in_flight` is a genuinely unfinished execution (its index, state,
     compiled role and phase). A settled execution awaiting its recovery
     suffix is never in-flight. In-flight executions are not recoverable
@@ -363,6 +369,15 @@ orchestrator inspect --run-id SAFE_ID --config-root ABS [--json]
   are never part of the projection, a planning proposal never reaches it,
   and until the terminal publication the list is empty (a crashed
   publication with no durable record is invisible).
+- The `succeeded` boundary confirms the integrity of the published
+  outputs before it is reported: the published tree is verified
+  read-only against the durable record through the one shared verifier
+  (the same machinery the resume adoption uses), so a finalized succeeded
+  run whose artifacts are missing, modified, substituted or
+  schema-violating is a typed inspect failure
+  (`artifact_missing`/`artifact_modified`), never a false success. A
+  failed run is not required to have published anything when its durable
+  contract contains no publication record.
 - Failures are typed with the closed inspect-only reason vocabulary:
   before the run root is verified `run_not_found`, `invalid_options` or
   `internal_error` with `runRoot: null` (an unvalidated run id is never
