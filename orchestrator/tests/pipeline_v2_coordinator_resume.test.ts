@@ -1651,25 +1651,11 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
   expect(fakeUnbound.createCalls).toHaveLength(0);
   expect(await fingerprint(unbound2.dirs.runRoot)).toBe(fpUnbound);
 
-  // 17c: a publishing phase
-  const publishing = await setupHarness(PIPELINE_DECISION_INPUT);
-  const runInputsC = await prefixCreateRun(publishing);
-  await prefixAgentStep(publishing, runInputsC, [], "coder", 1);
-  await prefixDecisionStep(publishing, runInputsC, [], "check", 2);
-  await publishing.recording.dispatch({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
-  const fpPublishing = await fingerprint(publishing.dirs.runRoot);
-  const reopenedPublishing = await reopenHarness(publishing);
-  const fakePublishing = fakeRuntime([]);
-  const resultPublishing = await resumePipelineV2Run({
-    pipeline: publishing.pipeline,
-    runId: publishing.runId,
-    runRoot: publishing.dirs.runRoot,
-    sink: reopenedPublishing,
-    runtime: fakePublishing.runtime,
-  }, NEUTRAL_CONTROL);
-  expectRefused(resultPublishing, "invalid_state");
-  expect(reopenedPublishing.commands).toHaveLength(0);
-  expect(await fingerprint(publishing.dirs.runRoot)).toBe(fpPublishing);
+  // 17c: the publishing phase moved to the recovery suite — a reached
+  // terminal with an unrecorded publication is the T1 post-commit crash
+  // window the production recovery completes (see
+  // pipeline_v2_recovery.test.ts); the refusal battery keeps only the
+  // shapes no chain owns.
 
   // 17d: a final success status
   const finished = await setupHarness(PIPELINE_DECISION_INPUT);

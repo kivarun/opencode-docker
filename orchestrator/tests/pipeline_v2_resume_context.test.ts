@@ -1128,7 +1128,7 @@ test("28. in-flight decisions and settled-but-unbound executions are rejected", 
   }
 });
 
-test("29. terminal, publishing, success, failed and cleanup-failed states are rejected", async () => {
+test("29. terminal, publishing, success, failed and cleanup-failed states: the recovery windows are restorable, the final states are rejected", async () => {
   const base = await setupBase();
   try {
     await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
@@ -1139,16 +1139,24 @@ test("29. terminal, publishing, success, failed and cleanup-failed states are re
       terminalStateId: "done",
       terminalResult: "success",
     });
-    expectRestoreError(
-      await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot).catch((error) => error),
-      "invalid_state",
-    );
+    // The reached-terminal publication window (T1) is a recovery boundary:
+    // the restore accepts it for the recovering coordinator.
+    const restored = await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+    expect(restored.state.terminal?.state_id).toBe("done");
+    expect(restored.next_execution_index).toBe(4);
     const published = JSON.parse(JSON.stringify(base.drive.state)) as Record<string, unknown>;
     const publishedDrive: Drive = { state: published as unknown as PipelineV2RunState, records: base.drive.records };
     dispatchClock(publishedDrive, base.clock, {
       kind: "run_outputs_published",
       outputs: [{ id: "plan", type: "json", required: true, present: true, digest: hex("d") }],
     });
+    // The published-outputs window (T3) is a recovery boundary too.
+    const restoredPublished = await restorePipelineV2RuntimeContext(
+      base.pipeline,
+      publishedDrive.state,
+      base.runRoot,
+    );
+    expect(restoredPublished.state.phase).toBe("publishing_outputs");
     dispatchClock(publishedDrive, base.clock, { kind: "run_succeeded" });
     expectRestoreError(
       await restorePipelineV2RuntimeContext(base.pipeline, publishedDrive.state, base.runRoot).catch((error) => error),

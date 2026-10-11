@@ -142,6 +142,7 @@ import type { PipelineV2WaitManifestAction } from "./pipeline_v2_wait_manifest.t
 import { pipelineV2OpenStageIteration } from "./pipeline_v2_state.ts";
 import {
   acceptActivationOutputs,
+  collectOrAdoptRunOutputs,
   collectRunOutputs,
   evaluatePreparedDecisionState,
   prepareActivationData,
@@ -155,6 +156,10 @@ import {
   type RunOutputSnapshotEntry,
 } from "./pipeline_v2_runtime.ts";
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
+import {
+  classifyPipelineV2ResumeRecovery,
+  type PipelineV2ExecutableRecovery,
+} from "./pipeline_v2_recovery.ts";
 import {
   PipelineV2RuntimeContextRestoreError,
   restorePipelineV2RuntimeContext,
@@ -1071,6 +1076,8 @@ export async function coordinatePipelineV2Run(
     acceptedInitial: [],
     seed: null,
     expectedNextExecutionIndex: null,
+    recovery: null,
+    readPendingSignal: () => capturedCurrentSignal(),
     checkSignal,
     takeCutoff,
     createExecutionSession: capturedCreateExecutionSession,
@@ -1106,6 +1113,18 @@ interface PipelineV2ContinuationSetup {
   readonly seed: PipelineV2GraphResumeSeed | null;
   /** Fresh: null; resume: the restored next global execution index. */
   readonly expectedNextExecutionIndex: number | null;
+  /**
+   * Resume recovery: the classified post-commit crash window whose
+   * missing durable suffix the chain completes before the engine; null
+   * for the fresh and the ordinary resumable paths.
+   */
+  readonly recovery: PipelineV2ExecutableRecovery | null;
+  /**
+   * The non-throwing signal read of the recovery boundary: a pending
+   * SIGINT/SIGTERM before the first recovery effect returns the signal
+   * failure result with zero durable writes.
+   */
+  readonly readPendingSignal: () => "SIGINT" | "SIGTERM" | null;
   readonly checkSignal: () => void;
   readonly takeCutoff: () => "SIGINT" | "SIGTERM" | null;
   readonly createExecutionSession: CapturedCreateExecutionSession;
@@ -1785,6 +1804,180 @@ async function continuePipelineV2Coordination(
     throw new CoordinatorSuspension("plan_ready");
   };
 
+  /**
+   * The single terminal-lifecycle owner of the whole coordination: the
+   * `terminal_reached` record, the run-output publication, the single
+   * signal cutoff and the final run-status command. The live engine
+   * result and the recovery suffix of a resumed run both finalize the
+   * terminal exclusively through this function — there is no second
+   * terminal publication owner and no second final-status writer.
+   *
+   * `recordTerminal` records `terminal_reached` (the live path and the
+   * recovery window whose cursor reached the terminal without the
+   * record); `publication` selects the run-output publication:
+   * `fresh` publishes into the absent fixed target (the live contract),
+   * `adopt-or-fresh` publishes into the absent target and adopts an
+   * already published tree only when it is byte-exactly the expected
+   * publication (the recovery path), and `skip` trusts the durable
+   * `run_outputs_published` record (the recovery path past it).
+   */
+  const runTerminalPhase = async (
+    terminal: { readonly stateId: string; readonly result: "success" | "failed" },
+    options: {
+      readonly recordTerminal: boolean;
+      readonly publication: "fresh" | "adopt-or-fresh" | "skip";
+    },
+  ): Promise<PipelineV2CoordinationResult> => {
+    if (options.recordTerminal) {
+      // 1. terminal_reached
+      await dispatchState({
+        kind: "terminal_reached",
+        terminalStateId: terminal.stateId,
+        terminalResult: terminal.result,
+      });
+    }
+
+    // 2./3. collect and publish the run outputs (both terminal results)
+    if (options.publication !== "skip") {
+      const runOutputs = options.publication === "fresh"
+        ? await collectRunOutputs(pipeline, runInputs, accepted)
+        : await collectOrAdoptRunOutputs(pipeline, runInputs, accepted);
+      await dispatchState({
+        kind: "run_outputs_published",
+        outputs: runOutputs.outputs.map(toRunOutputState),
+      });
+    }
+
+    // The single signal cutoff of the run, taken once here — synchronously
+    // before the final run-status write — and reused by every remaining
+    // decision. A signal accepted while the terminal outputs were
+    // collected finalizes the run as a signal failure; the already
+    // atomically published outputs are not rolled back. A signal
+    // delivered from here on — including while the final write is in
+    // flight — is late and can no longer change the recorded outcome. For
+    // a failed terminal the outcome is already determined: the reducer
+    // finalizes a failed terminal with published run outputs with the
+    // terminal failure reason only, so a frozen signal cannot rewrite it.
+    const cutoff = takeCutoff();
+    if (cutoff !== null && terminal.result === "success") {
+      await finalizeFailure(new CoordinatorSignalAbort(cutoff));
+      if (stateAbandoned) {
+        return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
+      }
+      const reason = failureReason ?? signalFailureReason(cutoff);
+      return deepFreeze({ ok: false as const, reason, state: sink.snapshot });
+    }
+
+    // 4./5. finalize the run status. `ok: true` is reserved for a
+    // confirmed `run_succeeded` commit; a failed terminal still publishes
+    // its outputs and returns the durable failed state with the terminal
+    // failure reason — never a second finalize after the committed write.
+    if (terminal.result === "success") {
+      await dispatchState({ kind: "run_succeeded" });
+      const state = requireSnapshot();
+      return deepFreeze({ ok: true as const, state });
+    }
+    await dispatchState({ kind: "run_failed", reason: PIPELINE_V2_TERMINAL_FAILURE_REASON });
+    const state = requireSnapshot();
+    return deepFreeze({
+      ok: false as const,
+      reason: PIPELINE_V2_TERMINAL_FAILURE_REASON,
+      state,
+    });
+  };
+
+  /**
+   * The exact recovery-suffix execution of one classified post-commit
+   * crash window, run inside the single continuation chain so every
+   * durable write, signal checkpoint, wait entry, finalization and
+   * terminal publication is the SAME implementation the live
+   * coordination uses — there is no second recovery owner.
+   *
+   * The recovery block runs strictly before the engine invocation and
+   * strictly before the pre-engine signal checkpoint. Its own first
+   * action is the recovery signal boundary: a pending SIGINT/SIGTERM
+   * before the first recovery effect returns the existing signal failure
+   * result with zero durable writes (the run stays retryable; the
+   * recorded signal never creates a Session and never dispatches).
+   *
+   *   - `run-finalization` dispatches exactly one run-level finalization
+   *     command carrying the durable failure reason (outcome-aware: a
+   *     not-committed or durability-unknown write reports the existing
+   *     `state_persist_failed` semantics on the authoritative snapshot).
+   *   - `terminal` runs the single terminal phase with the recovery
+   *     flags (record the missing `terminal_reached`, publish-or-adopt
+   *     the missing outputs, or trust the durable outputs record) and
+   *     returns its existing result shape.
+   *   - `transition` applies the exactly one missing `transition_committed`
+   *     through the shared kernel (including the post-commit signal
+   *     checkpoint and the trusted stage-wait attempt) and falls through
+   *     to the engine, which continues from the post-suffix cursor.
+   */
+  const runRecoverySuffix = async (
+    recovery: PipelineV2ExecutableRecovery,
+  ): Promise<PipelineV2CoordinationResult | null> => {
+    // The recovery signal boundary: a pending signal before the first
+    // recovery effect is 130/143 with zero durable writes.
+    const pending = setup.readPendingSignal();
+    if (pending !== null) {
+      return deepFreeze({
+        ok: false as const,
+        reason: signalFailureReason(pending),
+        state: requireSnapshot(),
+      });
+    }
+    if (recovery.kind === "run-finalization") {
+      const outcome = await dispatchOutcomeAware(recovery.command);
+      if (outcome.outcome !== "committed") {
+        // Nothing was durably changed (or the adopted candidate is the
+        // visible snapshot after a durability-unknown write): the
+        // existing persistence-failure semantics on the authoritative
+        // snapshot, no further dispatch.
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      const state = requireSnapshot();
+      return deepFreeze({
+        ok: false as const,
+        reason:
+          recovery.command.kind === "run_cleanup_failed"
+            ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+            : recovery.command.reason,
+        state,
+      });
+    }
+    if (recovery.kind === "terminal") {
+      return await runTerminalPhase(
+        { stateId: recovery.terminalStateId, result: recovery.terminalResult },
+        {
+          recordTerminal: !recovery.terminalRecorded,
+          publication: recovery.outputsRecorded ? "skip" : "adopt-or-fresh",
+        },
+      );
+    }
+    const applied = await applyTransitionCommit(recovery.step, recovery.executionIndex);
+    if (applied.outcome === "suspended-waiting") {
+      // The recovered stage→planning transition durably entered the
+      // trusted stage wait: the ordinary waiting result.
+      return deepFreeze({ ok: false as const, waiting: true as const, state: requireSnapshot() });
+    }
+    if (applied.outcome === "wait-entry-failed") {
+      // The same no-run_failed retryability as the live restart path: the
+      // active boundary stays retryable for a fresh resume.
+      return deepFreeze({
+        ok: false as const,
+        reason: waitEntryFailureReason(applied.cause),
+        state: applied.state ?? sink.snapshot,
+      });
+    }
+    // The transition is durably committed; the engine continues from the
+    // post-suffix cursor the coordinator passed as the seed.
+    return null;
+  };
+
   const executors: PipelineV2GraphExecutors = {
     executeAgent: async (view: V2AgentExecutionView): Promise<void> => {
       // Execution-start checkpoint: a signal accepted between states stops
@@ -1995,17 +2188,26 @@ async function continuePipelineV2Coordination(
   };
 
   /**
-   * The transition commit hook is the only writer of transitions: it
-   * dispatches `transition_committed` with the index of the last settled
-   * execution and must complete before the engine moves the cursor. A
-   * hook failure stops the graph before the next callback; the failure
-   * policy finalizes the run — except the exact trusted stage-wait
-   * boundary recognized right after the committed transition: the wait
-   * entry suspends the coordination through the private sentinel and no
-   * planning callback ever starts.
+   * The single transition-application kernel of the whole coordination:
+   * one `transition_committed` dispatch with the settled execution's
+   * index, followed by the shared post-commit sequence (the signal
+   * checkpoint and the trusted stage-wait boundary attempt). The live
+   * engine hook and the recovery suffix of a resumed run both apply
+   * their transitions exclusively through this kernel — there is no
+   * second transition writer and no second post-commit policy. The
+   * outcome is a discriminated result instead of an exception so the
+   * recovery path can return the controlled waiting suspension directly;
+   * the live hook converts the suspension into the established
+   * `CoordinatorSuspension` unwinding.
    */
-  const onTransitionCommit = async (step: TransitionStep): Promise<void> => {
-    const executionIndex = requireLastExecutionIndex();
+  const applyTransitionCommit = async (
+    step: TransitionStep,
+    executionIndex: number,
+  ): Promise<
+    | { readonly outcome: "committed" }
+    | { readonly outcome: "suspended-waiting" }
+    | { readonly outcome: "wait-entry-failed"; readonly cause: unknown; readonly state: PipelineV2RunState | null }
+  > => {
     await dispatchState({ kind: "transition_committed", step, executionIndex });
     tracking.unfinished = false;
     // The post-commit checkpoint (previously owned by the next callback's
@@ -2016,14 +2218,49 @@ async function continuePipelineV2Coordination(
     checkSignal();
     const attempt = await attemptStageWaitEntry();
     if (attempt.outcome === "suspended") {
-      throw new CoordinatorSuspension("waiting");
+      return { outcome: "suspended-waiting" };
     }
     if (attempt.outcome === "failed") {
-      throw new CoordinatorSuspension("waiting", { cause: attempt.cause, state: attempt.state });
+      return { outcome: "wait-entry-failed", cause: attempt.cause, state: attempt.state };
+    }
+    return { outcome: "committed" };
+  };
+
+  /**
+   * The transition commit hook is the only writer of transitions: it
+   * dispatches `transition_committed` with the index of the last settled
+   * execution and must complete before the engine moves the cursor. A
+   * hook failure stops the graph before the next callback; the failure
+   * policy finalizes the run — except the exact trusted stage-wait
+   * boundary recognized right after the committed transition: the wait
+   * entry suspends the coordination through the private sentinel and no
+   * planning callback ever starts.
+   */
+  const onTransitionCommit = async (step: TransitionStep): Promise<void> => {
+    const applied = await applyTransitionCommit(step, requireLastExecutionIndex());
+    if (applied.outcome === "suspended-waiting") {
+      throw new CoordinatorSuspension("waiting");
+    }
+    if (applied.outcome === "wait-entry-failed") {
+      throw new CoordinatorSuspension("waiting", { cause: applied.cause, state: applied.state });
     }
   };
 
   try {
+    // The recovery suffix of a classified post-commit crash window, run
+    // strictly before the engine: the missing durable commands are
+    // completed by the same single implementations the live coordination
+    // uses. A finalization or terminal suffix ends the coordination with
+    // the existing result shape; a committed recovery transition falls
+    // through to the engine (the post-commit stage-wait attempt already
+    // ran inside the shared kernel).
+    if (setup.recovery !== null) {
+      const recovered = await runRecoverySuffix(setup.recovery);
+      if (recovered !== null) {
+        return recovered;
+      }
+    }
+
     // Checkpoint before the engine: fresh this is after `create_run` (the
     // run state document exists from here on, so a signal accepted now
     // finalizes durably); resume it is after the successful restore. Every
@@ -2035,8 +2272,10 @@ async function continuePipelineV2Coordination(
     // is absent (a crash between the commit and the wait entry), the same
     // exact recognizer enters the wait here — before the engine can start
     // any planning callback. A fresh run carries no durable transition and
-    // never reaches this point.
-    if (setup.seed !== null) {
+    // never reaches this point. A recovery suffix skips it: the shared
+    // kernel already ran the post-commit attempt for the recovered
+    // transition.
+    if (setup.seed !== null && setup.recovery === null) {
       const restartAttempt = await attemptStageWaitEntry();
       if (restartAttempt.outcome === "suspended") {
         return deepFreeze({ ok: false as const, waiting: true as const, state: requireSnapshot() });
@@ -2065,57 +2304,10 @@ async function continuePipelineV2Coordination(
     checkSignal();
 
     // --- terminal phase ---------------------------------------------------
-
-    // 1. terminal_reached
-    await dispatchState({
-      kind: "terminal_reached",
-      terminalStateId: engineResult.terminalStateId,
-      terminalResult: engineResult.terminalResult,
-    });
-
-    // 2./3. collect and publish the run outputs (both terminal results)
-    const runOutputs = await collectRunOutputs(pipeline, runInputs, accepted);
-    await dispatchState({
-      kind: "run_outputs_published",
-      outputs: runOutputs.outputs.map(toRunOutputState),
-    });
-
-    // The single signal cutoff of the run, taken once here — synchronously
-    // before the final run-status write — and reused by every remaining
-    // decision. A signal accepted while the terminal outputs were
-    // collected finalizes the run as a signal failure; the already
-    // atomically published outputs are not rolled back. A signal
-    // delivered from here on — including while the final write is in
-    // flight — is late and can no longer change the recorded outcome. For
-    // a failed terminal the outcome is already determined: the reducer
-    // finalizes a failed terminal with published run outputs with the
-    // terminal failure reason only, so a frozen signal cannot rewrite it.
-    const cutoff = takeCutoff();
-    if (cutoff !== null && engineResult.terminalResult === "success") {
-      await finalizeFailure(new CoordinatorSignalAbort(cutoff));
-      if (stateAbandoned) {
-        return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
-      }
-      const reason = failureReason ?? signalFailureReason(cutoff);
-      return deepFreeze({ ok: false as const, reason, state: sink.snapshot });
-    }
-
-    // 4./5. finalize the run status. `ok: true` is reserved for a
-    // confirmed `run_succeeded` commit; a failed terminal still publishes
-    // its outputs and returns the durable failed state with the terminal
-    // failure reason — never a second finalize after the committed write.
-    if (engineResult.terminalResult === "success") {
-      await dispatchState({ kind: "run_succeeded" });
-      const state = requireSnapshot();
-      return deepFreeze({ ok: true as const, state });
-    }
-    await dispatchState({ kind: "run_failed", reason: PIPELINE_V2_TERMINAL_FAILURE_REASON });
-    const state = requireSnapshot();
-    return deepFreeze({
-      ok: false as const,
-      reason: PIPELINE_V2_TERMINAL_FAILURE_REASON,
-      state,
-    });
+    return await runTerminalPhase(
+      { stateId: engineResult.terminalStateId, result: engineResult.terminalResult },
+      { recordTerminal: true, publication: "fresh" },
+    );
   } catch (cause) {
     // The private controlled-suspension sentinel is recognized by exact
     // identity first: the runtime, the worker and every downstream layer
@@ -2308,12 +2500,32 @@ export async function resumePipelineV2Run(
     return resumeRefusal("run_id_mismatch", durableState);
   }
 
-  // 5. The active-boundary precheck on the validated durable snapshot:
-  //    only a clean active running boundary may continue. An open waiting
-  //    run is refused here — the wait controller remains the single owner
-  //    of `wait_response_recorded` — and so are a publishing phase, a
-  //    final status and a reached terminal, before any filesystem read.
-  if (durableState.status !== "active" || durableState.phase !== "running") {
+  // 5. The recovery classification over the validated durable snapshot:
+  //    the single catch-free classifier decides whether the run sits on
+  //    a post-commit crash window whose missing durable suffix this
+  //    resume completes. A classifier pipeline mismatch is refused
+  //    before any dispatch; a recovery window skips the active-boundary
+  //    precheck (its shapes — a settled-but-unbound stage/control
+  //    execution, a durably failed execution, a reached terminal — are
+  //    not clean running boundaries) and takes the recovery restore and
+  //    the recovery-enabled chain below; every other shape keeps the
+  //    exact established plain flow.
+  const recovery = classifyPipelineV2ResumeRecovery(pipeline, durableState);
+  if (recovery.kind === "pipeline-mismatch") {
+    return resumeRefusal("pipeline_mismatch", durableState);
+  }
+  const recovering = recovery.kind !== "none";
+
+  // 5b. The active-boundary precheck of the ordinary path on the
+  //     validated durable snapshot: only a clean active running boundary
+  //     may continue. An open waiting run is refused here — the wait
+  //     controller remains the single owner of `wait_response_recorded`
+  //     — and so are a publishing phase, a final status and a reached
+  //     terminal, before any filesystem read. A classified recovery
+  //     window bypasses this precheck: its shapes are the post-commit
+  //     crash windows this resume completes, and the recovery restore's
+  //     boundary policy re-derives the same classification.
+  if (!recovering && (durableState.status !== "active" || durableState.phase !== "running")) {
     return resumeRefusal("invalid_state", durableState);
   }
 
@@ -2333,15 +2545,26 @@ export async function resumePipelineV2Run(
 
   // 7. The shared continuation chain: restored cursor seed, restored input
   //    snapshot, restored accepted history and restored next execution
-  //    index. From here on the ordinary coordination semantics apply.
+  //    index. From here on the ordinary coordination semantics apply. A
+  //    recovery window passes the classified suffix: the chain completes
+  //    the missing durable commands with the same single implementations
+  //    the live coordination uses, before the engine continues from the
+  //    post-suffix cursor.
   return await continuePipelineV2Coordination({
     pipeline,
     sink,
     runRoot,
     runInputs: restored.run_inputs,
     acceptedInitial: restored.accepted_outputs,
-    seed: restored.cursor,
+    seed: recovering && recovery.kind === "transition"
+      ? deepFreeze({
+          current_state: recovery.step.to,
+          transition_count: durableState.cursor.transition_count + 1,
+        })
+      : restored.cursor,
     expectedNextExecutionIndex: restored.next_execution_index,
+    recovery: recovering ? recovery : null,
+    readPendingSignal: () => capturedCurrentSignal(),
     checkSignal,
     takeCutoff,
     createExecutionSession: capturedCreateExecutionSession,

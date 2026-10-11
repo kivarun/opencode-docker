@@ -12,6 +12,7 @@ import {
 import type { AuthFetcher, CliRunner, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
 import {
   acceptActivationOutputs,
+  collectRunOutputs,
   prepareActivationData,
   prepareDecisionStateData,
   evaluatePreparedDecisionState,
@@ -1060,19 +1061,9 @@ test("8. waiting, in-flight, publishing and final states refuse without mutation
   expect(createCount(capturedUnbound)).toBe(0);
   expect(await fingerprint(unbound.stateRoot)).toBe(fpUnbound);
 
-  // publishing outputs
-  const publishing = await setup(PIPELINE_AGENT_DECISION);
-  const pipelineP = await loadPipelineV2(publishing.bundle);
-  const runIdP = "resume-p";
-  const prefixP = await buildPrefix(publishing, pipelineP, runIdP);
-  await prefixAgentStep(prefixP, "coder", 1, {});
-  await prefixDecisionStep(prefixP, "check", 2);
-  await prefixP.sink.dispatch({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
-  const fpPublishing = await fingerprint(publishing.stateRoot);
-  const capturedPublishing = await runResume(publishing, runIdP);
-  expectRefused(capturedPublishing, "invalid_state");
-  expect(createCount(capturedPublishing)).toBe(0);
-  expect(await fingerprint(publishing.stateRoot)).toBe(fpPublishing);
+  // publishing outputs moved to the recovery suite: a reached terminal
+  // with an unrecorded publication is the T1 post-commit crash window the
+  // production recovery completes (see pipeline_v2_recovery.test.ts).
 
   // final success
   const finished = await setup(PIPELINE_AGENT_DECISION);
@@ -1507,4 +1498,124 @@ test("18. the whole state root fingerprint is identical across every pre-resume 
   expect(absentRun.outcome?.ok).toBe(false);
 
   expect(await fingerprint(harness.stateRoot)).toBe(fingerprintBefore);
+});
+
+// --- production recovery pass-through (the runner only displays) -------------
+
+test("19. the runner completes the settled control execution's missing transition (S3)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION);
+  const pipeline = await loadPipelineV2(harness.bundle);
+  const runId = "resume-s3";
+  const prefix = await buildPrefix(harness, pipeline, runId);
+  await prefixAgentStep(prefix, "coder", 1, {});
+  // the decision execution evaluated without its transition commit
+  const prepared = await prepareDecisionStateData(pipeline, prefix.runInputs, prefix.accepted, "check", 2);
+  await prefix.sink.dispatch({ kind: "start_decision_execution", stateId: "check", inputDigest: prepared.input_digest, ...startRoleArgs(pipeline, "check", prefix.sink.snapshot) });
+  const evaluated = evaluatePreparedDecisionState(pipeline, prepared);
+  await prefix.sink.dispatch({ kind: "decision_evaluated", result: toSelectedRecord(evaluated) });
+
+  const captured = await runResume(harness, runId);
+  const outcome = captured.outcome;
+  if (outcome === null || !outcome.ok) {
+    throw new Error(`expected a successful recovery, got ${JSON.stringify(outcome)}`);
+  }
+  expect(outcome.exitCode).toBe(0);
+  expect(outcome.state?.status).toBe("success");
+  // no session create/delete: the settled execution is never rerun
+  expect(createCount(captured)).toBe(0);
+  expect(deleteIds(captured)).toEqual([]);
+  const durable = parsePipelineV2RunState(await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"));
+  expect(durable.transitions).toHaveLength(2);
+  expect(durable.transitions[1]?.outcome).toBe(evaluated.outcome);
+});
+
+test("20. the runner completes the failed execution's missing run finalization (F0)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION);
+  const pipeline = await loadPipelineV2(harness.bundle);
+  const runId = "resume-f0";
+  const prefix = await buildPrefix(harness, pipeline, runId);
+  await prefix.sink.dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", ...startRoleArgs(pipeline, "coder", prefix.sink.snapshot) });
+  for (const command of [
+    { kind: "agent_data_prepared" },
+    { kind: "agent_execution_session_created", sessionId: "pfx-exec-1" },
+    { kind: "agent_tool_session_created", sessionId: "pfx-tool-1" },
+    { kind: "agent_running" },
+    { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+  ]) {
+    await prefix.sink.dispatch(command as never);
+  }
+
+  const captured = await runResume(harness, runId);
+  const outcome = captured.outcome;
+  if (outcome === null || outcome.ok) {
+    throw new Error(`expected the durable failure, got ${JSON.stringify(outcome)}`);
+  }
+  expect(outcome.exitCode).toBe(1);
+  expect(outcome.reason).toBe("worker_failed");
+  expect(outcome.state?.status).toBe("failed");
+  expect(createCount(captured)).toBe(0);
+  expect(deleteIds(captured)).toEqual([]);
+  // the retry after the lost result refuses with zero writes
+  const retry = await runResume(harness, runId);
+  expectRefused(retry, "invalid_state");
+  expect(createCount(retry)).toBe(0);
+});
+
+test("21. the runner publishes the missing terminal outputs and finalizes (T1)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION);
+  const pipeline = await loadPipelineV2(harness.bundle);
+  const runId = "resume-t1";
+  const prefix = await buildPrefix(harness, pipeline, runId);
+  await prefixAgentStep(prefix, "coder", 1, {});
+  await prefixDecisionStep(prefix, "check", 2);
+  await prefix.sink.dispatch({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
+
+  const captured = await runResume(harness, runId);
+  const outcome = captured.outcome;
+  if (outcome === null || !outcome.ok) {
+    throw new Error(`expected a successful recovery, got ${JSON.stringify(outcome)}`);
+  }
+  expect(outcome.exitCode).toBe(0);
+  expect(createCount(captured)).toBe(0);
+  expect(await readFile(join(harness.runRoot(runId), "outputs", "report"), "utf8")).toBe(JSON.stringify({ ok: true, port: "report" }));
+  const durable = parsePipelineV2RunState(await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"));
+  expect(durable.status).toBe("success");
+  expect(durable.run_outputs?.[0]?.present).toBe(true);
+});
+
+test("22. the runner finalizes the durable publication with only the run status (T3)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION);
+  const pipeline = await loadPipelineV2(harness.bundle);
+  const runId = "resume-t3";
+  const prefix = await buildPrefix(harness, pipeline, runId);
+  await prefixAgentStep(prefix, "coder", 1, {});
+  await prefixDecisionStep(prefix, "check", 2);
+  await prefix.sink.dispatch({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
+  // the crashed attempt published the outputs; the durable record landed
+  const collected = await collectRunOutputs(pipeline, prefix.runInputs, prefix.accepted);
+  await prefix.sink.dispatch({
+    kind: "run_outputs_published",
+    outputs: collected.outputs.map((entry) =>
+      entry.present
+        ? { id: entry.id, type: entry.type, required: entry.required, present: true, digest: entry.digest }
+        : { id: entry.id, type: entry.type, required: entry.required, present: false },
+    ),
+  });
+  const publishedPath = join(harness.runRoot(runId), "outputs", "report");
+  const beforeStat = await lstat(publishedPath);
+  const beforeBytes = await readFile(publishedPath);
+
+  const captured = await runResume(harness, runId);
+  const outcome = captured.outcome;
+  if (outcome === null || !outcome.ok) {
+    throw new Error(`expected a successful recovery, got ${JSON.stringify(outcome)}`);
+  }
+  expect(outcome.exitCode).toBe(0);
+  expect(createCount(captured)).toBe(0);
+  // the published artifact kept its identity
+  const afterStat = await lstat(publishedPath);
+  expect(afterStat.ino).toBe(beforeStat.ino);
+  expect(await readFile(publishedPath)).toEqual(beforeBytes);
+  const durable = parsePipelineV2RunState(await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"));
+  expect(durable.status).toBe("success");
 });

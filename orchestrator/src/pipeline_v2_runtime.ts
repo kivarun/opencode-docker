@@ -47,6 +47,7 @@ import {
   type ResolvedV2AgentInputPort,
   type ResolvedV2AgentOutputPort,
   type ResolvedV2DecisionState,
+  type ResolvedV2RunOutput,
   type ResolvedV2State,
 } from "./pipeline_v2.ts";
 import { validatePipelineJson } from "./pipeline_v2_schema.ts";
@@ -2721,6 +2722,72 @@ export type RunOutputSnapshotEntry =
     };
 
 /**
+ * The resolved source of one declared run output, shared by the fresh
+ * publication and the recovery adoption paths of the single run-output
+ * collector: the trusted pipeline declaration and the verified accepted
+ * history decide everything; an absent optional source is a present:false
+ * result, a missing required source is the typed `run_output_missing`
+ * failure, and a type mismatch is the plain trusted-pipeline error.
+ */
+type ResolvedRunOutputSource =
+  | { readonly present: false }
+  | { readonly present: true; readonly sourcePath: string; readonly sourceWhat: string };
+
+function resolveRunOutputSource(
+  output: ResolvedV2RunOutput,
+  runInputs: RunInputsSnapshot,
+  acceptedByRef: ReadonlyMap<string, ResolvedAcceptedOutput>,
+): ResolvedRunOutputSource {
+  const what = `run output ${JSON.stringify(output.id)}`;
+  if ("pipeline_input" in output.source) {
+    let entry: RunInputSnapshotEntry | undefined;
+    for (const candidate of runInputs.inputs) {
+      if (candidate.id === output.source.pipeline_input) {
+        entry = candidate;
+        break;
+      }
+    }
+    if (entry === undefined) {
+      throw new PipelineError(
+        `${what} references pipeline input ${JSON.stringify(output.source.pipeline_input)} which has no run input snapshot entry`,
+      );
+    }
+    if (entry.type !== output.type) {
+      throw new PipelineError(
+        `${what} expects type ${JSON.stringify(output.type)} but the run input snapshot entry has type ${JSON.stringify(entry.type)}`,
+      );
+    }
+    return {
+      present: true,
+      sourcePath: entry.snapshot_path,
+      sourceWhat: `${what} source pipeline input ${JSON.stringify(output.source.pipeline_input)}`,
+    };
+  }
+  const accepted = acceptedByRef.get(
+    `${output.source.state_output.state}\u0000${output.source.state_output.output}`,
+  );
+  if (accepted === undefined) {
+    if (output.required) {
+      throw runtimeFailure(
+        "run_output_missing",
+        `${what} references required state output ${JSON.stringify(output.source.state_output.state)}.${JSON.stringify(output.source.state_output.output)} which has no accepted output yet`,
+      );
+    }
+    return { present: false };
+  }
+  if (accepted.type !== output.type) {
+    throw new PipelineError(
+      `${what} expects type ${JSON.stringify(output.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
+    );
+  }
+  return {
+    present: true,
+    sourcePath: accepted.canonicalPath,
+    sourceWhat: `${what} source state output ${JSON.stringify(output.source.state_output.state)}.${JSON.stringify(output.source.state_output.output)}`,
+  };
+}
+
+/**
  * The deep-frozen result of a successful `collectRunOutputs`: the canonical
  * run root, the fixed canonical outputs root, and one entry per declared
  * run output in declaration order.
@@ -2780,6 +2847,39 @@ export async function collectRunOutputs(
   runInputs: RunInputsSnapshot,
   acceptedOutputs: readonly unknown[],
 ): Promise<RunOutputsSnapshot> {
+  return await collectRunOutputsInternal(pipeline, runInputs, acceptedOutputs, { adoptExisting: false });
+}
+
+/**
+ * The recovery entry of the single run-output collector: identical to
+ * `collectRunOutputs`, except that an already published `<runRoot>/outputs`
+ * tree is not a failure — it is verified byte-exactly against the
+ * publication the trusted sources determine (same declared outputs, same
+ * kinds, same `pipeline-v2-run-output` digests, no extra entries) and
+ * adopted without touching a single file. A foreign, damaged or
+ * incomplete tree fails closed with the typed `run_output_invalid` /
+ * `run_output_publish_failed` reasons; the files are never rewritten,
+ * repaired or removed. This is the crash-window adoption path of the
+ * terminal publication: the rename of the crashed attempt may already
+ * have landed while its durable `run_outputs_published` commit did not,
+ * and an exact retry must reuse the published bytes (the store's
+ * idempotent adoption semantics on the filesystem side) instead of
+ * failing or republishing.
+ */
+export async function collectOrAdoptRunOutputs(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+): Promise<RunOutputsSnapshot> {
+  return await collectRunOutputsInternal(pipeline, runInputs, acceptedOutputs, { adoptExisting: true });
+}
+
+async function collectRunOutputsInternal(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+  mode: { readonly adoptExisting: boolean },
+): Promise<RunOutputsSnapshot> {
   requireResolvedPipelineV2Provenance(pipeline, "run output collection");
   const provenance = runInputSnapshotProvenance.get(runInputs);
   if (provenance === undefined || provenance.pipeline !== pipeline) {
@@ -2790,10 +2890,22 @@ export async function collectRunOutputs(
   await requireRealDirectory(runRootCanonical, "run root");
   await requireRealDirectory(provenance.projectRootCanonical, "run project root");
 
-  // The publication target is fixed by the runtime, must be absent, and is
-  // never overwritten: this also makes a repeated call after a successful
-  // publication fail closed.
+  // The publication target is fixed by the runtime. The fresh path
+  // requires it absent and never overwrites (a repeated call after a
+  // successful publication fails closed); the recovery path adopts an
+  // existing tree only when it is byte-exactly the expected publication.
   const outputsPath = join(runRootCanonical, "outputs");
+  const existing = mode.adoptExisting ? await lstatOrNull(outputsPath) : null;
+  if (existing !== null) {
+    return await adoptPublishedRunOutputs(
+      pipeline,
+      runInputs,
+      acceptedOutputs,
+      provenance,
+      runRootCanonical,
+      outputsPath,
+    );
+  }
   await withRuntimeReason("run_output_publish_failed", () =>
     requireAbsent(outputsPath, "run outputs root"),
   );
@@ -2824,57 +2936,20 @@ export async function collectRunOutputs(
     const entries: RunOutputSnapshotEntry[] = [];
     for (const output of pipeline.outputs) {
       const what = `run output ${JSON.stringify(output.id)}`;
-      let sourcePath: string;
-      let sourceWhat: string;
-      if ("pipeline_input" in output.source) {
-        let entry: RunInputSnapshotEntry | undefined;
-        for (const candidate of runInputs.inputs) {
-          if (candidate.id === output.source.pipeline_input) {
-            entry = candidate;
-            break;
-          }
-        }
-        if (entry === undefined) {
-          throw new PipelineError(
-            `${what} references pipeline input ${JSON.stringify(output.source.pipeline_input)} which has no run input snapshot entry`,
-          );
-        }
-        if (entry.type !== output.type) {
-          throw new PipelineError(
-            `${what} expects type ${JSON.stringify(output.type)} but the run input snapshot entry has type ${JSON.stringify(entry.type)}`,
-          );
-        }
-        sourcePath = entry.snapshot_path;
-        sourceWhat = `${what} source pipeline input ${JSON.stringify(output.source.pipeline_input)}`;
-      } else {
-        const accepted = acceptedByRef.get(
-          `${output.source.state_output.state}\u0000${output.source.state_output.output}`,
-        );
-        if (accepted === undefined) {
-          if (output.required) {
-            throw runtimeFailure(
-              "run_output_missing",
-              `${what} references required state output ${JSON.stringify(output.source.state_output.state)}.${JSON.stringify(output.source.state_output.output)} which has no accepted output yet`,
-            );
-          }
-          // Absent optional output: recorded in the snapshot, no
-          // filesystem entry, nothing staged for it.
-          entries.push({
-            id: output.id,
-            type: output.type,
-            required: false,
-            present: false,
-          });
-          continue;
-        }
-        if (accepted.type !== output.type) {
-          throw new PipelineError(
-            `${what} expects type ${JSON.stringify(output.type)} but the accepted state output has type ${JSON.stringify(accepted.type)}`,
-          );
-        }
-        sourcePath = accepted.canonicalPath;
-        sourceWhat = `${what} source state output ${JSON.stringify(output.source.state_output.state)}.${JSON.stringify(output.source.state_output.output)}`;
+      const source = resolveRunOutputSource(output, runInputs, acceptedByRef);
+      if (!source.present) {
+        // Absent optional output: recorded in the snapshot, no
+        // filesystem entry, nothing staged for it.
+        entries.push({
+          id: output.id,
+          type: output.type,
+          required: false,
+          present: false,
+        });
+        continue;
       }
+      const sourcePath = source.sourcePath;
+      const sourceWhat = source.sourceWhat;
 
       const target = join(stagingPath, output.id);
       const hasher = runOutputDigestHasher(output.type);
@@ -2996,6 +3071,233 @@ export async function collectRunOutputs(
     }
     throw cause;
   }
+}
+
+/**
+ * The recovery adoption path of the single run-output collector: the
+ * fixed `<runRoot>/outputs` tree already exists (the crashed attempt's
+ * atomic rename landed while its durable `run_outputs_published` commit
+ * did not), so the publication itself is never repeated — the existing
+ * tree is verified byte-exactly against the publication the trusted
+ * sources determine and adopted as-is.
+ *
+ * Verification uses exactly the same machinery as the fresh publication:
+ * the shared source resolution, the same declared output set and order,
+ * the same `pipeline-v2-run-output` digest domain and framing, the same
+ * real-object kind rules (regular non-symlink files, real non-symlink
+ * directories containing only real directories and regular files), and
+ * the same loader-compiled JSON schema validation. The published bytes
+ * are never rewritten, repaired, chmodded or removed; a foreign,
+ * damaged, incomplete or extra-entry tree fails closed with the typed
+ * `run_output_invalid` / `run_output_publish_failed` reasons before any
+ * durable record is produced. The returned snapshot carries the same
+ * digests a fresh publication would have recorded, so the durable
+ * `run_outputs_published` record is identical across a crash and its
+ * recovery.
+ */
+async function adoptPublishedRunOutputs(
+  pipeline: ResolvedPipelineV2,
+  runInputs: RunInputsSnapshot,
+  acceptedOutputs: readonly unknown[],
+  provenance: RunInputSnapshotProvenance,
+  runRootCanonical: string,
+  outputsPath: string,
+): Promise<RunOutputsSnapshot> {
+  // The published root must still be a real non-symlink directory
+  // resolving exactly to its fixed path (a substituted or symlinked root
+  // is a typed publish failure, never an adoption).
+  await withRuntimeReason("run_output_publish_failed", async () => {
+    await requireRealDirectory(outputsPath, "run outputs root");
+    const resolved = await realpath(outputsPath);
+    if (resolved !== outputsPath) {
+      throw fail(`run outputs root ${outputsPath} does not resolve to its canonical path`);
+    }
+  });
+
+  // The same prologue as the fresh path: the run-owned snapshot and the
+  // whole accepted history must still be intact before anything is
+  // verified.
+  await verifyRunInputsSnapshot(runInputs, provenance);
+  const acceptedByRef = await resolveAcceptedHistory(
+    pipeline,
+    acceptedOutputs,
+    runRootCanonical,
+    undefined,
+  );
+
+  const publishedNames = await withRuntimeReason("run_output_publish_failed", async () => {
+    try {
+      return await readdir(outputsPath);
+    } catch (cause) {
+      throw fail(`run outputs root ${outputsPath} could not be read`, cause);
+    }
+  });
+
+  const entries: RunOutputSnapshotEntry[] = [];
+  for (const output of pipeline.outputs) {
+    const what = `run output ${JSON.stringify(output.id)}`;
+    const source = resolveRunOutputSource(output, runInputs, acceptedByRef);
+    const publishedPath = join(outputsPath, output.id);
+    const publishedInfo = await withRuntimeReason("run_output_publish_failed", () =>
+      lstatOrNull(publishedPath),
+    );
+    if (!source.present) {
+      // An absent optional source must have no published entry.
+      if (publishedInfo !== null) {
+        throw runtimeFailure(
+          "run_output_invalid",
+          `${what} has no present source but the published outputs tree carries an entry for it`,
+        );
+      }
+      entries.push({
+        id: output.id,
+        type: output.type,
+        required: false,
+        present: false,
+      });
+      continue;
+    }
+    if (publishedInfo === null) {
+      throw runtimeFailure(
+        "run_output_invalid",
+        `${what} is missing from the published outputs tree`,
+      );
+    }
+    if (publishedInfo.isSymbolicLink() || (output.type === "directory" ? !publishedInfo.isDirectory() : !publishedInfo.isFile())) {
+      throw runtimeFailure(
+        "run_output_invalid",
+        `${what} exists in the published outputs tree but is ${describeEntry(publishedInfo)}`,
+      );
+    }
+
+    // The expected digest is computed from the trusted source with the
+    // same framing as the fresh publication; the published object must
+    // carry exactly those bytes.
+    const expectedHasher = runOutputDigestHasher(output.type);
+    if (output.type === "directory") {
+      const tree = await withRuntimeReason("run_output_invalid", () =>
+        scanDirectoryTree(source.sourcePath, source.sourceWhat),
+      );
+      for (const treeEntry of tree) {
+        if (treeEntry.kind === "directory") {
+          hashDirectoryEntry(expectedHasher, treeEntry, undefined);
+          continue;
+        }
+        const content = await withRuntimeReason("run_output_invalid", () =>
+          readRegularFileBytes(
+            treeEntry.absolutePath,
+            `${source.sourceWhat} file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          ),
+        );
+        hashDirectoryEntry(expectedHasher, treeEntry, content);
+      }
+    } else {
+      const content = await withRuntimeReason("run_output_invalid", () =>
+        readRegularFileBytes(source.sourcePath, source.sourceWhat),
+      );
+      hashBytes(expectedHasher, content);
+      if (output.type === "json") {
+        try {
+          JSON.parse(content.toString("utf8"));
+        } catch {
+          throw runtimeFailure(
+            "run_output_invalid",
+            `${source.sourceWhat} ${source.sourcePath} is not valid JSON`,
+          );
+        }
+      }
+    }
+
+    // The published object's own digest, recomputed with the same domain
+    // and framing over its real bytes.
+    const publishedHasher = runOutputDigestHasher(output.type);
+    if (output.type === "directory") {
+      const tree = await withRuntimeReason("run_output_invalid", () =>
+        scanDirectoryTree(publishedPath, `${what} published copy`),
+      );
+      for (const treeEntry of tree) {
+        if (treeEntry.kind === "directory") {
+          hashDirectoryEntry(publishedHasher, treeEntry, undefined);
+          continue;
+        }
+        const content = await withRuntimeReason("run_output_invalid", () =>
+          readRegularFileBytes(
+            treeEntry.absolutePath,
+            `${what} published copy file entry ${JSON.stringify(treeEntry.relativePath)}`,
+          ),
+        );
+        hashDirectoryEntry(publishedHasher, treeEntry, content);
+      }
+    } else {
+      const content = await withRuntimeReason("run_output_invalid", () =>
+        readRegularFileBytes(publishedPath, `${what} published copy`),
+      );
+      hashBytes(publishedHasher, content);
+      if (output.type === "json") {
+        // The same schema validation the fresh publication applies to the
+        // staged bytes, applied to the published bytes: the adopted value
+        // must satisfy the declared loader-compiled contract. The digest
+        // comparison below is the byte-level authority; the schema check
+        // keeps the adopted value honest against the compiled contract.
+        if (output.schema === undefined) {
+          throw new PipelineError(`${what} has no compiled JSON schema`);
+        }
+        const runOutputSchema = output.schema;
+        let publishedJson: unknown;
+        try {
+          publishedJson = JSON.parse(content.toString("utf8"));
+        } catch {
+          throw runtimeFailure(
+            "run_output_invalid",
+            `${what} ${publishedPath} is not valid JSON`,
+          );
+        }
+        await withRuntimeReason("run_output_invalid", async () =>
+          validatePipelineJson(runOutputSchema, publishedJson, `${what} published copy`),
+        );
+      }
+    }
+    const expectedDigest = expectedHasher.digest("hex");
+    const publishedDigest = publishedHasher.digest("hex");
+    if (expectedDigest !== publishedDigest) {
+      throw runtimeFailure(
+        "run_output_invalid",
+        `${what} published copy does not match the trusted source content`,
+      );
+    }
+    entries.push({
+      id: output.id,
+      type: output.type,
+      required: output.required,
+      present: true,
+      snapshot_path: publishedPath,
+      digest: expectedDigest,
+    });
+  }
+
+  // The published tree must carry exactly the expected entries — no
+  // extra top-level object of any kind.
+  const expectedNames = new Set(entries.filter((entry) => entry.present).map((entry) => entry.id));
+  for (const name of publishedNames) {
+    if (!expectedNames.has(name)) {
+      throw runtimeFailure(
+        "run_output_invalid",
+        `the published outputs tree carries the undeclared entry ${JSON.stringify(name)}`,
+      );
+    }
+  }
+
+  const snapshot = deepFreeze({
+    run_root: runRootCanonical,
+    outputs_root: outputsPath,
+    outputs: entries,
+  });
+  runOutputsSnapshotProvenance.set(snapshot, {
+    pipeline,
+    runRootCanonical,
+    outputsRootCanonical: outputsPath,
+  });
+  return snapshot;
 }
 
 /**

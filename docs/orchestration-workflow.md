@@ -250,14 +250,38 @@ orchestrator resume \
   agent-state profile name in declaration order from the explicitly passed
   configuration root, the single Launcher authority check, one Docker
   runtime adapter, and finally the coordinator resume entrypoint.
-- `resume` continues only a clean active run: `status active`, `phase
-  running`, every execution settled and bound to its committed transition,
-  and the last wait (if any) already answered. A terminal cursor is valid
-  and finalizes without any agent or decision callback. Waiting, in-flight,
-  settled-but-unbound, publishing, terminal, and final states are refused
-  with zero durable dispatches, zero Sessions, zero callbacks, and an
-  untouched state document; the outcome carries the structured refusal
-  reason.
+- `resume` continues a clean active run and, since the production recovery
+  increment, also completes the missing durable suffix of the loader-valid
+  post-commit crash windows. The clean boundary is unchanged: `status
+  active`, `phase running`, every execution settled and bound to its
+  committed transition, and the last wait (if any) already answered. A
+  terminal cursor is valid and finalizes without any agent or decision
+  callback. The recoverable crash windows — classified by the single
+  catch-free recovery classifier and executed inside the same coordinator
+  chain with the same transition kernel, terminal owner and finalization
+  dispatch the live coordination uses — are:
+  - a settled-but-unbound **stage** or **control** execution awaiting its
+    exactly one `transition_committed` (the outcome comes from the
+    execution's own durable contract: the fixed agent lifecycle outcome
+    `completed`, or the durable decision record's outcome — the worker and
+    the decision are never rerun, no Session is created, and a recovered
+    stage→planning transition enters the automatic trusted stage wait);
+  - a durably failed execution awaiting the run-level failure
+    finalization (exactly one `run_failed` carrying the durable failure
+    reason, or `run_cleanup_failed` when the durable cleanup pair failed);
+  - the incomplete terminal lifecycle: the missing `terminal_reached`
+    record, the missing run-output publication (an already published
+    orphan tree is verified byte-exactly against the trusted sources and
+    adopted without touching a file), or the missing final run status.
+  A settled-but-unbound **planning** execution is NOT a recovery window:
+  the plan-ready chains (`resume-plan`, the trusted automatic
+  `plan_ready` continuation) own it. Genuinely in-flight executions
+  (`prepared`, session-created, `running`) are never recoverable — no
+  worker replay, no guessing whether an external worker finished: they
+  are refused with zero durable dispatches, zero Sessions, zero
+  callbacks, and an untouched state document, as are waiting and
+  finalized states. A pending SIGINT/SIGTERM before the first recovery
+  effect returns the signal failure (130/143) with zero durable writes.
 - Honest profile boundary: the pipeline execution identity is verified by
   the durable digest, the run-owned inputs/project/accepted outputs by the
   restore context, and profile definitions remain trusted operator

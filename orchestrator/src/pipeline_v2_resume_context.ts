@@ -17,6 +17,7 @@ import {
   compiledStageTemplateFor,
 } from "./pipeline_v2_orchestration.ts";
 import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
+import { classifyPipelineV2ResumeRecovery } from "./pipeline_v2_recovery.ts";
 import {
   comparePipelineV2RunIdentity,
   type PipelineV2RunIdentityField,
@@ -297,8 +298,36 @@ async function requireRestoreDirectory(
  * already validated state. It re-derives nothing the loader guarantees
  * beyond its own narrow question — which clean boundaries carry no
  * unfinished work.
+ *
+ * Since the production recovery increment the boundary also accepts the
+ * post-commit crash windows the single recovery classifier recognizes
+ * (`classifyPipelineV2ResumeRecovery`): a settled-but-unbound stage or
+ * control execution awaiting its transition commit, a durably failed
+ * execution awaiting the run-level failure finalization, and the
+ * incomplete terminal lifecycle (a reached terminal awaiting the
+ * `terminal_reached` record, the run-output publication, or the final
+ * run status). The classifier is the single authority shared with the
+ * coordinator's resume flow, so the restore accepts exactly the windows
+ * the coordinator recovers — one authority, no second validator. A
+ * classifier `pipeline-mismatch` result is surfaced as the typed
+ * `pipeline_mismatch` restore reason; every other non-window shape keeps
+ * the established refusal behavior byte-for-byte.
  */
-function checkResumableBoundary(state: PipelineV2RunState): void {
+function checkResumableBoundary(pipeline: ResolvedPipelineV2, state: PipelineV2RunState): void {
+  const recovery = classifyPipelineV2ResumeRecovery(pipeline, state);
+  if (
+    recovery.kind === "transition" ||
+    recovery.kind === "run-finalization" ||
+    recovery.kind === "terminal"
+  ) {
+    return;
+  }
+  if (recovery.kind === "pipeline-mismatch") {
+    throw restoreError(
+      "pipeline_mismatch",
+      "the settled execution's compiled transition does not resolve in the trusted pipeline",
+    );
+  }
   const fail = (message: string): PipelineV2RuntimeContextRestoreError =>
     restoreError("invalid_state", message);
   const clean =
@@ -361,7 +390,7 @@ function checkResumableBoundary(state: PipelineV2RunState): void {
  * fresh, partial and completed plan acceptance windows are all accepted
  * the same way.
  */
-function checkPlanningAcceptanceBoundary(state: PipelineV2RunState): void {
+function checkPlanningAcceptanceBoundary(_pipeline: ResolvedPipelineV2, state: PipelineV2RunState): void {
   const fail = (message: string): PipelineV2RuntimeContextRestoreError =>
     restoreError("invalid_state", message);
   const clean =
@@ -498,6 +527,13 @@ function reconstructAcceptedRecords(
     const declaredIds = pipelineState.outputIds;
     const durableOutputs = execution.outputs;
     if (durableOutputs === undefined) {
+      // A durably failed execution never reached output acceptance: the
+      // recovery window F0 restores it without accepted records. The
+      // loader guarantees the failure reason on the failed phase, so the
+      // shape is authoritative, not a partial activation.
+      if (execution.phase === "failed") {
+        continue;
+      }
       if (declaredIds.length > 0) {
         throw restoreError(
           "invalid_state",
@@ -791,7 +827,7 @@ async function restoreContextCore(
   pipeline: ResolvedPipelineV2,
   state: unknown,
   runRoot: string,
-  checkBoundary: (state: PipelineV2RunState) => void,
+  checkBoundary: (pipeline: ResolvedPipelineV2, state: PipelineV2RunState) => void,
 ): Promise<{
   validated: PipelineV2RunState;
   runInputs: RunInputsSnapshot;
@@ -812,7 +848,7 @@ async function restoreContextCore(
     throw cause;
   }
   // 3. The narrower boundary policy of the calling entrypoint.
-  checkBoundary(validated);
+  checkBoundary(pipeline, validated);
   // 4. The exact pipeline identity plus the run-id binding.
   checkPipelineIdentity(pipeline, validated, runRoot);
   // 5. The compiled-history verification: every durable transition must
