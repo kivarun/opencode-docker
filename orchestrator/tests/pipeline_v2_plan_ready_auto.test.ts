@@ -1802,3 +1802,37 @@ test("30. a signal inside the auto continuation finalizes 130 with the handoff d
   expect(state?.terminal).toBeUndefined();
   expect((await readDurableState(harness)).revision).toBe(22);
 });
+
+test("31. the bundled-default auto run accepts a caller-supplied run id end to end", async () => {
+  const runId = "auto-runner-caller-id";
+  const harness = await makeAutoHarness("auto-runner-caller-id", runId, {
+    planReady: { stage_position: 1, initial_budget: INITIAL_BUDGET },
+    devTarget: "done",
+  }, PROPOSAL_ONE_TASK, false);
+  const generatorCalls: string[] = [];
+  const deps: PipelineV2RunnerDeps = {
+    ...autoRunnerDeps(harness, runId),
+    randomId: () => {
+      generatorCalls.push("called");
+      return "never-generated";
+    },
+  };
+  const options = { ...autoRunOptions(harness), runId };
+  const outcome = await runPipelineV2(options, deps);
+  expect(generatorCalls).toEqual([]);
+  const state = expectRunnerSuccess(outcome);
+  expect(outcome.runId).toBe(runId);
+  expect(outcome.runRoot).toBe(harness.runRoot);
+  expect(state.run_id).toBe(runId);
+  expect(state.revision).toBe(24);
+  // the re-run with the same caller id collides without touching the run
+  const before = await fingerprint(harness.runRoot);
+  const collision = await runPipelineV2({ ...autoRunOptions(harness), runId }, autoRunnerDeps(harness, runId));
+  expect(collision.ok).toBe(false);
+  expect(collision.exitCode).toBe(1);
+  expect(collision.runId).toBe(runId);
+  expect(collision.runRoot).toBe(harness.runRoot);
+  expect(collision.state).toBeNull();
+  expect(collision.reason).toBe("run_already_exists");
+  expect(await fingerprint(harness.runRoot)).toBe(before);
+});

@@ -1139,6 +1139,7 @@ test("the export surface gains exactly one runtime key and the module implements
   // runner and the three existing-run intervention entrypoints — resume,
   // continue-stage and revise-task) plus the planning-run-plan entrypoint
   expect(Object.keys(namespace).sort()).toEqual([
+    "PipelineV2RunRootCollisionError",
     "continuePipelineV2Stage",
     "resumePipelineV2",
     "resumePipelineV2PlanningRunPlan",

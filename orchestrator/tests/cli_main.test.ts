@@ -199,6 +199,69 @@ test("exit codes 0/1/130/143 pass through unchanged", async () => {
   }
 });
 
+test("run CLI reports the caller-id collision with the exact human line and exit 1", async () => {
+  const { io, err } = makeIo();
+  io.runPipelineV2 = (async () =>
+    runOutcome({
+      ok: false,
+      exitCode: 1,
+      runId: "occupied-run",
+      runRoot: "/state/root/pipeline-runs/occupied-run",
+      reason: "run_already_exists",
+    })) as unknown as CliIo["runPipelineV2"];
+  const exit = await runCli(["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr"], io);
+  expect(exit).toBe(1);
+  expect(err.join("\n")).toBe(
+    'orchestrator: pipeline v2 run failed: run "occupied-run" already exists; use inspect',
+  );
+});
+
+test("run CLI passes the collision outcome through JSON mode unchanged", async () => {
+  const { io, out } = makeIo();
+  io.runPipelineV2 = (async () =>
+    runOutcome({
+      ok: false,
+      exitCode: 1,
+      runId: "occupied-run",
+      runRoot: "/state/root/pipeline-runs/occupied-run",
+      reason: "run_already_exists",
+    })) as unknown as CliIo["runPipelineV2"];
+  const exit = await runCli(["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr", "--json"], io);
+  expect(exit).toBe(1);
+  const documents = out.join("\n").trim().split("\n");
+  expect(documents).toHaveLength(1);
+  expect(JSON.parse(documents[0] ?? "{}")).toEqual({
+    ok: false,
+    exitCode: 1,
+    runId: "occupied-run",
+    runRoot: "/state/root/pipeline-runs/occupied-run",
+    state: null,
+    reason: "run_already_exists",
+  });
+});
+
+test("run dispatches the caller-supplied --run-id into the runner options", async () => {
+  const { io } = makeIo();
+  const calls: Array<Record<string, unknown>> = [];
+  io.runPipelineV2 = (async (options: unknown) => {
+    calls.push(options as Record<string, unknown>);
+    return runOutcome({});
+  }) as unknown as CliIo["runPipelineV2"];
+  const exit = await runCli(
+    ["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr", "--run-id=caller.run-01_x"],
+    io,
+  );
+  expect(exit).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.runId).toBe("caller.run-01_x");
+  // both flag forms
+  await runCli(
+    ["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr", "--run-id", "other_run"],
+    io,
+  );
+  expect(calls[1]?.runId).toBe("other_run");
+});
+
 test("parse errors return 2 before any runner or runner-function call", async () => {
   const { io } = makeIo();
   let called = 0;

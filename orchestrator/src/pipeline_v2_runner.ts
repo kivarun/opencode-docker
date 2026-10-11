@@ -167,8 +167,31 @@ export interface PipelineV2RunOptions {
   readonly configRoot: string;
   readonly projectSourcePath: string;
   readonly inputBindings: readonly RunInputBinding[];
+  /**
+   * Optional caller-supplied run identifier. When present, the exact
+   * captured value (never normalized, never re-generated) becomes the
+   * authoritative run id of the run root, the durable state, the
+   * execution documents, the output paths and the outcome; the built-in
+   * generator is bypassed entirely. The caller is responsible for storing
+   * the id durably before the call: a lost result is then recoverable
+   * through `orchestrator inspect --run-id R` and the existing
+   * continuation commands. This is caller correlation, not an idempotency
+   * key: a repeated `run` with the same id never reuses, replays or
+   * resumes the existing run — the run root is claimed exclusively and
+   * the collision fails the call with `run_already_exists`.
+   */
+  readonly runId?: string;
   readonly launcherId?: string;
 }
+
+/**
+ * The closed run-outcome vocabulary member produced only by the fresh-run
+ * collision path: the caller-supplied (or generated) run id names an
+ * existing run-root object, the exclusive claim refused it, and the
+ * existing run's state is deliberately not read, not returned and not
+ * disclosed — the caller must use `orchestrator inspect --run-id R`.
+ */
+export type PipelineV2RunCollisionReason = "run_already_exists";
 
 /**
  * Trusted runtime configuration mapping the orchestrator-side state root
@@ -229,7 +252,7 @@ export interface PipelineV2RunOutcome {
    * happen before any state document could exist, for confirmed success
    * and for the waiting branch.
    */
-  readonly reason?: PipelineV2FailureReason | PipelineV2ResumeRefusalReason;
+  readonly reason?: PipelineV2FailureReason | PipelineV2ResumeRefusalReason | PipelineV2RunCollisionReason;
 }
 
 function isNonEmptyAbsolutePath(value: unknown): value is string {
@@ -241,14 +264,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Thrown only by the authoritative exclusive run-leaf claim when the run
+ * id already names an existing object at
+ * `<state-root>/pipeline-runs/<run-id>` (a valid run, an incomplete
+ * directory, a symlink, a regular file or any other layout — the claim
+ * never inspects the object and never follows a symlink). The fresh-run
+ * collision path maps this error to the typed `run_already_exists`
+ * outcome; the existing object's state is never opened, read or
+ * disclosed.
+ */
+export class PipelineV2RunRootCollisionError extends Error {
+  readonly runId: string;
+  readonly localRunRoot: string;
+  constructor(runId: string, localRunRoot: string) {
+    super(
+      `pipeline v2 runner: refusing to reuse an existing object at ${JSON.stringify(localRunRoot)}`,
+    );
+    this.name = "PipelineV2RunRootCollisionError";
+    this.runId = runId;
+    this.localRunRoot = localRunRoot;
+  }
+}
+
+/**
  * Shape-only validation of the runner contract. It reads no secret value:
  * environment maps, profile bodies and binding paths are inspected only by
- * name/kind, never by value.
+ * name/kind, never by value. Returns the caller-supplied run id captured
+ * exactly once (undefined when the caller did not pass one); every other
+ * option field keeps its established one-time read order.
  */
 function validateRunnerContract(
   options: PipelineV2RunOptions,
   deps: PipelineV2RunnerDeps,
-): void {
+): string | undefined {
   if (!isRecord(options)) {
     throw new Error("pipeline v2 runner options must be an object");
   }
@@ -259,6 +307,18 @@ function validateRunnerContract(
   }
   if (!Array.isArray(options.inputBindings)) {
     throw new Error("pipeline v2 runner options.inputBindings must be an array");
+  }
+  // The caller-supplied run id is read exactly once, here, before any
+  // await: the captured value alone reaches the run-id selection, so a
+  // later caller mutation cannot swap the identity, and hostile extra
+  // fields are never read.
+  const capturedRunIdValue = options.runId;
+  let capturedRunId: string | undefined;
+  if (capturedRunIdValue !== undefined) {
+    if (typeof capturedRunIdValue !== "string") {
+      throw new Error("pipeline v2 runner options.runId must be a string");
+    }
+    capturedRunId = capturedRunIdValue;
   }
   if (options.launcherId !== undefined && !options.launcherId.startsWith("dhl_")) {
     throw new Error("pipeline v2 runner options.launcherId must be a launcher ID (dhl_...)");
@@ -300,6 +360,7 @@ function validateRunnerContract(
   if (deps.randomId !== undefined && typeof deps.randomId !== "function") {
     throw new Error("pipeline v2 runner deps.randomId must be a function");
   }
+  return capturedRunId;
 }
 
 function deepFreeze<T>(value: T): T {
@@ -440,9 +501,7 @@ async function prepareRunRoot(
     await mkdir(localRunRoot, { mode: 0o700 });
   } catch (cause) {
     if (isErrnoExceptionCode(cause, "EEXIST")) {
-      throw new Error(
-        `pipeline v2 runner: refusing to reuse an existing object at ${JSON.stringify(localRunRoot)}`,
-      );
+      throw new PipelineV2RunRootCollisionError(runId, localRunRoot);
     }
     throw new Error(
       `pipeline v2 runner: cannot create the run directory ${JSON.stringify(localRunRoot)}: ${describeError(cause)}`,
@@ -547,8 +606,9 @@ export async function runPipelineV2(
   };
 
   let gate: RunCauseGate;
+  let callerRunId: string | undefined;
   try {
-    validateRunnerContract(options, deps);
+    callerRunId = validateRunnerContract(options, deps);
     // The signal seam is read exactly once, here, inside the protected
     // preflight; the captured value alone is checked and handed to the
     // gate, so the original getter or property is never read again.
@@ -624,7 +684,11 @@ export async function runPipelineV2(
 
   let runId: string;
   try {
-    runId = deps.randomId ? deps.randomId() : crypto.randomUUID();
+    // The caller-supplied run id (captured once during the protected
+    // preflight) becomes the authoritative identity and bypasses the
+    // built-in generator entirely; without it the established
+    // generation path is unchanged.
+    runId = callerRunId !== undefined ? callerRunId : deps.randomId ? deps.randomId() : crypto.randomUUID();
     expectSafeId(runId, "pipeline v2 run id");
   } catch (cause) {
     if (recordedSignal() !== null) {
@@ -675,6 +739,20 @@ export async function runPipelineV2(
         return postRunRootSignalOutcome(leaf.localRunRoot, null);
       }
       return signalOutcomeBeforeRunRoot();
+    }
+    if (cause instanceof PipelineV2RunRootCollisionError) {
+      // The exclusive claim lost the race against an existing object:
+      // the existing run's state is never opened, read or disclosed, no
+      // sink is constructed and no Session is created. The caller must
+      // use `orchestrator inspect --run-id R`.
+      return deepFreeze({
+        ok: false,
+        exitCode: 1,
+        runId,
+        runRoot: cause.localRunRoot,
+        state: null,
+        reason: "run_already_exists",
+      });
     }
     if (leaf.created && leaf.localRunRoot !== null) {
       return postRunRootFailure(cause, leaf.localRunRoot, null);

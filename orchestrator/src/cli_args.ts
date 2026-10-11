@@ -31,6 +31,7 @@ export interface ParsedPipelineRunArgs {
   readonly configRoot: string;
   readonly projectSourcePath: string;
   readonly inputBindings: readonly RunInputBinding[];
+  readonly runId?: string;
   readonly launcherId?: string;
   readonly json: boolean;
 }
@@ -173,6 +174,15 @@ export function usage(): string {
     "                          and its next manual step is 'orchestrator resume-plan",
     "                          --stage-id stage-1 --initial-budget 1' (the manual",
     "                          planning path).",
+    "  [--run-id SAFE_ID]      optional caller-chosen run identifier (letters, digits, '_',",
+    "                          '.', '-', at most 128 characters). The caller is responsible",
+    "                          for durably storing it BEFORE the call: when the result is",
+    "                          lost, 'orchestrator inspect --run-id R' reports the exact",
+    "                          boundary and the existing resume/intervention commands take",
+    "                          over. A repeated 'run' with the same id is not a retry or a",
+    "                          resume: the run root is claimed exclusively and an already",
+    "                          existing object fails the call (use 'inspect', never a second",
+    "                          create). Without the flag the generated run id is unchanged.",
     "  --config-root PATH      operator-controlled configuration root holding",
     "                          profiles/<name>.yaml and the OpenCode configurations; required;",
     "                          absolute path",
@@ -793,6 +803,7 @@ function parseRunArgs(argv: string[]): ParsedPipelineRunArgs {
   let pipelineRoot: string | null = null;
   let configRoot: string | null = null;
   let projectSourcePath: string | null = null;
+  let runId: string | null = null;
   let launcherId: string | undefined;
   let json = false;
   const inputBindings: RunInputBinding[] = [];
@@ -854,6 +865,20 @@ function parseRunArgs(argv: string[]): ParsedPipelineRunArgs {
       seenInputIds.add(id);
       inputBindings.push({ id, path });
       i = next;
+    } else if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      if (runId !== null) {
+        throw new Error("--run-id may be given at most once");
+      }
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
     } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
       const { value, next } = parseValue(argv, i, "--launcher-id");
       if (!value.startsWith("dhl_")) {
@@ -910,6 +935,7 @@ function parseRunArgs(argv: string[]): ParsedPipelineRunArgs {
     configRoot,
     projectSourcePath,
     inputBindings,
+    runId: runId ?? undefined,
     launcherId,
     json,
   };

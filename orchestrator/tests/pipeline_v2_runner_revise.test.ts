@@ -1035,6 +1035,7 @@ test("capture contract: nested helper fields are read exactly once and replaceme
 test("the runner export surface gains exactly one key for the revise-task entrypoint", async () => {
   const namespace = (await import("../src/pipeline_v2_runner.ts")) as Record<string, unknown>;
   expect(Object.keys(namespace).sort()).toEqual([
+    "PipelineV2RunRootCollisionError",
     "continuePipelineV2Stage",
     "resumePipelineV2",
     "resumePipelineV2PlanningRunPlan",

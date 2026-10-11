@@ -1157,6 +1157,7 @@ test("a signal accepted at the authority boundary yields the signal outcome with
 test("the runner export surface gains exactly one new function key", async () => {
   const namespace = (await import("../src/pipeline_v2_runner.ts")) as Record<string, unknown>;
   expect(Object.keys(namespace).sort()).toEqual([
+    "PipelineV2RunRootCollisionError",
     "continuePipelineV2Stage",
     "resumePipelineV2",
     "resumePipelineV2PlanningRunPlan",

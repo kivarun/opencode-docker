@@ -149,6 +149,7 @@ layer, and no manual Session, mount, or Docker Helper argv in the CLI.
 
 ```
 orchestrator run \
+  [--run-id SAFE_ID] \
   --pipeline-root /absolute/pipeline-bundle \
   --config-root /absolute/operator-config \
   --project /absolute/project-source \
@@ -161,6 +162,19 @@ orchestrator run \
   be absolute paths. There is no default pipeline for `run`: the bundled
   pipeline is still the v1 diagnostic pipeline and is never selected by
   `run`.
+- `--run-id SAFE_ID` is an optional caller-supplied run identifier (the
+  shared safe-id grammar; both `--run-id value` and `--run-id=value`).
+  The caller is responsible for durably storing the id BEFORE the call:
+  when the result of the first invocation is lost,
+  `orchestrator inspect --run-id R` reports the exact boundary and the
+  existing resume/intervention commands take over. A repeated `run` with
+  the same id is caller correlation, never a retry or a resume: the run
+  root `<state-root>/pipeline-runs/<run-id>` is claimed exclusively by a
+  single atomic create, and an existing object of any kind fails the call
+  with the typed `run_already_exists` outcome (use `inspect`, never a
+  second create). Without the flag the runner generates the run id
+  exactly as before. Preflight failures before the claim reserve
+  nothing: the id stays free for a corrected retry.
 - `--input` is repeatable in the form `SAFE_ID=ABSOLUTE_PATH`; the pair is
   split at the first `=`, so `=` inside the path is allowed. Zero inputs are
   valid when the pipeline declares no run inputs; the trusted loader and

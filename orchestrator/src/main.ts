@@ -396,6 +396,7 @@ async function runPipelineV2Command(
       configRoot: parsed.configRoot,
       projectSourcePath: parsed.projectSourcePath,
       inputBindings: parsed.inputBindings,
+      runId: parsed.runId,
       launcherId: parsed.launcherId,
     },
     deps,
@@ -683,6 +684,13 @@ function reportPipelineV2Outcome(
     // the operator's next step (no automatic stage or budget exists).
     io.writeError(
       `orchestrator: ${command} plan-ready (run ${outcome.runId}, state ${outcome.runRoot}/state.json)`,
+    );
+  } else if (outcome.reason === "run_already_exists") {
+    // The fresh-run collision: the run root names an existing object the
+    // runner never opened. `orchestrator inspect --run-id R` is the one
+    // safe next step; the existing run's state is never disclosed here.
+    io.writeError(
+      `orchestrator: pipeline v2 run failed: run "${outcome.runId}" already exists; use inspect`,
     );
   } else if (outcome.runRoot !== null) {
     const reasonPart = outcome.reason !== undefined ? ` reason ${outcome.reason},` : "";

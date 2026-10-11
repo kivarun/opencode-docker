@@ -211,6 +211,70 @@ test("run rejects unknown flags and relative required paths", () => {
   expectRunError(["--pipeline-root=/p", "--config-root=/c", "--project", "relative"], "--project must be an absolute path");
 });
 
+// --- run --run-id parsing (optional caller-supplied run id) --------------------
+
+test("run accepts --run-id in both flag forms and propagates it exactly", () => {
+  const spaced = parseCommand("run", [...RUN_BASE, "--run-id", "caller.run-01_x"]);
+  expect(spaced.kind).toBe("run");
+  if (spaced.kind !== "run") {
+    throw new Error("expected run");
+  }
+  expect(spaced.runId).toBe("caller.run-01_x");
+  const equals = parseCommand("run", [...RUN_BASE, "--run-id=Run_1.2-x"]);
+  expect(equals.kind).toBe("run");
+  if (equals.kind !== "run") {
+    throw new Error("expected run");
+  }
+  expect(equals.runId).toBe("Run_1.2-x");
+  // the caller value is carried verbatim: no normalization of case or symbols
+  const carried = equals.runId;
+  if (carried === undefined) {
+    throw new Error("expected run id");
+  }
+  expect(carried).not.toBe(carried.toLowerCase());
+});
+
+test("run without --run-id parses exactly as before (no generated value at parse time)", () => {
+  const parsed = parseCommand("run", [...RUN_BASE]);
+  expect(parsed.kind).toBe("run");
+  if (parsed.kind !== "run") {
+    throw new Error("expected run");
+  }
+  expect(parsed.runId).toBeUndefined();
+});
+
+test("run rejects duplicate --run-id with exit-2 parse failure", () => {
+  expectRunError(
+    [...RUN_BASE, "--run-id", "first", "--run-id=second"],
+    "--run-id may be given at most once",
+  );
+});
+
+test("run rejects unsafe --run-id values through the shared safe-id grammar", () => {
+  for (const value of [
+    "a/b",
+    "../escape",
+    ".",
+    "..",
+    "a b",
+    "a\tb",
+    "a\nb",
+    "rün",
+    "run\u0000id",
+    "-leading",
+    "_leading",
+    "a".repeat(129),
+  ]) {
+    expectRunError([...RUN_BASE, "--run-id", value], "--run-id must be a safe identifier");
+  }
+  // the empty value is refused by the shared value grammar
+  expectRunError([...RUN_BASE, "--run-id", ""], "--run-id requires a value");
+});
+
+test("run rejects a value-less --run-id", () => {
+  expectRunError([...RUN_BASE, "--run-id"], "--run-id requires a value");
+});
+
 // --- resume parsing -----------------------------------------------------------
 
 test("resume parses the exact grammar with both flag forms", () => {
