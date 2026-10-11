@@ -93,6 +93,12 @@ import {
 } from "./projection_fs.ts";
 import { isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import type { PipelineStateIo } from "./pipeline_state_store.ts";
+import {
+  acquirePipelineV2RunMutationLock,
+  pipelineV2RunMutationLockPublicReason,
+  type PipelineV2RunMutationLockAcquisition,
+} from "./pipeline_v2_run_mutation_lock.ts";
+import type { PipelineV2PublicReason } from "./pipeline_v2_public_reason.ts";
 
 /**
  * The reserved intervention action ids (an implementation detail, never a
@@ -147,6 +153,7 @@ export type PipelineV2WaitResponseFailureReason =
   | "invalid_options"
   | "missing_state"
   | "run_layout_invalid"
+  | "run_busy"
   | "invalid_state"
   | "invalid_response"
   | "wait_conflict"
@@ -346,6 +353,50 @@ export async function respondPipelineV2Wait(
     );
   }
 
+  // --- run mutation lock (inter-process serialization) ---------------------
+  //
+  // The response command is a mutating command: it takes the same
+  // exclusive per-run lock the runner commands hold, after the read-only
+  // layout verification and before the sink opens, so a busy refusal
+  // performs zero state reads, zero publications and zero dispatches.
+  // The `existing` mode refuses a stateless run root first (the fresh
+  // runner between its claim and its first durable command), and the
+  // lock is released on every return and throw path of this command.
+  let respondLockAcquisition: PipelineV2RunMutationLockAcquisition;
+  try {
+    respondLockAcquisition = acquirePipelineV2RunMutationLock({
+      runRoot: canonicalRunRoot,
+      runId: validated.runId,
+      mode: "existing",
+    });
+  } catch (cause) {
+    const mapped = pipelineV2RunMutationLockPublicReason(cause);
+    const reason: PipelineV2WaitResponseFailureReason =
+      mapped === "missing_state" || mapped === "run_layout_invalid" ? mapped : "internal_error";
+    const message = cause instanceof Error ? cause.message : String(cause);
+    console.error(`orchestrator: pipeline v2 wait response failed: ${message}`);
+    return deepFreeze<PipelineV2WaitResponseOutcome>({
+      ok: false,
+      exitCode: 1,
+      runId: validated.runId,
+      runRoot: canonicalRunRoot,
+      state: null,
+      reason,
+    });
+  }
+  if (respondLockAcquisition.busy) {
+    return deepFreeze<PipelineV2WaitResponseOutcome>({
+      ok: false,
+      exitCode: 1,
+      runId: validated.runId,
+      runRoot: canonicalRunRoot,
+      state: null,
+      reason: "run_busy",
+    });
+  }
+  const respondMutationLock = respondLockAcquisition.lock;
+
+  try {
   // --- sink open (read-only), then the single response chain --------------
   let sink: PipelineV2RunStateSink;
   try {
@@ -439,4 +490,7 @@ export async function respondPipelineV2Wait(
     responseSha256: recorded.response_sha256,
     state: recorded.state,
   });
+  } finally {
+    respondMutationLock.release();
+  }
 }

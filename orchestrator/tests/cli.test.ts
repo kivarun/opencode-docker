@@ -1290,7 +1290,7 @@ test("usage documents the read-only inspect command and the corrected planning d
   expect(text).toContain("not recoverable yet");
   expect(text).toContain("A finished failed run inspects successfully (exit 0, status");
   expect(text).toContain("never output content or");
-  expect(text).toContain("One mutating caller per run is safe alongside inspect");
+  expect(text).toContain("Concurrent mutating commands on one run are serialized");
   // the corrected drift: the bundled default-v2 auto-continues; resume-plan
   // is the manual path for policy-less boundaries
   expect(text).toContain("carries the trusted");

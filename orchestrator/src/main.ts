@@ -692,6 +692,13 @@ function reportPipelineV2Outcome(
     io.writeError(
       `orchestrator: pipeline v2 run failed: run "${outcome.runId}" already exists; use inspect`,
     );
+  } else if (outcome.reason === "run_busy") {
+    // The per-run mutation lock is held by another process: a retryable
+    // transport/control-plane condition, not a durable run failure. The
+    // run tree was never touched by this command.
+    io.writeError(
+      `orchestrator: pipeline v2 ${command} failed: run "${outcome.runId}" is busy`,
+    );
   } else if (outcome.runRoot !== null) {
     const reasonPart = outcome.reason !== undefined ? ` reason ${outcome.reason},` : "";
     io.writeError(

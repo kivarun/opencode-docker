@@ -249,8 +249,10 @@ orchestrator run \
   progressed state is not an error to recover by hand: the outcome carries
   the machine-readable reason (`invalid_state` for a stale retry) with zero
   durable writes, and the caller calls `inspect` next. A successful inspect
-  of a failed run is an inspect success, not a command failure. One mutating
-  caller per run is still required (no multi-process locking).
+  of a failed run is an inspect success, not a command failure. Concurrent
+  mutating commands on one run are serialized by the kernel-owned run
+  mutation lock (see below); a refused caller fails fast with `run_busy`
+  and zero durable effects.
 - The signal wiring is shared with v1: the first SIGINT/SIGTERM is forwarded
   to a running worker `run` CLI process through `killActive` (first-wins),
   and the lifecycle records a user abort only when the signal may still be
@@ -343,6 +345,52 @@ orchestrator resume \
   exactly one JSON `PipelineV2RunOutcome` plus a newline to stdout with
   helper output streamed to stderr; the exit code is the outcome's exit
   code.
+
+## Inter-process run mutation lock (implemented)
+
+Every mutating Pipeline V2 command (`run`, `resume`, `respond`,
+`continue-stage`, `revise-task`, `resume-plan`) serializes per run id
+across real OS processes. The primitive is the kernel advisory exclusive
+lock `flock(fd, LOCK_EX|LOCK_NB)` taken on the verified run-root directory
+descriptor itself (opened `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` via
+`bun:ffi` `dlopen` of libc with an errno readback for the busy verdict).
+
+- Zero lock artifacts: the lock lives on an open file description, the run
+  directory's content is never modified, no chmod, no sentinel files — run
+  tree fingerprints, the strict layout and `inspect` are untouched.
+- Identity is inherently bound to the verified state root + safe run id
+  (no caller-supplied lock path); a symlinked/file/FIFO run root fails
+  closed (`run_layout_invalid`).
+- The kernel releases the lock when the owning process exits or is killed
+  — including SIGKILL — so there is no stale-lock metadata, no TTL/PID
+  heuristic, no unlock command, and no crash-recovery protocol. The lock
+  is not part of the run state; the run directory's existence means
+  nothing about the lock and vice versa.
+- `flock` is per-open-file-description, so two descriptors in one process
+  conflict too; `O_CLOEXEC` keeps docker-helper child processes from
+  inheriting the descriptor.
+- Lock lifetime covers the whole command: intervention/controller
+  dispatch, coordinator sessions, the automatic plan-ready continuation,
+  terminal publication and finalization, cleanup, and outcome
+  construction; release happens on every normal, throwing and signal
+  path, and composed controllers never re-acquire. The fresh `run` claims
+  the run root by its exclusive `mkdir` as before (a concurrent same-id
+  fresh run still reports `run_already_exists`, never `run_busy`) and
+  takes the lock right after the claim; the shared existing-run core and
+  the `respond` entrypoint take it after their read-only run-root
+  verification. An existing-run command whose run root has no committed
+  `state.json` yet refuses `missing_state` exactly as before instead of
+  contending for the fresh winner's lock window.
+- Busy outcome: the loser returns the exact
+  `{ok:false, exitCode:1, runId, runRoot, state:null, reason:"run_busy"}`
+  with zero state reads after the busy determination, zero sink opens,
+  zero dispatches, zero sessions and zero published artifacts, and the
+  human reporter prints `orchestrator: pipeline v2 <command> failed: run
+  "<id>" is busy`. `run_busy` is a transport/control-plane condition, not
+  a durable run failure: `inspect` is always the safe next step, and a
+  retry after the winner releases continues (or refuses) on the moved
+  boundary — never with `run_busy` again.
+- Different run ids never block each other.
 
 ## The read-only versioned run projection (`orchestrator inspect`)
 
@@ -438,10 +486,10 @@ orchestrator inspect --run-id SAFE_ID --config-root ABS [--json]
   <n>)`, optionally with the wait index or the terminal state id) and
   exits 0. JSON mode prints exactly one JSON document plus a newline to
   stdout; errors and diagnostics go to stderr.
-- Concurrency honesty: one mutating caller per run is safe alongside
-  inspect; the result may reflect the old or the new atomic revision, but
-  it is always entirely loader-valid and never mutated. Concurrent
-  mutating callers are not yet supported (no multi-process locking), and
+- Concurrency honesty: mutating commands on one run are serialized by the
+  kernel-owned run mutation lock (see below); `inspect` stays read-only
+  alongside them — the result may reflect the old or the new atomic
+  revision, but it is always entirely loader-valid and never mutated.
   list-runs, idempotency keys, event/log streams and an HTTP API remain
   out of scope.
 
@@ -828,9 +876,10 @@ orchestrator respond \
   published manifest as an orphan with the run still waiting, and the exact
   retry completes the commit; a `durability_unknown` adopts the visible
   candidate and poisons the loaded sink so nothing further dispatches in
-  this process. There is no multi-process locking: concurrent responders
-  race under the wait store's exclusive-link idempotency and the sink's
-  in-process dispatch serialization.
+  this process. Concurrent responding processes are serialized by the
+  run mutation lock at the `respond` entrypoint; the wait store's
+  exclusive-link idempotency and the sink's in-process dispatch
+  serialization remain the inner defenses.
 - Recording a response never continues the pipeline: it moves the run from
   `waiting` back to `active` at the declared target state. Continuation is
   the separate existing command `orchestrator resume`; there is no
@@ -2167,10 +2216,8 @@ while the Session is still cleaned up exactly once. The previous snapshot is
 never claimed to have survived in that case.
 
 Not implemented yet: resume (a fresh process cannot continue an existing
-run), multi-process coordination (concurrent writers of the same run in the
-same state root are not serialized across process boundaries), migration
-between schema versions, post-rename durability recovery, and run listing or
-inspection commands.
+run), migration between schema versions, post-rename durability recovery,
+and run listing or inspection commands.
 
 Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
@@ -2897,8 +2944,8 @@ compiled plan object and the last authoritative state; prepared
 manifests, canonical JSON, task bodies, paths and the caller candidate
 never enter the result or the content-free diagnostics.
 Production-reachable transitively through the planning-output
-composition (runner → handoff). Still unwired: wait/replanning policy,
-automatic resume and multi-process locking.
+composition (runner → handoff). Still unwired: wait/replanning policy and
+automatic resume.
 
 ### Run plan restoration after a restart (production-neutral, production-reachable transitively)
 

@@ -138,6 +138,11 @@ import {
   publicReasonFor,
   type PipelineV2PublicReason,
 } from "./pipeline_v2_public_reason.ts";
+import {
+  acquirePipelineV2RunMutationLock,
+  pipelineV2RunMutationLockPublicReason,
+  type PipelineV2RunMutationLockAcquisition,
+} from "./pipeline_v2_run_mutation_lock.ts";
 import { loadPipelineV2, type ResolvedPipelineV2 } from "./pipeline_v2.ts";
 import { PipelineV2RunStateSink } from "./pipeline_v2_state_sink.ts";
 import {
@@ -604,6 +609,18 @@ async function verifyPair(
   return null;
 }
 
+/**
+ * Maps a run mutation lock acquisition failure onto the public refusal
+ * vocabulary. Contention is never an error (the acquisition reports it as
+ * a typed busy result); only a failed acquisition reaches this mapping.
+ * The mapping is owned here — and not inside the public-reason mapper —
+ * so the read-only `inspect` boundary keeps no import path to the lock
+ * owner.
+ */
+function mutationLockPublicReason(cause: unknown): PipelineV2PublicReason {
+  return pipelineV2RunMutationLockPublicReason(cause) ?? "internal_error";
+}
+
 function signalReasonOf(signal: "SIGINT" | "SIGTERM"): PipelineV2FailureReason {
   return signal === "SIGINT" ? "signal_sigint" : "signal_sigterm";
 }
@@ -796,6 +813,44 @@ export async function runPipelineV2(
     return preflightFailure(cause);
   }
 
+  // --- run mutation lock ---------------------------------------------------
+  //
+  // The fresh runner holds the exclusive per-run mutation lock from the
+  // successful atomic run-root claim until the outcome is constructed:
+  // no other process can mutate this run while the command runs, and a
+  // concurrent existing-run command receives the typed `run_busy`
+  // refusal without touching the run. The acquisition is synchronous
+  // directly after the claim, so there is no window in which another
+  // process could take the lock of the just-claimed run: an existing-run
+  // command refuses a stateless run root (`missing_state`) before it
+  // ever attempts the lock, and once `state.json` exists this runner
+  // already holds the lock.
+  let freshLockAcquisition: PipelineV2RunMutationLockAcquisition;
+  try {
+    freshLockAcquisition = acquirePipelineV2RunMutationLock({
+      runRoot: runRoot.localRunRoot,
+      runId,
+      mode: "fresh",
+    });
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(runRoot.localRunRoot, null);
+    }
+    return postRunRootFailure(cause, runRoot.localRunRoot, null, mutationLockPublicReason(cause));
+  }
+  if (freshLockAcquisition.busy) {
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: null,
+      reason: "run_busy",
+    });
+  }
+  const freshMutationLock = freshLockAcquisition.lock;
+
+  try {
   // --- sink, runtime, coordinator -----------------------------------------
   //
   // Both are created after the run root exists: any failure here is a
@@ -957,6 +1012,9 @@ export async function runPipelineV2(
     state: result.state,
     reason,
   });
+  } finally {
+    freshMutationLock.release();
+  }
 }
 
 // --- resume ----------------------------------------------------------------
@@ -1692,6 +1750,43 @@ async function runExistingPipelineV2(
     return deepFreeze({ ok: false, exitCode: 1, runId, runRoot: runRoot.localRunRoot, state, reason });
   };
 
+  // --- run mutation lock (inter-process serialization) ---------------------
+  //
+  // The single acquisition site every existing-run mutating command
+  // shares (`resume`, `continue-stage`, `revise-task`, `resume-plan`).
+  // The lock is taken after the read-only run-root verification and
+  // before the sink opens, so a busy refusal performs zero state reads,
+  // zero dispatches and zero sessions. The `existing` mode refuses a
+  // stateless run root first: a fresh runner between its atomic claim
+  // and its first durable command cannot lose its own lock to an
+  // existing-run command, and once `state.json` exists the fresh runner
+  // provably holds the lock.
+  let existingLockAcquisition: PipelineV2RunMutationLockAcquisition;
+  try {
+    existingLockAcquisition = acquirePipelineV2RunMutationLock({
+      runRoot: runRoot.localRunRoot,
+      runId,
+      mode: "existing",
+    });
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(null);
+    }
+    return postRunRootFailure(cause, null, mutationLockPublicReason(cause));
+  }
+  if (existingLockAcquisition.busy) {
+    return deepFreeze({
+      ok: false,
+      exitCode: 1,
+      runId,
+      runRoot: runRoot.localRunRoot,
+      state: null,
+      reason: "run_busy",
+    });
+  }
+  const existingMutationLock = existingLockAcquisition.lock;
+
+  try {
   // --- sink open (read-only), then the durable snapshot --------------------
 
   let sinkOrNull: PipelineV2RunStateSink | null = null;
@@ -1927,6 +2022,9 @@ async function runExistingPipelineV2(
     state: result.state,
     reason,
   });
+  } finally {
+    existingMutationLock.release();
+  }
 }
 
 /**
