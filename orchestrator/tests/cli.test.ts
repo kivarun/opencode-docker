@@ -1133,6 +1133,111 @@ test("usage documents the production pipeline v2 resume-plan command", () => {
   expect(text).toContain("after a revise cycle (task revisions -> plan revision -> old generation");
   expect(text).toContain("planning loop and no automatic stage/budget selection");
   expect(text).toContain("a respond action and accepts no --action flag");
-  expect(text).toContain("resume-plan' accepts the settled planning output");
+  expect(text).toContain("resume-plan' is the manual planning path for a plan-ready boundary without");
   expect(text).toContain("the stage id and the initial budget are explicit operator");
+});
+
+test("inspect parses the full command with both flag forms", () => {
+  const withValues = parseCommand("inspect", ["--run-id", "run-1.2_abc", "--config-root", "/abs/config", "--json"]);
+  if (withValues.kind !== "inspect") {
+    throw new Error("expected inspect");
+  }
+  expect(withValues.runId).toBe("run-1.2_abc");
+  expect(withValues.configRoot).toBe("/abs/config");
+  expect(withValues.json).toBe(true);
+
+  const withEquals = parseCommand("inspect", ["--run-id=rid_x", "--config-root=/cfg"]);
+  if (withEquals.kind !== "inspect") {
+    throw new Error("expected inspect");
+  }
+  expect(withEquals.runId).toBe("rid_x");
+  expect(withEquals.configRoot).toBe("/cfg");
+  expect(withEquals.json).toBe(false);
+});
+
+test("inspect rejects missing, duplicate, unsafe and value-less required flags", () => {
+  expect(() => parseCommand("inspect", [])).toThrow(/--run-id SAFE_ID is required/);
+  expect(() => parseCommand("inspect", ["--run-id", "rid"])).toThrow(/--config-root ABS is required for inspect/);
+  expect(() => parseCommand("inspect", ["--config-root", "/c"])).toThrow(/--run-id SAFE_ID is required/);
+  expect(() => parseCommand("inspect", ["--run-id", "a", "--run-id", "b", "--config-root", "/c"])).toThrow(
+    /--run-id may be given at most once/,
+  );
+  expect(() => parseCommand("inspect", ["--run-id", "rid", "--config-root", "/c", "--config-root=/d"])).toThrow(
+    /--config-root may be given at most once/,
+  );
+  expect(() => parseCommand("inspect", ["--run-id", "a/b", "--config-root", "/c"])).toThrow(
+    /--run-id must be a safe identifier/,
+  );
+  expect(() => parseCommand("inspect", ["--run-id", "rid", "--config-root", "rel"])).toThrow(
+    /--config-root must be an absolute path/,
+  );
+  expect(() => parseCommand("inspect", ["--run-id"])).toThrow(/--run-id requires a value/);
+  expect(() => parseCommand("inspect", ["--run-id", "rid", "--config-root"])).toThrow(
+    /--config-root requires a value/,
+  );
+  expect(() => parseCommand("inspect", ["--run-id", "rid", "--config-root", "/c", "--json", "--json"])).toThrow(
+    /--json may be given at most once/,
+  );
+  expect(() => parseCommand("inspect", ["--run-id", "rid", "--config-root", "/c", "--json=1"])).toThrow(
+    /--json does not take a value/,
+  );
+});
+
+test("inspect rejects every fresh-run, auth, intervention and state-root flag", () => {
+  const base = ["--run-id", "rid", "--config-root", "/cfg"];
+  const rejected: Array<[string, string]> = [
+    ["--launcher-id", "it performs no Launcher authentication"],
+    ["--pipeline-root", "the pipeline comes only from the durable state"],
+    ["--project", "the run-owned project copy already exists"],
+    ["--input", "the run-owned input snapshot already exists"],
+    ["--workspace", "no worker is launched by inspect"],
+    ["--image", "no worker is launched by inspect"],
+    ["--profile", "no profile is loaded by inspect"],
+    ["--task", "there is no task input on an inspect"],
+    ["--stage-id", "operator policy of 'resume-plan'"],
+    ["--initial-budget", "operator policy of 'resume-plan'"],
+    ["--wait-index", "wait selection belongs to the response and intervention commands"],
+    ["--action", "it changes nothing and records no response"],
+    ["--additional-iterations", "grants belong to 'continue-stage'"],
+    ["--task-id", "task revisions belong to 'revise-task'"],
+    ["--task-file", "task revisions belong to 'revise-task'"],
+    ["--task-body", "task revisions belong to 'revise-task'"],
+    ["--state-root", "set the ORCHESTRATOR_STATE_ROOT environment variable"],
+    ["--daemon-state-root", "set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable"],
+  ];
+  for (const [flag, message] of rejected) {
+    expect(() => parseCommand("inspect", [...base, flag, "x"]), `${flag} value form must be rejected`).toThrow(message);
+    expect(() => parseCommand("inspect", [...base, `${flag}=x`]), `${flag}= form must be rejected`).toThrow(message);
+  }
+  expect(() => parseCommand("inspect", [...base, "--ghost"])).toThrow("unknown argument: --ghost");
+  expect(() => parseCommand("inspect", [...base, "stray"])).toThrow("unknown argument: stray");
+});
+
+test("usage documents the read-only inspect command and the corrected planning drift", () => {
+  const text = usage();
+  expect(text).toContain("inspect      read-only versioned projection of one durable run");
+  expect(text).toContain("inspect flags (production pipeline v2, read-only)");
+  expect(text).toContain("--run-id SAFE_ID        the run id of the durable run to inspect");
+  expect(text).toContain("no Launcher credential, no Docker Helper call and no durable");
+  expect(text).toContain("the exit code is 1 only when the inspect");
+  expect(text).toContain("schemaVersion 1");
+  expect(text).toContain("not the internal durable state document");
+  expect(text).toContain("always continued by 'orchestrator resume'");
+  expect(text).toContain("not recoverable yet");
+  expect(text).toContain("A finished failed run inspects successfully (exit 0, status");
+  expect(text).toContain("never output content or");
+  expect(text).toContain("One mutating caller per run is safe alongside inspect");
+  // the corrected drift: the bundled default-v2 auto-continues; resume-plan
+  // is the manual path for policy-less boundaries
+  expect(text).toContain("carries the trusted");
+  expect(text).toContain("'plan_ready' auto policy, so one 'run' command can");
+  expect(text).toContain("A bundle");
+  expect(text).toContain("without that policy stops with the planReady outcome");
+  expect(text).toContain("resume-plan' is the manual planning path for a plan-ready boundary without");
+  expect(text).toContain("can reach its");
+  expect(text).toContain("terminal in one 'run' command without a separate resume-plan step");
+  expect(text).toContain("completes the durable post-commit recovery");
+  expect(text).toContain("'orchestrator inspect' reads one durable run");
+  expect(text).toContain("The same resolution applies to 'respond' and to the");
+  expect(text).toContain("read-only 'inspect'");
 });

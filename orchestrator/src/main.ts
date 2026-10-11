@@ -49,6 +49,15 @@
  *   internal handoff parameter is derived by the composition controller
  *   from the authoritative durable state. There is no automatic planning
  *   loop and no automatic stage/budget selection.
+ * - `inspect` — the read-only versioned run projection: it resolves only
+ *   the state-root projection (the same resolver as `respond`; no helper
+ *   configuration, no Launcher credential, no auth, no subprocess, no
+ *   signal registration and no durable change) and invokes
+ *   `inspectPipelineV2Run` exactly once. The run id and the configuration
+ *   root are the only user inputs; the projection comes only from the
+ *   durable state, the run-owned layout and the verified pipeline. The
+ *   dispatcher builds no `SubprocessCliRunner` command dependencies and
+ *   no mutating command deps object for it.
  *
  * The dispatcher is testable through per-call dependency injection
  * (`runCli(argv, io)`); no module-global mutable state exists.
@@ -83,6 +92,10 @@ import {
   respondPipelineV2Wait,
   type PipelineV2WaitResponseOutcome,
 } from "./pipeline_v2_wait_respond.ts";
+import {
+  inspectPipelineV2Run,
+  type PipelineV2InspectOutcome,
+} from "./pipeline_v2_inspect.ts";
 
 /**
  * The per-call seam of the dispatcher. The production default builds one
@@ -103,6 +116,7 @@ export interface CliIo {
   revisePipelineV2Task: typeof revisePipelineV2Task;
   resumePipelineV2PlanningRunPlan: typeof resumePipelineV2PlanningRunPlan;
   respondPipelineV2Wait: typeof respondPipelineV2Wait;
+  inspectPipelineV2Run: typeof inspectPipelineV2Run;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
   /**
@@ -135,6 +149,7 @@ function productionCliIo(): CliIo {
     revisePipelineV2Task,
     resumePipelineV2PlanningRunPlan,
     respondPipelineV2Wait,
+    inspectPipelineV2Run,
     runSmoke,
     runAgentSmoke,
     readTaskFile: (path: string) => readFile(path, "utf8"),
@@ -167,7 +182,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -180,7 +195,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "respond" &&
     command !== "continue-stage" &&
     command !== "revise-task" &&
-    command !== "resume-plan"
+    command !== "resume-plan" &&
+    command !== "inspect"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -218,6 +234,15 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // subprocess, no signal registration) and invokes the response
     // production API exactly once.
     return await runPipelineV2RespondCommand(parsed, io);
+  }
+  if (parsed.kind === "inspect") {
+    // The read-only pipeline v2 inspect command: like respond, it
+    // resolves only the state-root projection (no helper configuration,
+    // no Launcher credential, no auth, no subprocess, no signal
+    // registration, no durable change) and invokes the inspect production
+    // API exactly once. No SubprocessCliRunner command dependencies and
+    // no mutating command deps object are built for it.
+    return await runPipelineV2InspectCommand(parsed, io);
   }
   if (parsed.kind === "continue-stage") {
     // The production pipeline v2 continue-stage intervention: the same
@@ -573,6 +598,57 @@ async function runPipelineV2RespondCommand(
   } else {
     io.writeError(
       `orchestrator: respond failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+/**
+ * The read-only pipeline v2 inspect command: parse already done. Only the
+ * state-root projection is resolved inside the protected CLI-configuration
+ * boundary (the same env resolver `run`, `resume` and `respond` use); the
+ * helper configuration is deliberately NOT resolved because inspect needs
+ * no Launcher credential, no Docker Helper transport and no signal
+ * lifecycle. Any resolution failure is exit 2 with the usage text and the
+ * production API never called. The dispatcher builds no
+ * `SubprocessCliRunner` and no mutating command deps object for inspect.
+ */
+async function runPipelineV2InspectCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "inspect" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2InspectOutcome = await io.inspectPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    let extra = "";
+    if (outcome.boundary.kind === "waiting") {
+      extra = `, wait ${outcome.boundary.waitIndex}`;
+    } else if (outcome.boundary.kind === "succeeded") {
+      extra = `, terminal ${outcome.boundary.terminalStateId}`;
+    }
+    io.writeError(
+      `orchestrator: inspect ${outcome.status}/${outcome.boundary.kind} (run ${outcome.runId}, revision ${outcome.revision}${extra})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: inspect failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

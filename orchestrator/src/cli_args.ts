@@ -82,6 +82,13 @@ export interface ParsedPipelineResumePlanArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineInspectArgs {
+  readonly kind: "inspect";
+  readonly runId: string;
+  readonly configRoot: string;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
@@ -90,7 +97,8 @@ export type ParsedCommand =
   | ParsedPipelineRespondArgs
   | ParsedPipelineContinueStageArgs
   | ParsedPipelineReviseTaskArgs
-  | ParsedPipelineResumePlanArgs;
+  | ParsedPipelineResumePlanArgs
+  | ParsedPipelineInspectArgs;
 
 export function usage(): string {
   return [
@@ -109,10 +117,15 @@ export function usage(): string {
     "               pipeline bundle -> profiles -> launcher credential -> run root ->",
     "               durable state -> agent/decision activations -> decision routing ->",
     "               terminal -> published run outputs",
-    "  resume       production pipeline v2 continuation of an already durable run",
-    "               from its clean active boundary: existing run root -> durable state ->",
-    "               restored runtime context -> agent/decision activations -> terminal ->",
-    "               published run outputs",
+    "  resume       production pipeline v2 continuation and recovery of an already",
+    "               durable run: existing run root -> durable state -> restored",
+    "               runtime context -> agent/decision activations -> terminal ->",
+    "               published run outputs (mutating; also completes the durable",
+    "               post-commit recovery suffixes of a crashed run)",
+    "  inspect      read-only versioned projection of one durable run: no worker,",
+    "               no Launcher credential, no Docker Helper call and no durable",
+    "               change - prints the run status, its boundary (the one safe",
+    "               next mutating command) and the stable run-output projection",
     "  respond      production pipeline v2 wait response: record the user's answer to",
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
@@ -150,13 +163,16 @@ export function usage(): string {
     `                          (${DEFAULT_PIPELINE_V2_ROOT}): the planner writes the`,
     "                          operator-visible run plan proposal (stage-1, template",
     "                          development, new task task-1 from the protected task",
-    "                          input), the first successful run stops with the",
-    "                          planReady outcome, and the next manual step is",
-    "                          'orchestrator resume-plan --stage-id stage-1",
-    "                          --initial-budget 1'. The default stage publishes the",
-    "                          V2-native result at <run-root>/outputs/result. There is",
-    "                          no automatic stage/budget selection and no automatic",
-    "                          resume.",
+    "                          input). The bundled default carries the trusted",
+    "                          'plan_ready' auto policy, so one 'run' command can",
+    "                          continue through plan acceptance, the first stage",
+    "                          generation/iteration and the successor execution",
+    "                          automatically; the default stage publishes the",
+    "                          V2-native result at <run-root>/outputs/result. A bundle",
+    "                          without that policy stops with the planReady outcome",
+    "                          and its next manual step is 'orchestrator resume-plan",
+    "                          --stage-id stage-1 --initial-budget 1' (the manual",
+    "                          planning path).",
     "  --config-root PATH      operator-controlled configuration root holding",
     "                          profiles/<name>.yaml and the OpenCode configurations; required;",
     "                          absolute path",
@@ -341,6 +357,41 @@ export function usage(): string {
   "  automatic planning loop and no automatic stage/budget selection: both",
   "  policy scalars are explicit operator decisions of each invocation.",
   "",
+  "inspect flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID        the run id of the durable run to inspect; required; a",
+  "                          safe identifier (letters, digits, '_', '.', '-', at most",
+  "                          128 characters)",
+  "  --config-root PATH      non-empty absolute configuration root; required by the",
+  "                          shared command grammar but not used by inspect (no",
+  "                          profile is loaded, no Launcher credential is read)",
+  "  --json                  print exactly one JSON versioned inspect document on",
+  "                          stdout (no progress lines); errors and diagnostics go",
+  "                          to stderr; the exit code is 1 only when the inspect",
+  "                          itself could not be performed, never because of the",
+  "                          run's own state.",
+  "",
+  "  inspect reads the durable state through the read-only snapshot store and",
+  "  never mutates anything: a missing run is not created, a damaged run is not",
+  "  repaired, and a repeated inspect over an unchanged run returns byte-identical",
+  "  JSON. The document is the versioned external projection (schemaVersion 1) -",
+  "  status, boundary and run outputs - not the internal durable state document,",
+  "  which is not an external integration contract. The boundary names the one",
+  "  safe next mutating command: 'plan_ready' (continuation 'resume' when the",
+  "  trusted compiled planning role carries the plan_ready auto policy,",
+  "  'resume_plan' for the manual 'resume-plan' contract), 'waiting' (with the",
+  "  open wait's declared actions in their verbatim order), 'resumable' (the",
+  "  ordinary runtime boundary and every durable post-commit recovery window -",
+  "  always continued by 'orchestrator resume'), 'in_flight' (a genuinely",
+  "  unfinished execution; not recoverable yet), and the final 'succeeded'/'failed'",
+  "  boundaries. A finished failed run inspects successfully (exit 0, status",
+  "  'failed'). Until the terminal publication the outputs list is empty; the",
+  "  projection carries id, type, required, present and - only for present",
+  "  outputs - the digest, in declaration order, never output content or",
+  "  filesystem paths. One mutating caller per run is safe alongside inspect;",
+  "  concurrent mutating callers are not yet supported (no multi-process",
+  "  locking). list-runs, event/log streams and idempotency keys are not part",
+  "  of this command.",
+  "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
     "    <state-root>/pipeline-runs/<run-id>/state.json",
@@ -357,7 +408,8 @@ export function usage(): string {
     "  and mode 0700. The same resolution applies to 'resume' and 'continue-stage',",
     "  which additionally require the existing run root",
     "  <state-root>/pipeline-runs/<run-id> to exist unchanged (it is never created",
-    "  or chmodded by them). The same resolution applies to 'respond'.",
+    "  or chmodded by them). The same resolution applies to 'respond' and to the",
+    "  read-only 'inspect'.",
     "",
     "run profiles and worker configuration:",
     "  The pipeline's agent states select the profiles; the worker image, the",
@@ -389,8 +441,12 @@ export function usage(): string {
     "",
   "agent-smoke is the v1 diagnostic command; the production pipeline v2 path is",
   "'orchestrator run', 'orchestrator resume' continues an already durable run",
-  "from its clean active boundary (the run id and the configuration root are the",
-  "only user inputs of a resume), 'orchestrator respond' records the user's",
+  "from its clean active boundary and completes the durable post-commit recovery",
+  "suffixes of a crashed run (the run id and the configuration root are the",
+  "only user inputs of a resume), 'orchestrator inspect' reads one durable run",
+  "without changing anything (the run id and the configuration root are the",
+  "only user inputs; no Launcher credential and no Docker Helper call),",
+  "'orchestrator respond' records the user's",
   "answer to one durably open wait (the run id, the wait index and the action id",
   "are the only user inputs of a response), 'orchestrator continue-stage'",
   "performs the continue_stage stage intervention and resumes the run in one",
@@ -399,11 +455,15 @@ export function usage(): string {
   "performs the revise_task task revision intervention and resumes the run in",
   "one operation (the run id, the wait index, the task id, the task-body file",
   "and the configuration root are the only user inputs), and 'orchestrator",
-  "resume-plan' accepts the settled planning output as the next plan revision",
+  "resume-plan' is the manual planning path for a plan-ready boundary without",
+  "the trusted plan_ready auto policy: it accepts the settled planning output",
+  "as the next plan revision",
   "and hands the run onto the explicitly selected stage in one operation (the",
   "run id, the stage id, the initial budget and the configuration root are the",
   "only user inputs; the stage id and the initial budget are explicit operator",
-  "policy and there is no automatic planning loop).",
+  "policy and there is no automatic planning loop). The bundled default-v2",
+  "carries the plan_ready auto policy, so a fresh run of it can reach its",
+  "terminal in one 'run' command without a separate resume-plan step.",
   "",
   "There is no --profile, --task, or --image flag for agent-smoke: the profile and",
     "input path come only from the pipeline's agent state, the worker image comes",
@@ -476,8 +536,136 @@ function parseValue(argv: string[], i: number, flag: string): { value: string; n
   throw new Error(`unknown argument: ${arg}`);
 }
 
+/**
+ * Parses the read-only pipeline v2 inspect command. The user-facing
+ * contract: `--run-id` (safe-id validated) and `--config-root`
+ * (non-empty absolute path) are required singletons; `--json` is an
+ * optional singleton. Inspect performs no Launcher authentication, no
+ * Docker Helper transport and no durable change: it accepts no
+ * `--launcher-id`, no fresh-run flag, no intervention flag, no
+ * state-root flag and no internal index/digest flag — every unknown flag
+ * or positional argument is rejected. The pipeline, the boundary
+ * classification and the output projection come only from the durable
+ * state, the run-owned layout and the verified pipeline.
+ */
+function parseInspectArgs(argv: string[]): ParsedPipelineInspectArgs {
+  let runId: string | null = null;
+  let configRoot: string | null = null;
+  let json = false;
+
+  const requireSingleton = (current: string | null, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      throw new Error(
+        "inspect does not accept --launcher-id; it performs no Launcher authentication",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "inspect does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error("inspect does not accept --project; the run-owned project copy already exists");
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error("inspect does not accept --input; the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error("inspect does not accept --workspace; no worker is launched by inspect");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("inspect does not accept --image; no worker is launched by inspect");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error("inspect does not accept --profile; no profile is loaded by inspect");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("inspect does not accept --task; there is no task input on an inspect");
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      throw new Error(
+        "inspect does not accept --stage-id; stage selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      throw new Error(
+        "inspect does not accept --initial-budget; budget selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      throw new Error(
+        "inspect does not accept --wait-index; wait selection belongs to the response and intervention commands",
+      );
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "inspect does not accept --action; it changes nothing and records no response",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "inspect does not accept --additional-iterations; grants belong to 'continue-stage'",
+      );
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      throw new Error("inspect does not accept --task-id; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      throw new Error("inspect does not accept --task-file; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error("inspect does not accept --task-body; task revisions belong to 'revise-task'");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "inspect does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "inspect does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for inspect");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for inspect");
+  }
+  return {
+    kind: "inspect",
+    runId,
+    configRoot,
+    json,
+  };
+}
+
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -497,6 +685,9 @@ export function parseCommand(
   }
   if (kind === "resume-plan") {
     return parseResumePlanArgs(argv);
+  }
+  if (kind === "inspect") {
+    return parseInspectArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;

@@ -267,10 +267,14 @@ test("the usage documents the optional flag, the bundled v2 default and the manu
   expect(text).toContain("[--pipeline-root ABS]");
   expect(text).toContain(DEFAULT_PIPELINE_V2_ROOT);
   expect(text).toContain("planReady");
-  expect(text).toContain("resume-plan --stage-id stage-1");
-  expect(text).toContain("orchestrator resume-plan --stage-id stage-1");
+  expect(text).toContain("resume-plan");
+  expect(text).toContain("--stage-id stage-1 --initial-budget 1");
   expect(text).toContain(DEFAULT_PIPELINE_ROOT);
-  expect(text).toContain("no automatic stage/budget selection");
+  // the bundled default carries the trusted plan_ready auto policy, so one
+  // 'run' command can continue automatically; the manual path stays documented
+  expect(text).toContain("'plan_ready' auto policy, so one 'run' command can");
+  expect(text).toContain("without that policy stops with the planReady outcome");
+  expect(text).toContain("planning path).");
 });
 
 // ---------------------------------------------------------------------------
@@ -395,6 +399,9 @@ function makeChain(stateRoot: string, resultBody: Record<string, unknown>, credF
     resumePipelineV2PlanningRunPlan: (async () => {
       throw new Error("fake not configured");
     }) as unknown as CliIo["resumePipelineV2PlanningRunPlan"],
+    inspectPipelineV2Run: (async () => {
+      throw new Error("fake inspectPipelineV2Run not configured");
+    }) as unknown as CliIo["inspectPipelineV2Run"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -609,7 +616,10 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
       resumePipelineV2PlanningRunPlan: (async () => {
         throw new Error("fake not configured");
       }) as unknown as CliIo["resumePipelineV2PlanningRunPlan"],
-      respondPipelineV2Wait: (async () => {
+      inspectPipelineV2Run: (async () => {
+      throw new Error("fake inspectPipelineV2Run not configured");
+    }) as unknown as CliIo["inspectPipelineV2Run"],
+    respondPipelineV2Wait: (async () => {
         throw new Error("fake not configured");
       }) as unknown as CliIo["respondPipelineV2Wait"],
       readTaskFile: (async () => {

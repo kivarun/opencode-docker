@@ -17,6 +17,10 @@ import {
   type PipelineV2RunOutcome,
 } from "../src/pipeline_v2_runner.ts";
 import { respondPipelineV2Wait, type PipelineV2WaitResponseOutcome } from "../src/pipeline_v2_wait_respond.ts";
+import {
+  inspectPipelineV2Run,
+  type PipelineV2InspectOutcome,
+} from "../src/pipeline_v2_inspect.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
@@ -93,6 +97,9 @@ function makeIo(): Recorder {
     resumePipelineV2PlanningRunPlan: (async () => {
       throw new Error("fake resumePipelineV2PlanningRunPlan not configured");
     }) as unknown as CliIo["resumePipelineV2PlanningRunPlan"],
+    inspectPipelineV2Run: (async () => {
+      throw new Error("fake inspectPipelineV2Run not configured");
+    }) as unknown as CliIo["inspectPipelineV2Run"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake respondPipelineV2Wait not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -3589,4 +3596,151 @@ test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (ex
       rmSync(parts.root, { recursive: true, force: true });
     }
   }
+});
+
+// --- inspect dispatcher ------------------------------------------------------
+
+function inspectReport(overrides: Partial<Extract<PipelineV2InspectOutcome, { ok: true }>> = {}): PipelineV2InspectOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    runRoot: "/state/root/pipeline-runs/run_x",
+    revision: 7,
+    status: "running",
+    boundary: { kind: "resumable", stateId: "check", transitionCount: 1 },
+    outputs: [],
+    ...overrides,
+  } as PipelineV2InspectOutcome;
+}
+
+test("inspect dispatches exactly once with the state-root local root and uses no runner", async () => {
+  const rec = makeIo();
+  const inspectCalls: unknown[] = [];
+  rec.io.inspectPipelineV2Run = (async (options: unknown) => {
+    inspectCalls.push(options);
+    return inspectReport();
+  }) as unknown as CliIo["inspectPipelineV2Run"];
+  const exit = await runCli(["inspect", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
+  expect(exit).toBe(0);
+  expect(inspectCalls).toHaveLength(1);
+  expect(inspectCalls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root" });
+  // no runner subprocess and no mutating deps object: inspect is read-only
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.out).toHaveLength(0);
+});
+
+test("inspect reports one human summary line per boundary shape", async () => {
+  const shapes: Array<{ args: string[]; line: string; outcome: PipelineV2InspectOutcome }> = [
+    {
+      args: ["inspect", "--run-id", "run_x", "--config-root", "/cfg"],
+      line: "orchestrator: inspect running/resumable (run run_x, revision 7)",
+      outcome: inspectReport(),
+    },
+    {
+      args: ["inspect", "--run-id", "run_x", "--config-root", "/cfg"],
+      line: "orchestrator: inspect waiting/waiting (run run_x, revision 9, wait 2)",
+      outcome: inspectReport({
+        revision: 9,
+        status: "waiting",
+        boundary: { kind: "waiting", waitIndex: 2, reason: "stage_iteration_completed", actions: [{ id: "continue_stage", to: "dev_entry" }] },
+      }),
+    },
+    {
+      args: ["inspect", "--run-id", "run_x", "--config-root", "/cfg"],
+      line: "orchestrator: inspect succeeded/succeeded (run run_x, revision 12, terminal done)",
+      outcome: inspectReport({
+        revision: 12,
+        status: "succeeded",
+        boundary: { kind: "succeeded", terminalStateId: "done" },
+      }),
+    },
+    {
+      args: ["inspect", "--run-id", "run_x", "--config-root", "/cfg"],
+      line: "orchestrator: inspect running/plan_ready (run run_x, revision 3)",
+      outcome: inspectReport({
+        revision: 3,
+        boundary: { kind: "plan_ready", planningExecutionIndex: 1, continuation: "resume_plan" },
+      }),
+    },
+  ];
+  for (const shape of shapes) {
+    const rec = makeIo();
+    rec.io.inspectPipelineV2Run = (async () => shape.outcome) as unknown as CliIo["inspectPipelineV2Run"];
+    const exit = await runCli(shape.args, rec.io);
+    expect(exit).toBe(0);
+    expect(rec.err).toEqual([shape.line]);
+    expect(rec.out).toHaveLength(0);
+  }
+});
+
+test("inspect reports failures with the reason and the exit code, human and JSON", async () => {
+  const rec = makeIo();
+  rec.io.inspectPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    runRoot: null,
+    reason: "run_not_found",
+  })) as unknown as CliIo["inspectPipelineV2Run"];
+  const exit = await runCli(["inspect", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
+  expect(exit).toBe(1);
+  expect(rec.err).toEqual(["orchestrator: inspect failed (run run_x, reason run_not_found)"]);
+  expect(rec.out).toHaveLength(0);
+
+  const jsonRec = makeIo();
+  jsonRec.io.inspectPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    runRoot: "/state/root/pipeline-runs/run_x",
+    reason: "pipeline_mismatch",
+  })) as unknown as CliIo["inspectPipelineV2Run"];
+  const jsonExit = await runCli(["inspect", "--run-id", "run_x", "--config-root", "/cfg", "--json"], jsonRec.io);
+  expect(jsonExit).toBe(1);
+  expect(jsonRec.out).toHaveLength(1);
+  const parsed = JSON.parse(jsonRec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot"]);
+  expect(parsed["reason"]).toBe("pipeline_mismatch");
+  expect(jsonRec.err).toHaveLength(0);
+});
+
+test("inspect JSON mode prints exactly one document and nothing else on stdout", async () => {
+  const rec = makeIo();
+  rec.io.inspectPipelineV2Run = (async () =>
+    inspectReport({
+      status: "succeeded",
+      revision: 12,
+      boundary: { kind: "succeeded", terminalStateId: "done" },
+      outputs: [{ id: "report", type: "json", required: true, present: true, digest: "a".repeat(64) }],
+    })) as unknown as CliIo["inspectPipelineV2Run"];
+  const exit = await runCli(["inspect", "--run-id", "run_x", "--config-root", "/cfg", "--json"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  expect(rec.out[0]?.endsWith("\n")).toBe(true);
+  const parsed = JSON.parse(rec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "boundary", "exitCode", "ok", "outputs", "revision", "runId", "runRoot", "schemaVersion", "status",
+  ]);
+  expect(parsed["schemaVersion"]).toBe(1);
+  expect("state" in parsed).toBe(false);
+  expect(rec.err).toHaveLength(0);
+});
+
+test("inspect resolver failure is exit 2 with the API never called", async () => {
+  const rec = makeIo();
+  rec.io.resolveStateRootProjection = () => {
+    throw new Error("no state root configured");
+  };
+  let called = 0;
+  rec.io.inspectPipelineV2Run = (async () => {
+    called += 1;
+    return inspectReport();
+  }) as unknown as CliIo["inspectPipelineV2Run"];
+  const exit = await runCli(["inspect", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
+  expect(exit).toBe(2);
+  expect(called).toBe(0);
+  expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
+  expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
 });

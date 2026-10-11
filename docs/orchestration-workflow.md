@@ -299,6 +299,92 @@ orchestrator resume \
   helper output streamed to stderr; the exit code is the outcome's exit
   code.
 
+## The read-only versioned run projection (`orchestrator inspect`)
+
+`orchestrator inspect` is the read-only external window onto one durable
+pipeline v2 run. It performs no worker or runtime work, reads no Launcher
+credential, calls no Docker Helper, creates or deletes no Session, and
+changes nothing on disk on any path: the run state is loaded only through
+the proven read-only snapshot store, the pipeline is reloaded from the
+durable bundle root and verified against the durable identity, and the
+boundary classification reuses the single authoritative recovery
+classifier and the authoritative planning/runtime restores. A missing run
+is never created, a damaged run is never repaired, and a repeated inspect
+over an unchanged run returns byte-identical JSON.
+
+```
+orchestrator inspect --run-id SAFE_ID --config-root ABS [--json]
+```
+
+- The command grammar: `--run-id` (the shared safe-id grammar) and
+  `--config-root` (non-empty absolute path) are required singletons;
+  `--config-root` is required by the shared command grammar but unused by
+  inspect (no profile is loaded). `--json` is a flag-only singleton. Every
+  fresh-run, auth, intervention and state-root flag, every internal index
+  or digest flag, and every unknown flag or positional argument is
+  rejected. Parse and configuration failures exit 2 before any filesystem
+  read. The dispatcher resolves only the state-root projection and builds
+  no runner subprocess and no mutating command dependencies object.
+- The successful JSON document is the versioned external projection
+  (`schemaVersion: 1`) with exactly the own keys `ok`, `exitCode`,
+  `schemaVersion`, `runId`, `runRoot`, `revision`, `status`, `boundary`
+  and `outputs`. The internal durable state document is deliberately NOT
+  part of the contract: schema v7 is the orchestrator's, not an external
+  integration API.
+- `status` is the stable external mapping of the durable status:
+  `running` (active), `waiting`, `succeeded` (success) and `failed`
+  (failed and cleanup_failed). A finished failed run inspects
+  successfully (exit 0, `status: "failed"`); exit 1 means only that the
+  inspect itself could not be performed.
+- `boundary` is a closed discriminated union with no `unknown`, `other`
+  or `stalled` slot:
+  - `plan_ready` carries the settled-but-unbound planning execution's
+    index and the operator-visible continuation: `resume` when the
+    provenance-verified compiled planning role carries the trusted
+    `plan_ready` auto policy, `resume_plan` for the manual
+    `orchestrator resume-plan` contract.
+  - `waiting` carries the open wait record's index, its reason and the
+    declared actions with their routing targets in verbatim order.
+  - `resumable` is the one boundary whose safe external action is always
+    `orchestrator resume`: it covers the ordinary runtime boundary AND
+    every durable post-commit recovery window (a settled stage or control
+    execution awaiting its transition, a failed execution awaiting its
+    run-level finalization, and the incomplete terminal lifecycle). The
+    internal recovery subtype is never exported.
+  - `in_flight` is a genuinely unfinished execution (its index, state,
+    compiled role and phase). A settled execution awaiting its recovery
+    suffix is never in-flight. In-flight executions are not recoverable
+    yet: `resume` refuses them with zero writes.
+  - `succeeded` and `failed` are the final boundaries, carrying the
+    terminal state id and the durable failure reason respectively.
+- `outputs` projects the durable run-output records in declaration order
+  with the exact own-key shapes `{id, type, required, present}` plus
+  `digest` only for present outputs. Output content and filesystem paths
+  are never part of the projection, a planning proposal never reaches it,
+  and until the terminal publication the list is empty (a crashed
+  publication with no durable record is invisible).
+- Failures are typed with the closed inspect-only reason vocabulary:
+  before the run root is verified `run_not_found`, `invalid_options` or
+  `internal_error` with `runRoot: null` (an unvalidated run id is never
+  echoed); after it `run_state_invalid`, `pipeline_mismatch`,
+  `artifact_missing`, `artifact_modified` or `internal_error` with the
+  canonical run root. The restore reasons map by phase (`invalid_state`
+  to `run_state_invalid`, `run_layout_invalid` to `artifact_missing`,
+  `run_input_modified`/`accepted_output_modified` to
+  `artifact_modified`); a bundle changed after the run is
+  `pipeline_mismatch`. Diagnostics are content-free.
+- Human mode prints one summary line
+  (`orchestrator: inspect <status>/<boundary-kind> (run <id>, revision
+  <n>)`, optionally with the wait index or the terminal state id) and
+  exits 0. JSON mode prints exactly one JSON document plus a newline to
+  stdout; errors and diagnostics go to stderr.
+- Concurrency honesty: one mutating caller per run is safe alongside
+  inspect; the result may reflect the old or the new atomic revision, but
+  it is always entirely loader-valid and never mutated. Concurrent
+  mutating callers are not yet supported (no multi-process locking), and
+  list-runs, idempotency keys, event/log streams and an HTTP API remain
+  out of scope.
+
 ## The production continue-stage runner API (`orchestrator continue-stage`)
 
 `orchestrator/src/pipeline_v2_runner.ts` adds the dedicated `continue_stage`
