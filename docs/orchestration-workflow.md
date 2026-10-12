@@ -5633,6 +5633,47 @@ present pipeline graphs, agents, events, artifacts, and waiting user questions.
 It remains optional. The browser does not receive direct access to the
 orchestrator Unix socket or docker-helper.
 
+### Control-plane subprocess substrate (implemented, not wired to HTTP or a UI)
+
+The first production substrate of a future Bun control-plane exists:
+`orchestrator/src/control_plane/routing.ts` owns the closed typed command
+union (`run`, `inspect`, `resume`, `resume_plan`, `continue_stage`,
+`revise_task`, `respond`) mapped one-to-one onto the CLI grammar, and
+`orchestrator/src/control_plane/subprocess_client.ts` drives the existing
+Orchestrator CLI as one self-contained Bun child process per call and
+converts its public JSON protocol into narrow projections.
+
+Implemented facts:
+
+- the CLI child remains the sole owner of orchestration semantics; the
+  substrate never reads the durable run-state document, never imports
+  orchestration-internal modules and never re-classifies boundaries;
+- the client config (Bun executable, entrypoint, working directory, config
+  root, optional pipeline root, allow-listed child environment, stdout and
+  stderr byte limits, SIGINT grace interval) is captured and deep-frozen
+  once; no shell, no PATH search after capture, no credential contents;
+- the wire contract is the proven external contract: exactly one JSON
+  document plus one newline on stdout, a required reason from the closed
+  public vocabulary on nonzero exit, and the versioned read-only `inspect`
+  projection (schemaVersion 1 only);
+- the raw durable `state` of a mutating outcome is verified as a permitted
+  runtime field and then dropped: it is never returned, stored or used for
+  routing; projections carry only run identity, exit code, the outcome
+  discriminant and the public failure reason;
+- transport failures form their own closed vocabulary, disjoint from the
+  public run reasons; a lost result is recovered through `inspect` by the
+  caller run id;
+- cancellation is per call through an `AbortSignal` and is isolated at the
+  process boundary: one abort delivers one SIGINT to that call's child
+  only, a grace interval ends in exactly one SIGKILL and a
+  `cancellation_forced` transport failure.
+
+Not implemented and deliberately out of scope of this substrate: any HTTP
+server or REST surface, a project/config registry, a browser UI, an
+operation queue, event or log streaming, and automatic stage/wait policy.
+The local HTTP API and the registry that binds public project identities
+to canonical host paths remain separate future layers.
+
 ## Event and log handling
 
 Normalized orchestrator events may include:
