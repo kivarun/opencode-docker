@@ -5668,11 +5668,27 @@ Implemented facts:
   only, a grace interval ends in exactly one SIGKILL and a
   `cancellation_forced` transport failure.
 
+The server-side project registry is implemented as the next substrate
+layer: `orchestrator/src/control_plane/project_registry.ts` loads a
+versioned, operator-owned JSON registry (schema version 1) once per
+service lifetime and resolves a transport-neutral public run request —
+`{runId, projectId, inputs[] {id, rootId, ref}}` — into the existing
+typed `OrchestratorCommand` plus its routing configuration. Browser- or
+API-facing identifiers never become host paths directly: every host
+path, the config root, the optional pipeline root and the launcher id
+come exclusively from the registry; inputs name one immediate child of
+one server-owned input root and are re-verified as real non-symlink
+regular files on every resolution, while the runner remains the owner of
+input snapshotting and modified detection. The registry is immutable
+after load (no hot reload, no watch, no discovery), its failures form
+their own closed vocabulary, and nothing is spawned, created or inspected
+on any registry or request failure.
+
 Not implemented and deliberately out of scope of this substrate: any HTTP
-server or REST surface, a project/config registry, a browser UI, an
+server or REST surface, a browser UI, authentication or RBAC, an
 operation queue, event or log streaming, and automatic stage/wait policy.
-The local HTTP API and the registry that binds public project identities
-to canonical host paths remain separate future layers.
+The local HTTP API remains the next separate future layer on top of the
+registry and the subprocess client.
 
 ## Event and log handling
 
