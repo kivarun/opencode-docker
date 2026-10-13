@@ -25,6 +25,12 @@ const PLAN_1 = JSON.stringify({
   stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
   new_tasks: [{ id: "task-a", body: "Body A" }],
 });
+const PLAN_1_POINTER = JSON.stringify({
+  schema_version: 1,
+  kind: "run_plan_proposal",
+  stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+  new_tasks: [],
+});
 const PLAN_2 = JSON.stringify({
   schema_version: 1,
   kind: "run_plan_proposal",
@@ -43,6 +49,7 @@ interface SessionRecord {
 const sessions = new Map<string, SessionRecord>();
 const sessionsByToken = new Map<string, SessionRecord>();
 const operations = new Map<string, { status: Record<string, unknown> }>();
+const architectRunsByWorkspace = new Map<string, number>();
 let counter = 0;
 
 function json(response: unknown, status = 200): Response {
@@ -70,7 +77,9 @@ function executeWorker(workspace: string, mounts: Array<{ source: string; target
   const outputsRoot = join(workspace, outputs.source);
   mkdirSync(outputsRoot, { recursive: true });
   if (stateId === "architect") {
-    writeFileSync(join(outputsRoot, "plan"), PLAN_1, { mode: 0o600 });
+    const architectRuns = (architectRunsByWorkspace.get(workspace) ?? 0) + 1;
+    architectRunsByWorkspace.set(workspace, architectRuns);
+    writeFileSync(join(outputsRoot, "plan"), architectRuns === 1 ? PLAN_1 : PLAN_1_POINTER, { mode: 0o600 });
   } else if (stateId === "planner2") {
     writeFileSync(join(outputsRoot, "plan2"), PLAN_2, { mode: 0o600 });
   } else if (stateId === "review_entry") {

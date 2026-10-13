@@ -5715,12 +5715,58 @@ zero writes, and a CLI-created run without a binding stays unbound:
 tree and the Pipeline V2 run tree are fully independent; the store never
 touches the run root or the durable run state.
 
-Not implemented and deliberately out of scope of this substrate: any HTTP
-server or REST surface, a browser UI, authentication or RBAC, binding
-import/adoption or retention, an operation queue, event or log streaming,
-and automatic stage/wait policy. The local HTTP API remains the next
-separate future layer on top of the registry, the binding store and the
-subprocess client.
+### Control-plane HTTP service (implemented, production-wired)
+
+The versioned loopback HTTP API is the production face of the control
+plane: `orchestrator/src/control_plane/http_server.ts` is the single
+`Bun.serve` owner and `orchestrator/src/control_plane/server_main.ts` is
+the runnable operator entrypoint
+(`bun server_main.ts --registry ABS --binding-store ABS --port N
+[--env KEY=VALUE ...]`). The service composes the existing substrate
+only — HTTP → project registry → durable run binding →
+`OrchestratorSubprocessClient` → existing CLI subprocess → Pipeline V2 —
+and never imports runner, controller, reducer or state modules, never
+executes orchestration in-process and never reads `state.json`, run
+roots, proposals, ledgers or worker files. The registry controls every
+path (config root, pipeline root, project and input roots; the revise
+task file comes exclusively from the bound project's declared input
+roots through `resolveControlPlaneBoundProjectInput`), the binding
+controls run authority (every existing-run route resolves the bound
+project first; a projectId is never accepted from the HTTP caller and a
+CLI-created run without a binding fails closed as `binding_not_found`),
+and the subprocess client remains the sole execution path. Configuration
+is loaded once and immutable: registry path, binding-store root, client
+runtime (explicit `--env` allow-list, no ambient inheritance), listen
+port and the fixed body limit; the routing authority is derived from the
+registry at startup and every declared project must share it.
+
+The trust boundary is a loopback single-user boundary, not auth or RBAC:
+the server binds `127.0.0.1` only, the Host header must equal the actual
+listen authority exactly, Origin must be absent or exactly the service
+origin (refused before body parsing and before any effect), POST accepts
+exactly `application/json`, bodies are read through a bounded stream
+loop with a fixed byte limit, OPTIONS/CORS are not supported, and query
+strings, percent-encoding, empty or dot segments, extra segments, unknown
+methods and unsafe path ids are refused. No HTTP parameter ever becomes
+a host path, argv fragment or env name. Responses are versioned
+(`schema_version: 1`): a correctly received orchestrator outcome is a
+200 `command_result` projection (failed outcomes stay 200 with their
+public reason — never reclassified into an HTTP status), a verified
+inspect is a `run` projection whose boundary and outputs are copied
+without new classification and whose run root is dropped, and control
+plane failures are `error` bodies with a closed layer/reason vocabulary
+and no message, details or paths. The browser never receives raw state,
+a run root or any host path. The request signal is never forwarded to
+the subprocess client: a client disconnect does not cancel the
+orchestration, a lost response is recovered through
+`GET /v1/runs/:runId`, and parallel mutators are not serialized by the
+HTTP layer — the kernel run mutation lock stays the single owner and the
+loser observes the ordinary `run_busy` outcome.
+
+Still unwired: a browser UI, authentication/RBAC/TLS/remote bind,
+list-runs/discovery, an operation queue or 202 jobs, event or log
+streaming, registry hot reload, input upload/materialization, binding
+import/adoption or retention/deletion, and automatic stage/wait policy.
 
 ## Event and log handling
 

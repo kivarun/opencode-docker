@@ -460,6 +460,95 @@ function captureRunRequest(request: unknown): CapturedRunRequest {
 }
 
 /**
+ * The single input-reference resolution policy of the registry: the
+ * reference must be one immediate child of one declared input root of the
+ * project, a real non-symlink regular file whose canonical path remains
+ * an immediate child of the canonical root. `what` carries the caller's
+ * noun for the content-free diagnostics. Both the run-command composition
+ * and the bound-project input resolver reuse exactly this policy.
+ */
+async function resolveProjectInputReference(
+  project: ResolvedControlPlaneProject,
+  rootId: string,
+  ref: string,
+  what: string,
+): Promise<string> {
+  let root: ResolvedControlPlaneInputRoot | null = null;
+  for (const candidate of project.inputRoots) {
+    if (candidate.id === rootId) {
+      root = candidate;
+      break;
+    }
+  }
+  if (root === null) {
+    throw new ControlPlaneProjectRegistryError("input_root_not_found", `the project ${project.id} has no input root ${rootId}`);
+  }
+  const leaf = join(root.root, ref);
+  let info;
+  try {
+    info = lstatSync(leaf);
+  } catch (cause) {
+    if (isErrnoException(cause, "ENOENT")) {
+      throw new ControlPlaneProjectRegistryError("input_not_found", `${what} does not exist in root ${rootId}`);
+    }
+    if (isErrnoException(cause, "EACCES")) {
+      throw new ControlPlaneProjectRegistryError("input_invalid", `${what} cannot be inspected (errno EACCES)`);
+    }
+    throw new ControlPlaneProjectRegistryError("input_invalid", `${what} cannot be inspected`);
+  }
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new ControlPlaneProjectRegistryError("input_invalid", `${what} must be a regular file`);
+  }
+  let canonicalLeaf: string;
+  try {
+    canonicalLeaf = await realpath(leaf);
+  } catch {
+    throw new ControlPlaneProjectRegistryError("input_invalid", `${what} cannot be canonicalized`);
+  }
+  if (dirname(canonicalLeaf) !== root.root) {
+    throw new ControlPlaneProjectRegistryError("input_invalid", `${what} must be an immediate child of its declared root`);
+  }
+  return canonicalLeaf;
+}
+
+/**
+ * Resolves one safe input reference against an already-bound project of
+ * the loaded registry — the one reusable resolver for a caller-supplied
+ * reference that must become the authoritative canonical regular-file
+ * path of a subprocess argument (e.g. the revised task body file of a
+ * `revise_task` command). The project must be the exact frozen entry of
+ * the loaded registry; the caller can never supply a host path.
+ */
+export async function resolveControlPlaneBoundProjectInput(
+  registry: ControlPlaneProjectRegistry,
+  project: ResolvedControlPlaneProject,
+  rootId: string,
+  ref: string,
+): Promise<string> {
+  if (
+    !isRecord(registry) ||
+    !Object.isFrozen(registry) ||
+    !Array.isArray((registry as unknown as Record<string, unknown>)["projects"])
+  ) {
+    throw new ControlPlaneProjectRegistryError("invalid_registry", "the registry must be a loaded, frozen registry object");
+  }
+  let declared = false;
+  for (const candidate of registry.projects) {
+    if (candidate === project) {
+      declared = true;
+      break;
+    }
+  }
+  if (!declared) {
+    throw new ControlPlaneProjectRegistryError("invalid_registry", "the project must be a declared entry of the loaded registry");
+  }
+  if (!isPipelineV2SafeId(rootId) || !isPipelineV2SafeId(ref)) {
+    throw new ControlPlaneProjectRegistryError("invalid_request", "the input reference must use safe identifiers");
+  }
+  return await resolveProjectInputReference(project, rootId, ref, "the input reference");
+}
+
+/**
  * Resolves one public run request against the loaded registry and
  * returns the existing typed `OrchestratorCommand` (kind `run`) plus its
  * routing configuration. Every path comes exclusively from the registry;
@@ -472,7 +561,7 @@ export async function resolveControlPlaneRunCommand(
   registry: ControlPlaneProjectRegistry,
   request: ControlPlaneRunRequest,
 ): Promise<ControlPlaneResolvedRun> {
-  if (!isRecord(registry) || !Object.isFrozen(registry) || !Array.isArray((registry as Record<string, unknown>)["projects"])) {
+  if (!isRecord(registry) || !Object.isFrozen(registry) || !Array.isArray((registry as unknown as Record<string, unknown>)["projects"])) {
     throw new ControlPlaneProjectRegistryError("invalid_registry", "the registry must be a loaded, frozen registry object");
   }
   const captured = captureRunRequest(request);
@@ -488,42 +577,8 @@ export async function resolveControlPlaneRunCommand(
   }
   const resolvedInputs: { id: string; path: string }[] = [];
   for (const input of captured.inputs) {
-    let root: ResolvedControlPlaneInputRoot | null = null;
-    for (const candidate of project.inputRoots) {
-      if (candidate.id === input.rootId) {
-        root = candidate;
-        break;
-      }
-    }
-    if (root === null) {
-      throw new ControlPlaneProjectRegistryError("input_root_not_found", `the project ${project.id} has no input root ${input.rootId}`);
-    }
-    const leaf = join(root.root, input.ref);
-    let info;
-    try {
-      info = lstatSync(leaf);
-    } catch (cause) {
-      if (isErrnoException(cause, "ENOENT")) {
-        throw new ControlPlaneProjectRegistryError("input_not_found", `the input ${input.id} does not exist in root ${input.rootId}`);
-      }
-      if (isErrnoException(cause, "EACCES")) {
-        throw new ControlPlaneProjectRegistryError("input_invalid", `the input ${input.id} cannot be inspected (errno EACCES)`);
-      }
-      throw new ControlPlaneProjectRegistryError("input_invalid", `the input ${input.id} cannot be inspected`);
-    }
-    if (info.isSymbolicLink() || !info.isFile()) {
-      throw new ControlPlaneProjectRegistryError("input_invalid", `the input ${input.id} must be a regular file`);
-    }
-    let canonicalLeaf: string;
-    try {
-      canonicalLeaf = await realpath(leaf);
-    } catch {
-      throw new ControlPlaneProjectRegistryError("input_invalid", `the input ${input.id} cannot be canonicalized`);
-    }
-    if (dirname(canonicalLeaf) !== root.root) {
-      throw new ControlPlaneProjectRegistryError("input_invalid", `the input ${input.id} must be an immediate child of its declared root`);
-    }
-    resolvedInputs.push({ id: input.id, path: canonicalLeaf });
+    const path = await resolveProjectInputReference(project, input.rootId, input.ref, `the input ${input.id}`);
+    resolvedInputs.push({ id: input.id, path });
   }
   const command: OrchestratorCommand = {
     kind: "run",
