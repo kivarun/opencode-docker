@@ -5684,11 +5684,43 @@ after load (no hot reload, no watch, no discovery), its failures form
 their own closed vocabulary, and nothing is spawned, created or inspected
 on any registry or request failure.
 
+The newest substrate layer is the durable run binding store:
+`orchestrator/src/control_plane/run_binding_store.ts` (public facade) with
+`orchestrator/src/control_plane/run_binding_store_internal.ts` (internal
+core). Before the control-plane starts the first `run` for a caller run
+id it durably binds that run id to one registry project id
+(`ControlPlaneRunBindingStore.open(root)` + `claim`); the binding is a
+versioned immutable canonical JSON record
+`{"project_id":"...","run_id":"...","schema_version":1}` published as a
+0600 regular file at `<store-root>/bindings/<runId>.json` inside a
+store-owned 0700 `bindings/` namespace, through the same exclusive
+publication protocol the wait and run-plan stores use (exclusive
+candidate file, exclusive publication without overwrite, parent
+durability barrier, read-back verification). A claim returns `created`
+for the fresh publication, `existing` for an exactly matching published
+binding, and the typed `binding_conflict` failure for a different
+project — the conflict diagnostics never name the existing owner. A
+published binding is never updated, rewritten or removed; there is no
+list, delete or update API, and `load` is strictly read-only. After any
+restart every later operation resolves its project, config and pipeline
+authority exclusively through
+`resolveBoundControlPlaneProject(registry, store, runId)` — the binding
+is loaded from the store and the project is looked up only in the
+already-loaded frozen registry; a caller-supplied project id is never
+accepted as ownership evidence and is not even a parameter. A run whose
+project left the registry fails closed as `project_unavailable` with
+zero writes, and a CLI-created run without a binding stays unbound:
+`binding_not_found`, never adopted, never guessed from raw state
+(operator import/adoption is a separate future increment). The binding
+tree and the Pipeline V2 run tree are fully independent; the store never
+touches the run root or the durable run state.
+
 Not implemented and deliberately out of scope of this substrate: any HTTP
-server or REST surface, a browser UI, authentication or RBAC, an
-operation queue, event or log streaming, and automatic stage/wait policy.
-The local HTTP API remains the next separate future layer on top of the
-registry and the subprocess client.
+server or REST surface, a browser UI, authentication or RBAC, binding
+import/adoption or retention, an operation queue, event or log streaming,
+and automatic stage/wait policy. The local HTTP API remains the next
+separate future layer on top of the registry, the binding store and the
+subprocess client.
 
 ## Event and log handling
 
