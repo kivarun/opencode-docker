@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { chmodSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -845,7 +854,7 @@ test("1. resume after create_run reaches success through the real transport", as
   expect(JSON.parse(report)).toEqual({ ok: true });
   const raw = await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8");
   expect(parsePipelineV2RunState(raw)).toEqual(outcome.state);
-});
+}, 15000);
 
 test("2. agent -> decision -> agent resume uses the global next execution index", async () => {
   const harness = await setup(PIPELINE_DECISION_FROM_OUTPUT);
@@ -871,7 +880,7 @@ test("2. agent -> decision -> agent resume uses the global next execution index"
   expect(leaf.isDirectory()).toBe(true);
   expect(createCount(captured)).toBe(2);
   expect(deleteIds(captured)).toEqual(["dhs_fake_2", "dhs_fake_1"]);
-});
+}, 15000);
 
 test("3. deleted original project source and input bindings are never re-read", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -893,7 +902,7 @@ test("3. deleted original project source and input bindings are never re-read", 
   // no diagnostic mentions the original source paths
   expect(captured.diagnostics.join("\n")).not.toContain("userdata");
   expect(captured.diagnostics.join("\n")).not.toContain("project-src");
-});
+}, 15000);
 
 test("4. old and winning accepted outputs are restored and used", async () => {
   const harness = await setup(PIPELINE_DECISION_FROM_OUTPUT);
@@ -923,7 +932,7 @@ test("4. old and winning accepted outputs are restored and used", async () => {
   // both activation trees still exist
   expect((await lstat(join(harness.runRoot(runId), "activations", "1-coder"))).isDirectory()).toBe(true);
   expect((await lstat(join(harness.runRoot(runId), "activations", "3-coder"))).isDirectory()).toBe(true);
-});
+}, 15000);
 
 test("5. a terminal cursor finalizes with zero executor callbacks", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -943,7 +952,7 @@ test("5. a terminal cursor finalizes with zero executor callbacks", async () => 
   expect(createCount(captured)).toBe(0);
   expect(captured.calls.filter((call) => call.args[0] === "pull")).toHaveLength(0);
   expect(captured.calls.filter((call) => call.args[0] === "run")).toHaveLength(0);
-});
+}, 15000);
 
 test("6. the total transition budget counts the durable transitions", async () => {
   const harness = await setup(PIPELINE_CYCLE_BUDGET);
@@ -961,7 +970,7 @@ test("6. the total transition budget counts the durable transitions", async () =
   expect(state.transitions).toHaveLength(2);
   // zero executor callbacks ran
   expect(createCount(captured)).toBe(0);
-});
+}, 15000);
 
 test("7. a missing state refuses read-only and creates nothing", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -995,7 +1004,7 @@ test("7. a missing state refuses read-only and creates nothing", async () => {
   // nothing was created anywhere
   expect((await readdir(harness.stateRoot)).sort()).toEqual(["pipeline-runs"]);
   expect((await readdir(join(harness.stateRoot, "pipeline-runs"))).sort()).toEqual([runId]);
-});
+}, 15000);
 
 test("8. waiting, in-flight, publishing and final states refuse without mutations", async () => {
   // waiting
@@ -1080,7 +1089,7 @@ test("8. waiting, in-flight, publishing and final states refuse without mutation
   expectRefused(capturedFinished, "invalid_state");
   expect(createCount(capturedFinished)).toBe(0);
   expect(await fingerprint(finished.stateRoot)).toBe(fpFinished);
-});
+}, 15000);
 
 test("9. damaged inputs, outputs, layout and pipeline identity refuse without Sessions or writes", async () => {
   // damaged input snapshot
@@ -1138,7 +1147,7 @@ test("9. damaged inputs, outputs, layout and pipeline identity refuse without Se
   expectRefused(capturedM, "pipeline_mismatch");
   expect(createCount(capturedM)).toBe(0);
   expect(await fingerprint(mismatched.stateRoot)).toBe(fpM);
-});
+}, 15000);
 
 test("10. the pre-existing run root is never re-created and never chmodded", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1167,7 +1176,7 @@ test("10. the pre-existing run root is never re-created and never chmodded", asy
   const afterInfo = await lstat(harness.runRoot(runId));
   expect(afterInfo.ino).toBe(beforeInfo.ino);
   expect(afterInfo.dev).toBe(beforeInfo.dev);
-});
+}, 15000);
 
 test("11. symlinked, file and split state-root projections are rejected", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1216,7 +1225,7 @@ test("11. symlinked, file and split state-root projections are rejected", async 
   expect(outcomeSplit.ok).toBe(false);
   expect(outcomeSplit.runId).toBe("");
   expect(outcomeSplit.runRoot).toBeNull();
-});
+}, 15000);
 
 test("12. onSignal is read exactly once; a throwing registration yields the ordinary outcome", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1276,7 +1285,7 @@ test("12. onSignal is read exactly once; a throwing registration yields the ordi
   expect(outcomeGetter.exitCode).toBe(1);
   expect(outcomeGetter.runId).toBe("");
   expect(outcomeGetter.runRoot).toBeNull();
-});
+}, 15000);
 
 test("13. signals before and during the resumed worker path keep the existing priorities", async () => {
   // a signal recorded during the seam registration happens before the
@@ -1323,7 +1332,7 @@ test("13. signals before and during the resumed worker path keep the existing pr
   expect(capturedD.outcome?.runRoot).toBe(during.runRoot(runIdD));
   expect(capturedD.outcome?.state).not.toBeNull();
   expect(createCount(capturedD)).toBe(0);
-});
+}, 15000);
 
 test("14. durability unknown adopts the exact candidate and stops every further operation", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1359,7 +1368,7 @@ test("14. durability unknown adopts the exact candidate and stops every further 
   } finally {
     chmodSync(harness.runRoot(runId), 0o700);
   }
-});
+}, 15000);
 
 test("15. the profile is loaded once; a missing or broken profile refuses before any Session", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1414,7 +1423,7 @@ test("15. the profile is loaded once; a missing or broken profile refuses before
   expect(capturedBroken.outcome?.ok).toBe(false);
   expect(createCount(capturedBroken)).toBe(0);
   expect(await fingerprint(broken.stateRoot)).toBe(fpBroken);
-});
+}, 15000);
 
 test("16. a launcher authority mismatch refuses before any Session", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1433,7 +1442,7 @@ test("16. a launcher authority mismatch refuses before any Session", async () =>
   expect(captured.authCalls).toBe(1);
   expect(createCount(captured)).toBe(0);
   expect(await fingerprint(harness.stateRoot)).toBe(fingerprintBefore);
-});
+}, 15000);
 
 test("17. hostile option shapes are ordinary preflight outcomes with zero side effects", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1477,7 +1486,7 @@ test("17. hostile option shapes are ordinary preflight outcomes with zero side e
   expect(badId.ok).toBe(false);
   expect(badId.runId).toBe("");
   expect(badId.runRoot).toBeNull();
-});
+}, 15000);
 
 test("18. the whole state root fingerprint is identical across every pre-resume refusal", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1498,7 +1507,7 @@ test("18. the whole state root fingerprint is identical across every pre-resume 
   expect(absentRun.outcome?.ok).toBe(false);
 
   expect(await fingerprint(harness.stateRoot)).toBe(fingerprintBefore);
-});
+}, 15000);
 
 // --- production recovery pass-through (the runner only displays) -------------
 
@@ -1527,7 +1536,7 @@ test("19. the runner completes the settled control execution's missing transitio
   const durable = parsePipelineV2RunState(await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"));
   expect(durable.transitions).toHaveLength(2);
   expect(durable.transitions[1]?.outcome).toBe(evaluated.outcome);
-});
+}, 15000);
 
 test("20. the runner completes the failed execution's missing run finalization (F0)", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1559,7 +1568,7 @@ test("20. the runner completes the failed execution's missing run finalization (
   const retry = await runResume(harness, runId);
   expectRefused(retry, "invalid_state");
   expect(createCount(retry)).toBe(0);
-});
+}, 15000);
 
 test("21. the runner publishes the missing terminal outputs and finalizes (T1)", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1581,7 +1590,7 @@ test("21. the runner publishes the missing terminal outputs and finalizes (T1)",
   const durable = parsePipelineV2RunState(await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"));
   expect(durable.status).toBe("success");
   expect(durable.run_outputs?.[0]?.present).toBe(true);
-});
+}, 15000);
 
 test("22. the runner finalizes the durable publication with only the run status (T3)", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION);
@@ -1618,4 +1627,4 @@ test("22. the runner finalizes the durable publication with only the run status 
   expect(await readFile(publishedPath)).toEqual(beforeBytes);
   const durable = parsePipelineV2RunState(await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"));
   expect(durable.status).toBe("success");
-});
+}, 15000);

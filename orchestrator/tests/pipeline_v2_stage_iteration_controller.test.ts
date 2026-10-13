@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -588,7 +597,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("2. the generation record carries the exact stage id/position/template/plan digest/budget/anchor from the compiled plan", async () => {
     await withPipeline(async (pipeline) => {
@@ -615,7 +624,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("3. a second declared stage gets declaration position 2", async () => {
     await withPipeline(async (pipeline) => {
@@ -635,7 +644,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("4. a template reused by two stages keeps their stage ids and positions distinct", async () => {
     await withPipeline(async (pipeline) => {
@@ -667,7 +676,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("5. W2: an exact durable generation without an iteration is completed by the iteration dispatch only", async () => {
     await withPipeline(async (pipeline) => {
@@ -698,7 +707,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("6. W3: an exact open iteration is an idempotent success with zero dispatch", async () => {
     await withPipeline(async (pipeline) => {
@@ -727,7 +736,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("7. a closed iteration opens the next index of the same generation", async () => {
     await withPipeline(async (pipeline) => {
@@ -750,7 +759,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("8. a mismatching initial budget against an existing open generation is a conflict", async () => {
     await withPipeline(async (pipeline) => {
@@ -769,7 +778,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("9. an iteration beyond the effective budget is rejected by the reducer pre-check with zero dispatch", async () => {
     await withPipeline(async (pipeline) => {
@@ -789,7 +798,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("10. a compiled plan of a foreign run is a conflict", async () => {
     await withPipeline(async (pipeline) => {
@@ -826,7 +835,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(fixture);
       }
     });
-  });
+  }, 15000);
 
   test("11. a compiled plan that is not the last durable plan revision is a conflict", async () => {
     await withPipeline(async (pipeline) => {
@@ -861,7 +870,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("12. a compiled plan whose digest does not match the durable last revision is a conflict", async () => {
     await withPipeline(async (pipeline) => {
@@ -895,7 +904,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("13. an open generation for another stage/template/plan is a conflict", async () => {
     await withPipeline(async (pipeline) => {
@@ -913,7 +922,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("14. waiting, final and in-flight boundaries are invalid_state without any dispatch", async () => {
     await withPipeline(async (pipeline) => {
@@ -971,7 +980,7 @@ describe("pipeline v2 stage iteration controller", () => {
         }
       }
     });
-  });
+  }, 15000);
 
   test("15. an invalid or unknown stage id keeps the compiled-layer error", async () => {
     await withPipeline(async (pipeline) => {
@@ -991,7 +1000,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("16. hand-built, spread, cloned and Proxy compiled plans are rejected with zero traps", async () => {
     await withPipeline(async (pipeline) => {
@@ -1048,7 +1057,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("17. the compiled-plan provenance gate runs before any snapshot field read", async () => {
     await withPipeline(async (pipeline) => {
@@ -1082,7 +1091,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("18. a missing or invalid durable snapshot is invalid_state", async () => {
     await withPipeline(async (pipeline) => {
@@ -1114,7 +1123,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("19. a poisoned sink is fail-closed with zero dispatch", async () => {
     await withPipeline(async (pipeline) => {
@@ -1138,7 +1147,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("20. not_committed on the generation: the fresh retry dispatches generation and iteration", async () => {
     await withPipeline(async (pipeline) => {
@@ -1181,7 +1190,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("21. not_committed on the iteration: the generation stays durable; the retry writes only the iteration", async () => {
     await withPipeline(async (pipeline) => {
@@ -1222,7 +1231,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("22. durability_unknown on the generation and on the iteration adopts the candidate and poisons the sink", async () => {
     await withPipeline(async (pipeline) => {
@@ -1260,7 +1269,7 @@ describe("pipeline v2 stage iteration controller", () => {
         }
       }
     });
-  });
+  }, 15000);
 
   test("23. a hostile sink that resolves without the expected snapshot change fails closed", async () => {
     await withPipeline(async (pipeline) => {
@@ -1288,7 +1297,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("24. identical concurrency opens exactly one generation and one iteration; both calls succeed", async () => {
     await withPipeline(async (pipeline) => {
@@ -1310,7 +1319,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("25. conflicting concurrency for different stages: one winner, the other a typed conflict", async () => {
     await withPipeline(async (pipeline) => {
@@ -1337,7 +1346,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("26. every options field and the sink dispatch are captured exactly once; unexpected getter errors keep their identity", async () => {
     await withPipeline(async (pipeline) => {
@@ -1414,7 +1423,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("27. the result is deep-frozen and caller objects are neither mutated nor frozen", async () => {
     await withPipeline(async (pipeline) => {
@@ -1437,7 +1446,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("28. the result and the diagnostics carry no bodies, paths, digest values or credentials", async () => {
     await withPipeline(async (pipeline) => {
@@ -1470,7 +1479,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("29. the runtime export surface is exactly the three keys", async () => {
     const namespace = (await import("../src/pipeline_v2_stage_iteration_controller.ts")) as Record<string, unknown>;
@@ -1479,7 +1488,7 @@ describe("pipeline v2 stage iteration controller", () => {
       "closePipelineV2StageIteration",
       "ensurePipelineV2StageIteration",
     ]);
-  });
+  }, 15000);
 
   test("30. source proof: no forbidden imports, no second authority, no message parsing, no mutable seam", () => {
     const source = readFileSync(
@@ -1572,7 +1581,7 @@ describe("pipeline v2 stage iteration controller", () => {
     // no mutable module-global seam
     expect(source.includes("let real")).toBe(false);
     expect(source.includes("installOps")).toBe(false);
-  });
+  }, 15000);
 
   test("31. a compiled plan compiled from a foreign pipeline is a lifecycle conflict with zero dispatch", async () => {
     const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-foreign-"));
@@ -1629,7 +1638,7 @@ describe("pipeline v2 stage iteration controller", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("32. a content-equal bundle in another directory mismatches only bundle_root", async () => {
     const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-bundles-"));
@@ -1679,7 +1688,7 @@ describe("pipeline v2 stage iteration controller", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("33. each of the five durable identity fields is a mismatch, compared in the fixed field order", () => {
     const identity = (overrides: Partial<PipelineV2RunState["pipeline"]>): PipelineV2RunState["pipeline"] => ({
@@ -1706,7 +1715,7 @@ describe("pipeline v2 stage iteration controller", () => {
       expect(comparison).toEqual({ kind: "mismatch", field });
     }
     expect(comparePipelineV2RunIdentity(base, identity({}))).toEqual({ kind: "match" });
-  });
+  }, 15000);
 
   test("34. the exact originating identity passes; the hidden identity is frozen and equals the pipeline and the durable record", async () => {
     await withPipeline(async (pipeline) => {
@@ -1727,7 +1736,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("35. a failed stage execution is not a clean boundary: W3 returns invalid_state with zero dispatch", async () => {
     await withPipeline(async (pipeline) => {
@@ -1766,7 +1775,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("36. a settled stage execution inside an open iteration is still a clean W3 boundary", async () => {
     await withPipeline(async (pipeline) => {
@@ -1802,7 +1811,7 @@ describe("pipeline v2 stage iteration controller", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   /**
    * Drives the run from the accepted-plan boundary to the contract hook
@@ -1893,7 +1902,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("38. exhausted closes the open iteration with the caller-selected reason", async () => {
       await withPipeline(async (pipeline) => {
@@ -1909,7 +1918,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("39. normal_close plus generation next_stage dispatches iteration close then generation close, in this order", async () => {
       await withPipeline(async (pipeline) => {
@@ -1933,7 +1942,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("40. normal_close plus generation final_stage records the final_stage generation closure", async () => {
       await withPipeline(async (pipeline) => {
@@ -1949,7 +1958,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("41. exhausted plus an explicit generation closure records both closures", async () => {
       await withPipeline(async (pipeline) => {
@@ -1972,7 +1981,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("42. a stage-role decision execution in phase evaluated is a valid closure boundary", async () => {
       await withDecisionStagePipeline(async (pipeline) => {
@@ -1992,7 +2001,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("43. the result carries the exact frozen compiled stage object and is deep-frozen", async () => {
       await withPipeline(async (pipeline) => {
@@ -2014,7 +2023,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("44. partial retry: the durable iteration close is completed by the generation close dispatch only", async () => {
       await withPipeline(async (pipeline) => {
@@ -2051,7 +2060,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("45. exact retry after an iteration-only closure is an idempotent success with zero dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2074,7 +2083,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("46. exact retry after the full closure is an idempotent success with zero dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2094,7 +2103,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("47. not_committed on the iteration close: nothing durable; the fresh retry dispatches the iteration close", async () => {
       await withPipeline(async (pipeline) => {
@@ -2124,7 +2133,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("48. not_committed on the generation close: the fresh reopen completes the partial commit", async () => {
       await withPipeline(async (pipeline) => {
@@ -2156,7 +2165,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("49. durability_unknown on the iteration close adopts the candidate, poisons the sink and dispatches no generation close", async () => {
       await withPipeline(async (pipeline) => {
@@ -2183,7 +2192,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("50. durability_unknown on the generation close adopts the candidate and poisons the sink", async () => {
       await withPipeline(async (pipeline) => {
@@ -2210,7 +2219,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("51. identical concurrency closes exactly one iteration (and one generation); both calls succeed", async () => {
       await withPipeline(async (pipeline) => {
@@ -2234,7 +2243,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("52. different iteration close reasons race: one winner, the loser a typed conflict", async () => {
       await withPipeline(async (pipeline) => {
@@ -2259,7 +2268,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("53. different generation close reasons race: one winner, the loser a typed conflict", async () => {
       await withPipeline(async (pipeline) => {
@@ -2285,7 +2294,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("54. wait-bound and replanned reasons are invalid_options with zero dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2318,7 +2327,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("55. an open wait is rejected before any dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2346,7 +2355,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("56. in-flight agent and decision executions are rejected before any dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2392,7 +2401,7 @@ describe("pipeline v2 stage iteration controller", () => {
           }
         }
       });
-    });
+    }, 15000);
 
     test("57. failed agent and decision executions are rejected before any dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2435,7 +2444,7 @@ describe("pipeline v2 stage iteration controller", () => {
           }
         }
       });
-    });
+    }, 15000);
 
     test("58. planning and control executions are rejected as the settled execution of the boundary", async () => {
       await withPipeline(async (pipeline) => {
@@ -2466,7 +2475,7 @@ describe("pipeline v2 stage iteration controller", () => {
           }
         }
       });
-    });
+    }, 15000);
 
     test("59. a settled-but-bound execution is rejected before any dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2488,7 +2497,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("60. a stage execution of another compiled stage is rejected before any dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2520,7 +2529,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("61. a settled execution whose recorded iteration index does not match the durable iteration is a conflict", async () => {
       await withPipeline(async (pipeline) => {
@@ -2545,7 +2554,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("62. a compiled plan of a foreign pipeline is a conflict for the close API", async () => {
       const root = await mkdtemp(join(tmpdir(), "pipeline-v2-stage-close-foreign-"));
@@ -2583,7 +2592,7 @@ describe("pipeline v2 stage iteration controller", () => {
       } finally {
         await rm(root, { recursive: true, force: true });
       }
-    });
+    }, 15000);
 
     test("63. a stale or non-current plan is a conflict for the close API", async () => {
       await withPipeline(async (pipeline) => {
@@ -2615,7 +2624,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("64. a newer generation of the reused template that belongs to another stage is a conflict", async () => {
       await withPipeline(async (pipeline) => {
@@ -2671,7 +2680,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("65. an existing iteration close with a different reason is a conflict", async () => {
       await withPipeline(async (pipeline) => {
@@ -2691,7 +2700,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("66. a hostile dispatch that resolves without the expected record fails closed; the pre-check maps reducer rejections to invalid_state with zero dispatch", async () => {
       await withPipeline(async (pipeline) => {
@@ -2728,7 +2737,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("67. the pipeline provenance gate runs before any snapshot field read for the close API", async () => {
       await withPipeline(async (pipeline) => {
@@ -2762,7 +2771,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("68. hand-built, spread, cloned and Proxy compiled plans are rejected with zero traps for the close API", async () => {
       await withPipeline(async (pipeline) => {
@@ -2819,7 +2828,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("69. every options field and the sink members are captured exactly once; unexpected getter errors keep their identity", async () => {
       await withPipeline(async (pipeline) => {
@@ -2882,7 +2891,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("70. the result and the diagnostics of the close API carry no bodies, paths, digest values or credentials", async () => {
       await withPipeline(async (pipeline) => {
@@ -2908,7 +2917,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     /** One settled stage agent execution on the given state id. */
     async function settleStageExecution(ctx: StageCtx, stateId: string, iterationIndex: number, label: string): Promise<void> {
@@ -2957,7 +2966,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("72. the same template and iteration index with a unique positional candidate closes normally", async () => {
       await withPipeline(async (pipeline) => {
@@ -2996,7 +3005,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("73. a recorded iteration index with no template-matching positional candidate is a conflict", async () => {
       await withPipeline(async (pipeline) => {
@@ -3040,7 +3049,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("74. a unique positional candidate in another generation is a conflict (the exact binding)", async () => {
       await withPipeline(async (pipeline) => {
@@ -3082,7 +3091,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("75. an iteration-only closure reads the authoritative snapshot exactly twice (capture plus post-dispatch verification)", async () => {
       await withPipeline(async (pipeline) => {
@@ -3115,7 +3124,7 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
 
     test("76. a full closure with two dispatches reads the authoritative snapshot exactly three times", async () => {
       await withPipeline(async (pipeline) => {
@@ -3150,6 +3159,6 @@ describe("pipeline v2 stage iteration controller", () => {
           await disposeRun(ctx.fixture);
         }
       });
-    });
+    }, 15000);
   });
 });

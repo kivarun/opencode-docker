@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -637,7 +646,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. the post-closure state round-trips through the loader", async () => {
     const ctx = await closureReady();
@@ -655,7 +664,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. the result is deep-frozen and content-free", async () => {
     const ctx = await closureReady();
@@ -678,7 +687,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. C1 zero-dispatch retry: the exact durable closure returns the same result", async () => {
     const ctx = await closureReady();
@@ -692,7 +701,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. active/answered immediate retry: zero dispatch on the answered boundary", async () => {
     const ctx = await closureReady({ respondReviseTask: true });
@@ -718,7 +727,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. the missing accepted intent is invalid state with zero dispatch", async () => {
     const ctx = await closureReady({ acceptIntent: false });
@@ -731,7 +740,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("7. a different accepted intent is invalid state with zero dispatch", async () => {
     const ctx = await closureReady({ acceptIntentSha256: hex("9") });
@@ -744,7 +753,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("8. the missing revise_task action is invalid state", async () => {
     const ctx = await closureReady({ noReviseAction: true });
@@ -755,7 +764,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("9. the missing accepted task record is invalid state with zero dispatch", async () => {
     const ctx = await closureReady({ recordTaskRevision: false });
@@ -768,7 +777,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("10. a wrong task digest is revision conflict with zero dispatch", async () => {
     const ctx = await closureReady({ recordTaskSha256: hex("8") });
@@ -782,7 +791,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("11. a wrong expected predecessor is revision conflict", async () => {
     const ctx = await closureReady({ intent: WRONG_PREV_INTENT });
@@ -793,7 +802,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("12. duplicate wait-bound task records are revision conflict", async () => {
     const ctx = await closureReady({ extraTaskRevision: true });
@@ -806,7 +815,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("13. an iteration closed by normal_close is lifecycle conflict", async () => {
     const ctx = await closureReady({ closeIterationNormal: true });
@@ -819,7 +828,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("14. a closed generation is lifecycle conflict", async () => {
     const ctx = await closureReady({ closeIterationNormal: true, closeGeneration: true });
@@ -830,7 +839,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("15. a generation bound to another plan digest is lifecycle conflict", async () => {
     const ctx = await closureReady({ secondPlanRevision: true });
@@ -841,7 +850,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("16. the active retry answered with another action is lifecycle conflict", async () => {
     const ctx = await closureReady({ answerOtherAction: true });
@@ -852,7 +861,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("17. the active retry with a later execution is lifecycle conflict", async () => {
     const ctx = await closureReady({ respondReviseTask: true, laterExecution: true });
@@ -863,7 +872,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("18. the active retry with a new wait is lifecycle conflict", async () => {
     const ctx = await closureReady({ respondReviseTask: true, newWait: true });
@@ -874,7 +883,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("19. the active retry with a new generation is lifecycle conflict", async () => {
     const ctx = await closureReady({ respondReviseTask: true, newGeneration: true });
@@ -885,7 +894,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("20. the reducer pre-check precedes the dispatch (source-order proof)", async () => {
     const { readFileSync } = await import("node:fs");
@@ -900,7 +909,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     // the exact command is the only dispatch of the C0 path
     expect(flow).toContain('kind: "stage_iteration_closed"');
     expect(flow).toContain('by: "replanned"');
-  });
+  }, 15000);
 
   test("21. a normal hostile post-dispatch snapshot with a removed or replaced wait intent is invalid state", async () => {
     const ctx = await closureReady();
@@ -922,7 +931,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("22. a normal hostile post-dispatch snapshot with changed wait bindings or actions is invalid state", async () => {
     for (const mutate of [
@@ -954,7 +963,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("23. a normal hostile post-dispatch snapshot with a changed task-ledger prefix is invalid state", async () => {
     const ctx = await closureReady();
@@ -975,7 +984,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("24. a normal hostile post-dispatch snapshot with a changed plan or generation binding is invalid state", async () => {
     for (const mutate of [
@@ -1014,7 +1023,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("25. a normal hostile malformed post-dispatch snapshot is typed invalid state, never a TypeError", async () => {
     const variants: Array<[string, (derived: PipelineV2RunState) => void]> = [
@@ -1073,7 +1082,9 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  // measured: recorded par2 timeout under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("26. a racing hostile post-dispatch snapshot is invalid state with zero additional dispatch", async () => {
     const ctx = await closureReady();
@@ -1096,7 +1107,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("27. the closure not_committed keeps the previous open state; the fresh retry dispatches the closure", async () => {
     const ctx = await closureReady();
@@ -1120,7 +1131,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("28. the closure durability_unknown adopts the durable closure; the fresh sink recognizes zero dispatch", async () => {
     const ctx = await closureReady();
@@ -1152,7 +1163,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("29. a racing identical closure through the real dispatch is exact idempotent success", async () => {
     const ctx = await closureReady();
@@ -1179,7 +1190,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30. a resolve-without-change dispatch is invalid state", async () => {
     const ctx = await closureReady();
@@ -1193,7 +1204,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("31. two identical concurrent attempts both succeed with one durable closure and exactly one revision increment", async () => {
     const ctx = await closureReady();
@@ -1214,7 +1225,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("32. a conflicting retry with another intent is refused with zero additional dispatch", async () => {
     const ctx = await closureReady();
@@ -1237,7 +1248,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("33. the options and sink members are read exactly once", async () => {
     const ctx = await closureReady();
@@ -1279,7 +1290,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("34. a non-registered or Proxy intent is rejected before any field read", async () => {
     const ctx = await closureReady();
@@ -1333,7 +1344,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("35. caller mutation after the capture cannot influence the acceptance", async () => {
     const ctx = await closureReady();
@@ -1361,7 +1372,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("36. unexpected downstream errors preserve their identity", async () => {
     const ctx = await closureReady();
@@ -1383,7 +1394,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("37. diagnostics are content-free across the failure paths", async () => {
     const messages: string[] = [];
@@ -1436,7 +1447,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
       expect(message).not.toContain("Bearer");
       expect(message).not.toContain("credential");
     }
-  });
+  }, 15000);
 
   test("40. a second task revision of another task accepted for the same wait is revision conflict", async () => {
     const ctx = await closureReady({ extraOtherTaskRevision: true });
@@ -1450,7 +1461,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("41. a normal hostile post-dispatch snapshot with an unchanged or larger revision is invalid state", async () => {
     for (const revisionDelta of [0, 2]) {
@@ -1481,7 +1492,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("42. a racing hostile post-dispatch snapshot with an unchanged revision is invalid state", async () => {
     const ctx = await closureReady();
@@ -1502,7 +1513,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("43. a normal hostile post-dispatch snapshot with a foreign run id is invalid state", async () => {
     const ctx = await closureReady();
@@ -1520,7 +1531,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("44. the multi-iteration boundary applies the closure to the last iteration and keeps the historical prefix", async () => {
     const ctx = await closureReady({ secondIteration: true });
@@ -1558,7 +1569,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("45. a hostile post-dispatch snapshot that changes a historical iteration is invalid state", async () => {
     const ctx = await closureReady({ secondIteration: true });
@@ -1583,7 +1594,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("46. a racing hostile snapshot that changes a historical iteration is not an idempotent success", async () => {
     const ctx = await closureReady({ secondIteration: true });
@@ -1606,7 +1617,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("47. a hostile post-dispatch snapshot with a mutated generation index is invalid state", async () => {
     const ctx = await closureReady();
@@ -1641,7 +1652,7 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 });
 
 /**
@@ -1666,7 +1677,7 @@ test("38. the runtime export surfaces are exact (public two keys, internal two k
     "PipelineV2ReviseTaskClosureControllerError",
     "applyPipelineV2ReviseTaskClosureInternal",
   ]);
-});
+}, 15000);
 
 test("39. the closure controller is pure state-and-sink (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
@@ -1719,4 +1730,4 @@ test("39. the closure controller is pure state-and-sink (source scan)", async ()
   }
   expect(countOf("Object.freeze")).toBe(0);
   expect(countOf("let production")).toBe(0);
-});
+}, 15000);

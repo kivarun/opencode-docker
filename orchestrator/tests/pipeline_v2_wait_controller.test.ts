@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -189,7 +198,7 @@ test("1. request happy path: derived manifest, publication, run_waiting, round-t
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("2. response happy path: durable request, self-loaded request, response publication", async () => {
   const ctx = await setup();
@@ -228,7 +237,7 @@ test("2. response happy path: durable request, self-loaded request, response pub
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("3. the caller cannot inject cursor, run, index or target values", async () => {
   const ctx = await setup();
@@ -254,7 +263,7 @@ test("3. the caller cannot inject cursor, run, index or target values", async ()
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("4. a request publication failure dispatches nothing and keeps the state", async () => {
   const ctx = await setup();
@@ -278,7 +287,7 @@ test("4. a request publication failure dispatches nothing and keeps the state", 
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("5. a conflicting pre-published request target conflicts before any dispatch", async () => {
   const ctx = await setup();
@@ -309,7 +318,7 @@ test("5. a conflicting pre-published request target conflicts before any dispatc
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("6. a not_committed run_waiting leaves the orphan and the previous state", async () => {
   const ctx = await setup(faultIo({ failCommit: 13 }));
@@ -341,7 +350,7 @@ test("6. a not_committed run_waiting leaves the orphan and the previous state", 
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("7. the exact retry after not_committed reuses the orphan bytes and commits", async () => {
   const ctx = await setup(faultIo({ failCommit: 13 }));
@@ -372,7 +381,7 @@ test("7. the exact retry after not_committed reuses the orphan bytes and commits
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("8. a durability-unknown run_waiting adopts the candidate and dispatches nothing more", async () => {
   const ctx = await setup(faultIo({ failCommit: 13, failStep: "dirfsync" }));
@@ -404,7 +413,7 @@ test("8. a durability-unknown run_waiting adopts the candidate and dispatches no
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("9. a repeat against the durable open wait succeeds without a second command", async () => {
   const ctx = await setup();
@@ -434,7 +443,7 @@ test("9. a repeat against the durable open wait succeeds without a second comman
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("10. a different request against the open wait is a conflict without writes", async () => {
   const ctx = await setup();
@@ -461,7 +470,7 @@ test("10. a different request against the open wait is a conflict without writes
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("11. a tampered request file forbids the response publication", async () => {
   const ctx = await setup();
@@ -495,7 +504,7 @@ test("11. a tampered request file forbids the response publication", async () =>
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("12. a missing request file is restored before the response is recorded", async () => {
   const ctx = await setup();
@@ -523,7 +532,7 @@ test("12. a missing request file is restored before the response is recorded", a
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("13. malformed, undeclared and foreign responses are rejected before publication", async () => {
   const ctx = await setup();
@@ -574,7 +583,7 @@ test("13. malformed, undeclared and foreign responses are rejected before public
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("14. a response publication conflict keeps the run waiting without dispatch", async () => {
   const ctx = await setup();
@@ -602,7 +611,7 @@ test("14. a response publication conflict keeps the run waiting without dispatch
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("15. a not_committed response leaves the orphan and the exact retry commits", async () => {
   const ctx = await setup(faultIo({ failCommit: 14 }));
@@ -632,7 +641,9 @@ test("15. a not_committed response leaves the orphan and the exact retry commits
   } finally {
     await dispose(ctx);
   }
-});
+// measured: recorded par8 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("16. a durability-unknown response adopts the recorded candidate", async () => {
   const ctx = await setup(faultIo({ failCommit: 14, failStep: "dirfsync" }));
@@ -668,7 +679,7 @@ test("16. a durability-unknown response adopts the recorded candidate", async ()
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("17. repeating the durable response succeeds without a dispatch", async () => {
   const ctx = await setup();
@@ -708,7 +719,7 @@ test("17. repeating the durable response succeeds without a dispatch", async () 
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("18. a different response for the answered wait is a conflict without writes", async () => {
   const ctx = await setup();
@@ -742,7 +753,7 @@ test("18. a different response for the answered wait is a conflict without write
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("19. two sequential wait cycles keep the first journal record byte-identical", async () => {
   const ctx = await setup();
@@ -789,7 +800,7 @@ test("19. two sequential wait cycles keep the first journal record byte-identica
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("20. concurrent identical requests: both succeed, one durable run_waiting", async () => {
   const ctx = await setup();
@@ -807,7 +818,7 @@ test("20. concurrent identical requests: both succeed, one durable run_waiting",
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("21. concurrent different requests: one wins, the loser conflicts", async () => {
   const ctx = await setup();
@@ -831,7 +842,7 @@ test("21. concurrent different requests: one wins, the loser conflicts", async (
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("22. concurrent identical responses: both succeed, one durable response", async () => {
   const ctx = await setup();
@@ -856,7 +867,7 @@ test("22. concurrent identical responses: both succeed, one durable response", a
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("23. concurrent different responses: one wins, the loser conflicts", async () => {
   const ctx = await setup();
@@ -893,7 +904,7 @@ test("23. concurrent different responses: one wins, the loser conflicts", async 
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("24. reassigning sink.dispatch after the call cannot hijack the captured dispatch", async () => {
   const ctx = await setup();
@@ -913,7 +924,7 @@ test("24. reassigning sink.dispatch after the call cannot hijack the captured di
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("25. a poisoned sink is rejected before any filesystem effect", async () => {
   const ctx = await setup();
@@ -936,7 +947,7 @@ test("25. a poisoned sink is rejected before any filesystem effect", async () =>
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("26. a run root that does not belong to the run is rejected before the filesystem", async () => {
   const ctx = await setup();
@@ -962,7 +973,7 @@ test("26. a run root that does not belong to the run is rejected before the file
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("27. results are deep-frozen and input mutations cannot reach them", async () => {
   const ctx = await setup();
@@ -994,7 +1005,7 @@ test("27. results are deep-frozen and input mutations cannot reach them", async 
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("28. diagnostics never carry manifest content, response bodies or canaries", async () => {
   const ctx = await setup();
@@ -1036,7 +1047,7 @@ test("28. diagnostics never carry manifest content, response bodies or canaries"
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("29. the controller changes nothing outside the sink protocol and the waits directory", async () => {
   const ctx = await setup();
@@ -1063,7 +1074,7 @@ test("29. the controller changes nothing outside the sink protocol and the waits
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("30. no message-text classification exists in the controller source", async () => {
   const { readFileSync } = await import("node:fs");
@@ -1075,7 +1086,7 @@ test("30. no message-text classification exists in the controller source", async
   expect(source.includes(".message.match")).toBe(false);
   expect(source.includes(".message.startsWith")).toBe(false);
   expect(source.includes("new RegExp")).toBe(false);
-});
+}, 15000);
 
 // --- the structured action path ---------------------------------------------
 
@@ -1131,7 +1142,7 @@ test("A1. the structured action and the raw response produce one canonical manif
     await dispose(raw.ctx);
     await dispose(structured.ctx);
   }
-});
+}, 15000);
 
 test("A2. both paths dispatch exactly one wait_response_recorded with the same payload", async () => {
   const raw = await answeredFixture("raw", "continue_stage");
@@ -1148,7 +1159,7 @@ test("A2. both paths dispatch exactly one wait_response_recorded with the same p
     await dispose(raw.ctx);
     await dispose(structured.ctx);
   }
-});
+}, 15000);
 
 test("A3. the action target is derived only from the request; a caller target is structurally impossible", async () => {
   const ctx = await setup();
@@ -1176,7 +1187,7 @@ test("A3. the action target is derived only from the request; a caller target is
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("A4. an undeclared action is rejected with zero filesystem writes and zero dispatch", async () => {
   const ctx = await setup();
@@ -1211,7 +1222,7 @@ test("A4. an undeclared action is rejected with zero filesystem writes and zero 
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("A5. two action ids with one shared target are valid and differ by digest and action id", async () => {
   const first = await answeredFixture("action", "continue_stage");
@@ -1231,7 +1242,7 @@ test("A5. two action ids with one shared target are valid and differ by digest a
     await dispose(first.ctx);
     await dispose(second.ctx);
   }
-});
+}, 15000);
 
 test("A6. the structured path reads only the validated option surface; hostile getters stay silent", async () => {
   const ctx = await setup();
@@ -1263,7 +1274,7 @@ test("A6. the structured path reads only the validated option surface; hostile g
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("A7. repeating the structured answer after the raw answer is an idempotent success with zero dispatch", async () => {
   const { ctx, result: rawResult } = await answeredFixture("raw", "continue_stage");
@@ -1284,7 +1295,7 @@ test("A7. repeating the structured answer after the raw answer is an idempotent 
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("A8. repeating with a different structured action is a conflict without writes", async () => {
   const { ctx } = await answeredFixture("action", "continue_stage");
@@ -1310,7 +1321,7 @@ test("A8. repeating with a different structured action is a conflict without wri
   } finally {
     await dispose(ctx);
   }
-});
+}, 15000);
 
 test("31. the public export surface carries no IO or test seams", async () => {
   const namespace = (await import("../src/pipeline_v2_wait_controller.ts")) as Record<
@@ -1323,4 +1334,4 @@ test("31. the public export surface carries no IO or test seams", async () => {
     "recordPipelineV2WaitAction",
     "recordPipelineV2WaitResponse",
   ]);
-});
+}, 15000);

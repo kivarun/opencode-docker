@@ -16,6 +16,15 @@
  * API stays unwired: the CLI, `main.ts`, the default pipeline and the
  * automatic stage/budget selection policy are untouched.
  */
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -717,7 +726,7 @@ test("C0: the runner reopens the run, loads the pipeline from the durable bundle
   expect(state.pipeline.bundle_root).toBe(harness.bundle);
   // the loader round-trip
   expect(await readDurableState(harness)).toEqual(state);
-});
+}, 15000);
 
 // --- C1 / crash retry --------------------------------------------------------
 
@@ -770,7 +779,7 @@ test("C1: after the durable handoff the runner repeats no handoff command and re
   expect(sessionDeletes).toEqual(["dhs_2", "dhs_1"]);
   expect(await readDurableState(harness)).toEqual(state);
   void boundaryFingerprint;
-});
+}, 15000);
 
 // --- capture contract --------------------------------------------------------
 
@@ -809,7 +818,7 @@ test("capture contract: every planning option field is read exactly once in the 
   // each of the five fields is read exactly once, in the contract order;
   // every forbidden/internal field stays unread
   expect(readKeys).toEqual(["runId", "stageId", "initialBudget", "configRoot", "launcherId"]);
-});
+}, 15000);
 
 test("capture contract: mutating stageId and initialBudget getters cannot change the recorded handoff policy", async () => {
   const harness = await makeHarness("pipeline-v2-planning-runner-policy-mut-");
@@ -854,7 +863,7 @@ test("capture contract: mutating stageId and initialBudget getters cannot change
   expect(state.generations[2]?.template_id).toBe("review");
   expect(state.generations[2]?.initial_budget).toBe(INITIAL_BUDGET);
   expect(state.cursor).toEqual({ current_state: "review_entry", transition_count: 5 });
-});
+}, 15000);
 
 test("capture contract: a mutating runId getter cannot redirect the continuation to another run", async () => {
   const harness = await makeHarness("pipeline-v2-planning-runner-run-select-");
@@ -900,7 +909,7 @@ test("capture contract: a mutating runId getter cannot redirect the continuation
   expect(stateB.transitions).toHaveLength(4);
   expect(stateB.plan_revisions.map((record) => record.revision)).toEqual([1, 2]);
   expect(outcome.runId).toBe(RUN_ID);
-});
+}, 15000);
 
 test("capture contract: a mutation delivered during the pending auth and a replacement clock never reach the composed call", async () => {
   const harness = await makeHarness("pipeline-v2-planning-runner-pending-mut-");
@@ -955,7 +964,7 @@ test("capture contract: a mutation delivered during the pending auth and a repla
   // every durable timestamp stayed on the 2026 clock
   expect(nowReads).toBe(1);
   expect(state.updated_at.startsWith("2026-01-01")).toBe(true);
-});
+}, 15000);
 
 // --- invalid options matrix (preflight, before any run-root access) ----------
 
@@ -1015,7 +1024,7 @@ test("invalid options matrix: every refusal happens before any run-root access, 
   }
   // the durable state is byte-identical after every refused call
   expect(await readFile(harness.statePath)).toEqual(prefixBytes);
-});
+}, 15000);
 
 // --- existing-run precedence -------------------------------------------------
 
@@ -1038,7 +1047,7 @@ test("existing-run precedence: missing state and an invalid run-root layout are 
   expectPreflightFailure(layoutOutcome.outcome);
   const info = await stat(layout.runRoot);
   expect(info.mode & 0o777).toBe(0o755);
-});
+}, 15000);
 
 test("existing-run precedence: pipeline load failure, pipeline identity mismatch, profile and auth failures carry no sessions and no handoff dispatch", async () => {
   // a broken pipeline bundle fails at the shared pipeline load
@@ -1086,7 +1095,9 @@ test("existing-run precedence: pipeline load failure, pipeline identity mismatch
   expectPostRunRootFailure(authRun.outcome, auth, "active");
   expect(authRun.sessionCreates).toEqual([]);
   expect((await readDurableState(auth)).revision).toBe(authBefore.revision);
-});
+// measured: recorded par2 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 // --- completed-boundary wrong policy -----------------------------------------
 
@@ -1121,7 +1132,7 @@ test("wrong caller policy on the completed boundary is the typed downstream refu
   expect(afterForeignBudget.revision).toBe(boundary.revision);
   expect(afterForeignBudget.waits).toEqual(boundary.waits);
   expect(afterForeignBudget.generations).toEqual(boundary.generations);
-});
+}, 15000);
 
 // --- signal proof ------------------------------------------------------------
 
@@ -1150,7 +1161,9 @@ test("a signal accepted at the authority boundary yields the signal outcome with
   expect(sigterm.outcome.reason).toBe("signal_sigterm");
   expect(sigterm.sessionCreates).toEqual([]);
   expect((await readDurableState(harness)).revision).toBe(prefixState.revision);
-});
+// measured: recorded par4 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 // --- export surfaces and source scan -----------------------------------------
 
@@ -1165,7 +1178,7 @@ test("the runner export surface gains exactly one new function key", async () =>
     "runPipelineV2",
   ]);
   expect(typeof namespace["resumePipelineV2PlanningRunPlan"]).toBe("function");
-});
+}, 15000);
 
 test("source scan: one existing-run core, one composed call, no second machinery", async () => {
   const source = await readFile(
@@ -1201,4 +1214,4 @@ test("source scan: one existing-run core, one composed call, no second machinery
   // the existing-run core stays the single shared core: one definition
   // plus exactly the four existing-run entrypoints calling it
   expect(source.split("runExistingPipelineV2(").length - 1).toBe(5);
-});
+}, 15000);

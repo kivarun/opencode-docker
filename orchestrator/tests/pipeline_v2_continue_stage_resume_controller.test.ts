@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -570,7 +579,7 @@ test("identity contract: a real intervention result carries the authoritative si
   expect(intervention.state).toBe(authoritative);
   expect(Object.isFrozen(intervention.state)).toBe(true);
   assertCompletedBoundary(authoritative, ctx.intent.sha256, intervention.response_sha256);
-});
+}, 15000);
 
 // --- crash seam and C5 ------------------------------------------------------
 
@@ -671,7 +680,7 @@ test("crash seam: the durable intervention is recognized with zero dispatch afte
   expect(state.failure).toEqual({ reason: "worker_failed" });
   // loader round-trip of the final durable state
   expect(await readDurableState(ctx)).toEqual(state);
-});
+}, 15000);
 
 /**
  * The C0 main proof: the honest prefix through the existing production
@@ -768,7 +777,7 @@ test("C0: the full handoff through the new facade on the reopened run — interv
   expect(state.plan_revisions).toHaveLength(1);
   // loader round-trip of the final durable state
   expect(await readDurableState(ctx)).toEqual(state);
-});
+}, 15000);
 
 // --- helpers ---------------------------------------------------------------
 
@@ -880,7 +889,7 @@ test("an intervention failure passes through by identity with zero resume calls 
   expect(caught).toBe(sentinel);
   expect(resumeCalls).toBe(0);
   expect(kinds(reopened)).toEqual([]);
-});
+}, 15000);
 
 test("a resume thrown error passes through by object identity after the real intervention", async () => {
   const ctx = await driveToWaitBoundary();
@@ -906,7 +915,7 @@ test("a resume thrown error passes through by object identity after the real int
   );
   expect(caught).toBe(sentinel);
   expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
-});
+}, 15000);
 
 // --- malformed intervention-result matrix ------------------------------------
 
@@ -980,7 +989,7 @@ test("malformed intervention results on the waiting boundary: the typed invalid_
     expect(resumeCalls).toBe(0);
     expect(kinds(reopened)).toEqual([]);
   }
-});
+}, 15000);
 
 /**
  * The durable-binding mutations against the real completed boundary: the
@@ -1038,7 +1047,7 @@ test("mutated flat fields against the real completed boundary: the durable bindi
     // the hostile calls dispatch nothing: only the capture step's five commands
     expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
   }
-});
+}, 15000);
 
 /**
  * A foreign caller budget (the durable generation was opened with a
@@ -1079,7 +1088,7 @@ test("a foreign caller budget is refused by the composed layers with zero resume
     "stage_iteration_closed",
     "wait_response_recorded",
   ]);
-});
+}, 15000);
 
 // --- malformed resume-result matrix and valid-outcome identity ---------------
 
@@ -1161,7 +1170,7 @@ test("malformed resume coordinator results: the typed invalid_result matrix over
   // the hostile resume calls dispatch nothing durable: the boundary journal
   // stays exactly the five intervention commands
   expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
-});
+}, 15000);
 
 /**
  * Valid coordinator unions are returned unchanged by object identity —
@@ -1197,7 +1206,7 @@ test("valid coordinator outcomes are returned by object identity without reclass
     expect(returned).toBe(built as PipelineV2ResumeCoordinationResult);
   }
   expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
-});
+}, 15000);
 
 /**
  * The exact coordinator union vocabulary: every refusal reason of the
@@ -1271,7 +1280,7 @@ test("the exact coordinator union vocabulary: every valid reason is returned by 
   }
   expect(validBuilders.length).toBe(2 * 9 + 2 * PIPELINE_V2_FAILURE_REASONS.length + 2);
   expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX]);
-});
+}, 15000);
 
 // --- mutation after await ----------------------------------------------------
 
@@ -1339,7 +1348,7 @@ test("mutation after await: the captured policy, runtime and control are immune 
   // the captured budget, not the mutated one, verified the handoff
   expect(kinds(reopened)).toEqual([...INTERVENTION_SUFFIX, ...RESUME_FAILED_COMMANDS]);
   expect(await readDurableState(ctx)).toEqual(result.state as PipelineV2RunState);
-});
+}, 15000);
 
 // --- capture order and exact read counts -------------------------------------
 
@@ -1408,7 +1417,7 @@ test("the capture boundary reads every option field and ops member exactly once,
   expect(interventionCalls).toBe(1);
   expect(resumeCalls).toBe(0);
   expect(optionRecord.hostileExtra).toBe("NEVER-READ");
-});
+}, 15000);
 
 test("the runtime and control contract functions are read exactly once and the coordinator consumes the stable adapters", async () => {
   const ctx = await driveToWaitBoundary();
@@ -1453,7 +1462,7 @@ test("the runtime and control contract functions are read exactly once and the c
     { stateId: "dev_entry", activationIndex: 3, session: "execution" },
     { stateId: "dev_entry", activationIndex: 3, session: "tool" },
   ]);
-});
+}, 15000);
 
 test("the controller reads the authoritative snapshot exactly once per verification phase", async () => {
   const ctx = await driveToWaitBoundary();
@@ -1516,7 +1525,7 @@ test("the controller reads the authoritative snapshot exactly once per verificat
   expect(result.ok).toBe(true);
   // exactly one read after the intervention and one after the resume
   expect(reopened.snapshotReads).toBe(2);
-});
+}, 15000);
 
 // --- invalid runtime/control and provenance failures before any effect -------
 
@@ -1562,7 +1571,7 @@ test("invalid runtime or control shapes are invalid_options with zero facade cal
     expect(resumeCalls).toBe(0);
   }
   expect(kinds(reopened)).toEqual([]);
-});
+}, 15000);
 
 test("pipeline and intent clone/proxy provenance failures happen before any facade call", async () => {
   const ctx = await driveToWaitBoundary();
@@ -1646,7 +1655,7 @@ test("pipeline and intent clone/proxy provenance failures happen before any faca
   expect(interventionCalls).toBe(0);
   expect(resumeCalls).toBe(0);
   expect(kinds(reopened)).toEqual([]);
-});
+}, 15000);
 
 // --- export surfaces and source scan -----------------------------------------
 
@@ -1665,7 +1674,7 @@ test("the runtime export surfaces are exact (public two keys, internal three key
   expect(productionContinueStageResumeOps.applyIntervention).toBe(applyPipelineV2ContinueStageIntervention);
   expect(productionContinueStageResumeOps.resumeRun).toBe(resumePipelineV2Run);
   expect(Object.isFrozen(productionContinueStageResumeOps)).toBe(true);
-});
+}, 15000);
 
 test("the handoff controller composes only the two existing facades (source scan)", async () => {
   const { readFile: readSource } = await import("node:fs/promises");
@@ -1711,4 +1720,4 @@ test("the handoff controller composes only the two existing facades (source scan
     expect(countOf("cause.message")).toBe(0);
     expect(countOf(".message.includes")).toBe(0);
   }
-});
+}, 15000);

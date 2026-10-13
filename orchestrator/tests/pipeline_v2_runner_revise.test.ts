@@ -17,6 +17,15 @@
  * runner API stays unwired: the CLI, `main.ts` and the default pipeline
  * are untouched.
  */
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -569,7 +578,7 @@ test("C0: the runner routes the waiting revise boundary through the handoff faca
   expect(state.pipeline.bundle_root).toBe(harness.bundle);
   // the loader round-trip
   expect(await readDurableState(harness)).toEqual(state);
-});
+}, 15000);
 
 // --- R4 / crash retry -------------------------------------------------------
 
@@ -605,7 +614,7 @@ test("R4: after the durable completed intervention the runner repeats no interve
   });
   expect(sessionCreates).toHaveLength(2);
   expect(await readDurableState(harness)).toEqual(state);
-});
+}, 15000);
 
 // --- invalid options matrix (preflight, before any run-root access) ----------
 
@@ -642,7 +651,7 @@ test("invalid options matrix: every refusal happens before any run-root access",
   }
   // the durable tree is untouched by every contract refusal
   expect(await readFile(harness.statePath)).toEqual(prefixBytes);
-});
+}, 15000);
 
 // --- routing derivation matrix ----------------------------------------------
 
@@ -736,7 +745,9 @@ test("routing refusals happen before any pipeline, profile, authority or runtime
   expect(midOutcome.state?.waits[0]?.response).toBeUndefined();
   expect(midRun.sessionCreates).toEqual([]);
   expect(midRun.authCalls).toBe(0);
-});
+// measured: recorded par2 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("loader-invalid wait journals are refused at the sink open, before any routing", async () => {
   for (const [prefix, mutate] of [
@@ -776,7 +787,7 @@ test("loader-invalid wait journals are refused at the sink open, before any rout
     const raw = JSON.parse(await readFile(harness.statePath, "utf8")) as Record<string, unknown>;
     expect(raw).toEqual(clone);
   }
-});
+}, 15000);
 
 // --- wrong-body R4 ----------------------------------------------------------
 
@@ -800,7 +811,7 @@ test("wrong-body R4: the handoff refuses with its own typed error; the durable t
   // the durable tree and state are byte-identical
   expect(await readFile(harness.statePath)).toEqual(boundaryBytes);
   expect((await readDurableState(harness)).revision).toBe(boundary.revision);
-});
+}, 15000);
 
 // --- signals ------------------------------------------------------------------
 
@@ -831,7 +842,9 @@ test("a signal accepted at the authority boundary yields 130/143 with zero inter
   expect(sigterm.sessionCreates).toEqual([]);
   state = await readDurableState(harness);
   expect(state.revision).toBe(prefixState.revision);
-});
+// measured: recorded par4 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 // --- capture contract ---------------------------------------------------------
 
@@ -880,7 +893,7 @@ test("capture contract: the six revise options are read exactly once in the fixe
   for (const forbidden of ["pipelineRoot", "runRoot", "actionId", "intent", "candidateTaskRevision", "stageId", "expectedPlanSha256", "initialBudget", "additionalIterations", "compiledPlan"]) {
     expect(readKeys).not.toContain(forbidden);
   }
-});
+}, 15000);
 
 test("capture contract: a mutating taskId getter cannot redirect the revision to another task", async () => {
   const harness = await makeHarness("pipeline-v2-revise-runner-task-select-");
@@ -917,7 +930,7 @@ test("capture contract: a mutating taskId getter cannot redirect the revision to
   // only the first validated task was revised
   const state = await readDurableState(harness);
   expect(state.task_revisions.map((record) => record.task_id)).toEqual(["task-a", "task-a"]);
-});
+}, 15000);
 
 test("capture contract: caller mutation after the pending auth cannot change the captured policy", async () => {
   const harness = await makeHarness("pipeline-v2-revise-runner-policy-mut-");
@@ -960,7 +973,7 @@ test("capture contract: caller mutation after the pending auth cannot change the
   const state = await readDurableState(harness);
   expect(state.waits).toEqual((await readDurableState(harness)).waits);
   expect(state.task_revisions.map((record) => `${record.task_id}@${record.revision}`)).toEqual(["task-a@1", "task-a@2"]);
-});
+}, 15000);
 
 test("capture contract: nested helper fields are read exactly once and replacement deps are never used", async () => {
   const harness = await makeHarness("pipeline-v2-revise-runner-deps-mut-");
@@ -1028,7 +1041,7 @@ test("capture contract: nested helper fields are read exactly once and replaceme
   // the replacement socket was never published anywhere
   expect(captured.errors.join("\n")).not.toContain("socket-b");
   expect(JSON.stringify(outcome)).not.toContain("socket-b");
-});
+}, 15000);
 
 // --- export surface -----------------------------------------------------------
 
@@ -1043,4 +1056,4 @@ test("the runner export surface gains exactly one key for the revise-task entryp
     "runPipelineV2",
   ]);
   expect(typeof namespace["revisePipelineV2Task"]).toBe("function");
-});
+}, 15000);

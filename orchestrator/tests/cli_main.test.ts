@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -179,7 +188,7 @@ test("run dispatches exactly once to runPipelineV2 with the exact options mappin
   expect(typeof d.cli).toBe("function");
   expect(typeof d.onSignal).toBe("function");
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("run deps.cli is wired to the single runner instance", async () => {
   const { io, runnerCalls } = makeIo();
@@ -192,7 +201,7 @@ test("run deps.cli is wired to the single runner instance", async () => {
   const cli = capturedCli as (args: string[], env: Record<string, string>, stdio: CliStdio) => Promise<CliResult>;
   await cli(["session", "list"], {}, "capture");
   expect(runnerCalls).toEqual([{ args: ["session", "list"], env: {}, stdio: "capture", opts: undefined }]);
-});
+}, 15000);
 
 test("exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const code of [0, 1, 130, 143]) {
@@ -201,7 +210,7 @@ test("exit codes 0/1/130/143 pass through unchanged", async () => {
     const exit = await runCli(["run", "--pipeline-root=/p", "--config-root=/c", "--project=/pr"], io);
     expect(exit).toBe(code);
   }
-});
+}, 15000);
 
 test("run CLI reports the caller-id collision with the exact human line and exit 1", async () => {
   const { io, err } = makeIo();
@@ -218,7 +227,7 @@ test("run CLI reports the caller-id collision with the exact human line and exit
   expect(err.join("\n")).toBe(
     'orchestrator: pipeline v2 run failed: run "occupied-run" already exists; use inspect',
   );
-});
+}, 15000);
 
 test("run CLI passes the collision outcome through JSON mode unchanged", async () => {
   const { io, out } = makeIo();
@@ -242,7 +251,7 @@ test("run CLI passes the collision outcome through JSON mode unchanged", async (
     state: null,
     reason: "run_already_exists",
   });
-});
+}, 15000);
 
 test("run dispatches the caller-supplied --run-id into the runner options", async () => {
   const { io } = makeIo();
@@ -264,7 +273,7 @@ test("run dispatches the caller-supplied --run-id into the runner options", asyn
     io,
   );
   expect(calls[1]?.runId).toBe("other_run");
-});
+}, 15000);
 
 test("parse errors return 2 before any runner or runner-function call", async () => {
   const { io } = makeIo();
@@ -276,7 +285,7 @@ test("parse errors return 2 before any runner or runner-function call", async ()
   const exit = await runCli(["run", "--pipeline-root=/p"], io);
   expect(exit).toBe(2);
   expect(called).toBe(0);
-});
+}, 15000);
 
 test("unknown command returns 2 before any runner call", async () => {
   const { io } = makeIo();
@@ -287,7 +296,7 @@ test("unknown command returns 2 before any runner call", async () => {
   }) as unknown as CliIo["runPipelineV2"];
   expect(await runCli(["deploy"], io)).toBe(2);
   expect(called).toBe(0);
-});
+}, 15000);
 
 test("a real resolveHelperConfig without HOME and XDG_CONFIG_HOME is a CLI configuration error", async () => {
   const { io, err } = makeIo();
@@ -313,7 +322,7 @@ test("a real resolveHelperConfig without HOME and XDG_CONFIG_HOME is a CLI confi
   expect(err.join("\n")).toContain("error:");
   expect(err.join("\n")).toContain("docker-helper credential");
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("an injected throwing resolveHelperConfig is a CLI configuration error", async () => {
   const { io, err } = makeIo();
@@ -338,7 +347,7 @@ test("an injected throwing resolveHelperConfig is a CLI configuration error", as
   expect(runnerCalls).toBe(0);
   expect(err.join("\n")).toContain("helper configuration exploded");
   expect(registrations).toBe(0);
-});
+}, 15000);
 
 test("with both resolvers impossible the state-root error is reported first", async () => {
   const { io, err } = makeIo();
@@ -355,7 +364,7 @@ test("with both resolvers impossible the state-root error is reported first", as
   expect(helperConfigCalls).toBe(0);
   expect(err.join("\n")).toContain("cannot build the orchestrator state root");
   expect(err.join("\n")).not.toContain("helper configuration exploded");
-});
+}, 15000);
 
 test("a parse error happens before both configuration resolvers", async () => {
   const { io, err } = makeIo();
@@ -374,7 +383,7 @@ test("a parse error happens before both configuration resolvers", async () => {
   expect(projectionCalls).toBe(0);
   expect(helperConfigCalls).toBe(0);
   expect(err.join("\n")).toContain("--config-root ABSOLUTE_PATH is required for run");
-});
+}, 15000);
 
 test("state-root resolver failure is a CLI configuration error (exit 2, no runner call)", async () => {
   const { io, err } = makeIo();
@@ -390,7 +399,7 @@ test("state-root resolver failure is a CLI configuration error (exit 2, no runne
   expect(exit).toBe(2);
   expect(called).toBe(0);
   expect(err.join("\n")).toContain("cannot build the orchestrator state root");
-});
+}, 15000);
 
 test("human mode: success prints one stderr summary line with run/state/outputs", async () => {
   const { io, err, out } = makeIo();
@@ -401,7 +410,7 @@ test("human mode: success prints one stderr summary line with run/state/outputs"
   expect(err).toEqual([
     "orchestrator: run ok (run rid-1, state /state/root/pipeline-runs/rid-1/state.json, outputs /state/root/pipeline-runs/rid-1/outputs)",
   ]);
-});
+}, 15000);
 
 test("human mode: post-run-root failure prints one summary line with reason", async () => {
   const { io, err } = makeIo();
@@ -412,7 +421,7 @@ test("human mode: post-run-root failure prints one summary line with reason", as
   expect(err).toEqual([
     "orchestrator: run failed (run rid-1, reason worker_failed, state /state/root/pipeline-runs/rid-1/state.json)",
   ]);
-});
+}, 15000);
 
 test("human mode: pre-run-root failure prints no summary line", async () => {
   const { io, err } = makeIo();
@@ -421,7 +430,7 @@ test("human mode: pre-run-root failure prints no summary line", async () => {
   const exit = await runCli(RUN_ARGS, io);
   expect(exit).toBe(1);
   expect(err).toEqual([]);
-});
+}, 15000);
 
 test("JSON mode: stdout holds exactly one JSON document, stderr may carry runner diagnostics", async () => {
   const { io, out, err } = makeIo();
@@ -435,7 +444,7 @@ test("JSON mode: stdout holds exactly one JSON document, stderr may carry runner
   expect(out).toEqual([`${JSON.stringify(result)}\n`]);
   expect(err).toContain("orchestrator: launcher credential ok (launcher dhl_l1)");
   expect(out.join("")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("JSON mode: document round-trips the outcome fields without extra wrappers", async () => {
   const { io, out } = makeIo();
@@ -449,7 +458,7 @@ test("JSON mode: document round-trips the outcome fields without extra wrappers"
   );
   expect(document.runId).toBe("rid-1");
   expect(document.ok).toBe(true);
-});
+}, 15000);
 
 test("JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
   const { io, out, err } = makeIo();
@@ -499,7 +508,7 @@ test("JSON mode maps only the inherit-asked calls to the streaming stderr mode",
   expect(err.join("\n")).not.toContain("PULL-PROGRESS");
   expect(err.join("\n")).not.toContain("WORKER-EVENTS");
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("human mode keeps the adapter's inherit plumbing untouched", async () => {
   const { io, err } = makeIo();
@@ -523,7 +532,7 @@ test("human mode keeps the adapter's inherit plumbing untouched", async () => {
   expect(err).toEqual([
     "orchestrator: run ok (run rid-1, state /state/root/pipeline-runs/rid-1/state.json, outputs /state/root/pipeline-runs/rid-1/outputs)",
   ]);
-});
+}, 15000);
 
 // --- resume dispatcher ---------------------------------------------------------
 
@@ -559,7 +568,7 @@ test("runCli routes continue-stage to continuePipelineV2Stage exactly once", asy
   expect(out).toEqual([]);
   expect(err.join("\n")).toContain("orchestrator: continue-stage ok (run rid-1");
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("continue-stage parse failures return exit 2 before any resolver, runner or facade call", async () => {
   for (const argv of [
@@ -606,7 +615,7 @@ test("continue-stage parse failures return exit 2 before any resolver, runner or
     expect(facadeCalls).toBe(0);
     expect(err.join("\n")).not.toContain(CANARY_SECRET);
   }
-});
+}, 15000);
 
 test("continue-stage state-root and helper-config resolution failures are CLI configuration errors", async () => {
   const { io, err } = makeIo();
@@ -635,7 +644,7 @@ test("continue-stage state-root and helper-config resolution failures are CLI co
   expect(exit2).toBe(2);
   expect(facadeCalls).toBe(0);
   expect(err2.join("\n")).toContain("helper configuration exploded");
-});
+}, 15000);
 
 test("continue-stage resolves the state-root projection before the helper configuration", async () => {
   const { io, err } = makeIo();
@@ -655,7 +664,7 @@ test("continue-stage resolves the state-root projection before the helper config
   expect(exit).toBe(0);
   expect(helperResolverCalls).toBe(1);
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("continue-stage human mode prints the content-free summary lines", async () => {
   const { io, err, out } = makeIo();
@@ -683,7 +692,7 @@ test("continue-stage human mode prints the content-free summary lines", async ()
   const exit3 = await runCli(CONTINUE_STAGE_ARGS, io3);
   expect(exit3).toBe(1);
   expect(err3).toEqual([]);
-});
+}, 15000);
 
 test("continue-stage JSON mode prints exactly one outcome document on stdout", async () => {
   const { io, out, err } = makeIo();
@@ -702,7 +711,7 @@ test("continue-stage JSON mode prints exactly one outcome document on stdout", a
     ["exitCode", "ok", "runId", "runRoot", "reason", "state"].sort(),
   );
   expect(document.reason).toBe("run_input_modified");
-});
+}, 15000);
 
 test("continue-stage JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
   const { io, out, runnerCalls } = makeIo();
@@ -731,7 +740,7 @@ test("continue-stage JSON mode maps only the inherit-asked calls to the streamin
     expect(call.stdio).toBe("capture");
   }
   expect(out).toEqual([`${JSON.stringify(runOutcome({}))}\n`]);
-});
+}, 15000);
 
 test("continue-stage exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const code of [0, 1, 130, 143]) {
@@ -741,7 +750,7 @@ test("continue-stage exit codes 0/1/130/143 pass through unchanged", async () =>
     const exit = await runCli(CONTINUE_STAGE_ARGS, io);
     expect(exit).toBe(code);
   }
-});
+}, 15000);
 
 test("continue-stage deps.cli is wired to the single runner instance", async () => {
   const { io, runnerCalls } = makeIo();
@@ -754,14 +763,14 @@ test("continue-stage deps.cli is wired to the single runner instance", async () 
   const cli = capturedCli as (args: string[], env: Record<string, string>, stdio: CliStdio) => Promise<CliResult>;
   await cli(["session", "list"], {}, "capture");
   expect(runnerCalls).toEqual([{ args: ["session", "list"], env: {}, stdio: "capture", opts: undefined }]);
-});
+}, 15000);
 
 test("the continue-stage command appears in the command list and unknown commands are still rejected", async () => {
   const { io, err } = makeIo();
   const exit = await runCli(["deploy"], io);
   expect(exit).toBe(2);
   expect(err.join("\n")).toContain("'orchestrator continue-stage'");
-});
+}, 15000);
 
 // --- revise-task dispatcher --------------------------------------------------
 
@@ -807,7 +816,7 @@ test("runCli routes revise-task to revisePipelineV2Task exactly once with the ta
   expect(JSON.stringify(err)).not.toContain("REVISED BODY");
   expect(JSON.stringify(err)).not.toContain("/abs/body.md");
   expect(JSON.stringify(out)).not.toContain("/abs/body.md");
-});
+}, 15000);
 
 test("revise-task passes the exact file content unchanged, including whitespace and the final newline", async () => {
   const { io } = makeIo();
@@ -826,7 +835,7 @@ test("revise-task passes the exact file content unchanged, including whitespace 
   expect(fileReads).toBe(1);
   // no trim, no newline normalization, no added trailing newline
   expect(bodies).toEqual(["\n  revised body with leading/trailing space  \t\n\n"]);
-});
+}, 15000);
 
 test("revise-task calls no other production API", async () => {
   const { io } = makeIo();
@@ -846,7 +855,7 @@ test("revise-task calls no other production API", async () => {
   io.readTaskFile = async () => "BODY\n";
   const exit = await runCli(REVISE_TASK_ARGS, io);
   expect(exit).toBe(0);
-});
+}, 15000);
 
 test("revise-task parse failures return exit 2 before any resolver, file or runner call", async () => {
   for (const argv of [
@@ -899,7 +908,7 @@ test("revise-task parse failures return exit 2 before any resolver, file or runn
     expect(facadeCalls).toBe(0);
     expect(err.join("\n")).not.toContain(CANARY_SECRET);
   }
-});
+}, 15000);
 
 test("revise-task state-root and helper-config resolution failures are CLI configuration errors", async () => {
   const { io, err } = makeIo();
@@ -938,7 +947,7 @@ test("revise-task state-root and helper-config resolution failures are CLI confi
   expect(exit2).toBe(2);
   expect(fileReads2).toBe(0);
   expect(err2.join("\n")).toContain("helper configuration exploded");
-});
+}, 15000);
 
 test("revise-task resolves the state-root projection before the helper configuration", async () => {
   const { io, err } = makeIo();
@@ -959,7 +968,7 @@ test("revise-task resolves the state-root projection before the helper configura
   expect(exit).toBe(0);
   expect(helperResolverCalls).toBe(1);
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("revise-task task-file read failures and an empty file are contract errors with content-free messages", async () => {
   // a read failure: no path, no body, no hostile filesystem error echo
@@ -1016,7 +1025,7 @@ test("revise-task task-file read failures and an empty file are contract errors 
   expect(err2.join("\n")).not.toContain("/abs/empty.md");
   expect(err2.join("\n")).toContain("revise-task requires a non-empty task body");
   expect(err2.join("\n")).toContain("usage: orchestrator");
-});
+}, 15000);
 
 test("revise-task human mode prints the content-free summary lines", async () => {
   const { io, err, out } = makeIo();
@@ -1047,7 +1056,7 @@ test("revise-task human mode prints the content-free summary lines", async () =>
   const exit3 = await runCli(REVISE_TASK_ARGS, io3);
   expect(exit3).toBe(1);
   expect(err3).toEqual([]);
-});
+}, 15000);
 
 test("revise-task JSON mode prints exactly one outcome document on stdout", async () => {
   const { io, out, err } = makeIo();
@@ -1067,7 +1076,7 @@ test("revise-task JSON mode prints exactly one outcome document on stdout", asyn
     ["exitCode", "ok", "runId", "runRoot", "reason", "state"].sort(),
   );
   expect(document.reason).toBe("run_input_modified");
-});
+}, 15000);
 
 test("revise-task JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
   const { io, out, runnerCalls } = makeIo();
@@ -1097,7 +1106,7 @@ test("revise-task JSON mode maps only the inherit-asked calls to the streaming s
     expect(call.stdio).toBe("capture");
   }
   expect(out).toEqual([`${JSON.stringify(runOutcome({}))}\n`]);
-});
+}, 15000);
 
 test("revise-task exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const code of [0, 1, 130, 143]) {
@@ -1108,7 +1117,7 @@ test("revise-task exit codes 0/1/130/143 pass through unchanged", async () => {
     const exit = await runCli(REVISE_TASK_ARGS, io);
     expect(exit).toBe(code);
   }
-});
+}, 15000);
 
 test("revise-task deps.cli is wired to the single runner instance", async () => {
   const { io, out, err, runnerCalls } = makeIo();
@@ -1129,14 +1138,14 @@ test("revise-task deps.cli is wired to the single runner instance", async () => 
   expect(runnerCalls[0]!.args).toEqual(["session", "list"]);
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
   expect(out).toEqual([]);
-});
+}, 15000);
 
 test("the revise-task command appears in the command list and unknown commands are still rejected", async () => {
   const { io, err } = makeIo();
   const exit = await runCli(["deploy"], io);
   expect(exit).toBe(2);
   expect(err.join("\n")).toContain("'orchestrator revise-task'");
-});
+}, 15000);
 
 test("resume dispatches exactly once to resumePipelineV2 with the exact options mapping", async () => {
   const { io, err } = makeIo();
@@ -1166,7 +1175,7 @@ test("resume dispatches exactly once to resumePipelineV2 with the exact options 
   expect(typeof d.cli).toBe("function");
   expect(typeof d.onSignal).toBe("function");
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("resume parse failures return exit 2 before any resolver, runner or subprocess call", async () => {
   for (const argv of [
@@ -1213,7 +1222,7 @@ test("resume parse failures return exit 2 before any resolver, runner or subproc
     expect(resumeCalls).toBe(0);
     expect(err.join("\n")).not.toContain(CANARY_SECRET);
   }
-});
+}, 15000);
 
 test("resume state-root and helper-config resolution failures are CLI configuration errors", async () => {
   const { io, err } = makeIo();
@@ -1242,7 +1251,7 @@ test("resume state-root and helper-config resolution failures are CLI configurat
   expect(exit2).toBe(2);
   expect(resumeCalls).toBe(0);
   expect(err2.join("\n")).toContain("helper configuration exploded");
-});
+}, 15000);
 
 test("resume human mode prints the content-free summary lines", async () => {
   const { io, err, out } = makeIo();
@@ -1271,7 +1280,7 @@ test("resume human mode prints the content-free summary lines", async () => {
   const exit3 = await runCli(RESUME_ARGS, io3);
   expect(exit3).toBe(1);
   expect(err3).toEqual([]);
-});
+}, 15000);
 
 test("resume JSON mode prints exactly one outcome document on stdout", async () => {
   const { io, out, err } = makeIo();
@@ -1290,7 +1299,7 @@ test("resume JSON mode prints exactly one outcome document on stdout", async () 
     ["exitCode", "ok", "runId", "runRoot", "reason", "state"].sort(),
   );
   expect(document.reason).toBe("run_input_modified");
-});
+}, 15000);
 
 test("resume JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
   const { io, out, runnerCalls } = makeIo();
@@ -1319,7 +1328,7 @@ test("resume JSON mode maps only the inherit-asked calls to the streaming stderr
     expect(call.stdio).toBe("capture");
   }
   expect(out).toEqual([`${JSON.stringify(runOutcome({}))}\n`]);
-});
+}, 15000);
 
 test("resume exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const code of [0, 1, 130, 143]) {
@@ -1329,7 +1338,7 @@ test("resume exit codes 0/1/130/143 pass through unchanged", async () => {
     const exit = await runCli(RESUME_ARGS, io);
     expect(exit).toBe(code);
   }
-});
+}, 15000);
 
 // --- respond dispatcher ---------------------------------------------------------
 
@@ -1372,7 +1381,7 @@ test("respond dispatches exactly once to respondPipelineV2Wait with the exact op
   expect(options).toEqual({ runId: "rid-1", waitIndex: 1, actionId: "continue_stage" });
   expect(deps).toEqual({ stateRootProjection: { localRoot: "/state/root", daemonRoot: "/daemon/root" } });
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 test("respond parse failures return exit 2 before any resolver, runner or subprocess call", async () => {
   for (const argv of [
@@ -1429,7 +1438,7 @@ test("respond parse failures return exit 2 before any resolver, runner or subpro
     expect(respondCalls).toBe(0);
     expect(err.join("\n")).not.toContain(CANARY_SECRET);
   }
-});
+}, 15000);
 
 test("respond state-root resolution failure is a CLI configuration error (exit 2, no API call)", async () => {
   const { io, err } = makeIo();
@@ -1445,7 +1454,7 @@ test("respond state-root resolution failure is a CLI configuration error (exit 2
   expect(exit).toBe(2);
   expect(respondCalls).toBe(0);
   expect(err.join("\n")).toContain("cannot build the orchestrator state root");
-});
+}, 15000);
 
 test("respond never resolves the helper configuration, runs no subprocess and registers no signal", async () => {
   const { io, err, runnerCalls } = makeIo();
@@ -1461,7 +1470,7 @@ test("respond never resolves the helper configuration, runs no subprocess and re
   expect(exit).toBe(0);
   expect(runnerCalls).toEqual([]);
   expect(err.join("\n")).not.toContain("must not be called by respond");
-});
+}, 15000);
 
 test("respond human mode prints the content-free summary lines", async () => {
   const humanArgs = ["respond", "--run-id", "rid-1", "--wait-index", "1", "--action", "continue_stage"];
@@ -1492,7 +1501,7 @@ test("respond human mode prints the content-free summary lines", async () => {
   expect(err3).toEqual([
     "orchestrator: respond failed (run rid-1, reason run_layout_invalid)",
   ]);
-});
+}, 15000);
 
 test("respond end-to-end with the real production module: a reserved intervention action exits 1 with no orphan file and no machinery", async () => {
   const root = mkdtempSync(join(tmpdir(), "cli-respond-reserved-"));
@@ -1566,7 +1575,7 @@ test("respond end-to-end with the real production module: a reserved interventio
   expect(fetchAuthCalls).toBe(0);
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
   rmSync(root, { recursive: true, force: true });
-});
+}, 15000);
 
 test("respond JSON mode prints exactly one outcome document on stdout", async () => {
   const { io, out, err } = makeIo();
@@ -1585,7 +1594,7 @@ test("respond JSON mode prints exactly one outcome document on stdout", async ()
     ["actionId", "actionTo", "exitCode", "ok", "reason", "requestSha256", "responseSha256", "runId", "runRoot", "state", "waitIndex"].sort(),
   );
   expect(document.reason).toBe("state_persist_failed");
-});
+}, 15000);
 
 test("respond exit codes 0 and 1 pass through unchanged", async () => {
   for (const code of [0, 1]) {
@@ -1595,14 +1604,14 @@ test("respond exit codes 0 and 1 pass through unchanged", async () => {
     const exit = await runCli(RESPOND_ARGS, io);
     expect(exit).toBe(code);
   }
-});
+}, 15000);
 
 test("the respond command appears in the command list and unknown commands are still rejected", async () => {
   const { io, err } = makeIo();
   const exit = await runCli(["deploy"], io);
   expect(exit).toBe(2);
   expect(err.join("\n")).toContain("'orchestrator respond'");
-});
+}, 15000);
 
 test("resume deps.cli is wired to the single runner instance", async () => {
   const { io, runnerCalls } = makeIo();
@@ -1615,7 +1624,7 @@ test("resume deps.cli is wired to the single runner instance", async () => {
   const cli = capturedCli as (args: string[], env: Record<string, string>, stdio: CliStdio) => Promise<CliResult>;
   await cli(["session", "list"], {}, "capture");
   expect(runnerCalls).toEqual([{ args: ["session", "list"], env: {}, stdio: "capture", opts: undefined }]);
-});
+}, 15000);
 
 test("smoke and agent-smoke keep routing to their own runner functions", async () => {
   const smokeCalls: Array<{ options: unknown; hasDeps: boolean }> = [];
@@ -1642,7 +1651,7 @@ test("smoke and agent-smoke keep routing to their own runner functions", async (
     },
   ]);
   expect(err.join("\n")).not.toContain(CANARY_SECRET);
-});
+}, 15000);
 
 // --- the real continue-stage CLI integration proof ---------------------------
 
@@ -2016,7 +2025,7 @@ test("revise-task end-to-end with the real production runner: the honest waiting
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("continue-stage end-to-end with the real production runner: the honest waiting prefix, the full intervention suffix and the resumed successor execution", async () => {
   const root = mkdtempSync(join(tmpdir(), "cli-continue-stage-"));
@@ -2293,7 +2302,7 @@ test("continue-stage end-to-end with the real production runner: the honest wait
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- resume-plan (production pipeline v2 planning continuation) --------------
 
@@ -2329,7 +2338,7 @@ test("resume-plan dispatches exactly once to resumePipelineV2PlanningRunPlan wit
   expect(err).toEqual([
     "orchestrator: resume-plan ok (run planning-run, state /state/root/pipeline-runs/planning-run/state.json, outputs /state/root/pipeline-runs/planning-run/outputs)",
   ]);
-});
+}, 15000);
 
 test("resume-plan calls no other production API", async () => {
   const { io } = makeIo();
@@ -2339,7 +2348,7 @@ test("resume-plan calls no other production API", async () => {
     runOutcome({ exitCode: 1, ok: false, runId: "planning-run", runRoot: "/state/root/pipeline-runs/planning-run" })) as unknown as CliIo["resumePipelineV2PlanningRunPlan"];
   const exit = await runCli(RESUME_PLAN_ARGS, io);
   expect(exit).toBe(1);
-});
+}, 15000);
 
 test("resume-plan parse failures return exit 2 before any resolver, runner or subprocess call", async () => {
   for (const argv of [
@@ -2367,7 +2376,7 @@ test("resume-plan parse failures return exit 2 before any resolver, runner or su
     expect(resolveHelperCalls).toBe(0);
     expect(err.join("\n")).toContain("usage:");
   }
-});
+}, 15000);
 
 test("resume-plan state-root and helper-config resolution failures are CLI configuration errors", async () => {
   // state-root failure: no helper resolution, no runner call
@@ -2402,7 +2411,7 @@ test("resume-plan state-root and helper-config resolution failures are CLI confi
   expect(await runCli(RESUME_PLAN_ARGS, bothIo.io)).toBe(2);
   expect(bothIo.err.join("\n")).toContain("STATE-ROOT-FAILURE");
   expect(bothIo.err.join("\n")).not.toContain("HELPER-CONFIG-FAILURE");
-});
+}, 15000);
 
 test("resume-plan human mode prints the content-free summary lines and a pre-run-root failure prints none", async () => {
   const success = makeIo();
@@ -2438,7 +2447,7 @@ test("resume-plan human mode prints the content-free summary lines and a pre-run
     runOutcome({ ok: false, exitCode: 1, runId: "", runRoot: null, state: null })) as unknown as CliIo["resumePipelineV2PlanningRunPlan"];
   expect(await runCli(RESUME_PLAN_ARGS, preroot.io)).toBe(1);
   expect(preroot.err).toEqual([]);
-});
+}, 15000);
 
 test("resume-plan JSON mode prints exactly one outcome document on stdout", async () => {
   const { io, out, err } = makeIo();
@@ -2460,7 +2469,7 @@ test("resume-plan JSON mode prints exactly one outcome document on stdout", asyn
   expect(parsed["reason"]).toBe("worker_failed");
   expect(parsed["runId"]).toBe("planning-run");
   expect(err).toEqual([]);
-});
+}, 15000);
 
 test("resume-plan JSON mode maps only the inherit-asked calls to the streaming stderr mode", async () => {
   const { io, runnerCalls } = makeIo();
@@ -2475,7 +2484,7 @@ test("resume-plan JSON mode maps only the inherit-asked calls to the streaming s
   expect(runnerCalls[0]?.stdio).toBe("stderr");
   expect(runnerCalls[1]?.stdio).toBe("capture");
   expect(runnerCalls[2]?.stdio).toBe("capture");
-});
+}, 15000);
 
 test("resume-plan exit codes 0/1/130/143 pass through unchanged", async () => {
   for (const exitCode of [0, 1, 130, 143]) {
@@ -2491,7 +2500,7 @@ test("resume-plan exit codes 0/1/130/143 pass through unchanged", async () => {
       )) as unknown as CliIo["resumePipelineV2PlanningRunPlan"];
     expect(await runCli(RESUME_PLAN_ARGS, io)).toBe(exitCode);
   }
-});
+}, 15000);
 
 test("resume-plan deps.cli is wired to the single runner instance", async () => {
   const { io, runnerCalls } = makeIo();
@@ -2502,13 +2511,13 @@ test("resume-plan deps.cli is wired to the single runner instance", async () => 
   expect(await runCli(RESUME_PLAN_ARGS, io)).toBe(0);
   expect(runnerCalls).toHaveLength(1);
   expect(runnerCalls[0]?.args).toEqual(["session", "create"]);
-});
+}, 15000);
 
 test("the resume-plan command appears in the command list and unknown commands are still rejected", async () => {
   const { io, err } = makeIo();
   expect(await runCli(["no-such-command"], io)).toBe(2);
   expect(err.join("\n")).toContain("'orchestrator resume-plan'");
-});
+}, 15000);
 
 // --- resume-plan end-to-end with the real production runner ------------------
 
@@ -2994,7 +3003,7 @@ test("resume-plan end-to-end with the real production runner: the two-cycle plan
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("resume-plan end-to-end with the real production runner: the initial plan-ready boundary, the initial handoff suffix and the resumed successor execution", async () => {
   const root = mkdtempSync(join(tmpdir(), "cli-initial-plan-"));
@@ -3202,7 +3211,7 @@ test("resume-plan end-to-end with the real production runner: the initial plan-r
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- the real wait-entry CLI integration proof --------------------------------
 
@@ -3473,7 +3482,7 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
       rmSync(parts.root, { recursive: true, force: true });
     }
   }
-});
+}, 15000);
 
 test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (exit 0) and one human plan-ready line", async () => {
   const buildFresh = async (runId: string) => {
@@ -3665,7 +3674,7 @@ test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (ex
       rmSync(parts.root, { recursive: true, force: true });
     }
   }
-});
+}, 15000);
 
 // --- inspect dispatcher ------------------------------------------------------
 
@@ -3698,7 +3707,7 @@ test("inspect dispatches exactly once with the state-root local root and uses no
   // no runner subprocess and no mutating deps object: inspect is read-only
   expect(rec.runnerCalls).toHaveLength(0);
   expect(rec.out).toHaveLength(0);
-});
+}, 15000);
 
 test("inspect reports one human summary line per boundary shape", async () => {
   const shapes: Array<{ args: string[]; line: string; outcome: PipelineV2InspectOutcome }> = [
@@ -3742,7 +3751,7 @@ test("inspect reports one human summary line per boundary shape", async () => {
     expect(rec.err).toEqual([shape.line]);
     expect(rec.out).toHaveLength(0);
   }
-});
+}, 15000);
 
 test("inspect reports failures with the reason and the exit code, human and JSON", async () => {
   const rec = makeIo();
@@ -3773,7 +3782,7 @@ test("inspect reports failures with the reason and the exit code, human and JSON
   expect(Object.keys(parsed).sort()).toEqual(["exitCode", "ok", "reason", "runId", "runRoot"]);
   expect(parsed["reason"]).toBe("pipeline_mismatch");
   expect(jsonRec.err).toHaveLength(0);
-});
+}, 15000);
 
 test("inspect JSON mode prints exactly one document and nothing else on stdout", async () => {
   const rec = makeIo();
@@ -3795,7 +3804,7 @@ test("inspect JSON mode prints exactly one document and nothing else on stdout",
   expect(parsed["schemaVersion"]).toBe(1);
   expect("state" in parsed).toBe(false);
   expect(rec.err).toHaveLength(0);
-});
+}, 15000);
 
 test("inspect resolver failure is exit 2 with the API never called", async () => {
   const rec = makeIo();
@@ -3812,4 +3821,4 @@ test("inspect resolver failure is exit 2 with the API never called", async () =>
   expect(called).toBe(0);
   expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
   expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
-});
+}, 15000);

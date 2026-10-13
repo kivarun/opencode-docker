@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { expect, test } from "bun:test";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -839,7 +848,7 @@ test("1. the real accepted planning JSON output becomes the exact candidate r1 w
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 2. replanning across the restart ---------------------------------------
 
@@ -916,7 +925,7 @@ test("2. after the restart an existing task r1 and a new task-c build the exact 
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 3. the real revise boundary --------------------------------------------
 
@@ -975,7 +984,7 @@ test("3. after the honest revise flow the second planning execution's proposal p
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 4. the ledger ∩ new_tasks policy rule ----------------------------------
 
@@ -1009,7 +1018,7 @@ test("4. a new task id already recorded in the durable task ledger with a differ
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 5. the unused new_tasks policy rule ------------------------------------
 
@@ -1051,7 +1060,7 @@ test("5. an unreferenced new task entry is a construction conflict after the sin
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 6. the unresolvable pointer policy rule --------------------------------
 
@@ -1089,7 +1098,7 @@ test("6. a pointer absent from both the ledger and new_tasks is a construction c
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 7. the manifest validator keeps its graph semantics --------------------
 
@@ -1194,7 +1203,7 @@ test("7. duplicate pointers, unknown/cross-stage dependencies, cycles and empty 
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 8. the missing-artifact matrix -----------------------------------------
 
@@ -1273,7 +1282,7 @@ test("8. missing current plan, current task and task predecessor manifests are t
   } finally {
     await rm(boundary.harness.dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 9. the malformed loader-result matrix -----------------------------------
 
@@ -1427,7 +1436,7 @@ test("9. hostile loader results are typed construction failures, never TypeError
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 10. the ledger, never the filesystem, selects the revision --------------
 
@@ -1524,7 +1533,7 @@ test("10. orphan artifacts at non-target revisions stay ignored; a foreign orpha
   } finally {
     await rm(dirs2.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 11. capture, provenance and mutation batteries --------------------------
 
@@ -1570,7 +1579,7 @@ test("11a. the options fields are read exactly once in the fixed order and hosti
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("11b. a Proxy or cloned proposal is rejected through the existing provenance registry with zero traps and zero reads", async () => {
   const harness = await setupHarness(CONSTRUCTION_PIPELINE);
@@ -1629,7 +1638,7 @@ test("11b. a Proxy or cloned proposal is rejected through the existing provenanc
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("11c. mutating the caller's state and options after the pending load cannot change the construction", async () => {
   const fixture = await setupReplanning();
@@ -1689,7 +1698,7 @@ test("11c. mutating the caller's state and options after the pending load cannot
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("11d. malformed options and ops are typed invalid_options at the capture boundary, before any state read or store call", async () => {
   const harness = await setupHarness(CONSTRUCTION_PIPELINE);
@@ -1791,7 +1800,7 @@ test("11d. malformed options and ops are typed invalid_options at the capture bo
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 12. the state and run-root boundaries ----------------------------------
 
@@ -1918,7 +1927,7 @@ test("12. the state validation, run-root binding and root-task derivation bounda
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 13. the candidate is returned directly by identity ----------------------
 
@@ -1966,7 +1975,7 @@ test("13. the construction returns the existing candidate preparation's exact re
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 14. the derivation never re-checks the acceptance boundary --------------
 
@@ -2035,7 +2044,7 @@ test("14. the origin is the last durable execution regardless of its role — th
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 15. export surfaces and the source scan --------------------------------
 
@@ -2056,7 +2065,7 @@ test("15a. the facade exports exactly the error class and the construction funct
   expect(error.state).toBeNull();
   expect(error.name).toBe("PipelineV2RunPlanConstructionError");
   expect(() => new PipelineV2RunPlanConstructionError("no_such_reason" as never, "message", null)).toThrow(TypeError);
-});
+}, 15000);
 
 test("15b. the construction layer is strictly read-only: one manifest preparer path, one candidate preparer, two store loaders, no second machinery", async () => {
   const facade = await readFile(
@@ -2110,7 +2119,7 @@ test("15b. the construction layer is strictly read-only: one manifest preparer p
   // the facade delegates to the internal core with the frozen production ops
   expect(facade).toMatch(/constructPipelineV2RunPlanCandidateFromProposalInternal/);
   expect(facade).toMatch(/productionRunPlanConstructionOps/);
-});
+}, 15000);
 
 // --- 16. the anchored/retry-aware construction matrix ------------------------
 //
@@ -2414,7 +2423,7 @@ test("16. the anchored construction returns the exact candidate on fresh, partia
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("16b. the pointer-only completed boundary recognizes the accepted plan instead of building the next revision", async () => {
   const dirs = await makeDirs("pipeline-v2-plan-construction-anchored-ptr-", RUN_ID);
@@ -2579,7 +2588,7 @@ test("16b. the pointer-only completed boundary recognizes the accepted plan inst
   } finally {
     await rm(dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- 17. the anchored negative battery ----------------------------------------
 
@@ -2642,4 +2651,4 @@ test("17. the anchored refusals: no-commit-marker evidence, incoherent target le
   } finally {
     await rm(fixtureB.harness.dirs.root, { recursive: true, force: true });
   }
-});
+}, 15000);

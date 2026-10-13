@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -638,7 +647,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. the unified result carries exactly the content-free fields and is deep-frozen", async () => {
     const ctx = await reviseReady();
@@ -668,7 +677,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. C1 retry: the durable closure dispatches the response only", async () => {
     const ctx = await reviseReady();
@@ -683,7 +692,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. C2 orphan response retry: the exact file is adopted and committed once", async () => {
     const ctx = await reviseReady();
@@ -716,7 +725,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. C3 durability-unknown response retry: a fresh retry dispatches nothing", async () => {
     const ctx = await reviseReady();
@@ -747,7 +756,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. C4 committed response retry: zero dispatch, publications restored byte-for-byte", async () => {
     const ctx = await reviseReady();
@@ -780,7 +789,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("7. a closure not_committed stops the completion before the response; the fresh retry completes both", async () => {
     const ctx = await reviseReady();
@@ -809,7 +818,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("8. a closure durability_unknown stops the completion; the fresh reopened sink records the response only", async () => {
     const ctx = await reviseReady();
@@ -846,7 +855,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("9. two identical C0 completions racing: both succeed, one durable closure, one response, revision +2", async () => {
     const ctx = await reviseReady();
@@ -870,7 +879,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("10. a conflicting retry with another intent rewrites nothing", async () => {
     const ctx = await reviseReady();
@@ -903,7 +912,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("11. a non-registered intent surfaces the closure controller's typed error", async () => {
     const ctx = await reviseReady();
@@ -935,7 +944,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("12. a tampered request file surfaces the wait controller's typed error without rollback", async () => {
     const ctx = await reviseReady();
@@ -956,7 +965,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("13. a hostile closure result with a missing or different closure is invalid_result before any response work", async () => {
     const last = (generation: PipelineV2RunState["generations"][number]) =>
@@ -1007,7 +1016,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("14. a hostile closure result with a mutated generation index is invalid_result", async () => {
     const ctx = await reviseReady();
@@ -1030,7 +1039,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("15. a hostile closure result with a changed plan or stage binding is invalid_result", async () => {
     for (const mutate of [
@@ -1066,7 +1075,9 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  // measured: 3.9s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("16. a hostile closure result with a changed historical iteration prefix is invalid_result", async () => {
     const ctx = await reviseReady({ secondIteration: true });
@@ -1092,7 +1103,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("17. a hostile closure result with a replaced wait intent is invalid_result", async () => {
     const ctx = await reviseReady();
@@ -1116,7 +1127,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("18. a hostile closure result with an extra wait-bound task record of another task is invalid_result", async () => {
     const ctx = await reviseReady();
@@ -1144,7 +1155,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("19. a hostile closure result with a mismatching task revision field is invalid_result", async () => {
     const ctx = await reviseReady();
@@ -1161,7 +1172,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("20. a malformed closure result state is typed invalid_result, never a TypeError", async () => {
     const variants: Array<[string, (derived: PipelineV2RunState) => void]> = [
@@ -1216,7 +1227,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("20b. a mutated multi-wait journal with an early duplicate of the target index is invalid_result", async () => {
     const ctx = await reviseReadyMultiWait();
@@ -1244,7 +1255,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("21. hostile response results with a changed request digest, action target or wait anchor are invalid_result", async () => {
     const variants: Array<[string, (response: RecordedPipelineV2WaitResponse) => void]> = [
@@ -1280,7 +1291,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("22. a hostile response result with a wrong revision delta is invalid_result", async () => {
     const ctx = await reviseReady();
@@ -1303,7 +1314,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("23. hostile response results with changed early task, plan or wait records are invalid_result", async () => {
     const variants: Array<[string, (derived: PipelineV2RunState) => void]> = [
@@ -1339,7 +1350,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("24. hostile response results with a changed generation index, binding or historical iteration are invalid_result", async () => {
     const variants: Array<[string, boolean, (derived: PipelineV2RunState) => void]> = [
@@ -1382,7 +1393,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("25. hostile response results with a removed, substituted closure or an appeared open_iteration are invalid_result", async () => {
     const variants: Array<[string, (derived: PipelineV2RunState) => void]> = [
@@ -1433,7 +1444,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("26. hostile response results with a shifted cursor or journals are invalid_result", async () => {
     const variants: Array<[string, (derived: PipelineV2RunState) => void]> = [
@@ -1475,7 +1486,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("27. a malformed response result is typed invalid_result, never a TypeError", async () => {
     const variants: Array<[string, (derived: PipelineV2RunState) => void]> = [
@@ -1521,7 +1532,7 @@ describe("completePipelineV2ReviseTask", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("28. options and ops getters are read exactly once", async () => {
     const ctx = await reviseReady();
@@ -1560,7 +1571,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("29. caller mutation after the capture cannot influence the completion", async () => {
     const ctx = await reviseReady();
@@ -1589,7 +1600,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30. downstream unexpected errors preserve their identity", async () => {
     const ctx = await reviseReady();
@@ -1621,7 +1632,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30b. an unexpected direct sink.snapshot getter error keeps its identity and the response is never recorded", async () => {
     const ctx = await reviseReady();
@@ -1653,7 +1664,7 @@ describe("completePipelineV2ReviseTask", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("31. hostile option shapes are invalid_options", async () => {
     const runRoot = "/tmp/unused-run-root";
@@ -1675,7 +1686,7 @@ describe("completePipelineV2ReviseTask", () => {
         { runRoot, sink: {}, intent: INTENT },
       );
     })()).rejects.toMatchObject({ reason: "invalid_options" });
-  });
+  }, 15000);
 
   test("31b. diagnostics are content-free across the failure paths", async () => {
     const messages: string[] = [];
@@ -1742,7 +1753,7 @@ describe("completePipelineV2ReviseTask", () => {
       expect(message).not.toContain("Bearer");
       expect(message).not.toContain("credential");
     }
-  });
+  }, 15000);
 });
 
 test("32. the runtime export surfaces are exact (public two keys, internal three keys)", async () => {
@@ -1757,7 +1768,7 @@ test("32. the runtime export surfaces are exact (public two keys, internal three
     "completePipelineV2ReviseTaskWithIo",
     "productionReviseTaskCompletionOps",
   ]);
-});
+}, 15000);
 
 test("33. the completion composes the existing layers only (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
@@ -1810,4 +1821,4 @@ test("33. the completion composes the existing layers only (source scan)", async
     expect(source).not.toContain(banned);
   }
   expect(countOf("let production")).toBe(0);
-});
+}, 15000);

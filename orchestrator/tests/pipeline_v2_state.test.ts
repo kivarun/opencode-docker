@@ -4707,7 +4707,10 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     expect(child.status).toBeNull();
     expect(child.signal).toBe("SIGTERM");
     expect(String(child.stdout ?? "")).toBe("");
-  });
+  // measured: 2.0s under bun test --parallel=2 (2026-10-13); the child
+  // termination waits on real process scheduling - local deadline headroom
+  // only, assertions unchanged.
+  }, 15000);
 
   test("the loader rejects a transition committed inside an unresolved answered wait", () => {
     // The exact accepted-at-b10678c form: the reducer builds the run through

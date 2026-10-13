@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -688,7 +697,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. the result is deep-frozen and content-free", async () => {
     const ctx = await replannedStageReady();
@@ -726,7 +735,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. the exact result fields and the loader round-trip", async () => {
     const ctx = await replannedStageReady();
@@ -760,7 +769,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. the C1 path: the closed old generation skips the close dispatch", async () => {
     const ctx = await replannedStageReady();
@@ -793,7 +802,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. the C2 retry path with the first iteration open is zero-dispatch through both controllers", async () => {
     const ctx = await replannedStageReady();
@@ -823,7 +832,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. the C2 retry path with the bare new generation opens only the iteration", async () => {
     const ctx = await replannedStageReady();
@@ -869,7 +878,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("7. the close not_committed fault window: identity refusal, zero ensure calls, full fresh retry", async () => {
     const ctx = await replannedStageReady();
@@ -909,7 +918,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("8. the close durability_unknown fault window: identity refusal, fresh sink continues from C1", async () => {
     const ctx = await replannedStageReady();
@@ -959,7 +968,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("9. the generation-open not_committed fault window: fresh retry continues from C1", async () => {
     const ctx = await replannedStageReady();
@@ -1011,7 +1020,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("10. the generation-open durability_unknown fault window: fresh retry continues from C2", async () => {
     const ctx = await replannedStageReady();
@@ -1054,7 +1063,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("11. the iteration-open durability_unknown fault window: fresh retry is zero-dispatch through both controllers", async () => {
     const ctx = await replannedStageReady();
@@ -1095,7 +1104,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("12. the exact complete retry dispatches nothing through either controller", async () => {
     const ctx = await replannedStageReady();
@@ -1122,7 +1131,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("13. two identical C0 races both succeed with exactly one of each command and revision +3", async () => {
     const ctx = await replannedStageReady();
@@ -1152,7 +1161,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("14. two identical races after C1 both succeed with the generation and iteration written once", async () => {
     const ctx = await replannedStageReady();
@@ -1180,7 +1189,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("15. a conflicting budget retry rewrites nothing and the winner state stays unchanged", async () => {
     const ctx = await replannedStageReady();
@@ -1212,7 +1221,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("16. an unknown stage id or a forged compiled plan refuses through the existing resolver before any dispatch", async () => {
     const ctx = await replannedStageReady();
@@ -1246,7 +1255,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("17. a Proxy compiled plan is rejected with zero proxy traps and zero controller calls", async () => {
     const ctx = await replannedStageReady();
@@ -1273,7 +1282,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("18. invalid budgets and option shapes refuse as invalid_options with zero dispatches", async () => {
     const ctx = await replannedStageReady();
@@ -1340,7 +1349,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("19. a hostile close result never reaches the ensure call", async () => {
     const ctx = await replannedStageReady();
@@ -1387,7 +1396,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("20. a hostile C2 close result with a closed new generation never reaches the ensure call", async () => {
     const ctx = await replannedStageReady();
@@ -1447,7 +1456,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("21. a hostile ensure result is compared against the verified close state, never itself", async () => {
     const ctx = await replannedStageReady();
@@ -1556,7 +1565,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("22. a coherent hostile ensure result with simultaneously mutated fields and state is detected", async () => {
     const ctx = await replannedStageReady();
@@ -1586,7 +1595,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("23. option getter counts, ops getter counts and caller mutation isolation", async () => {
     const ctx = await replannedStageReady();
@@ -1664,7 +1673,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("24. downstream and unexpected errors pass through by identity", async () => {
     const ctx = await replannedStageReady();
@@ -1728,7 +1737,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("25. diagnostics are content-free across the failure paths", async () => {
     const ctx = await replannedStageReady();
@@ -1764,7 +1773,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("28. the prefix C2-bare composition retry succeeds without changing the historical prefix", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
@@ -1811,7 +1820,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("29. the prefix C2-open full composition is a zero-dispatch recognition on repeat", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
@@ -1837,7 +1846,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30. a hostile extra generation in the prefix scenario is refused by the close controller identity", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
@@ -1887,7 +1896,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("31. an ensure result with a changed revision at otherwise coherent fields is invalid_result", async () => {
     const ctx = await replannedStageReady();
@@ -1914,7 +1923,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("32. an ensure result with a changed pipeline identity is invalid_result", async () => {
     const ctx = await replannedStageReady();
@@ -1939,7 +1948,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("33. a C2-bare hostile ensure cannot heal the generation binding under the caller-selected budget", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
@@ -1975,7 +1984,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("34. a C2-bare hostile ensure cannot heal plan digest, template or anchor bindings", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
@@ -2012,7 +2021,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("35. a C2-open hostile ensure rewriting an immutable generation binding is invalid_result", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
@@ -2044,7 +2053,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("36. a changed result iteration_index is invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2068,7 +2077,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("37. a coherent hostile task id and digest off the intent manifest are invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2096,7 +2105,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("38. a changed predecessor task digest is invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2121,7 +2130,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("39. a broken plan predecessor digest is invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2146,7 +2155,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("40. broken iteration count, last-iteration index or an open projection are invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2182,7 +2191,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("41. a C2-bare hostile ensure preserving a mismatching caller budget never succeeds", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
@@ -2225,7 +2234,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("42. a C2-open hostile ensure preserving a mismatching caller budget never succeeds", async () => {
     // The precise stage-mismatch counterpart of this case is test 48:
@@ -2268,7 +2277,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("43. a malformed wait action declaration is invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2302,7 +2311,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("44. malformed inputs, transitions and executions journals are invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2346,7 +2355,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("45. malformed grants, early plan records, cursor, pipeline and the predecessor revision are invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2391,7 +2400,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("46. corrupted nested execution shapes are invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2431,7 +2440,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("47. corrupted nested wait and generation shapes are invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady();
@@ -2474,7 +2483,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("48. a C2-open preserved generation on another compiled stage is invalid_result with zero dispatch", async () => {
     const ctx = await replannedStageReady({ withStageTwoGeneration: true });
@@ -2511,7 +2520,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
   test("49. a null closure projection on a historical prefix generation is invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady({ withPrefixGeneration: true });
     try {
@@ -2540,7 +2549,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("50. an early wait record without its actions array is invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady({ withEarlyWait: true });
@@ -2570,7 +2579,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("51. historical decision results without their required id lists are invalid_result with zero ensure calls", async () => {
     const ctx = await replannedStageReady({ withDecisionExecution: true });
@@ -2608,7 +2617,7 @@ describe("openPipelineV2ReplannedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 });
 
 test("26. the runtime export surfaces are exact (public two keys, internal three keys)", async () => {
@@ -2627,7 +2636,7 @@ test("26. the runtime export surfaces are exact (public two keys, internal three
   expect(Object.keys(productionReplannedStageOps).sort()).toEqual(["closeGeneration", "ensureStageIteration"]);
   expect(productionReplannedStageOps.closeGeneration).toBe(closePipelineV2ReplannedGeneration);
   expect(productionReplannedStageOps.ensureStageIteration).toBe(ensurePipelineV2StageIteration);
-});
+}, 15000);
 
 test("27. the composition module imports only the composed layers (source scan)", async () => {
   const { readFile } = await import("node:fs/promises");
@@ -2667,4 +2676,4 @@ test("27. the composition module imports only the composed layers (source scan)"
     "./pipeline_v2_state.ts",
   ]);
   expect(countOf("import ")).toBe(7);
-});
+}, 15000);

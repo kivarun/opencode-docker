@@ -538,26 +538,68 @@ async function readDurableState(runRoot: string): Promise<ReturnType<typeof pars
   return parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
 }
 
-/** Polls the durable state until the predicate holds (bounded, no sleeps). */
-async function waitForState(
+/**
+ * The default wall-clock deadline of the durable-state poller: strictly
+ * below the default 5000ms per-test timeout, so an unmet durable boundary
+ * is reported by the poller's own content-free diagnostic and never by
+ * the runner's generic timeout.
+ */
+const WAIT_FOR_STATE_DEFAULT_DEADLINE_MS = 4200;
+
+/**
+ * Polls `read` until `predicate` holds. Bounded by a monotonic
+ * wall-clock deadline — never by an iteration count — and every
+ * unsuccessful poll yields to the scheduler before the next attempt, so
+ * the loop cannot starve the child process it is waiting for. The fast
+ * path returns on the first satisfying poll without any artificial
+ * delay; the deadline diagnostic carries only the last observed scalar
+ * shape, never file contents.
+ */
+async function waitForState<T>(
+  read: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  options?: { readonly deadlineMs?: number },
+): Promise<T> {
+  const deadlineMs = options?.deadlineMs ?? WAIT_FOR_STATE_DEFAULT_DEADLINE_MS;
+  const deadline = performance.now() + deadlineMs;
+  let lastObservation = "the observed document does not exist yet";
+  for (;;) {
+    try {
+      const value = await read();
+      if (predicate(value)) {
+        return value;
+      }
+      lastObservation = describeObserved(value);
+    } catch {
+      lastObservation = "the observed document does not exist yet";
+    }
+    if (performance.now() >= deadline) {
+      throw new Error(
+        `the awaited condition was not met within ${String(deadlineMs)}ms (last observation: ${lastObservation})`,
+      );
+    }
+    await Bun.sleep(2);
+  }
+}
+
+/** Content-free description of the last observed value for the deadline diagnostic. */
+function describeObserved(value: unknown): string {
+  if (typeof value !== "object" || value === null) {
+    return "an unexpected value shape";
+  }
+  const record = value as { readonly revision?: unknown; readonly status?: unknown; readonly phase?: unknown };
+  return `revision ${typeof record.revision === "number" ? String(record.revision) : "unknown"}, status ${
+    typeof record.status === "string" ? record.status : "unknown"
+  }, phase ${typeof record.phase === "string" ? record.phase : "unknown"}`;
+}
+
+/** Polls the durable run state until the predicate holds. */
+async function waitForDurableState(
   runRoot: string,
   predicate: (state: ReturnType<typeof parsePipelineV2RunState>) => boolean,
+  options?: { readonly deadlineMs?: number },
 ): Promise<ReturnType<typeof parsePipelineV2RunState>> {
-  for (let attempt = 0; attempt < 5000; attempt += 1) {
-    try {
-      const state = await readDurableState(runRoot);
-      if (predicate(state)) {
-        return state;
-      }
-    } catch {
-      // the state document does not exist yet
-    }
-    await Promise.resolve();
-    if (attempt % 200 === 199) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-  }
-  throw new Error("the durable state never reached the expected shape");
+  return await waitForState(() => readDurableState(runRoot), predicate, options);
 }
 
 function expectReport(outcome: PipelineV2InspectOutcome): Extract<PipelineV2InspectOutcome, { ok: true }> {
@@ -951,16 +993,20 @@ test("lost result L1: after the durable create_run, before any worker execution"
   const call = makeRunCall(harness, { runId, script: { hangOnCreate: true } });
   const abandoned = runPipelineV2(call.options, call.deps);
   const runRoot = join(harness.stateRoot, "pipeline-runs", runId);
-  const state = await waitForState(runRoot, (current) => {
-    if (current.executions.length !== 1) {
-      return false;
-    }
-    try {
-      return agentOf(current, 1).phase === "data_prepared";
-    } catch {
-      return false;
-    }
-  });
+  const state = await waitForDurableState(
+    runRoot,
+    (current) => {
+      if (current.executions.length !== 1) {
+        return false;
+      }
+      try {
+        return agentOf(current, 1).phase === "data_prepared";
+      } catch {
+        return false;
+      }
+    },
+    { deadlineMs: 12000 },
+  );
   expect(agentOf(state, 1).phase).toBe("data_prepared");
   void abandoned;
   const before = await fingerprint(runRoot);
@@ -978,7 +1024,10 @@ test("lost result L1: after the durable create_run, before any worker execution"
   expectCollision(collision, harness, runId);
   expect(retry.calls).toEqual([]);
   expect(await fingerprint(runRoot)).toBe(before);
-});
+  // measured: the hanging child reaches its durable phase in <=2s sequentially and
+  // up to ~4s under bun test --parallel=2 (2026-10-13); the poller deadline (12s)
+  // stays below this local timeout, so the poller diagnostic reports first.
+}, 15000);
 
 test("lost result L2: in-flight worker execution is never re-run by a second run", async () => {
   const harness = await setupHarness(PIPELINE_HAPPY, ["coder"]);
@@ -986,13 +1035,17 @@ test("lost result L2: in-flight worker execution is never re-run by a second run
   const call = makeRunCall(harness, { runId, script: { hangOnRun: true } });
   const abandoned = runPipelineV2(call.options, call.deps);
   const runRoot = join(harness.stateRoot, "pipeline-runs", runId);
-  const state = await waitForState(runRoot, (current) => {
-    try {
-      return agentOf(current, 1).phase === "running";
-    } catch {
-      return false;
-    }
-  });
+  const state = await waitForDurableState(
+    runRoot,
+    (current) => {
+      try {
+        return agentOf(current, 1).phase === "running";
+      } catch {
+        return false;
+      }
+    },
+    { deadlineMs: 12000 },
+  );
   expect(agentOf(state, 1).phase).toBe("running");
   void abandoned;
   const before = await fingerprint(runRoot);
@@ -1009,7 +1062,9 @@ test("lost result L2: in-flight worker execution is never re-run by a second run
   expectCollision(collision, harness, runId);
   expect(retry.calls).toEqual([]);
   expect(await fingerprint(runRoot)).toBe(before);
-});
+// measured: the hanging child reaches phase "running" up to ~4s under
+// bun test --parallel=2 (2026-10-13); the poller deadline (12s) stays below this local timeout.
+}, 15000);
 
 test("lost result L3: plan-ready boundary continues through the existing resume-plan", async () => {
   const harness = await setupHarness(PIPELINE_STAGE, ["architect", "coder"]);
@@ -1130,4 +1185,75 @@ test("source restrictions: one generator site, one exclusive claim, no discovery
   // the runner classifies only through the mapper
   expect(runner.split("publicReasonFor(").length - 1).toBeGreaterThan(0);
   expect(runner).not.toContain('.message.includes');
+});
+
+test("waitForState battery: the poller is wall-clock bounded and every negative poll yields", async () => {
+  let reads = 0;
+  const started = performance.now();
+  let deadlineError: Error | null = null;
+  try {
+    await waitForState(
+      async () => {
+        reads += 1;
+        return { marker: false };
+      },
+      (value) => value.marker,
+      { deadlineMs: 120 },
+    );
+  } catch (cause) {
+    deadlineError = cause as Error;
+  }
+  const elapsed = performance.now() - started;
+  expect(deadlineError !== null).toBe(true);
+  expect(deadlineError?.message).toContain("within 120ms");
+  expect(deadlineError?.message).not.toContain("marker");
+  expect(elapsed).toBeGreaterThanOrEqual(110);
+  expect(reads).toBeLessThanOrEqual(90);
+  expect(reads).toBeGreaterThan(10);
+});
+
+test("waitForState battery: the fast path returns on the first satisfying poll without delay", async () => {
+  let reads = 0;
+  const started = performance.now();
+  const value = await waitForState(
+    async () => {
+      reads += 1;
+      return { marker: true };
+    },
+    (candidate) => candidate.marker,
+    { deadlineMs: 5000 },
+  );
+  expect(value.marker).toBe(true);
+  expect(reads).toBe(1);
+  expect(performance.now() - started).toBeLessThan(50);
+});
+
+test("waitForState battery: a satisfying observation immediately before the deadline is accepted", async () => {
+  const barrier = Bun.sleep(80).then(() => "ready");
+  const value = await waitForState(
+    async () => {
+      return { phase: (await barrier) === "ready" ? "settled" : "pending" };
+    },
+    (candidate) => candidate.phase === "settled",
+    { deadlineMs: 4000 },
+  );
+  expect(value.phase).toBe("settled");
+});
+
+test("waitForState battery: a read failure is reported content-free by the deadline diagnostic", async () => {
+  let deadlineError: Error | null = null;
+  try {
+    await waitForState(
+      async () => {
+        throw new Error("synthetic read failure");
+      },
+      () => true,
+      { deadlineMs: 80 },
+    );
+  } catch (cause) {
+    deadlineError = cause as Error;
+  }
+  expect(deadlineError?.message).toContain("within 80ms");
+  expect(deadlineError?.message).toContain("does not exist yet");
+  expect(deadlineError?.message).not.toContain("synthetic read failure");
 });

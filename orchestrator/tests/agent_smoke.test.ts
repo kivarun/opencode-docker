@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { link, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -826,7 +835,7 @@ test("1. default one-state pipeline: one session, v2 result identity, durable v2
     expect(doc).not.toContain(OPENCODE_CONFIG);
     expect(doc).not.toContain(INPUT_MARKER);
   });
-});
+}, 15000);
 
 test("2. two sequential agent-states: two different sessions in create/run/delete order", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -914,7 +923,7 @@ test("2. two sequential agent-states: two different sessions in create/run/delet
       "run_succeeded",
     ]);
   });
-});
+}, 15000);
 
 test("3. the first transition commits only after the first session is deleted", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -949,12 +958,12 @@ test("3. the first transition commits only after the first session is deleted", 
     );
     expect(events.length).toBeGreaterThan(0);
   });
-});
+}, 15000);
 
 test("4. different profiles, images, and timeouts per state (covered with test 2)", async () => {
   // asserted inline in test 2: image + timeoutSeconds per run call
   expect(true).toBe(true);
-});
+}, 15000);
 
 test("5. the second state reads an unprotected input created by the first", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -976,7 +985,7 @@ test("5. the second state reads an unprotected input created by the first", asyn
     expect(JSON.stringify(state.events)).not.toContain("NOTES");
     expect(await readFile(join(dirs.workspace, NOTES_PATH), "utf8")).toBe(NOTES_BODY);
   });
-});
+}, 15000);
 
 test("6. a missing runtime input fails before the consuming session is created", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1009,7 +1018,7 @@ test("6. a missing runtime input fails before the consuming session is created",
     // no session existed, so the cleanup step trivially completed
     expect(state.activations[1].session_cleanup).toBe("completed");
   });
-});
+}, 15000);
 
 test("7. worker failure of the second state: first transition kept, no second transition", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1056,7 +1065,7 @@ test("7. worker failure of the second state: first transition kept, no second tr
       "run_failed",
     ]);
   });
-});
+}, 15000);
 
 test("8. the previous activation's result copied into the next: identity mismatch", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1092,7 +1101,7 @@ test("8. the previous activation's result copied into the next: identity mismatc
     expect(state.transitions).toHaveLength(1);
     expect(state.activations[1].phase).toBe("failed");
   });
-});
+}, 15000);
 
 test("9. a revisit uses a new activation path and a new session; the loop stops at max_transitions", async () => {
   await withFixture(async (dirs) => {
@@ -1132,7 +1141,7 @@ test("9. a revisit uses a new activation path and a new session; the loop stops 
     expect(state.transitions.map((t: any) => t.to)).toEqual(["execute", "execute"]);
     expect(state.terminal).toBeUndefined();
   });
-});
+}, 15000);
 
 test("10. an entry terminal runs zero sessions", async () => {
   await withFixture(async (dirs) => {
@@ -1155,7 +1164,7 @@ test("10. an entry terminal runs zero sessions", async () => {
     expect(state.terminal).toEqual({ state_id: "done", result: "success" });
     expect(state.events.map((e: any) => e.kind)).toEqual(["run_created", "terminal_reached", "run_succeeded"]);
   });
-});
+}, 15000);
 
 test("11. a failed terminal is a normal graph result: durable terminal, exit 1", async () => {
   await withFixture(async (dirs) => {
@@ -1187,7 +1196,7 @@ test("11. a failed terminal is a normal graph result: durable terminal, exit 1",
       "run_failed",
     ]);
   });
-});
+}, 15000);
 
 test("12. signal between states: the next session is never created", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1243,7 +1252,7 @@ test("12. signal between states: the next session is never created", async () =>
       "run_failed",
     ]);
   });
-});
+}, 15000);
 
 test("13. signal during session create: the create completes, the session is deleted once, the worker never runs", async () => {
   await withFixture(async (dirs) => {
@@ -1293,7 +1302,7 @@ test("13. signal during session create: the create completes, the session is del
       "run_failed",
     ]);
   });
-});
+}, 15000);
 
 test("14. the timeout of the second state does not affect the first", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1322,7 +1331,7 @@ test("14. the timeout of the second state does not affect the first", async () =
     expect(state.activations[1]).toMatchObject({ phase: "failed", failure_reason: "worker_timeout" });
     expect(state.terminal).toBeUndefined();
   });
-});
+}, 15000);
 
 test("15. a session cleanup failure forbids the transition", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1352,7 +1361,7 @@ test("15. a session cleanup failure forbids the transition", async () => {
     expect(state.activations).toHaveLength(1);
     expect(state.terminal).toBeUndefined();
   });
-});
+}, 15000);
 
 test("16. not_committed during the second activation: previous revision stays authoritative, run fails", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1393,7 +1402,7 @@ test("16. not_committed during the second activation: previous revision stays au
     });
     expect(state.terminal).toBeUndefined();
   });
-});
+}, 15000);
 
 test("17. durability_unknown during the second activation: candidate visible, poisoned, no further writes", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -1422,7 +1431,7 @@ test("17. durability_unknown during the second activation: candidate visible, po
     expect(state.transitions).toHaveLength(1);
     expect(state.terminal).toBeUndefined();
   });
-});
+}, 15000);
 
 test("18. several protected inputs; an artifact aliasing a protected input is rejected", async () => {
   await withFixture(async (dirs) => {
@@ -1455,7 +1464,7 @@ test("18. several protected inputs; an artifact aliasing a protected input is re
     expect(state.status).toBe("failed");
     expect(state.failure).toEqual({ reason: "agent_result_invalid" });
   });
-});
+}, 15000);
 
 test("18b. a symlinked artifact aliasing a protected input is rejected", async () => {
   await withFixture(async (dirs) => {
@@ -1481,7 +1490,7 @@ test("18b. a symlinked artifact aliasing a protected input is rejected", async (
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("protected input");
   });
-});
+}, 15000);
 
 test("18c. a hardlinked artifact aliasing a protected input is rejected", async () => {
   await withFixture(async (dirs) => {
@@ -1507,7 +1516,7 @@ test("18c. a hardlinked artifact aliasing a protected input is rejected", async 
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("protected input");
   });
-});
+}, 15000);
 
 test("19. agent nonzero exit: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1519,7 +1528,7 @@ test("19. agent nonzero exit: run fails, session deleted", async () => {
     expect(outcome.detail).toContain("agent container failed (exit 3)");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("20. missing result.json: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1530,7 +1539,7 @@ test("20. missing result.json: run fails, session deleted", async () => {
     expect(outcome.detail).toContain("agent result not readable");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("21. invalid JSON result: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1541,7 +1550,7 @@ test("21. invalid JSON result: run fails, session deleted", async () => {
     expect(outcome.detail).toContain("not valid JSON");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("22. unknown field in the result: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1566,7 +1575,7 @@ test("22. unknown field in the result: run fails, session deleted", async () => 
     expect(outcome.detail).toContain('unknown field "extra"');
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("23. result attempt 2 is rejected", async () => {
   await withFixture(async (dirs) => {
@@ -1590,7 +1599,7 @@ test("23. result attempt 2 is rejected", async () => {
     expect(outcome.detail).toContain("attempt");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("24. listed artifact missing on disk: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1615,7 +1624,7 @@ test("24. listed artifact missing on disk: run fails, session deleted", async ()
     expect(outcome.detail).toContain("is not readable");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("25. artifact escaping the workspace: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1639,7 +1648,7 @@ test("25. artifact escaping the workspace: run fails, session deleted", async ()
     expect(outcome.detail).toContain("not a clean workspace-relative");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("26. artifact referencing the protected input: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1664,7 +1673,7 @@ test("26. artifact referencing the protected input: run fails, session deleted",
     expect(outcome.detail).toContain("protected input");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("27. agent modified the protected input: run fails, session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -1675,7 +1684,7 @@ test("27. agent modified the protected input: run fails, session deleted", async
     expect(outcome.detail).toContain("was modified after the agent run");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("28. pull failure is non-fatal when the image may be local", async () => {
   await withFixture(async (dirs) => {
@@ -1687,7 +1696,7 @@ test("28. pull failure is non-fatal when the image may be local", async () => {
     expect(runCalls(calls).length).toBe(1);
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("29. exact env projection; control and ambient material never reaches worker env; prompt/input bodies never in argv", async () => {
   await withFixture(async (dirs) => {
@@ -1730,7 +1739,7 @@ test("29. exact env projection; control and ambient material never reaches worke
     const inputContent = await readFile(join(dirs.workspace, "TASK.md"), "utf8");
     expect(inputContent).toContain(INPUT_MARKER);
   });
-});
+}, 15000);
 
 test("30. no launcher/admin/state/canary markers in run args or env; only the workspace is mounted", async () => {
   await withFixture(async (dirs) => {
@@ -1762,7 +1771,7 @@ test("30. no launcher/admin/state/canary markers in run args or env; only the wo
       ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"].filter((k) => del.env[k] !== undefined).sort(),
     );
   });
-});
+}, 15000);
 
 test("31. cleanup failure: overall result can never be success", async () => {
   await withFixture(async (dirs) => {
@@ -1774,7 +1783,7 @@ test("31. cleanup failure: overall result can never be success", async () => {
     expect(outcome.status).toBe("cleanup_failed");
     expect(deleteCallCount(calls)).toBe(1);
   });
-});
+}, 15000);
 
 test("32. missing workspace input fails before any session is created", async () => {
   await withFixture(async (dirs) => {
@@ -1787,7 +1796,7 @@ test("32. missing workspace input fails before any session is created", async ()
     expect(createCallCount(calls)).toBe(0);
     expect(deleteCallCount(calls)).toBe(0);
   });
-});
+}, 15000);
 
 test("33. workspace input escaping through a symlink is rejected", async () => {
   await withFixture(async (dirs) => {
@@ -1801,7 +1810,7 @@ test("33. workspace input escaping through a symlink is rejected", async () => {
     expect(outcome.detail).toContain("resolves outside workspace");
     expect(createCallCount(calls)).toBe(0);
   });
-});
+}, 15000);
 
 test("34. workspace input that is a directory is rejected", async () => {
   await withFixture(async (dirs) => {
@@ -1814,7 +1823,7 @@ test("34. workspace input that is a directory is rejected", async () => {
     expect(outcome.detail).toContain("not a regular file");
     expect(createCallCount(calls)).toBe(0);
   });
-});
+}, 15000);
 
 test("35. unknown profile referenced by the pipeline state: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
@@ -1833,7 +1842,7 @@ test("35. unknown profile referenced by the pipeline state: fails before any ses
     expect(authCalls.length).toBe(0);
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
   });
-});
+}, 15000);
 
 test("36. missing required source env: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
@@ -1853,7 +1862,7 @@ test("36. missing required source env: fails before any session is created", asy
     expect(authCalls.length).toBe(0);
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
   });
-});
+}, 15000);
 
 test("37. malformed profile: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
@@ -1867,7 +1876,7 @@ test("37. malformed profile: fails before any session is created", async () => {
     expect(createCallCount(calls)).toBe(0);
     expect(authCalls.length).toBe(0);
   });
-});
+}, 15000);
 
 test("38. profile with control destination: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
@@ -1893,7 +1902,7 @@ test("38. profile with control destination: fails before any session is created"
     expect(createCallCount(calls)).toBe(0);
     expect(authCalls.length).toBe(0);
   });
-});
+}, 15000);
 
 test("39. profile symlink escape: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
@@ -1910,7 +1919,7 @@ test("39. profile symlink escape: fails before any session is created", async ()
     expect(createCallCount(calls)).toBe(0);
     expect(authCalls.length).toBe(0);
   });
-});
+}, 15000);
 
 test("40. pipeline root that does not exist: fails before any session is created", async () => {
   await withFixture(async (dirs) => {
@@ -1929,7 +1938,7 @@ test("40. pipeline root that does not exist: fails before any session is created
     expect(authCalls.length).toBe(0);
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
   });
-});
+}, 15000);
 
 test("41. unsupported multi-state forms are rejected before auth and before any session", async () => {
   await withFixture(async (dirs) => {
@@ -1948,7 +1957,7 @@ test("41. unsupported multi-state forms are rejected before auth and before any 
     expect(createCallCount(calls)).toBe(0);
     expect(authCalls.length).toBe(0);
   });
-});
+}, 15000);
 
 test("42. unsupported retries (max_attempts != 1) are rejected before any session", async () => {
   await withFixture(async (dirs) => {
@@ -1965,7 +1974,7 @@ test("42. unsupported retries (max_attempts != 1) are rejected before any sessio
     expect(createCallCount(calls)).toBe(0);
     expect(authCalls.length).toBe(0);
   });
-});
+}, 15000);
 
 test("43. a custom result schema on a state is rejected before any session", async () => {
   await withFixture(async (dirs) => {
@@ -1986,7 +1995,7 @@ test("43. a custom result schema on a state is rejected before any session", asy
     expect(createCallCount(calls)).toBe(0);
     expect(authCalls.length).toBe(0);
   });
-});
+}, 15000);
 
 test("44. signal during the agent run: signal forwarded -> CLI exited -> session deleted", async () => {
   await withFixture(async (dirs) => {
@@ -2044,7 +2053,7 @@ test("44. signal during the agent run: signal forwarded -> CLI exited -> session
     });
     expect(state.transitions).toEqual([]);
   });
-});
+}, 15000);
 
 test("45. signal during pull: pull completes, run never starts, single cleanup", async () => {
   await withFixture(async (dirs) => {
@@ -2086,7 +2095,7 @@ test("45. signal during pull: pull completes, run never starts, single cleanup",
       session_cleanup: "completed",
     });
   });
-});
+}, 15000);
 
 test("46. cutoff: signal after the final write completed does not change the result", async () => {
   await withFixture(async (dirs) => {
@@ -2124,7 +2133,7 @@ test("46. cutoff: signal after the final write completed does not change the res
     expect(state.failure).toBeUndefined();
     expect(state.events[state.events.length - 1].kind).toBe("run_succeeded");
   });
-});
+}, 15000);
 
 test("47. signal while the blocked terminal write is in flight is late: persisted success, exit 0", async () => {
   await withFixture(async (dirs) => {
@@ -2171,7 +2180,7 @@ test("47. signal while the blocked terminal write is in flight is late: persiste
       "run_succeeded",
     ]);
   });
-});
+}, 15000);
 
 test("48. signal during cleanup, directly before the cutoff: persisted failed, exit 130", async () => {
   await withFixture(async (dirs) => {
@@ -2218,7 +2227,7 @@ test("48. signal during cleanup, directly before the cutoff: persisted failed, e
       "run_failed",
     ]);
   });
-});
+}, 15000);
 
 test("49. transition commit failure: run fails, no transition recorded, failure is durable", async () => {
   await withFixture(async (dirs) => {
@@ -2259,7 +2268,7 @@ test("49. transition commit failure: run fails, no transition recorded, failure 
       "run_failed",
     ]);
   });
-});
+}, 15000);
 
 test("50. final commit failure: the complete active snapshot stays on disk, run is not ok", async () => {
   await withFixture(async (dirs) => {
@@ -2294,7 +2303,7 @@ test("50. final commit failure: the complete active snapshot stays on disk, run 
       "terminal_reached",
     ]);
   });
-});
+}, 15000);
 
 test("51. transition durability failure: exit 1, one cleanup, candidate stays on disk, no further callback", async () => {
   await withFixture(async (dirs) => {
@@ -2317,7 +2326,7 @@ test("51. transition durability failure: exit 1, one cleanup, candidate stays on
     expect(state.transitions).toHaveLength(1);
     expect(state.terminal).toBeUndefined();
   });
-});
+}, 15000);
 
 test("52. terminal durability failure: exit 1, not reported as a confirmed success", async () => {
   await withFixture(async (dirs) => {
@@ -2339,7 +2348,7 @@ test("52. terminal durability failure: exit 1, not reported as a confirmed succe
     expect(state.phase).toBe("finished");
     expect(state.events[state.events.length - 1].kind).toBe("run_succeeded");
   });
-});
+}, 15000);
 
 test("53. timeout only on the worker run; timeout expiry fails the run with a single cleanup", async () => {
   await withFixture(async (dirs) => {
@@ -2367,7 +2376,7 @@ test("53. timeout only on the worker run; timeout expiry fails the run with a si
     const del = calls.find((c) => c.args[0] === "session" && c.args[1] === "delete")!;
     expect(del.timeoutSeconds).toBeUndefined();
   });
-});
+}, 15000);
 
 test("54. worker argv, mounts, env and execution documents never contain the state root", async () => {
   await withFixture(async (dirs) => {
@@ -2386,7 +2395,7 @@ test("54. worker argv, mounts, env and execution documents never contain the sta
     const doc = await readFile(activationExecutionDocPath(dirs.workspace, outcome.runId, 1, "execute"), "utf8");
     expect(doc).not.toContain(dirs.state);
   });
-});
+}, 15000);
 
 test("55. two runs against the same bundle record the same execution snapshot digest", async () => {
   await withFixture(async (dirs) => {
@@ -2408,7 +2417,7 @@ test("55. two runs against the same bundle record the same execution snapshot di
     expect(secondState.pipeline.bundle_root).toBe(dirs.pipelineRoot);
     expect(firstState.protected_inputs[0].sha256).toBe(secondState.protected_inputs[0].sha256);
   });
-});
+}, 15000);
 
 test("56. pre-existing v1 state files are left untouched by new runs", async () => {
   await withFixture(async (dirs) => {
@@ -2448,7 +2457,7 @@ test("56. pre-existing v1 state files are left untouched by new runs", async () 
     expect(state.schema_version).toBe(2);
     expect(state.run_id).toBe(outcome.runId);
   });
-});
+}, 15000);
 
 test("57. the default one-state pipeline executes through the graph engine", async () => {
   await withFixture(async (dirs) => {
@@ -2475,7 +2484,7 @@ test("57. the default one-state pipeline executes through the graph engine", asy
       restoreError.mockRestore();
     }
   });
-});
+}, 15000);
 
 test("58. a foreign result status does not advance the graph", async () => {
   await withFixture(async (dirs) => {
@@ -2516,7 +2525,7 @@ test("58. a foreign result status does not advance the graph", async () => {
       restoreError.mockRestore();
     }
   });
-});
+}, 15000);
 
 test("59. arbitrary valid state ids through the engine", async () => {
   await withFixture(async (dirs) => {
@@ -2572,7 +2581,7 @@ test("59. arbitrary valid state ids through the engine", async () => {
       restoreError.mockRestore();
     }
   });
-});
+}, 15000);
 
 test("60. input path comes from the pipeline", async () => {
   await withFixture(async (dirs) => {
@@ -2594,7 +2603,7 @@ test("60. input path comes from the pipeline", async () => {
     const state = await readState(dirs, outcome.runId);
     expect(state.protected_inputs[0].path).toBe("docs/input.md");
   });
-});
+}, 15000);
 
 test("extra: agent worker spec argv, entrypoint and env", () => {
   const spec = agentWorkerSpec({
@@ -2656,7 +2665,7 @@ test("extra: agent worker spec argv, entrypoint and env", () => {
   const separatorIndex = args.indexOf("--");
   expect(args.slice(separatorIndex + 1)).toEqual(spec.command);
   expect(pullArgs("base:latest", SOCKET)).toEqual(["pull", "--endpoint", SOCKET, "base:latest"]);
-});
+}, 15000);
 
 test("extra: instruction contains only the execution document path", () => {
   const instruction = agentInstruction(".pipeline-agent-smoke/run/activations/1-execute/attempt-1/execution.md");
@@ -2664,7 +2673,7 @@ test("extra: instruction contains only the execution document path", () => {
   expect(instruction).not.toContain(INPUT_MARKER);
   expect(instruction).not.toContain(INPUT_BODY.trim());
   expect(instruction).not.toContain(PROMPT_MARKER);
-});
+}, 15000);
 
 test("extra: result contract v2 identity", () => {
   const identity = { runId: "r", stateId: "execute", activationIndex: 2, attempt: 1 };
@@ -2707,7 +2716,7 @@ test("extra: result contract v2 identity", () => {
   for (const [body, pattern] of invalid) {
     expect(() => parseAgentResult(body, identity)).toThrow(pattern);
   }
-});
+}, 15000);
 
 test("extra: artifacts must not alias a protected input (direct, symlink, hardlink)", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-input-artifact-"));
@@ -2773,7 +2782,7 @@ test("extra: artifacts must not alias a protected input (direct, symlink, hardli
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("extra: artifact containment and existence checks", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-result-test-"));
@@ -2816,7 +2825,7 @@ test("extra: artifact containment and existence checks", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("extra: artifact symlink escaping the workspace is rejected", async () => {
   const root = await mkdtemp(join(tmpdir(), "agent-result-symlink-"));
@@ -2845,7 +2854,7 @@ test("extra: artifact symlink escaping the workspace is rejected", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("extra: activation directories are separate per revisit", () => {
   expect(activationDirPath("/w", "run-1", 1, "execute")).toBe(
@@ -2858,7 +2867,7 @@ test("extra: activation directories are separate per revisit", () => {
     "/w/.pipeline-agent-smoke/run-1/activations/2-review/attempt-1",
   );
   expect(agentRunDirPath("/w", "run-1")).toBe("/w/.pipeline-agent-smoke/run-1");
-});
+}, 15000);
 
 /**
  * Replaces a file with a new inode carrying identical bytes,
@@ -2936,7 +2945,7 @@ test("60a. a symlink planted at the future activation leaf is rejected before th
     expect(state.activations[1].phase).toBe("failed");
     expect(state.activations[1].failure_reason).toBe("control_path_invalid");
   });
-});
+}, 15000);
 
 test("60b. a planted execution.md symlink is rejected before the second session", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -2963,7 +2972,7 @@ test("60b. a planted execution.md symlink is rejected before the second session"
     expect(state.transitions).toHaveLength(1);
     expect(state.activations[1].failure_reason).toBe("control_path_invalid");
   });
-});
+}, 15000);
 
 test("60c. a planted result.json symlink is rejected before the second session", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -2989,7 +2998,7 @@ test("60c. a planted result.json symlink is rejected before the second session",
     expect(state.failure.reason).toBe("control_path_invalid");
     expect(state.transitions).toHaveLength(1);
   });
-});
+}, 15000);
 
 test("60d. a pre-created regular future activation leaf with prepared content is rejected", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -3016,7 +3025,7 @@ test("60d. a pre-created regular future activation leaf with prepared content is
     expect(state.failure.reason).toBe("control_path_invalid");
     expect(state.transitions).toHaveLength(1);
   });
-});
+}, 15000);
 
 test("60e. the first activation retargets a declared symlink protected input: the second session is never created", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -3052,7 +3061,7 @@ test("60e. the first activation retargets a declared symlink protected input: th
     // the durable path is the declared pipeline path
     expect(state.protected_inputs[0].path).toBe("TASK.md");
   });
-});
+}, 15000);
 
 test("60f. a protected regular file replaced with a new inode of identical bytes is detected", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -3077,7 +3086,7 @@ test("60f. a protected regular file replaced with a new inode of identical bytes
     expect(state.failure.reason).toBe("protected_input_modified");
     expect(state.transitions).toHaveLength(1);
   });
-});
+}, 15000);
 
 test("60g. a replaced protected input plus a declared hardlink artifact does not bypass alias protection", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -3129,7 +3138,7 @@ test("60g. a replaced protected input plus a declared hardlink artifact does not
     expect(state.activations[1].artifacts).toBeUndefined();
     expect(state.activations[1].session_id).toBe("dhs_child_2");
   });
-});
+}, 15000);
 
 test("60h. an unchanged internal symlink protected input passes the full identity check", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -3151,7 +3160,7 @@ test("60h. an unchanged internal symlink protected input passes the full identit
       new Bun.CryptoHasher("sha256").update("TARGET A\n").digest("hex"),
     );
   });
-});
+}, 15000);
 
 test("60i. a plain protected input content change is still detected after the run", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -3168,7 +3177,7 @@ test("60i. a plain protected input content change is still detected after the ru
     const state = await readState(dirs, outcome.runId);
     expect(state.failure.reason).toBe("protected_input_modified");
   });
-});
+}, 15000);
 
 test("61. a signal recorded during the blocked second start_activation closes the window before the second session", async () => {
   await withTwoStateFixture(async (dirs) => {
@@ -3217,4 +3226,4 @@ test("61. a signal recorded during the blocked second start_activation closes th
       "run_failed",
     ]);
   });
-});
+}, 15000);

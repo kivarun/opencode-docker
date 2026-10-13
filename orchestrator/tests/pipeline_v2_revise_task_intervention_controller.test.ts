@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { lstat, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -661,7 +670,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. the unified result carries exactly the content-free fields and is deep-frozen", async () => {
     const ctx = await reviseReady({ window: "r0" });
@@ -700,7 +709,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. R1 window: the durable intent skips the intent command; the exact +3 suffix", async () => {
     const ctx = await reviseReady({ window: "r1" });
@@ -727,7 +736,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. R2 window: the durable candidate skips both acceptance commands; the exact +2 suffix", async () => {
     const ctx = await reviseReady({ window: "r2" });
@@ -750,7 +759,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. R3 window: the durable replanned closure skips the acceptance entirely; the response only (+1)", async () => {
     const ctx = await reviseReady({ window: "r3" });
@@ -776,7 +785,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. R4 window: the answered boundary is the exact completed retry; zero dispatch, +0", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -802,7 +811,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("7. the task-b selection revises only task-b; the task-a neighbor record is untouched", async () => {
     const ctx = await reviseReady({ window: "r0", taskId: "task-b", taskBody: "Body B revised" });
@@ -853,7 +862,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("8. C4 after the ordinary reopen: zero dispatch, the state file byte/inode/mtime identical, the tree unchanged", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -883,7 +892,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- wrong-body retries ----------------------------------------------------
 
@@ -911,7 +920,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("10. a wrong body at R2 is the acceptance's intent conflict by identity; zero dispatch", async () => {
     const ctx = await reviseReady({ window: "r2" });
@@ -935,7 +944,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("11. a wrong body at R3 refuses before any facade call; zero writes", async () => {
     const ctx = await reviseReady({ window: "r3" });
@@ -964,7 +973,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("12. a wrong body at R4 refuses before any facade call; zero writes", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -992,7 +1001,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- hostile near-miss progressions ----------------------------------------
 
@@ -1020,7 +1029,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("14. a mutated closure anchor is refused by the state validation before any effect", async () => {
     const ctx = await reviseReady({ window: "r3" });
@@ -1057,7 +1066,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("15. an answered wait with another action is never the revise_task boundary", async () => {
     const ctx = await reviseReady({ window: "r3" });
@@ -1090,7 +1099,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("16. a shifted cursor at the answered boundary is refused by the state validation", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -1124,7 +1133,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- post-boundary states are never retries (test area 8) -------------------
 
@@ -1153,7 +1162,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("18. a state after a new committed transition is never recognized as the retry", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -1185,7 +1194,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("19. a state after a new wait is never recognized as the retry", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -1223,7 +1232,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("20. a state after a new accepted plan revision is never recognized as the retry", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -1268,7 +1277,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("21. a state after a new generation with an open iteration is never recognized as the retry", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -1302,7 +1311,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("22. an open successor iteration after the revise response is refused", async () => {
     const ctx = await reviseReady({ window: "r4" });
@@ -1330,7 +1339,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- derivation refusals (test area 9) --------------------------------------
 
@@ -1356,7 +1365,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("24. a stale plan artifact is the restoration's typed refusal; zero effects", async () => {
     const ctx = await reviseReady();
@@ -1404,7 +1413,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- hostile successful results (test area 10) -------------------------------
 
@@ -1453,7 +1462,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("26. a forged or foreign compiled plan is the controller's invalid_result", async () => {
     const ctx = await reviseReady();
@@ -1516,7 +1525,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("27. a hostile acceptance result is the controller's invalid_result; the completion never runs", async () => {
     const ctx = await reviseReady();
@@ -1554,7 +1563,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("28. a healed acceptance state (wrong appended record) is refused", async () => {
     const ctx = await reviseReady();
@@ -1600,7 +1609,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("29. a hostile completion result is the controller's invalid_result", async () => {
     // At R2 the real acceptance is a zero-dispatch idempotent recognition,
@@ -1656,7 +1665,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30. a malformed completion state is a typed invalid_result, never a TypeError", async () => {
     const ctx = await reviseReady({ window: "r2" });
@@ -1700,7 +1709,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("31. a hostile racing acceptance state is never a retry; the cause keeps its identity", async () => {
     const ctx = await reviseReady({ window: "r2" });
@@ -1726,7 +1735,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- provenance and capture (test area 11) -----------------------------------
 
@@ -1756,7 +1765,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("33. a Proxy pipeline causes no getter traps and no effect", async () => {
     const ctx = await reviseReady();
@@ -1778,7 +1787,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("34. options are read exactly once in the fixed contract order; hostile extras never read", async () => {
     const ctx = await reviseReady();
@@ -1809,7 +1818,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("35. ops members are read exactly once; a missing member refuses before any effect", async () => {
     const ctx = await reviseReady();
@@ -1850,7 +1859,9 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  // measured: 2.5s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("36. caller mutation after the pending start cannot influence the intervention", async () => {
     const ctx = await reviseReady();
@@ -1885,7 +1896,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- durability windows (test area 12) ---------------------------------------
 
@@ -1927,7 +1938,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("38. a not-committed candidate dispatch keeps the durable intent; the fresh retry runs the remaining suffix", async () => {
     const ctx = await reviseReady({ reopen: false });
@@ -1963,7 +1974,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("39. a not-committed closure dispatch keeps the durable acceptance; the fresh retry completes it", async () => {
     const ctx = await reviseReady({ reopen: false });
@@ -1999,7 +2010,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("40. a not-committed response dispatch keeps the durable closure; the fresh retry records the response", async () => {
     const ctx = await reviseReady({ reopen: false });
@@ -2035,7 +2046,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("41. a durability-unknown candidate dispatch adopts the candidate; the fresh retry finishes", async () => {
     const ctx = await reviseReady({ reopen: false });
@@ -2078,7 +2089,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("42. a durability-unknown response dispatch adopts the candidate; the fresh retry is zero-dispatch", async () => {
     const ctx = await reviseReady({ reopen: false });
@@ -2122,7 +2133,9 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  // measured: recorded par4 timeout under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("43. publication failures pass through by identity; zero dispatch", async () => {
     const ctx = await reviseReady();
@@ -2140,7 +2153,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- concurrency (test area 13) ----------------------------------------------
 
@@ -2170,7 +2183,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- export surfaces and source scan (test area 14) ---------------------------
 
@@ -2192,7 +2205,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     expect(productionReviseTaskInterventionOps.prepareIntent).toBe(prepareWaitIntent);
     expect(productionReviseTaskInterventionOps.acceptIntent).toBe(acceptPipelineV2ReviseTaskIntent);
     expect(productionReviseTaskInterventionOps.completeTask).toBe(completePipelineV2ReviseTask);
-  });
+  }, 15000);
 
   test("46. the controller composes the existing layers only (source scan)", async () => {
     const { readFileSync } = await import("node:fs");
@@ -2242,7 +2255,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
       expect(source).not.toContain(banned);
     }
     expect(countOf("let production")).toBe(0);
-  });
+  }, 15000);
 
   // --- invalid options (test area 15) -------------------------------------------
 
@@ -2277,7 +2290,7 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   // --- the racing reconciliation never recovers an acceptance window ----------
 
@@ -2358,7 +2371,9 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  // measured: 3.6s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("49. the genuine racing progression still recovers: exact R3 records the response only", async () => {
     const ctx = await reviseReady({ window: "r0", reopen: false });
@@ -2417,7 +2432,9 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  // measured: 3.3s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("50. the genuine racing progression still recovers: exact R4 is the zero-dispatch completed retry", async () => {
     const ctx = await reviseReady({ window: "r0", reopen: false });
@@ -2476,5 +2493,5 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 });

@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { chmodSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -704,7 +713,7 @@ test("1. happy path: agent -> decision -> success through the real sink, runtime
     .filter((spec): spec is string => spec !== null)
     .map((spec) => spec.split(":")[1]);
   expect(mounts).toEqual(["/workspace", "/pipeline/inputs", "/pipeline/outputs"]);
-});
+}, 15000);
 
 test("2. run-root layout, permissions and local/daemon identity in host mode", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -730,7 +739,7 @@ test("2. run-root layout, permissions and local/daemon identity in host mode", a
   const daemonRunRoot = await lstat(join(harness.daemonStateRoot, "pipeline-runs", runId));
   expect(daemonRunRoot.dev).toBe(localInfo.dev);
   expect(daemonRunRoot.ino).toBe((await lstat(runRoot)).ino);
-});
+}, 15000);
 
 test("3. two distinct profiles load before auth, in declaration order, and the run succeeds", async () => {
   const harness = await setup(PIPELINE_TWO_AGENTS, ["alpha", "beta"]);
@@ -747,7 +756,7 @@ test("3. two distinct profiles load before auth, in declaration order, and the r
   expect(state.executions[0]?.state_id).toBe("first");
   expect(state.executions[1]?.state_id).toBe("second");
   expect(state.terminal).toEqual({ state_id: "done", result: "success" });
-});
+}, 15000);
 
 test("4. a broken second profile fails before auth, run root and sessions", async () => {
   const harness = await setup(PIPELINE_TWO_AGENTS, ["alpha", "beta"]);
@@ -765,7 +774,7 @@ test("4. a broken second profile fails before auth, run root and sessions", asyn
   expect(createCount(captured.transport)).toBe(0);
   expect(captured.diagnostics.join("\n")).toContain("BETA_SOURCE_VAR_2");
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 test("5. with both profiles broken, the first declaration (alpha) fails first", async () => {
   const harness = await setup(PIPELINE_TWO_AGENTS, ["alpha", "beta"]);
@@ -779,7 +788,7 @@ test("5. with both profiles broken, the first declaration (alpha) fails first", 
   const message = captured.diagnostics.join("\n");
   expect(message).toContain("ALPHA_SOURCE_VAR_1");
   expect(message).not.toContain("BETA_SOURCE_VAR_2");
-});
+}, 15000);
 
 test("6. pipeline load failure creates no auth, run root or session", async () => {
   const harness = await setup("schema_version: 2\nentry_state: nope\n", []);
@@ -793,7 +802,7 @@ test("6. pipeline load failure creates no auth, run root or session", async () =
   expect(captured.authCalls).toBe(0);
   expect(createCount(captured.transport)).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 test("7. credential missing / wrong authority / launcher mismatch create no run root", async () => {
   // credential missing
@@ -832,7 +841,7 @@ test("7. credential missing / wrong authority / launcher mismatch create no run 
     expect(createCount(captured.transport)).toBe(0);
     expect((await lstatOrNull(join(mismatch.stateRoot, "pipeline-runs"))) === null).toBe(true);
   }
-});
+}, 15000);
 
 test("8. no secret value appears in the outcome, the durable state or the diagnostics", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -861,7 +870,7 @@ test("8. no secret value appears in the outcome, the durable state or the diagno
   expect(Object.isFrozen(captured.outcome)).toBe(true);
   expect(Object.isFrozen(captured.outcome?.state)).toBe(true);
   expect(Object.isFrozen(captured.outcome?.state?.executions)).toBe(true);
-});
+}, 15000);
 
 // --- run-root ownership -------------------------------------------------------
 
@@ -903,7 +912,7 @@ test("9. a pre-existing run directory, file or symlink with the run id is never 
     }
     expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
   }
-});
+}, 15000);
 
 test("10. symlinked or wrong-kind pipeline-runs and a projection mismatch are rejected", async () => {
   // symlinked pipeline-runs
@@ -937,7 +946,7 @@ test("10. symlinked or wrong-kind pipeline-runs and a projection mismatch are re
     expect(captured.outcome?.runRoot).toBeNull();
     expect(createCount(captured.transport)).toBe(0);
   }
-});
+}, 15000);
 
 test("11. a successful exclusive run-root creation survives later failures", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -957,7 +966,7 @@ test("11. a successful exclusive run-root creation survives later failures", asy
   expect(info.isDirectory()).toBe(true);
   expect(modeOf(info)).toBe(0o700);
   expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
-});
+}, 15000);
 
 test("12. durability-unknown at create_run: the adopted candidate is visible, no further dispatch", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -996,7 +1005,7 @@ test("12. durability-unknown at create_run: the adopted candidate is visible, no
   expect(JSON.parse(raw).run_id).toBe(runId);
   // Restore the mode so the teardown can remove the tree.
   chmodSync(runRoot, 0o700);
-});
+}, 15000);
 
 // --- signals -------------------------------------------------------------------
 
@@ -1017,7 +1026,7 @@ test("13. a signal accepted during auth leaves no run root and no state", async 
   expect(captured.outcome?.state).toBeNull();
   expect(createCount(captured.transport)).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 test("14. a signal accepted while the data plane parses bindings leaves no snapshot and no state", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1050,7 +1059,7 @@ test("14. a signal accepted while the data plane parses bindings leaves no snaps
   expect((await lstatOrNull(join(runRootPath(harness, runId), "project"))) !== null).toBe(true);
   expect((await lstatOrNull(join(runRootPath(harness, runId), "data"))) === null).toBe(true);
   expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
-});
+}, 15000);
 
 test("15. a signal accepted during start_agent_execution creates no Session", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1067,7 +1076,7 @@ test("15. a signal accepted during start_agent_execution creates no Session", as
   expect(agent?.phase).toBe("failed");
   expect(agent?.session_cleanup).toEqual({ execution: "not_required", tool: "not_required" });
   expect(state?.transitions.length).toBe(0);
-});
+}, 15000);
 
 test("16. a signal during the Execution Session create records and cleans it, no Tool, no worker", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1092,7 +1101,7 @@ test("16. a signal during the Execution Session create records and cleans it, no
   const agent = asAgent(state?.executions[0]);
   expect(agent?.session_cleanup).toEqual({ execution: "completed", tool: "not_required" });
   expect(state?.failure?.reason).toBe("signal_sigint");
-});
+}, 15000);
 
 test("17. a signal during the Tool Session create cleans both sessions, no worker", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1116,7 +1125,7 @@ test("17. a signal during the Tool Session create cleans both sessions, no worke
   const agent = asAgent(captured.outcome?.state?.executions[0]);
   expect(agent?.session_cleanup).toEqual({ execution: "completed", tool: "completed" });
   expect(captured.outcome?.state?.failure?.reason).toBe("signal_sigint");
-});
+}, 15000);
 
 test("18. a signal during the worker run wins over the worker failure; cleanup Tool then Execution", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1137,7 +1146,7 @@ test("18. a signal during the worker run wins over the worker failure; cleanup T
   expect(captured.outcome?.state?.failure?.reason).toBe("signal_sigint");
   expect(createCount(captured.transport)).toBe(2);
   expect(deleteIds(captured.transport)).toEqual(["dhs_fake_2", "dhs_fake_1"]);
-});
+}, 15000);
 
 test("19. SIGTERM maps to exit 143 and signal_sigterm", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1156,7 +1165,7 @@ test("19. SIGTERM maps to exit 143 and signal_sigterm", async () => {
   expect(captured.outcome?.exitCode).toBe(143);
   expect(captured.outcome?.reason).toBe("signal_sigterm");
   expect(captured.outcome?.state?.failure?.reason).toBe("signal_sigterm");
-});
+}, 15000);
 
 test("20. a signal between states keeps the previous transition durable and starts no new execution", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1176,7 +1185,7 @@ test("20. a signal between states keeps the previous transition durable and star
   expect(createCount(captured.transport)).toBe(2);
   expect(deleteIds(captured.transport)).toEqual(["dhs_fake_2", "dhs_fake_1"]);
   expect(state?.failure?.reason).toBe("signal_sigint");
-});
+}, 15000);
 
 test("21. a signal during the decision execution records decision_failed", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1194,7 +1203,7 @@ test("21. a signal during the decision execution records decision_failed", async
   expect(state?.executions[1]?.phase).toBe("failed");
   expect(state?.transitions.length).toBe(1);
   expect(state?.failure?.reason).toBe("signal_sigint");
-});
+}, 15000);
 
 test("22. a cleanup failure outranks a signal accepted during the same cleanup", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1216,7 +1225,7 @@ const captured = await runScript(harness, {
   expect(captured.outcome?.state?.status).toBe("cleanup_failed");
   expect(captured.outcome?.state?.failure?.reason).toBe("session_cleanup_failed");
   expect(deleteIds(captured.transport).length).toBe(2);
-});
+}, 15000);
 
 test("23. a signal delivered inside the final write after the cutoff is ignored", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1229,7 +1238,7 @@ test("23. a signal delivered inside the final write after the cutoff is ignored"
   const state = expectOk(captured);
   expect(state.status).toBe("success");
   expect(captured.handlerCalls).toBe(1);
-});
+}, 15000);
 
 test("24. a late signal after the runner returned changes nothing", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1247,7 +1256,7 @@ test("24. a late signal after the runner returned changes nothing", async () => 
   const after = await readFile(statePath(harness, runId), "utf8");
   expect(after).toBe(before);
   expect(state.status).toBe("success");
-});
+}, 15000);
 
 test("25. a runner timeout keeps worker_timeout when no signal is forwarded", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1258,7 +1267,7 @@ test("25. a runner timeout keeps worker_timeout when no signal is forwarded", as
   expect(captured.outcome?.reason).toBe("worker_timeout");
   expect(captured.outcome?.state?.failure?.reason).toBe("worker_timeout");
   expect(deleteIds(captured.transport)).toEqual(["dhs_fake_2", "dhs_fake_1"]);
-});
+}, 15000);
 
 
 // --- fix 1: the protected preflight gate -------------------------------------
@@ -1357,7 +1366,7 @@ test("F1a. a null deps resolves with the generic preflight outcome and no side e
   expectPreflightOutcome(outcome);
   expect(authCalls).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 test("F1b. a primitive deps resolves with the generic preflight outcome", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1368,7 +1377,7 @@ test("F1b. a primitive deps resolves with the generic preflight outcome", async 
   expectPreflightOutcome(outcome);
   expect(authCalls).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 test("F1c. a throwing getter behind onSignal resolves with the preflight outcome", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1393,7 +1402,7 @@ test("F1c. a throwing getter behind onSignal resolves with the preflight outcome
   expect(getterReads).toBeGreaterThanOrEqual(1);
   expect(authCalls).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 test("F1d. a non-function onSignal resolves with the preflight outcome", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1404,7 +1413,7 @@ test("F1d. a non-function onSignal resolves with the preflight outcome", async (
   expectPreflightOutcome(outcome);
   expect(authCalls).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 test("F1e. a throwing onSignal registration resolves with the preflight outcome", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1420,7 +1429,7 @@ test("F1e. a throwing onSignal registration resolves with the preflight outcome"
   expect(handlerSeen).not.toBe("not-called");
   expect(authCalls).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 // --- fix 2: the post-snapshot signal outcome and preflight priority ----------
 
@@ -1476,7 +1485,7 @@ test("F1g. unclean projection paths are rejected by the shared clean-path contra
     expect(outcome.exitCode).toBe(1);
     expect(diagnostics.join("\n")).not.toContain("stateRootProjection");
   }
-});
+}, 15000);
 
 test("F1f. the onSignal getter is read exactly once and the full run still succeeds", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1561,7 +1570,7 @@ test("F1f. the onSignal getter is read exactly once and the full run still succe
   expect(handlerSeen).not.toBeNull();
   // No second-getter diagnostics anywhere.
   expect(capturedDiagnostics.errors.join("\n")).not.toContain("SECOND-GETTER-READ");
-});
+}, 15000);
 
 test("F2a. a signal delivered during a successful snapshot yields the pre-create_run signal outcome", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1599,7 +1608,7 @@ test("F2a. a signal delivered during a successful snapshot yields the pre-create
   expect((await lstatOrNull(join(runRootPath(harness, runId), "project"))) !== null).toBe(true);
   expect((await lstatOrNull(join(runRootPath(harness, runId), "data", "inputs"))) !== null).toBe(true);
   expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
-});
+}, 15000);
 
 test("F2b. a signal accepted during auth wins over the failing authority check", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1621,7 +1630,7 @@ test("F2b. a signal accepted during auth wins over the failing authority check",
   expect(captured.outcome?.state).toBeNull();
   expect(createCount(captured.transport)).toBe(0);
   expect((await lstatOrNull(join(harness.stateRoot, "pipeline-runs"))) === null).toBe(true);
-});
+}, 15000);
 
 // --- fix 4: the exact 0700 mode policy ----------------------------------------
 
@@ -1638,7 +1647,7 @@ test("F4a. an existing pipeline-runs with mode 0700 is accepted", async () => {
   const state = expectOk(captured);
   expect(state.status).toBe("success");
   expect(modeOf((await lstat(runsDir))!)).toBe(0o700);
-});
+}, 15000);
 
 test("F4b. an existing pipeline-runs with mode 0755 is rejected unchanged", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1657,7 +1666,7 @@ test("F4b. an existing pipeline-runs with mode 0755 is rejected unchanged", asyn
   expect(await readFile(join(runsDir, "sentinel.txt"), "utf8")).toBe("KEEP-ME");
   expect((await lstatOrNull(join(runsDir, runId))) === null).toBe(true);
   expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
-});
+}, 15000);
 
 test("F4c. an existing pipeline-runs with mode 0777 is rejected unchanged", async () => {
   const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
@@ -1675,7 +1684,7 @@ test("F4c. an existing pipeline-runs with mode 0777 is rejected unchanged", asyn
   expect(await readFile(join(runsDir, "sentinel.txt"), "utf8")).toBe("KEEP-ME");
   expect((await lstatOrNull(join(runsDir, runId))) === null).toBe(true);
   expect((await lstatOrNull(statePath(harness, runId))) === null).toBe(true);
-});
+}, 15000);
 
 // --- fix 5: the outcome boundary after the run-root creation ------------------
 
@@ -1723,11 +1732,11 @@ test("F5. a runtime factory failure after the run-root creation reports runId an
   expect(diagnostics).not.toContain(SECRET_ENV_VALUE);
   expect(diagnostics).not.toContain(PROMPT_BODY.trim());
   expect(diagnostics).not.toContain("SOURCE-BODY");
-});
+}, 15000);
 
 test("26. the projection suffix translation admits only clean relative paths", () => {
   expect(translateProjectionPath("/a", "/b", "/a")).toEqual({ ok: true, daemonPath: "/b" });
   expect(translateProjectionPath("/a", "/b", "/a/x/y")).toEqual({ ok: true, daemonPath: "/b/x/y" });
   expect(translateProjectionPath("/a", "/b", "/a/../x").ok).toBe(false);
   expect(translateProjectionPath("/a", "/b", "/z").ok).toBe(false);
-});
+}, 15000);

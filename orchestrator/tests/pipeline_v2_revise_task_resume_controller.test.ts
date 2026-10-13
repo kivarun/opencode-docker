@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -731,7 +740,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   // --- crash seam / R4 ---------------------------------------------------------
 
@@ -795,7 +804,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   // --- identity pass-through ---------------------------------------------------
 
@@ -827,7 +836,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   test("4. a resume thrown error passes through by identity", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
@@ -851,7 +860,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   // --- malformed intervention results and durable-binding near-misses ----------
 
@@ -1074,7 +1083,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   test("6. the honest multi-task ledger with a non-adjacent predecessor is accepted and returned by identity", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
@@ -1146,7 +1155,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   // --- the resume union contract -----------------------------------------------
 
@@ -1222,7 +1231,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   // --- capture and provenance ---------------------------------------------------
 
@@ -1335,7 +1344,9 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  // measured: par2 timeout under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("9. the controller reads the authoritative snapshot exactly once per verification phase", async () => {
     const ctx = await reviseResumeReady();
@@ -1393,7 +1404,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   test("10. caller mutation after the pending intervention cannot change the resume", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
@@ -1459,7 +1470,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   test("11. a forged pipeline fails the provenance gate before any facade call; a Proxy pipeline causes no traps", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
@@ -1502,7 +1513,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   test("12. invalid runtime or control contract refuses before any facade call", async () => {
     const ctx = await reviseResumeReady({ advance: "r4" });
@@ -1542,7 +1553,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     } finally {
       await disposeReviseResume(ctx);
     }
-  });
+  }, 15000);
 
   // --- export surfaces and source scan ------------------------------------------
 
@@ -1561,7 +1572,7 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     expect(Object.isFrozen(productionReviseTaskResumeOps)).toBe(true);
     expect(productionReviseTaskResumeOps.applyIntervention).toBe(applyPipelineV2ReviseTaskIntervention);
     expect(productionReviseTaskResumeOps.resumeRun).toBe(resumePipelineV2Run);
-  });
+  }, 15000);
 
   test("14. the controller composes the two facades only (source scan)", async () => {
     const { readFile: readSource } = await import("node:fs/promises");
@@ -1616,5 +1627,5 @@ describe("resumePipelineV2RunAfterReviseTaskIntervention", () => {
     const internalSource = await readSource(join(import.meta.dir, "..", "src", "pipeline_v2_revise_task_resume_controller_internal.ts"), "utf8");
     expect(internalSource.split('from "./pipeline_v2_revise_task_intervention_controller.ts"').length - 1).toBe(1);
     expect(internalSource.split('from "./pipeline_v2_coordinator.ts"').length - 1).toBe(1);
-  });
+  }, 15000);
 });

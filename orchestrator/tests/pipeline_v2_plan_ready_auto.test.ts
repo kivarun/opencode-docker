@@ -10,6 +10,15 @@
  * real data plane and the real store over real pipeline bundles; no LLM,
  * no Docker Helper, no launcher credential, no sleeps.
  */
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -651,7 +660,7 @@ test("1. the warm initial plan-ready boundary continues automatically to termina
   expect(fake.events).toEqual(["run:execution", "cleanup:tool", "cleanup:execution"]);
   // loader round-trip
   expect(parsePipelineV2RunState(JSON.stringify(state))).toEqual(state);
-});
+}, 15000);
 
 test("2. the composition returns the exact downstream result by object identity and verifies the stage confirmation", async () => {
   const runId = "auto-identity";
@@ -688,7 +697,7 @@ test("2. the composition returns the exact downstream result by object identity 
   // replaced only the handoff+resume step
   const durable = await readDurableState(harness);
   expect(durable.plan_revisions).toHaveLength(1);
-});
+}, 15000);
 
 test("3. hostile composed facade results are typed invalid_result, never a TypeError", async () => {
   const runId = "auto-hostile-results";
@@ -741,7 +750,7 @@ test("3. hostile composed facade results are typed invalid_result, never a TypeE
   function sentinelOf(): never {
     throw new Error("the resume facade must never be reached by a hostile result");
   }
-});
+}, 15000);
 
 test("4. A0 restart window: the pure plan-ready boundary continues with the full suffix", async () => {
   const runId = "auto-window-a0";
@@ -776,7 +785,7 @@ test("4. A0 restart window: the pure plan-ready boundary continues with the full
     "run_outputs_published",
     "run_succeeded",
   ]);
-});
+}, 15000);
 
 test("5. A1 restart window: the partial task acceptance is reconciled by the acceptance facade", async () => {
   const runId = "auto-window-a1";
@@ -822,7 +831,7 @@ test("5. A1 restart window: the partial task acceptance is reconciled by the acc
     "run_outputs_published",
     "run_succeeded",
   ]);
-});
+}, 15000);
 
 test("6. A2 restart window: the accepted plan is recognized with zero acceptance dispatch", async () => {
   const runId = "auto-window-a2";
@@ -859,7 +868,7 @@ test("6. A2 restart window: the accepted plan is recognized with zero acceptance
     "run_outputs_published",
     "run_succeeded",
   ]);
-});
+}, 15000);
 
 test("7. A3 restart window: the generation without its iteration opens only the iteration", async () => {
   const runId = "auto-window-a3";
@@ -904,7 +913,7 @@ test("7. A3 restart window: the generation without its iteration opens only the 
     "run_outputs_published",
     "run_succeeded",
   ]);
-});
+}, 15000);
 
 test("8. A4 restart window: the opened generation and iteration need only the planning transition", async () => {
   const runId = "auto-window-a4";
@@ -941,7 +950,7 @@ test("8. A4 restart window: the opened generation and iteration need only the pl
     "run_outputs_published",
     "run_succeeded",
   ]);
-});
+}, 15000);
 
 test("9. A5 restart window: the committed planning transition is recognized by the handoff Branch B with zero dispatch", async () => {
   const runId = "auto-window-a5";
@@ -984,7 +993,7 @@ test("9. A5 restart window: the committed planning transition is recognized by t
     "run_outputs_published",
     "run_succeeded",
   ]);
-});
+}, 15000);
 
 test("10. A6: a started successor execution is never re-handed off; the composition fails closed", async () => {
   const runId = "auto-window-a6";
@@ -1028,7 +1037,7 @@ test("10. A6: a started successor execution is never re-handed off; the composit
   expect(reopened.commands).toHaveLength(0);
   expect(fake.sessionIds).toHaveLength(0);
   expect(await fingerprint(harness.runRoot)).toBe(before);
-});
+}, 15000);
 
 test("11. shared-entry ambiguity: the trusted positions 1 and 2 select different stages of the same template", async () => {
   for (const position of [1, 2] as const) {
@@ -1055,7 +1064,7 @@ test("11. shared-entry ambiguity: the trusted positions 1 and 2 select different
     expect(selected?.opened_transition_count, `position ${position}`).toBe(0);
     expect(state.plan_revisions[0]?.origin_execution, `position ${position}`).toBe(1);
   }
-});
+}, 15000);
 
 test("12. an out-of-range trusted position fails closed after the durable acceptance", async () => {
   const runId = "auto-out-of-range";
@@ -1085,7 +1094,7 @@ test("12. an out-of-range trusted position fails closed after the durable accept
   expect(state.transitions).toHaveLength(0);
   expect(reopened.commands.map((command) => command.kind)).toEqual(["task_revision_accepted", "plan_revision_accepted"]);
   expect(fake.sessionIds).toHaveLength(0);
-});
+}, 15000);
 
 test("13. an edge-incompatible selected stage is refused before any stage lifecycle write", async () => {
   const runId = "auto-edge-incompatible";
@@ -1119,7 +1128,7 @@ test("13. an edge-incompatible selected stage is refused before any stage lifecy
   expect(state.generations).toHaveLength(0);
   expect(state.transitions).toHaveLength(0);
   expect(fake.sessionIds).toHaveLength(0);
-});
+}, 15000);
 
 test("14. the composition's option battery: shapes, hostile extras, provenance and the sink contract", async () => {
   const runId = "auto-options";
@@ -1214,7 +1223,7 @@ test("14. the composition's option battery: shapes, hostile extras, provenance a
   }) as unknown as Record<string, unknown>;
   await applyPipelineV2PlanReadyContinuationWithIo(productionOps, hostileOptions);
   expect(read.sort()).toEqual(["control", "pipeline", "runRoot", "runtime", "sink"]);
-});
+}, 15000);
 
 test("15. the routing helper admits exactly the settled planning boundaries with a policy", async () => {
   const runId = "auto-routing-helper";
@@ -1263,7 +1272,7 @@ test("15. the routing helper admits exactly the settled planning boundaries with
     return bare.bundle;
   })());
   expect(pipelineV2PlanReadyPolicyFor(plain, ready)).toBeNull();
-});
+}, 15000);
 
 test("16. the restore branch's hostile composed results are typed fail-closed at the committed boundary", async () => {
   const runId = "auto-restore-hostile";
@@ -1305,7 +1314,7 @@ test("16. the restore branch's hostile composed results are typed fail-closed at
     expect(error instanceof PipelineV2PlanReadyAutoControllerError, String(JSON.stringify(restoreResult)?.slice(0, 40))).toBe(true);
   }
   expect(await fingerprint(harness.runRoot)).toBe(before);
-});
+}, 15000);
 
 test("17. no proposal, task or output body ever reaches the durable state or the controller diagnostics", async () => {
   const runId = "auto-canary";
@@ -1340,7 +1349,7 @@ test("17. no proposal, task or output body ever reaches the durable state or the
       expect(message, `${canary} in ${message}`).not.toContain(canary);
     }
   }
-});
+}, 15000);
 
 test("18. the public export surface is exactly the three runtime keys plus types", async () => {
   const facade = await import("../src/pipeline_v2_plan_ready_auto_controller.ts");
@@ -1349,7 +1358,7 @@ test("18. the public export surface is exactly the three runtime keys plus types
     "applyPipelineV2PlanReadyContinuation",
     "pipelineV2PlanReadyPolicyFor",
   ]);
-});
+}, 15000);
 
 test("19. the controller source scan: only the existing facades and resolvers; no second mechanism", async () => {
   const { readFileSync } = await import("node:fs");
@@ -1379,7 +1388,7 @@ test("19. the controller source scan: only the existing facades and resolvers; n
   expect(source).not.toContain(".message.includes");
   expect(source).not.toContain("instanceof PipelineV2PlanningRunPlan");
   expect(source).not.toContain("instanceof PipelineV2RunPlanRestore");
-});
+}, 15000);
 
 // ---------------------------------------------------------------------------
 // Runner-level proofs.
@@ -1530,7 +1539,7 @@ test("20. the fresh runner run auto-continues through the policy to terminal suc
   const durable = await readDurableState(harness);
   expect(durable.revision).toBe(24);
   expect(durable.status).toBe("success");
-});
+}, 15000);
 
 test("21. a bundle without the policy keeps the exact manual planReady runner outcome", async () => {
   const runId = "auto-runner-manual";
@@ -1546,7 +1555,7 @@ test("21. a bundle without the policy keeps the exact manual planReady runner ou
   expect(outcome.state?.revision).toBe(8);
   expect(outcome.state?.task_revisions).toHaveLength(0);
   expect(outcome.state?.generations).toHaveLength(0);
-});
+}, 15000);
 
 test("22. the revise-task chain auto-continues the replanned boundary to the next waiting state", async () => {
   const runId = "auto-runner-revise";
@@ -1594,7 +1603,9 @@ test("22. the revise-task chain auto-continues the replanned boundary to the nex
   const durable = await readDurableState(harness);
   expect(durable.revision).toBe(47);
   expect(durable.status).toBe("waiting");
-});
+// measured: recorded par4 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("23. the plain resume auto-continues the durable plan-ready restart (A0)", async () => {
   const runId = "auto-runner-resume-a0";
@@ -1611,7 +1622,7 @@ test("23. the plain resume auto-continues the durable plan-ready restart (A0)", 
   const state = expectRunnerSuccess(outcome);
   expect(state.revision).toBe(24);
   expect(runnerSessionCounter - before).toBe(2);
-});
+}, 15000);
 
 test("24. the plain resume auto-continues the accepted plan boundary (A2)", async () => {
   const runId = "auto-runner-resume-a2";
@@ -1632,7 +1643,7 @@ test("24. the plain resume auto-continues the accepted plan boundary (A2)", asyn
   expect(state.task_revisions).toHaveLength(1);
   expect(state.plan_revisions).toHaveLength(1);
   expect(runnerSessionCounter - before).toBe(2);
-});
+}, 15000);
 
 test("25. the plain resume auto-continues the committed boundary through the restore branch (A5)", async () => {
   const runId = "auto-runner-resume-a5";
@@ -1662,7 +1673,7 @@ test("25. the plain resume auto-continues the committed boundary through the res
   const state = expectRunnerSuccess(outcome);
   expect(state.revision).toBe(24);
   expect(runnerSessionCounter - before).toBe(2);
-});
+}, 15000);
 
 test("26. the plain resume on a started successor execution stays an ordinary typed refusal (A6)", async () => {
   const runId = "auto-runner-resume-a6";
@@ -1700,7 +1711,7 @@ test("26. the plain resume on a started successor execution stays an ordinary ty
   expect(outcome.state?.revision).toBe(14);
   expect(runnerSessionCounter - before).toBe(0);
   expect((await readDurableState(harness)).revision).toBe(14);
-});
+}, 15000);
 
 test("27. the plain resume on a plan-ready boundary without the policy keeps the ordinary refusal", async () => {
   const runId = "auto-runner-resume-plain";
@@ -1717,7 +1728,7 @@ test("27. the plain resume on a plan-ready boundary without the policy keeps the
   expect(outcome.state?.revision).toBe(8);
   expect(runnerSessionCounter - before).toBe(0);
   expect((await readDurableState(harness)).revision).toBe(8);
-});
+}, 15000);
 
 test("28. a signal during the planning worker run finalizes 130 without any continuation", async () => {
   const runId = "auto-runner-signal";
@@ -1741,7 +1752,7 @@ test("28. a signal during the planning worker run finalizes 130 without any cont
   expect(state?.transitions).toHaveLength(0);
   expect(state?.executions[0]?.phase).toBe("cleanup_completed");
   expect((await readDurableState(harness)).revision).toBe(9);
-});
+}, 15000);
 
 test("29. no secret, body or host path reaches the durable auto-continued state", async () => {
   const runId = "auto-runner-canary";
@@ -1768,7 +1779,7 @@ test("29. no secret, body or host path reaches the durable auto-continued state"
   ]) {
     expect(serialized, canary).not.toContain(canary);
   }
-});
+}, 15000);
 
 test("30. a signal inside the auto continuation finalizes 130 with the handoff durable", async () => {
   const runId = "auto-runner-signal-mid";
@@ -1801,7 +1812,7 @@ test("30. a signal inside the auto continuation finalizes 130 with the handoff d
   expect(state?.failure?.reason).toBe("signal_sigint");
   expect(state?.terminal).toBeUndefined();
   expect((await readDurableState(harness)).revision).toBe(22);
-});
+}, 15000);
 
 test("31. the bundled-default auto run accepts a caller-supplied run id end to end", async () => {
   const runId = "auto-runner-caller-id";
@@ -1835,4 +1846,4 @@ test("31. the bundled-default auto run accepts a caller-supplied run id end to e
   expect(collision.state).toBeNull();
   expect(collision.reason).toBe("run_already_exists");
   expect(await fingerprint(harness.runRoot)).toBe(before);
-});
+}, 15000);

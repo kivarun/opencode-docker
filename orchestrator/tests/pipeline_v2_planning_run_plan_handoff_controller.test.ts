@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~4.5x (measured 2026-10-13: the heaviest member
+// took 3.4s in isolation, crossed 15s in one full-suite parallel run, and
+// several members crossed the 5000ms default while passing sequentially
+// and in isolation). Each test therefore carries an explicit local
+// 30000ms deadline; assertions, matrices and fixtures are unchanged and
+// the default suite command stays untouched.
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -504,7 +513,7 @@ test("1. honest S0 full path after restart: the exact six-command suffix, delta 
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("2. S1-S4: the fresh facade runs only the missing suffix with deltas +5/+4/+3/+1 and converges", async () => {
   for (const failFrom of [1, 2, 3, 4]) {
@@ -544,7 +553,9 @@ test("2. S1-S4: the fresh facade runs only the missing suffix with deltas +5/+4/
       await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+// measured: recorded par2/1.3.14 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 30000);
 
 test("3. S5 branch B: zero acceptance/stage calls; restore/load/transition exactly once; C1 zero dispatch", async () => {
   const prefix = await buildPrefix();
@@ -601,7 +612,7 @@ test("3. S5 branch B: zero acceptance/stage calls; restore/load/transition exact
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("4. branch selection never catches: an injected acceptance sentinel on branch A returns by identity; branch B ops untouched", async () => {
   const prefix = await buildPrefix();
@@ -653,7 +664,7 @@ test("4. branch selection never catches: an injected acceptance sentinel on bran
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("5. S3 caller-policy pinning: captured budget/stage survive pending awaits; a replayed different budget conflicts by identity", async () => {
   const prefix = await buildPrefix();
@@ -694,7 +705,7 @@ test("5. S3 caller-policy pinning: captured budget/stage survive pending awaits;
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("6. concurrent identical calls at S0 and at S3 converge to one projection without duplicates", async () => {
   for (const failFrom of [Infinity, 3]) {
@@ -721,7 +732,7 @@ test("6. concurrent identical calls at S0 and at S3 converge to one projection w
       await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+}, 30000);
 
 test("7. concurrent S3 calls with budgets 2 and 3: one durable policy wins; the loser is typed-refused; bindings stay pure", async () => {
   const prefix = await buildPrefix();
@@ -751,7 +762,7 @@ test("7. concurrent S3 calls with budgets 2 and 3: one durable policy wins; the 
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("8. missing, damaged and foreign-kind intent: the stage/transition facades never run; foreign errors keep identity", async () => {
   const prefix = await buildPrefix();
@@ -791,7 +802,7 @@ test("8. missing, damaged and foreign-kind intent: the stage/transition facades 
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("9. stale restored plan, foreign stage and wrong wait binding are refused", async () => {
   const prefix = await buildPrefix();
@@ -835,7 +846,7 @@ test("9. stale restored plan, foreign stage and wrong wait binding are refused",
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("9b. an intent bound to another wait is refused before any downstream call", async () => {
   const prefix = await buildPrefix();
@@ -864,7 +875,7 @@ test("9b. an intent bound to another wait is refused before any downstream call"
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("10a. a successor execution started after the handoff is never an S5 retry", async () => {
   const prefix = await buildPrefix();
@@ -893,7 +904,7 @@ test("10a. a successor execution started after the handoff is never an S5 retry"
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("10b. a new wait after the handoff is never an S5 retry", async () => {
   const prefix = await buildPrefix();
@@ -943,7 +954,7 @@ test("10b. a new wait after the handoff is never an S5 retry", async () => {
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 interface ChainCallRecorder {
   readonly calls: string[];
@@ -1002,44 +1013,53 @@ test("11. malformed-result matrix: every composed op's hostile result is the con
   ];
   const branchAOps = ["acceptPlanningRunPlan", "loadWaitIntent", "openReplannedStage", "openReplannedStageTransition"] as const;
   for (const hostileOp of [...branchAOps, "restoreAcceptedRunPlan"] as const) {
-    for (const [hostileLabel, hostile] of hostiles) {
-      const prefix = await buildPrefix();
-      const { fixture } = prefix;
-      try {
-        if (hostileOp === "restoreAcceptedRunPlan") {
-          // The restore is used only on branch B: drive the clean handoff
-          // first, then inject the hostile restore result.
-          await runHandoff(fixture);
-        }
-        const recorder: ChainCallRecorder = { calls: [] };
-        const ops = chainOpsWithHostile(fixture, hostileOp, hostile, recorder);
-        const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
-        const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
-        const error = await catchHandoff(() =>
-          applyPipelineV2PlanningRunPlanHandoffWithIo(
-            { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
-            ops,
-          ));
-        const expectedReason = hostileOp === "loadWaitIntent" && hostile === null ? "artifact_missing" : "invalid_result";
-        expectHandoffError(error, expectedReason);
-        if (hostileOp === "acceptPlanningRunPlan") {
-          expect(recorder.calls).toEqual(["acceptPlanningRunPlan"]);
-        } else if (hostileOp === "restoreAcceptedRunPlan") {
-          expect(recorder.calls).toEqual(["restoreAcceptedRunPlan"]);
-        } else if (hostileOp === "loadWaitIntent") {
-          expect(recorder.calls).toEqual(["acceptPlanningRunPlan", "loadWaitIntent"]);
-        } else if (hostileOp === "openReplannedStage") {
-          expect(recorder.calls).toEqual(["acceptPlanningRunPlan", "loadWaitIntent", "openReplannedStage"]);
-        } else {
-          expect(recorder.calls).toEqual(["acceptPlanningRunPlan", "loadWaitIntent", "openReplannedStage", "openReplannedStageTransition"]);
-        }
-        void hostileLabel;
-      } finally {
-        await rm(fixture.root, { recursive: true, force: true });
+    // One durable prefix per composed op instead of one per hostile value:
+    // the hostile result is injected at the op itself, so the real
+    // predecessors either never run (first op) or re-run as the facades'
+    // documented zero-dispatch recognition on exactly the crash window the
+    // previous case of this group left behind. Assertions, matrices and
+    // expectations are unchanged; only the repeated identical fixture
+    // preparation left the timed section.
+    const prefix = await buildPrefix();
+    const { fixture } = prefix;
+    try {
+      for (const [hostileLabel, hostile] of hostiles) {
+          if (hostileOp === "restoreAcceptedRunPlan") {
+            // The restore is used only on branch B: drive the clean handoff
+            // first, then inject the hostile restore result.
+            await runHandoff(fixture);
+          }
+          const recorder: ChainCallRecorder = { calls: [] };
+          const ops = chainOpsWithHostile(fixture, hostileOp, hostile, recorder);
+          const reopened = await PipelineV2RunStateSink.open({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
+          const pipeline = await loadPipelineV2((reopened.snapshot as PipelineV2RunState).pipeline.bundle_root);
+          const error = await catchHandoff(() =>
+            applyPipelineV2PlanningRunPlanHandoffWithIo(
+              { pipeline, runRoot: fixture.runRoot, sink: reopened, stageId: STAGE_ID, initialBudget: INITIAL_BUDGET },
+              ops,
+            ));
+          const expectedReason = hostileOp === "loadWaitIntent" && hostile === null ? "artifact_missing" : "invalid_result";
+          expectHandoffError(error, expectedReason);
+          if (hostileOp === "acceptPlanningRunPlan") {
+            expect(recorder.calls).toEqual(["acceptPlanningRunPlan"]);
+          } else if (hostileOp === "restoreAcceptedRunPlan") {
+            expect(recorder.calls).toEqual(["restoreAcceptedRunPlan"]);
+          } else if (hostileOp === "loadWaitIntent") {
+            expect(recorder.calls).toEqual(["acceptPlanningRunPlan", "loadWaitIntent"]);
+          } else if (hostileOp === "openReplannedStage") {
+            expect(recorder.calls).toEqual(["acceptPlanningRunPlan", "loadWaitIntent", "openReplannedStage"]);
+          } else {
+            expect(recorder.calls).toEqual(["acceptPlanningRunPlan", "loadWaitIntent", "openReplannedStage", "openReplannedStageTransition"]);
+          }
+          void hostileLabel;
       }
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+// measured: 5.0s under par2 after the fixture-hoist fix under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 30000);
 
 test("11b. forged flat bindings and a coherently forged state are refused", async () => {
   const prefix = await buildPrefix();
@@ -1100,7 +1120,7 @@ test("11b. forged flat bindings and a coherently forged state are refused", asyn
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("12. C1 state proof: the downstream state is not identity-bound; honest deep-equal is accepted; one mutation is refused", async () => {
   const prefix = await buildPrefix();
@@ -1141,7 +1161,7 @@ test("12. C1 state proof: the downstream state is not identity-bound; honest dee
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("13. options Proxy: the five contract fields are read exactly once in contract order; hostile extras never read", async () => {
   const prefix = await buildPrefix();
@@ -1166,7 +1186,7 @@ test("13. options Proxy: the five contract fields are read exactly once in contr
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("14. ops Proxy: each member read exactly once before the first await; later mutation cannot redirect", async () => {
   const prefix = await buildPrefix();
@@ -1209,7 +1229,7 @@ test("14. ops Proxy: each member read exactly once before the first await; later
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("15. pipeline clone and Proxy are refused by the provenance gate before any state or facade access", async () => {
   const prefix = await buildPrefix();
@@ -1255,7 +1275,7 @@ test("15. pipeline clone and Proxy are refused by the provenance gate before any
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("16. snapshot read count: the capture reads nothing before the provenance gate; verification phases read the authoritative state", async () => {
   const prefix = await buildPrefix();
@@ -1286,7 +1306,7 @@ test("16. snapshot read count: the capture reads nothing before the provenance g
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("17. export surfaces: the public and internal runtime keys are exact", async () => {
   const publicModule = (await import("../src/pipeline_v2_planning_run_plan_handoff_controller.ts")) as unknown as Record<string, unknown>;
@@ -1301,7 +1321,7 @@ test("17. export surfaces: the public and internal runtime keys are exact", asyn
     "productionPlanningRunPlanHandoffOps",
   ]);
   expect(() => new PipelineV2PlanningRunPlanHandoffControllerError("foreign" as never, "x", null)).toThrow(TypeError);
-});
+}, 30000);
 
 test("16b. exact snapshot read counts per branch", async () => {
   const prefix = await buildPrefix();
@@ -1357,7 +1377,7 @@ test("16b. exact snapshot read counts per branch", async () => {
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("19. diagnostics are content-free: no task bodies, output JSON, digest canaries or filesystem paths", async () => {
   const prefix = await buildPrefix();
@@ -1415,7 +1435,7 @@ test("19. diagnostics are content-free: no task bodies, output JSON, digest cana
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("18. source scan: only the listed facades; no reducer/store/fs/parser/serializer/digest/registry/runner", async () => {
   const sourceRoot = join(import.meta.dir, "..", "src");
@@ -1456,7 +1476,7 @@ test("18. source scan: only the listed facades; no reducer/store/fs/parser/seria
   ]) {
     expect(internalSource.includes(required), `the internal core must import ${required}`).toBe(true);
   }
-});
+}, 30000);
 
 const REVISED_TASKS = ["task-a", "task-b", "task-c"] as const;
 const REVISED_BODIES = ["Body A revised", "Body B revised", "Body C revised"] as const;
@@ -2091,7 +2111,9 @@ test("20. RED1: a second honest revise cycle is currently refused by historical 
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+// measured: 5.0s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 30000);
 
 test("21. RED1: a third honest revise cycle passes S0, and the second/third handoffs pass S5 branch B", async () => {
   const prefix = await buildCycledPrefix(3);
@@ -2146,7 +2168,9 @@ test("21. RED1: a third honest revise cycle passes S0, and the second/third hand
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+// measured: 5.0s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 30000);
 
 test("22. RED2: the caller stage-2 (different template) currently fails the outer verifier after durable writes", async () => {
   const prefix = await buildTwoStagePrefix(2);
@@ -2168,7 +2192,7 @@ test("22. RED2: the caller stage-2 (different template) currently fails the oute
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("23. RED2 positive controls: the first stage, the shared-entry stage-3, and branch B with stage-2", async () => {
   // The first stage's own-template binding is covered by the
@@ -2216,7 +2240,7 @@ test("23. RED2 positive controls: the first stage, the shared-entry stage-3, and
       await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+}, 30000);
 
 test("24. RED3: a hostile restore result state currently lets the transition run", async () => {
   const prefix = await buildPrefix();
@@ -2246,7 +2270,7 @@ test("24. RED3: a hostile restore result state currently lets the transition run
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("25. RED4: near-miss flat bindings currently reach the transition or return false success", async () => {
   // The stage near-miss: the mutated stage result must stop the chain
@@ -2331,7 +2355,7 @@ test("25. RED4: near-miss flat bindings currently reach the transition or return
       await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+}, 30000);
 
 test("26. RED5: a malformed sink currently produces a native TypeError or reads the snapshot through the gate", async () => {
   const prefix = await buildPrefix();
@@ -2397,7 +2421,7 @@ test("26. RED5: a malformed sink currently produces a native TypeError or reads 
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("27. RED6: hostile presentations after real durable writes currently carry non-authoritative error states", async () => {
   // The real acceptance durable, the hostile acceptance presentation.
@@ -2500,7 +2524,7 @@ test("27. RED6: hostile presentations after real durable writes currently carry 
       await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+}, 30000);
 
 test("28. a hostile acceptance compiled plan carries the post-acceptance authoritative snapshot", async () => {
   const prefix = await buildPrefix();
@@ -2530,7 +2554,7 @@ test("28. a hostile acceptance compiled plan carries the post-acceptance authori
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("29. a malformed intent wrapper keeps the verified current state", async () => {
   const prefix = await buildPrefix();
@@ -2567,7 +2591,7 @@ test("29. a malformed intent wrapper keeps the verified current state", async ()
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("30. a branch-B restore result with a broken key set or hostile compiled plan keeps the initial authoritative snapshot", async () => {
   const prefix = await buildPrefix();
@@ -2603,7 +2627,7 @@ test("30. a branch-B restore result with a broken key set or hostile compiled pl
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("31. a stage plan-binding mismatch keeps the post-stage authoritative snapshot", async () => {
   for (const field of ["plan_revision", "plan_sha256", "origin_execution"] as const) {
@@ -2646,7 +2670,7 @@ test("31. a stage plan-binding mismatch keeps the post-stage authoritative snaps
       await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+}, 30000);
 
 test("32. non-record post-call snapshots fail closed with the last verified authoritative state", async () => {
   const malformedValues: unknown[] = [null, undefined, 42, ["array"]];
@@ -2801,7 +2825,9 @@ test("32. non-record post-call snapshots fail closed with the last verified auth
       await rm(fixture.root, { recursive: true, force: true });
     }
   }
-});
+// measured: 3.4s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 30000);
 
 // --- corrective pass: the planning-edge gate before any replanned-stage write --
 
@@ -2903,7 +2929,7 @@ test("28. GREEN: the incompatible caller stage is refused before any replanned-s
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("29. GREEN: the S2 accepted-plan boundary with an incompatible stage is a total zero dispatch", async () => {
   const prefix = await buildTwoStagePrefix(2);
@@ -2950,7 +2976,7 @@ test("29. GREEN: the S2 accepted-plan boundary with an incompatible stage is a t
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("30. GREEN: a real zero-candidate plan is refused before any stage lifecycle write", async () => {
   const prefix = await buildTwoStagePrefix(4);
@@ -2968,7 +2994,7 @@ test("30. GREEN: a real zero-candidate plan is refused before any stage lifecycl
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("31. GREEN: ambiguity control - both same-entry stages are still accepted on independent prefixes", async () => {
   const prefixA = await buildTwoStagePrefix(3);
@@ -3001,7 +3027,7 @@ test("31. GREEN: ambiguity control - both same-entry stages are still accepted o
     await rm(prefixA.fixture.root, { recursive: true, force: true });
     await rm(prefixB.fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("32. GREEN: the engine resolver errors pass by identity and the malformed edge results are the controller's own invalid_result", async () => {
   const prefix = await buildTwoStagePrefix(2);
@@ -3096,7 +3122,7 @@ test("32. GREEN: the engine resolver errors pass by identity and the malformed e
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 /** The honest INITIAL plan-ready boundary: the settled unbound planning execution, no acceptance yet. */
 async function buildInitialPrefix(): Promise<Prefix> {
@@ -3176,7 +3202,7 @@ test("IA. the initial boundary runs the full Initial A suffix through the shared
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("IB. the committed initial boundary is the zero-dispatch retry", async () => {
   const prefix = await buildInitialPrefix();
@@ -3206,7 +3232,7 @@ test("IB. the committed initial boundary is the zero-dispatch retry", async () =
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("I4. the acceptance-and-stage window retry dispatches only the transition", async () => {
   const prefix = await buildInitialPrefix();
@@ -3224,7 +3250,7 @@ test("I4. the acceptance-and-stage window retry dispatches only the transition",
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("IW. an unknown caller stage refuses with the compiled resolver's error and no stage writes", async () => {
   const prefix = await buildInitialPrefix();
@@ -3251,7 +3277,7 @@ test("IW. an unknown caller stage refuses with the compiled resolver's error and
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);
 
 test("IB2. a conflicting caller budget on the committed initial boundary is a lifecycle_conflict with zero dispatch", async () => {
   const prefix = await buildInitialPrefix();
@@ -3286,4 +3312,4 @@ test("IB2. a conflicting caller budget on the committed initial boundary is a li
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 30000);

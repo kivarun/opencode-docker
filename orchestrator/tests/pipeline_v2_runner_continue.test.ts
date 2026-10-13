@@ -15,6 +15,15 @@
  * real one (the fake CLI transport is the only fake). No LLM, no Docker
  * Helper, no launcher credential, no sleeps.
  */
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -522,7 +531,7 @@ test("C0: the runner derives the full intervention policy from the durable state
   expect(state.revision).toBe(prefixState.revision + 12);
   // the loader round-trip
   expect(await readDurableState(harness)).toEqual(state);
-});
+}, 15000);
 
 // --- C5 / crash retry -------------------------------------------------------
 
@@ -584,7 +593,7 @@ test("C5: after the durable completed boundary the runner reconstructs the exact
     phase: "failed",
   });
   expect(await readDurableState(harness)).toEqual(state);
-});
+}, 15000);
 
 // --- derivation refusals ----------------------------------------------------
 
@@ -737,7 +746,7 @@ test("derivation refusals happen before any pipeline, profile, authority or runt
   expect(mismatchDurable.waits[0]?.response?.action_id).toBe("continue_stage");
   expect(mismatchDurable.grants[0]?.additional_iterations).toBe(3);
   expect(mismatchDurable.revision).toBe(preSink3.snapshot!.revision);
-});
+}, 15000);
 
 // --- contract battery -------------------------------------------------------
 
@@ -825,7 +834,7 @@ test("contract battery: malformed options, additionalIterations bounds and hosti
   for (const key of readKeys) {
     expect(["runId", "waitIndex", "additionalIterations", "configRoot", "launcherId"]).toContain(key);
   }
-});
+}, 15000);
 
 // --- signal before the intervention ----------------------------------------
 
@@ -871,7 +880,7 @@ test("a signal accepted before the facade yields the signal outcome with zero in
   expect(outcome2.ok).toBe(false);
   expect(outcome2.exitCode).toBe(143);
   expect(outcome2.reason).toBe("signal_sigterm");
-});
+}, 15000);
 
 // --- capture contract -------------------------------------------------------
 
@@ -905,7 +914,7 @@ test("capture contract: every continue option field is read exactly once in the 
   expect(outcome.reason).toBe("worker_failed");
   // each of the five fields is read exactly once, in the contract order
   expect(readKeys).toEqual(["runId", "waitIndex", "additionalIterations", "configRoot", "launcherId"]);
-});
+}, 15000);
 
 test("capture contract: a mutating additionalIterations getter cannot change the recorded grant", async () => {
   const harness = await makeHarness("pipeline-v2-continue-runner-policy-mut-");
@@ -941,7 +950,7 @@ test("capture contract: a mutating additionalIterations getter cannot change the
   const state = await readDurableState(harness);
   // the validated policy (2) is the only value the run ever sees
   expect(state.grants[0]?.additional_iterations).toBe(2);
-});
+}, 15000);
 
 test("capture contract: a mutating runId getter cannot redirect the continuation to another run", async () => {
   const harness = await makeHarness("pipeline-v2-continue-runner-run-select-");
@@ -986,7 +995,7 @@ test("capture contract: a mutating runId getter cannot redirect the continuation
   expect(stateB.waits[0]?.response).toBeUndefined();
   expect(stateB.grants).toEqual([]);
   expect(outcome.runId).toBe("run-a");
-});
+}, 15000);
 
 test("capture contract: a mutating deps.now getter cannot change the run clock", async () => {
   const harness = await makeHarness("pipeline-v2-continue-runner-deps-mut-");
@@ -1026,7 +1035,7 @@ test("capture contract: a mutating deps.now getter cannot change the run clock",
   // every durable timestamp came from the validated clock
   expect(state.updated_at.startsWith("2026-01-01")).toBe(true);
   expect(nowReads).toBe(1);
-});
+}, 15000);
 
 // --- captured helper config -------------------------------------------------
 
@@ -1128,7 +1137,7 @@ test("capture contract: a mutating helperConfig getter cannot swap the socket or
       expect(endpoint).toBe(socketA);
     }
   }
-});
+}, 15000);
 
 // --- export surface and source scan ----------------------------------------
 
@@ -1175,7 +1184,7 @@ test("the export surface gains exactly one runtime key and the module implements
   ]) {
     expect(source.includes(banned)).toBe(false);
   }
-});
+}, 15000);
 
 // --- cumulative stage iteration budget (fail-fast preflight) -----------------
 
@@ -1197,7 +1206,7 @@ test("cumulative budget: an unsafe MAX_SAFE_INTEGER request is a fail-fast refus
   // the run-tree is untouched apart from nothing: the diagnostics carry the
   // typed refusal, the durable state is byte-identical in content
   expect(JSON.parse(JSON.stringify(after))).toEqual(JSON.parse(JSON.stringify(before)));
-});
+}, 15000);
 
 test("cumulative budget: after the fail-fast refusal the valid value continues the same untouched run (restart semantics)", async () => {
   const harness = await makeHarness("pipeline-v2-continue-runner-budget-restart-");
@@ -1228,7 +1237,7 @@ test("cumulative budget: after the fail-fast refusal the valid value continues t
   expect(after.grants).toHaveLength(1);
   expect(after.grants[0]?.additional_iterations).toBe(1);
   expect(after.waits).toHaveLength(2);
-});
+}, 15000);
 
 test("cumulative budget through the CLI: the unsafe request exits 1 without writes and the valid request succeeds", async () => {
   const harness = await makeHarness("pipeline-v2-continue-runner-budget-cli-");
@@ -1337,4 +1346,4 @@ test("cumulative budget through the CLI: the unsafe request exits 1 without writ
   const after = await readDurableState(harness);
   expect(after.status).toBe("waiting");
   expect(after.grants[0]?.additional_iterations).toBe(1);
-});
+}, 15000);

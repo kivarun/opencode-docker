@@ -241,11 +241,77 @@ function mkfifo(path: string): void {
  * and resolves only after the writer closes (EOF). The returned JSON tells the
  * test exactly which state write completed.
  */
+/**
+ * Residual bytes of a FIFO per absolute path: a state writer that raced
+ * ahead of the test's drain delivered its document into an earlier read
+ * window, and the document must be preserved for the next expected drain
+ * instead of corrupting it.
+ */
+const fifoResidual = new Map<string, string>();
+
+/**
+ * Returns the index just past the first complete JSON value in `text`, or
+ * -1 while the text still ends inside a value. The scan tracks nesting and
+ * string/escape state, so pretty-printed documents (which contain internal
+ * newlines) and concatenated documents both split exactly on value
+ * boundaries.
+ */
+function firstJsonValueEnd(text: string): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let started = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i] as string;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      started = true;
+      continue;
+    }
+    if (ch === "{" || ch === "[") {
+      depth += 1;
+      started = true;
+      continue;
+    }
+    if (ch === "}" || ch === "]") {
+      depth -= 1;
+      if (started && depth === 0) {
+        return i + 1;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * Reads exactly one complete JSON state document from the FIFO. Each read
+ * drains the pipe to EOF and yields; leftovers stay buffered for the next
+ * call, so the rendezvous with a lagging writer never depends on scheduler
+ * timing and a write that raced into an earlier read window is never lost.
+ */
 async function drainFifo(fifo: string): Promise<string> {
-  const fh = await open(fifo, "r");
-  const data = await fh.readFile();
-  await fh.close();
-  return data.toString("utf8");
+  let buffered = fifoResidual.get(fifo) ?? "";
+  for (;;) {
+    const end = firstJsonValueEnd(buffered);
+    if (end >= 0) {
+      const document = buffered.slice(0, end);
+      fifoResidual.set(fifo, buffered.slice(end).replace(/^\s+/, ""));
+      return document;
+    }
+    const fh = await open(fifo, "r");
+    buffered += (await fh.readFile()).toString("utf8");
+    await fh.close();
+  }
 }
 
 /** Writer side of a FIFO barrier: rendezvous with a blocked reader, then deliver. */
@@ -617,11 +683,13 @@ test("7. signal during updateState(worker_running): run never starts, status not
 
     // rendezvous with the in-flight worker_running write, record the signal
     // while updateState is still pending, then release it
-    const reader3 = await open(stateFifo, "r");
     signalHandler!("SIGTERM");
     killActive("SIGTERM");
-    const b3 = JSON.parse((await reader3.readFile()).toString("utf8"));
-    await reader3.close();
+    // the buffered drain opens the read end itself: the in-flight
+    // worker_running write rendezvouses exactly here, after the signal
+    // cutoff, and a document that raced into an earlier read window comes
+    // from the residual buffer without any I/O
+    const b3 = JSON.parse(await drainFifo(stateFifo));
     expect(b3.status).toBe("worker_running");
 
     // the abort check right after the state write skips the worker run; wait
@@ -780,11 +848,13 @@ test("8. signal during the final success state write is late: persisted success,
     // the FIFO; the signal cutoff already happened before the write started,
     // so the signal recorded while the write is in flight is late and changes
     // nothing: the success snapshot is written exactly once and is final
-    const reader5 = await open(stateFifo, "r");
     signalHandler!("SIGTERM");
     killActive("SIGTERM");
-    const b5 = JSON.parse((await reader5.readFile()).toString("utf8"));
-    await reader5.close();
+    // the buffered drain opens the read end itself: a final write that is
+    // still blocked on the FIFO rendezvouses exactly here, after the
+    // signal cutoff, and a document already delivered by an earlier race
+    // comes from the residual buffer without any I/O
+    const b5 = JSON.parse(await drainFifo(stateFifo));
     expect(b5.status).toBe("success");
 
     const outcome = await pending;

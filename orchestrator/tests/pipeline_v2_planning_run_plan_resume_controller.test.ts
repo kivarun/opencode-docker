@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -680,7 +689,7 @@ test("1. honest C0 after restart on the two-cycle prefix: the handoff suffix the
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("2. crash seam: handoff durable, sentinel resume, C1 zero-dispatch retry, then the seven resume commands", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -776,7 +785,9 @@ test("2. crash seam: handoff durable, sentinel resume, C1 zero-dispatch retry, t
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+// measured: 4.2s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("3. handoff error identity: a typed handoff error passes through and the resume never runs", async () => {
   const fixture = await setupFixture();
@@ -813,7 +824,7 @@ test("3. handoff error identity: a typed handoff error passes through and the re
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("4. resume thrown-error identity: a thrown resume error passes through unchanged", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -850,7 +861,7 @@ test("4. resume thrown-error identity: a thrown resume error passes through unch
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("5. malformed handoff-result matrix: every hostile result is the controller's own invalid_result and the resume never runs", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -966,7 +977,7 @@ test("5. malformed handoff-result matrix: every hostile result is the controller
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("6. malformed resume-union matrix and positive vocabulary table: valid results return by identity", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -1153,7 +1164,7 @@ test("6. malformed resume-union matrix and positive vocabulary table: valid resu
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("7. capture battery: options and ops read exactly once in contract order; mutations and replacements never redirect", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -1257,7 +1268,9 @@ test("7. capture battery: options and ops read exactly once in contract order; m
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+// measured: 2.5s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("8. pipeline clone and Proxy are refused by the provenance gate with zero traps and zero facade calls", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -1327,7 +1340,9 @@ test("8. pipeline clone and Proxy are refused by the provenance gate with zero t
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+// measured: 2.7s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("9. invalid runtime, control and sink shapes: typed own errors without native TypeErrors or facade calls", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -1427,7 +1442,7 @@ test("9. invalid runtime, control and sink shapes: typed own errors without nati
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("10. snapshot reads: exactly one post-handoff and one post-resume read; malformed post-call snapshots are own refusals", async () => {
   const prefix = await buildTwoCyclePrefix();
@@ -1602,7 +1617,9 @@ test("10. snapshot reads: exactly one post-handoff and one post-resume read; mal
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+// measured: 4.3s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("11. export surfaces: the public and internal runtime keys are exact", async () => {
   const publicModule = await import("../src/pipeline_v2_planning_run_plan_resume_controller.ts");
@@ -1613,7 +1630,7 @@ test("11. export surfaces: the public and internal runtime keys are exact", asyn
     "applyPipelineV2PlanningRunPlanResumeWithIo",
     "productionPlanningRunPlanResumeOps",
   ]);
-});
+}, 15000);
 
 test("12. source scan: only the two facades; no reducer/store/fs/parser/serializer/digest/registry/runner", async () => {
   const sourceRoot = join(import.meta.dir, "..", "src");
@@ -1654,7 +1671,7 @@ test("12. source scan: only the two facades; no reducer/store/fs/parser/serializ
   ]) {
     expect(internalSource.includes(required), `the internal core must import ${required}`).toBe(true);
   }
-});
+}, 15000);
 
 /** The honest INITIAL plan-ready boundary: the settled unbound planning execution, no acceptance yet. */
 async function buildInitialReadyPrefix(): Promise<PrefixCoordinates> {
@@ -1721,7 +1738,7 @@ test("8. the initial plan-ready boundary: the initial handoff suffix then the re
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("9. the initial crash seam: the committed initial boundary is the zero-dispatch handoff retry and the resume runs exactly once", async () => {
   const prefix = await buildInitialReadyPrefix();
@@ -1775,4 +1792,4 @@ test("9. the initial crash seam: the committed initial boundary is the zero-disp
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
-});
+}, 15000);

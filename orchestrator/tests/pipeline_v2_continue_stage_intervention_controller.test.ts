@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -621,7 +630,7 @@ test("1. the proof: the existing three-facade chain drives the reopened run thro
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- the intervention through the new controller -----------------------------
 
@@ -718,7 +727,7 @@ test("2. the C0 intervention composes the exact five-command suffix with revisio
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("3. the intervention result is flat, deep-frozen, content-free and carries the restored compiled stage", async () => {
   const ctx = await driveToReopenedWait();
@@ -755,7 +764,7 @@ test("3. the intervention result is flat, deep-frozen, content-free and carries 
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("4. the C1 window: the exact durable intent skips re-acceptance and the remaining four commands run", async () => {
   const ctx = await driveToReopenedWait({ acceptIntent: true });
@@ -771,7 +780,7 @@ test("4. the C1 window: the exact durable intent skips re-acceptance and the rem
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("5. the C2 window: the exact durable grant skips to closure, response and open", async () => {
   const ctx = await driveToReopenedWait({ recordGrant: { additionalIterations: 2 } });
@@ -786,7 +795,7 @@ test("5. the C2 window: the exact durable grant skips to closure, response and o
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("6. the C3 window: the exact grant closure is the progressed retry and runs response and open", async () => {
   const ctx = await driveToReopenedWait({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true });
@@ -801,7 +810,7 @@ test("6. the C3 window: the exact grant closure is the progressed retry and runs
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("7. the C4 window: the exact durable response is the progressed retry and only the successor opens", async () => {
   const ctx = await driveToReopenedWait({
@@ -820,7 +829,7 @@ test("7. the C4 window: the exact durable response is the progressed retry and o
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("8. the C5 window: the exact open successor iteration is the zero-dispatch recognition", async () => {
   const ctx = await driveToReopenedWait({
@@ -840,7 +849,7 @@ test("8. the C5 window: the exact open successor iteration is the zero-dispatch 
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- the narrow progressed-retry classification -----------------------------
 
@@ -916,7 +925,7 @@ test("9. an unrecognized acceptance error is re-thrown by object identity with z
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("10. an invalid_state without an authoritative state is never a progressed retry", async () => {
   const ctx = await driveToReopenedWait();
@@ -942,7 +951,7 @@ test("10. an invalid_state without an authoritative state is never a progressed 
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("11. an intent that is absent or different on the target wait is never a progressed retry", async () => {
   const ctx = await driveToReopenedWait();
@@ -983,7 +992,7 @@ test("11. an intent that is absent or different on the target wait is never a pr
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("12. a historical intent (the target wait not the last record) is never a progressed retry", async () => {
   const ctx = await driveToReopenedWait({ acceptIntent: true });
@@ -1017,7 +1026,7 @@ test("12. a historical intent (the target wait not the last record) is never a p
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("13. a boundary answered with another action is never a continue-stage retry", async () => {
   const ctx = await driveToReopenedWait({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -1042,7 +1051,7 @@ test("13. a boundary answered with another action is never a continue-stage retr
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("14. a state after an already started successor execution is never an intervention retry", async () => {
   const ctx = await driveToReopenedWait({
@@ -1097,7 +1106,7 @@ test("14. a state after an already started successor execution is never an inter
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- hostile successful results ---------------------------------------------
 
@@ -1240,7 +1249,9 @@ test("15. a mutated successful acceptance result is invalid_result before the re
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+// measured: 2.6s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("16. malformed acceptance result shapes are invalid_result, never a TypeError", async () => {
   const ctx = await driveToReopenedWait();
@@ -1279,7 +1290,7 @@ test("16. malformed acceptance result shapes are invalid_result, never a TypeErr
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("17. a mutated successful restore result is invalid_result before the composition", async () => {
   const ctx = await driveToReopenedWait();
@@ -1335,7 +1346,7 @@ test("17. a mutated successful restore result is invalid_result before the compo
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("18. a forged cloned compiled plan in the restore result is invalid_result", async () => {
   const ctx = await driveToReopenedWait();
@@ -1356,7 +1367,7 @@ test("18. a forged cloned compiled plan in the restore result is invalid_result"
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("19. a foreign-pipeline compiled plan in the restore result is invalid_result", async () => {
   const ctx = await driveToReopenedWait();
@@ -1396,7 +1407,7 @@ test("19. a foreign-pipeline compiled plan in the restore result is invalid_resu
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("20. a mutated successful open result is invalid_result", async () => {
   const ctx = await driveToReopenedWait();
@@ -1438,7 +1449,7 @@ test("20. a mutated successful open result is invalid_result", async () => {
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("21. malformed open result shapes are invalid_result, never a TypeError", async () => {
   const ctx = await driveToReopenedWait();
@@ -1484,7 +1495,7 @@ test("21. malformed open result shapes are invalid_result, never a TypeError", a
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- healing red-before -----------------------------------------------------
 
@@ -1591,7 +1602,7 @@ test("42. a successful acceptance result with a forged started_at heals downstre
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("43. a successful restore result with a forged input digest heals downstream and is refused", async () => {
   const ctx = await driveToSecondWait();
@@ -1616,7 +1627,7 @@ test("43. a successful restore result with a forged input digest heals downstrea
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("44. a forged final open state with a forged input digest is refused with the verified state", async () => {
   const ctx = await driveToSecondWait();
@@ -1643,7 +1654,7 @@ test("44. a forged final open state with a forged input digest is refused with t
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 
 /**
@@ -1858,7 +1869,7 @@ test("22. the options fields and the ops members are read exactly once in the fi
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("48. a different canonical updated_at at a non-zero suffix delta is not refused for the timestamp difference", async () => {
   // The acceptance result's state carries another schema-valid canonical
@@ -1963,7 +1974,7 @@ test("23. forged intents and pipelines are rejected before any effect", async ()
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("24. malformed options are invalid_options before any effect", async () => {
   const ctx = await driveToReopenedWait();
@@ -2051,7 +2062,7 @@ test("24. malformed options are invalid_options before any effect", async () => 
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("25. malformed ops are invalid_options before any effect", async () => {
   const ctx = await driveToReopenedWait();
@@ -2102,7 +2113,7 @@ test("25. malformed ops are invalid_options before any effect", async () => {
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("26. caller mutation after the pending acceptance cannot change the intervention policy", async () => {
   const ctx = await driveToReopenedWait();
@@ -2147,7 +2158,7 @@ test("26. caller mutation after the pending acceptance cannot change the interve
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- durability windows -----------------------------------------------------
 
@@ -2206,43 +2217,43 @@ async function expectFaultWindow(
 
 test("27. a fresh retry after a not_committed at the plan_intent_accepted commit completes the missing suffix", async () => {
   await expectFaultWindow(1, "rename");
-});
+}, 15000);
 
 test("28. a fresh retry after a not_committed at the iteration_grant_recorded commit completes the missing suffix", async () => {
   await expectFaultWindow(2, "rename");
-});
+}, 15000);
 
 test("29. a fresh retry after a not_committed at the stage_iteration_closed commit completes the missing suffix", async () => {
   await expectFaultWindow(3, "rename");
-});
+}, 15000);
 
 test("30. a fresh retry after a not_committed at the wait_response_recorded commit completes the missing suffix", async () => {
   await expectFaultWindow(4, "rename");
-});
+}, 15000);
 
 test("31. a fresh retry after a not_committed at the stage_iteration_opened commit completes the missing suffix", async () => {
   await expectFaultWindow(5, "rename");
-});
+}, 15000);
 
 test("32. a fresh retry after a durability_unknown at the plan_intent_accepted commit completes the missing suffix", async () => {
   await expectFaultWindow(1, "dirfsync");
-});
+}, 15000);
 
 test("33. a fresh retry after a durability_unknown at the iteration_grant_recorded commit completes the missing suffix", async () => {
   await expectFaultWindow(2, "dirfsync");
-});
+}, 15000);
 
 test("34. a fresh retry after a durability_unknown at the stage_iteration_closed commit completes the missing suffix", async () => {
   await expectFaultWindow(3, "dirfsync");
-});
+}, 15000);
 
 test("35. a fresh retry after a durability_unknown at the wait_response_recorded commit completes the missing suffix", async () => {
   await expectFaultWindow(4, "dirfsync");
-});
+}, 15000);
 
 test("36. a fresh retry after a durability_unknown at the stage_iteration_opened commit completes the missing suffix", async () => {
   await expectFaultWindow(5, "dirfsync");
-});
+}, 15000);
 
 // --- concurrency and conflicts ----------------------------------------------
 
@@ -2272,7 +2283,7 @@ test("37. two identical concurrent interventions converge to one durable suffix"
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("38. a conflicting caller budget is never accepted as a retry", async () => {
   const ctx = await driveToReopenedWait();
@@ -2299,7 +2310,7 @@ test("38. a conflicting caller budget is never accepted as a retry", async () =>
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("39. a conflicting intent (another stage or another budget) is never accepted as a retry", async () => {
   const ctx = await driveToReopenedWait({ acceptIntent: true });
@@ -2357,7 +2368,7 @@ test("39. a conflicting intent (another stage or another budget) is never accept
   } finally {
     await rm(ctx.root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // --- export surface and source scan -----------------------------------------
 
@@ -2377,7 +2388,7 @@ test("40. the runtime export surfaces are exact (public two keys, internal three
   expect(productionContinueStageInterventionOps.restoreAcceptedPlan).toBe(restorePipelineV2AcceptedRunPlan);
   expect(productionContinueStageInterventionOps.openContinuedStage).toBe(openPipelineV2ContinuedStage);
   expect(Object.isFrozen(productionContinueStageInterventionOps)).toBe(true);
-});
+}, 15000);
 
 test("41. the intervention module composes only the three existing facades (source scan)", async () => {
   const { readFile: readSource } = await import("node:fs/promises");
@@ -2420,7 +2431,7 @@ test("41. the intervention module composes only the three existing facades (sour
   // the message composition is explicit, never parsed from causes
   expect(countOf("cause.message")).toBe(0);
   expect(countOf(".message.includes")).toBe(0);
-});
+}, 15000);
 
 test("A. an unsafe MAX_SAFE_INTEGER intent is refused fail-fast through the whole facade with zero writes", async () => {
     const ctx = await driveToReopenedWait();
@@ -2452,7 +2463,7 @@ test("A. an unsafe MAX_SAFE_INTEGER intent is refused fail-fast through the whol
     } finally {
       await rm(ctx.root, { recursive: true, force: true });
     }
-  });
+}, 15000);
 
 test("B. the exact representable boundary value runs the full five-command suffix and opens the successor iteration", async () => {
     const ctx = await driveToReopenedWait();
@@ -2481,4 +2492,4 @@ test("B. the exact representable boundary value runs the full five-command suffi
     } finally {
       await rm(ctx.root, { recursive: true, force: true });
     }
-  });
+}, 15000);

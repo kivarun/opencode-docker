@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -592,7 +601,7 @@ test("1. agent -> decision -> success records the exact two-session command orde
     "cleanup-tool:coder",
     "cleanup-exec:coder",
   ]);
-});
+}, 15000);
 
 test("2. two agent states run four unique sessions with full cleanup and durable transitions in between", async () => {
   const harness = await setupHarness(PIPELINE_TWO_AGENTS);
@@ -651,7 +660,7 @@ test("2. two agent states run four unique sessions with full cleanup and durable
     "cleanup-tool:second",
     "cleanup-exec:second",
   ]);
-});
+}, 15000);
 
 test("3. entry success terminal publishes outputs with zero executions and sessions", async () => {
   const harness = await setupHarness(PIPELINE_ENTRY_SUCCESS);
@@ -674,7 +683,7 @@ test("3. entry success terminal publishes outputs with zero executions and sessi
     "run_outputs_published",
     "run_succeeded",
   ]);
-});
+}, 15000);
 
 test("4. failed terminal publishes outputs, reports ok:false with the terminal failure, and finalizes durably", async () => {
   const harness = await setupHarness(PIPELINE_ENTRY_FAILED);
@@ -702,7 +711,7 @@ test("4. failed terminal publishes outputs, reports ok:false with the terminal f
   expect(harness.recording.commands[3]?.reason).toBe("terminal_failed");
   // no second finalize after the committed run_failed{terminal_failed}
   expect(kinds(harness.recording).filter((kind) => kind === "run_failed")).toHaveLength(1);
-});
+}, 15000);
 
 test("5. a planning agent accepts exactly its declared plan output", async () => {
   const harness = await setupHarness(PIPELINE_ZERO_PORTS);
@@ -717,7 +726,7 @@ test("5. a planning agent accepts exactly its declared plan output", async () =>
   const accepted = harness.recording.commands.find((command) => command.kind === "agent_outputs_accepted") as { outputs: { id: string }[] } | undefined;
   expect(accepted?.outputs.map((output) => output.id)).toEqual(["plan"]);
   expect(state.run_outputs).toEqual([]);
-});
+}, 15000);
 
 test("6. typed worker failures clean both sessions tool-first and fail the run", async () => {
   for (const reason of ["worker_failed", "worker_timeout"] as const) {
@@ -752,7 +761,7 @@ test("6. typed worker failures clean both sessions tool-first and fail the run",
       "cleanup-exec:coder",
     ]);
   }
-});
+}, 15000);
 
 test("7. a failure before any Session records not_required cleanup for both slots", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -772,7 +781,7 @@ test("7. a failure before any Session records not_required cleanup for both slot
   expect(agentExecution.execution_session_id).toBeUndefined();
   expect(agentExecution.tool_session_id).toBeUndefined();
   expect(fake.pairs).toHaveLength(0);
-});
+}, 15000);
 
 test("8. a failure after both Sessions were created still cleans both up exactly once", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
@@ -805,7 +814,7 @@ test("8. a failure after both Sessions were created still cleans both up exactly
   expect(pair.execution.cleanupCount).toBe(1);
   expect(pair.tool.cleanupCount).toBe(1);
   expect(result.state.transitions).toEqual([]);
-});
+}, 15000);
 
 test("9. a failed tool cleanup finalizes as cleanup_failed with an exact cleanup pair", async () => {
   const harness = await setupHarness(PIPELINE_TWO_AGENTS);
@@ -840,7 +849,7 @@ test("9. a failed tool cleanup finalizes as cleanup_failed with an exact cleanup
   // the first cleanup error never blocks the second session's cleanup
   expect(pair.execution.cleanupCount).toBe(1);
   expect(pair.tool.cleanupCount).toBe(1);
-});
+}, 15000);
 
 test("10. decision results produce exact content-free records and route through the engine", async () => {
   const cases: Array<{
@@ -927,7 +936,7 @@ test("10. decision results produce exact content-free records and route through 
     // decision and terminal states never create a session
     expect(fake.pairs).toHaveLength(1);
   }
-});
+}, 15000);
 
 test("11. decision input failures stay typed after start_decision_execution", async () => {
   // (a) adapter level: the evaluation phase parses the saved bytes only; a
@@ -987,7 +996,7 @@ test("11. decision input failures stay typed after start_decision_execution", as
   expect(result.state.transitions).toHaveLength(1);
   expect(result.state.terminal).toBeUndefined();
   expect(result.state.status).toBe("failed");
-});
+}, 15000);
 
 test("12. transition budget exhaustion fails before the next callback with both slots cleaned", async () => {
   const harness = await setupHarness(PIPELINE_CYCLE_BUDGET);
@@ -1009,7 +1018,7 @@ test("12. transition budget exhaustion fails before the next callback with both 
   expect(result.state.executions).toHaveLength(2);
   expect(result.state.transitions).toHaveLength(2);
   expect(result.state.terminal).toBeUndefined();
-});
+}, 15000);
 
 test("13. a transition-hook failure stops the graph before the next callback", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
@@ -1033,7 +1042,7 @@ test("13. a transition-hook failure stops the graph before the next callback", a
   expect(result.state.executions).toHaveLength(1);
   expect(agentAt(result.state, 0).phase).toBe("cleanup_completed");
   expect(fake.pairs).toHaveLength(1);
-});
+}, 15000);
 
 test("14. typed data-plane failures keep their exact reason with both slots cleaned", async () => {
   // (a) the snapshot of a protected input is modified during the run: the
@@ -1084,7 +1093,7 @@ test("14. typed data-plane failures keep their exact reason with both slots clea
   expect(result2.reason).toBe("accepted_output_modified");
   expect(result2.state.executions[1]?.failure_reason).toBe("accepted_output_modified");
   expect(fake2.pairs).toHaveLength(1);
-});
+}, 15000);
 
 test("15. plain unexpected errors normalize to internal_error", async () => {
   // (a) the runtime contract explodes before any Session exists.
@@ -1158,7 +1167,7 @@ test("15. plain unexpected errors normalize to internal_error", async () => {
       tool: "completed",
     });
   }
-});
+}, 15000);
 
 test("16. pre-rename state failures and post-rename durability unknown behave exactly", async () => {
   // (a) pre-rename failure at agent_running: not committed; both sessions
@@ -1248,7 +1257,7 @@ test("16. pre-rename state failures and post-rename durability unknown behave ex
     expect(result.reason).toBe("state_persist_failed");
     expect(result.state).toBeNull();
   }
-});
+}, 15000);
 
 test("17. after a poisoned sink no further state writes or side effects happen", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
@@ -1276,7 +1285,7 @@ test("17. after a poisoned sink no further state writes or side effects happen",
   }
   expect(pair.execution.cleanupCount).toBe(1);
   expect(pair.tool.cleanupCount).toBe(1);
-});
+}, 15000);
 
 test("18. run-output publication and terminal-write faults are contained", async () => {
   // (a) the publication record fails after the outputs were published.
@@ -1344,7 +1353,7 @@ test("18. run-output publication and terminal-write faults are contained", async
     expect(result.state.run_outputs).toBeDefined();
     expect(result.state.status).toBe("failed");
   }
-});
+}, 15000);
 
 test("19. runtime method reassignment during a pending callback cannot change the captured callbacks", async () => {
   const harness = await setupHarness(PIPELINE_TWO_AGENTS);
@@ -1381,7 +1390,7 @@ test("19. runtime method reassignment during a pending callback cannot change th
     "exec-2",
   ]);
   expect(state.status).toBe("success");
-});
+}, 15000);
 
 test("20. protected inputs and accepted outputs are re-verified through the existing data plane", async () => {
   // (a) the snapshot of a protected input disappears: the next activation
@@ -1406,7 +1415,7 @@ test("20. protected inputs and accepted outputs are re-verified through the exis
   expect(result.reason).toBe("run_input_modified");
   expect(fake.pairs).toHaveLength(1);
   // (b) the accepted-output tamper case is covered by test 14b.
-});
+}, 15000);
 
 test("21. durable state and results carry no secrets, prompts, facts, bodies, error messages or worker output", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, { source: "SECRET-SOURCE-BODY\n" });
@@ -1431,7 +1440,7 @@ test("21. durable state and results carry no secrets, prompts, facts, bodies, er
     expect(stateJson.includes(canary)).toBe(false);
     expect(resultJson.includes(canary)).toBe(false);
   }
-});
+}, 15000);
 
 test("22. the existing evaluateDecisionStateFromData stays the wrapper over prepare + evaluate", async () => {
   const dirs = await makeDirs();
@@ -1466,7 +1475,7 @@ test("22. the existing evaluateDecisionStateFromData stays the wrapper over prep
   expect(result.outcome).toBe("beta");
   expect(result.decision).toBe("beta");
   expect(result.rule_id).toBe("rule-b");
-});
+}, 15000);
 
 test("23. the result reason and the durable failure reason stay consistent on every write outcome", async () => {
   // (a) a normal worker failure: the result reason and the durable
@@ -1639,7 +1648,7 @@ test("23. the result reason and the durable failure reason stay consistent on ev
     expect(harness.recording.commands[3]?.reason).toBe("terminal_failed");
     expect(harness.ioCounts).toEqual({ tempOpens: 3, renames: 3, dirSyncs: 3 });
   }
-});
+}, 15000);
 
 test("24. durability unknown at every failure-write level stops all further dispatches", async () => {
   // (a) during the agent_failed write: the adopted candidate is visible,
@@ -1747,7 +1756,7 @@ test("24. durability unknown at every failure-write level stops all further disp
     expect(state.run_outputs ?? []).toHaveLength(1);
     expect(harness.ioCounts).toEqual({ tempOpens: 4, renames: 4, dirSyncs: 3 });
   }
-});
+}, 15000);
 
 test("25. the worker run result is accepted only in its two exact shapes", async () => {
   const cases: Array<{ run: NonNullable<FakeSessionSpec["run"]>; canaries: string[] }> = [
@@ -1784,7 +1793,7 @@ test("25. the worker run result is accepted only in its two exact shapes", async
       expect(stateJson.includes(canary)).toBe(false);
     }
   }
-});
+}, 15000);
 
 test("26. damaged session handles still clean up exactly once through the captured cleanups", async () => {
   // (a) no runAgent member on the Execution Session, valid cleanups: the
@@ -1941,7 +1950,9 @@ test("26. damaged session handles still clean up exactly once through the captur
     expect(fake.pairs.map((pair) => pair.tool.cleanupCount)).toEqual([1, 1]);
     expect(fake.pairs[0]?.execution.rogueCount).toBe(0);
   }
-});
+// measured: 3.4s under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);
 
 test("27. an Execution Session create failure creates no Tool Session and runs no worker", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -1963,7 +1974,7 @@ test("27. an Execution Session create failure creates no Tool Session and runs n
   expect(fake.pairs).toHaveLength(0);
   expect(fake.events).toEqual([]);
   expect(JSON.stringify(result)).not.toContain("EXEC-CREATE-EXPLODED");
-});
+}, 15000);
 
 test("28. an unconfirmed execution-session write cleans the Execution Session and never creates the Tool Session", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
@@ -2003,7 +2014,7 @@ test("28. an unconfirmed execution-session write cleans the Execution Session an
   expect(pair.execution.cleanupCount).toBe(1);
   expect(fake.events).toEqual(["create-exec:coder:1", "cleanup-exec:coder"]);
   expect(harness.ioCounts).toEqual({ tempOpens: 5, renames: 5, dirSyncs: 5 });
-});
+}, 15000);
 
 test("29. a Tool Session create failure still deletes the Execution Session and runs no worker", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2030,7 +2041,7 @@ test("29. a Tool Session create failure still deletes the Execution Session and 
   expect(pair.execution.cleanupCount).toBe(1);
   expect(fake.events).toEqual(["create-exec:coder:1", "cleanup-exec:coder"]);
   expect(JSON.stringify(result)).not.toContain("TOOL-CREATE-EXPLODED");
-});
+}, 15000);
 
 test("30. an unconfirmed tool-session write cleans both sessions tool-first exactly once each", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
@@ -2076,7 +2087,7 @@ test("30. an unconfirmed tool-session write cleans both sessions tool-first exac
     "cleanup-exec:coder",
   ]);
   expect(harness.ioCounts).toEqual({ tempOpens: 6, renames: 6, dirSyncs: 6 });
-});
+}, 15000);
 
 test("31. a failed Execution Session cleanup finalizes as cleanup_failed", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2106,7 +2117,7 @@ test("31. a failed Execution Session cleanup finalizes as cleanup_failed", async
     "cleanup-tool:coder",
     "cleanup-exec:coder",
   ]);
-});
+}, 15000);
 
 test("32. both cleanup failures are recorded and the second attempt still runs", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2134,7 +2145,7 @@ test("32. both cleanup failures are recorded and the second attempt still runs",
     "cleanup-tool:coder",
     "cleanup-exec:coder",
   ]);
-});
+}, 15000);
 
 test("33. durability unknown at both session-created writes adopts the candidate and stops all dispatches", async () => {
   // (a) at the execution-session record: the adopted candidate carries the
@@ -2210,7 +2221,7 @@ test("33. durability unknown at both session-created writes adopts the candidate
     ]);
     expect(harness.ioCounts).toEqual({ tempOpens: 5, renames: 5, dirSyncs: 4 });
   }
-});
+}, 15000);
 
 // --- helpers used above ----------------------------------------------------
 
@@ -2670,7 +2681,7 @@ test("34. a project preparation failure reaches no command and no session", asyn
   expect(
     (await lstatOrNull(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"))) === null,
   ).toBe(true);
-});
+}, 15000);
 
 test("35. a late run-input failure keeps the published project copy and an untouched source", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2703,7 +2714,7 @@ test("35. a late run-input failure keeps the published project copy and an untou
   expect(await readFile(join(harness.dirs.runRoot, "project", "seed.md"), "utf8")).toBe("PROJECT-SEED\n");
   // the source stays untouched
   expect((await readdir(harness.dirs.projectSource)).sort()).toEqual(["seed.md"]);
-});
+}, 15000);
 
 test("36. a create_run store failure keeps the published project copy", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
@@ -2722,7 +2733,7 @@ test("36. a create_run store failure keeps the published project copy", async ()
   expect(projectInfo.isDirectory()).toBe(true);
   expect(await readFile(join(harness.dirs.runRoot, "project", "seed.md"), "utf8")).toBe("PROJECT-SEED\n");
   expect((await readdir(harness.dirs.projectSource)).sort()).toEqual(["seed.md"]);
-});
+}, 15000);
 
 test("37. a successful coordination leaves the source untouched and keeps the source out of the durable state", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2749,7 +2760,7 @@ test("37. a successful coordination leaves the source untouched and keeps the so
   const resultJson = JSON.stringify(result);
   expect(resultJson).not.toContain(harness.dirs.projectSource);
   expect(resultJson).not.toContain("PROJECT-SEED");
-});
+}, 15000);
 
 test("38. a forged pipeline is rejected by the provenance gate before any side effect", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2876,7 +2887,7 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
   expect(
     (await lstatOrNull(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"))) === null,
   ).toBe(true);
-});
+}, 15000);
 
 /**
  * A counting coordinator control: it counts every `freezeSignal` call so a
@@ -2926,7 +2937,7 @@ test("56. the cutoff freezes signal acceptance exactly once (sigint-then-throw c
   const finalize = harness.recording.commands.at(-1);
   expect(finalize?.kind).toBe("run_failed");
   expect((finalize as { reason?: string }).reason).toBe("signal_sigint");
-});
+}, 15000);
 
 test("57. the cutoff runs exactly once for a normal success", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2936,7 +2947,7 @@ test("57. the cutoff runs exactly once for a normal success", async () => {
   expect(result.ok).toBe(true);
   expect(result.state?.status).toBe("success");
   expect(control.freezeCalls()).toBe(1);
-});
+}, 15000);
 
 test("58. the cutoff runs exactly once for a normal failure", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2950,7 +2961,7 @@ test("58. the cutoff runs exactly once for a normal failure", async () => {
   expect(result.state?.failure?.reason).toBe("worker_failed");
   expect(control.freezeCalls()).toBe(1);
   expect(kinds(harness.recording)).not.toContain("run_succeeded");
-});
+}, 15000);
 
 test("59. the cutoff runs exactly once for a failed terminal, which stays terminal_failed", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION, {
@@ -2966,7 +2977,7 @@ test("59. the cutoff runs exactly once for a failed terminal, which stays termin
   expect(result.state?.terminal).toEqual({ state_id: "failed_end", result: "failed" });
   expect(result.state?.failure?.reason).toBe("terminal_failed");
   expect(control.freezeCalls()).toBe(1);
-});
+}, 15000);
 
 test("60. a sigterm-then-sigint control observes exactly one freeze, so the first signal wins", async () => {
   const harness = await setupHarness(PIPELINE_AGENT_DECISION);
@@ -2979,7 +2990,7 @@ test("60. a sigterm-then-sigint control observes exactly one freeze, so the firs
   }
   expect(result.state?.failure?.reason).toBe("signal_sigterm");
   expect(control.freezeCalls()).toBe(1);
-});
+}, 15000);
 
 test("61. create_run durability-unknown takes the cutoff exactly once and keeps state_persist_failed", async () => {
   const harness = await setupHarness(PIPELINE_ENTRY_SUCCESS, {
@@ -3012,7 +3023,7 @@ test("61. create_run durability-unknown takes the cutoff exactly once and keeps 
   // create_run.
   expect(kinds(harness.recording)).toEqual(["create_run"]);
   expect(fake.createCalls.length).toBe(0);
-});
+}, 15000);
 
 test("62. create_run not_committed returns state null and takes no cutoff", async () => {
   const harness = await setupHarness(PIPELINE_ENTRY_SUCCESS, {
@@ -3031,7 +3042,7 @@ test("62. create_run not_committed returns state null and takes no cutoff", asyn
   expect(kinds(harness.recording)).toEqual(["create_run"]);
   expect(fake.createCalls.length).toBe(0);
   expect(harness.sink.poisoned).toBe(false);
-});
+}, 15000);
 
 async function lstatOrNull(path: string): Promise<import("node:fs").Stats | null> {
   try {
@@ -3200,7 +3211,7 @@ test("31. a pipeline without orchestration metadata refuses the fresh run before
   expect(harness.ioCounts.tempOpens).toBe(0);
   // no durable state document was ever created
   expect((await lstatOrNull(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"))) === null).toBe(true);
-});
+}, 15000);
 
 test("32. a stage execution without an open lifecycle fails the run as invalid_graph before any Session", async () => {
   const harness = await setupHarness(PIPELINE_STAGE);
@@ -3220,4 +3231,4 @@ test("32. a stage execution without an open lifecycle fails the run as invalid_g
   expect(fake.pairs[0]?.execution.cleanupCount).toBe(1);
   expect(fake.pairs[0]?.tool.cleanupCount).toBe(1);
   expect(state.failure).toEqual({ reason: "invalid_graph" });
-});
+}, 15000);

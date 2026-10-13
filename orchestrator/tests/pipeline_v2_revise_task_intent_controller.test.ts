@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { lstat, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
@@ -543,7 +552,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. the published manifests carry exactly the canonical bytes at the fixed paths", async () => {
     const ctx = await reviseReady();
@@ -559,7 +568,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. the result shape is exact, deep-frozen and content-free", async () => {
     const ctx = await reviseReady();
@@ -581,7 +590,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. the accepted state round-trips through the loader", async () => {
     const ctx = await reviseReady();
@@ -594,7 +603,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. partial retry: the durable intent dispatches only the task revision", async () => {
     const ctx = await reviseReady({ acceptIntent: true });
@@ -608,7 +617,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. full idempotent retry: both durable, zero dispatch, files preserved", async () => {
     const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {} });
@@ -638,7 +647,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("7. a different durable intent is an intent conflict with zero writes", async () => {
     const ctx = await reviseReady({ acceptIntent: false });
@@ -654,7 +663,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("8. stale candidate: a durable ledger past the candidate is a candidate conflict", async () => {
     const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {}, extraTaskRevision: { revision: 3, previousSha256: A2.sha256, sha256: hex("3"), body: "Body A third" } });
@@ -667,7 +676,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("9. a different digest at the durable candidate revision is a candidate conflict", async () => {
     const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: { sha256: hex("9") } });
@@ -680,7 +689,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("10. the candidate binding failures keep the original binding error class", async () => {
     const ctx = await reviseReady();
@@ -745,7 +754,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("11. a non-registered intent or candidate is rejected before any field read", async () => {
     const ctx = await reviseReady();
@@ -779,7 +788,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("12. the durable boundary rejections", async () => {
     const ctx = await reviseReady();
@@ -837,7 +846,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("13. a missing or mismatched current task revision is an invalid state", async () => {
     // unknown task id
@@ -880,7 +889,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("14. a pre-placed conflicting manifest file is a store conflict with zero dispatch", async () => {
     const ctx = await reviseReady();
@@ -914,7 +923,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("15. the intent dispatch not-committed keeps both manifests as orphans and the retry commits both", async () => {
     const ctx = await reviseReady();
@@ -941,7 +950,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("16. the intent dispatch durability-unknown adopts the intent and the retry dispatches only the task", async () => {
     const ctx = await reviseReady();
@@ -966,7 +975,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("17. the task dispatch not-committed keeps the intent durable and the retry dispatches only the task", async () => {
     const ctx = await reviseReady({ acceptIntent: true });
@@ -992,7 +1001,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("18. the task dispatch durability-unknown adopts the revision and the full retry dispatches nothing", async () => {
     const ctx = await reviseReady({ acceptIntent: true });
@@ -1016,7 +1025,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("19. a racing identical dispatch is idempotent success on the exact durable record", async () => {
     const ctx = await reviseReady({ acceptIntent: true });
@@ -1040,7 +1049,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("20. a resolve-without-change dispatch failure is invalid state", async () => {
     const ctx = await reviseReady();
@@ -1065,7 +1074,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("21. two identical racing acceptances both succeed with one inode per file and +2 revisions", async () => {
     const ctx = await reviseReady();
@@ -1087,7 +1096,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("22. options and ops getters are read exactly once", async () => {
     const ctx = await reviseReady();
@@ -1122,7 +1131,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("23. caller mutation after the capture cannot influence the acceptance", async () => {
     const ctx = await reviseReady();
@@ -1135,7 +1144,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("24. unexpected downstream errors preserve their identity", async () => {
     const ctx = await reviseReady();
@@ -1154,7 +1163,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("25. diagnostics are content-free across the failure paths", async () => {
     const ctx = await reviseReady({ acceptIntent: false });
@@ -1179,7 +1188,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 });
 
   test("28. a task of another stage of the last plan is rejected as invalid state", async () => {
@@ -1203,7 +1212,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("29. a generation bound to another plan digest is rejected as invalid state", async () => {
     const ctx = await reviseReady({ secondPlanRevision: true });
@@ -1218,7 +1227,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30. a missing or mismatched last plan artifact is rejected as invalid state", async () => {
     const dropped = await reviseReady({ dropPlanArtifact: true });
@@ -1241,7 +1250,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(tampered.fixture);
     }
-  });
+  }, 15000);
 
   test("31. the plan pointer, not the ledger tail, derives the current revision", async () => {
     // R2: the ledger's latest task-a record is the candidate (revision 2),
@@ -1271,7 +1280,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(fresh.fixture);
     }
-  });
+  }, 15000);
 
   test("32. an unchanged task body is invalid intent with zero publication and dispatch", async () => {
     const ctx = await reviseReady();
@@ -1292,7 +1301,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("33. R2 with a removed candidate artifact restores it exactly with zero dispatch", async () => {
     const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {}, dropCandidateArtifact: true });
@@ -1307,7 +1316,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("34. R2 with a removed intent artifact restores it exactly with zero dispatch", async () => {
     const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {}, dropIntentArtifact: true });
@@ -1322,7 +1331,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("35. R2 with both artifacts removed restores them in the task then intent order with zero dispatch", async () => {
     const ctx = await reviseReady({ acceptIntent: true, recordTaskRevision: {}, dropCandidateArtifact: true, dropIntentArtifact: true });
@@ -1337,7 +1346,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("36. a hostile sink dispatch getter is read exactly once", async () => {
     const ctx = await reviseReady();
@@ -1364,7 +1373,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("37. a hostile post-intent snapshot that closes the generation is invalid state without a task dispatch", async () => {
     const ctx = await reviseReady();
@@ -1404,7 +1413,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("37b. a racing intent whose authoritative snapshot closed the generation is rejected with zero task dispatch", async () => {
     const ctx = await reviseReady();
@@ -1444,7 +1453,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("38. a hostile post-task snapshot that removes or changes the wait intent is invalid state", async () => {
     const ctx = await reviseReady();
@@ -1480,7 +1489,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("39. a hostile post-task snapshot with a duplicate or later task record is not success", async () => {
     const ctx = await reviseReady();
@@ -1520,7 +1529,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("40. a malformed nested post-dispatch snapshot is typed invalid state, never a TypeError", async () => {
     const ctx = await reviseReady();
@@ -1552,7 +1561,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("41. conflicting concurrent candidates: one winner, one typed loser, no winner rewrite", async () => {
     const ctx = await reviseReady();
@@ -1590,7 +1599,7 @@ describe("acceptPipelineV2ReviseTaskIntent", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 test("26. the runtime export surfaces are exact (public two keys, internal three keys)", async () => {
   const publicModule = await import("../src/pipeline_v2_revise_task_intent_controller.ts");
   expect(Object.keys(publicModule).sort()).toEqual([
@@ -1603,7 +1612,7 @@ test("26. the runtime export surfaces are exact (public two keys, internal three
     "acceptPipelineV2ReviseTaskIntentWithIo",
     "productionReviseTaskIntentOps",
   ]);
-});
+}, 15000);
 
 test("27. the revise acceptance composes the existing layers only (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
@@ -1639,7 +1648,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
   // the reducer pre-check helper is internal: no runtime export and no
   // test seam (the pre-check ordering is proven by the source-order test)
   expect(countOf("export function precheckReviseSequence")).toBe(0);
-});
+}, 15000);
   test("42. the reducer pre-check precedes both publishers (source-order proof)", async () => {
     const { readFileSync } = await import("node:fs");
     const source = readFileSync(join(import.meta.dir, "..", "src", "pipeline_v2_revise_task_intent_controller_internal.ts"), "utf8");
@@ -1657,7 +1666,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     expect(flow).toContain("if (candidateDurable && !intentDurable)");
     // the unified post-intent classification is used on both paths
     expect(flow.split("classifyPostIntentState(").length - 1).toBe(2);
-  });
+  }, 15000);
 
   test("44. a racing intent with the unchanged ledger dispatches the task suffix exactly once", async () => {
     const ctx = await reviseReady();
@@ -1684,7 +1693,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("45. a racing intent that already appended the exact candidate is idempotent success with zero further dispatch", async () => {
     const ctx = await reviseReady();
@@ -1718,7 +1727,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("46. a racing intent with a changed plan binding is rejected with zero task dispatch", async () => {
     const ctx = await reviseReady();
@@ -1757,7 +1766,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("47. a post-task snapshot with a mutated predecessor digest is invalid state", async () => {
     const ctx = await reviseReady();
@@ -1792,7 +1801,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("48. a post-task snapshot with a mutated early foreign task record is invalid state", async () => {
     const ctx = await reviseReady();
@@ -1827,7 +1836,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("49. a post-task snapshot with a foreign record inserted before the exact candidate is invalid state", async () => {
     const ctx = await reviseReady();
@@ -1862,7 +1871,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("50. a hostile post-intent snapshot with a second wait record is invalid state", async () => {
     const ctx = await reviseReady();
@@ -1896,7 +1905,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("51. malformed post-dispatch snapshot shapes yield typed invalid state, never a TypeError", async () => {
     const firstRecord = (value: unknown): Record<string, unknown> | undefined => {
@@ -2064,7 +2073,9 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  // measured: recorded par2 timeout under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("52. the racing P2 result is exactly the classified snapshot with no re-read and zero further dispatch", async () => {
     const ctx = await reviseReady();
@@ -2117,7 +2128,7 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("53. a foreign wait record inserted before the target wait is rejected as invalid state", async () => {
     const ctx = await reviseReady();
@@ -2158,4 +2169,4 @@ test("27. the revise acceptance composes the existing layers only (source scan)"
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);

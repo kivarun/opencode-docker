@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -698,7 +707,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. the result is deep-frozen and content-free", async () => {
     const ctx = await replannedReady();
@@ -728,7 +737,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. C1 exact retry: zero dispatch, the same verified snapshot", async () => {
     const ctx = await replannedReady();
@@ -745,7 +754,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. the next plan is not accepted yet: plan_conflict", async () => {
     const ctx = await replannedReady({ withoutPlanAcceptance: true });
@@ -760,7 +769,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. the accepted plan is not the exact successor of the generation plan: plan_conflict", async () => {
     const ctx = await replannedReadyExtraPlanRevision();
@@ -775,7 +784,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. a stale task revision or a missing revised task in the compiled plan is plan_conflict", async () => {
     const stale = await replannedReady();
@@ -821,7 +830,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(foreignTask.fixture);
     }
-  });
+  }, 15000);
 
   test("7. a foreign compiled-plan pipeline identity is a lifecycle_conflict", async () => {
     const ctx = await replannedReady();
@@ -839,7 +848,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("8. fake, cloned and Proxy-wrapped compiled plans are rejected with plan_conflict and zero traps", async () => {
     const ctx = await replannedReady();
@@ -868,7 +877,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("9. fake, cloned and Proxy-wrapped intents are rejected with invalid_intent and zero traps", async () => {
     const ctx = await replannedReady();
@@ -897,7 +906,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("10. a continue_stage intent kind is rejected with invalid_intent", async () => {
     const ctx = await replannedReady({ withoutTaskRevision: true });
@@ -918,7 +927,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("11. the whole revise flow under a different intent is invalid_intent at the durable wait binding", async () => {
     const ctx = await replannedReady({ withShiftedIntent: true });
@@ -931,7 +940,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("12. a wait answered with the continue_stage action is invalid_state at the response binding", async () => {
     const ctx = await replannedReady({ withContinueResponse: true });
@@ -944,7 +953,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("13. a duplicate wait index is typed invalid_state", async () => {
     const ctx = await replannedReady();
@@ -960,7 +969,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("14. a missing, conflicting or later wait-bound task revision is typed", async () => {
     const absent = await replannedReady({ withoutTaskRevision: true });
@@ -996,7 +1005,9 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(conflicting.fixture);
     }
-  });
+  // measured: 2.7s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("15. a wrong iteration closure reason is a lifecycle_conflict; a wrong anchor is loader-typed", async () => {
     const wrongReason = await replannedReady();
@@ -1034,7 +1045,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(wrongAnchor.fixture);
     }
-  });
+  }, 15000);
 
   test("16. a generation closed with another reason is a lifecycle_conflict; a wrong anchor is loader-typed", async () => {
     const wrongReason = await replannedReady();
@@ -1070,7 +1081,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(wrongAnchor.fixture);
     }
-  });
+  }, 15000);
 
   test("17. a replaced generation plan binding is loader-typed; the opened new plan's generation is the C2 retry form", async () => {
     const replaced = await replannedReady();
@@ -1114,7 +1125,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(later.fixture);
     }
-  });
+  }, 15000);
 
   test("17b. several generations of the current plan after the replanned closure are fail-closed", async () => {
     const ctx = await replannedReady();
@@ -1155,7 +1166,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("18. a later transition or a later wait past the boundary is typed fail-closed", async () => {
     const laterTransition = await replannedReady();
@@ -1182,7 +1193,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(laterWait.fixture);
     }
-  });
+  }, 15000);
 
   test("19. the pre-check precedes the dispatch (source-order proof)", async () => {
     const { readFileSync } = await import("node:fs");
@@ -1191,7 +1202,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     const dispatch = source.indexOf("await dispatchBound(command)");
     expect(precheck).toBeGreaterThan(0);
     expect(dispatch).toBeGreaterThan(precheck);
-  });
+  }, 15000);
 
   test("20. a racing bare reducer rejection without any state change is a failure", async () => {
     const ctx = await replannedReady();
@@ -1212,7 +1223,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("21. a resolve-without-change dispatch is a lifecycle_conflict", async () => {
     const ctx = await replannedReady();
@@ -1236,7 +1247,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("22. a racing exact closure is an idempotent success through the same verification", async () => {
     const ctx = await replannedReady();
@@ -1259,7 +1270,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("23. a racing hostile closure is a failure, never a success", async () => {
     const ctx = await replannedReady();
@@ -1282,7 +1293,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("24. a wrong revision delta or a foreign run id in the post-dispatch snapshot is a lifecycle_conflict", async () => {
     const wrongDelta = await replannedReady();
@@ -1337,7 +1348,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(foreignRun.fixture);
     }
-  });
+  }, 15000);
 
   test("25. a not_committed closure keeps the open state authoritative; the fresh retry dispatches again", async () => {
     const ctx = await replannedReady();
@@ -1365,7 +1376,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("26. a durability-unknown closure adopts the candidate and poisons the sink; a fresh sink recognizes C1", async () => {
     const ctx = await replannedReady();
@@ -1393,7 +1404,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("27. two identical concurrent closings both succeed with one durable closure", async () => {
     const ctx = await replannedReady();
@@ -1409,7 +1420,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("28. a conflicting retry with another intent rewrites nothing", async () => {
     const ctx = await replannedReady();
@@ -1434,7 +1445,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("29. capture counts, bound dispatch and caller mutation isolation", async () => {
     const ctx = await replannedReady();
@@ -1498,7 +1509,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30. malformed hostile snapshots are typed invalid_state, never a TypeError", async () => {
     const variants: Array<[string, (state: PipelineV2RunState) => void]> = [
@@ -1547,7 +1558,9 @@ describe("closePipelineV2ReplannedGeneration", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  // measured: 4.5s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("31. unexpected sink getter and dispatch errors keep their identity", async () => {
     const ctx = await replannedReady();
@@ -1581,7 +1594,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("32. diagnostics are content-free across the failure paths", async () => {
     const ctx = await replannedReady();
@@ -1607,7 +1620,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("35. the post-dispatch hostile matrix: no false success through narrowed mutations", async () => {
     const variants: Array<[string, (state: PipelineV2RunState) => void]> = [
@@ -1706,7 +1719,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("36. the same post-dispatch hostile matrix through the racing PipelineV2StateError path", async () => {
     const variants: Array<(state: PipelineV2RunState) => void> = [
@@ -1738,7 +1751,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  }, 15000);
 
   test("37. an injected PipelineV2RunStateStoreError keeps the single-validator contract", async () => {
     const ctx = await replannedReady();
@@ -1789,7 +1802,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("38. the poisoned-sink capture order: all three members read once, the latch last, no traversal after it", async () => {
     const ctx = await replannedReady();
@@ -1888,7 +1901,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("39. the C2 retry form with the first iteration open is a zero-dispatch success", async () => {
     const ctx = await replannedReady();
@@ -1910,7 +1923,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("40. the racing path recognizes the full immediate suffix as an idempotent success", async () => {
     const ctx = await replannedReady();
@@ -1950,7 +1963,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("41. hostile C2 shapes: a closed new generation, a closed or second iteration and a foreign anchor never pass", async () => {
     const closedNewGeneration = await replannedReady();
@@ -2033,7 +2046,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(foreignAnchor.fixture);
     }
-  });
+  }, 15000);
 
   test("42. the prefix C2 retry form (old generation index 2, bare new generation) is a zero-dispatch success", async () => {
     const ctx = await replannedReady({ withPrefixGeneration: true });
@@ -2072,7 +2085,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("43. the prefix C2 retry form with the first iteration open is a zero-dispatch success", async () => {
     const ctx = await replannedReady({ withPrefixGeneration: true });
@@ -2093,7 +2106,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("44. the racing path recognizes the prefix C2 suffix on an old generation with index > 1", async () => {
     const ctx = await replannedReady({ withPrefixGeneration: true });
@@ -2134,7 +2147,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("45. an extra generation after the prefix C2 form is fail-closed", async () => {
     const ctx = await replannedReady({ withPrefixGeneration: true });
@@ -2169,7 +2182,7 @@ describe("closePipelineV2ReplannedGeneration", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 });
 
 test("33. the runtime export surfaces are exact (public two keys, internal two keys)", async () => {
@@ -2183,7 +2196,7 @@ test("33. the runtime export surfaces are exact (public two keys, internal two k
     "PipelineV2ReplannedGenerationControllerError",
     "closePipelineV2ReplannedGenerationInternal",
   ]);
-});
+}, 15000);
 
 test("34. the controller composes the existing layers only (source scan)", async () => {
   const { readFileSync } = await import("node:fs");
@@ -2230,4 +2243,4 @@ test("34. the controller composes the existing layers only (source scan)", async
   ]) {
     expect(source).not.toContain(banned);
   }
-});
+}, 15000);

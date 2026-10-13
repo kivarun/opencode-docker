@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -553,7 +562,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. C0 after the composition commits exactly one exact planning transition", async () => {
     const ctx = await transitionReady();
@@ -616,7 +625,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. a foreign stage with a shared entry state is lifecycle_conflict before dispatch", async () => {
     const ctx = await transitionReady({ withStageTwoGeneration: true });
@@ -644,7 +653,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. a foreign caller budget is lifecycle_conflict before dispatch", async () => {
     const ctx = await transitionReady();
@@ -665,7 +674,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. the exact durable transition is a zero-dispatch C1 retry", async () => {
     const ctx = await transitionReady();
@@ -681,7 +690,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. a durable transition changed in one field is lifecycle_conflict with zero dispatch", async () => {
     const ctx = await transitionReady();
@@ -703,7 +712,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("7. a dispatch that resolves without the durable change is invalid_state", async () => {
     const ctx = await transitionReady();
@@ -718,7 +727,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("8. not_committed keeps the previous snapshot and a fresh retry commits the transition", async () => {
     const ctx = await transitionReady();
@@ -745,7 +754,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("9. durability_unknown adopts the candidate and a fresh retry is a zero-dispatch recognition", async () => {
     const ctx = await transitionReady();
@@ -772,7 +781,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("10. provenance gates: forged intents and plans, Proxy pipelines and hostile budgets are rejected before any dispatch", async () => {
     const ctx = await transitionReady();
@@ -819,7 +828,7 @@ describe("openPipelineV2ReplannedStageTransition", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 });
 
 /**
@@ -871,7 +880,7 @@ describe("post-dispatch full verification", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("14. a changed schema_version is invalid_state", async () => {
     const ctx = await transitionReady();
@@ -886,7 +895,7 @@ describe("post-dispatch full verification", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("15. a changed protected input digest is invalid_state", async () => {
     const ctx = await transitionReady();
@@ -901,7 +910,7 @@ describe("post-dispatch full verification", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("16. a changed historical grant is invalid_state (real grant fixture)", async () => {
     const ctx = await transitionReady({ withGrantHistory: true });
@@ -918,7 +927,7 @@ describe("post-dispatch full verification", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("17. hostile historical decision results are invalid_state", async () => {
     // Every variant needs its own fresh C0 boundary: the hostile sink
@@ -961,7 +970,9 @@ describe("post-dispatch full verification", () => {
         await disposeRun(ctx.fixture);
       }
     }
-  });
+  // measured: 5.0s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 });
 
 test("11. the runtime export surfaces are exact (public two keys, internal two keys)", async () => {
@@ -976,7 +987,7 @@ test("11. the runtime export surfaces are exact (public two keys, internal two k
     "openPipelineV2ReplannedStageTransitionInternal",
   ]);
   expect(PublicError).toBe(PipelineV2ReplannedStageTransitionControllerError);
-});
+}, 15000);
 
 test("12. the controller composes the existing layers only (source scan)", async () => {
   const { readFile } = await import("node:fs/promises");
@@ -1031,4 +1042,4 @@ test("12. the controller composes the existing layers only (source scan)", async
   }
   expect(countOf("Object.freeze")).toBe(0);
   expect(countOf("let production")).toBe(0);
-});
+}, 15000);

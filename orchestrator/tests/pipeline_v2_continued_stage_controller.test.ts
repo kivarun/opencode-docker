@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -571,7 +580,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("2. the result is deep-frozen, content-free and round-trips through the loader", async () => {
     const ctx = await continuedStageReady();
@@ -601,7 +610,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("3. the C1 partial retry runs closure, response and open only", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 } });
@@ -620,7 +629,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("4. the C2 partial retry runs response and open only", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true });
@@ -637,7 +646,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("5. the C3 orphan response retry: identity error, no open, fresh retry commits response and open once", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true });
@@ -666,7 +675,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("6. the C4 committed response retry: the completion is zero-dispatch and only the iteration opens", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -682,7 +691,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("7. the C4 durability-unknown window: identity error, poisoned sink, fresh retry opens", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true });
@@ -706,7 +715,9 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  // measured: 3.8s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("8. the C5 exact already-open retry is a zero-dispatch full retry", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -722,7 +733,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("9. a deviating open iteration is never the C5 retry: the typed grant refusal passes by identity", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -741,7 +752,9 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  // measured: 3.0s under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("10. a hostile presentation preserving a mismatching budget never succeeds", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -769,7 +782,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("11. hostile successful completion results are invalid_result with zero ensure calls", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -836,7 +849,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("12. malformed completion results are invalid_result, never a TypeError", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -918,7 +931,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("13. hostile successful ensure results are invalid_result", async () => {
     const ctx = await continuedStageReady();
@@ -988,7 +1001,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("14. a grant not-committed passes through and a fresh retry runs the full suffix", async () => {
     const ctx = await continuedStageReady();
@@ -1018,7 +1031,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("15. a grant durability-unknown adopts the grant and a fresh retry completes the suffix", async () => {
     const ctx = await continuedStageReady();
@@ -1045,7 +1058,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("16. a closure not-committed keeps the grant and a fresh retry runs the remaining suffix", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 } });
@@ -1072,7 +1085,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("17. an iteration-open not-committed passes through and a fresh retry opens once", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true });
@@ -1096,7 +1109,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("18. two identical concurrent calls converge to one durable state", async () => {
     const ctx = await continuedStageReady();
@@ -1119,7 +1132,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("19. a conflicting caller budget is refused by the completion policy verification before the ensure", async () => {
     const ctx = await continuedStageReady();
@@ -1144,7 +1157,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("20. a stage id that is not in the compiled plan is the compiled resolver's typed error before any dispatch", async () => {
     const ctx = await continuedStageReady();
@@ -1173,7 +1186,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("21. a compiled plan of a foreign pipeline is the ensure controller's lifecycle_conflict by identity", async () => {
     await withTwoPipelines(async (first, second) => {
@@ -1204,7 +1217,7 @@ describe("openPipelineV2ContinuedStage", () => {
         await disposeRun(ctx.fixture);
       }
     });
-  });
+  }, 15000);
 
   test("22. a conflicting durable grant surfaces the typed grant conflict by identity", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 5 } });
@@ -1217,7 +1230,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("23. a boundary answered with another action is re-thrown by identity, never reconciled", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true });
@@ -1231,7 +1244,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("24. caller mutation after the dispatch cannot change the captured policy or the captured ops", async () => {
     const ctx = await continuedStageReady();
@@ -1269,7 +1282,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("25. the completion result's generation_index is bound to the verified durable grant boundary", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -1294,7 +1307,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("26. the completion result's iteration_index is bound to the grant-closed iteration", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -1319,7 +1332,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("27. a second conflicting grant of the granted pair is invalid_result with zero ensure calls", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -1350,7 +1363,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("28. a hostile ensure result changing only the grant closure's wait_index is invalid_result; the exact closure is still accepted", async () => {
     const ctx = await continuedStageReady();
@@ -1387,7 +1400,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(fresh.fixture);
     }
-  });
+  }, 15000);
 
   test("29. a hostile C5 ensure result changing only updated_at is invalid_result", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true, openNextIteration: true });
@@ -1411,7 +1424,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("30. a non-C5 completion error is re-thrown as the exact same object", async () => {
     const ctx = await continuedStageReady();
@@ -1444,7 +1457,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("31. an ensure error is re-thrown as the exact same object", async () => {
     const ctx = await continuedStageReady();
@@ -1470,7 +1483,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 
   test("32. a lifecycle_conflict that is not the exact C5 shape is re-thrown as the exact same object", async () => {
     const ctx = await continuedStageReady({ recordGrant: { additionalIterations: 2 }, closeGrantIteration: true, recordResponse: true });
@@ -1503,7 +1516,7 @@ describe("openPipelineV2ContinuedStage", () => {
     } finally {
       await disposeRun(ctx.fixture);
     }
-  });
+  }, 15000);
 });
 
 test("33. the runtime export surfaces are exact (public two keys, internal three keys)", async () => {
@@ -1521,7 +1534,7 @@ test("33. the runtime export surfaces are exact (public two keys, internal three
   expect(productionContinuedStageOps.completeStage).toBe(completePipelineV2ContinueStage);
   expect(productionContinuedStageOps.ensureStageIteration).toBe(ensurePipelineV2StageIteration);
   expect(Object.isFrozen(productionContinuedStageOps)).toBe(true);
-});
+}, 15000);
 
 test("34. the composition module imports only the composed layers (source scan)", async () => {
   const { readFile } = await import("node:fs/promises");
@@ -1568,4 +1581,4 @@ test("34. the composition module imports only the composed layers (source scan)"
     "./pipeline_v2_state.ts",
   ]);
   expect(countOf("import ")).toBe(9);
-});
+}, 15000);

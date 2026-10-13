@@ -5,6 +5,15 @@
  * CLI default selection, the packaging assumptions, and the full
  * operator-facing chain through the public CLI.
  */
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -60,7 +69,7 @@ test("the bundled v2 default loads, digests deterministically, and stays portabl
   } finally {
     rmSync(copyRoot, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 test("every referenced bundle asset exists", async () => {
   for (const path of [
@@ -72,7 +81,7 @@ test("every referenced bundle asset exists", async () => {
   ]) {
     expect(existsSync(join(V2_BUNDLE, path))).toBe(true);
   }
-});
+}, 15000);
 
 test("compiled roles: architect is the planning state with the exact plan_output and trusted stage_wait; execute is the development stage", async () => {
   const pipeline = await loadPipelineV2(V2_BUNDLE);
@@ -95,7 +104,7 @@ test("compiled roles: architect is the planning state with the exact plan_output
     throw new Error("unreachable");
   }
   expect(stage.stage_template).toBe("development");
-});
+}, 15000);
 
 test("the planning output is a JSON proposal port and the stage output is a JSON result port", async () => {
   const pipeline = await loadPipelineV2(V2_BUNDLE);
@@ -130,7 +139,7 @@ test("the planning output is a JSON proposal port and the stage output is a JSON
   expect(pipeline.inputs.map((input) => ({ id: input.id, type: input.type, protected: input.protected }))).toEqual([
     { id: "task", type: "file", protected: true },
   ]);
-});
+}, 15000);
 
 test("the v2-native result schema drops the legacy identity fields and keeps the v1 constraints", async () => {
   const schemaText = await readFile(join(V2_BUNDLE, "schemas", "agent-result-v2.schema.json"), "utf8");
@@ -154,7 +163,7 @@ test("the v2-native result schema drops the legacy identity fields and keeps the
   const v1Schema = JSON.parse(await readFile(join(V1_BUNDLE, "schemas", "agent-result.schema.json"), "utf8")) as Record<string, unknown>;
   expect(v1Schema["required"]).toContain("run_id");
   expect(v1Schema["required"]).toContain("activation_index");
-});
+}, 15000);
 
 test("the planning prompt demands the documented deterministic proposal; the prompts use only declared output paths", async () => {
   const architectPrompt = await readFile(join(V2_BUNDLE, "prompts", "architect.md"), "utf8");
@@ -178,7 +187,7 @@ test("the planning prompt demands the documented deterministic proposal; the pro
   expect(executePrompt).not.toContain("run_plan_proposal");
   // no prompt demands a legacy v1 result contract
   expect(executePrompt).not.toContain("Write the structured result");
-});
+}, 15000);
 
 test("the v1 default bundle is preserved: the v1 loader accepts it and the v2 loader rejects it", async () => {
   const v1 = await loadPipeline(V1_BUNDLE);
@@ -202,7 +211,7 @@ test("the v1 default bundle is preserved: the v1 loader accepts it and the v2 lo
     v1Error = cause instanceof Error ? cause.message : String(cause);
   }
   expect(v1Error).toBe("pipeline schema version 2 is not executable yet");
-});
+}, 15000);
 
 test("the data plane works on the bundled v2 default", async () => {
   const pipeline = await loadPipelineV2(V2_BUNDLE);
@@ -227,7 +236,7 @@ test("the data plane works on the bundled v2 default", async () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // ---------------------------------------------------------------------------
 // CLI grammar: the run default selection and unchanged explicit behavior.
@@ -245,7 +254,7 @@ test("run without --pipeline-root resolves the bundled v2 default in the parser"
   expect(DEFAULT_PIPELINE_ROOT).toBe("/opt/orchestrator/pipelines/default");
   const agentSmoke = parseCommand("agent-smoke", ["--config-root=/c"]);
   expect(agentSmoke.kind === "agent-smoke" && agentSmoke.pipelineRoot).toBe(DEFAULT_PIPELINE_ROOT);
-});
+}, 15000);
 
 test("run with an explicit --pipeline-root keeps the exact previous behavior", () => {
   const parsed = parseCommand("run", ["--pipeline-root", "/custom/root", "--config-root=/c", "--project=/pr"]);
@@ -260,7 +269,7 @@ test("run with an explicit --pipeline-root keeps the exact previous behavior", (
   expect(() => parseCommand("run", ["--pipeline-root=/a", "--pipeline-root=/b", "--config-root=/c", "--project=/pr"])).toThrow(
     "--pipeline-root may be given at most once",
   );
-});
+}, 15000);
 
 test("the usage documents the optional flag, the bundled v2 default and the manual continuation", () => {
   const text = usage();
@@ -275,7 +284,7 @@ test("the usage documents the optional flag, the bundled v2 default and the manu
   expect(text).toContain("'plan_ready' auto policy, so one 'run' command can");
   expect(text).toContain("without that policy stops with the planReady outcome");
   expect(text).toContain("planning path).");
-});
+}, 15000);
 
 // ---------------------------------------------------------------------------
 // Packaging: the whole pipelines/ tree ships; the installed path is the
@@ -290,7 +299,7 @@ test("the packaging assumption holds: the Dockerfile copies pipelines/ wholesale
   expect(DEFAULT_PIPELINE_V2_ROOT).toBe("/opt/orchestrator/pipelines/default-v2");
   expect(DEFAULT_PIPELINE_ROOT).toBe("/opt/orchestrator/pipelines/default");
   expect(existsSync(V2_BUNDLE)).toBe(true);
-});
+}, 15000);
 
 // ---------------------------------------------------------------------------
 // Production E2E of the tracked bundle through the public CLI.
@@ -570,7 +579,7 @@ test("e2e: the tracked bundled v2 default runs to terminal success in one comman
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 function statDirSafe(path: string): boolean {
   try {
@@ -635,7 +644,7 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
   } finally {
     rmSync(stateRoot, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 // ---------------------------------------------------------------------------
 // The durable restart windows (A0-A5) of the automatic plan-ready
@@ -892,4 +901,6 @@ test("e2e: plain orchestrator resume auto-continues every durable plan-ready res
       rmSync(root, { recursive: true, force: true });
     }
   }
-});
+// measured: recorded par8 timeout under bun test --parallel=2 (2026-10-13); local deadline
+// headroom only - assertions, matrices and fixtures unchanged.
+}, 15000);

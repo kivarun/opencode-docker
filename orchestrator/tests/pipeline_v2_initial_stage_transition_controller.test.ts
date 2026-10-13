@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -664,7 +673,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("2. C1: the exact durable transition is a zero-dispatch retry with the identical result", async () => {
     const ctx = await acceptedBoundary();
@@ -678,7 +687,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("3. the fresh acceptance boundary without the opened generation is refused with zero dispatch", async () => {
     const ctx = await acceptedBoundary();
@@ -695,7 +704,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("4. the control-prefix boundary commits the transition of the third execution", async () => {
     const fixture = await makeFixture({ control: true });
@@ -794,7 +803,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("5. the pipeline provenance gate rejects hand-built, cloned and Proxy pipelines before any read or effect", async () => {
     const ctx = await acceptedBoundary();
@@ -822,7 +831,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("6. the invalid_options matrix refuses before any read or effect", async () => {
     const ctx = await acceptedBoundary();
@@ -857,7 +866,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("7. the poisoned sink refuses with zero dispatch", async () => {
     const ctx = await acceptedBoundary();
@@ -883,7 +892,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("8. a missing or invalid durable snapshot is a typed invalid_state with zero dispatch", async () => {
     const ctx = await acceptedBoundary();
@@ -909,7 +918,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("9. a foreign compiled plan is a lifecycle_conflict naming the identity field", async () => {
     const ctx = await acceptedBoundary();
@@ -962,7 +971,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("10. an unknown stage id is the compiled resolver's typed error with zero dispatch", async () => {
     const ctx = await acceptedBoundary();
@@ -975,7 +984,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("11. a failed run is refused with zero dispatch", async () => {
     const fixture = await makeFixture();
@@ -1031,7 +1040,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("12. the pre-acceptance boundary without a plan revision is refused", async () => {
     const fixture = await makeFixture();
@@ -1071,7 +1080,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("13. an in-flight planning execution is refused", async () => {
     const fixture = await makeFixture();
@@ -1111,7 +1120,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("14. a settled stage execution (not planning) on the cursor is refused", async () => {
     const ctx = await acceptedBoundary();
@@ -1139,7 +1148,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("15. a compiled plan that does not match the accepted plan revision is a lifecycle_conflict", async () => {
     const ctx = await acceptedBoundary();
@@ -1183,7 +1192,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("16. a durable generation bound to another budget is a lifecycle_conflict", async () => {
     const fixture = await makeFixture();
@@ -1212,7 +1221,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("17. a committed transition to a different target is a C1 lifecycle_conflict with zero dispatch", async () => {
     const ctx = await acceptedBoundary();
@@ -1234,7 +1243,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("18. the edge gate refuses a stage whose entry differs from the completed edge with zero generation writes", async () => {
     const fixture = await makeFixture({ edge: true });
@@ -1299,7 +1308,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("19. not_committed keeps the previous snapshot and a fresh retry commits the transition", async () => {
     const ctx = await acceptedBoundary();
@@ -1328,7 +1337,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("20. durability_unknown adopts the candidate and a fresh reopened sink recognizes the transition with zero dispatch", async () => {
     const ctx = await acceptedBoundary();
@@ -1360,7 +1369,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("21. a racing identical dispatch is an idempotent success; a racing different transition is a lifecycle_conflict", async () => {
     const ctx = await acceptedBoundary();
@@ -1417,7 +1426,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("22. a dispatch that resolves without any durable change is an invalid_state", async () => {
     const ctx = await acceptedBoundary();
@@ -1440,7 +1449,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("23. a hostile post-dispatch snapshot is an invalid_state per mutated field", async () => {
     const mutations: Array<[string, (state: PipelineV2RunState) => void]> = [
@@ -1466,7 +1475,9 @@ describe("openPipelineV2InitialStageTransition", () => {
           await rm(ctx.fixture.root, { recursive: true, force: true });
         }
       }
-  });
+  // measured: recorded par2 timeout under bun test --parallel=2 (2026-10-13); local deadline
+  // headroom only - assertions, matrices and fixtures unchanged.
+  }, 15000);
 
   test("24. caller mutation after the pending dispatch cannot redirect the captured policy", async () => {
     const ctx = await acceptedBoundary();
@@ -1487,7 +1498,7 @@ describe("openPipelineV2InitialStageTransition", () => {
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   test("25. the export surfaces are exactly the contract", async () => {
     const publicModule = await import("../src/pipeline_v2_initial_stage_transition_controller.ts");
@@ -1500,7 +1511,7 @@ describe("openPipelineV2InitialStageTransition", () => {
       "PipelineV2InitialStageTransitionControllerError",
       "openPipelineV2InitialStageTransitionInternal",
     ]);
-  });
+  }, 15000);
 
   test("26. the controller composes the shared kernel only (source scan)", async () => {
     const { readFile } = await import("node:fs/promises");
@@ -1542,5 +1553,5 @@ describe("openPipelineV2InitialStageTransition", () => {
     ]) {
       expect(source).not.toContain(banned);
     }
-  });
+  }, 15000);
 });
