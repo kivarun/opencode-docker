@@ -1,0 +1,14 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+
+RUN apk add --no-cache \
+    picocom \
+    lrzsz \
+    usbutils \
+    libusb \
+    python3 \
+    py3-pyserial
+
+USER opencode
