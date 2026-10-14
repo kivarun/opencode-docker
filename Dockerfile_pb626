@@ -3,9 +3,10 @@ FROM ${BASE_IMAGE}
 
 USER root
 
+# lrzsz (rz/sz) was removed from the Alpine aports and is unavailable in
+# every current repository; picocom stays usable as the serial terminal.
 RUN apk add --no-cache \
     picocom \
-    lrzsz \
     usbutils \
     libusb \
     python3 \
