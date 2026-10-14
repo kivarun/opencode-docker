@@ -4,11 +4,13 @@ Repo of Dockerfiles for OpenCode agent images (published to GHCR via CI) plus an
 
 ## Verification commands
 
-- Orchestrator tests (only test suite in repo): `cd orchestrator && bun test`
+- Orchestrator tests (only test suite in repo): `cd orchestrator && bun run test` — the pinned package script running the full suite as file-level isolated `bun test --parallel=2`.
+  - Direct `bun test` (sequential) is only the diagnostic/baseline mode, and targeted suites run directly as `bun test ./tests/<file>.test.ts`.
+  - The fixed worker count 2 is the measured limit for this durable/fsync-heavy suite (measured 2026-10-13: parallel=4/8 inflate durable-commit contention and the timeout flake rate without a wall-time win). Do not raise the parallelism or add `--concurrent` on your own.
   - Tests use fake CLI runners and temp dirs; no docker, network, or docker-helper needed.
 - Type checking (from repo root): `tsc --noEmit -p orchestrator`. `bun test` does not type-check TypeScript.
   - `orchestrator/package.json` + `orchestrator/bun.lock` pin all orchestrator dependencies (runtime: `ajv` 8.17.1; dev: `@types/bun` 1.4.1 with an `overrides` pin on `@types/node` 26.5.0). Install them with `cd orchestrator && bun install --frozen-lockfile` (needs `orchestrator/node_modules`, which is gitignored and never committed). Type checking additionally needs a prepared environment with `tsc` on PATH.
-- CI (`.github/workflows/`) only plans/builds images — it does **not** run orchestrator tests. Run `bun test` locally before pushing.
+- CI (`.github/workflows/`) only plans/builds images — it does **not** run orchestrator tests. Run `bun run test` locally before pushing.
 - Shell/workflow checks (from repo root): `shellcheck scripts/*.sh gdk/*.sh`, `yamllint .github/`, `actionlint`. Preserve the existing targeted `# yamllint disable-line` markers in workflows.
 - If required tools or dependencies are unavailable, report the affected checks as not run, not passed.
 
