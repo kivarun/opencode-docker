@@ -32,8 +32,10 @@
  * (canonical JSON sorts the keys; the schema version is the number 1).
  * It carries no paths, no config, no launcher, no inputs, no timestamps
  * and no credentials. After publication a binding is never updated,
- * rewritten, replaced or deleted; the store exposes no list, delete or
- * update API and performs no directory discovery.
+ * rewritten, replaced or deleted; the store exposes no delete or update
+ * API. The one read-only enumeration (`listRunBindingsWithIo`) re-verifies
+ * the namespace and partitions its entries by the exact binding-file and
+ * substrate temp grammars - no other directory discovery exists.
  *
  * Claim semantics: the caller resolves the request and the project
  * through the registry first; the claim happens immediately before the
@@ -82,6 +84,7 @@ import type { Stats } from "node:fs";
 import {
   ImmutableDocumentStoreError,
   describeImmutableObject,
+  isImmutablePublicationTempName,
   ensureImmutableDirectory,
   immutableDocumentErrnoSuffix,
   inspectStoredDocumentOrNull,
@@ -558,6 +561,70 @@ export async function claimRunBindingWithIo(
  * failure. Nothing is created, repaired, rewritten or removed, and the
  * store never looks at any Pipeline V2 run tree.
  */
+
+/**
+ * One binding projection of the authoritative enumeration: only the run
+ * id and the project id - never paths, modes, digests or timestamps.
+ */
+export interface ListedControlPlaneRunBinding {
+  readonly runId: string;
+  readonly projectId: string;
+}
+
+/**
+ * The authoritative read-only enumeration of the durable bindings. The
+ * store root and the `bindings/` namespace are re-verified against the
+ * open-time fixation; the namespace entries are enumerated once with
+ * `readdir`, partitioned by the exact binding-file name grammar and the
+ * substrate-owned temp-file grammar, and every final binding file is
+ * loaded through the existing single leaf-verification path. A name that
+ * is neither a final binding nor a protocol temp file is corruption and
+ * fails closed as `binding_invalid`; nothing is ever created, repaired,
+ * rewritten or removed, no Pipeline V2 run tree is read and no in-memory
+ * index is kept. The result is sorted lexicographically by run id and
+ * freshly frozen.
+ */
+export async function listRunBindingsWithIo(
+  io: RunBindingStoreIo,
+  state: RunBindingStoreState,
+): Promise<readonly ListedControlPlaneRunBinding[]> {
+  return await withBindingGuard(async () => {
+    await verifyStoreRoot(state);
+    const bindingsPath = await verifyBindingsDirectory(state);
+    if (bindingsPath === null) {
+      return deepFreezeValue([] as readonly ListedControlPlaneRunBinding[]);
+    }
+    let names: string[];
+    try {
+      names = await io.readdirNames(bindingsPath);
+    } catch (cause) {
+      throw storeUnavailable(`the bindings directory cannot be enumerated${immutableDocumentErrnoSuffix(cause)}`);
+    }
+    const bindings: ListedControlPlaneRunBinding[] = [];
+    for (const name of names) {
+      if (!name.endsWith(BINDING_FILE_SUFFIX)) {
+        if (isImmutablePublicationTempName(name, TEMP_PREFIX)) {
+          continue;
+        }
+        throw bindingInvalid("the bindings directory carries an unrecognized entry");
+      }
+      const runId = name.slice(0, name.length - BINDING_FILE_SUFFIX.length);
+      if (!isPipelineV2SafeId(runId)) {
+        throw bindingInvalid("the bindings directory carries an entry that is not a run binding file");
+      }
+      const leafPath = bindingLeafPath(bindingsPath, runId);
+      const info = await inspectBindingLeaf(io, leafPath);
+      if (info === null) {
+        throw bindingInvalid("the bindings directory carries an entry that is not a run binding file");
+      }
+      const binding = await loadBindingLeafFromInfo(io, leafPath, info, runId);
+      bindings.push({ runId: binding.runId, projectId: binding.projectId });
+    }
+    bindings.sort((first, second) => (first.runId < second.runId ? -1 : first.runId > second.runId ? 1 : 0));
+    return deepFreezeValue(bindings as readonly ListedControlPlaneRunBinding[]);
+  });
+}
+
 export async function loadRunBindingWithIo(
   io: RunBindingStoreIo,
   state: RunBindingStoreState,

@@ -16,8 +16,9 @@
  * store-owned 0700 `bindings/` namespace, through the one shared
  * immutable publication protocol (exclusive temp file, fsync, exclusive
  * `link()`, parent fsync, read-back verification). A published binding is
- * never updated, rewritten or removed; there is no list, delete or update
- * API. The store never touches the Pipeline V2 run root or the durable
+ * never updated, rewritten or removed; there is no delete or update API,
+ * and the read-only `listBindings` enumeration is the single discovery
+ * source of the service. The store never touches the Pipeline V2 run root or the durable
  * run state tree, and a CLI-created run without a binding fails closed
  * (`binding_not_found`) — it is never adopted and never guessed from raw
  * state; operator import/adoption is a separate future increment.
@@ -37,17 +38,24 @@ import {
 import {
   ControlPlaneRunBindingError,
   claimRunBindingWithIo,
+  listRunBindingsWithIo,
   loadRunBindingWithIo,
   openRunBindingStoreWithIo,
   realRunBindingStoreIo,
   type ControlPlaneRunBinding,
   type ControlPlaneRunBindingClaim,
   type ControlPlaneRunBindingFailureReason,
+  type ListedControlPlaneRunBinding,
   type RunBindingStoreState,
 } from "./run_binding_store_internal.ts";
 
 export { ControlPlaneRunBindingError };
-export type { ControlPlaneRunBinding, ControlPlaneRunBindingClaim, ControlPlaneRunBindingFailureReason };
+export type {
+  ControlPlaneRunBinding,
+  ControlPlaneRunBindingClaim,
+  ControlPlaneRunBindingFailureReason,
+  ListedControlPlaneRunBinding,
+};
 
 /**
  * The durable run binding store. Opened once per use against one
@@ -84,6 +92,17 @@ export class ControlPlaneRunBindingStore {
    */
   load(runId: string): Promise<ControlPlaneRunBinding> {
     return loadRunBindingWithIo(realRunBindingStoreIo, this.state, runId);
+  }
+
+  /**
+   * The authoritative read-only enumeration of every durable binding,
+   * sorted lexicographically by run id: the one discovery source of the
+   * service. The namespace is re-verified, protocol temp files are
+   * ignored by the substrate-owned grammar and any other unexpected or
+   * defective entry fails closed; nothing is written, repaired or cached.
+   */
+  listBindings(): Promise<readonly ListedControlPlaneRunBinding[]> {
+    return listRunBindingsWithIo(realRunBindingStoreIo, this.state);
   }
 }
 

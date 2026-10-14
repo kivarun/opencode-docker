@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import type { Stats } from "node:fs";
 import {
   chmod,
@@ -203,7 +212,7 @@ test("1. task publish/load round-trip: exact path, canonical bytes, binding", as
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("2. plan publish/load round-trip: exact path, canonical bytes, binding", async () => {
   const fixture = await setup();
@@ -220,7 +229,7 @@ test("2. plan publish/load round-trip: exact path, canonical bytes, binding", as
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 3-4. canonical bytes and modes ------------------------------------------
 
@@ -239,7 +248,7 @@ test("3. stored bytes are exactly the canonical JSON without a trailing newline"
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("4. directory components have mode 0700, manifest files mode 0600", async () => {
   const fixture = await setup();
@@ -255,7 +264,7 @@ test("4. directory components have mode 0700, manifest files mode 0600", async (
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 5. missing tree load ------------------------------------------------------
 
@@ -272,7 +281,7 @@ test("5. missing tree load returns null and leaves the filesystem untouched", as
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 6-9. idempotency and conflicts -------------------------------------------
 
@@ -292,7 +301,7 @@ test("6. repeated exact task publication preserves inode, mtime, bytes", async (
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("7. repeated exact plan publication preserves inode, mtime, bytes", async () => {
   const fixture = await setup();
@@ -310,7 +319,7 @@ test("7. repeated exact plan publication preserves inode, mtime, bytes", async (
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("8. conflicting task body fails as conflict and the old file is untouched", async () => {
   const fixture = await setup();
@@ -329,7 +338,7 @@ test("8. conflicting task body fails as conflict and the old file is untouched",
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("9. a different plan on the same revision path is a typed conflict", async () => {
   const fixture = await setup();
@@ -347,7 +356,7 @@ test("9. a different plan on the same revision path is a typed conflict", async 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 10-12. bindings -----------------------------------------------------------
 
@@ -366,7 +375,7 @@ test("10. run-id/basename mismatch fails before anything is written", async () =
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("11. the task path is bound by the manifest task id and revision only", async () => {
   const fixture = await setup();
@@ -384,7 +393,7 @@ test("11. the task path is bound by the manifest task id and revision only", asy
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("12. the plan path is bound by the manifest revision only", async () => {
   const fixture = await setup();
@@ -397,7 +406,7 @@ test("12. the plan path is bound by the manifest revision only", async () => {
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 13-19. damaged artifacts and layouts --------------------------------------
 
@@ -426,7 +435,7 @@ test("13. malformed JSON load keeps the existing manifest error class", async ()
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("14. a noncanonical but valid JSON artifact fails as conflict on load", async () => {
   const fixture = await setup();
@@ -468,7 +477,7 @@ test("14. a noncanonical but valid JSON artifact fails as conflict on load", asy
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("15. a stored artifact with the wrong mode fails as conflict", async () => {
   const fixture = await setup();
@@ -486,7 +495,7 @@ test("15. a stored artifact with the wrong mode fails as conflict", async () => 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("16. a symlinked artifact target fails as conflict on load and publication", async () => {
   const fixture = await setup();
@@ -506,7 +515,7 @@ test("16. a symlinked artifact target fails as conflict on load and publication"
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("17. directory, FIFO and socket artifact targets fail closed and stay untouched", async () => {
   const fixture = await setup();
@@ -528,7 +537,7 @@ test("17. directory, FIFO and socket artifact targets fail closed and stay untou
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("18. a symlinked store-owned directory component fails closed as invalid layout", async () => {
   const fixture = await setup();
@@ -574,7 +583,7 @@ test("18. a symlinked store-owned directory component fails closed as invalid la
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 
 test("19. a regular file in place of any store-owned directory component fails closed", async () => {
@@ -608,7 +617,7 @@ test("19. a regular file in place of any store-owned directory component fails c
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 20-21. write loop ---------------------------------------------------------
 
@@ -636,7 +645,7 @@ test("20. partial writes are completed by the write-all loop", async () => {
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("21. a zero-progress, NaN or oversized write fails after exactly one attempt", async () => {
   const fixture = await setup();
@@ -666,7 +675,7 @@ test("21. a zero-progress, NaN or oversized write fails after exactly one attemp
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 22-23. fault matrices ------------------------------------------------------
 
@@ -764,7 +773,7 @@ test("22. pre-link fault matrix: mkdir, chmod, open, stat, write, fsync, close, 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("23. post-link fault matrix: temp unlink and parent durability become durability_unknown, exact retry confirms", async () => {
   const fixture = await setup();
@@ -866,7 +875,7 @@ test("23. post-link fault matrix: temp unlink and parent durability become durab
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 24-26. concurrency ---------------------------------------------------------
 
@@ -884,7 +893,7 @@ test("24. concurrent identical task publishers both succeed through a link barri
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("25. concurrent conflicting task publishers: one wins, the loser gets a conflict", async () => {
   const fixture = await setup();
@@ -905,7 +914,7 @@ test("25. concurrent conflicting task publishers: one wins, the loser gets a con
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("26. concurrent plan publishers: identical both succeed, conflicting one wins", async () => {
   const fixture = await setup();
@@ -932,7 +941,7 @@ test("26. concurrent plan publishers: identical both succeed, conflicting one wi
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 27-28. temp hygiene ---------------------------------------------------------
 
@@ -952,7 +961,7 @@ test("27. an orphan temp file does not block publication", async () => {
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("28. the temp cleanup ownership gate never removes a substituted object", async () => {
   const fixture = await setup();
@@ -994,7 +1003,7 @@ test("28. the temp cleanup ownership gate never removes a substituted object", a
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 29-33. isolation, diagnostics, surface, proofs ------------------------------
 
@@ -1022,7 +1031,7 @@ test("29. published results are deep-frozen and input mutations cannot reach the
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("30. diagnostics never contain manifest bodies, task bodies, raw JSON or canaries", async () => {
   const fixture = await setup();
@@ -1056,7 +1065,7 @@ test("30. diagnostics never contain manifest bodies, task bodies, raw JSON or ca
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("31. the public export surface carries exactly the seven runtime keys", async () => {
   const namespace = (await import("../src/pipeline_v2_run_plan_store.ts")) as Record<string, unknown>;
@@ -1070,7 +1079,7 @@ test("31. the public export surface carries exactly the seven runtime keys", asy
     "publishPipelineV2TaskRevision",
     "publishPipelineV2WaitIntent",
   ]);
-});
+}, 15000);
 
 test("32. the immutable publication protocol lives exactly once (single-protocol source proof)", async () => {
   const { readFileSync } = await import("node:fs");
@@ -1126,7 +1135,7 @@ test("32. the immutable publication protocol lives exactly once (single-protocol
     expect(adapter.includes("O_CREAT")).toBe(false);
     expect(adapter.includes("O_EXCL")).toBe(false);
   }
-});
+}, 15000);
 
 test("33. publication never modifies anything outside <runRoot>/run-plan", async () => {
   const fixture = await setup();
@@ -1167,7 +1176,7 @@ test("33. publication never modifies anything outside <runRoot>/run-plan", async
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 34-38. concurrent directory adoption and parent durability ---------------
 
@@ -1212,7 +1221,7 @@ test("34. a concurrently created correct task directory is adopted without chmod
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("35. a concurrently created wrong-mode task directory fails closed without repair", async () => {
   const fixture = await setup();
@@ -1257,7 +1266,7 @@ test("35. a concurrently created wrong-mode task directory fails closed without 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("36. a chmod failure on a directory created by this call still removes it", async () => {
   const fixture = await setup();
@@ -1282,7 +1291,7 @@ test("36. a chmod failure on a directory created by this call still removes it",
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("37. a parent fsync failure after creating the directory keeps not_published and may leave it", async () => {
   const fixture = await setup();
@@ -1305,7 +1314,7 @@ test("37. a parent fsync failure after creating the directory keeps not_publishe
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("38. an exact retry after a parent fsync failure adopts the directory, re-syncs the parent and publishes", async () => {
   const fixture = await setup();
@@ -1344,7 +1353,7 @@ test("38. an exact retry after a parent fsync failure adopts the directory, re-s
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("39. a concurrently created regular file at a directory component fails as invalid layout", async () => {
   const fixture = await setup();
@@ -1408,7 +1417,7 @@ test("39. a concurrently created regular file at a directory component fails as 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 // --- 40-56. wait intent store -------------------------------------------------
 
@@ -1481,7 +1490,7 @@ test("40. continue intent publish/load round-trip: exact layout, modes and canon
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("41. revise intent publish/load round-trip with the same exact contract", async () => {
   const fixture = await setup();
@@ -1502,7 +1511,7 @@ test("41. revise intent publish/load round-trip with the same exact contract", a
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("42. the run root basename and the wait index bind both publication and load", async () => {
   const fixture = await setup();
@@ -1534,7 +1543,7 @@ test("42. the run root basename and the wait index bind both publication and loa
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("43. exact retry preserves inode, mode, mtime and bytes; a conflict changes nothing", async () => {
   const fixture = await setup();
@@ -1557,7 +1566,7 @@ test("43. exact retry preserves inode, mode, mtime and bytes; a conflict changes
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("44. one wait index owns one immutable intent: both kinds conflict in both directions", async () => {
   const fixture = await setup();
@@ -1584,7 +1593,7 @@ test("44. one wait index owns one immutable intent: both kinds conflict in both 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("45. concurrent identical intent publications both succeed; different ones race to one winner", async () => {
   const fixture = await setup();
@@ -1615,7 +1624,7 @@ test("45. concurrent identical intent publications both succeed; different ones 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("46. load: missing tree and missing target are null; malformed and noncanonical fail closed", async () => {
   const fixture = await setup();
@@ -1638,7 +1647,7 @@ test("46. load: missing tree and missing target are null; malformed and noncanon
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("47. load: wrong mode, symlink, directory and FIFO targets fail closed untouched", async () => {
   const fixture = await setup();
@@ -1675,7 +1684,7 @@ test("47. load: wrong mode, symlink, directory and FIFO targets fail closed unto
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("48. load: foreign run id and foreign wait index fail as conflicts", async () => {
   const fixture = await setup();
@@ -1692,7 +1701,7 @@ test("48. load: foreign run id and foreign wait index fail as conflicts", async 
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("49. pre-link fault keeps not_published; post-link fault is durability_unknown and the exact retry confirms", async () => {
   const fixture = await setup();
@@ -1747,7 +1756,7 @@ test("49. pre-link fault keeps not_published; post-link fault is durability_unkn
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("50. an existing intents directory with the wrong mode or kind fails closed without chmod or rmdir", async () => {
   const fixture = await setup();
@@ -1788,7 +1797,7 @@ test("50. an existing intents directory with the wrong mode or kind fails closed
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("51. a concurrently created correct intents directory is adopted and its parent is fsynced in both creation and adoption", async () => {
   const fixture = await setup();
@@ -1842,7 +1851,7 @@ test("51. a concurrently created correct intents directory is adopted and its pa
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("52. intent publication never modifies anything outside <runRoot>/run-plan/intents", async () => {
   const fixture = await setup();
@@ -1869,7 +1878,7 @@ test("52. intent publication never modifies anything outside <runRoot>/run-plan/
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("53. the caller value is neither mutated nor frozen and later mutations cannot reach the store", async () => {
   const fixture = await setup();
@@ -1889,7 +1898,7 @@ test("53. the caller value is neither mutated nor frozen and later mutations can
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("54. diagnostics are content-free: no canary, no raw JSON, no caller property names", async () => {
   const fixture = await setup();
@@ -1911,7 +1920,7 @@ test("54. diagnostics are content-free: no canary, no raw JSON, no caller proper
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);
 
 test("55. the wait intent layer uses the immutable substrate exactly once and owns no second protocol", async () => {
   const { readFileSync } = await import("node:fs");
@@ -1961,7 +1970,7 @@ test("55. the wait intent layer uses the immutable substrate exactly once and ow
   expect(source.split("parseWaitIntent(").length - 1).toBe(1);
   expect(source.includes("prepareTaskRevisionManifest(")).toBe(true);
   expect(source.includes("preparePlanRevisionManifest(")).toBe(true);
-});
+}, 15000);
 
 test("56. an unexpected cause is sanitized to the fixed not-published io failure fallback", async () => {
   const fixture = await setup();
@@ -1986,4 +1995,4 @@ test("56. an unexpected cause is sanitized to the fixed not-published io failure
   } finally {
     await dispose(fixture);
   }
-});
+}, 15000);

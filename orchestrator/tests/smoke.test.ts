@@ -1,3 +1,12 @@
+// File-wide local test deadline policy: every test in this file builds a
+// multi-command durable reducer history (dozens of fsync-bound commits).
+// Under `bun test --parallel=2` the concurrent durable writers inflate the
+// per-test wall time up to ~3x (measured 2026-10-13: members of this file
+// crossed the 5000ms default in full-suite parallel runs while passing
+// sequentially and in isolation). Each test therefore carries an explicit
+// local 15000ms deadline (3x the worst measured member); assertions,
+// matrices and fixtures are unchanged and the default suite command stays
+// untouched.
 import { mkdir, mkdtemp, open, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -418,7 +427,7 @@ test("1. success: worker runs, artifact verified, session cleaned up, exit 0", a
     const artifact = JSON.parse(await readText(artifactPath(dirs.workspace, outcome.runId)));
     expect(artifact.run_id).toBe(outcome.runId);
   });
-});
+}, 15000);
 
 test("2. worker failure: session still deleted, exit non-zero", async () => {
   await withTempDirs(async (dirs) => {
@@ -434,7 +443,7 @@ test("2. worker failure: session still deleted, exit non-zero", async () => {
     expect(calls.filter((c) => c.args[0] === "run").length).toBe(1);
     expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
   });
-});
+}, 15000);
 
 test("3. pull failure is fatal for smoke", async () => {
   await withTempDirs(async (dirs) => {
@@ -449,7 +458,7 @@ test("3. pull failure is fatal for smoke", async () => {
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
     expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
   });
-});
+}, 15000);
 
 test("3b. missing artifact: run fails, session deleted", async () => {
   await withTempDirs(async (dirs) => {
@@ -462,7 +471,7 @@ test("3b. missing artifact: run fails, session deleted", async () => {
     expect(outcome.exitCode).toBe(1);
     expect(outcome.detail).toContain("artifact not readable");
   });
-});
+}, 15000);
 
 test("3c. wrong artifact schema: run fails, session deleted", async () => {
   await withTempDirs(async (dirs) => {
@@ -477,7 +486,7 @@ test("3c. wrong artifact schema: run fails, session deleted", async () => {
 
     expect(outcome.exitCode).toBe(1);
   });
-});
+}, 15000);
 
 test("4. cleanup failure: overall result can never be success", async () => {
   await withTempDirs(async (dirs) => {
@@ -492,7 +501,7 @@ test("4. cleanup failure: overall result can never be success", async () => {
     expect(outcome.status).toBe("cleanup_failed");
     expect(calls.filter((c) => c.args[1] === "delete").length).toBe(1);
   });
-});
+}, 15000);
 
 test("5. launcher/admin/state/canary never reach run env or args; task body never in argv", async () => {
   await withTempDirs(async (dirs) => {
@@ -524,7 +533,7 @@ test("5. launcher/admin/state/canary never reach run env or args; task body neve
       }
     }
   });
-});
+}, 15000);
 
 test("6. signal during run: signal forwarded -> CLI exited -> Session deleted", async () => {
   await withTempDirs(async (dirs) => {
@@ -572,7 +581,7 @@ test("6. signal during run: signal forwarded -> CLI exited -> Session deleted", 
     expect(events[events.length - 1]).toBe("session:delete");
     expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
   });
-});
+}, 15000);
 
 test("6b. signal during session create: create completed -> Session deleted", async () => {
   await withTempDirs(async (dirs) => {
@@ -616,7 +625,7 @@ test("6b. signal during session create: create completed -> Session deleted", as
     expect(calls.some((c) => c.args[0] === "pull")).toBe(false);
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
   });
-});
+}, 15000);
 
 test("6c. signal during pull: pull completed -> run skipped -> Session deleted", async () => {
   await withTempDirs(async (dirs) => {
@@ -651,7 +660,7 @@ test("6c. signal during pull: pull completed -> run skipped -> Session deleted",
     expect(calls.some((c) => c.args[0] === "run")).toBe(false);
     expect(calls.find((c) => c.args[0] === "pull")?.signalOnAbort).toBe(false);
   });
-});
+}, 15000);
 
 test("7. signal during updateState(worker_running): run never starts, status not success", async () => {
   await withTempDirs(async (dirs) => {
@@ -708,7 +717,7 @@ test("7. signal during updateState(worker_running): run never starts, status not
     expect(finalState.status).toBe("failed");
     expect(finalState.session_id).toBe(CHILD_SESSION_ID);
   });
-});
+}, 15000);
 
 test("7b. signal after successful run, before artifact verification completes: cleanup ok, status not success", async () => {
   await withTempDirs(async (dirs) => {
@@ -774,7 +783,7 @@ test("7b. signal after successful run, before artifact verification completes: c
 
     expect(finalState.status).toBe("failed");
   });
-});
+}, 15000);
 
 test("7c. signal during session delete: delete completes once, status not success", async () => {
   await withTempDirs(async (dirs) => {
@@ -810,7 +819,7 @@ test("7c. signal during session delete: delete completes once, status not succes
     expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
     expect(events.filter((e) => e === "session:delete").length).toBe(1);
   });
-});
+}, 15000);
 
 test("8. signal during the final success state write is late: persisted success, exit 0", async () => {
   await withTempDirs(async (dirs) => {
@@ -868,7 +877,7 @@ test("8. signal during the final success state write is late: persisted success,
     // write; a rewrite attempt would block forever on the FIFO and the run
     // could never have resolved with exit 0
   });
-});
+}, 15000);
 
 test("8b. cutoff: signal after the authoritative final write does not change the result", async () => {
   await withTempDirs(async (dirs) => {
@@ -913,7 +922,7 @@ test("8b. cutoff: signal after the authoritative final write does not change the
     expect(outcome.status).toBe("success");
     expect(calls.filter((c) => c.args[0] === "session" && c.args[1] === "delete").length).toBe(1);
   });
-});
+}, 15000);
 
 test("extra: endpoint unreachable fails before any session is created", async () => {
   await withTempDirs(async (dirs) => {
@@ -929,7 +938,7 @@ test("extra: endpoint unreachable fails before any session is created", async ()
 
     expect(outcome.exitCode).toBe(1);
   });
-});
+}, 15000);
 
 test("extra: principal authority credential is rejected", async () => {
   await withTempDirs(async (dirs) => {
@@ -943,7 +952,7 @@ test("extra: principal authority credential is rejected", async () => {
 
     expect(outcome.exitCode).toBe(1);
   });
-});
+}, 15000);
 
 test("extra: wrong launcher id is rejected before creating a session", async () => {
   await withTempDirs(async (dirs) => {
@@ -957,7 +966,7 @@ test("extra: wrong launcher id is rejected before creating a session", async () 
     expect(outcome.detail).toContain("dhl_expected");
     expect(calls.filter((c) => c.args[1] === "create").length).toBe(0);
   });
-});
+}, 15000);
 
 test("extra: matching launcher id passes the guard", async () => {
   await withTempDirs(async (dirs) => {
@@ -969,7 +978,7 @@ test("extra: matching launcher id passes the guard", async () => {
 
     expect(outcome.exitCode).toBe(0);
   });
-});
+}, 15000);
 
 test("extra: docker-helper 2.1.0 contract shapes", () => {
   const auth = classifyAuthResult({
@@ -1000,7 +1009,7 @@ test("extra: docker-helper 2.1.0 contract shapes", () => {
 
   parseSessionDelete(JSON.stringify({ ok: true, id: "dhs_x", deleted: true }), "dhs_x");
   expect(() => parseSessionDelete(JSON.stringify({ ok: true, id: "dhs_other", deleted: true }), "dhs_x")).toThrow();
-});
+}, 15000);
 
 test("extra: artifact contract", () => {
   const ok = { schema_version: 1, status: "success", run_id: "r" };
@@ -1016,7 +1025,7 @@ test("extra: artifact contract", () => {
   );
   expect(() => parseArtifact("[]", "r")).toThrow(/not a JSON object/);
   expect(() => parseArtifact("{", "r")).toThrow(/not valid JSON/);
-});
+}, 15000);
 
 test("extra: worker spec and CLI args", () => {
   const spec = smokeWorkerSpec("run-1", CHILD_TOKEN, "alpine:3.22");
@@ -1070,7 +1079,7 @@ test("extra: worker spec and CLI args", () => {
   expect(childSessionEnv("dht_x")).toEqual({ DOCKER_HELPER_SESSION_TOKEN: "dht_x" });
   expect(signalExitCode("SIGINT")).toBe(130);
   expect(signalExitCode("SIGTERM")).toBe(143);
-});
+}, 15000);
 
 const dockerHelperOnPath = (await Bun.which("docker-helper")) !== null;
 
@@ -1096,4 +1105,4 @@ test("extra: state dir resolution", async () => {
   expect(stateDir({ XDG_STATE_HOME: "/xdg-state", HOME: "/home/opencode" })).toBe(
     "/xdg-state/orchestrator",
   );
-});
+}, 15000);

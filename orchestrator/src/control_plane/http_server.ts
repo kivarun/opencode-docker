@@ -138,7 +138,16 @@ export class ControlPlaneHttpServiceError extends Error {
 }
 
 interface ParsedRoute {
-  readonly kind: "fresh_run" | "inspect" | "resume" | "resume_plan" | "continue_stage" | "revise_task" | "respond";
+  readonly kind:
+    | "fresh_run"
+    | "inspect"
+    | "resume"
+    | "resume_plan"
+    | "continue_stage"
+    | "revise_task"
+    | "respond"
+    | "projects"
+    | "runs";
   readonly projectId: string | null;
   readonly runId: string | null;
 }
@@ -195,6 +204,18 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
       return new ControlPlaneHttpRequestError("invalid_path", "the project id must be a safe identifier");
     }
     return { kind: "fresh_run", projectId, runId: null };
+  }
+  if (matchesShape(["v1", "projects"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the projects discovery route accepts GET only");
+    }
+    return { kind: "projects", projectId: null, runId: null };
+  }
+  if (matchesShape(["v1", "runs"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the runs discovery route accepts GET only");
+    }
+    return { kind: "runs", projectId: null, runId: null };
   }
   if (matchesShape(["v1", "runs", "*"])) {
     if (shapeMethodMismatch("GET")) {
@@ -447,6 +468,137 @@ export function parseReviseTaskBody(
   };
 }
 
+/**
+ * The discovery query of the runs listing: an optional positive safe
+ * integer limit (default 100, maximum 200) and an optional safe run id
+ * cursor. The raw query string is parsed strictly - no percent-encoding,
+ * no bare keys, no duplicates, no empty values and no unknown fields.
+ */
+export function parseRunsDiscoveryQuery(
+  search: string,
+): { readonly limit: number; readonly after: string | null } | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { limit: 100, after: null };
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the discovery query must not carry encoded components");
+  }
+  let limit: number | null = null;
+  let after: string | null = null;
+  for (const part of search.split("&")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) {
+      return new ControlPlaneHttpRequestError("invalid_request", "every discovery query field must carry exactly one value");
+    }
+    const key = part.slice(0, separator);
+    const value = part.slice(separator + 1);
+    if (key === "limit") {
+      if (limit !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the discovery query fields must be unique");
+      }
+      if (!/^[0-9]+$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the discovery query limit must be a positive safe integer");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 200) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the discovery query limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      continue;
+    }
+    if (key === "after") {
+      if (after !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the discovery query fields must be unique");
+      }
+      if (value === "" || !isPipelineV2SafeId(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the discovery query after must be a safe run identifier");
+      }
+      after = value;
+      continue;
+    }
+    return new ControlPlaneHttpRequestError("invalid_request", "the discovery query carries an unknown field");
+  }
+  return { limit: limit ?? 100, after };
+}
+
+/** The projects discovery projection: declaration-order ids only. */
+export interface ProjectsDiscoveryProjection {
+  readonly schema_version: 1;
+  readonly kind: "projects";
+  readonly projects: readonly { readonly id: string; readonly input_roots: readonly { readonly id: string }[] }[];
+}
+
+export function projectControlPlaneProjects(registry: ControlPlaneProjectRegistry): ProjectsDiscoveryProjection {
+  const projects: { id: string; input_roots: { id: string }[] }[] = [];
+  for (const project of registry.projects) {
+    const inputRoots: { id: string }[] = [];
+    for (const root of project.inputRoots) {
+      inputRoots.push({ id: root.id });
+    }
+    projects.push({ id: project.id, input_roots: inputRoots });
+  }
+  return { schema_version: 1, kind: "projects", projects };
+}
+
+/** One projected run of the runs discovery: ids only, never run status. */
+export interface RunsDiscoveryEntry {
+  readonly run_id: string;
+  readonly project_id: string;
+  readonly project_available: boolean;
+}
+
+export interface RunsDiscoveryProjection {
+  readonly schema_version: 1;
+  readonly kind: "runs";
+  readonly runs: readonly RunsDiscoveryEntry[];
+  readonly next_after: string | null;
+}
+
+/**
+ * The runs discovery projection over the authoritative binding list:
+ * exclusive lexical cursor, page limit, and `next_after` exactly when
+ * another binding exists beyond the page. A project the current registry
+ * no longer declares stays visible with `project_available: false`.
+ */
+export function projectControlPlaneRuns(
+  bindings: readonly { readonly runId: string; readonly projectId: string }[],
+  options: { readonly limit: number; readonly after: string | null },
+  registry: ControlPlaneProjectRegistry,
+): RunsDiscoveryProjection {
+  let start = 0;
+  if (options.after !== null) {
+    while (start < bindings.length && bindings[start] !== undefined && (bindings[start] as { runId: string }).runId <= options.after) {
+      start += 1;
+    }
+  }
+  const runs: RunsDiscoveryEntry[] = [];
+  for (let index = start; index < bindings.length && runs.length < options.limit; index += 1) {
+    const binding = bindings[index];
+    if (binding === undefined) {
+      break;
+    }
+    let available = false;
+    for (const project of registry.projects) {
+      if (project.id === binding.projectId) {
+        available = true;
+        break;
+      }
+    }
+    runs.push({
+      run_id: binding.runId,
+      project_id: binding.projectId,
+      project_available: available,
+    });
+  }
+  const lastEntry = runs[runs.length - 1];
+  const lastIndex = start + runs.length;
+  const nextAfter = lastEntry !== undefined && lastIndex < bindings.length ? lastEntry.run_id : null;
+  return { schema_version: 1, kind: "runs", runs, next_after: nextAfter };
+}
+
 interface CommandOutcomeProjection {
   readonly schema_version: 1;
   readonly kind: "command_result";
@@ -544,7 +696,7 @@ export function projectControlPlaneInspect(
 }
 
 function projectionResponse(
-  projection: CommandOutcomeProjection | RunProjection | ControlPlaneHttpFailure,
+  projection: CommandOutcomeProjection | RunProjection | ProjectsDiscoveryProjection | RunsDiscoveryProjection | ControlPlaneHttpFailure,
 ): Response {
   if ("layer" in projection && "reason" in projection && !("kind" in projection)) {
     return failureResponse(projection as ControlPlaneHttpFailure);
@@ -567,6 +719,8 @@ export interface ControlPlaneHttpServiceDeps {
   readonly client: OrchestratorSubprocessClient;
   readonly port: number;
   readonly bodyLimitBytes: number;
+  /** The raw query string of the current discovery request ("" otherwise). */
+  readonly discoveryQuery?: string;
 }
 
 async function readBodyLimited(request: Request, limit: number): Promise<{ readonly ok: true; readonly text: string } | { readonly ok: false }> {
@@ -629,12 +783,15 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       return requestFailure("invalid_origin");
     }
     const url = new URL(request.url);
-    if (url.search !== "" || url.hash !== "") {
+    if (url.hash !== "") {
       return requestFailure("invalid_path");
     }
     const parsed = parseControlPlaneRoute(url.pathname, request.method);
     if (parsed instanceof ControlPlaneHttpRequestError) {
       return requestFailure(parsed.reason);
+    }
+    if (parsed.kind !== "projects" && parsed.kind !== "runs" && url.search !== "") {
+      return requestFailure("invalid_path");
     }
     if (request.method === "POST") {
       const contentType = request.headers.get("content-type");
@@ -655,7 +812,11 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       }
       bodyText = body.text;
     }
-    return await dispatchControlPlaneRoute(deps, parsed, bodyText);
+    return await dispatchControlPlaneRoute(
+      parsed.kind === "projects" || parsed.kind === "runs" ? { ...deps, discoveryQuery: url.search } : deps,
+      parsed,
+      bodyText,
+    );
   } catch (cause) {
     if (cause instanceof ControlPlaneProjectRegistryError) {
       return failureResponse({ layer: "registry", reason: cause.reason });
@@ -675,6 +836,20 @@ async function dispatchControlPlaneRoute(
   route: ParsedRoute,
   bodyText: string,
 ): Promise<Response> {
+  if (route.kind === "projects") {
+    if ((deps.discoveryQuery ?? "") !== "") {
+      return requestFailure("invalid_request");
+    }
+    return projectionResponse(projectControlPlaneProjects(deps.registry));
+  }
+  if (route.kind === "runs") {
+    const query = parseRunsDiscoveryQuery(deps.discoveryQuery ?? "");
+    if (query instanceof ControlPlaneHttpRequestError) {
+      return requestFailure(query.reason);
+    }
+    const bindings = await deps.bindingStore.listBindings();
+    return projectionResponse(projectControlPlaneRuns(bindings, query, deps.registry));
+  }
   if (route.kind === "fresh_run") {
     const body = parseFreshRunBody(parseJsonBody(bodyText));
     const resolved = await resolveControlPlaneRunCommand(deps.registry, {

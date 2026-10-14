@@ -21,8 +21,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ControlPlaneHttpRequestError,
-  parseContinueStageBody,
   parseControlPlaneRoute,
+  parseRunsDiscoveryQuery,
+  projectControlPlaneProjects,
+  projectControlPlaneRuns,
+  parseContinueStageBody,
   parseEmptyBody,
   parseFreshRunBody,
   parseRespondBody,
@@ -34,6 +37,7 @@ import {
   statusForControlPlaneFailure,
   type RunningControlPlaneHttpService,
 } from "../src/control_plane/http_server.ts";
+import { ControlPlaneRunBindingStore } from "../src/control_plane/run_binding_store.ts";
 import { OrchestratorSubprocessClient, type OrchestratorCallResult } from "../src/control_plane/subprocess_client.ts";
 
 const CANARY = "httpcanaryhostpath";
@@ -1039,6 +1043,305 @@ describe("control-plane HTTP: production entrypoint", () => {
   );
 });
 
+
+describe("control-plane HTTP: discovery (projects and bound runs)", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-discovery-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const registryV2Path = join(envRoot, "registry-v2.json");
+  const storeRoot = join(envRoot, "bindings");
+  let service: RunningControlPlaneHttpService;
+  let reducedService: RunningControlPlaneHttpService;
+  let port = 0;
+  let reducedPort = 0;
+
+  const get = (path: string): Promise<RawResponse> => rawRequest(port, "GET", path, { host: `127.0.0.1:${port}` });
+  const reducedGet = (path: string): Promise<RawResponse> =>
+    rawRequest(reducedPort, "GET", path, { host: `127.0.0.1:${reducedPort}` });
+
+  beforeAll(async () => {
+    const inputRootOne = join(envRoot, "inputs-a");
+    const inputRootTwo = join(envRoot, "inputs-b");
+    const projectDir = join(envRoot, "project");
+    mkdirSync(inputRootOne, { mode: 0o700 });
+    mkdirSync(inputRootTwo, { mode: 0o700 });
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [
+              { id: "tasks", root: inputRootOne },
+              { id: "plans", root: inputRootTwo },
+            ],
+          },
+          {
+            id: "project-b",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [{ id: "notes", root: inputRootOne }],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      registryV2Path,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [{ id: "tasks", root: inputRootOne }],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "run-c", projectId: "project-a" });
+    await store.claim({ runId: "run-a", projectId: "project-b" });
+    await store.claim({ runId: "run-d", projectId: "project-gone" });
+    await store.claim({ runId: "run-b", projectId: "project-a" });
+    const client = {
+      bunExecutable: process.execPath,
+      // discovery never spawns: a nonexistent entrypoint would fail loudly
+      orchestratorEntrypoint: join(envRoot, "missing-entrypoint.ts"),
+      workingDirectory: envRoot,
+      baseEnv: { PATH: "/usr/bin:/bin" },
+      stdoutLimitBytes: 100000,
+      stderrLimitBytes: 100000,
+      sigintGraceMs: 1000,
+    };
+    service = await startControlPlaneHttpService({ registryPath, bindingStoreRoot: storeRoot, client, port: 0, bodyLimitBytes: 4096 });
+    port = service.port;
+    reducedService = await startControlPlaneHttpService({ registryPath: registryV2Path, bindingStoreRoot: storeRoot, client, port: 0, bodyLimitBytes: 4096 });
+    reducedPort = reducedService.port;
+  }, 20000);
+
+  afterAll(() => {
+    service?.stop();
+    reducedService?.stop();
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  test("d1. projects project declaration-order ids only, byte-identical on repeat", async () => {
+    const expected = {
+      schema_version: 1,
+      kind: "projects",
+      projects: [
+        { id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }] },
+        { id: "project-b", input_roots: [{ id: "notes" }] },
+      ],
+    };
+    const first = await get("/v1/projects");
+    expect(first.status).toBe(200);
+    expect(JSON.parse(first.body)).toEqual(expected);
+    expect(JSON.parse(first.body)).toEqual(JSON.parse((await get("/v1/projects")).body));
+    expect(first.body).not.toContain(envRoot);
+    expect(first.body).not.toContain(CANARY);
+    expect(first.body).not.toContain("config_root");
+    expect(first.body).not.toContain("launcher");
+  });
+
+  test("d2. the projects endpoint rejects query parameters and POST", async () => {
+    expect((await get("/v1/projects?limit=1")).status).toBe(400);
+    const posted = await rawRequest(port, "POST", "/v1/projects", { "content-type": "application/json", host: `127.0.0.1:${port}` }, "{}");
+    expect(posted.status).toBe(405);
+  });
+
+  test("d3. runs project lexical order, exact entry keys and page-complete next_after", async () => {
+    const all = JSON.parse((await get("/v1/runs")).body);
+    expect(all).toEqual({
+      schema_version: 1,
+      kind: "runs",
+      runs: [
+        { run_id: "run-a", project_id: "project-b", project_available: true },
+        { run_id: "run-b", project_id: "project-a", project_available: true },
+        { run_id: "run-c", project_id: "project-a", project_available: true },
+        { run_id: "run-d", project_id: "project-gone", project_available: false },
+      ],
+      next_after: null,
+    });
+  });
+
+  test("d4. the limit pages carry next_after exactly when another binding follows", async () => {
+    const one = JSON.parse((await get("/v1/runs?limit=1")).body);
+    expect(one.runs).toEqual([{ run_id: "run-a", project_id: "project-b", project_available: true }]);
+    expect(one.next_after).toBe("run-a");
+    const two = JSON.parse((await get("/v1/runs?limit=2")).body);
+    expect(two.runs.map((entry: { run_id: string }) => entry.run_id)).toEqual(["run-a", "run-b"]);
+    expect(two.next_after).toBe("run-b");
+    const full = JSON.parse((await get("/v1/runs?limit=200")).body);
+    expect(full.runs.length).toBe(4);
+    expect(full.next_after).toBe(null);
+  });
+
+  test("d5. the after cursor is exclusive and combines with the limit", async () => {
+    const afterFirst = JSON.parse((await get("/v1/runs?after=run-a")).body);
+    expect(afterFirst.runs.map((entry: { run_id: string }) => entry.run_id)).toEqual(["run-b", "run-c", "run-d"]);
+    expect(afterFirst.next_after).toBe(null);
+    const beforeAll = JSON.parse((await get("/v1/runs?after=run-0")).body);
+    expect(beforeAll.runs.length).toBe(4);
+    const afterLast = JSON.parse((await get("/v1/runs?after=run-d")).body);
+    expect(afterLast).toEqual({ schema_version: 1, kind: "runs", runs: [], next_after: null });
+    const between = JSON.parse((await get("/v1/runs?after=run-b&limit=1")).body);
+    expect(between.runs).toEqual([{ run_id: "run-c", project_id: "project-a", project_available: true }]);
+    expect(between.next_after).toBe("run-c");
+  });
+
+  test("d6. malformed, duplicate, out-of-range and unknown query fields are request errors", async () => {
+    for (const query of [
+      "?limit=0",
+      "?limit=201",
+      "?limit=-1",
+      "?limit=abc",
+      "?limit=1.5",
+      "?limit=1e2",
+      "?limit=+5",
+      "?limit=",
+      "?limit=1&limit=1",
+      "?after=run-a&after=run-b",
+      "?after=",
+      "?after=-bad",
+      "?unknown=1",
+      "?limit",
+      "?=x",
+      "?limit=%32",
+    ]) {
+      const response = await get(`/v1/runs${query}`);
+      expect(response.status).toBe(400);
+      expect(errorBody(response)).toEqual({ layer: "request", reason: "invalid_request" });
+    }
+  });
+
+  test("d7. a removed registry project stays visible with project_available false", async () => {
+    const listed = JSON.parse((await reducedGet("/v1/runs")).body);
+    expect(listed.runs).toEqual([
+      { run_id: "run-a", project_id: "project-b", project_available: false },
+      { run_id: "run-b", project_id: "project-a", project_available: true },
+      { run_id: "run-c", project_id: "project-a", project_available: true },
+      { run_id: "run-d", project_id: "project-gone", project_available: false },
+    ]);
+  });
+
+  test("d8. repeated discovery responses are byte-identical and discovery writes nothing", async () => {
+    const before = await fingerprintTree(storeRoot);
+    const first = await get("/v1/runs");
+    const second = await get("/v1/runs?limit=2");
+    expect((await get("/v1/runs")).body).toBe(first.body);
+    expect((await get("/v1/runs?limit=2")).body).toBe(second.body);
+    expect(await fingerprintTree(storeRoot)).toBe(before);
+  });
+
+  test("d9. discovery never spawns a subprocess and never leaks the client", async () => {
+    // the client's entrypoint does not exist: any spawn would surface as 502
+    expect((await get("/v1/runs")).status).toBe(200);
+    expect((await get("/v1/projects")).status).toBe(200);
+  });
+
+  test("d10. the trust gates apply to the discovery routes", async () => {
+    const wrongHost = await rawRequest(port, "GET", "/v1/runs", { host: "evil.example" });
+    expect(wrongHost.status).toBe(400);
+    expect(errorBody(wrongHost)).toEqual({ layer: "request", reason: "invalid_host" });
+    const wrongOrigin = await rawRequest(port, "GET", "/v1/runs", { host: `127.0.0.1:${port}`, origin: "http://evil.example" });
+    expect(wrongOrigin.status).toBe(400);
+    expect(errorBody(wrongOrigin)).toEqual({ layer: "request", reason: "invalid_origin" });
+    const withBody = await rawRequest(port, "GET", "/v1/runs", { host: `127.0.0.1:${port}`, "content-length": "5" }, "hello");
+    expect(withBody.status).toBe(400);
+    expect(errorBody(withBody)).toEqual({ layer: "request", reason: "invalid_request" });
+  });
+
+  test("d11. a defective binding fails the whole listing with the typed envelope", async () => {
+    writeFileSync(join(storeRoot, "bindings", "defective-run.json"), "not-json{");
+    try {
+      const response = await get("/v1/runs");
+      expect(response.status).toBe(500);
+      expect(errorBody(response)).toEqual({ layer: "binding", reason: "binding_invalid" });
+      expect(response.body.includes("run-a")).toBe(false);
+    } finally {
+      rmSync(join(storeRoot, "bindings", "defective-run.json"));
+    }
+    expect(JSON.parse((await get("/v1/runs")).body).runs.length).toBe(4);
+  });
+
+  test("d12. a claim concurrent with a listing lands now or at the next refresh", async () => {
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    const claimPromise = store.claim({ runId: "run-e", projectId: "project-a" });
+    const during = await get("/v1/runs");
+    expect(claimPromise).resolves.toMatchObject({ kind: "created" });
+    const duringListed = JSON.parse(during.body).runs.map((entry: { run_id: string }) => entry.run_id);
+    expect(duringListed).toEqual([...duringListed].sort());
+    expect(duringListed.includes("run-e") || !duringListed.includes("run-e")).toBe(true);
+    const refreshed = JSON.parse((await get("/v1/runs")).body);
+    expect(refreshed.runs.map((entry: { run_id: string }) => entry.run_id)).toContain("run-e");
+    expect(refreshed.next_after).toBe(null);
+  });
+
+  test("d13. the discovery query parser is exact at the unit level", () => {
+    const ok = (search: string) => {
+      const parsed = parseRunsDiscoveryQuery(search);
+      if (parsed instanceof ControlPlaneHttpRequestError) throw parsed;
+      return parsed;
+    };
+    expect(ok("")).toEqual({ limit: 100, after: null });
+    expect(ok("?limit=7")).toEqual({ limit: 7, after: null });
+    expect(ok("?after=run-a")).toEqual({ limit: 100, after: "run-a" });
+    expect(ok("?limit=200&after=run-b")).toEqual({ limit: 200, after: "run-b" });
+    const bad = (search: string) => (parseRunsDiscoveryQuery(search) as ControlPlaneHttpRequestError).reason;
+    expect(bad("?limit=201")).toBe("invalid_request");
+    expect(bad("?limit=x")).toBe("invalid_request");
+  });
+
+  test("d14. the projections are pure over frozen inputs and never sorted", () => {
+    const frozen = Object.freeze({
+      projects: [
+        Object.freeze({
+          id: "project-a",
+          configRoot: "/not/exposed",
+          pipelineRoot: null,
+          launcherId: null,
+          projectRoot: "/not/exposed",
+          inputRoots: [Object.freeze({ id: "tasks", root: "/not/exposed" }), Object.freeze({ id: "plans", root: "/not/exposed" })],
+        }),
+        Object.freeze({
+          id: "project-b",
+          configRoot: "/not/exposed",
+          pipelineRoot: null,
+          launcherId: null,
+          projectRoot: "/not/exposed",
+          inputRoots: [Object.freeze({ id: "notes", root: "/not/exposed" })],
+        }),
+      ],
+    });
+    const projected = projectControlPlaneProjects(frozen as never);
+    expect(projected.projects.map((project) => project.id)).toEqual(["project-a", "project-b"]);
+    const entries = projectControlPlaneRuns(
+      [
+        { runId: "z-run", projectId: "project-a" },
+        { runId: "a-run", projectId: "project-b" },
+      ],
+      { limit: 100, after: null },
+      frozen as never,
+    );
+    expect(entries.runs.map((entry) => entry.run_id)).toEqual(["z-run", "a-run"]);
+  });
+});
+
 describe("control-plane HTTP: source restrictions", () => {
   test("the production tree has exactly one HTTP server owner and no forbidden capabilities", async () => {
     const serverSource = readFileSync(join(import.meta.dir, "..", "src", "control_plane", "http_server.ts"), "utf8");
@@ -1064,6 +1367,17 @@ describe("control-plane HTTP: source restrictions", () => {
       expect(serverSource.includes(banned)).toBe(false);
     }
     expect(serverSource.split("JSON.parse(").length - 1).toBe(1);
+    // discovery: no filesystem access, no run-state scanning, no subprocess,
+    // no sorting and no raw registry document in any projection
+    const discoverySource = serverSource.split("interface CommandOutcomeProjection")[0] ?? "";
+    expect(discoverySource).not.toContain("deps.client");
+    expect(discoverySource).not.toContain(".sort(");
+    expect(discoverySource).not.toContain("readdir");
+    expect(discoverySource).not.toContain("state.json");
+    expect(discoverySource).not.toContain("pipeline-runs");
+    expect(discoverySource.split("projectControlPlaneProjects(").length - 1).toBe(1);
+    expect(discoverySource.split("projectControlPlaneRuns(").length - 1).toBe(1);
+    expect(serverSource.split("bindingStore.listBindings(").length - 1).toBe(1);
     for (const imported of [
       'from "./routing.ts"',
       'from "../clean_path.ts"',

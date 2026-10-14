@@ -39,6 +39,7 @@ import {
 } from "../src/control_plane/run_binding_store.ts";
 import {
   claimRunBindingWithIo,
+  listRunBindingsWithIo,
   loadRunBindingWithIo,
   openRunBindingStoreWithIo,
   prepareRunBinding,
@@ -1397,6 +1398,157 @@ describe("control plane run binding store: real composition smoke", () => {
   );
 });
 
+
+describe("control plane run binding store: authoritative discovery list", () => {
+  test("44. an empty store without the namespace enumerates to an empty frozen list", async () => {
+    const root = await makeRoot();
+    try {
+      const store = await ControlPlaneRunBindingStore.open(root);
+      const listed = await store.listBindings();
+      expect(listed).toEqual([]);
+      expect(Object.isFrozen(listed)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("45. several bindings enumerate in lexical run-id order with exact projections", async () => {
+    const root = await makeRoot();
+    try {
+      const store = await ControlPlaneRunBindingStore.open(root);
+      await store.claim({ runId: "run-zeta", projectId: "project-two" });
+      await store.claim({ runId: "run-alpha", projectId: "project-one" });
+      await store.claim({ runId: "run-mid", projectId: "project-one" });
+      const listed = await store.listBindings();
+      expect(listed).toEqual([
+        { runId: "run-alpha", projectId: "project-one" },
+        { runId: "run-mid", projectId: "project-one" },
+        { runId: "run-zeta", projectId: "project-two" },
+      ]);
+      expect(Object.isFrozen(listed)).toBe(true);
+      for (const entry of listed) {
+        expect(Object.isFrozen(entry)).toBe(true);
+      }
+      const fingerprintBefore = await fingerprint(root);
+      await store.listBindings();
+      expect(await fingerprint(root)).toBe(fingerprintBefore);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("46. an exact protocol temp orphan is ignored; a wrong-shaped temp name is corruption", async () => {
+    const root = await makeRoot();
+    try {
+      const store = await ControlPlaneRunBindingStore.open(root);
+      await store.claim({ runId: "orphan-run", projectId: "orphan-project" });
+      writeFileSync(join(root, "bindings", ".binding-publish-orphan-run-0123456789abcdef"), '{"x":1}');
+      expect(await store.listBindings()).toEqual([{ runId: "orphan-run", projectId: "orphan-project" }]);
+      writeFileSync(join(root, "bindings", ".binding-publish-orphan-run-nottemp"), "x");
+      const store2 = await ControlPlaneRunBindingStore.open(root);
+      await expect(store2.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("47. unknown namespace entries and wrong-kind finals fail closed as binding_invalid", async () => {
+    const root = await makeRoot();
+    try {
+      const store = await ControlPlaneRunBindingStore.open(root);
+      await store.claim({ runId: "clean-run", projectId: "clean-project" });
+      const bindings = join(root, "bindings");
+      writeFileSync(join(bindings, "notes.txt"), "x");
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      rmSync(join(bindings, "notes.txt"));
+
+      writeFileSync(join(bindings, "suffix.jsonx"), "x");
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      rmSync(join(bindings, "suffix.jsonx"));
+
+      await symlink(join(bindings, "clean-run.json"), join(bindings, "symlinked.json"));
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      rmSync(join(bindings, "symlinked.json"));
+
+      await mkdir(join(bindings, "dir-run.json"));
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      await rm(join(bindings, "dir-run.json"), { recursive: true });
+
+      await makeFifo(join(bindings, "fifo-run.json"));
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      await rm(join(bindings, "fifo-run.json"));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("48. a malformed, mismatched or wrong-mode final binding fails closed", async () => {
+    const root = await makeRoot();
+    try {
+      const store = await ControlPlaneRunBindingStore.open(root);
+      await store.claim({ runId: "seed-run", projectId: "seed-project" });
+      const bindings = join(root, "bindings");
+
+      writeFileSync(join(bindings, "broken-run.json"), "not-json{");
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      rmSync(join(bindings, "broken-run.json"));
+
+      writeFileSync(
+        join(bindings, "naming-run.json"),
+        '{"project_id":"other-project","run_id":"another-run","schema_version":1}',
+      );
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      rmSync(join(bindings, "naming-run.json"));
+
+      await store.claim({ runId: "mode-run", projectId: "mode-project" });
+      await chmod(join(bindings, "mode-run.json"), 0o644);
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_invalid" });
+      await chmod(join(bindings, "mode-run.json"), 0o600);
+      expect(await store.listBindings()).toEqual([
+        { runId: "mode-run", projectId: "mode-project" },
+        { runId: "seed-run", projectId: "seed-project" },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("49. a replaced namespace is a store-unavailable failure", async () => {
+    const root = await makeRoot();
+    try {
+      const store = await ControlPlaneRunBindingStore.open(root);
+      await rm(join(root, "bindings"), { recursive: true, force: true });
+      writeFileSync(join(root, "bindings"), "not a directory");
+      await expect(store.listBindings()).rejects.toMatchObject({ reason: "binding_store_unavailable" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("50. a binding published after the readdir snapshot joins only the next refresh", async () => {
+    const root = await makeRoot();
+    try {
+      const store = await ControlPlaneRunBindingStore.open(root);
+      await store.claim({ runId: "snapshot-first", projectId: "project-one" });
+      const base = realRunBindingStoreIo;
+      const snapshotIo = Object.freeze({
+        ...base,
+        readdirNames: async () => ["snapshot-first.json"],
+      }) as unknown as RunBindingStoreIo;
+      await store.claim({ runId: "snapshot-second", projectId: "project-two" });
+      const stale = await listRunBindingsWithIo(snapshotIo, await openRunBindingStoreWithIo(snapshotIo, root));
+      expect(stale).toEqual([{ runId: "snapshot-first", projectId: "project-one" }]);
+      const fresh = await store.listBindings();
+      expect(fresh).toEqual([
+        { runId: "snapshot-first", projectId: "project-one" },
+        { runId: "snapshot-second", projectId: "project-two" },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("control plane run binding store: source restrictions", () => {
   const publicSource = readFileSync(join(import.meta.dir, "..", "src", "control_plane", "run_binding_store.ts"), "utf8");
   const internalSource = readFileSync(
@@ -1405,12 +1557,11 @@ describe("control plane run binding store: source restrictions", () => {
   );
   const combined = `${publicSource}\n${internalSource}`;
 
-  test("40. no spawn, no server, no discovery, no deletion, no run-state access", () => {
+  test("40. no spawn, no server, no deletion, no run-state access; one enumeration owner", () => {
     for (const forbidden of [
       "Bun.spawn",
       "Bun.serve",
       "fetch(",
-      "readdir",
       "unlink",
       "rmSync",
       "state.json",
@@ -1424,6 +1575,12 @@ describe("control plane run binding store: source restrictions", () => {
     ]) {
       expect(combined).not.toContain(forbidden);
     }
+    // The namespace enumeration is owned exactly once, through the IO seam:
+    // the raw fs readdir lives only in the immutable-document substrate.
+    expect(combined.split("io.readdirNames(").length - 1).toBe(1);
+    expect(combined).not.toContain("readdir(");
+    expect(publicSource).not.toContain("readdir");
+    expect(publicSource).not.toContain("node:fs");
   });
 
   test("41. one binding serializer/parser owner and no second publication implementation", () => {
@@ -1471,6 +1628,7 @@ describe("control plane run binding store: source restrictions", () => {
     expect(Object.keys(internalModule).sort()).toEqual([
       "ControlPlaneRunBindingError",
       "claimRunBindingWithIo",
+      "listRunBindingsWithIo",
       "loadRunBindingWithIo",
       "openRunBindingStoreWithIo",
       "parseRunBindingDocument",

@@ -8,6 +8,7 @@ import {
   mkdir,
   open,
   rmdir,
+  readdir,
   realpath,
   unlink,
   type FileHandle,
@@ -182,6 +183,36 @@ export interface ImmutableDocumentDirHandle {
  * production wrappers always pass the fixed immutable
  * `realImmutableDocumentIo`; tests inject their own object per call.
  */
+/**
+ * The exact temp-name grammar of the immutable publication protocol: a
+ * candidate file is `<tempPrefix><tempStem>-` plus 16 lowercase hex
+ * characters. The builder and the recognition predicate share one shape
+ * so a crash-orphan temp file can be recognized without a second parser.
+ */
+const TEMP_RANDOM_SUFFIX_HEX_LENGTH = 16;
+
+function randomHexTempSuffix(): string {
+  return randomBytes(TEMP_RANDOM_SUFFIX_HEX_LENGTH / 2).toString("hex");
+}
+
+/**
+ * Recognizes exactly the temp-file names this substrate builds for the
+ * given prefix. Anything else - including a prefix-shaped name with a
+ * wrong suffix - is not a temp file of this protocol.
+ */
+export function isImmutablePublicationTempName(name: string, tempPrefix: string): boolean {
+  if (!name.startsWith(tempPrefix)) {
+    return false;
+  }
+  const rest = name.slice(tempPrefix.length);
+  const separator = rest.lastIndexOf("-");
+  if (separator <= 0) {
+    return false;
+  }
+  const suffix = rest.slice(separator + 1);
+  return suffix.length === TEMP_RANDOM_SUFFIX_HEX_LENGTH && /^[0-9a-f]+$/.test(suffix);
+}
+
 export interface ImmutableDocumentIo {
   /** Exclusive `mkdir`, mode 0700 (the caller handles `EEXIST`). */
   readonly mkdirExclusive: (path: string) => Promise<void>;
@@ -203,6 +234,8 @@ export interface ImmutableDocumentIo {
   readonly unlink: (path: string) => Promise<void>;
   /** rmdir of the empty directory this call created, on chmod failure. */
   readonly rmdir: (path: string) => Promise<void>;
+  /** Plain entry names of a directory (no entry types); every failure rejects. */
+  readonly readdirNames: (path: string) => Promise<string[]>;
 }
 
 class RealImmutableDocumentFileHandle implements ImmutableDocumentFileHandle {
@@ -267,6 +300,7 @@ const realImmutableDocumentIoImplementation: ImmutableDocumentIo = {
     }
   },
   realpath: (path) => realpath(path),
+  readdirNames: (path) => readdir(path),
   openTempExclusive: async (path) =>
     new RealImmutableDocumentFileHandle(
       await open(
@@ -843,7 +877,7 @@ export async function publishImmutableDocumentFile(
   let tempPath = "";
   let identity: OwnedTempFile | null = null;
   for (let attempt = 0; attempt < MAX_TEMP_ATTEMPTS; attempt += 1) {
-    tempPath = `${parentPath}/${target.tempPrefix}${target.tempStem}-${randomBytes(8).toString("hex")}`;
+    tempPath = `${parentPath}/${target.tempPrefix}${target.tempStem}-${randomHexTempSuffix()}`;
     let handle: ImmutableDocumentFileHandle;
     try {
       handle = await io.openTempExclusive(tempPath);

@@ -5763,10 +5763,30 @@ orchestration, a lost response is recovered through
 HTTP layer — the kernel run mutation lock stays the single owner and the
 loser observes the ordinary `run_busy` outcome.
 
-Still unwired: a browser UI, authentication/RBAC/TLS/remote bind,
-list-runs/discovery, an operation queue or 202 jobs, event or log
-streaming, registry hot reload, input upload/materialization, binding
-import/adoption or retention/deletion, and automatic stage/wait policy.
+Two additional read-only discovery routes are production-wired:
+`GET /v1/projects` returns the declaration-order ids of the loaded
+registry (`projects[] {id, input_roots[] {id}}` — safe ids only, no
+roots, config, launcher material or host paths, no query parameters),
+and `GET /v1/runs` returns the durable binding-store enumeration
+(`runs[] {run_id, project_id, project_available}`, `next_after`) with an
+optional exclusive lexical `after` cursor and an optional `limit`
+(positive safe integer, default 100, maximum 200). Discovery is built
+only from the loaded frozen registry and the durable bindings — never
+from Pipeline run directories or `state.json` — spawns no subprocess and
+takes no mutation lock. A registry project the current registry no
+longer declares stays visible with `project_available: false`, which is
+never a run status: run status and boundary are read separately through
+`GET /v1/runs/:runId`. Pagination is lexical, paginates nothing but the
+binding list, and offers no snapshot isolation under concurrent claims —
+a concurrent binding either lands in the page or is visible at the next
+refresh, and the immutable publication makes a partial document
+unobservable.
+
+Still unwired: a browser UI, authentication/RBAC/TLS/remote bind, run
+status aggregation, list filtering/search, an operation queue or 202
+jobs, event or log streaming, registry hot reload, input
+upload/materialization, binding import/adoption or retention/deletion,
+and automatic stage/wait policy.
 
 ## Event and log handling
 
