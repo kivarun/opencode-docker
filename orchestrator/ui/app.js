@@ -445,6 +445,320 @@ export async function requestApiJson(fetchImpl, path, init) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Manual lifecycle controls (v2): inspect document → action model.    */
+/* ------------------------------------------------------------------ */
+
+const RESERVED_WAIT_ACTIONS = ["continue_stage", "revise_task"];
+const INSPECT_BOUNDARY_KINDS = ["plan_ready", "waiting", "resumable", "in_flight", "succeeded", "failed"];
+
+function unusableBoundary(runId, reason) {
+  return Object.freeze({ kind: "unusable_boundary", runId, reason });
+}
+
+function isPositiveIntegerText(text) {
+  if (typeof text !== "string" || !/^[0-9]+$/.test(text)) {
+    return null;
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    return null;
+  }
+  return value;
+}
+
+function expectWaitingBoundaryFields(runId, boundary) {
+  const waitIndex = boundary["waitIndex"];
+  if (typeof waitIndex !== "number" || !Number.isSafeInteger(waitIndex) || waitIndex < 1) {
+    return null;
+  }
+  if (typeof boundary["reason"] !== "string" || boundary["reason"] === "") {
+    return null;
+  }
+  const actions = boundary["actions"];
+  if (!Array.isArray(actions) || actions.length === 0) {
+    return null;
+  }
+  for (const action of actions) {
+    if (!isRecord(action) || typeof action["id"] !== "string" || action["id"] === "" || typeof action["to"] !== "string" || action["to"] === "") {
+      return null;
+    }
+    if (!RESERVED_WAIT_ACTIONS.includes(action["id"])) {
+      return unusableBoundary(runId, "unknown_action");
+    }
+  }
+  return waitIndex;
+}
+
+/**
+ * The one inspect-to-action-model owner. The boundary of the last
+ * applied inspect projection is the single source of every control;
+ * previous mutating results, local history and guessed state never
+ * participate. Unknown statuses, boundaries, continuations or actions
+ * fail closed into `unusable_boundary` (no control, zero POST).
+ */
+export function buildRunActionModel(runModel, authority) {
+  if (!isRecord(runModel) || runModel["kind"] !== "run" || !isSafeId(runModel["runId"])) {
+    throw new UiContractError("invalid_state");
+  }
+  const runId = runModel["runId"];
+  const status = runModel["status"];
+  const boundary = runModel["boundary"];
+  if (!isRecord(boundary) || typeof boundary["kind"] !== "string" || !INSPECT_BOUNDARY_KINDS.includes(boundary["kind"])) {
+    return unusableBoundary(runId, "unknown_boundary");
+  }
+  const boundaryKind = boundary["kind"];
+  if (status === "running" ? !["plan_ready", "resumable", "in_flight"].includes(boundaryKind) : boundaryKind !== status) {
+    return unusableBoundary(runId, "status_boundary_mismatch");
+  }
+  if (boundaryKind === "resumable") {
+    return Object.freeze({ kind: "resume", runId });
+  }
+  if (boundaryKind === "in_flight") {
+    return Object.freeze({ kind: "observe_only", runId });
+  }
+  if (boundaryKind === "succeeded" || boundaryKind === "failed") {
+    return Object.freeze({ kind: "terminal", runId, status });
+  }
+  if (boundaryKind === "plan_ready") {
+    const continuation = boundary["continuation"];
+    if (continuation === "resume") {
+      return Object.freeze({ kind: "resume", runId });
+    }
+    if (continuation === "resume_plan") {
+      return Object.freeze({ kind: "resume_plan", runId });
+    }
+    return unusableBoundary(runId, "unknown_continuation");
+  }
+  const waitIndex = expectWaitingBoundaryFields(runId, boundary);
+  if (typeof waitIndex !== "number") {
+    return waitIndex === null ? unusableBoundary(runId, "invalid_boundary_shape") : waitIndex;
+  }
+  const projectsModel = isRecord(authority) ? authority["projectsModel"] : null;
+  const runEntry = isRecord(authority) ? authority["runEntry"] : null;
+  const controls = boundary["actions"].map((action) => {
+    if (action["id"] === "continue_stage") {
+      return Object.freeze({ kind: "continue_stage", runId, waitIndex });
+    }
+    return Object.freeze(reviseTaskControl(runId, waitIndex, projectsModel, runEntry));
+  });
+  return Object.freeze({ kind: "waiting", runId, controls: Object.freeze(controls) });
+}
+
+function reviseTaskControl(runId, waitIndex, projectsModel, runEntry) {
+  const blocked = (cause) => ({ kind: "revise_task_blocked", runId, waitIndex, cause });
+  if (!isRecord(projectsModel) || projectsModel["kind"] !== "projects") {
+    return blocked("projects_not_loaded");
+  }
+  if (!isRecord(runEntry) || runEntry["runId"] !== runId) {
+    return blocked("project_missing");
+  }
+  if (runEntry["projectAvailable"] !== true) {
+    return blocked("project_unavailable");
+  }
+  const projectId = runEntry["projectId"];
+  const project = projectsModel["projects"].find((entry) => isRecord(entry) && entry["id"] === projectId);
+  if (project === undefined) {
+    return blocked("project_missing");
+  }
+  if (!Array.isArray(project["inputRootIds"]) || project["inputRootIds"].length === 0) {
+    return blocked("no_input_roots");
+  }
+  return { kind: "revise_task", runId, waitIndex, projectId, inputRootIds: project["inputRootIds"] };
+}
+
+/**
+ * The one mutation request owner: exact route path and exact snake_case
+ * wire body with exact own keys. The wait index comes only from the
+ * action model (the last applied inspect), never from a form value;
+ * validation completes before any fetch.
+ */
+export function buildMutationRequest(action, formValues) {
+  if (!isRecord(action) || !isSafeId(action["runId"])) {
+    throw new UiContractError("no_mutation");
+  }
+  const runId = action["runId"];
+  const values = isRecord(formValues) ? formValues : {};
+  if (action["kind"] === "resume") {
+    return Object.freeze({ endpoint: "resume", path: `/v1/runs/${runId}/resume`, body: Object.freeze({}) });
+  }
+  if (action["kind"] === "resume_plan") {
+    const stageId = values["stageId"];
+    if (!isSafeId(stageId)) {
+      throw new UiContractError("invalid_stage_id");
+    }
+    const initialBudget = isPositiveIntegerText(values["initialBudget"]);
+    if (initialBudget === null) {
+      throw new UiContractError("invalid_initial_budget");
+    }
+    return Object.freeze({
+      endpoint: "resume_plan",
+      path: `/v1/runs/${runId}/resume-plan`,
+      body: Object.freeze({ stage_id: stageId, initial_budget: initialBudget }),
+    });
+  }
+  if (action["kind"] === "continue_stage") {
+    const waitIndex = action["waitIndex"];
+    if (typeof waitIndex !== "number" || !Number.isSafeInteger(waitIndex) || waitIndex < 1) {
+      throw new UiContractError("no_mutation");
+    }
+    const additionalIterations = isPositiveIntegerText(values["additionalIterations"]);
+    if (additionalIterations === null) {
+      throw new UiContractError("invalid_additional_iterations");
+    }
+    return Object.freeze({
+      endpoint: "continue_stage",
+      path: `/v1/runs/${runId}/continue-stage`,
+      body: Object.freeze({ wait_index: waitIndex, additional_iterations: additionalIterations }),
+    });
+  }
+  if (action["kind"] === "revise_task") {
+    const waitIndex = action["waitIndex"];
+    if (typeof waitIndex !== "number" || !Number.isSafeInteger(waitIndex) || waitIndex < 1) {
+      throw new UiContractError("no_mutation");
+    }
+    const taskId = values["taskId"];
+    const rootId = values["rootId"];
+    const ref = values["ref"];
+    if (!isSafeId(taskId) || !isSafeId(rootId) || !isSafeId(ref)) {
+      throw new UiContractError("invalid_task_reference");
+    }
+    const inputRootIds = Array.isArray(action["inputRootIds"]) ? action["inputRootIds"] : [];
+    if (!inputRootIds.includes(rootId)) {
+      throw new UiContractError("invalid_task_reference");
+    }
+    return Object.freeze({
+      endpoint: "revise_task",
+      path: `/v1/runs/${runId}/revise-task`,
+      body: Object.freeze({
+        wait_index: waitIndex,
+        task_id: taskId,
+        task: Object.freeze({ root_id: rootId, ref }),
+      }),
+    });
+  }
+  throw new UiContractError("no_mutation");
+}
+
+/**
+ * Endpoint-specific response acceptance: an inspect accepts only
+ * `run|error`, a discovery call only its own discovery kind or `error`,
+ * a mutation only `command_result|error`. A known but unsuitable kind is
+ * a contract error, never a guessed interpretation.
+ */
+export function expectRunOrError(result) {
+  return acceptEndpointKinds(result, ["run", "error"]);
+}
+
+export function expectDiscoveryModel(result, kind) {
+  if (kind !== "projects" && kind !== "runs") {
+    throw new UiContractError("invalid_endpoint");
+  }
+  return acceptEndpointKinds(result, [kind, "error"]);
+}
+
+export function expectMutationResult(result) {
+  return acceptEndpointKinds(result, ["command_result", "error"]);
+}
+
+function acceptEndpointKinds(result, kinds) {
+  if (!isRecord(result) || typeof result["ok"] !== "boolean") {
+    return Object.freeze({ ok: false, failure: Object.freeze({ layer: "contract", reason: "invalid_result" }) });
+  }
+  if (result["ok"] === false) {
+    return Object.freeze({ ok: false, failure: result["failure"] });
+  }
+  const model = result["model"];
+  if (!isRecord(model) || typeof model["kind"] !== "string" || !kinds.includes(model["kind"])) {
+    return Object.freeze({ ok: false, failure: Object.freeze({ layer: "contract", reason: "unexpected_kind" }) });
+  }
+  return Object.freeze({ ok: true, model });
+}
+
+/** The one UI-wide mutation gate: at most one mutating POST in flight. */
+export function createMutationGate() {
+  let inFlight = false;
+  return Object.freeze({
+    begin() {
+      if (inFlight) {
+        return false;
+      }
+      inFlight = true;
+      return true;
+    },
+    end() {
+      inFlight = false;
+    },
+    isInFlight() {
+      return inFlight;
+    },
+  });
+}
+
+/**
+ * Monotonic GET generation guard: a response from an older generation
+ * never overwrites newer state (stale page responses after a Refresh
+ * are dropped; safe GET cancellation stays possible).
+ */
+export function createGenerationGuard() {
+  let current = 0;
+  return Object.freeze({
+    next() {
+      current += 1;
+      return current;
+    },
+    isCurrent(generation) {
+      return generation === current;
+    },
+  });
+}
+
+/**
+ * The one mutation flow owner for every mutating POST (fresh run,
+ * resume, resume-plan, continue-stage, revise-task). Exactly one POST
+ * is sent; a network failure after send means outcome unknown and is
+ * recovered only through exactly one safe GET inspect of the known run
+ * id — the POST is never retried. A received command_result is shown,
+ * followed by exactly one authoritative inspect of the same run id;
+ * no next mutator is started automatically.
+ */
+export async function runMutationFlow(flow) {
+  const handlers = isRecord(flow) && isRecord(flow["handlers"]) ? flow["handlers"] : null;
+  const runId = isRecord(flow) ? flow["runId"] : null;
+  if (handlers === null || !isSafeId(runId) || typeof flow["send"] !== "function" || typeof flow["inspect"] !== "function") {
+    throw new UiContractError("invalid_flow");
+  }
+  const recover = async () => {
+    const inspected = expectRunOrError(await flow["inspect"](runId));
+    if (inspected.ok && inspected.model["kind"] === "run") {
+      await handlers["onRecovered"](inspected.model);
+      return;
+    }
+    await handlers["onRecoveryUnavailable"](inspected.ok ? inspected.model : inspected.failure);
+  };
+  const result = await flow["send"]();
+  if (result.ok === false) {
+    if (result.lost === true) {
+      await handlers["onLost"]();
+      await recover();
+      return;
+    }
+    await handlers["onError"](result.failure);
+    return;
+  }
+  const mutation = expectMutationResult(result);
+  if (mutation.ok === false) {
+    await handlers["onError"](mutation.failure);
+    return;
+  }
+  if (mutation.model["kind"] === "error") {
+    await handlers["onError"](mutation.model);
+    return;
+  }
+  await handlers["onCommandResult"](mutation.model);
+  await recover();
+}
+
+/* ------------------------------------------------------------------ */
 /* Thin DOM adapter: createElement/textContent only.                   */
 /* ------------------------------------------------------------------ */
 
@@ -454,6 +768,24 @@ function element(tag, text) {
     node.textContent = text;
   }
   return node;
+}
+
+function textInput(inputId, className) {
+  const input = document.createElement("input");
+  input.id = inputId;
+  input.type = "text";
+  input.className = className;
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  return input;
+}
+
+function labeledControl(labelText, control) {
+  const label = document.createElement("label");
+  label.htmlFor = control.id;
+  label.textContent = labelText;
+  label.appendChild(control);
+  return label;
 }
 
 function describeCommandResult(model) {
@@ -475,7 +807,25 @@ function showResultFailure(result) {
   showError(`contract: unexpected ${result.model.kind} document`);
 }
 
+function setMutationControlsDisabled(disabled) {
+  for (const node of document.querySelectorAll(".mutation-control")) {
+    node.disabled = disabled;
+  }
+}
+
+function authorityFor(runId) {
+  let entry = null;
+  for (const run of runsState.runs) {
+    if (run.runId === runId) {
+      entry = run;
+      break;
+    }
+  }
+  return { projectsModel: projectsState, runEntry: entry };
+}
+
 function renderProjects(model) {
+  projectsState = model;
   const body = document.getElementById("projects-body");
   body.replaceChildren();
   for (const project of model.projects) {
@@ -539,33 +889,52 @@ function renderRunDetail(model) {
   document.getElementById("outputs-table").hidden = false;
 }
 
+function showRunModel(model) {
+  selectedRunId = model.runId;
+  renderRunDetail(model);
+  renderRunControls(buildRunActionModel(model, authorityFor(model.runId)));
+  if (mutationGate.isInFlight()) {
+    setMutationControlsDisabled(true);
+  }
+}
+
+async function loadProjects() {
+  const result = expectDiscoveryModel(await requestApiJson(fetchImplementation, "/v1/projects"), "projects");
+  if (result.ok && result.model.kind === "projects") {
+    renderProjects(result.model);
+    setStatus("Projects loaded.");
+    return;
+  }
+  showResultFailure(result);
+}
+
 async function inspectRun(runId, mode) {
   if (mode !== "after_command") {
     setStatus(mode === "manual" ? `Inspecting run ${runId}…` : `Checking run ${runId}…`);
   }
+  selectedRunId = runId;
   document.getElementById("detail-run-id").textContent = `Run ${runId}`;
   document.getElementById("inspect-selected").hidden = false;
   document.getElementById("run-detail").hidden = true;
   document.getElementById("outputs-table").hidden = true;
-  const result = await requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
-  if (result.ok && result.model.kind === "run") {
-    renderRunDetail(result.model);
+  document.getElementById("run-controls").replaceChildren();
+  const inspected = expectRunOrError(await requestApiJson(fetchImplementation, `/v1/runs/${runId}`));
+  // A stale inspect after the operator selected another run is ignored.
+  if (selectedRunId !== runId) {
+    return;
+  }
+  if (inspected.ok && inspected.model.kind === "run") {
+    showRunModel(inspected.model);
     if (mode !== "after_command") {
-      setStatus(mode === "after_lost" ? `Run ${runId} found after the lost create request.` : `Run ${runId} inspected.`);
+      setStatus(mode === "after_lost" ? `Run ${runId} found after the lost request.` : `Run ${runId} inspected.`);
     }
     return;
   }
-  if (result.ok && result.model.kind === "command_result") {
-    setStatus(`${describeCommandResult(result.model)}; use Refresh or Inspect to retry.`);
+  if (inspected.ok && inspected.model.kind === "command_result") {
+    setStatus(`${describeCommandResult(inspected.model)}; use Refresh or Inspect to retry.`);
     return;
   }
-  if (result.ok && result.model.kind === "error") {
-    showError(formatFailure(result.model));
-  } else if (result.ok) {
-    showError(`contract: unexpected ${result.model.kind} document`);
-  } else {
-    showError(formatFailure(result.failure));
-  }
+  showError(formatFailure(inspected.ok ? inspected.model : inspected.failure));
   if (mode !== "after_command") {
     setStatus(
       mode === "after_lost"
@@ -576,7 +945,12 @@ async function inspectRun(runId, mode) {
 }
 
 async function refreshRuns(announce) {
-  const result = await requestApiJson(fetchImplementation, runsPagePath(null));
+  const generation = runsGuard.next();
+  const result = expectDiscoveryModel(await requestApiJson(fetchImplementation, runsPagePath(null)), "runs");
+  // A page response started before a newer Refresh never overwrites it.
+  if (!runsGuard.isCurrent(generation)) {
+    return;
+  }
   if (result.ok && result.model.kind === "runs") {
     runsState = applyRunsPage(createRunsState(), result.model);
     renderRuns(runsState);
@@ -592,8 +966,12 @@ async function loadMoreRuns() {
   if (runsState.nextAfter === null) {
     return;
   }
+  const generation = runsGuard.current();
   const after = runsState.nextAfter;
-  const result = await requestApiJson(fetchImplementation, runsPagePath(after));
+  const result = expectDiscoveryModel(await requestApiJson(fetchImplementation, runsPagePath(after)), "runs");
+  if (!runsGuard.isCurrent(generation)) {
+    return;
+  }
   if (result.ok && result.model.kind === "runs") {
     runsState = applyRunsPage(runsState, result.model);
     renderRuns(runsState);
@@ -617,15 +995,239 @@ function readInputRows() {
   return rows;
 }
 
-async function recoverFromLostResponse(runId) {
-  const recovery = lostResponseRecovery(runId);
-  setStatus(`outcome unknown; the create request for run ${recovery.runId} may have been received; checking once…`);
-  await inspectRun(recovery.runId, "after_lost");
+/**
+ * The one mutating POST owner: every mutating request of the UI (fresh
+ * run, resume, resume-plan, continue-stage, revise-task) is sent here
+ * exactly once and driven through the shared mutation flow.
+ */
+async function postMutation(request, flow) {
+  await runMutationFlow({
+    send: () =>
+      requestApiJson(fetchImplementation, request.path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request.body),
+      }),
+    inspect: (runId) => requestApiJson(fetchImplementation, `/v1/runs/${runId}`),
+    runId: flow.runId,
+    handlers: flow.handlers,
+  });
+}
+
+/**
+ * The one mutating submit path: the shared gate admits at most one
+ * mutating POST, the request is built and fully validated before any
+ * fetch, and the shared flow owns the outcome, the lost-response
+ * recovery and the authoritative inspect.
+ */
+async function submitAction(action, readForm, describe) {
+  if (!mutationGate.begin()) {
+    return;
+  }
+  setMutationControlsDisabled(true);
+  try {
+    let request;
+    try {
+      request = buildMutationRequest(action, readForm());
+    } catch (error) {
+      if (error instanceof UiContractError) {
+        showError(`contract: ${error.reason}`);
+        return;
+      }
+      throw error;
+    }
+    setStatus(`Sending ${describe} for run ${action.runId}…`);
+    await postMutation(request, {
+      runId: action.runId,
+      handlers: {
+        onCommandResult: async (model) => {
+          setStatus(describeCommandResult(model));
+          await refreshRuns(false);
+        },
+        onLost: () => {
+          setStatus(`outcome unknown; the ${describe} request for run ${action.runId} may have been received; checking once…`);
+        },
+        onRecovered: (model) => {
+          if (selectedRunId !== model.runId) {
+            return;
+          }
+          showRunModel(model);
+          setStatus(`Run ${model.runId} inspected after the ${describe} request.`);
+        },
+        onRecoveryUnavailable: (presented) => {
+          showError(formatFailure(presented));
+          setStatus(`outcome unknown or unchanged; use Refresh or Inspect.`);
+        },
+        onError: (presented) => {
+          showError(formatFailure(presented));
+          setStatus(`The ${describe} request was not applied; use Refresh or Inspect.`);
+        },
+      },
+    });
+  } finally {
+    mutationGate.end();
+    setMutationControlsDisabled(false);
+  }
+}
+
+let controlCounter = 0;
+
+function controlInput(labelText, className) {
+  controlCounter += 1;
+  return labeledControl(labelText, textInput(`control-${controlCounter}-${className}`, className));
+}
+
+function mutationButton(label, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "mutation-control";
+  button.textContent = label;
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function waitIndexLine(control) {
+  return element("p", `Wait index ${control.waitIndex} (from the inspect projection; not editable)`);
+}
+
+function resumePlanForm(action) {
+  const form = document.createElement("form");
+  const stageField = controlInput("Stage id", "form-stage-id");
+  const budgetField = controlInput("Initial budget", "form-initial-budget");
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "mutation-control";
+  submit.textContent = "Resume plan";
+  form.appendChild(stageField);
+  form.appendChild(budgetField);
+  form.appendChild(submit);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitAction(action, () => ({
+      stageId: stageField.querySelector("input").value,
+      initialBudget: budgetField.querySelector("input").value,
+    }), "resume-plan");
+  });
+  return form;
+}
+
+function continueStageForm(control) {
+  const form = document.createElement("form");
+  const iterationsField = controlInput("Additional iterations", "form-additional-iterations");
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "mutation-control";
+  submit.textContent = "Continue stage";
+  form.appendChild(waitIndexLine(control));
+  form.appendChild(iterationsField);
+  form.appendChild(submit);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitAction(control, () => ({
+      additionalIterations: iterationsField.querySelector("input").value,
+    }), "continue-stage");
+  });
+  return form;
+}
+
+function reviseTaskForm(control) {
+  const form = document.createElement("form");
+  const taskField = controlInput("Task id", "form-task-id");
+  const rootSelect = document.createElement("select");
+  controlCounter += 1;
+  rootSelect.id = `control-${controlCounter}-form-root-id`;
+  rootSelect.className = "form-root-id";
+  rootSelect.autocomplete = "off";
+  for (const rootId of control.inputRootIds) {
+    const option = document.createElement("option");
+    option.value = rootId;
+    option.textContent = rootId;
+    rootSelect.appendChild(option);
+  }
+  const rootField = labeledControl("Input root", rootSelect);
+  const refField = controlInput("Input ref", "form-task-ref");
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "mutation-control";
+  submit.textContent = "Revise task";
+  form.appendChild(waitIndexLine(control));
+  form.appendChild(taskField);
+  form.appendChild(rootField);
+  form.appendChild(refField);
+  form.appendChild(submit);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitAction(control, () => ({
+      taskId: taskField.querySelector("input").value,
+      rootId: rootSelect.value,
+      ref: refField.querySelector("input").value,
+    }), "revise-task");
+  });
+  return form;
+}
+
+function blockedReviseControl(control) {
+  const causes = {
+    projects_not_loaded: "the project discovery has not been loaded",
+    project_missing: "the run-to-project binding is not in the loaded discovery",
+    project_unavailable: "the bound project is not available in the current registry",
+    no_input_roots: "the bound project declares no input roots",
+  };
+  const container = document.createElement("div");
+  container.appendChild(waitIndexLine(control));
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "mutation-control";
+  button.textContent = "Revise task";
+  button.disabled = true;
+  container.appendChild(button);
+  container.appendChild(element("p", `Revise task is disabled: ${causes[control.cause] ?? "the project authority is unavailable"}.`));
+  return container;
+}
+
+function renderRunControls(action) {
+  const container = document.getElementById("run-controls");
+  container.replaceChildren();
+  if (action.kind === "unusable_boundary") {
+    container.appendChild(element("p", `contract: ${action.reason} — no manual control; use Refresh.`));
+    return;
+  }
+  if (action.kind === "observe_only") {
+    container.appendChild(element("p", "Execution in flight — use Refresh to re-inspect."));
+    return;
+  }
+  if (action.kind === "terminal") {
+    container.appendChild(
+      element("p", action.status === "failed" ? "The run failed; no manual controls." : "The run succeeded; no manual controls."),
+    );
+    return;
+  }
+  if (action.kind === "resume") {
+    container.appendChild(mutationButton("Resume run", () => {
+      void submitAction(action, () => ({}), "resume");
+    }));
+    return;
+  }
+  if (action.kind === "resume_plan") {
+    container.appendChild(resumePlanForm(action));
+    return;
+  }
+  if (action.kind === "waiting") {
+    for (const control of action.controls) {
+      if (control.kind === "continue_stage") {
+        container.appendChild(continueStageForm(control));
+      } else if (control.kind === "revise_task") {
+        container.appendChild(reviseTaskForm(control));
+      } else {
+        container.appendChild(blockedReviseControl(control));
+      }
+    }
+  }
 }
 
 async function submitNewRun(event) {
   event.preventDefault();
-  if (submitInFlight) {
+  if (!mutationGate.begin()) {
     return;
   }
   clearMessages();
@@ -642,34 +1244,43 @@ async function submitNewRun(event) {
     throw error;
   }
   const submit = document.getElementById("submit-run");
-  submitInFlight = true;
-  submit.disabled = true;
+  setMutationControlsDisabled(true);
   try {
     setStatus(`Creating run ${runId}…`);
-    const result = await requestApiJson(fetchImplementation, freshRunPath(projectId), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
+    await postMutation({ path: freshRunPath(projectId), body }, {
+      runId,
+      handlers: {
+        onCommandResult: async (model) => {
+          setStatus(describeCommandResult(model));
+          await refreshRuns(false);
+        },
+        onLost: () => {
+          setStatus(`outcome unknown; the create request for run ${runId} may have been received; checking once…`);
+        },
+        onRecovered: (model) => {
+          selectedRunId = model.runId;
+          showRunModel(model);
+        },
+        onRecoveryUnavailable: (presented) => {
+          showError(formatFailure(presented));
+          setStatus(`outcome unknown; run ${runId} not found yet — use Refresh or Inspect.`);
+        },
+        onError: (presented) => {
+          showError(formatFailure(presented));
+        },
+      },
     });
-    if (result.ok && result.model.kind === "command_result") {
-      setStatus(describeCommandResult(result.model));
-      await refreshRuns(false);
-      await inspectRun(result.model.runId, "after_command");
-      return;
-    }
-    if (result.lost) {
-      await recoverFromLostResponse(runId);
-      return;
-    }
-    showResultFailure(result);
   } finally {
-    submitInFlight = false;
-    submit.disabled = false;
+    mutationGate.end();
+    setMutationControlsDisabled(false);
   }
 }
 
 let runsState = createRunsState();
-let submitInFlight = false;
+let projectsState = null;
+let selectedRunId = null;
+const mutationGate = createMutationGate();
+const runsGuard = createGenerationGuard();
 const fetchImplementation = typeof fetch === "function" ? fetch : null;
 
 function setStatus(text) {
@@ -685,29 +1296,15 @@ function clearMessages() {
   showError("");
 }
 
-function labeledInput(inputId, labelText, className) {
-  const label = document.createElement("label");
-  label.htmlFor = inputId;
-  label.textContent = labelText;
-  const input = document.createElement("input");
-  input.id = inputId;
-  input.type = "text";
-  input.className = className;
-  input.autocomplete = "off";
-  input.spellcheck = false;
-  label.appendChild(input);
-  return label;
-}
-
 let inputRowCounter = 0;
 
 function addInputRow() {
   inputRowCounter += 1;
   const row = document.createElement("div");
   row.className = "input-row";
-  row.appendChild(labeledInput(`input-row-${inputRowCounter}-id`, "Input id", "input-id"));
-  row.appendChild(labeledInput(`input-row-${inputRowCounter}-root`, "Input root", "input-root"));
-  row.appendChild(labeledInput(`input-row-${inputRowCounter}-ref`, "Input ref", "input-ref"));
+  row.appendChild(labeledControl("Input id", textInput(`input-row-${inputRowCounter}-id`, "input-id")));
+  row.appendChild(labeledControl("Input root", textInput(`input-row-${inputRowCounter}-root`, "input-root")));
+  row.appendChild(labeledControl("Input ref", textInput(`input-row-${inputRowCounter}-ref`, "input-ref")));
   const remove = document.createElement("button");
   remove.type = "button";
   remove.textContent = "Remove";
@@ -722,15 +1319,7 @@ function boot() {
   document.getElementById("refresh-projects").addEventListener("click", () => {
     clearMessages();
     setStatus("Loading projects…");
-    void (async () => {
-      const result = await requestApiJson(fetchImplementation, "/v1/projects");
-      if (result.ok && result.model.kind === "projects") {
-        renderProjects(result.model);
-        setStatus("Projects loaded.");
-        return;
-      }
-      showResultFailure(result);
-    })();
+    void loadProjects();
   });
   document.getElementById("refresh-runs").addEventListener("click", () => {
     clearMessages();

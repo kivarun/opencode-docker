@@ -115,3 +115,92 @@ export declare function requestApiJson(
   path: string,
   init?: RequestInit,
 ): Promise<UiApiResult>;
+
+/* ------------------------------------------------------------------ */
+/* Manual lifecycle controls (v2).                                     */
+/* ------------------------------------------------------------------ */
+
+export interface UiReviseTaskControl {
+  readonly kind: "revise_task";
+  readonly runId: string;
+  readonly waitIndex: number;
+  readonly projectId: string;
+  readonly inputRootIds: readonly string[];
+}
+
+export interface UiReviseTaskBlockedControl {
+  readonly kind: "revise_task_blocked";
+  readonly runId: string;
+  readonly waitIndex: number;
+  readonly cause: "projects_not_loaded" | "project_missing" | "project_unavailable" | "no_input_roots";
+}
+
+export type UiWaitingControl =
+  | { readonly kind: "continue_stage"; readonly runId: string; readonly waitIndex: number }
+  | UiReviseTaskControl
+  | UiReviseTaskBlockedControl;
+
+export type UiRunActionModel =
+  | { readonly kind: "resume"; readonly runId: string }
+  | { readonly kind: "resume_plan"; readonly runId: string }
+  | { readonly kind: "terminal"; readonly runId: string; readonly status: "succeeded" | "failed" }
+  | { readonly kind: "observe_only"; readonly runId: string }
+  | { readonly kind: "waiting"; readonly runId: string; readonly controls: readonly UiWaitingControl[] }
+  | { readonly kind: "unusable_boundary"; readonly runId: string; readonly reason: string };
+
+export interface UiRunActionAuthority {
+  readonly projectsModel: UiProjectsModel | null;
+  readonly runEntry: UiRunsEntry | null;
+}
+
+export declare function buildRunActionModel(runModel: unknown, authority: UiRunActionAuthority | null): UiRunActionModel;
+
+export type UiMutationEndpoint = "resume" | "resume_plan" | "continue_stage" | "revise_task";
+
+export interface UiMutationRequest {
+  readonly endpoint: UiMutationEndpoint;
+  readonly path: string;
+  readonly body: Record<string, unknown>;
+}
+
+export declare function buildMutationRequest(action: unknown, formValues: unknown): UiMutationRequest;
+
+export interface UiEndpointResult {
+  readonly ok: boolean;
+  readonly model?: UiApiModel;
+  readonly failure?: UiApiFailure;
+}
+
+export declare function expectRunOrError(result: UiApiResult | UiEndpointResult): UiEndpointResult;
+export declare function expectDiscoveryModel(result: UiApiResult | UiEndpointResult, kind: "projects" | "runs"): UiEndpointResult;
+export declare function expectMutationResult(result: UiApiResult | UiEndpointResult): UiEndpointResult;
+
+export interface UiMutationGate {
+  begin(): boolean;
+  end(): void;
+  isInFlight(): boolean;
+}
+
+export declare function createMutationGate(): UiMutationGate;
+
+export interface UiGenerationGuard {
+  next(): number;
+  isCurrent(generation: number): boolean;
+}
+
+export declare function createGenerationGuard(): UiGenerationGuard;
+
+export interface UiMutationFlow {
+  readonly send: () => Promise<UiApiResult>;
+  readonly inspect: (runId: string) => Promise<UiApiResult>;
+  readonly runId: string;
+  readonly handlers: {
+    onCommandResult(model: UiCommandResultModel): void | Promise<void>;
+    onLost(): void | Promise<void>;
+    onRecovered(model: UiRunModel): void | Promise<void>;
+    onRecoveryUnavailable(presented: UiApiFailure | UiErrorModel): void | Promise<void>;
+    onError(presented: UiApiFailure | UiErrorModel): void | Promise<void>;
+  };
+}
+
+export declare function runMutationFlow(flow: UiMutationFlow): Promise<void>;

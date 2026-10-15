@@ -93,6 +93,25 @@ form {
   max-width: 40rem;
 }
 
+#run-controls form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: end;
+  margin-block: 0.5rem;
+}
+
+#run-controls p {
+  font-weight: 600;
+  margin-block: 0.25rem;
+}
+
+#run-controls fieldset,
+#run-controls select,
+#run-controls input {
+  max-width: 24rem;
+}
+
 fieldset {
   display: flex;
   flex-direction: column;

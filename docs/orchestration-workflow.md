@@ -5843,16 +5843,83 @@ CLI:
   navigation, visible focus, an aria-live status region and an alert
   error region; the submit button is disabled only for the duration of
   one POST, while Refresh and Inspect stay repeatable.
-- Not part of the UI: the intervention flows (resume, resume-plan,
-  continue-stage, revise-task, respond), automatic polling, logs or
-  event streams, input upload, and deletion or retention — these stay
-  CLI/API-only.
+### Browser UI v2: manual boundary-driven lifecycle controls
+  (implemented, production-wired)
 
-Still unwired: authentication/RBAC/TLS/remote bind, run
-status aggregation, list filtering/search, an operation queue or 202
-jobs, event or log streaming, registry hot reload, input
-upload/materialization, binding import/adoption or retention/deletion,
-and automatic stage/wait policy.
+The UI extends the read-only surfaces with manual run continuation
+over the existing versioned HTTP endpoints — no new endpoint, no schema
+version, no automatic policy, and no reading of internal state
+documents. The single decision source is `GET /v1/runs/:runId`; the
+inspect-to-action-model builder maps the exact boundary union
+fail-closed:
+
+| Inspect boundary | UI control |
+| --- | --- |
+| `running / in_flight` | observe-only (Refresh) |
+| `running / resumable` | Resume |
+| `running / plan_ready`, `continuation: "resume"` | Resume |
+| `running / plan_ready`, `continuation: "resume_plan"` | resume-plan form |
+| `waiting`, action `continue_stage` | continue-stage form |
+| `waiting`, action `revise_task` | revise-task form |
+| `succeeded` | terminal/output projection only |
+| `failed` | failure projection only |
+| unknown status/boundary/continuation/action | fail closed, zero POST |
+
+Waiting actions are offered in the verbatim server order; a waiting
+boundary with any unrecognized action id fails closed as a whole.
+
+- The resume-plan form takes only explicit operator input: a
+  `stage_id` safe identifier and an `initial_budget` positive safe
+  integer. There is no default stage, no derivation from stage
+  position, entry state or template, no guessed budget, and nothing is
+  persisted outside page memory.
+- The continue-stage form takes the non-editable `wait_index` from the
+  boundary and an operator-entered positive safe integer
+  `additional_iterations`.
+- The revise-task form takes `wait_index` from the boundary,
+  an operator-entered `task_id`/`ref`, and a `root_id` select over ONLY
+  the bound project's declared input roots (`GET /v1/projects`), with
+  the run-to-project link taken exclusively from the binding-backed
+  `GET /v1/runs` entry. A removed or `project_available: false` project
+  disables revise-task fail-closed; there is no editable project id and
+  no guessing. No raw task body, upload or host path exists.
+- One mutation request owner builds every mutating route path and the
+  exact snake_case body with exact own keys (`resume` `{}`;
+  `resume-plan` `{stage_id, initial_budget}`; `continue-stage`
+  `{wait_index, additional_iterations}`; `revise-task`
+  `{wait_index, task_id, task {root_id, ref}}`). Form values are read
+  once at submit, validation completes before any fetch, the wait index
+  can never come from a form value, and validation failures create zero
+  network effects. Generic `respond` is never exposed: the reserved
+  interventions go only through their specialized endpoints.
+- Responses are accepted endpoint-specifically (inspect accepts only
+  `run|error`, discovery its own kind or `error`, a mutation only
+  `command_result|error`); a known but unsuitable kind is a contract
+  error, never a guessed interpretation.
+- A UI-wide mutation gate admits at most one mutating POST: every
+  mutating control is disabled while it is in flight, a double submit
+  creates no second POST, GET discovery/inspect stay allowed, and
+  selecting another run does not cancel the mutator. After a received
+  `command_result` the UI shows the outcome/reason, performs exactly
+  one authoritative inspect of the known run id, refreshes the runs
+  discovery and never starts the next mutator automatically;
+  `run_busy` and `invalid_state` are surfaced and never retried.
+- The lost-response contract covers every mutation: a network failure
+  after a POST began means outcome unknown — the run id and the sent
+  action stay visible, exactly one safe GET inspect of the known run id
+  runs, and only manual Refresh/Inspect is offered when the run is not
+  visible yet. The POST is never retried and the request body never
+  enters a URL or browser storage.
+- Async GET ordering uses generation semantics: a stale page response
+  after a Refresh and a stale inspect after selecting another run are
+  ignored. There is no background polling and no POST cancellation.
+
+Still unwired: automatic stage/budget or wait-action selection,
+retries/backoff/polling, an operation queue or 202 jobs, event/log
+streaming, input upload or a task-body editor, deletion/retention,
+authentication/RBAC/TLS/remote bind, registry hot reload, run status
+aggregation, list filtering/search, binding import/adoption, and any
+Pipeline V2 reducer/controller/CLI or schema change.
 
 ## Event and log handling
 

@@ -18,15 +18,24 @@ import {
   UiContractError,
   applyRunsPage,
   buildFreshRunBody,
+  buildMutationRequest,
+  buildRunActionModel,
+  createGenerationGuard,
+  createMutationGate,
   createRunsState,
+  expectDiscoveryModel,
+  expectMutationResult,
+  expectRunOrError,
   formatFailure,
   freshRunPath,
   isSafeId,
   lostResponseRecovery,
   parseApiDocument,
   requestApiJson,
+  runMutationFlow,
   runsPagePath,
   type UiApiModel,
+  type UiRunActionModel,
 } from "../ui/app.js";
 
 const appSource = readFileSync(join(import.meta.dir, "..", "ui", "app.js"), "utf8");
@@ -459,6 +468,14 @@ describe("ui model: export surface and source restrictions", () => {
         "lostResponseRecovery",
         "formatFailure",
         "requestApiJson",
+        "buildRunActionModel",
+        "buildMutationRequest",
+        "expectRunOrError",
+        "expectDiscoveryModel",
+        "expectMutationResult",
+        "createMutationGate",
+        "createGenerationGuard",
+        "runMutationFlow",
       ].sort(),
     );
   });
@@ -491,14 +508,29 @@ describe("ui model: export surface and source restrictions", () => {
       "run_root",
       "POST_RETRY",
       "retryPost",
+      "setInterval",
+      "/respond",
+      "stage-1",
+      "stage-2",
+      "task-a",
+      "task-b",
+      '"tasks"',
+      "/opt/",
+      "/home/",
+      "file://",
+      "stdout",
     ]) {
       expect(appSource.includes(banned)).toBe(false);
     }
     expect(appSource.split("await fetchImpl(").length - 1).toBe(1);
-    // exactly one mutating request site (the fresh-run POST); the GETs
-    // are the discovery and inspect reads
+    // exactly one mutating POST site (the shared postMutation owner);
+    // the GETs are the discovery and inspect reads
     expect(appSource.split('method: "POST"').length - 1).toBe(1);
     expect(appSource.split('method: "GET"').length - 1).toBe(0);
+    expect(appSource.split("buildMutationRequest(").length - 1).toBe(2);
+    expect(appSource.split("buildRunActionModel(").length - 1).toBe(2);
+    expect(appSource.split("runMutationFlow(").length - 1).toBe(2);
+    expect(appSource.split("postMutation(").length - 1).toBe(3);
     for (const line of appSource.split("\n")) {
       expect(line.startsWith("import ")).toBe(false);
     }
@@ -516,3 +548,464 @@ describe("ui model: export surface and source restrictions", () => {
     }
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Browser UI v2: manual boundary-driven lifecycle controls.           */
+/* ------------------------------------------------------------------ */
+
+const RUNNING_BOUNDARIES = {
+  in_flight: { kind: "in_flight", executionIndex: 3, stateId: "dev_entry", executionRole: "stage", phase: "running" },
+  resumable: { kind: "resumable", stateId: "next_state", transitionCount: 4 },
+  plan_ready_resume: { kind: "plan_ready", planningExecutionIndex: 1, continuation: "resume" },
+  plan_ready_manual: { kind: "plan_ready", planningExecutionIndex: 1, continuation: "resume_plan" },
+} as const;
+
+function runModelOf(status: string, boundary: unknown): UiApiModel {
+  return parseApiDocument({
+    schema_version: 1,
+    kind: "run",
+    run_id: "run-a",
+    revision: 5,
+    status,
+    boundary,
+    outputs: [],
+  });
+}
+
+type UiRunActionAuthorityFixture = Parameters<typeof buildRunActionModel>[1];
+
+const AUTHORITY_AVAILABLE = {
+  projectsModel: parseApiDocument({
+    schema_version: 1,
+    kind: "projects",
+    projects: [{ id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }] }],
+  }) as UiApiModel & { kind: "projects" },
+  runEntry: { runId: "run-a", projectId: "project-a", projectAvailable: true },
+} as const;
+
+function waitingRun(actionIds: readonly string[]): UiApiModel {
+  return runModelOf("running", { kind: "waiting" }) === null
+    ? (undefined as never)
+    : runModelOf("waiting", {
+        kind: "waiting",
+        waitIndex: 2,
+        reason: "stage_iteration_completed",
+        actions: actionIds.map((id) => ({ id, to: "architect" })),
+      });
+}
+
+describe("ui v2: boundary-to-control matrix", () => {
+  test("in_flight allows refresh only; resumable offers resume", () => {
+    expect(buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.in_flight), null)).toEqual({
+      kind: "observe_only",
+      runId: "run-a",
+    });
+    expect(buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.resumable), null)).toEqual({
+      kind: "resume",
+      runId: "run-a",
+    });
+  });
+
+  test("plan_ready distinguishes the inspect-declared continuation only", () => {
+    expect(buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.plan_ready_resume), null)).toEqual({
+      kind: "resume",
+      runId: "run-a",
+    });
+    expect(buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.plan_ready_manual), null)).toEqual({
+      kind: "resume_plan",
+      runId: "run-a",
+    });
+  });
+
+  test("waiting boundaries expose the declared actions in server order", () => {
+    const model = buildRunActionModel(waitingRun(["continue_stage", "revise_task"]), AUTHORITY_AVAILABLE) as UiRunActionModel & {
+      kind: "waiting";
+    };
+    expect(model.kind).toBe("waiting");
+    expect(model.controls.map((control) => control.kind)).toEqual(["continue_stage", "revise_task"]);
+    const reversed = buildRunActionModel(waitingRun(["revise_task", "continue_stage"]), AUTHORITY_AVAILABLE) as UiRunActionModel & {
+      kind: "waiting";
+    };
+    expect(reversed.controls.map((control) => control.kind)).toEqual(["revise_task", "continue_stage"]);
+    const single = buildRunActionModel(waitingRun(["continue_stage"]), null) as UiRunActionModel & { kind: "waiting" };
+    expect(single.controls.map((control) => control.kind)).toEqual(["continue_stage"]);
+  });
+
+  test("the revise-task control carries the project and its input-root ids from discovery only", () => {
+    const model = buildRunActionModel(waitingRun(["revise_task"]), AUTHORITY_AVAILABLE) as UiRunActionModel & { kind: "waiting" };
+    const control = model.controls[0] as { kind: string; projectId: string; inputRootIds: readonly string[]; waitIndex: number };
+    expect(control).toMatchObject({ kind: "revise_task", projectId: "project-a", waitIndex: 2 });
+    expect(control.inputRootIds).toEqual(["tasks", "plans"]);
+  });
+
+  test("an unavailable or unresolvable project disables revise-task fail closed", () => {
+    const blocked = (authority: UiRunActionAuthorityFixture): string => {
+      const model = buildRunActionModel(waitingRun(["revise_task"]), authority) as UiRunActionModel & { kind: "waiting" };
+      const control = model.controls[0] as { kind: string; cause?: string };
+      return control.kind === "revise_task_blocked" ? (control.cause as string) : control.kind;
+    };
+    expect(blocked({ ...AUTHORITY_AVAILABLE, runEntry: { runId: "run-a", projectId: "project-a", projectAvailable: false } })).toBe(
+      "project_unavailable",
+    );
+    expect(blocked({ projectsModel: null, runEntry: AUTHORITY_AVAILABLE.runEntry })).toBe("projects_not_loaded");
+    expect(blocked({ projectsModel: AUTHORITY_AVAILABLE.projectsModel, runEntry: null })).toBe("project_missing");
+    expect(
+      blocked({
+        projectsModel: parseApiDocument({
+          schema_version: 1,
+          kind: "projects",
+          projects: [{ id: "other", input_roots: [{ id: "tasks" }] }],
+        }) as UiApiModel & { kind: "projects" },
+        runEntry: AUTHORITY_AVAILABLE.runEntry,
+      }),
+    ).toBe("project_missing");
+    expect(
+      blocked({
+        projectsModel: parseApiDocument({
+          schema_version: 1,
+          kind: "projects",
+          projects: [{ id: "project-a", input_roots: [] }],
+        }) as UiApiModel & { kind: "projects" },
+        runEntry: AUTHORITY_AVAILABLE.runEntry,
+      }),
+    ).toBe("no_input_roots");
+  });
+
+  test("terminal boundaries project the outcome only", () => {
+    expect(buildRunActionModel(runModelOf("succeeded", { kind: "succeeded", terminalStateId: "done" }), null)).toEqual({
+      kind: "terminal",
+      runId: "run-a",
+      status: "succeeded",
+    });
+    expect(buildRunActionModel(runModelOf("failed", { kind: "failed", reason: "worker_failed" }), null)).toEqual({
+      kind: "terminal",
+      runId: "run-a",
+      status: "failed",
+    });
+  });
+
+  test("unknown statuses, boundaries, continuations and actions fail closed", () => {
+    const reasonOf = (status: string, boundary: unknown): string =>
+      (buildRunActionModel(runModelOf(status, boundary), null) as UiRunActionModel & { reason?: string }).reason ?? "none";
+    expect(reasonOf("running", { kind: "mystery" })).toBe("unknown_boundary");
+    expect(reasonOf("running", { kind: "waiting", waitIndex: 1, reason: "r", actions: [{ id: "continue_stage", to: "x" }] })).toBe(
+      "status_boundary_mismatch",
+    );
+    expect(reasonOf("waiting", RUNNING_BOUNDARIES.resumable)).toBe("status_boundary_mismatch");
+    expect(reasonOf("succeeded", { kind: "resumable", stateId: "s", transitionCount: 1 })).toBe("status_boundary_mismatch");
+    expect(reasonOf("failed", { kind: "failed", reason: "r" }) === "none").toBe(true);
+    expect(reasonOf("running", { kind: "plan_ready", planningExecutionIndex: 1, continuation: "auto" })).toBe("unknown_continuation");
+    expect(reasonOf("waiting", { kind: "waiting", waitIndex: 1, reason: "r", actions: [{ id: "other_action", to: "x" }] })).toBe("unknown_action");
+    expect(reasonOf("waiting", { kind: "waiting", waitIndex: 0, reason: "r", actions: [{ id: "continue_stage", to: "x" }] })).toBe(
+      "invalid_boundary_shape",
+    );
+    expect(reasonOf("waiting", { kind: "waiting", waitIndex: 1, reason: "r", actions: [] })).toBe("invalid_boundary_shape");
+    expect(reasonOf("waiting", { kind: "waiting", waitIndex: 1, reason: "r", actions: [{ id: "continue_stage" }] })).toBe(
+      "invalid_boundary_shape",
+    );
+    expect(() => buildRunActionModel({ kind: "command_result" }, null)).toThrow(UiContractError);
+  });
+});
+
+describe("ui v2: the one mutation request builder", () => {
+  test("resume sends an empty object to the resume route", () => {
+    const action = buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.resumable), null);
+    expect(buildMutationRequest(action, {})).toEqual({ endpoint: "resume", path: "/v1/runs/run-a/resume", body: {} });
+  });
+
+  test("resume-plan sends exactly stage_id and initial_budget", () => {
+    const action = buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.plan_ready_manual), null);
+    expect(buildMutationRequest(action, { stageId: "stage-1", initialBudget: "2" })).toEqual({
+      endpoint: "resume_plan",
+      path: "/v1/runs/run-a/resume-plan",
+      body: { stage_id: "stage-1", initial_budget: 2 },
+    });
+  });
+
+  test("continue-stage takes the wait index only from the inspect projection", () => {
+    const model = buildRunActionModel(waitingRun(["continue_stage"]), null) as UiRunActionModel & { kind: "waiting" };
+    const control = model.controls[0];
+    expect(buildMutationRequest(control, { additionalIterations: "1", waitIndex: 99 })).toEqual({
+      endpoint: "continue_stage",
+      path: "/v1/runs/run-a/continue-stage",
+      body: { wait_index: 2, additional_iterations: 1 },
+    });
+  });
+
+  test("revise-task sends the wait index, the task id and the registry-controlled reference", () => {
+    const model = buildRunActionModel(waitingRun(["revise_task"]), AUTHORITY_AVAILABLE) as UiRunActionModel & { kind: "waiting" };
+    expect(buildMutationRequest(model.controls[0], { taskId: "task-a", rootId: "tasks", ref: "task-a-v2.md" })).toEqual({
+      endpoint: "revise_task",
+      path: "/v1/runs/run-a/revise-task",
+      body: { wait_index: 2, task_id: "task-a", task: { root_id: "tasks", ref: "task-a-v2.md" } },
+    });
+  });
+
+  test("validation completes before any fetch and never echoes values", () => {
+    const resumePlan = buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.plan_ready_manual), null);
+    for (const values of [
+      { stageId: "stage-1", initialBudget: "0" },
+      { stageId: "stage-1", initialBudget: "-1" },
+      { stageId: "stage-1", initialBudget: "1.5" },
+      { stageId: "stage-1", initialBudget: "abc" },
+      { stageId: "stage-1", initialBudget: String(2 ** 53) },
+      { stageId: "stage-1", initialBudget: "" },
+      { stageId: "", initialBudget: "1" },
+      { stageId: "../escape", initialBudget: "1" },
+      {},
+    ]) {
+      expect(contractReason(() => buildMutationRequest(resumePlan, values))).toBe(
+        values.stageId === undefined || !isSafeId(values.stageId) ? "invalid_stage_id" : "invalid_initial_budget",
+      );
+    }
+    const model = buildRunActionModel(waitingRun(["continue_stage"]), null) as UiRunActionModel & { kind: "waiting" };
+    for (const values of [{ additionalIterations: "0" }, { additionalIterations: "x" }, {}]) {
+      expect(contractReason(() => buildMutationRequest(model.controls[0], values))).toBe("invalid_additional_iterations");
+    }
+    const revise = buildRunActionModel(waitingRun(["revise_task"]), AUTHORITY_AVAILABLE) as UiRunActionModel & { kind: "waiting" };
+    for (const values of [
+      { taskId: "task-a", rootId: "tasks", ref: "a/b" },
+      { taskId: "task-a", rootId: "tasks", ref: "" },
+      { taskId: "", rootId: "tasks", ref: "t.md" },
+      { taskId: "task-a", rootId: "other-root", ref: "t.md" },
+      { taskId: "task-a", rootId: "/secret/root", ref: "t.md" },
+      {},
+    ]) {
+      expect(contractReason(() => buildMutationRequest(revise.controls[0], values))).toBe("invalid_task_reference");
+    }
+  });
+
+  test("non-mutating action models never build a request", () => {
+    for (const action of [
+      buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.in_flight), null),
+      buildRunActionModel(runModelOf("succeeded", { kind: "succeeded", terminalStateId: "done" }), null),
+      buildRunActionModel(waitingRun(["revise_task"]), { projectsModel: null, runEntry: null }).kind === "waiting"
+        ? (buildRunActionModel(waitingRun(["revise_task"]), { projectsModel: null, runEntry: null }) as UiRunActionModel & { kind: "waiting" })
+            .controls[0]
+        : null,
+      buildRunActionModel(runModelOf("running", { kind: "mystery" }), null),
+    ]) {
+      expect(contractReason(() => buildMutationRequest(action, {}))).toBe("no_mutation");
+    }
+    expect(contractReason(() => buildMutationRequest(buildRunActionModel(waitingRun(["continue_stage"]), null), {}))).toBe("no_mutation");
+  });
+});
+
+describe("ui v2: endpoint-specific response acceptance", () => {
+  const asResult = (model: unknown) => ({ ok: true, lost: false, model }) as never;
+  const asFailure = (failure: unknown) => ({ ok: false, lost: false, failure }) as never;
+
+  test("an inspect accepts only run or error documents", () => {
+    expect(expectRunOrError(asResult(runModelOf("running", RUNNING_BOUNDARIES.resumable))).ok).toBe(true);
+    expect(expectRunOrError(asResult({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_not_found" })).ok).toBe(true);
+    const wrong = expectRunOrError(asResult({ schema_version: 1, kind: "command_result", run_id: "r", outcome: "waiting", exit_code: 0 }));
+    expect(wrong.ok).toBe(false);
+    expect(wrong.failure).toEqual({ layer: "contract", reason: "unexpected_kind" });
+    expect(expectRunOrError(asFailure({ layer: "transport", reason: "network_error" })).failure).toEqual({
+      layer: "transport",
+      reason: "network_error",
+    });
+  });
+
+  test("discovery accepts only its own kind or an error", () => {
+    const projects = { schema_version: 1, kind: "projects", projects: [] };
+    const runs = { schema_version: 1, kind: "runs", runs: [], next_after: null };
+    expect(expectDiscoveryModel(asResult(projects), "projects").ok).toBe(true);
+    expect(expectDiscoveryModel(asResult(runs), "projects").failure).toEqual({ layer: "contract", reason: "unexpected_kind" });
+    expect(expectDiscoveryModel(asResult(runs), "runs").ok).toBe(true);
+    expect(expectDiscoveryModel(asResult(projects), "runs").failure).toEqual({ layer: "contract", reason: "unexpected_kind" });
+    expect(expectDiscoveryModel(asResult({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_request" }), "runs").ok).toBe(true);
+    expect(() => expectDiscoveryModel(asResult(runs), "command_result" as never)).toThrow(UiContractError);
+  });
+
+  test("a mutation accepts only command_result or error documents", () => {
+    expect(expectMutationResult(asResult({ schema_version: 1, kind: "command_result", run_id: "r", outcome: "waiting", exit_code: 0 })).ok).toBe(true);
+    expect(expectMutationResult(asResult({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_conflict" })).ok).toBe(true);
+    expect(expectMutationResult(asResult(runModelOf("running", RUNNING_BOUNDARIES.resumable))).failure).toEqual({
+      layer: "contract",
+      reason: "unexpected_kind",
+    });
+  });
+});
+
+describe("ui v2: one mutation in flight and stale GET suppression", () => {
+  test("the mutation gate admits exactly one mutating POST", () => {
+    const gate = createMutationGate();
+    expect(gate.isInFlight()).toBe(false);
+    expect(gate.begin()).toBe(true);
+    expect(gate.isInFlight()).toBe(true);
+    expect(gate.begin()).toBe(false);
+    gate.end();
+    expect(gate.begin()).toBe(true);
+    gate.end();
+    expect(gate.isInFlight()).toBe(false);
+  });
+
+  test("the generation guard drops stale page responses", () => {
+    const guard = createGenerationGuard();
+    const first = guard.next();
+    expect(guard.isCurrent(first)).toBe(true);
+    const second = guard.next();
+    expect(guard.isCurrent(first)).toBe(false);
+    expect(guard.isCurrent(second)).toBe(true);
+  });
+});
+
+describe("ui v2: the one mutation flow", () => {
+  interface FlowLog {
+    readonly send: number;
+    readonly inspect: number;
+    readonly events: string[];
+  }
+
+  const makeFlow = (sendResult: () => unknown, inspectResult: () => unknown, runId = "run-a") => {
+    const log = { send: 0, inspect: 0, events: [] as string[] };
+    const handlers = {
+      onCommandResult: (model: unknown) => {
+        log.events.push(`command:${JSON.stringify(model)}`);
+      },
+      onLost: () => {
+        log.events.push("lost");
+      },
+      onRecovered: (model: unknown) => {
+        log.events.push(`recovered:${(model as { boundary: { kind: string } }).boundary.kind}`);
+      },
+      onRecoveryUnavailable: (presented: unknown) => {
+        log.events.push(`recovery_unavailable:${JSON.stringify(presented)}`);
+      },
+      onError: (presented: unknown) => {
+        log.events.push(`error:${JSON.stringify(presented)}`);
+      },
+    };
+    const flow = {
+      send: async () => {
+        log.send += 1;
+        return sendResult();
+      },
+      inspect: async () => {
+        log.inspect += 1;
+        return inspectResult();
+      },
+      runId,
+      handlers,
+    };
+    return { log, flow };
+  };
+
+  const succeededRun = () => runModelOf("succeeded", { kind: "succeeded", terminalStateId: "done" });
+  const waitingRunModel = () => waitingRun(["continue_stage", "revise_task"]);
+  const command = (outcome: string, reason?: string) => {
+    const document: Record<string, unknown> = { schema_version: 1, kind: "command_result", run_id: "run-a", outcome, exit_code: outcome === "failed" ? 1 : 0 };
+    if (reason !== undefined) {
+      document["reason"] = reason;
+    }
+    return document;
+  };
+
+  test("a command result is shown, followed by exactly one authoritative inspect", async () => {
+    const { log, flow } = makeFlow(() => asResultLike(command("waiting")), () => asResultLike(waitingRunModel()));
+    await runMutationFlow(flow as never);
+    expect(log.send).toBe(1);
+    expect(log.inspect).toBe(1);
+    expect(log.events[0]?.startsWith("command:")).toBe(true);
+    expect(log.events[1]).toBe("recovered:waiting");
+  });
+
+  test("run_busy and invalid_state are surfaced once and never retried", async () => {
+    for (const reason of ["run_busy", "invalid_state"]) {
+      const { log, flow } = makeFlow(() => asResultLike(command("failed", reason)), () => asResultLike(waitingRunModel()));
+      await runMutationFlow(flow as never);
+      expect(log.send).toBe(1);
+      expect(log.events[0]).toBe(`command:${JSON.stringify(command("failed", reason))}`);
+      expect(log.events[1]).toBe("recovered:waiting");
+    }
+  });
+
+  test("an error document or a contract kind stops the flow with zero inspect", async () => {
+    const errorFlow = makeFlow(() => asResultLike({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_conflict" }), () => {
+      throw new Error("inspect must not run");
+    });
+    await runMutationFlow(errorFlow.flow as never);
+    expect(errorFlow.log.send).toBe(1);
+    expect(errorFlow.log.inspect).toBe(0);
+    expect(errorFlow.log.events[0]).toContain("binding_conflict");
+    const contractFlow = makeFlow(() => asResultLike(succeededRun()), () => {
+      throw new Error("inspect must not run");
+    });
+    await runMutationFlow(contractFlow.flow as never);
+    expect(contractFlow.log.inspect).toBe(0);
+    expect(contractFlow.log.events[0]).toContain("unexpected_kind");
+  });
+
+  test("a lost mutation response means outcome unknown with exactly one inspect GET and zero re-POST", async () => {
+    const lostResult = { ok: false, lost: true, failure: { layer: "transport", reason: "network_error" } };
+    const notFound = { schema_version: 1, kind: "error", layer: "binding", reason: "binding_not_found" };
+    for (const endpoint of ["resume", "resume_plan", "continue_stage", "revise_task"]) {
+      const action =
+        endpoint === "resume"
+          ? buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.resumable), null)
+          : endpoint === "resume_plan"
+            ? buildRunActionModel(runModelOf("running", RUNNING_BOUNDARIES.plan_ready_manual), null)
+            : endpoint === "continue_stage"
+              ? (buildRunActionModel(waitingRun(["continue_stage"]), null) as UiRunActionModel & { kind: "waiting" }).controls[0]
+              : (buildRunActionModel(waitingRun(["revise_task"]), AUTHORITY_AVAILABLE) as UiRunActionModel & { kind: "waiting" }).controls[0];
+      const request = buildMutationRequest(action, {
+        stageId: "stage-1",
+        initialBudget: "1",
+        additionalIterations: "1",
+        taskId: "task-a",
+        rootId: "tasks",
+        ref: "task-a-v2.md",
+      });
+      expect(request.path.startsWith("/v1/runs/run-a/")).toBe(true);
+      for (const inspectOutcome of ["found", "not_found", "network"] as const) {
+        const log = { send: 0, inspect: 0, events: [] as string[] };
+        await runMutationFlow({
+          send: async () => {
+            log.send += 1;
+            return lostResult;
+          },
+          inspect: async () => {
+            log.inspect += 1;
+            if (inspectOutcome === "found") {
+              return asResultLike(waitingRunModel());
+            }
+            if (inspectOutcome === "not_found") {
+              return asResultLike(notFound);
+            }
+            return { ok: false, lost: false, failure: { layer: "transport", reason: "network_error" } };
+          },
+          runId: "run-a",
+          handlers: {
+            onCommandResult: () => log.events.push("command"),
+            onLost: () => log.events.push("lost"),
+            onRecovered: () => log.events.push("recovered"),
+            onRecoveryUnavailable: (presented: unknown) => log.events.push(`recovery_unavailable:${JSON.stringify(presented)}`),
+            onError: (presented: unknown) => log.events.push(`error:${JSON.stringify(presented)}`),
+          },
+        } as never);
+        expect(log.send).toBe(1);
+        expect(log.inspect).toBe(1);
+        expect(log.events[0]).toBe("lost");
+        expect(
+          log.events[1] === "recovered" ||
+            log.events[1]?.startsWith("recovery_unavailable:") ||
+            log.events[1]?.startsWith("error:"),
+        ).toBe(true);
+        if (inspectOutcome === "found") {
+          expect(log.events[1]).toBe("recovered");
+        }
+        if (inspectOutcome === "not_found") {
+          expect(log.events[1]).toContain("binding_not_found");
+        }
+        if (inspectOutcome === "network") {
+          expect(log.events[1]).toContain("network_error");
+        }
+      }
+    }
+  });
+});
+
+function asResultLike(model: unknown): { ok: true; lost: false; model: unknown } {
+  return { ok: true, lost: false, model };
+}
