@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestrator control plane</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header>
+  <h1>Orchestrator control plane</h1>
+</header>
+<p id="status" class="status" aria-live="polite"></p>
+<p id="error" class="error" role="alert"></p>
+<main>
+  <section id="projects-section" aria-labelledby="projects-heading">
+    <h2 id="projects-heading">Projects</h2>
+    <button type="button" id="refresh-projects">Refresh projects</button>
+    <table id="projects-table">
+      <caption>Registered projects and their input-root ids</caption>
+      <thead>
+        <tr><th scope="col">Project</th><th scope="col">Input roots</th></tr>
+      </thead>
+      <tbody id="projects-body"></tbody>
+    </table>
+  </section>
+  <section id="runs-section" aria-labelledby="runs-heading">
+    <h2 id="runs-heading">Runs</h2>
+    <button type="button" id="refresh-runs">Refresh runs</button>
+    <table id="runs-table">
+      <caption>Bound runs</caption>
+      <thead>
+        <tr><th scope="col">Run</th><th scope="col">Project</th><th scope="col">Project available</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr>
+      </thead>
+      <tbody id="runs-body"></tbody>
+    </table>
+    <button type="button" id="load-more" hidden>Load more</button>
+  </section>
+  <section id="detail-section" aria-labelledby="detail-heading">
+    <h2 id="detail-heading">Run detail</h2>
+    <p id="detail-run-id">No run selected.</p>
+    <button type="button" id="inspect-selected" hidden>Inspect again</button>
+    <dl id="run-detail" hidden>
+      <dt>Status</dt><dd id="detail-status"></dd>
+      <dt>Revision</dt><dd id="detail-revision"></dd>
+      <dt>Boundary</dt><dd><pre id="detail-boundary"></pre></dd>
+    </dl>
+    <table id="outputs-table" hidden>
+      <caption>Run outputs</caption>
+      <thead>
+        <tr><th scope="col">Output</th><th scope="col">Type</th><th scope="col">Required</th><th scope="col">Present</th><th scope="col">Digest</th></tr>
+      </thead>
+      <tbody id="outputs-body"></tbody>
+    </table>
+  </section>
+  <section id="new-run-section" aria-labelledby="new-run-heading">
+    <h2 id="new-run-heading">New run</h2>
+    <form id="new-run-form">
+      <div class="field">
+        <label for="new-run-project">Project</label>
+        <select id="new-run-project" required></select>
+      </div>
+      <div class="field">
+        <label for="new-run-id">Run id</label>
+        <input id="new-run-id" name="run_id" type="text" required autocomplete="off" spellcheck="false">
+        <button type="button" id="generate-id">Generate ID</button>
+      </div>
+      <fieldset id="new-run-inputs">
+        <legend>Inputs</legend>
+        <div id="input-rows"></div>
+        <button type="button" id="add-input">Add input</button>
+      </fieldset>
+      <button type="submit" id="submit-run">Create run</button>
+    </form>
+  </section>
+</main>
+<script type="module" src="/ui/app.js"></script>
+</body>
+</html>

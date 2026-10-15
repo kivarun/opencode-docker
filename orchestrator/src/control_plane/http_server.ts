@@ -2,8 +2,8 @@
  * The versioned loopback HTTP service of the control-plane.
  *
  * This module is the single `Bun.serve` owner of the production tree: it
- * exposes exactly seven versioned routes over the existing control-plane
- * substrate and never executes orchestration itself:
+ * exposes the versioned orchestration routes and the same-origin browser
+ * UI assets, and never executes orchestration itself:
  *
  *   HTTP -> project registry -> durable run binding
  *        -> OrchestratorSubprocessClient -> existing CLI subprocess
@@ -15,6 +15,16 @@
  *   POST /v1/runs/:runId/continue-stage
  *   POST /v1/runs/:runId/revise-task
  *   POST /v1/runs/:runId/respond
+ *   GET  /                                 browser UI document
+ *   GET  /ui/app.js                        browser UI script
+ *   GET  /ui/style.css                     browser UI stylesheet
+ *
+ * The three UI routes serve the static assets captured once by the asset
+ * owner before `Bun.serve` starts; every UI response carries the fixed
+ * same-origin security headers and `Cache-Control: no-store`. The UI is
+ * the only browser-facing surface: it consumes the versioned discovery,
+ * inspect and fresh-run projections and never sees raw state, host paths
+ * or diagnostics.
  *
  * Authority flow: a fresh run resolves the registry request first
  * (invalid requests and missing inputs never reserve a run id), then
@@ -87,6 +97,13 @@ import {
   type OrchestratorCallResult,
   type OrchestratorSubprocessClientConfig,
 } from "./subprocess_client.ts";
+import {
+  defaultControlPlaneUiRoot,
+  loadControlPlaneUiAssets,
+  type ControlPlaneUiAsset,
+  type ControlPlaneUiAssets,
+  type ControlPlaneUiRoute,
+} from "./ui_assets.ts";
 
 /** The closed failure vocabulary of the HTTP request layer itself. */
 export type ControlPlaneHttpRequestFailureReason =
@@ -147,9 +164,59 @@ interface ParsedRoute {
     | "revise_task"
     | "respond"
     | "projects"
-    | "runs";
+    | "runs"
+    | "ui_root"
+    | "ui_app_js"
+    | "ui_style_css";
   readonly projectId: string | null;
   readonly runId: string | null;
+}
+
+/**
+ * The fixed security headers of every UI response: a closed
+ * same-origin-only content security policy plus the anti-sniffing,
+ * referrer, opener and resource-policy headers.
+ */
+const UI_SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  "content-security-policy":
+    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "cache-control": "no-store",
+});
+
+function isControlPlaneUiRoute(kind: ParsedRoute["kind"]): kind is ControlPlaneUiRoute {
+  return kind === "ui_root" || kind === "ui_app_js" || kind === "ui_style_css";
+}
+
+/** The exact UI path of one route, or null for any other path. */
+function controlPlaneUiRouteForPath(pathname: string): ControlPlaneUiRoute | null {
+  if (pathname === "/") return "ui_root";
+  if (pathname === "/ui/app.js") return "ui_app_js";
+  if (pathname === "/ui/style.css") return "ui_style_css";
+  return null;
+}
+
+/** Attaches the fixed UI security headers to one response (a copy). */
+function withUiSecurityHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const key of Object.keys(UI_SECURITY_HEADERS)) {
+    headers.set(key, UI_SECURITY_HEADERS[key] as string);
+  }
+  return new Response(response.body, { status: response.status, headers });
+}
+
+/** One captured UI asset as a response: exact content type, no store. */
+function uiAssetResponse(asset: ControlPlaneUiAsset): Response {
+  return new Response(asset.bytes, {
+    status: 200,
+    headers: {
+      "content-type": asset.contentType,
+      ...UI_SECURITY_HEADERS,
+    },
+  });
 }
 
 const FRESH_RUN_SEGMENTS = 4;
@@ -164,6 +231,12 @@ const ACTION_NAMES: readonly string[] = ["resume", "resume-plan", "continue-stag
  * known shape with the wrong method is `method_not_allowed`.
  */
 export function parseControlPlaneRoute(pathname: string, method: string): ParsedRoute | ControlPlaneHttpRequestError {
+  if (pathname === "/") {
+    if (method !== "GET") {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the ui document route accepts GET only");
+    }
+    return { kind: "ui_root", projectId: null, runId: null };
+  }
   const segments = pathname.split("/");
   if (segments.length < 2 || segments[0] !== "") {
     return new ControlPlaneHttpRequestError("invalid_path", "the request path must be an absolute versioned path");
@@ -195,6 +268,18 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
     }
     return value;
   };
+  if (matchesShape(["ui", "app.js"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the ui script route accepts GET only");
+    }
+    return { kind: "ui_app_js", projectId: null, runId: null };
+  }
+  if (matchesShape(["ui", "style.css"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the ui stylesheet route accepts GET only");
+    }
+    return { kind: "ui_style_css", projectId: null, runId: null };
+  }
   if (matchesShape(["v1", "projects", "*", "runs"])) {
     if (shapeMethodMismatch("POST")) {
       return new ControlPlaneHttpRequestError("method_not_allowed", "the fresh-run route accepts POST only");
@@ -717,6 +802,8 @@ export interface ControlPlaneHttpServiceDeps {
   readonly registry: ControlPlaneProjectRegistry;
   readonly bindingStore: ControlPlaneRunBindingStore;
   readonly client: OrchestratorSubprocessClient;
+  /** The captured static UI assets, loaded once before `Bun.serve`. */
+  readonly assets: ControlPlaneUiAssets;
   readonly port: number;
   readonly bodyLimitBytes: number;
   /** The raw query string of the current discovery request ("" otherwise). */
@@ -786,23 +873,28 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
     if (url.hash !== "") {
       return requestFailure("invalid_path");
     }
+    const respondUi = (response: Response): Response =>
+      controlPlaneUiRouteForPath(url.pathname) === null ? response : withUiSecurityHeaders(response);
     const parsed = parseControlPlaneRoute(url.pathname, request.method);
     if (parsed instanceof ControlPlaneHttpRequestError) {
-      return requestFailure(parsed.reason);
+      return respondUi(requestFailure(parsed.reason));
     }
     if (parsed.kind !== "projects" && parsed.kind !== "runs" && url.search !== "") {
-      return requestFailure("invalid_path");
+      return respondUi(requestFailure("invalid_path"));
     }
     if (request.method === "POST") {
       const contentType = request.headers.get("content-type");
       if (contentType !== "application/json") {
-        return requestFailure("unsupported_media_type");
+        return respondUi(requestFailure("unsupported_media_type"));
       }
     } else {
       const lengthHeader = request.headers.get("content-length");
       if (lengthHeader !== null && lengthHeader !== "0") {
-        return requestFailure("invalid_request");
+        return respondUi(requestFailure("invalid_request"));
       }
+    }
+    if (isControlPlaneUiRoute(parsed.kind)) {
+      return respondUi(uiAssetResponse(deps.assets[parsed.kind]));
     }
     let bodyText = "";
     if (request.method === "POST") {
@@ -967,7 +1059,8 @@ function requireCleanPath(value: unknown, what: string): string {
  * Starts one loopback HTTP service: validates the configuration, loads
  * the registry once, proves the single routing authority across every
  * declared project, opens the binding store once, builds the one
- * immutable subprocess client and serves the seven versioned routes on
+ * immutable subprocess client, captures the static UI assets once and
+ * serves the versioned routes plus the UI assets on
  * `127.0.0.1`. There is no hot reload, no discovery and no second
  * execution path.
  */
@@ -1020,6 +1113,9 @@ export async function startControlPlaneHttpService(config: ControlPlaneHttpServi
       );
     }
   }
+  // The static UI assets are captured once, before the server starts:
+  // the request handler never touches the disk.
+  const assets = loadControlPlaneUiAssets(defaultControlPlaneUiRoot());
   const bindingStore = await ControlPlaneRunBindingStore.open(bindingStoreRoot);
   const clientFullConfig: OrchestratorSubprocessClientConfig = {
     bunExecutable,
@@ -1050,6 +1146,7 @@ export async function startControlPlaneHttpService(config: ControlPlaneHttpServi
     registry,
     bindingStore,
     client,
+    assets,
     port: boundPort,
     bodyLimitBytes,
   };

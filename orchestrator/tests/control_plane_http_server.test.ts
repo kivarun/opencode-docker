@@ -168,7 +168,6 @@ describe("control-plane HTTP: route parser", () => {
       "/v1/runs/./r1",
       "/v1/runs/../r1",
       "/v1/runs/r1/resume/",
-      "/",
     ]) {
       expect(routeReason(path, "GET")).toBe("invalid_path");
     }
