@@ -16,6 +16,13 @@
  * - the thin DOM adapter below renders the models through
  *   `createElement`/`textContent` only and boots only in a browser
  *   (where `document` exists); under a test runner it is inert.
+ * - the live observation (v3) is one pure scheduling owner: it repeats
+ *   the read-only inspect GET of the selected run at a fixed interval
+ *   only while the last applied authoritative inspect shows `running`
+ *   with boundary kind `in_flight`, the tab is visible, live updates
+ *   are enabled and no mutation is in flight. Any other boundary, any
+ *   error and any lost response stop it until an explicit user action;
+ *   it never sends a mutating request and never retries one.
  *
  * Security posture: all inserted content travels through textContent
  * (no direct HTML injection, no dynamic code evaluation, no external
@@ -759,6 +766,341 @@ export async function runMutationFlow(flow) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Live observation (v3): bounded read-only polling of one selected    */
+/* run while the authoritative inspect shows `running` + `in_flight`.  */
+/* ------------------------------------------------------------------ */
+
+export const LIVE_OBSERVATION_POLL_DELAY_MS = 2000;
+
+function noEffect() {
+  return Object.freeze({ effect: "no_op" });
+}
+
+function cancelTimerEffect() {
+  return Object.freeze({ effect: "cancel_timer" });
+}
+
+function startInspectEffect() {
+  return Object.freeze({ effect: "start_inspect" });
+}
+
+function renderStateEffect() {
+  return Object.freeze({ effect: "render_state" });
+}
+
+function scheduleTimerEffect() {
+  return Object.freeze({ effect: "schedule_timer", delayMs: LIVE_OBSERVATION_POLL_DELAY_MS });
+}
+
+function isObservationSnapshot(value) {
+  return (
+    isRecord(value) &&
+    typeof value["status"] === "string" &&
+    typeof value["boundaryKind"] === "string" &&
+    typeof value["revision"] === "number" &&
+    Number.isSafeInteger(value["revision"]) &&
+    value["revision"] >= 0
+  );
+}
+
+/**
+ * The one live-observation scheduling owner. Inputs are semantic
+ * events; outputs are declarative effects only (schedule_timer,
+ * cancel_timer, start_inspect, render_state, no_op) — the machine never
+ * touches the network, the DOM or timers itself and never produces a
+ * mutating request. Polling is eligible exactly while the last applied
+ * authoritative inspect shows `running` with boundary kind `in_flight`
+ * and the tab is visible, live updates are enabled and no mutation is
+ * in flight. Every other boundary, an error or a lost response stops
+ * the observation; only an explicit user action (refresh, re-enable,
+ * re-selection) runs a new inspect whose success may restart it.
+ */
+export function createLiveObservationScheduler() {
+  let selectedRunId = null;
+  let snapshot = null;
+  let documentVisible = true;
+  let liveEnabled = true;
+  let mutationInFlight = false;
+  let inspectInFlight = false;
+  let timerPending = false;
+  let stoppedAfterError = false;
+  let disposed = false;
+
+  const pollingEligible = () =>
+    snapshot !== null && snapshot["status"] === "running" && snapshot["boundaryKind"] === "in_flight";
+
+  const canSchedule = () =>
+    !disposed && pollingEligible() && !stoppedAfterError && documentVisible && liveEnabled && !mutationInFlight;
+
+  const immediateInspectAllowed = (afterError) =>
+    !disposed &&
+    pollingEligible() &&
+    documentVisible &&
+    !mutationInFlight &&
+    !inspectInFlight &&
+    selectedRunId !== null &&
+    (afterError || !stoppedAfterError);
+
+  const leaveTimer = () => {
+    if (!timerPending) {
+      return null;
+    }
+    timerPending = false;
+    return cancelTimerEffect();
+  };
+
+  const presentationState = () => {
+    if (disposed || selectedRunId === null) {
+      return "off";
+    }
+    if (stoppedAfterError) {
+      return "stopped";
+    }
+    if (pollingEligible()) {
+      if (timerPending || inspectInFlight) {
+        return "live";
+      }
+      if (!documentVisible || !liveEnabled || mutationInFlight) {
+        return "paused";
+      }
+    }
+    return "off";
+  };
+
+  return Object.freeze({
+    presentationState,
+    /**
+     * The single-flight owner: at most one active inspect of the
+     * selected run. A user-initiated inspect takes the slot over — an
+     * inspect already in flight is invalidated (its response is dropped
+     * by the adapter and never applied or scheduled from).
+     */
+    admitInspect(runId) {
+      return !disposed && typeof runId === "string" && runId === selectedRunId && !inspectInFlight;
+    },
+    takeOverInspect(runId) {
+      if (disposed || runId !== selectedRunId) {
+        return noEffect();
+      }
+      const cancel = leaveTimer();
+      inspectInFlight = true;
+      return cancel ?? noEffect();
+    },
+    runSelected(runId) {
+      if (disposed || typeof runId !== "string" || runId === "") {
+        return noEffect();
+      }
+      const cancel = leaveTimer();
+      selectedRunId = runId;
+      snapshot = null;
+      inspectInFlight = false;
+      stoppedAfterError = false;
+      return cancel ?? renderStateEffect();
+    },
+    inspectStarted(runId) {
+      if (disposed || runId !== selectedRunId) {
+        return noEffect();
+      }
+      inspectInFlight = true;
+      return leaveTimer() ?? noEffect();
+    },
+    inspectSucceeded(runId, applied) {
+      if (disposed || runId !== selectedRunId || !isObservationSnapshot(applied)) {
+        return noEffect();
+      }
+      inspectInFlight = false;
+      stoppedAfterError = false;
+      snapshot = Object.freeze({ ...applied, runId });
+      if (canSchedule()) {
+        timerPending = true;
+        return scheduleTimerEffect();
+      }
+      return leaveTimer() ?? renderStateEffect();
+    },
+    inspectFailed(runId) {
+      if (disposed || runId !== selectedRunId) {
+        return noEffect();
+      }
+      inspectInFlight = false;
+      stoppedAfterError = true;
+      return leaveTimer() ?? renderStateEffect();
+    },
+    inspectCancelled(runId) {
+      if (disposed || runId !== selectedRunId) {
+        return noEffect();
+      }
+      inspectInFlight = false;
+      return leaveTimer() ?? noEffect();
+    },
+    timerFired() {
+      if (disposed || !timerPending) {
+        return noEffect();
+      }
+      timerPending = false;
+      if (!canSchedule() || inspectInFlight) {
+        return noEffect();
+      }
+      return startInspectEffect();
+    },
+    visibilityChanged(visible) {
+      if (disposed) {
+        return noEffect();
+      }
+      documentVisible = visible === true;
+      if (!documentVisible) {
+        return leaveTimer() ?? renderStateEffect();
+      }
+      if (immediateInspectAllowed(false)) {
+        return startInspectEffect();
+      }
+      return renderStateEffect();
+    },
+    liveToggleChanged(enabled) {
+      if (disposed) {
+        return noEffect();
+      }
+      liveEnabled = enabled === true;
+      if (!liveEnabled) {
+        return leaveTimer() ?? renderStateEffect();
+      }
+      // Re-enabling is an explicit user action: it may resume even after
+      // an error, but only through one inspect whose success re-confirms
+      // the polling-eligible boundary.
+      if (immediateInspectAllowed(true)) {
+        return startInspectEffect();
+      }
+      return renderStateEffect();
+    },
+    mutationStarted() {
+      if (disposed) {
+        return noEffect();
+      }
+      mutationInFlight = true;
+      // An inspect already in flight is invalidated: its response is
+      // dropped by the adapter and the single-flight slot is released
+      // for the authoritative post-mutation inspect.
+      inspectInFlight = false;
+      return leaveTimer() ?? renderStateEffect();
+    },
+    mutationCompleted() {
+      if (disposed) {
+        return noEffect();
+      }
+      mutationInFlight = false;
+      if (canSchedule() && !inspectInFlight) {
+        timerPending = true;
+        return scheduleTimerEffect();
+      }
+      return renderStateEffect();
+    },
+    disposed() {
+      if (disposed) {
+        return noEffect();
+      }
+      disposed = true;
+      timerPending = false;
+      inspectInFlight = false;
+      return cancelTimerEffect();
+    },
+  });
+}
+
+/**
+ * The one timer adapter: the single setTimeout call site and the single
+ * clearTimeout call site of the whole module. It enforces the at-most-
+ * one-pending-timer invariant regardless of the effect sequence.
+ */
+export function createSchedulerTimerAdapter(timers, onFire) {
+  if (
+    !isRecord(timers) ||
+    typeof timers["setTimeout"] !== "function" ||
+    typeof timers["clearTimeout"] !== "function" ||
+    typeof onFire !== "function"
+  ) {
+    throw new UiContractError("invalid_timer_source");
+  }
+  let handle = null;
+  return Object.freeze({
+    apply(effect) {
+      if (!isRecord(effect)) {
+        throw new UiContractError("invalid_effect");
+      }
+      if (effect["effect"] === "schedule_timer") {
+        const delay = effect["delayMs"];
+        if (typeof delay !== "number" || !Number.isSafeInteger(delay) || delay < 1) {
+          throw new UiContractError("invalid_effect");
+        }
+        if (handle !== null) {
+          timers.clearTimeout(handle);
+        }
+        handle = timers.setTimeout(() => {
+          handle = null;
+          onFire();
+        }, delay);
+        return;
+      }
+      if (effect["effect"] === "cancel_timer") {
+        if (handle !== null) {
+          timers.clearTimeout(handle);
+          handle = null;
+        }
+        return;
+      }
+      if (effect["effect"] === "start_inspect" || effect["effect"] === "render_state" || effect["effect"] === "no_op") {
+        return;
+      }
+      throw new UiContractError("invalid_effect");
+    },
+    hasPendingTimer() {
+      return handle !== null;
+    },
+  });
+}
+
+/**
+ * The change key of one applied run document: two identical inspect
+ * projections share one key, so an unchanged poll never rebuilds the
+ * detail DOM (focus and selection survive) and never announces.
+ */
+export function liveObservationDocumentKey(model) {
+  if (!isRecord(model) || model["kind"] !== "run") {
+    throw new UiContractError("invalid_state");
+  }
+  return JSON.stringify({
+    runId: model["runId"],
+    revision: model["revision"],
+    status: model["status"],
+    boundary: model["boundary"],
+    outputs: model["outputs"],
+  });
+}
+
+/**
+ * The aria-live policy of one scheduled poll: an unchanged document is
+ * silent; a changed document announces once with the new revision.
+ */
+export function livePollAnnouncement(previousDocumentKey, model) {
+  if (liveObservationDocumentKey(model) === previousDocumentKey) {
+    return null;
+  }
+  return `Run ${model["runId"]} updated (revision ${model["revision"]}).`;
+}
+
+/** The presentation label of the live-observation state line. */
+export function liveStateLabel(state) {
+  if (state === "live") {
+    return "Live";
+  }
+  if (state === "paused") {
+    return "Paused";
+  }
+  if (state === "stopped") {
+    return "Stopped after error";
+  }
+  return "off";
+}
+
+/* ------------------------------------------------------------------ */
 /* Thin DOM adapter: createElement/textContent only.                   */
 /* ------------------------------------------------------------------ */
 
@@ -861,7 +1203,7 @@ function renderRuns(state) {
     button.type = "button";
     button.textContent = "Inspect";
     button.addEventListener("click", () => {
-      void inspectRun(run.runId, "manual");
+      void inspectRun(run.runId);
     });
     actions.appendChild(button);
     row.appendChild(actions);
@@ -889,13 +1231,24 @@ function renderRunDetail(model) {
   document.getElementById("outputs-table").hidden = false;
 }
 
-function showRunModel(model) {
+function showRunModel(model, options = {}) {
+  const key = liveObservationDocumentKey(model);
+  // A manual inspect reset the detail panel first, so its own result
+  // must always render; a scheduled poll of an unchanged document
+  // renders nothing (focus and selection survive).
+  const changed = options.force === true || key !== lastDocumentKey;
+  lastDocumentKey = key;
   selectedRunId = model.runId;
-  renderRunDetail(model);
-  renderRunControls(buildRunActionModel(model, authorityFor(model.runId)));
-  if (mutationGate.isInFlight()) {
-    setMutationControlsDisabled(true);
+  if (changed) {
+    renderRunDetail(model);
+    renderRunControls(buildRunActionModel(model, authorityFor(model.runId)));
+    if (mutationGate.isInFlight()) {
+      setMutationControlsDisabled(true);
+    }
   }
+  refreshSequence += 1;
+  updateLiveStateLine();
+  return changed;
 }
 
 async function loadProjects() {
@@ -908,40 +1261,142 @@ async function loadProjects() {
   showResultFailure(result);
 }
 
-async function inspectRun(runId, mode) {
-  if (mode !== "after_command") {
-    setStatus(mode === "manual" ? `Inspecting run ${runId}…` : `Checking run ${runId}…`);
+function observationSnapshotOf(model) {
+  return Object.freeze({ status: model.status, boundaryKind: model.boundary.kind, revision: model.revision });
+}
+
+function applySchedulerEffect(effect) {
+  liveTimers.apply(effect);
+  if (effect.effect === "start_inspect") {
+    void scheduledInspect();
   }
+  updateLiveStateLine();
+}
+
+function updateLiveStateLine() {
+  const line = document.getElementById("live-state");
+  if (line === null) {
+    return;
+  }
+  const state = scheduler.presentationState();
+  let text = `Live updates: ${liveStateLabel(state)}`;
+  if (refreshSequence > 0 && state !== "off") {
+    text += ` · refresh ${refreshSequence}`;
+  }
+  line.textContent = text;
+}
+
+function beginInspectToken(runId) {
+  const token = { runId, discarded: false };
+  activeInspectToken = token;
+  return token;
+}
+
+function invalidateActiveInspectToken() {
+  if (activeInspectToken !== null) {
+    activeInspectToken.discarded = true;
+  }
+}
+
+let inspectChain = Promise.resolve();
+
+/**
+ * Every inspect GET of the UI is serialized through this chain, so two
+ * inspect requests for one run never overlap on the wire; a superseded
+ * response is dropped by the token discipline instead.
+ */
+function enqueueInspect(task) {
+  const next = inspectChain.then(task, task);
+  inspectChain = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+/**
+ * The shared inspect tail: only the response of the still-active token
+ * of the still-selected run applies; a superseded response is dropped
+ * silently (the machine slot belongs to the newer inspect), and a
+ * discarded active token releases the slot. A scheduled poll stays
+ * silent on an unchanged document and stops the observation on any
+ * failure.
+ */
+async function applyInspectOutcome(runId, result, scheduled, token) {
+  if (activeInspectToken !== token || selectedRunId !== runId) {
+    return;
+  }
+  if (token.discarded) {
+    applySchedulerEffect(scheduler.inspectCancelled(runId));
+    return;
+  }
+  const inspected = expectRunOrError(result);
+  if (inspected.ok && inspected.model.kind === "run") {
+    const model = inspected.model;
+    const keyBefore = lastDocumentKey;
+    showRunModel(model, { force: !scheduled });
+    if (scheduled) {
+      const announce = livePollAnnouncement(keyBefore, model);
+      if (announce !== null) {
+        setStatus(announce);
+      }
+    } else {
+      setStatus(`Run ${runId} inspected.`);
+    }
+    applySchedulerEffect(scheduler.inspectSucceeded(runId, observationSnapshotOf(model)));
+    return;
+  }
+  showError(formatFailure(inspected.ok ? inspected.model : inspected.failure));
+  setStatus(
+    scheduled
+      ? "Live update stopped; use Refresh or Inspect to retry."
+      : `Run ${runId} could not be inspected; use Refresh or Inspect to retry.`,
+  );
+  applySchedulerEffect(scheduler.inspectFailed(runId));
+}
+
+/** The scheduler-driven read-only poll of the selected run. */
+function scheduledInspect() {
+  const runId = selectedRunId;
+  if (runId === null) {
+    return;
+  }
+  void enqueueInspect(async () => {
+    if (selectedRunId !== runId || !scheduler.admitInspect(runId)) {
+      return;
+    }
+    applySchedulerEffect(scheduler.inspectStarted(runId));
+    const token = beginInspectToken(runId);
+    const result = await requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
+    await applyInspectOutcome(runId, result, true, token);
+  });
+}
+
+/**
+ * The manual inspect: a user action that resets the observation for the
+ * selected run, cancels any pending timer and takes over the
+ * single-flight inspect owner (an in-flight inspect is invalidated and
+ * its response dropped). The GET itself is serialized behind any
+ * outstanding inspect.
+ */
+async function inspectRun(runId) {
+  setStatus(`Inspecting run ${runId}…`);
+  applySchedulerEffect(scheduler.runSelected(runId));
   selectedRunId = runId;
+  applySchedulerEffect(scheduler.takeOverInspect(runId));
   document.getElementById("detail-run-id").textContent = `Run ${runId}`;
   document.getElementById("inspect-selected").hidden = false;
   document.getElementById("run-detail").hidden = true;
   document.getElementById("outputs-table").hidden = true;
   document.getElementById("run-controls").replaceChildren();
-  const inspected = expectRunOrError(await requestApiJson(fetchImplementation, `/v1/runs/${runId}`));
-  // A stale inspect after the operator selected another run is ignored.
-  if (selectedRunId !== runId) {
-    return;
-  }
-  if (inspected.ok && inspected.model.kind === "run") {
-    showRunModel(inspected.model);
-    if (mode !== "after_command") {
-      setStatus(mode === "after_lost" ? `Run ${runId} found after the lost request.` : `Run ${runId} inspected.`);
+  await enqueueInspect(async () => {
+    if (selectedRunId !== runId) {
+      return;
     }
-    return;
-  }
-  if (inspected.ok && inspected.model.kind === "command_result") {
-    setStatus(`${describeCommandResult(inspected.model)}; use Refresh or Inspect to retry.`);
-    return;
-  }
-  showError(formatFailure(inspected.ok ? inspected.model : inspected.failure));
-  if (mode !== "after_command") {
-    setStatus(
-      mode === "after_lost"
-        ? `outcome unknown; run ${runId} not found yet — use Refresh or Inspect.`
-        : `Run ${runId} could not be inspected; use Refresh or Inspect to retry.`,
-    );
-  }
+    const token = beginInspectToken(runId);
+    const result = await requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
+    await applyInspectOutcome(runId, result, false, token);
+  });
 }
 
 async function refreshRuns(announce) {
@@ -998,7 +1453,10 @@ function readInputRows() {
 /**
  * The one mutating POST owner: every mutating request of the UI (fresh
  * run, resume, resume-plan, continue-stage, revise-task) is sent here
- * exactly once and driven through the shared mutation flow.
+ * exactly once and driven through the shared mutation flow. The
+ * authoritative inspect of the flow also drives the live observation:
+ * `running`/`in_flight` after a completed mutator may start polling,
+ * any other boundary or failure never does.
  */
 async function postMutation(request, flow) {
   await runMutationFlow({
@@ -1008,9 +1466,48 @@ async function postMutation(request, flow) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(request.body),
       }),
-    inspect: (runId) => requestApiJson(fetchImplementation, `/v1/runs/${runId}`),
+    inspect: (runId) => notifyObservationOfInspect(runId),
     runId: flow.runId,
     handlers: flow.handlers,
+  });
+}
+
+/**
+ * The authoritative post-mutation inspect: one GET that renders through
+ * the flow handlers and drives the live-observation machine (never a
+ * mutation, never a retry of the POST). It owns the single inspect
+ * token, so a superseded poll response can never release its slot.
+ */
+/**
+ * The authoritative post-mutation inspect: one GET that renders through
+ * the flow handlers and drives the live-observation machine (never a
+ * mutation, never a retry of the POST). It is serialized behind any
+ * outstanding inspect and owns the single inspect token, so a
+ * superseded poll response can never release its slot.
+ */
+function notifyObservationOfInspect(runId) {
+  return enqueueInspect(async () => {
+    if (selectedRunId !== runId) {
+      return requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
+    }
+    scheduler.inspectStarted(runId);
+    const token = beginInspectToken(runId);
+    const result = await requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
+    if (selectedRunId !== runId || activeInspectToken !== token) {
+      return result;
+    }
+    if (token.discarded) {
+      scheduler.inspectCancelled(runId);
+      return result;
+    }
+    const inspected = expectRunOrError(result);
+    if (inspected.ok && inspected.model.kind === "run") {
+      showRunModel(inspected.model);
+      applySchedulerEffect(scheduler.inspectSucceeded(runId, observationSnapshotOf(inspected.model)));
+      return result;
+    }
+    applySchedulerEffect(scheduler.inspectFailed(runId));
+    return result;
   });
 }
 
@@ -1025,6 +1522,7 @@ async function submitAction(action, readForm, describe) {
     return;
   }
   setMutationControlsDisabled(true);
+  let mutationObserved = false;
   try {
     let request;
     try {
@@ -1036,6 +1534,9 @@ async function submitAction(action, readForm, describe) {
       }
       throw error;
     }
+    invalidateActiveInspectToken();
+    applySchedulerEffect(scheduler.mutationStarted());
+    mutationObserved = true;
     setStatus(`Sending ${describe} for run ${action.runId}…`);
     await postMutation(request, {
       runId: action.runId,
@@ -1067,6 +1568,9 @@ async function submitAction(action, readForm, describe) {
   } finally {
     mutationGate.end();
     setMutationControlsDisabled(false);
+    if (mutationObserved) {
+      applySchedulerEffect(scheduler.mutationCompleted());
+    }
   }
 }
 
@@ -1245,7 +1749,11 @@ async function submitNewRun(event) {
   }
   const submit = document.getElementById("submit-run");
   setMutationControlsDisabled(true);
+  let mutationObserved = false;
   try {
+    invalidateActiveInspectToken();
+    applySchedulerEffect(scheduler.mutationStarted());
+    mutationObserved = true;
     setStatus(`Creating run ${runId}…`);
     await postMutation({ path: freshRunPath(projectId), body }, {
       runId,
@@ -1258,8 +1766,9 @@ async function submitNewRun(event) {
           setStatus(`outcome unknown; the create request for run ${runId} may have been received; checking once…`);
         },
         onRecovered: (model) => {
-          selectedRunId = model.runId;
+          applySchedulerEffect(scheduler.runSelected(model.runId));
           showRunModel(model);
+          applySchedulerEffect(scheduler.inspectSucceeded(model.runId, observationSnapshotOf(model)));
         },
         onRecoveryUnavailable: (presented) => {
           showError(formatFailure(presented));
@@ -1273,15 +1782,28 @@ async function submitNewRun(event) {
   } finally {
     mutationGate.end();
     setMutationControlsDisabled(false);
+    if (mutationObserved) {
+      applySchedulerEffect(scheduler.mutationCompleted());
+    }
   }
 }
 
 let runsState = createRunsState();
 let projectsState = null;
 let selectedRunId = null;
+let lastDocumentKey = null;
+let refreshSequence = 0;
+let activeInspectToken = null;
 const mutationGate = createMutationGate();
 const runsGuard = createGenerationGuard();
 const fetchImplementation = typeof fetch === "function" ? fetch : null;
+const scheduler = createLiveObservationScheduler();
+const liveTimers = createSchedulerTimerAdapter(
+  { setTimeout, clearTimeout },
+  () => {
+    applySchedulerEffect(scheduler.timerFired());
+  },
+);
 
 function setStatus(text) {
   document.getElementById("status").textContent = text;
@@ -1332,8 +1854,16 @@ function boot() {
   document.getElementById("inspect-selected").addEventListener("click", () => {
     if (document.getElementById("detail-run-id").textContent.startsWith("Run ")) {
       clearMessages();
-      void inspectRun(document.getElementById("detail-run-id").textContent.slice(4), "manual");
+      void inspectRun(document.getElementById("detail-run-id").textContent.slice(4));
     }
+  });
+  const liveToggle = document.getElementById("live-updates");
+  liveToggle.addEventListener("change", () => {
+    applySchedulerEffect(scheduler.liveToggleChanged(liveToggle.checked));
+    setStatus(liveToggle.checked ? "Live updates enabled." : "Live updates disabled.");
+  });
+  document.addEventListener("visibilitychange", () => {
+    applySchedulerEffect(scheduler.visibilityChanged(document.visibilityState !== "hidden"));
   });
   document.getElementById("generate-id").addEventListener("click", () => {
     if (typeof crypto.randomUUID === "function") {

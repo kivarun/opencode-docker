@@ -8,16 +8,17 @@
  * GET /operations/:id[/logs]. Worker behavior is keyed by the state id
  * from the orchestrator-owned execution document.
  *
- * usage: bun control_plane_daemon.ts <socket-path>
+ * usage: bun control_plane_daemon.ts <socket-path> [dev-entry-delay-ms]
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const socketPath = process.argv[2] ?? "";
 if (socketPath === "") {
-  console.error("usage: control_plane_daemon.ts SOCKET_PATH");
+  console.error("usage: control_plane_daemon.ts SOCKET_PATH [DEV_ENTRY_DELAY_MS]");
   process.exit(2);
 }
+const devEntryDelayMs = Number(process.argv[3] ?? "") || 2500;
 
 const PLAN_1 = JSON.stringify({
   schema_version: 1,
@@ -72,7 +73,7 @@ function executeWorker(workspace: string, mounts: Array<{ source: string; target
     return 1;
   }
   if (stateId === "dev_entry") {
-    Bun.sleepSync(2500);
+    Bun.sleepSync(devEntryDelayMs);
   }
   const outputsRoot = join(workspace, outputs.source);
   mkdirSync(outputsRoot, { recursive: true });

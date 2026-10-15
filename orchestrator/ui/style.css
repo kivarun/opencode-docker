@@ -180,3 +180,16 @@ button:disabled {
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
+
+.live-state {
+  margin-block: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.live-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  margin-block: 0.25rem 0.75rem;
+}

@@ -204,3 +204,57 @@ export interface UiMutationFlow {
 }
 
 export declare function runMutationFlow(flow: UiMutationFlow): Promise<void>;
+
+/* ------------------------------------------------------------------ */
+/* Live observation (v3): bounded read-only polling.                   */
+/* ------------------------------------------------------------------ */
+
+export declare const LIVE_OBSERVATION_POLL_DELAY_MS: 2000;
+
+export type UiObservationEffect =
+  | { readonly effect: "no_op" }
+  | { readonly effect: "cancel_timer" }
+  | { readonly effect: "start_inspect" }
+  | { readonly effect: "render_state" }
+  | { readonly effect: "schedule_timer"; readonly delayMs: number };
+
+export interface UiObservationSnapshot {
+  readonly status: string;
+  readonly boundaryKind: string;
+  readonly revision: number;
+}
+
+export interface UiLiveObservationScheduler {
+  presentationState(): "off" | "live" | "paused" | "stopped";
+  admitInspect(runId: unknown): boolean;
+  takeOverInspect(runId: unknown): UiObservationEffect;
+  runSelected(runId: unknown): UiObservationEffect;
+  inspectStarted(runId: unknown): UiObservationEffect;
+  inspectSucceeded(runId: unknown, applied: UiObservationSnapshot): UiObservationEffect;
+  inspectFailed(runId: unknown): UiObservationEffect;
+  inspectCancelled(runId: unknown): UiObservationEffect;
+  timerFired(): UiObservationEffect;
+  visibilityChanged(visible: unknown): UiObservationEffect;
+  liveToggleChanged(enabled: unknown): UiObservationEffect;
+  mutationStarted(): UiObservationEffect;
+  mutationCompleted(): UiObservationEffect;
+  disposed(): UiObservationEffect;
+}
+
+export declare function createLiveObservationScheduler(): UiLiveObservationScheduler;
+
+export interface UiSchedulerTimers {
+  readonly setTimeout: (callback: () => void, delayMs: number) => unknown;
+  readonly clearTimeout: (handle: unknown) => void;
+}
+
+export interface UiSchedulerTimerAdapter {
+  apply(effect: unknown): void;
+  hasPendingTimer(): boolean;
+}
+
+export declare function createSchedulerTimerAdapter(timers: UiSchedulerTimers, onFire: () => void): UiSchedulerTimerAdapter;
+
+export declare function liveObservationDocumentKey(model: unknown): string;
+export declare function livePollAnnouncement(previousDocumentKey: unknown, model: unknown): string | null;
+export declare function liveStateLabel(state: unknown): string;

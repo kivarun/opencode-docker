@@ -5912,14 +5912,96 @@ boundary with any unrecognized action id fails closed as a whole.
   enters a URL or browser storage.
 - Async GET ordering uses generation semantics: a stale page response
   after a Refresh and a stale inspect after selecting another run are
-  ignored. There is no background polling and no POST cancellation.
+  ignored. There is no POST cancellation and no unbounded background
+  polling; the single automatic GET loop is the bounded read-only live
+  observation of Browser UI v3 (next section).
 
 Still unwired: automatic stage/budget or wait-action selection,
-retries/backoff/polling, an operation queue or 202 jobs, event/log
+retries/backoff (the bounded read-only live observation is Browser UI
+v3, next section), an operation queue or 202 jobs, event/log
 streaming, input upload or a task-body editor, deletion/retention,
 authentication/RBAC/TLS/remote bind, registry hot reload, run status
 aggregation, list filtering/search, binding import/adoption, and any
 Pipeline V2 reducer/controller/CLI or schema change.
+
+### Browser UI v3: bounded read-only live observation
+  (implemented, production-wired)
+
+The run detail can repeat the existing read-only inspect GET of the one
+selected run automatically. This is not an operation queue, not a retry
+machine and not an orchestration policy: the UI only re-issues the
+existing `GET /v1/runs/:runId` while a genuinely executing boundary is
+confirmed. One pure scheduling owner (`createLiveObservationScheduler`)
+receives semantic events (run selected, inspect started/succeeded/
+failed/cancelled, timer fired, visibility changed, live toggle changed,
+mutation started/completed, disposed) and emits declarative effects
+only (`schedule_timer`, `cancel_timer`, `start_inspect`, `render_state`,
+`no_op`); it consumes only the already validated inspect model and
+never touches HTTP, the DOM or timers itself.
+
+Polling eligibility (all conditions must hold simultaneously):
+
+- a run is selected and the last authoritative inspect succeeded;
+- `status === "running"` and `boundary.kind === "in_flight"`;
+- the tab is visible;
+- the `Live updates` toggle (default enabled, page memory only) is on;
+- no inspect of the run is in flight;
+- no mutating POST is active.
+
+For every other state polling is absent: `resumable`, `plan_ready`,
+`waiting`, `succeeded`, `failed`, an unusable or unknown boundary, an
+inspect error, `run_not_found`, a project/binding error. The period is
+a fixed 2000 ms measured from the completion of the previous successful
+inspect — never from the request start. The timer is one chained
+`setTimeout` behind the single timer adapter (at most one pending
+timer, no `setInterval`); a slow GET never queues a second one, and
+manual Refresh shares the machine's single-flight inspect owner.
+
+Stop rules: the first inspect that returns a non-eligible boundary, a
+contract failure, an API error envelope or a network error stops the
+scheduler permanently. After an error the UI shows a safe
+`layer: reason` diagnostic, keeps manual Refresh, sets no new timer and
+performs no backoff. Only an explicit user action (Refresh, re-enabling
+live updates, re-selecting the run) runs a new inspect, and the
+scheduler restarts only if that inspect again confirms
+`running/in_flight`.
+
+Visibility and selection: hiding the document cancels the pending
+timer; returning to visibility triggers exactly one immediate inspect,
+only when the last applied boundary was polling-eligible and never
+after an error. Selecting another run cancels the timer and
+invalidates the outstanding response — a stale response can never
+apply to the newly selected run.
+
+Mutation interaction: a mutating POST cancels the pending timer and
+invalidates the in-flight inspect (its response is dropped and the
+single-flight slot is released for the authoritative inspect), the
+toggle is untouched, and polling is forbidden until the mutator
+completes. After the mutator completes, the existing one authoritative
+v2 inspect decides: `running/in_flight` restarts polling, any other
+boundary never does. `run_busy` is inspect-only and never retries the
+POST; the double-submit gate and the one-mutator rule are unchanged.
+
+Lost-response boundary: after a lost POST the existing exactly-one
+recovery inspect runs. If it confirms `running/in_flight`, ordinary
+GET-only polling may continue; if it returns `run_not_found`, an error
+or any other boundary, polling never starts; the original POST is
+never repeated, and no polling result ever initiates a mutation.
+
+Presentation: a `Live updates` line shows `Live`, `Paused`,
+`Stopped after error` or `off` plus a browser-local refresh sequence
+number — presentation only, never a durable or API fact; there is no
+progress bar and no estimated completion. Announcements happen only
+for revision/boundary/status changes, polling errors and
+user-initiated pause/resume; an unchanged poll is silent and does not
+rebuild the detail DOM, so focus and selection survive.
+
+Still unwired: polling beyond the one selected run (list aggregation,
+discovery sweeps), automatic mutations from any observation result,
+retries/backoff, an operation queue or 202 jobs, event/log streaming,
+input upload or a task-body editor, deletion/retention,
+authentication/RBAC/TLS/remote bind, registry hot reload, and any HTTP
+schema or orchestrator CLI change.
 
 ## Event and log handling
 

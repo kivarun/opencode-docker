@@ -453,7 +453,7 @@ describe("ui model: export surface and source restrictions", () => {
   test("the runtime export surface is exactly the declared model API", async () => {
     const runtime = (await import("../ui/app.js")) as unknown as Record<string, unknown>;
     const declared = readFileSync(join(import.meta.dir, "..", "ui", "app.d.ts"), "utf8");
-    const declaredNames = [...declared.matchAll(/export declare (?:class|function) (\w+)/g)].map((match) => match[1] as string);
+    const declaredNames = [...declared.matchAll(/export declare (?:class|function|const) (\w+)/g)].map((match) => match[1] as string);
     expect(Object.keys(runtime).sort()).toEqual(declaredNames.slice().sort());
     expect(Object.keys(runtime).sort()).toEqual(
       [
@@ -476,6 +476,12 @@ describe("ui model: export surface and source restrictions", () => {
         "createMutationGate",
         "createGenerationGuard",
         "runMutationFlow",
+        "LIVE_OBSERVATION_POLL_DELAY_MS",
+        "createLiveObservationScheduler",
+        "createSchedulerTimerAdapter",
+        "liveObservationDocumentKey",
+        "livePollAnnouncement",
+        "liveStateLabel",
       ].sort(),
     );
   });
