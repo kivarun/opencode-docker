@@ -5954,8 +5954,18 @@ inspect error, `run_not_found`, a project/binding error. The period is
 a fixed 2000 ms measured from the completion of the previous successful
 inspect — never from the request start. The timer is one chained
 `setTimeout` behind the single timer adapter (at most one pending
-timer, no `setInterval`); a slow GET never queues a second one, and
-manual Refresh shares the machine's single-flight inspect owner.
+timer, no `setInterval`); a slow GET never queues a second one.
+
+The one admission owner of every inspect GET is the module-level
+inspect transport: at most one unsettled fetch exists at any instant —
+fulfil, reject and abort all settle it before anything new starts. A
+new desire supersedes the unsettled request (best-effort abort, which
+never frees the slot by itself) and coalesces as the single follow-up
+started exactly when the slot releases; `invalidate()` supersedes the
+unsettled request and withdraws a queued desire. Every settled
+superseded response is dropped and never applied or scheduled from;
+manual Refresh keeps the machine's single-flight semantics
+(`takeOverInspect`).
 
 Stop rules: the first inspect that returns a non-eligible boundary, a
 contract failure, an API error envelope or a network error stops the

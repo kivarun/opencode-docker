@@ -476,6 +476,7 @@ describe("ui model: export surface and source restrictions", () => {
         "createMutationGate",
         "createGenerationGuard",
         "runMutationFlow",
+        "createInspectTransport",
         "LIVE_OBSERVATION_POLL_DELAY_MS",
         "createLiveObservationScheduler",
         "createSchedulerTimerAdapter",

@@ -206,6 +206,43 @@ export interface UiMutationFlow {
 export declare function runMutationFlow(flow: UiMutationFlow): Promise<void>;
 
 /* ------------------------------------------------------------------ */
+/* Inspect transport: the one single-flight admission owner of every   */
+/* inspect GET.                                                        */
+/* ------------------------------------------------------------------ */
+
+export interface UiInspectTransportIo {
+  /** The only inspect GET site; receives the request's abort signal. */
+  readonly fetchInspect: (runId: string, signal: AbortSignal) => Promise<UiApiResult | undefined>;
+  /** Fires exactly once per fetch start, before the request goes out. */
+  readonly onInspectStarted: (runId: string) => void;
+  /** Fires when a superseded request settles with no desired follow-up. */
+  readonly onInspectDropped: (runId: string) => void;
+}
+
+export interface UiInspectDesire {
+  readonly runId: string;
+  /** Called only when the request settled and was never superseded. */
+  readonly onApplied: (result: UiApiResult | undefined) => void;
+}
+
+export interface UiInspectTransport {
+  /**
+   * Admits one inspect desire: when the wire slot is free the desire
+   * starts immediately, otherwise the active result is superseded and
+   * the desire coalesces into the latest desired request. The returned
+   * promise resolves with the raw API result after the settlement,
+   * whatever the supersede state is.
+   */
+  request(desire: UiInspectDesire): Promise<UiApiResult | undefined>;
+  /** Supersedes the active result and withdraws the pending desire. */
+  invalidate(): void;
+  /** Withdraws everything and refuses every later desire. */
+  dispose(): void;
+}
+
+export declare function createInspectTransport(io: UiInspectTransportIo): UiInspectTransport;
+
+/* ------------------------------------------------------------------ */
 /* Live observation (v3): bounded read-only polling.                   */
 /* ------------------------------------------------------------------ */
 

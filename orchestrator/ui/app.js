@@ -16,6 +16,17 @@
  * - the thin DOM adapter below renders the models through
  *   `createElement`/`textContent` only and boots only in a browser
  *   (where `document` exists); under a test runner it is inert.
+ * - the inspect transport is the one single-flight admission owner of
+ *   every inspect GET of the module: exactly one active wire request
+ *   and one latest desired request. A desire that arrives while a
+ *   request is on the wire supersedes the active result (its response
+ *   can never be applied) and coalesces into the latest desired
+ *   request; after the active request settles — fulfil, reject or
+ *   abort rejection — the wire slot is released exactly once, the
+ *   result is applied only when the request was never superseded, and
+ *   at most one coalesced follow-up starts. A new inspect fetch never
+ *   begins while the previous one is unsettled, even when the previous
+ *   result is already superseded.
  * - the live observation (v3) is one pure scheduling owner: it repeats
  *   the read-only inspect GET of the selected run at a fixed interval
  *   only while the last applied authoritative inspect shows `running`
@@ -766,6 +777,155 @@ export async function runMutationFlow(flow) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Inspect transport: the one single-flight admission owner of every   */
+/* inspect GET of the module.                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The one inspect transport admission owner. It distinguishes the
+ * active wire request, the validity of its result, the latest desired
+ * request and nothing else — there is no queue, no pending-request
+ * list and no second admission path.
+ *
+ * Semantics:
+ *
+ * - `request(desire)`: when the wire slot is free the desire starts
+ *   immediately; while a request is on the wire the desire supersedes
+ *   the active result (its response can never be applied) and
+ *   coalesces into the latest desired request, so several takeover,
+ *   refresh and selection events collapse into one last desire.
+ * - Supersede never starts a fetch. `invalidate()` supersedes the
+ *   active result and withdraws the pending desire (the mutation
+ *   boundary); `dispose()` withdraws everything and refuses every
+ *   later desire.
+ * - After the active request settles — fulfil, reject or abort
+ *   rejection, exactly once — the slot is released, the result is
+ *   applied only when the request was never superseded (the stale
+ *   filter is an application filter, never an admission mechanism),
+ *   and at most one coalesced follow-up starts. Aborting a superseded
+ *   request is a best-effort wire release: it never frees the slot
+ *   and never starts the follow-up; a fetch implementation that
+ *   ignores the abort delays the follow-up instead of overlapping it.
+ * - An invalid desire (unsafe run id, malformed shape) never reaches
+ *   the wire and resolves without effects.
+ *
+ * The returned promise of every accepted request resolves with the raw
+ * API result (or undefined when the transport produced none), whatever
+ * the supersede state is — the per-request application callback decides
+ * what a superseded result may still mean.
+ */
+export function createInspectTransport(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["fetchInspect"] !== "function" ||
+    typeof io["onInspectStarted"] !== "function" ||
+    typeof io["onInspectDropped"] !== "function"
+  ) {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const fetchInspect = io["fetchInspect"];
+  const onInspectStarted = io["onInspectStarted"];
+  const onInspectDropped = io["onInspectDropped"];
+  let active = null;
+  let desired = null;
+  let disposed = false;
+
+  /** The only fetch start site: the wire slot must be free. */
+  const startRequest = (request) => {
+    if (active !== null) {
+      throw new UiContractError("transport_slot_busy");
+    }
+    active = request;
+    const controller = new AbortController();
+    request.controller = controller;
+    onInspectStarted(request.runId);
+    void (async () => {
+      let result;
+      try {
+        result = await fetchInspect(request.runId, controller.signal);
+      } catch {
+        result = undefined;
+      } finally {
+        settleActive(request, result);
+      }
+    })();
+  };
+
+  /** The single settlement owner: release, apply-or-drop, one follow-up. */
+  const settleActive = (request, result) => {
+    try {
+      if (request.superseded) {
+        if (desired === null) {
+          onInspectDropped(request.runId);
+        }
+      } else {
+        request.onApplied(result);
+      }
+    } finally {
+      active = null;
+      const followUp = desired;
+      desired = null;
+      request.resolve(result);
+      if (followUp !== null && !disposed) {
+        startRequest(followUp);
+      }
+    }
+  };
+
+  return Object.freeze({
+    request(desire) {
+      const runId = isRecord(desire) && isSafeId(desire["runId"]) ? desire["runId"] : null;
+      const onApplied = isRecord(desire) && typeof desire["onApplied"] === "function" ? desire["onApplied"] : null;
+      let resolveResult = null;
+      const settled = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      if (disposed || runId === null || onApplied === null) {
+        resolveResult(undefined);
+        return settled;
+      }
+      const request = { runId, onApplied, superseded: false, controller: null, resolve: resolveResult };
+      if (active === null) {
+        startRequest(request);
+      } else {
+        active.superseded = true;
+        active.controller.abort();
+        const replaced = desired;
+        desired = request;
+        if (replaced !== null) {
+          // a coalesced-over desire never runs; it settles without a result
+          replaced.resolve(undefined);
+        }
+      }
+      return settled;
+    },
+    invalidate() {
+      if (active !== null) {
+        active.superseded = true;
+        active.controller.abort();
+      }
+      const withdrawn = desired;
+      desired = null;
+      if (withdrawn !== null) {
+        withdrawn.resolve(undefined);
+      }
+    },
+    dispose() {
+      disposed = true;
+      const withdrawn = desired;
+      desired = null;
+      if (withdrawn !== null) {
+        withdrawn.resolve(undefined);
+      }
+      if (active !== null) {
+        active.superseded = true;
+        active.controller.abort();
+      }
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Live observation (v3): bounded read-only polling of one selected    */
 /* run while the authoritative inspect shows `running` + `in_flight`.  */
 /* ------------------------------------------------------------------ */
@@ -1286,48 +1446,16 @@ function updateLiveStateLine() {
   line.textContent = text;
 }
 
-function beginInspectToken(runId) {
-  const token = { runId, discarded: false };
-  activeInspectToken = token;
-  return token;
-}
-
-function invalidateActiveInspectToken() {
-  if (activeInspectToken !== null) {
-    activeInspectToken.discarded = true;
-  }
-}
-
-let inspectChain = Promise.resolve();
-
 /**
- * Every inspect GET of the UI is serialized through this chain, so two
- * inspect requests for one run never overlap on the wire; a superseded
- * response is dropped by the token discipline instead.
+ * The shared inspect tail: only the response of a request the transport
+ * still considers valid and of the still-selected run applies; the
+ * transport calls it only for a never-superseded settlement, so a
+ * superseded response is dropped before any rendering or machine
+ * event. A scheduled poll stays silent on an unchanged document and
+ * stops the observation on any failure.
  */
-function enqueueInspect(task) {
-  const next = inspectChain.then(task, task);
-  inspectChain = next.then(
-    () => undefined,
-    () => undefined,
-  );
-  return next;
-}
-
-/**
- * The shared inspect tail: only the response of the still-active token
- * of the still-selected run applies; a superseded response is dropped
- * silently (the machine slot belongs to the newer inspect), and a
- * discarded active token releases the slot. A scheduled poll stays
- * silent on an unchanged document and stops the observation on any
- * failure.
- */
-async function applyInspectOutcome(runId, result, scheduled, token) {
-  if (activeInspectToken !== token || selectedRunId !== runId) {
-    return;
-  }
-  if (token.discarded) {
-    applySchedulerEffect(scheduler.inspectCancelled(runId));
+function applyInspectOutcome(runId, result, scheduled) {
+  if (selectedRunId !== runId) {
     return;
   }
   const inspected = expectRunOrError(result);
@@ -1361,25 +1489,26 @@ function scheduledInspect() {
   if (runId === null) {
     return;
   }
-  void enqueueInspect(async () => {
-    if (selectedRunId !== runId || !scheduler.admitInspect(runId)) {
-      return;
-    }
-    applySchedulerEffect(scheduler.inspectStarted(runId));
-    const token = beginInspectToken(runId);
-    const result = await requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
-    await applyInspectOutcome(runId, result, true, token);
+  inspectTransport.request({
+    runId,
+    onApplied: (result) => {
+      applyInspectOutcome(runId, result, true);
+    },
   });
 }
 
 /**
  * The manual inspect: a user action that resets the observation for the
- * selected run, cancels any pending timer and takes over the
- * single-flight inspect owner (an in-flight inspect is invalidated and
- * its response dropped). The GET itself is serialized behind any
- * outstanding inspect.
+ * selected run, cancels any pending timer and hands its desire to the
+ * one inspect transport. An inspect already on the wire is superseded
+ * (its response is dropped) and the manual inspect runs as the single
+ * coalesced follow-up after the wire slot is released.
  */
-async function inspectRun(runId) {
+function inspectRun(runId) {
+  if (!isSafeId(runId)) {
+    showError("contract: invalid_run_id");
+    return;
+  }
   setStatus(`Inspecting run ${runId}…`);
   applySchedulerEffect(scheduler.runSelected(runId));
   selectedRunId = runId;
@@ -1389,13 +1518,11 @@ async function inspectRun(runId) {
   document.getElementById("run-detail").hidden = true;
   document.getElementById("outputs-table").hidden = true;
   document.getElementById("run-controls").replaceChildren();
-  await enqueueInspect(async () => {
-    if (selectedRunId !== runId) {
-      return;
-    }
-    const token = beginInspectToken(runId);
-    const result = await requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
-    await applyInspectOutcome(runId, result, false, token);
+  inspectTransport.request({
+    runId,
+    onApplied: (result) => {
+      applyInspectOutcome(runId, result, false);
+    },
   });
 }
 
@@ -1473,41 +1600,29 @@ async function postMutation(request, flow) {
 }
 
 /**
- * The authoritative post-mutation inspect: one GET that renders through
- * the flow handlers and drives the live-observation machine (never a
- * mutation, never a retry of the POST). It owns the single inspect
- * token, so a superseded poll response can never release its slot.
- */
-/**
- * The authoritative post-mutation inspect: one GET that renders through
- * the flow handlers and drives the live-observation machine (never a
- * mutation, never a retry of the POST). It is serialized behind any
- * outstanding inspect and owns the single inspect token, so a
- * superseded poll response can never release its slot.
+ * The authoritative post-mutation inspect: one GET through the one
+ * inspect transport that renders through the flow handlers and drives
+ * the live-observation machine (never a mutation, never a retry of the
+ * POST). The raw result reaches the flow whatever the supersede state
+ * is; the machine application happens only for a never-superseded
+ * settlement of the still-selected run, so a superseded poll response
+ * can never release or take the machine slot.
  */
 function notifyObservationOfInspect(runId) {
-  return enqueueInspect(async () => {
-    if (selectedRunId !== runId) {
-      return requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
-    }
-    scheduler.inspectStarted(runId);
-    const token = beginInspectToken(runId);
-    const result = await requestApiJson(fetchImplementation, `/v1/runs/${runId}`);
-    if (selectedRunId !== runId || activeInspectToken !== token) {
-      return result;
-    }
-    if (token.discarded) {
-      scheduler.inspectCancelled(runId);
-      return result;
-    }
-    const inspected = expectRunOrError(result);
-    if (inspected.ok && inspected.model.kind === "run") {
-      showRunModel(inspected.model);
-      applySchedulerEffect(scheduler.inspectSucceeded(runId, observationSnapshotOf(inspected.model)));
-      return result;
-    }
-    applySchedulerEffect(scheduler.inspectFailed(runId));
-    return result;
+  return inspectTransport.request({
+    runId,
+    onApplied: (result) => {
+      if (selectedRunId !== runId) {
+        return;
+      }
+      const inspected = expectRunOrError(result);
+      if (inspected.ok && inspected.model.kind === "run") {
+        showRunModel(inspected.model);
+        applySchedulerEffect(scheduler.inspectSucceeded(runId, observationSnapshotOf(inspected.model)));
+        return;
+      }
+      applySchedulerEffect(scheduler.inspectFailed(runId));
+    },
   });
 }
 
@@ -1534,7 +1649,7 @@ async function submitAction(action, readForm, describe) {
       }
       throw error;
     }
-    invalidateActiveInspectToken();
+    inspectTransport.invalidate();
     applySchedulerEffect(scheduler.mutationStarted());
     mutationObserved = true;
     setStatus(`Sending ${describe} for run ${action.runId}…`);
@@ -1751,7 +1866,7 @@ async function submitNewRun(event) {
   setMutationControlsDisabled(true);
   let mutationObserved = false;
   try {
-    invalidateActiveInspectToken();
+    inspectTransport.invalidate();
     applySchedulerEffect(scheduler.mutationStarted());
     mutationObserved = true;
     setStatus(`Creating run ${runId}…`);
@@ -1793,7 +1908,6 @@ let projectsState = null;
 let selectedRunId = null;
 let lastDocumentKey = null;
 let refreshSequence = 0;
-let activeInspectToken = null;
 const mutationGate = createMutationGate();
 const runsGuard = createGenerationGuard();
 const fetchImplementation = typeof fetch === "function" ? fetch : null;
@@ -1804,6 +1918,15 @@ const liveTimers = createSchedulerTimerAdapter(
     applySchedulerEffect(scheduler.timerFired());
   },
 );
+const inspectTransport = createInspectTransport({
+  fetchInspect: (runId, signal) => requestApiJson(fetchImplementation, `/v1/runs/${runId}`, { signal }),
+  onInspectStarted: (runId) => {
+    applySchedulerEffect(scheduler.inspectStarted(runId));
+  },
+  onInspectDropped: (runId) => {
+    applySchedulerEffect(scheduler.inspectCancelled(runId));
+  },
+});
 
 function setStatus(text) {
   document.getElementById("status").textContent = text;

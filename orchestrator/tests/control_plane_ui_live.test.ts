@@ -125,8 +125,8 @@ describe("control-plane UI live observation: bounded read-only polling", () => {
     );
     const log = join(smokeRoot, "daemon.log");
     const daemonLogFd = openSync(log, "a");
-    // the stage worker is held for five seconds: an honest in_flight window
-    const daemon = Bun.spawn([process.execPath, join(import.meta.dir, "control_plane_daemon.ts"), socketPath, "5000"], {
+    // the stage worker is held for eight seconds: an honest in_flight window
+    const daemon = Bun.spawn([process.execPath, join(import.meta.dir, "control_plane_daemon.ts"), socketPath, "8000"], {
       stdout: daemonLogFd,
       stderr: daemonLogFd,
     });
@@ -251,6 +251,7 @@ describe("control-plane UI live observation: bounded read-only polling", () => {
       let previousRevision = recovered.revision;
       const observationDeadline = Date.now() + 60000;
       let lastEffect: UiObservationEffect = { effect: "no_op" };
+      let pendingProof: { before: string; after: string } | null = null;
       for (;;) {
         if (Date.now() > observationDeadline) {
           throw new Error("the observation loop never stopped at a new boundary");
@@ -262,7 +263,17 @@ describe("control-plane UI live observation: bounded read-only polling", () => {
         expect(timerAdapter.hasPendingTimer()).toBe(false);
         const before = await fingerprintTree(runTree);
         const model = await uiInspect(port, runId);
-        expect(await fingerprintTree(runTree)).toBe(before);
+        const after = await fingerprintTree(runTree);
+        // The previous iteration's zero-write proof is claimed only when
+        // the boundary is still in_flight: the only run-tree writes are
+        // the orchestration's own boundary-crossing commits, never the
+        // GET, so a still-in_flight observation proves the previous GET
+        // wrote nothing, while a crossed boundary legitimately explains
+        // a difference and drops the proof.
+        if (pendingProof !== null && model.boundary.kind === "in_flight") {
+          expect(pendingProof.after).toBe(pendingProof.before);
+        }
+        pendingProof = { before, after };
         expect(model.revision).toBeGreaterThanOrEqual(previousRevision);
         previousRevision = model.revision;
         for (const secret of secrets) {
@@ -281,7 +292,11 @@ describe("control-plane UI live observation: bounded read-only polling", () => {
       expect(lastEffect.effect).not.toBe("schedule_timer");
       expect(timerAdapter.hasPendingTimer()).toBe(false);
       expect(inFlightObservations).toBeGreaterThanOrEqual(2);
+      // the quiescent waiting boundary: one more real inspect must be
+      // zero-write over the settled run tree
+      const settledBefore = await fingerprintTree(runTree);
       const finalModel = await uiInspect(port, runId);
+      expect(await fingerprintTree(runTree)).toBe(settledBefore);
       expect(finalModel.boundary).toMatchObject({ kind: "waiting", waitIndex: 2 });
       expect(finalModel.status).toBe("waiting");
       expect(scheduler.presentationState()).toBe("off");

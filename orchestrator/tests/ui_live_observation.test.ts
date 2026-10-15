@@ -568,6 +568,21 @@ describe("ui v3: source restrictions of the live observation", () => {
     expect(appSource.split("function buildRunActionModel").length - 1).toBe(1);
     expect(appSource.split("function buildMutationRequest").length - 1).toBe(1);
     expect(appSource.split("async function postMutation").length - 1).toBe(1);
+    // the one inspect transport admission owner: one declaration, one
+    // module wiring, one abort-controller site, one fetch start
+    expect(appSource.split("export function createInspectTransport(").length - 1).toBe(1);
+    expect(appSource.split("createInspectTransport({").length - 1).toBe(1);
+    expect(appSource.split("new AbortController(").length - 1).toBe(1);
+    expect(appSource.split("await fetchInspect(").length - 1).toBe(1);
+    expect(appSource.split("fetchInspect:").length - 1).toBe(1);
+    // the inspect GET path is constructed only for the transport and the
+    // lost-response recovery description
+    expect(appSource.split("`/v1/runs/${runId}`").length - 1).toBe(2);
+    // the incidental promise-chain single flight and the token
+    // machinery are gone; supersede is the transport's own state
+    for (const gone of ["enqueueInspect", "inspectChain", "beginInspectToken", "activeInspectToken", "invalidateActiveInspectToken"]) {
+      expect(appSource.includes(gone)).toBe(false);
+    }
   });
 
   test("s2. the scheduler region contains no mutation, transport or persistence capability", () => {
@@ -597,13 +612,52 @@ describe("ui v3: source restrictions of the live observation", () => {
     }
   });
 
-  test("s3. the scheduled poll path reads only the run inspect endpoint", () => {
+  test("s3. the scheduled poll path delegates to the one transport owner", () => {
     const start = appSource.indexOf("function scheduledInspect");
-    const end = appSource.indexOf("async function inspectRun");
+    const end = appSource.indexOf("function inspectRun");
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     const region = appSource.slice(start, end);
-    expect(region.includes("method")).toBe(false);
-    expect(region.includes("/v1/runs/")).toBe(true);
+    expect(region.includes("inspectTransport.request(")).toBe(true);
+    for (const banned of ["method", "requestApiJson", "/v1/runs/", "fetch", "admitInspect"]) {
+      expect(region.includes(banned)).toBe(false);
+    }
+  });
+
+  test("s4. the transport region owns admission without queues, timers or retries", () => {
+    const start = appSource.indexOf("Inspect transport: the one single-flight admission owner");
+    const end = appSource.indexOf("Live observation (v3)");
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const region = appSource.slice(start, end);
+    for (const banned of [
+      "setTimeout",
+      "setInterval",
+      "clearTimeout",
+      ".push(",
+      "new Map(",
+      "new Set(",
+      '"POST"',
+      "`POST`",
+      "retry",
+      "backoff",
+      "while (",
+      "for (",
+      ".then(",
+      "await fetchImpl",
+      "import ",
+      "require(",
+    ]) {
+      expect(region.includes(banned)).toBe(false);
+    }
+    // supersede aborts at most the three owner sites (busy desire,
+    // invalidate, dispose); the abort never frees the slot itself
+    expect(region.split(".abort()").length - 1).toBe(3);
+    // the slot is released exactly once, from the single settlement owner:
+    // the slot variable is declared once and nulled only there
+    expect(region.split("let active = null").length - 1).toBe(1);
+    expect(region.split("active = null").length - 1).toBe(2);
+    expect(region.split("const startRequest = (request)").length - 1).toBe(1);
+    expect(region.split("startRequest(").length - 1).toBe(2);
   });
 });
