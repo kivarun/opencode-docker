@@ -1511,6 +1511,7 @@ test("export surface: exactly the inspect module's public runtime names", async 
   const mod = await import("../src/pipeline_v2_inspect.ts");
   expect(Object.keys(mod).sort()).toEqual([
     "inspectPipelineV2Run",
+    "loadDurablePipelineV2Run",
   ]);
 });
 

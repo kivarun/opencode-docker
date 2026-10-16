@@ -411,6 +411,9 @@ function makeChain(stateRoot: string, resultBody: Record<string, unknown>, credF
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],
+    eventsPipelineV2Run: (async () => {
+      throw new Error("fake eventsPipelineV2Run not configured");
+    }) as unknown as CliIo["eventsPipelineV2Run"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -628,6 +631,9 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
       inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],
+    eventsPipelineV2Run: (async () => {
+      throw new Error("fake eventsPipelineV2Run not configured");
+    }) as unknown as CliIo["eventsPipelineV2Run"],
     respondPipelineV2Wait: (async () => {
         throw new Error("fake not configured");
       }) as unknown as CliIo["respondPipelineV2Wait"],

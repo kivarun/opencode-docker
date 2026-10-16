@@ -308,3 +308,27 @@ describe("control plane routing", () => {
     expect(Object.keys(error)).toContain("reason");
   });
 });
+
+test("events routes read-only pagination flags only", () => {
+  const plain = routeOrchestratorCommand({ kind: "events", runId: "cp-run-1" }, ROUTING_CONFIG);
+  expect(plain.argv).toEqual(["events", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config", "--json"]);
+  expect(plain.expectedRunId).toBe("cp-run-1");
+  const full = routeOrchestratorCommand({ kind: "events", runId: "cp-run-1", after: 4, limit: 9 }, ROUTING_CONFIG);
+  expect(full.argv).toEqual([
+    "events", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config",
+    "--after", "4", "--limit", "9", "--json",
+  ]);
+  const zeroAfter = routeOrchestratorCommand({ kind: "events", runId: "cp-run-1", after: 0 }, ROUTING_CONFIG);
+  expect(zeroAfter.argv).toEqual(["events", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config", "--after", "0", "--json"]);
+});
+
+test("events rejects hostile and invalid command shapes", () => {
+  expectRoutingError({ kind: "events", runId: "../escape" }, "invalid_command");
+  expectRoutingError({ kind: "events", runId: "" }, "invalid_command");
+  expectRoutingError({ kind: "events" } as never, "invalid_command");
+  expectRoutingError({ kind: "events", runId: "r", after: -1 }, "invalid_command");
+  expectRoutingError({ kind: "events", runId: "r", after: 1.5 }, "invalid_command");
+  expectRoutingError({ kind: "events", runId: "r", limit: 0 }, "invalid_command");
+  expectRoutingError({ kind: "events", runId: "r", limit: -3 }, "invalid_command");
+  expectRoutingError({ kind: "events", runId: "r", ghost: 1 } as never, "invalid_command");
+});

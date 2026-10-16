@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ControlPlaneHttpRequestError,
+  handleControlPlaneHttpRequest,
   parseControlPlaneRoute,
   parseRunsDiscoveryQuery,
   projectControlPlaneProjects,
@@ -33,11 +34,15 @@ import {
   parseReviseTaskBody,
   projectControlPlaneCommandResult,
   projectControlPlaneInspect,
+  projectControlPlaneEvents,
+  parseEventsQuery,
   startControlPlaneHttpService,
   statusForControlPlaneFailure,
   type RunningControlPlaneHttpService,
 } from "../src/control_plane/http_server.ts";
 import { ControlPlaneRunBindingStore } from "../src/control_plane/run_binding_store.ts";
+import { loadControlPlaneProjectRegistry } from "../src/control_plane/project_registry.ts";
+import { defaultControlPlaneUiRoot, loadControlPlaneUiAssets } from "../src/control_plane/ui_assets.ts";
 import { OrchestratorSubprocessClient, type OrchestratorCallResult } from "../src/control_plane/subprocess_client.ts";
 
 const CANARY = "httpcanaryhostpath";
@@ -144,6 +149,7 @@ describe("control-plane HTTP: route parser", () => {
     expect(routeReason("/v1/runs/r1/continue-stage", "POST")).toBe("ok:continue_stage");
     expect(routeReason("/v1/runs/r1/revise-task", "POST")).toBe("ok:revise_task");
     expect(routeReason("/v1/runs/r1/respond", "POST")).toBe("ok:respond");
+    expect(routeReason("/v1/runs/r1/events", "GET")).toBe("ok:events");
   });
 
   test("method mismatches on known shapes are method_not_allowed", () => {
@@ -153,6 +159,7 @@ describe("control-plane HTTP: route parser", () => {
       ["/v1/runs/r1/resume", "GET"],
       ["/v1/runs/r1", "OPTIONS"],
       ["/v1/runs/r1/respond", "PUT"],
+      ["/v1/runs/r1/events", "POST"],
     ] as const) {
       expect(routeReason(path, method)).toBe("method_not_allowed");
     }
@@ -353,6 +360,82 @@ describe("control-plane HTTP: status table and projections", () => {
       reason: "run_not_found",
     });
     expect(JSON.stringify(inspectFailure)).not.toContain("/secret/root");
+  });
+
+  test("events projections copy the events page and drop the run root", () => {
+    const projection = {
+      kind: "events" as const,
+      schemaVersion: 1 as const,
+      runId: "r1",
+      revision: 9,
+      events: [{ revision: 1, kind: "create_run" }],
+      nextAfter: null,
+    };
+    const projected = projectControlPlaneEvents(asCallResult({ ok: true, projection })) as unknown as Record<string, unknown>;
+    expect(projected).toEqual({
+      schema_version: 1,
+      kind: "events",
+      run_id: "r1",
+      revision: 9,
+      events: [{ revision: 1, kind: "create_run" }],
+      next_after: null,
+    });
+    expect(JSON.stringify(projected)).not.toContain("runRoot");
+    expect(JSON.stringify(projected)).not.toContain("/secret/root");
+    const failure = projectControlPlaneEvents(
+      asCallResult({ ok: true, projection: { kind: "eventsFailure", exitCode: 1, runId: "gone", runRoot: "/secret/root", reason: "run_not_found" } }),
+    ) as unknown as Record<string, unknown>;
+    expect(failure).toEqual({
+      schema_version: 1,
+      kind: "command_result",
+      run_id: "gone",
+      outcome: "failed",
+      exit_code: 1,
+      reason: "run_not_found",
+    });
+    expect(JSON.stringify(failure)).not.toContain("/secret/root");
+    expect(projectControlPlaneEvents(asCallResult({ ok: false, failure: { reason: "spawn_failed", expectedRunId: "r1" } }))).toEqual({
+      layer: "transport",
+      reason: "spawn_failed",
+    });
+    const unknownVersion = projectControlPlaneEvents(
+      asCallResult({ ok: true, projection: { kind: "events", schemaVersion: 2, runId: "r1", revision: 1, events: [], nextAfter: null } }),
+    );
+    expect(unknownVersion).toEqual({ layer: "transport", reason: "internal_error" });
+  });
+
+  test("the events query parser accepts only after and limit with the exact grammar", () => {
+    expect(parseEventsQuery("")).toEqual({ after: null, limit: null });
+    expect(parseEventsQuery("?after=5")).toEqual({ after: 5, limit: null });
+    expect(parseEventsQuery("?limit=9")).toEqual({ after: null, limit: 9 });
+    expect(parseEventsQuery("?limit=9&after=5")).toEqual({ after: 5, limit: 9 });
+    expect(parseEventsQuery("?after=0")).toEqual({ after: 0, limit: null });
+    expect(parseEventsQuery("?limit=200")).toEqual({ after: null, limit: 200 });
+    const rejected: Array<[string, string]> = [
+      ["?after=-1", "non-negative safe integer"],
+      ["?after=1.5", "non-negative safe integer"],
+      ["?after=1e2", "non-negative safe integer"],
+      ["?after=+1", "non-negative safe integer"],
+      ["?after=01", "non-negative safe integer"],
+      ["?limit=0", "positive safe integer"],
+      ["?limit=-2", "positive safe integer"],
+      ["?limit=2.5", "positive safe integer"],
+      ["?limit=201", "up to 200"],
+      ["?after", "exactly one value"],
+      ["?after=", "non-negative safe integer"],
+      ["?after=1&after=2", "unique"],
+      ["?limit=1&limit=2", "unique"],
+      ["?ghost=1", "unknown field"],
+      ["?after=%31", "encoded"],
+    ];
+    for (const [query, message] of rejected) {
+      const parsed = parseEventsQuery(query);
+      if (!(parsed instanceof ControlPlaneHttpRequestError)) {
+        throw new Error(`expected rejection for ${query}`);
+      }
+      expect(parsed.message, query).toContain(message);
+      expect(parsed.reason).toBe("invalid_request");
+    }
   });
 
   test("an unknown inspect schema version is a transport failure, never a guessed projection", () => {
@@ -1392,5 +1475,188 @@ describe("control-plane HTTP: source restrictions", () => {
     }
     expect(entrySource.split("Bun.serve(").length - 1).toBe(0);
     expect(entrySource.includes("node:fs")).toBe(false);
+  });
+});
+
+describe("control-plane HTTP: lifecycle events route", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-events-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const storeRoot = join(envRoot, "bindings");
+  const projectDir = join(envRoot, "project");
+  let registry: Awaited<ReturnType<typeof loadControlPlaneProjectRegistry>>;
+  const calls: unknown[] = [];
+  let nextResult: OrchestratorCallResult = {
+    ok: true,
+    projection: {
+      kind: "events",
+      schemaVersion: 1,
+      runId: "events-run",
+      revision: 3,
+      events: [{ revision: 1, kind: "create_run" }],
+      nextAfter: null,
+    },
+  };
+
+  beforeAll(async () => {
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    registry = await loadControlPlaneProjectRegistry(registryPath);
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "events-run", projectId: "project-a" });
+    await store.claim({ runId: "gone-project-run", projectId: "project-removed" });
+  }, 20000);
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  const callHandler = async (path: string, method = "GET", headers: Record<string, string> = {}, body?: string): Promise<RawResponse> => {
+    const fakeClient = {
+      run: async (command: unknown): Promise<OrchestratorCallResult> => {
+        calls.push(command);
+        return nextResult;
+      },
+    } as unknown as OrchestratorSubprocessClient;
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: fakeClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+    };
+    const request = new Request(`http://127.0.0.1:4711${path}`, {
+      method,
+      headers: { host: "127.0.0.1:4711", ...headers },
+      ...(body === undefined ? {} : { body }),
+    });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    return { status: response.status, headers: Object.fromEntries(response.headers.entries()), body: await response.text() };
+  };
+  const get = (path: string, headers: Record<string, string> = {}): Promise<RawResponse> => callHandler(path, "GET", headers);
+
+  test("a bound run serves the events page with the exact schema and no run root", async () => {
+    const response = await get("/v1/runs/events-run/events");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(body).toEqual({
+      schema_version: 1,
+      kind: "events",
+      run_id: "events-run",
+      revision: 3,
+      events: [{ revision: 1, kind: "create_run" }],
+      next_after: null,
+    });
+    expect(response.body).not.toContain("run_root");
+    expect(response.headers["content-type"]).toBe("application/json");
+    expect(calls).toEqual([{ kind: "events", runId: "events-run" }]);
+  });
+
+  test("the query cursor and limit travel as typed command fields", async () => {
+    calls.length = 0;
+    await get("/v1/runs/events-run/events?after=5&limit=2");
+    expect(calls).toEqual([{ kind: "events", runId: "events-run", after: 5, limit: 2 }]);
+    calls.length = 0;
+    await get("/v1/runs/events-run/events?limit=2&after=5");
+    expect(calls).toEqual([{ kind: "events", runId: "events-run", after: 5, limit: 2 }]);
+    calls.length = 0;
+    await get("/v1/runs/events-run/events?after=0");
+    expect(calls).toEqual([{ kind: "events", runId: "events-run", after: 0 }]);
+  });
+
+  test("a typed invalid_cursor is the explicit request-layer 400, never a 502", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "eventsFailure", exitCode: 1, runId: "events-run", runRoot: "/secret/root", reason: "invalid_cursor" },
+    };
+    const response = await get("/v1/runs/events-run/events?after=999");
+    expect(response.status).toBe(400);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_cursor" });
+    expect(response.body).not.toContain("/secret/root");
+  });
+
+  test("other events failures follow the command-result precedent", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "eventsFailure", exitCode: 1, runId: "events-run", runRoot: null, reason: "run_state_invalid" },
+    };
+    const response = await get("/v1/runs/events-run/events");
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      schema_version: 1,
+      kind: "command_result",
+      run_id: "events-run",
+      outcome: "failed",
+      exit_code: 1,
+      reason: "run_state_invalid",
+    });
+  });
+
+  test("an unbound CLI-created run fails closed before any subprocess", async () => {
+    calls.length = 0;
+    const response = await get("/v1/runs/unbound-run/events");
+    expect(response.status).toBe(404);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_not_found" });
+    expect(calls).toEqual([]);
+  });
+
+  test("a removed registry project stays project_unavailable with the binding kept", async () => {
+    const response = await get("/v1/runs/gone-project-run/events");
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "project_unavailable" });
+  });
+
+  test("the events route accepts GET only and no body", async () => {
+    const post = await callHandler("/v1/runs/events-run/events", "POST", { "content-type": "application/json" }, "{}");
+    expect(post.status).toBe(405);
+    const withBody = await callHandler("/v1/runs/events-run/events", "GET", { "content-length": "5" }, "hello");
+    expect(withBody.status).toBe(400);
+  });
+
+  test("the loopback gates apply to the events route unchanged", async () => {
+    const host = await callHandler("/v1/runs/events-run/events", "GET", { host: "evil.example" });
+    expect(host.status).toBe(400);
+    expect(JSON.parse(host.body).reason).toBe("invalid_host");
+    const origin = await callHandler("/v1/runs/events-run/events", "GET", { origin: "http://evil.example" });
+    expect(origin.status).toBe(400);
+    expect(JSON.parse(origin.body).reason).toBe("invalid_origin");
+  });
+
+  test("the events response never carries host paths or canaries", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "events",
+        schemaVersion: 1,
+        runId: "events-run",
+        revision: 2,
+        events: [{ revision: 1, kind: "create_run" }, { revision: 2, kind: "agent_running", execution_index: 1 }],
+        nextAfter: null,
+      },
+    };
+    const response = await get("/v1/runs/events-run/events");
+    expect(response.status).toBe(200);
+    expect(response.body).not.toContain(CANARY);
+    expect(response.body).not.toContain("state");
+    expect(response.body).not.toContain("boundary");
+    expect(response.body).not.toContain(envRoot);
   });
 });

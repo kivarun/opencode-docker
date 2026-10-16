@@ -46,6 +46,12 @@ export type OrchestratorCommand =
       readonly launcherId?: string;
     }
   | { readonly kind: "inspect"; readonly runId: string }
+  | {
+      readonly kind: "events";
+      readonly runId: string;
+      readonly after?: number;
+      readonly limit?: number;
+    }
   | { readonly kind: "resume"; readonly runId: string; readonly launcherId?: string }
   | {
       readonly kind: "resume_plan";
@@ -144,6 +150,8 @@ interface CapturedCommand {
   readonly taskId: string;
   readonly taskFile: string;
   readonly actionId: string;
+  readonly after: number | null;
+  readonly limit: number | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -162,6 +170,14 @@ function expectPositiveIntegerField(record: Record<string, unknown>, key: string
   const value = record[key];
   if (!isPositiveSafeInteger(value)) {
     throw new OrchestratorSubprocessClientError("invalid_command", `${what} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function expectNonNegativeIntegerField(record: Record<string, unknown>, key: string, what: string): number {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new OrchestratorSubprocessClientError("invalid_command", `${what} must be a non-negative safe integer`);
   }
   return value;
 }
@@ -241,6 +257,8 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
     taskId: "",
     taskFile: "",
     actionId: "",
+    after: null,
+    limit: null,
   };
   switch (kind) {
     case "run": {
@@ -287,6 +305,21 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
         throw new OrchestratorSubprocessClientError("invalid_command", "missing field runId on inspect command");
       }
       return { ...empty, kind, runId: expectSafeIdField(command, "runId", "runId") };
+    }
+    case "events": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "after" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on events command");
+        }
+      }
+      if (!Object.hasOwn(command, "runId")) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "missing field runId on events command");
+      }
+      const afterField = optionalField(command, "after");
+      const after = afterField.present ? expectNonNegativeIntegerField({ after: afterField.value }, "after", "after") : null;
+      const limitField = optionalField(command, "limit");
+      const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
+      return { ...empty, kind, runId: expectSafeIdField(command, "runId", "runId"), after, limit };
     }
     case "resume": {
       for (const key of Object.keys(command)) {
@@ -426,6 +459,11 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
     }
     case "inspect":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
+      break;
+    case "events":
+      argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
+      if (captured.after !== null) argv.push("--after", String(captured.after));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       break;
     case "resume":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);

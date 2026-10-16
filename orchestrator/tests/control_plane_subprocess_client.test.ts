@@ -630,3 +630,47 @@ describe("control plane subprocess client: real CLI smoke", () => {
     60000,
   );
 });
+
+// --- events projection -------------------------------------------------------
+
+function eventsScenario(scenario: string): { kind: "events"; runId: string } {
+  return { kind: "events", runId: `sc-${scenario}` };
+}
+
+test("projects the events report with the run root dropped before the HTTP layer", async () => {
+  const client = makeClient();
+  const result = await client.run(eventsScenario("events-report"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "events") throw new Error("unreachable");
+  expect(projection.schemaVersion).toBe(1);
+  expect(projection.runId).toBe("cp-child-run");
+  expect(projection.revision).toBe(5);
+  expect(projection.nextAfter).toBeNull();
+  expect(projection.events).toEqual([
+    { revision: 1, kind: "create_run" },
+    { revision: 2, kind: "start_agent_execution", execution_index: 1, state_id: "coder" },
+  ]);
+  expect(Object.isFrozen(projection)).toBe(true);
+  expect(Object.isFrozen(projection.events)).toBe(true);
+  expect(JSON.stringify(projection)).not.toContain("runRoot");
+  expect(JSON.stringify(projection)).not.toContain("/tmp/cp-child-run");
+}, 15000);
+
+test("an events schemaVersion other than 1 is unsupported_contract", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(eventsScenario("events-report-v2")), "unsupported_contract");
+}, 15000);
+
+test("projects an events failure outcome without classifying the reason", async () => {
+  const client = makeClient();
+  const result = await client.run(eventsScenario("events-failure"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  expect(result.projection.kind).toBe("eventsFailure");
+  if (result.projection.kind !== "eventsFailure") throw new Error("unreachable");
+  expect(result.projection.exitCode).toBe(1);
+  expect(result.projection.reason).toBe("invalid_cursor");
+  expect(result.projection.runRoot).toBeNull();
+}, 15000);

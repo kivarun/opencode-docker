@@ -335,31 +335,52 @@ async function verifyTerminalPublication(
 }
 
 /**
- * Inspects one durable pipeline v2 run and returns the versioned external
- * projection, or exactly one typed failure. Every path is read-only: the
- * run state is loaded through the read-only snapshot store, the pipeline
- * through the trusted loader, and the boundaries through the single
- * authoritative classifiers/restores. No sink, no dispatch, no publisher,
- * no runtime adapter, no Launcher credential, no Docker Helper subprocess,
- * no session, no filesystem repair.
+ * The shared read-only load chain of the external read-only commands:
+ * option validation, the run-root determination, the read-only snapshot
+ * load through the proven store, and the pipeline reload plus durable
+ * identity verification. Both `inspect` and `events` consume exactly this
+ * chain — there is no second read-only loader. A pipeline load error
+ * propagates unchanged (the caller's own classification applies); every
+ * expected boundary failure is the typed read result.
  */
-export async function inspectPipelineV2Run(
-  options: PipelineV2InspectOptions,
-): Promise<PipelineV2InspectOutcome> {
+export type PipelineV2DurableRunRead =
+  | {
+      readonly ok: true;
+      readonly runId: string;
+      readonly runRoot: string;
+      readonly state: PipelineV2RunState;
+      readonly pipeline: ResolvedPipelineV2;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: PipelineV2InspectErrorReason;
+      readonly runId: string;
+      readonly runRoot: string | null;
+    };
+
+/**
+ * Loads one durable pipeline v2 run strictly read-only: a missing run is
+ * never created, a damaged state document is never repaired, and the
+ * pipeline is verified against the durable identity before any use.
+ */
+export async function loadDurablePipelineV2Run(options: {
+  readonly runId: unknown;
+  readonly stateRoot: string;
+}): Promise<PipelineV2DurableRunRead> {
   // 1. The option capture: exactly one read per field, validated before
   //    any path is built. An invalid run id is never echoed.
   const runId = options.runId;
   const stateRoot = options.stateRoot;
   if (typeof runId !== "string") {
-    return failure("", null, "invalid_options");
+    return { ok: false, reason: "invalid_options", runId: "", runRoot: null };
   }
   try {
     expectSafeId(runId, "pipeline v2 inspect run id");
   } catch {
-    return failure("", null, "invalid_options");
+    return { ok: false, reason: "invalid_options", runId: "", runRoot: null };
   }
   if (typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute(stateRoot)) {
-    return failure(runId, null, "invalid_options");
+    return { ok: false, reason: "invalid_options", runId, runRoot: null };
   }
 
   // 2. The run-root determination is a read-only existence check: a
@@ -371,44 +392,71 @@ export async function inspectPipelineV2Run(
   try {
     runRootInfo = await lstat(runRootCandidate);
   } catch {
-    return failure(runId, null, "run_not_found");
+    return { ok: false, reason: "run_not_found", runId, runRoot: null };
   }
   if (!runRootInfo.isDirectory() || runRootInfo.isSymbolicLink()) {
-    return failure(runId, null, "run_not_found");
+    return { ok: false, reason: "run_not_found", runId, runRoot: null };
   }
   let runRoot: string;
   try {
     runRoot = await realpath(runRootCandidate);
   } catch {
-    return failure(runId, runRootCandidate, "run_state_invalid");
+    return { ok: false, reason: "run_state_invalid", runId, runRoot: runRootCandidate };
   }
 
   // 3. The read-only snapshot load through the proven store: a missing or
-  //    damaged state document is a typed inspect failure, never a repair.
+  //    damaged state document is a typed failure, never a repair.
   const store = new PipelineV2RunStateStore({ stateRoot, runId });
   let state: PipelineV2RunState;
   try {
     const loaded = await store.load();
     if (loaded === null) {
-      return failure(runId, runRoot, "run_state_invalid");
+      return { ok: false, reason: "run_state_invalid", runId, runRoot };
     }
     state = loaded;
   } catch {
-    return failure(runId, runRoot, "run_state_invalid");
+    return { ok: false, reason: "run_state_invalid", runId, runRoot };
   }
 
+  // 4. The pipeline is reloaded from the durable bundle root and verified
+  //    against the durable identity; a broken or foreign bundle is a
+  //    pipeline mismatch, never a mutation. An unexpected load failure is
+  //    the honest internal error of the read chain (the validated run
+  //    identity and canonical run root travel with it).
+  let pipeline: ResolvedPipelineV2;
   try {
-    // 4. The pipeline is reloaded from the durable bundle root and
-    //    verified against the durable identity; a broken or foreign
-    //    bundle is a pipeline mismatch, never a mutation.
-    const pipeline = await loadPipelineV2(state.pipeline.bundle_root);
+    pipeline = await loadPipelineV2(state.pipeline.bundle_root);
     const comparison = comparePipelineV2RunIdentity(
       pipelineV2RunPipelineIdentity(pipeline),
       state.pipeline,
     );
     if (comparison.kind === "mismatch") {
-      return failure(runId, runRoot, "pipeline_mismatch");
+      return { ok: false, reason: "pipeline_mismatch", runId, runRoot };
     }
+  } catch {
+    return { ok: false, reason: "internal_error", runId, runRoot };
+  }
+  return { ok: true, runId, runRoot, state, pipeline };
+}
+
+/**
+ * Inspects one durable pipeline v2 run and returns the versioned external
+ * projection, or exactly one typed failure. Every path is read-only: the
+ * run state is loaded through the read-only snapshot store, the pipeline
+ * through the trusted loader, and the boundaries through the single
+ * authoritative classifiers/restores. No sink, no dispatch, no publisher,
+ * no runtime adapter, no Launcher credential, no Docker Helper subprocess,
+ * no session, no filesystem repair.
+ */
+export async function inspectPipelineV2Run(
+  options: PipelineV2InspectOptions,
+): Promise<PipelineV2InspectOutcome> {
+  const read = await loadDurablePipelineV2Run(options);
+  if (!read.ok) {
+    return failure(read.runId, read.runRoot, read.reason);
+  }
+  const { runId, runRoot, state, pipeline } = read;
+  try {
     const boundary = await classifyInspectBoundary(pipeline, state, runRoot);
     if (typeof boundary === "string") {
       return failure(runId, runRoot, boundary);

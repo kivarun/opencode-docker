@@ -96,6 +96,10 @@ import {
   inspectPipelineV2Run,
   type PipelineV2InspectOutcome,
 } from "./pipeline_v2_inspect.ts";
+import {
+  eventsPipelineV2Run,
+  type PipelineV2EventsOutcome,
+} from "./pipeline_v2_events.ts";
 
 /**
  * The per-call seam of the dispatcher. The production default builds one
@@ -117,6 +121,7 @@ export interface CliIo {
   resumePipelineV2PlanningRunPlan: typeof resumePipelineV2PlanningRunPlan;
   respondPipelineV2Wait: typeof respondPipelineV2Wait;
   inspectPipelineV2Run: typeof inspectPipelineV2Run;
+  eventsPipelineV2Run: typeof eventsPipelineV2Run;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
   /**
@@ -150,6 +155,7 @@ function productionCliIo(): CliIo {
     resumePipelineV2PlanningRunPlan,
     respondPipelineV2Wait,
     inspectPipelineV2Run,
+    eventsPipelineV2Run,
     runSmoke,
     runAgentSmoke,
     readTaskFile: (path: string) => readFile(path, "utf8"),
@@ -182,7 +188,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -196,7 +202,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "continue-stage" &&
     command !== "revise-task" &&
     command !== "resume-plan" &&
-    command !== "inspect"
+    command !== "inspect" &&
+    command !== "events"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -243,6 +250,15 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // API exactly once. No SubprocessCliRunner command dependencies and
     // no mutating command deps object are built for it.
     return await runPipelineV2InspectCommand(parsed, io);
+  }
+  if (parsed.kind === "events") {
+    // The read-only pipeline v2 events command: like inspect, it resolves
+    // only the state-root projection (no helper configuration, no
+    // Launcher credential, no auth, no subprocess, no signal
+    // registration, no mutation lock, no durable change) and invokes the
+    // events production API exactly once. No SubprocessCliRunner command
+    // dependencies and no mutating command deps object are built for it.
+    return await runPipelineV2EventsCommand(parsed, io);
   }
   if (parsed.kind === "continue-stage") {
     // The production pipeline v2 continue-stage intervention: the same
@@ -650,6 +666,52 @@ async function runPipelineV2InspectCommand(
   } else {
     io.writeError(
       `orchestrator: inspect failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+/**
+ * The read-only pipeline v2 events command: parse already done. Only the
+ * state-root projection is resolved inside the protected CLI-configuration
+ * boundary; the helper configuration is deliberately NOT resolved because
+ * events need no Launcher credential, no Docker Helper transport, no
+ * mutation lock and no signal lifecycle. Any resolution failure is exit 2
+ * with the usage text and the production API never called. The dispatcher
+ * builds no `SubprocessCliRunner` and no mutating command deps object.
+ */
+async function runPipelineV2EventsCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "events" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2EventsOutcome = await io.eventsPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    after: parsed.after,
+    limit: parsed.limit,
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: events ok (run ${outcome.runId}, revision ${outcome.revision}, events ${outcome.events.length}, next-after ${outcome.nextAfter === null ? "none" : outcome.nextAfter})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: events failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

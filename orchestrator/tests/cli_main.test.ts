@@ -30,6 +30,10 @@ import {
   inspectPipelineV2Run,
   type PipelineV2InspectOutcome,
 } from "../src/pipeline_v2_inspect.ts";
+import {
+  eventsPipelineV2Run,
+  type PipelineV2EventsOutcome,
+} from "../src/pipeline_v2_events.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
@@ -109,6 +113,9 @@ function makeIo(): Recorder {
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],
+    eventsPipelineV2Run: (async () => {
+      throw new Error("fake eventsPipelineV2Run not configured");
+    }) as unknown as CliIo["eventsPipelineV2Run"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake respondPipelineV2Wait not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -3817,6 +3824,97 @@ test("inspect resolver failure is exit 2 with the API never called", async () =>
     return inspectReport();
   }) as unknown as CliIo["inspectPipelineV2Run"];
   const exit = await runCli(["inspect", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
+  expect(exit).toBe(2);
+  expect(called).toBe(0);
+  expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
+  expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
+}, 15000);
+
+// --- events dispatcher -------------------------------------------------------
+
+function eventsReport(overrides: Partial<Extract<PipelineV2EventsOutcome, { ok: true }>> = {}): PipelineV2EventsOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    runRoot: "/state/root/pipeline-runs/run_x",
+    revision: 12,
+    events: [
+      { revision: 1, kind: "create_run" },
+      { revision: 2, kind: "start_agent_execution", execution_index: 1, state_id: "coder" },
+    ],
+    nextAfter: null,
+    ...overrides,
+  } as PipelineV2EventsOutcome;
+}
+
+test("events dispatches exactly once with the parsed pagination and uses no runner", async () => {
+  const rec = makeIo();
+  const eventsCalls: unknown[] = [];
+  rec.io.eventsPipelineV2Run = (async (options: unknown) => {
+    eventsCalls.push(options);
+    return eventsReport();
+  }) as unknown as CliIo["eventsPipelineV2Run"];
+  const exit = await runCli(["events", "--run-id", "run_x", "--config-root", "/cfg", "--after", "4", "--limit", "9"], rec.io);
+  expect(exit).toBe(0);
+  expect(eventsCalls).toHaveLength(1);
+  expect(eventsCalls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root", after: 4, limit: 9 });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: events ok (run run_x, revision 12, events 2, next-after none)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("events reports the default pagination, the next cursor and the failure line", async () => {
+  const rec = makeIo();
+  rec.io.eventsPipelineV2Run = (async () =>
+    eventsReport({ revision: 66, events: [{ revision: 1, kind: "create_run" }], nextAfter: 40 })) as unknown as CliIo["eventsPipelineV2Run"];
+  const exit = await runCli(["events", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.err).toEqual(["orchestrator: events ok (run run_x, revision 66, events 1, next-after 40)"]);
+
+  const failureRec = makeIo();
+  failureRec.io.eventsPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    runRoot: null,
+    reason: "run_not_found",
+  })) as unknown as CliIo["eventsPipelineV2Run"];
+  const failureExit = await runCli(["events", "--run-id", "run_x", "--config-root", "/cfg"], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: events failed (run run_x, reason run_not_found)"]);
+  expect(failureRec.out).toHaveLength(0);
+}, 15000);
+
+test("events JSON mode prints exactly one document and nothing else on stdout", async () => {
+  const rec = makeIo();
+  rec.io.eventsPipelineV2Run = (async () =>
+    eventsReport({ events: [{ revision: 1, kind: "create_run" }] })) as unknown as CliIo["eventsPipelineV2Run"];
+  const exit = await runCli(["events", "--run-id", "run_x", "--config-root", "/cfg", "--json"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  expect(rec.out[0]?.endsWith("\n")).toBe(true);
+  const parsed = JSON.parse(rec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "events", "exitCode", "nextAfter", "ok", "revision", "runId", "runRoot", "schemaVersion",
+  ]);
+  expect(parsed["schemaVersion"]).toBe(1);
+  expect("state" in parsed).toBe(false);
+  expect(rec.err).toHaveLength(0);
+}, 15000);
+
+test("events resolver failure is exit 2 with the API never called", async () => {
+  const rec = makeIo();
+  rec.io.resolveStateRootProjection = () => {
+    throw new Error("no state root configured");
+  };
+  let called = 0;
+  rec.io.eventsPipelineV2Run = (async () => {
+    called += 1;
+    return eventsReport();
+  }) as unknown as CliIo["eventsPipelineV2Run"];
+  const exit = await runCli(["events", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
   expect(exit).toBe(2);
   expect(called).toBe(0);
   expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);

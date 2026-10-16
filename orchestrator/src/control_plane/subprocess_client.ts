@@ -124,6 +124,30 @@ export type OrchestratorInspectProjection =
       readonly reason: string;
     };
 
+/**
+ * The projected result of one `events` call: the exact schemaVersion-1
+ * events projection (the event entries pass through as opaque frozen
+ * JSON — the client never re-classifies or re-orders them; the raw
+ * `runRoot` is dropped before the HTTP layer), or the typed events
+ * failure outcome of the CLI itself.
+ */
+export type OrchestratorEventsProjection =
+  | {
+      readonly kind: "events";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly events: readonly OrchestratorJsonValue[];
+      readonly nextAfter: number | null;
+    }
+  | {
+      readonly kind: "eventsFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly runRoot: string | null;
+      readonly reason: string;
+    };
+
 /** A transport failure: not a durable run outcome, no stderr or body contents. */
 export interface OrchestratorTransportFailure {
   readonly reason: OrchestratorTransportReason;
@@ -139,7 +163,7 @@ export interface OrchestratorTransportFailure {
  * through `inspect` when a run id was known.
  */
 export type OrchestratorCallResult =
-  | { readonly ok: true; readonly projection: OrchestratorRunProjection | OrchestratorInspectProjection }
+  | { readonly ok: true; readonly projection: OrchestratorRunProjection | OrchestratorInspectProjection | OrchestratorEventsProjection }
   | { readonly ok: false; readonly failure: OrchestratorTransportFailure };
 
 export interface OrchestratorCallOptions {
@@ -266,6 +290,17 @@ const INSPECT_REPORT_KEYS = [
   "status",
 ] as const;
 const INSPECT_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+const EVENTS_REPORT_KEYS = [
+  "events",
+  "exitCode",
+  "nextAfter",
+  "ok",
+  "revision",
+  "runId",
+  "runRoot",
+  "schemaVersion",
+] as const;
+const EVENTS_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
 
 function expectExactKeys(document: Record<string, unknown>, expected: readonly string[]): void {
   const actual = Object.keys(document);
@@ -383,6 +418,82 @@ function parseOutcomeDocument(
           status,
           boundary: parsed["boundary"] as OrchestratorJsonObject,
           outputs: deepFreezeValue(parsed["outputs"] as OrchestratorJsonValue[]),
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "events") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, EVENTS_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "events failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const runRootValue = parsed["runRoot"];
+        if (runRootValue !== null && typeof runRootValue !== "string") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "events failure runRoot must be a string or null");
+        }
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "events failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "eventsFailure",
+            exitCode: 1,
+            runId,
+            runRoot: runRootValue as string | null,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, EVENTS_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "events report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "events projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      const runRoot = expectStringField(parsed, "runRoot");
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "events revision must be a positive safe integer");
+      }
+      if (!Array.isArray(parsed["events"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "events must be an array");
+      }
+      const nextAfterValue = parsed["nextAfter"];
+      if (
+        nextAfterValue !== null &&
+        (typeof nextAfterValue !== "number" || !Number.isSafeInteger(nextAfterValue) || nextAfterValue < 0)
+      ) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "events nextAfter must be a non-negative safe integer or null");
+      }
+      // The raw run root never reaches the HTTP layer: the projection
+      // carries the run identity and the events page only.
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "events",
+          schemaVersion: 1,
+          runId,
+          revision: parsed["revision"] as number,
+          events: deepFreezeValue(parsed["events"] as OrchestratorJsonValue[]),
+          nextAfter: nextAfterValue as number | null,
         }),
       };
     } catch (cause) {

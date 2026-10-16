@@ -1305,3 +1305,130 @@ test("usage documents the read-only inspect command and the corrected planning d
   expect(text).toContain("The same resolution applies to 'respond' and to the");
   expect(text).toContain("read-only 'inspect'");
 });
+
+// --- events parser -----------------------------------------------------------
+
+test("events parses the full grammar with both flag forms and defaults", () => {
+  const full = parseCommand("events", [
+    "--run-id", "run-1.2_abc",
+    "--config-root", "/abs/config",
+    "--after", "5",
+    "--limit", "10",
+    "--json",
+  ]);
+  if (full.kind !== "events") {
+    throw new Error("expected events");
+  }
+  expect(full.runId).toBe("run-1.2_abc");
+  expect(full.configRoot).toBe("/abs/config");
+  expect(full.after).toBe(5);
+  expect(full.limit).toBe(10);
+  expect(full.json).toBe(true);
+
+  const equals = parseCommand("events", ["--run-id=rid_x", "--config-root=/cfg", "--after=3", "--limit=7"]);
+  if (equals.kind !== "events") {
+    throw new Error("expected events");
+  }
+  expect(equals.after).toBe(3);
+  expect(equals.limit).toBe(7);
+  expect(equals.json).toBe(false);
+
+  const defaults = parseCommand("events", ["--run-id", "rid", "--config-root", "/cfg"]);
+  if (defaults.kind !== "events") {
+    throw new Error("expected events");
+  }
+  expect(defaults.after).toBe(0);
+  expect(defaults.limit).toBe(100);
+});
+
+test("events accepts after 0 and limit boundaries 1 and 200", () => {
+  const zero = parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--after", "0"]);
+  if (zero.kind !== "events") throw new Error("expected events");
+  expect(zero.after).toBe(0);
+  const one = parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--limit", "1"]);
+  if (one.kind !== "events") throw new Error("expected events");
+  expect(one.limit).toBe(1);
+  const max = parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--limit", "200"]);
+  if (max.kind !== "events") throw new Error("expected events");
+  expect(max.limit).toBe(200);
+});
+
+test("events rejects signed, fractional, exponent, leading-zero, empty and overflowing numerics", () => {
+  const base = ["--run-id", "rid", "--config-root", "/c"];
+  for (const value of ["-1", "+1", "1.5", "1e2", "01", " ", "0x1"]) {
+    expect(() => parseCommand("events", [...base, "--after", value])).toThrow(/--after must be a non-negative decimal integer/);
+    expect(() => parseCommand("events", [...base, "--limit", value])).toThrow(/--limit must be a positive decimal integer/);
+  }
+  expect(() => parseCommand("events", [...base, "--after", ""])).toThrow(/--after requires a value/);
+  expect(() => parseCommand("events", [...base, "--limit", ""])).toThrow(/--limit requires a value/);
+  expect(() => parseCommand("events", [...base, "--after", String(Number.MAX_SAFE_INTEGER + 1)])).toThrow(/--after exceeds the safe integer range/);
+  expect(() => parseCommand("events", [...base, "--limit", String(Number.MAX_SAFE_INTEGER)])).toThrow(/--limit must be a positive safe integer up to 200/);
+  expect(() => parseCommand("events", [...base, "--limit", "201"])).toThrow(/--limit must be a positive safe integer up to 200/);
+});
+
+test("events rejects missing, duplicate and value-less flags", () => {
+  expect(() => parseCommand("events", [])).toThrow(/--run-id SAFE_ID is required for events/);
+  expect(() => parseCommand("events", ["--run-id", "rid"])).toThrow(/--config-root ABS is required for events/);
+  expect(() => parseCommand("events", ["--config-root", "/c"])).toThrow(/--run-id SAFE_ID is required for events/);
+  expect(() => parseCommand("events", ["--run-id", "a", "--run-id", "b", "--config-root", "/c"])).toThrow(
+    /--run-id may be given at most once/,
+  );
+  expect(() => parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--after", "1", "--after", "2"])).toThrow(
+    /--after may be given at most once/,
+  );
+  expect(() => parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--limit", "1", "--limit=2"])).toThrow(
+    /--limit may be given at most once/,
+  );
+  expect(() => parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--after"])).toThrow(
+    /--after requires a value/,
+  );
+  expect(() => parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--json", "--json"])).toThrow(
+    /--json may be given at most once/,
+  );
+  expect(() => parseCommand("events", ["--run-id", "rid", "--config-root", "/c", "--json=1"])).toThrow(
+    /--json does not take a value/,
+  );
+});
+
+test("events rejects every fresh-run, auth, intervention and state-root flag", () => {
+  const base = ["--run-id", "rid", "--config-root", "/c"];
+  const rejected: Array<[string, string]> = [
+    ["--launcher-id", "events does not accept --launcher-id"],
+    ["--pipeline-root", "events does not accept --pipeline-root"],
+    ["--project", "events does not accept --project"],
+    ["--input", "events does not accept --input"],
+    ["--workspace", "no worker is launched by events"],
+    ["--image", "no worker is launched by events"],
+    ["--profile", "no profile is loaded by events"],
+    ["--task", "there is no task input on an events read"],
+    ["--stage-id", "stage selection is operator policy of 'resume-plan'"],
+    ["--initial-budget", "budget selection is operator policy of 'resume-plan'"],
+    ["--wait-index", "wait selection belongs to the response and intervention commands"],
+    ["--action", "it changes nothing and records no response"],
+    ["--additional-iterations", "grants belong to 'continue-stage'"],
+    ["--task-id", "task revisions belong to 'revise-task'"],
+    ["--task-file", "task revisions belong to 'revise-task'"],
+    ["--task-body", "task revisions belong to 'revise-task'"],
+    ["--state-root", "set the ORCHESTRATOR_STATE_ROOT environment variable"],
+    ["--daemon-state-root", "set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable"],
+  ];
+  for (const [flag, message] of rejected) {
+    expect(() => parseCommand("events", [...base, flag, "x"]), `${flag} value form`).toThrow(message);
+    expect(() => parseCommand("events", [...base, `${flag}=x`]), `${flag}= form`).toThrow(message);
+  }
+  expect(() => parseCommand("events", [...base, "--ghost"])).toThrow("unknown argument: --ghost");
+  expect(() => parseCommand("events", [...base, "stray"])).toThrow("unknown argument: stray");
+});
+
+test("usage documents the read-only events command", () => {
+  const text = usage();
+  expect(text).toContain("events       read-only versioned lifecycle events of one durable run");
+  expect(text).toContain("events flags (production pipeline v2, read-only)");
+  expect(text).toContain("--run-id SAFE_ID        the run id of the durable run to read");
+  expect(text).toContain("exclusive durable revision cursor (default 0)");
+  expect(text).toContain("reason 'invalid_cursor'");
+  expect(text).toContain("page limit (default 100, maximum 200)");
+  expect(text).toContain("never an array offset and never process-local state");
+  expect(text).toContain("takes no mutation lock, never");
+  expect(text).toContain("Worker stdout/stderr and durable log capture are not part of this");
+});

@@ -70,6 +70,17 @@ describe("ui model: document classification", () => {
     expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "mystery" }))).toBe("unknown_kind");
     expect(contractReason(() => parseApiDocument({ schema_version: 1 }))).toBe("unknown_kind");
     expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "run", extra: 1, run_id: "r", revision: 1, status: "running", boundary: {}, outputs: [] }))).toBe("invalid_shape");
+    // the browser UI boundary: the events feed stays API/CLI-only until a
+    // dedicated UI increment; the parser keeps failing closed on the kind
+    expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "events", run_id: "r", revision: 1, events: [], next_after: null }))).toBe("unknown_kind");
+  });
+
+  test("the browser UI never references the events endpoint or kind", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const app = await readFile(new URL("../ui/app.js", import.meta.url), "utf8");
+    expect(app.includes("/events")).toBe(false);
+    expect(app.includes('"events"')).toBe(false);
+    expect(app.includes("kind: \"events\"")).toBe(false);
   });
 
   test("the model is frozen and repeated parses are structurally identical", () => {

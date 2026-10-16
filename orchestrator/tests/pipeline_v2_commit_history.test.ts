@@ -31,7 +31,7 @@ import { faultIo } from "./state_io_test_helpers.ts";
 
 const hex = (char: string): string => char.repeat(64);
 
-const IDENTITY: PipelineV2RunPipelineIdentity = {
+export const IDENTITY: PipelineV2RunPipelineIdentity = {
   schema_version: 2,
   bundle_root: "/opt/orchestrator/pipelines/v2",
   execution_snapshot_sha256: hex("a"),
@@ -39,9 +39,9 @@ const IDENTITY: PipelineV2RunPipelineIdentity = {
   max_transitions: 8,
 };
 
-const TICKS = Array.from({ length: 96 }, (_, t) => new Date(Date.UTC(2026, 0, 1, 0, 0, t + 1)));
+export const TICKS = Array.from({ length: 96 }, (_, t) => new Date(Date.UTC(2026, 0, 1, 0, 0, t + 1)));
 
-function apply(commands: PipelineV2RunCommand[]): PipelineV2RunState {
+export function apply(commands: PipelineV2RunCommand[]): PipelineV2RunState {
   let current: PipelineV2RunState | null = null;
   commands.forEach((command, index) => {
     current = reducePipelineV2RunCommand(current, command, TICKS[index % TICKS.length]!);
@@ -86,7 +86,7 @@ function transition(from: string, to: string, executionIndex: number, transition
  * reducer: run → planning → plan-ready → stage → wait → continue-stage →
  * wait → revise-task → plan-ready → stage → terminal success.
  */
-function lifecycleCommands(): PipelineV2RunCommand[] {
+export function lifecycleCommands(): PipelineV2RunCommand[] {
   return [
     { kind: "create_run", runId: "run-history", pipeline: IDENTITY, inputs: [] },
     ...planningLadder("sess-1", "tool-1"),

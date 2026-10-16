@@ -10,6 +10,8 @@
  *
  *   POST /v1/projects/:projectId/runs      fresh run
  *   GET  /v1/runs/:runId                   inspect
+ *   GET  /v1/runs/:runId/events            lifecycle events (read-only,
+ *                                          exclusive revision cursor)
  *   POST /v1/runs/:runId/resume
  *   POST /v1/runs/:runId/resume-plan
  *   POST /v1/runs/:runId/continue-stage
@@ -158,6 +160,7 @@ interface ParsedRoute {
   readonly kind:
     | "fresh_run"
     | "inspect"
+    | "events"
     | "resume"
     | "resume_plan"
     | "continue_stage"
@@ -311,6 +314,16 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
       return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
     }
     return { kind: "inspect", projectId: null, runId };
+  }
+  if (matchesShape(["v1", "runs", "*", "events"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the events route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    return { kind: "events", projectId: null, runId };
   }
   if (matchesShape(["v1", "runs", "*", "*"])) {
     const action = rest[3];
@@ -609,6 +622,69 @@ export function parseRunsDiscoveryQuery(
   return { limit: limit ?? 100, after };
 }
 
+/**
+ * The events query of one run's lifecycle feed: an optional non-negative
+ * safe integer cursor (default 0, the exclusive durable revision cursor)
+ * and an optional positive safe integer limit (default 100, maximum 200).
+ * The raw query string is parsed strictly - no percent-encoding, no bare
+ * keys, no duplicates, no empty values, no sign, fraction or exponent,
+ * and no unknown fields; the order of the fields is semantically
+ * irrelevant.
+ */
+export function parseEventsQuery(
+  search: string,
+): { readonly after: number | null; readonly limit: number | null } | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { after: null, limit: null };
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the events query must not carry encoded components");
+  }
+  let after: number | null = null;
+  let limit: number | null = null;
+  for (const part of search.split("&")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) {
+      return new ControlPlaneHttpRequestError("invalid_request", "every events query field must carry exactly one value");
+    }
+    const key = part.slice(0, separator);
+    const value = part.slice(separator + 1);
+    if (key === "after") {
+      if (after !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the events query fields must be unique");
+      }
+      if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the events query after must be a non-negative safe integer");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the events query after must be a non-negative safe integer");
+      }
+      after = parsed;
+      continue;
+    }
+    if (key === "limit") {
+      if (limit !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the events query fields must be unique");
+      }
+      if (!/^[1-9][0-9]*$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the events query limit must be a positive safe integer");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed > 200) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the events query limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      continue;
+    }
+    return new ControlPlaneHttpRequestError("invalid_request", "the events query carries an unknown field");
+  }
+  return { after, limit };
+}
+
 /** The projects discovery projection: declaration-order ids only. */
 export interface ProjectsDiscoveryProjection {
   readonly schema_version: 1;
@@ -707,7 +783,7 @@ export function projectControlPlaneCommandResult(
     return { layer: "transport", reason: result.failure.reason };
   }
   const projection = result.projection;
-  if (projection.kind === "inspect" || projection.kind === "inspectFailure") {
+  if (projection.kind === "inspect" || projection.kind === "inspectFailure" || projection.kind === "events" || projection.kind === "eventsFailure") {
     return { layer: "transport", reason: "internal_error" };
   }
   if (projection.kind === "success") {
@@ -780,8 +856,60 @@ export function projectControlPlaneInspect(
   };
 }
 
+/** The versioned events projection of one run's lifecycle feed. */
+export interface EventsProjection {
+  readonly schema_version: 1;
+  readonly kind: "events";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly events: readonly unknown[];
+  readonly next_after: number | null;
+}
+
+/**
+ * The one projection builder for a verified schemaVersion-1 events
+ * projection: the event entries are copied without any new
+ * classification and the run root is already dropped by the client. A
+ * typed `invalid_cursor` failure is the one explicit events-layer
+ * mapping: the request-layer 400 envelope, never a 502 transport
+ * failure; every other events failure follows the inspect precedent (a
+ * correctly received failed outcome as a 200 command result).
+ */
+export function projectControlPlaneEvents(
+  result: OrchestratorCallResult,
+): EventsProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "eventsFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "events" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "events",
+    run_id: projection.runId,
+    revision: projection.revision,
+    events: projection.events,
+    next_after: projection.nextAfter,
+  };
+}
+
 function projectionResponse(
-  projection: CommandOutcomeProjection | RunProjection | ProjectsDiscoveryProjection | RunsDiscoveryProjection | ControlPlaneHttpFailure,
+  projection: CommandOutcomeProjection | RunProjection | ProjectsDiscoveryProjection | RunsDiscoveryProjection | EventsProjection | ControlPlaneHttpFailure,
 ): Response {
   if ("layer" in projection && "reason" in projection && !("kind" in projection)) {
     return failureResponse(projection as ControlPlaneHttpFailure);
@@ -879,7 +1007,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
     if (parsed instanceof ControlPlaneHttpRequestError) {
       return respondUi(requestFailure(parsed.reason));
     }
-    if (parsed.kind !== "projects" && parsed.kind !== "runs" && url.search !== "") {
+    if (parsed.kind !== "projects" && parsed.kind !== "runs" && parsed.kind !== "events" && url.search !== "") {
       return respondUi(requestFailure("invalid_path"));
     }
     if (request.method === "POST") {
@@ -905,7 +1033,9 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       bodyText = body.text;
     }
     return await dispatchControlPlaneRoute(
-      parsed.kind === "projects" || parsed.kind === "runs" ? { ...deps, discoveryQuery: url.search } : deps,
+      parsed.kind === "projects" || parsed.kind === "runs" || parsed.kind === "events"
+        ? { ...deps, discoveryQuery: url.search }
+        : deps,
       parsed,
       bodyText,
     );
@@ -959,6 +1089,20 @@ async function dispatchControlPlaneRoute(
     case "inspect": {
       const result = await deps.client.run({ kind: "inspect", runId });
       return projectionResponse(projectControlPlaneInspect(result));
+    }
+    case "events": {
+      const query = parseEventsQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "events",
+        runId,
+        ...(query.after === null ? {} : { after: query.after }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneEvents(result));
     }
     case "resume": {
       parseEmptyBody(parseJsonBody(bodyText));

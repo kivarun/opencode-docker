@@ -90,6 +90,15 @@ export interface ParsedPipelineInspectArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineEventsArgs {
+  readonly kind: "events";
+  readonly runId: string;
+  readonly configRoot: string;
+  readonly after: number;
+  readonly limit: number;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
@@ -99,7 +108,8 @@ export type ParsedCommand =
   | ParsedPipelineContinueStageArgs
   | ParsedPipelineReviseTaskArgs
   | ParsedPipelineResumePlanArgs
-  | ParsedPipelineInspectArgs;
+  | ParsedPipelineInspectArgs
+  | ParsedPipelineEventsArgs;
 
 export function usage(): string {
   return [
@@ -127,6 +137,10 @@ export function usage(): string {
     "               no Launcher credential, no Docker Helper call and no durable",
     "               change - prints the run status, its boundary (the one safe",
     "               next mutating command) and the stable run-output projection",
+    "  events       read-only versioned lifecycle events of one durable run: the",
+    "               schema-v8 commit history projected as public event schema 1",
+    "               with an exclusive revision cursor - no worker, no Launcher",
+    "               credential, no mutation lock and no durable change",
     "  respond      production pipeline v2 wait response: record the user's answer to",
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
@@ -402,6 +416,36 @@ export function usage(): string {
   "  fast with reason 'run_busy' and zero durable effects. list-runs,",
   "  event/log streams and idempotency keys are not part of this command.",
   "",
+  "events flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID        the run id of the durable run to read; required; a",
+  "                          safe identifier (letters, digits, '_', '.', '-', at most",
+  "                          128 characters)",
+  "  --config-root PATH      non-empty absolute configuration root; required by the",
+  "                          shared command grammar but not used by events (no",
+  "                          profile is loaded, no Launcher credential is read)",
+  "  --after N               exclusive durable revision cursor (default 0): an event",
+  "                          is returned only when its commit revision is greater",
+  "                          than N; a cursor beyond the observed revision fails with",
+  "                          reason 'invalid_cursor'",
+  "  --limit N               page limit (default 100, maximum 200), applied after",
+  "                          the exclusive filter; next-after carries the last",
+  "                          returned revision only when further events exist",
+  "  --json                  print exactly one JSON versioned events document on",
+  "                          stdout (no progress lines); errors and diagnostics go",
+  "                          to stderr; the exit code is 1 only when the events read",
+  "                          itself could not be performed, never because of the",
+  "                          run's own state.",
+  "",
+  "  events project the durable schema-v8 commit history - the reducer-owned",
+  "  ordered provenance of every applied command - as the versioned public",
+  "  event schema 1: one entry per revision with its closed kind and the",
+  "  minimal content-free references. The cursor is an exclusive durable",
+  "  revision cursor, never an array offset and never process-local state;",
+  "  events reads one atomic state snapshot, takes no mutation lock, never",
+  "  writes, and a repeated read over an unchanged run is byte-identical.",
+  "  Worker stdout/stderr and durable log capture are not part of this",
+  "  command.",
+  "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
     "    <state-root>/pipeline-runs/<run-id>/state.json",
@@ -674,8 +718,156 @@ function parseInspectArgs(argv: string[]): ParsedPipelineInspectArgs {
   };
 }
 
+/**
+ * Parses the read-only pipeline v2 events command. The user-facing
+ * contract: `--run-id` (safe-id validated) and `--config-root`
+ * (non-empty absolute path) are required singletons; `--after`
+ * (non-negative decimal safe integer, default 0 — the exclusive durable
+ * revision cursor) and `--limit` (positive decimal safe integer, default
+ * 100, maximum 200) are optional singletons; `--json` is an optional
+ * singleton. Events performs no Launcher authentication, no Docker
+ * Helper transport, no mutation lock and no durable change: it accepts
+ * no `--launcher-id`, no fresh-run flag, no intervention flag, no
+ * state-root flag and no internal index/digest flag — every unknown flag
+ * or positional argument is rejected. The events projection comes only
+ * from the durable schema-v8 commit history.
+ */
+function parseEventsArgs(argv: string[]): ParsedPipelineEventsArgs {
+  let runId: string | null = null;
+  let configRoot: string | null = null;
+  let after: number | null = null;
+  let limit: number | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--after" || arg.startsWith("--after=")) {
+      const { value, next } = parseValue(argv, i, "--after");
+      requireSingleton(after, "--after");
+      after = parseNonNegativeDecimalSafeInteger(value, "--after");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > 200) {
+        throw new Error("--limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      throw new Error(
+        "events does not accept --launcher-id; it performs no Launcher authentication",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "events does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error("events does not accept --project; the run-owned project copy already exists");
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error("events does not accept --input; the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error("events does not accept --workspace; no worker is launched by events");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("events does not accept --image; no worker is launched by events");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error("events does not accept --profile; no profile is loaded by events");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("events does not accept --task; there is no task input on an events read");
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      throw new Error(
+        "events does not accept --stage-id; stage selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      throw new Error(
+        "events does not accept --initial-budget; budget selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      throw new Error(
+        "events does not accept --wait-index; wait selection belongs to the response and intervention commands",
+      );
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "events does not accept --action; it changes nothing and records no response",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "events does not accept --additional-iterations; grants belong to 'continue-stage'",
+      );
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      throw new Error("events does not accept --task-id; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      throw new Error("events does not accept --task-file; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error("events does not accept --task-body; task revisions belong to 'revise-task'");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "events does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "events does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for events");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for events");
+  }
+  return {
+    kind: "events",
+    runId,
+    configRoot,
+    after: after ?? 0,
+    limit: limit ?? 100,
+    json,
+  };
+}
+
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -698,6 +890,9 @@ export function parseCommand(
   }
   if (kind === "inspect") {
     return parseInspectArgs(argv);
+  }
+  if (kind === "events") {
+    return parseEventsArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;
@@ -1064,6 +1259,25 @@ function parsePositiveDecimalSafeInteger(value: string, flag: string): number {
   if (!/^[1-9][0-9]*$/.test(value)) {
     throw new Error(
       `${flag} must be a positive decimal integer without sign, leading zeros, fraction, exponent or whitespace`,
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${flag} exceeds the safe integer range`);
+  }
+  return parsed;
+}
+
+/**
+ * Parses one non-negative decimal safe integer (zero allowed): no sign,
+ * no leading zeros, no fraction, no exponent, whose numeric value is a
+ * safe integer. The parser rejects everything else before any filesystem
+ * access.
+ */
+function parseNonNegativeDecimalSafeInteger(value: string, flag: string): number {
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(
+      `${flag} must be a non-negative decimal integer without sign, leading zeros, fraction, exponent or whitespace`,
     );
   }
   const parsed = Number(value);

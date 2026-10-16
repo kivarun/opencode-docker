@@ -228,11 +228,10 @@ orchestrator run \
   v7 migration: the exact v7 dispatch order of the two ambiguity clusters
   is unrecoverable, so v7 documents are rejected with the established
   typed legacy message and never rewritten. The provenance is an internal
-  durable-state contract only: no public events API, no worker-log
-  capture, and no inspect/HTTP/UI exposure exist yet — a read-only events
-  endpoint over this ledger is a separate future increment, and worker
-  logs remain ephemeral/unwired (docker-helper operation logs die with the
-  daemon and mix worker stderr into one stream).
+  durable-state contract: the read-only external exposure is the versioned
+  lifecycle events API (see "The read-only lifecycle events API" below) —
+  worker logs remain ephemeral/unwired (docker-helper operation logs die
+  with the daemon and mix worker stderr into one stream).
 - The pipeline's agent states select the profiles; the worker image, the
   OpenCode configuration, and the exact environment bindings belong to those
   profiles. The user never sets mounts, container paths, Session
@@ -519,8 +518,73 @@ orchestrator inspect --run-id SAFE_ID --config-root ABS [--json]
   kernel-owned run mutation lock (see below); `inspect` stays read-only
   alongside them — the result may reflect the old or the new atomic
   revision, but it is always entirely loader-valid and never mutated.
-  list-runs, idempotency keys, event/log streams and an HTTP API remain
-  out of scope.
+  list-runs, idempotency keys and worker-log capture remain out of scope;
+  the durable lifecycle events feed is the separate `orchestrator events`
+  API documented below.
+
+## The read-only lifecycle events API (`orchestrator events`, GET /v1/runs/:runId/events)
+
+The schema-v8 `commit_history` is exported as the stable public event
+schema 1 through three read-only surfaces: the CLI, the control-plane
+subprocess substrate, and the loopback HTTP service. The Browser UI is
+deliberately not connected yet — the wire contract stabilizes first.
+
+- Single projection owner: `orchestrator/src/pipeline_v2_events.ts`
+  accepts only a loader-validated schema-v8 state and the pagination
+  request; it reads only `commit_history`, never reconstructs order from
+  executions/transitions/controllers, and returns a deep-frozen page
+  `{revision, events, nextAfter}`. The public event entry union IS the
+  provenance union passed through verbatim: `{revision, kind}` plus the
+  minimal content-free references (`execution_index`, `state_id`,
+  `transition_index`, `wait_index`, `generation_index`,
+  `iteration_index`, `task_index`, `plan_index`, `grant_index`). History
+  order is preserved; nothing is normalized, reordered or merged; there
+  are no timestamps and no derived descriptions.
+- Cursor contract: `after` is an exclusive durable revision cursor
+  (default 0 starts at revision 1). An event is included iff
+  `event.revision > after`; `limit` (default 100, maximum 200) applies
+  after the filter. `after === state.revision` succeeds with an empty
+  page; `after > state.revision` is the typed `invalid_cursor` failure
+  with no partial response. The cursor is never an array offset and
+  never depends on process memory: one call reads one atomic snapshot
+  (old-complete or new-complete, never partial), and a restart
+  reproduces the same cursors and the same event bytes.
+- CLI: `orchestrator events --run-id SAFE_ID --config-root ABS [--after
+  N] [--limit N] [--json]`. Success carries exactly `ok`/`exitCode`/
+  `schemaVersion: 1`/`runId`/`runRoot`/`revision`/`events`/`nextAfter`;
+  `nextAfter` is the last returned event's revision only when further
+  events exist in the snapshot, else `null`. Failures carry
+  `ok`/`exitCode: 1`/`runId`/`runRoot: string|null`/`reason` over the
+  closed events vocabulary (the inspect vocabulary plus
+  `invalid_cursor`); a legacy schema-v7 document is typed
+  `run_state_invalid` with no synthetic history and no rewrite. Exit 2
+  stays the parser/usage failure. Human mode prints one content-free
+  stderr line with the run id, the observed revision, the event count
+  and the next cursor.
+- HTTP: `GET /v1/runs/:runId/events[?after=N&limit=M]` always flows
+  `runId → durable binding → frozen registry project → subprocess
+  client`; the caller never passes a project id or a config root, an
+  unbound CLI-created run fails closed `binding_not_found`, and a
+  removed project stays `project_unavailable`. The query parser accepts
+  only `after` and `limit` with the strict numeric grammar; the success
+  body is exactly `{schema_version: 1, kind: "events", run_id, revision,
+  events, next_after}` (snake_case, no `run_root`, no raw state, no host
+  paths). A typed `invalid_cursor` maps explicitly to the request-layer
+  400 envelope — never a 502 transport failure; every other events
+  failure follows the inspect precedent (a correctly received failed
+  outcome as a 200 command result).
+- Read-only guarantees: no Docker Helper auth, no mutation lock, no
+  durable change and no filesystem write on any path; the run tree is
+  byte-identical before and after a read, a repeated read over an
+  unchanged run is byte-identical, and every durable window (in-flight,
+  settled-but-unbound, committed transition, waiting, partial
+  intervention, accepted plan, failure, terminal, publication,
+  succeeded/failed, durability-unknown adopted candidate) ends its feed
+  at the exact current revision without starting a recovery.
+- This is the durable commit provenance exposed, not worker logs: worker
+  stdout/stderr remain ephemeral and uncaptured, and durable log capture
+  stays a separate future increment. The Browser UI timeline over the
+  events feed is likewise a separate later increment.
 
 ## The production continue-stage runner API (`orchestrator continue-stage`)
 
