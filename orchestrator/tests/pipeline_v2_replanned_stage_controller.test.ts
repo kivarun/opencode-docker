@@ -1890,8 +1890,12 @@ describe("openPipelineV2ReplannedStage", () => {
           initialBudget: 2,
         }),
       );
+      // Schema v8: the forged extra generation and its closed projection
+      // contradict the durable commit ledger (no closure entries were
+      // dispatched), so the loader rejects the document and the close
+      // controller surfaces its loader-typed refusal.
       expect(cause).toBeInstanceOf(PipelineV2ReplannedGenerationControllerError);
-      expect((cause as PipelineV2ReplannedGenerationControllerError).reason).toBe("lifecycle_conflict");
+      expect((cause as PipelineV2ReplannedGenerationControllerError).reason).toBe("invalid_state");
       expect(ensureCalls).toBe(0);
     } finally {
       await disposeRun(ctx.fixture);

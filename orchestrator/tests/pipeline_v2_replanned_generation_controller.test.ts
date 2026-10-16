@@ -1023,8 +1023,12 @@ describe("closePipelineV2ReplannedGeneration", () => {
       const cause = await catchClose(() =>
         closePipelineV2ReplannedGeneration({ sink: hostile, intent: wrongReason.intent, compiledPlan: wrongReason.compiledPlan }),
       );
-      const error = expectCloseError(cause, "lifecycle_conflict");
-      expect(error.message).toContain("not the exact replanned closure of the target wait");
+      // Schema v8: the forged record contradicts the durable commit
+      // ledger (the replanned closure entry), so the loader rejects the
+      // document before the controller's own targeted check; the
+      // controller surfaces the loader-typed refusal through its own gate.
+      const error = expectCloseError(cause, "invalid_state");
+      expect(error.message).toContain("requires a durable pipeline v2 run state document");
     } finally {
       await disposeRun(wrongReason.fixture);
     }
@@ -1060,8 +1064,11 @@ describe("closePipelineV2ReplannedGeneration", () => {
       const cause = await catchClose(() =>
         closePipelineV2ReplannedGeneration({ sink: hostile, intent: wrongReason.intent, compiledPlan: wrongReason.compiledPlan }),
       );
-      const error = expectCloseError(cause, "lifecycle_conflict");
-      expect(error.message).toContain("the generation closure is not the exact replanned closure");
+      // Schema v8: the forged generation closure contradicts the ledger's
+      // dispatch order, so the loader rejects the document; the controller
+      // surfaces the loader-typed refusal through its own gate.
+      const error = expectCloseError(cause, "invalid_state");
+      expect(error.message).toContain("requires a durable pipeline v2 run state document");
     } finally {
       await disposeRun(wrongReason.fixture);
     }
@@ -1982,8 +1989,11 @@ describe("closePipelineV2ReplannedGeneration", () => {
       const cause = await catchClose(() =>
         closePipelineV2ReplannedGeneration({ sink: hostile, intent: closedNewGeneration.intent, compiledPlan: closedNewGeneration.compiledPlan }),
       );
-      const error = expectCloseError(cause, "lifecycle_conflict");
-      expect(error.message).toContain("the target iteration closure is not the exact replanned closure");
+      // Schema v8: the forged closed generation contradicts the ledger
+      // (no closure entry was dispatched), so the loader rejects the
+      // document and the controller surfaces its gate.
+      const error = expectCloseError(cause, "invalid_state");
+      expect(error.message).toContain("requires a durable pipeline v2 run state document");
       expect(first).toBeDefined();
     } finally {
       await disposeRun(closedNewGeneration.fixture);
@@ -2026,8 +2036,10 @@ describe("closePipelineV2ReplannedGeneration", () => {
       const cause = await catchClose(() =>
         closePipelineV2ReplannedGeneration({ sink: hostile, intent: closedIteration.intent, compiledPlan: closedIteration.compiledPlan }),
       );
-      const error3 = expectCloseError(cause, "lifecycle_conflict");
-      expect(error3.message).toContain("the new generation's first iteration is not open");
+      // Schema v8: the forged closed iteration contradicts the ledger's
+      // open-iteration claim, so the loader rejects the document.
+      const error3 = expectCloseError(cause, "invalid_state");
+      expect(error3.message).toContain("requires a durable pipeline v2 run state document");
     } finally {
       await disposeRun(closedIteration.fixture);
     }
@@ -2177,8 +2189,10 @@ describe("closePipelineV2ReplannedGeneration", () => {
       const cause = await catchClose(() =>
         closePipelineV2ReplannedGeneration({ sink: hostile, intent: ctx.intent, compiledPlan: ctx.compiledPlan }),
       );
-      const error = expectCloseError(cause, "lifecycle_conflict");
-      expect(error.message).toContain("the target iteration closure is not the exact replanned closure");
+      // Schema v8: the forged extra generation breaks the ledger/journal
+      // correspondence, so the loader rejects the document.
+      const error = expectCloseError(cause, "invalid_state");
+      expect(error.message).toContain("requires a durable pipeline v2 run state document");
     } finally {
       await disposeRun(ctx.fixture);
     }

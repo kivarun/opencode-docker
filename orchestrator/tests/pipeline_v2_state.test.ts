@@ -299,7 +299,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver();
     playSuccessRun(driver);
     const state = driver.current as PipelineV2RunState;
-    expect(state.schema_version).toBe(7);
+    expect(state.schema_version).toBe(8);
     expect(state.revision).toBe(23);
     expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
@@ -320,7 +320,7 @@ describe("pipeline v2 run state schema v6", () => {
       { index: 0, from: "check", outcome: "approved", to: "ship", execution_index: 2 },
       { index: 0, from: "ship", outcome: "completed", to: "done", execution_index: 3 },
     ]);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(7);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(8);
   });
 
   test("every accepted command grows the revision by exactly one and refreshes updated_at", () => {
@@ -1366,36 +1366,42 @@ describe("pipeline v2 run state schema v6", () => {
     }, 'execution 1 records a failed session cleanup, so the run must finalize as status "cleanup_failed"');
   });
 
-  test("parse rejects schema versions 1, 2, 3, 4 and 5 without any migration", () => {
+  test("parse rejects schema versions 1, 2, 3, 4, 5, 6 and 7 without any migration", () => {
     expect(() => parsePipelineV2RunState('{"schema_version":1}')).toThrow(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v1 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":2}')).toThrow(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 2 })).toThrow(
-      "not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
+      "not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":3}')).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 3 })).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":4}')).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 4 })).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":5}')).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 5 })).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
     );
-    expect(() => parsePipelineV2RunState('{"schema_version":8}')).toThrow(
-      "pipeline v2 run state has schema_version 8, expected 7",
+    expect(() => parsePipelineV2RunState('{"schema_version":6}')).toThrow(
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v6 migration exists)",
+    );
+    expect(() => parsePipelineV2RunState('{"schema_version":7}')).toThrow(
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v7 migration exists)",
+    );
+    expect(() => parsePipelineV2RunState('{"schema_version":10}')).toThrow(
+      "pipeline v2 run state has schema_version 10, expected 8",
     );
   });
 
@@ -1430,7 +1436,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v3Document);
     expect(() => parsePipelineV2RunState(v3Document)).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v3Document);
     await rm(root, { recursive: true, force: true });
@@ -1456,7 +1462,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v4Document);
     expect(() => parsePipelineV2RunState(v4Document)).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v4Document);
     await rm(root, { recursive: true, force: true });
@@ -1489,7 +1495,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v5Document);
     expect(() => parsePipelineV2RunState(v5Document)).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v5Document);
     await rm(root, { recursive: true, force: true });
@@ -4199,12 +4205,13 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     playStageRun(driver);
     const raw = JSON.stringify(driver.current);
     const exact = {
-      1: "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v1 migration exists)",
-      2: "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
-      3: "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
-      4: "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
-      5: "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
-      6: "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v6 migration exists)",
+      1: "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v1 migration exists)",
+      2: "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
+      3: "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
+      4: "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
+      5: "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
+      6: "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v6 migration exists)",
+      7: "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v7 migration exists)",
     };
     for (const [version, message] of Object.entries(exact)) {
       const draft = JSON.parse(raw) as Record<string, unknown>;
@@ -5308,6 +5315,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     expect(Object.keys(namespace).sort()).toEqual([
       "PIPELINE_V2_AGENT_EXECUTION_FAILURE_REASONS",
       "PIPELINE_V2_AGENT_EXECUTION_PHASES",
+      "PIPELINE_V2_COMMIT_PROVENANCE_KINDS",
       "PIPELINE_V2_DECISION_EXECUTION_FAILURE_REASONS",
       "PIPELINE_V2_DECISION_EXECUTION_PHASES",
       "PIPELINE_V2_EXECUTION_ROLES",

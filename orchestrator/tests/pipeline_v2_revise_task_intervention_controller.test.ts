@@ -700,7 +700,13 @@ describe("applyPipelineV2ReviseTaskIntervention", () => {
       ]);
       expect(Object.isFrozen(result)).toBe(true);
       expect(Object.isFrozen(result.state)).toBe(true);
-      const serialized = JSON.stringify(result);
+      // The commit provenance ledger (schema v8) legitimately carries its
+      // own `kind` fields; the discriminator canary ban applies to
+      // everything outside it.
+      const serialized = JSON.stringify({
+        ...result,
+        state: { ...result.state, commit_history: undefined },
+      });
       expect(serialized).not.toContain("Body A");
       expect(serialized).not.toContain('"kind"');
       expect(serialized).not.toContain(ctx.fixture.runRoot);

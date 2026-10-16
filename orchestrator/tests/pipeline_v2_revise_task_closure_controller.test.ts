@@ -683,7 +683,14 @@ describe("applyPipelineV2ReviseTaskClosure", () => {
       expect(Object.isFrozen(result)).toBe(true);
       expect(Object.isFrozen(result.state)).toBe(true);
       expect(JSON.stringify(result)).not.toContain("Body A");
-      expect(JSON.stringify(result)).not.toContain('"kind"');
+      // The commit provenance ledger (schema v8) legitimately carries its
+      // own `kind` fields; the discriminator canary ban applies to
+      // everything outside it.
+      const withoutLedger = {
+        ...result,
+        state: { ...result.state, commit_history: undefined },
+      };
+      expect(JSON.stringify(withoutLedger)).not.toContain('"kind"');
     } finally {
       await disposeRun(ctx.fixture);
     }

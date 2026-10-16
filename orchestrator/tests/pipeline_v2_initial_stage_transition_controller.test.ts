@@ -697,9 +697,13 @@ describe("openPipelineV2InitialStageTransition", () => {
       });
       const commandsBefore = ctx.recording.commands.length;
       const cause = await callTransition(ctx, hostile).catch((error) => error);
+      // Schema v8: removing the generation record contradicts the
+      // durable commit ledger (the opened-generation entry), so the
+      // loader rejects the document and the controller surfaces its
+      // loader-typed refusal; the zero-dispatch boundary is unchanged.
       const error = expectTransitionError(cause);
-      expect(error.reason).toBe("lifecycle_conflict");
-      expect(error.message).toBe("the initial stage transition requires the opened generation of the selected stage");
+      expect(error.reason).toBe("invalid_state");
+      expect(error.message).toContain("the durable run state is missing or not a valid pipeline v2 run state");
       expect(ctx.recording.commands.slice(commandsBefore)).toEqual([]);
     } finally {
       await rm(ctx.fixture.root, { recursive: true, force: true });

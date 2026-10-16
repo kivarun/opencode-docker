@@ -1601,7 +1601,11 @@ test("43. a generation bound to a template the compiled pipeline does not declar
       generations: unknown[];
     };
     // a loader-valid plan revision accepted by the settled planning
-    // execution, plus a generation bound to an undeclared template
+    // execution, plus a generation bound to an undeclared template. The
+    // commit provenance ledger (schema v8) claims both records at their
+    // reducer-valid positions: the plan acceptance directly after the
+    // planning execution's cleanup (origin 1, boundary 0), the generation
+    // directly after the stage transition (anchor 1).
     draft.plan_revisions = [
       { index: 1, revision: 1, sha256: "a".repeat(64), previous_sha256: null, origin_execution: 1 },
     ];
@@ -1618,6 +1622,32 @@ test("43. a generation bound to a template the compiled pipeline does not declar
         iterations: [],
       },
     ];
+    {
+      const history = draft.commit_history as Array<Record<string, unknown>>;
+      const cleanupPosition = history.findIndex(
+        (entry) => entry.kind === "agent_cleanup_completed" && entry.execution_index === 1,
+      );
+      const transitionPosition = history.findIndex(
+        (entry) => entry.kind === "transition_committed" && entry.execution_index === 1,
+      );
+      if (cleanupPosition < 0 || transitionPosition < 0 || transitionPosition < cleanupPosition) {
+        throw new Error("expected the planning cleanup before the stage transition");
+      }
+      history.splice(cleanupPosition + 1, 0, {
+        revision: 0,
+        kind: "plan_revision_accepted",
+        plan_index: 1,
+      });
+      history.splice(transitionPosition + 2, 0, {
+        revision: 0,
+        kind: "stage_generation_opened",
+        generation_index: 1,
+      });
+      history.forEach((entry, position) => {
+        entry.revision = position + 1;
+      });
+      draft.revision = history.length;
+    }
     expectRestoreError(
       await restorePipelineV2RuntimeContext(base.pipeline, draft, base.runRoot).catch((error) => error),
       "pipeline_mismatch",

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { loadPipelineV2, type ResolvedPipelineV2 } from "../src/pipeline_v2.ts";
 import {
   parsePipelineV2RunState,
+  reducePipelineV2RunCommand,
   validatePipelineV2RunState,
   type PipelineV2RunCommand,
   type PipelineV2RunInputState,
@@ -2629,7 +2630,24 @@ test("17. the anchored refusals: no-commit-marker evidence, incoherent target le
   // so the not-last branch is pure defense-in-depth.
   const fixtureB = await setupReviseBoundary();
   try {
-    const record = fixtureB.harness.recording.snapshot as PipelineV2RunState;
+    // Schema v8: the ambiguous-target state is forged at the settled-unbound
+    // planning boundary (the reducer accepts two same-origin plan records
+    // there), replayed from the recorded commands so the commit provenance
+    // ledger stays coherent; the waiting-boundary snapshot cannot carry a
+    // second plan claim at all.
+    const midCommands = fixtureB.harness.recording.commands;
+    const acceptIndex = midCommands.findIndex((command) => command.kind === "plan_revision_accepted");
+    if (acceptIndex < 0) {
+      throw new Error("expected the recorded plan acceptance");
+    }
+    const midState = midCommands
+      .slice(0, acceptIndex + 1)
+      .reduce<PipelineV2RunState | null>(
+        (current, command, index) =>
+          reducePipelineV2RunCommand(current, command, new Date(Date.UTC(2026, 0, 1, 0, 0, index + 1))),
+        null,
+      ) as PipelineV2RunState;
+    const record = midState;
     const forged = JSON.parse(JSON.stringify(record)) as Record<string, unknown>;
     const plans = forged["plan_revisions"] as Array<Record<string, unknown>>;
     plans.push({
@@ -2639,6 +2657,14 @@ test("17. the anchored refusals: no-commit-marker evidence, incoherent target le
       previous_sha256: fixtureB.plan1.sha256,
       origin_execution: 1,
     });
+    // Schema v8: the forged second plan record needs its own commit
+    // provenance claim at the same replayed boundary (both acceptances
+    // name origin execution 1 at the settled-unbound planning boundary),
+    // so the document stays loader-coherent and the construction layer's
+    // own ambiguity refusal stays reachable.
+    const forgedHistory = forged["commit_history"] as Array<Record<string, unknown>>;
+    forgedHistory.push({ revision: forgedHistory.length + 1, kind: "plan_revision_accepted", plan_index: 2 });
+    forged["revision"] = forgedHistory.length;
     validatePipelineV2RunState(forged);
     const { ops, calls } = recordingOps();
     const cause = await constructPipelineV2RunPlanCandidateFromProposalInternal(

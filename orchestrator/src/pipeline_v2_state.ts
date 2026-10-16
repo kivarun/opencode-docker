@@ -117,7 +117,7 @@ import {
   isPositiveSafeInteger,
 } from "./pipeline_v2_scalar.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 7;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 8;
 
 /** The closed execution-role vocabulary fixed on every execution at start. */
 export const PIPELINE_V2_EXECUTION_ROLES = ["planning", "control", "stage"] as const;
@@ -568,7 +568,7 @@ export type PipelineDecisionStateRecord =
     };
 
 export interface PipelineV2RunState {
-  schema_version: 7;
+  schema_version: 8;
   revision: number;
   run_id: string;
   status: PipelineV2RunStatus;
@@ -591,6 +591,16 @@ export interface PipelineV2RunState {
   plan_revisions: PipelineV2PlanRevisionState[];
   /** The append-only iteration grant ledger (schema v7). */
   grants: PipelineV2IterationGrantState[];
+  /**
+   * The authoritative commit provenance ledger (schema v8): exactly one
+   * entry per durable revision, appended by the reducer itself in the same
+   * atomic snapshot. `commit_history[i]` names the command kind (plus its
+   * minimal content-free references) that produced revision `i + 1`; the
+   * ledger is the single durable owner of the dispatch order and is never
+   * rewritten. The loader verifies it against the projection as one
+   * coherence replay.
+   */
+  commit_history: PipelineV2CommitProvenance[];
   terminal?: PipelineV2TerminalState;
   run_outputs?: PipelineV2RunOutputState[];
   failure?: PipelineV2FailureState;
@@ -720,6 +730,173 @@ export type PipelineV2RunCommand =
       intentSha256: string;
       additionalIterations: number;
     };
+
+/**
+ * The exact closed kind vocabulary of one commit provenance entry (schema
+ * v8): every successful reducer command appends exactly one entry whose
+ * `kind` is the command's own discriminator. The list is typed against the
+ * command union itself, so a kind can never be added to, removed from, or
+ * renamed in one without failing this module's type check — there is no
+ * second command-kind vocabulary in the codebase.
+ */
+export type PipelineV2CommitProvenanceKind = PipelineV2RunCommand["kind"];
+
+export const PIPELINE_V2_COMMIT_PROVENANCE_KINDS: readonly PipelineV2CommitProvenanceKind[] = [
+  "create_run",
+  "start_agent_execution",
+  "agent_data_prepared",
+  "agent_execution_session_created",
+  "agent_tool_session_created",
+  "agent_running",
+  "agent_outputs_accepted",
+  "agent_cleanup_completed",
+  "agent_failed",
+  "start_decision_execution",
+  "decision_evaluated",
+  "decision_failed",
+  "transition_committed",
+  "run_waiting",
+  "wait_response_recorded",
+  "terminal_reached",
+  "run_outputs_published",
+  "run_succeeded",
+  "run_failed",
+  "run_cleanup_failed",
+  "stage_generation_opened",
+  "stage_iteration_opened",
+  "stage_iteration_closed",
+  "stage_generation_closed",
+  "plan_intent_accepted",
+  "task_revision_accepted",
+  "plan_revision_accepted",
+  "iteration_grant_recorded",
+] satisfies readonly PipelineV2CommitProvenanceKind[];
+
+/** Compile-time exhaustiveness proof for the kinds list above. */
+const COMMIT_PROVENANCE_KIND_COVERAGE: Record<PipelineV2CommitProvenanceKind, true> = Object.fromEntries(
+  PIPELINE_V2_COMMIT_PROVENANCE_KINDS.map((kind) => [kind, true as const]),
+) as Record<PipelineV2CommitProvenanceKind, true>;
+void COMMIT_PROVENANCE_KIND_COVERAGE;
+
+/**
+ * One durable commit provenance entry (schema v8). The reducer appends
+ * exactly one entry per successful command in the same atomic state
+ * snapshot; the entry's `revision` is the post-commit revision of that
+ * command and its `kind` is the command's discriminator. The only other
+ * fields are minimal content-free references that pin the entry to the
+ * record it created or mutated, so the loader can bind the ledger to the
+ * projection without heuristic inference:
+ *
+ * - `execution_index` — the execution the command started or mutated (its
+ *   durable `index`);
+ * - `transition_index` — the 1-based position of the committed transition
+ *   in the `transitions` journal (not the engine's per-state index);
+ * - `wait_index` — the wait record the command appended, accepted an
+ *   intent on, or answered (its durable `index`);
+ * - `generation_index` / `iteration_index` — the stage generation and
+ *   iteration records the command appended or closed;
+ * - `task_index` / `plan_index` / `grant_index` — the 1-based position the
+ *   command appended to the task/plan/grant ledger;
+ * - `state_id` — the state id a start command named (a durable safe id).
+ *
+ * Nothing else may enter an entry: no bodies, prompts, paths, run roots,
+ * session or operation ids, credentials, env, output, timestamps, error
+ * text, or raw command objects.
+ */
+export type PipelineV2CommitProvenance =
+  | { readonly revision: number; readonly kind: "create_run" }
+  | {
+      readonly revision: number;
+      readonly kind: "start_agent_execution";
+      readonly execution_index: number;
+      readonly state_id: string;
+    }
+  | {
+      readonly revision: number;
+      readonly kind: "start_decision_execution";
+      readonly execution_index: number;
+      readonly state_id: string;
+    }
+  | { readonly revision: number; readonly kind: "agent_data_prepared"; readonly execution_index: number }
+  | {
+      readonly revision: number;
+      readonly kind: "agent_execution_session_created";
+      readonly execution_index: number;
+    }
+  | { readonly revision: number; readonly kind: "agent_tool_session_created"; readonly execution_index: number }
+  | { readonly revision: number; readonly kind: "agent_running"; readonly execution_index: number }
+  | { readonly revision: number; readonly kind: "agent_outputs_accepted"; readonly execution_index: number }
+  | { readonly revision: number; readonly kind: "agent_cleanup_completed"; readonly execution_index: number }
+  | { readonly revision: number; readonly kind: "agent_failed"; readonly execution_index: number }
+  | { readonly revision: number; readonly kind: "decision_evaluated"; readonly execution_index: number }
+  | { readonly revision: number; readonly kind: "decision_failed"; readonly execution_index: number }
+  | {
+      readonly revision: number;
+      readonly kind: "transition_committed";
+      readonly execution_index: number;
+      readonly transition_index: number;
+    }
+  | { readonly revision: number; readonly kind: "run_waiting"; readonly wait_index: number }
+  | { readonly revision: number; readonly kind: "wait_response_recorded"; readonly wait_index: number }
+  | { readonly revision: number; readonly kind: "terminal_reached" }
+  | { readonly revision: number; readonly kind: "run_outputs_published" }
+  | { readonly revision: number; readonly kind: "run_succeeded" }
+  | { readonly revision: number; readonly kind: "run_failed" }
+  | { readonly revision: number; readonly kind: "run_cleanup_failed" }
+  | { readonly revision: number; readonly kind: "stage_generation_opened"; readonly generation_index: number }
+  | {
+      readonly revision: number;
+      readonly kind: "stage_iteration_opened";
+      readonly generation_index: number;
+      readonly iteration_index: number;
+    }
+  | {
+      readonly revision: number;
+      readonly kind: "stage_iteration_closed";
+      readonly generation_index: number;
+      readonly iteration_index: number;
+    }
+  | { readonly revision: number; readonly kind: "stage_generation_closed"; readonly generation_index: number }
+  | { readonly revision: number; readonly kind: "plan_intent_accepted"; readonly wait_index: number }
+  | { readonly revision: number; readonly kind: "task_revision_accepted"; readonly task_index: number }
+  | { readonly revision: number; readonly kind: "plan_revision_accepted"; readonly plan_index: number }
+  | { readonly revision: number; readonly kind: "iteration_grant_recorded"; readonly grant_index: number };
+
+/**
+ * The exact own-key shape of every provenance entry kind: the minimal
+ * content-free references each command kind carries. `create_run` and the
+ * run-level lifecycle commands carry no reference beyond the revision.
+ */
+const COMMIT_PROVENANCE_ENTRY_KEYS: Record<PipelineV2CommitProvenanceKind, readonly string[]> = {
+  create_run: [],
+  start_agent_execution: ["execution_index", "state_id"],
+  start_decision_execution: ["execution_index", "state_id"],
+  agent_data_prepared: ["execution_index"],
+  agent_execution_session_created: ["execution_index"],
+  agent_tool_session_created: ["execution_index"],
+  agent_running: ["execution_index"],
+  agent_outputs_accepted: ["execution_index"],
+  agent_cleanup_completed: ["execution_index"],
+  agent_failed: ["execution_index"],
+  decision_evaluated: ["execution_index"],
+  decision_failed: ["execution_index"],
+  transition_committed: ["execution_index", "transition_index"],
+  run_waiting: ["wait_index"],
+  wait_response_recorded: ["wait_index"],
+  terminal_reached: [],
+  run_outputs_published: [],
+  run_succeeded: [],
+  run_failed: [],
+  run_cleanup_failed: [],
+  stage_generation_opened: ["generation_index"],
+  stage_iteration_opened: ["generation_index", "iteration_index"],
+  stage_iteration_closed: ["generation_index", "iteration_index"],
+  stage_generation_closed: ["generation_index"],
+  plan_intent_accepted: ["wait_index"],
+  task_revision_accepted: ["task_index"],
+  plan_revision_accepted: ["plan_index"],
+  iteration_grant_recorded: ["grant_index"],
+};
 
 export class PipelineV2StateError extends Error {
   constructor(message: string) {
@@ -932,6 +1109,130 @@ function expectSafeIdList(value: unknown, what: string): string[] {
   });
 }
 
+const COMMIT_PROVENANCE_KIND_SET: ReadonlySet<string> = new Set<string>(PIPELINE_V2_COMMIT_PROVENANCE_KINDS);
+
+/**
+ * The exact shape and value validation of one commit provenance entry:
+ * the entry must carry exactly `revision`, `kind`, and the kind's minimal
+ * content-free references (per `COMMIT_PROVENANCE_ENTRY_KEYS`), with every
+ * reference a positive safe integer or a safe id. Unknown fields, missing
+ * fields, and foreign kinds are rejected before the coherence replay.
+ */
+function validateCommitProvenanceEntry(value: unknown, what: string): PipelineV2CommitProvenance {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new PipelineV2StateError(`${what} is not a JSON object`);
+  }
+  const obj = value as Record<string, unknown>;
+  const kindValue = obj.kind;
+  if (
+    typeof kindValue !== "string" ||
+    !COMMIT_PROVENANCE_KIND_SET.has(kindValue)
+  ) {
+    throw new PipelineV2StateError(
+      `${what} carries kind ${JSON.stringify(kindValue)}, which is not a pipeline v2 run command kind`,
+    );
+  }
+  const kind = kindValue as PipelineV2CommitProvenanceKind;
+  const referenceKeys = COMMIT_PROVENANCE_ENTRY_KEYS[kind];
+  const expected = new Set<string>(["revision", "kind", ...referenceKeys]);
+  for (const key of Object.keys(obj)) {
+    if (!expected.has(key)) {
+      throw new PipelineV2StateError(`${what} has unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of ["revision", "kind", ...referenceKeys]) {
+    if (!(key in obj)) {
+      throw new PipelineV2StateError(`${what} is missing required field ${JSON.stringify(key)}`);
+    }
+  }
+  const revision = expectSafePositiveInteger(obj.revision, `${what} revision`);
+  const entryIndex = (key: string): number =>
+    expectSafePositiveInteger(obj[key], `${what} ${key}`);
+  switch (kind) {
+    case "create_run":
+      return { revision, kind };
+    case "start_agent_execution":
+      return {
+        revision,
+        kind,
+        execution_index: entryIndex("execution_index"),
+        state_id: expectSafeId(obj.state_id, `${what} state_id`),
+      };
+    case "start_decision_execution":
+      return {
+        revision,
+        kind,
+        execution_index: entryIndex("execution_index"),
+        state_id: expectSafeId(obj.state_id, `${what} state_id`),
+      };
+    case "agent_data_prepared":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "agent_execution_session_created":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "agent_tool_session_created":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "agent_running":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "agent_outputs_accepted":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "agent_cleanup_completed":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "agent_failed":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "decision_evaluated":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "decision_failed":
+      return { revision, kind, execution_index: entryIndex("execution_index") };
+    case "transition_committed":
+      return {
+        revision,
+        kind,
+        execution_index: entryIndex("execution_index"),
+        transition_index: entryIndex("transition_index"),
+      };
+    case "run_waiting":
+      return { revision, kind, wait_index: entryIndex("wait_index") };
+    case "wait_response_recorded":
+      return { revision, kind, wait_index: entryIndex("wait_index") };
+    case "terminal_reached":
+      return { revision, kind };
+    case "run_outputs_published":
+      return { revision, kind };
+    case "run_succeeded":
+      return { revision, kind };
+    case "run_failed":
+      return { revision, kind };
+    case "run_cleanup_failed":
+      return { revision, kind };
+    case "stage_generation_opened":
+      return { revision, kind, generation_index: entryIndex("generation_index") };
+    case "stage_iteration_opened":
+      return {
+        revision,
+        kind,
+        generation_index: entryIndex("generation_index"),
+        iteration_index: entryIndex("iteration_index"),
+      };
+    case "stage_iteration_closed":
+      return {
+        revision,
+        kind,
+        generation_index: entryIndex("generation_index"),
+        iteration_index: entryIndex("iteration_index"),
+      };
+    case "stage_generation_closed":
+      return { revision, kind, generation_index: entryIndex("generation_index") };
+    case "plan_intent_accepted":
+      return { revision, kind, wait_index: entryIndex("wait_index") };
+    case "task_revision_accepted":
+      return { revision, kind, task_index: entryIndex("task_index") };
+    case "plan_revision_accepted":
+      return { revision, kind, plan_index: entryIndex("plan_index") };
+    case "iteration_grant_recorded":
+      return { revision, kind, grant_index: entryIndex("grant_index") };
+  }
+}
+
 function rejectLegacySchemaVersions(value: unknown): void {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return;
@@ -939,32 +1240,37 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 7 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
     );
   }
   if (version === 3) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
     );
   }
   if (version === 4) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
     );
   }
   if (version === 5) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
     );
   }
   if (version === 6) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 7 is the supported contract; no v6 migration exists)",
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v6 migration exists)",
+    );
+  }
+  if (version === 7) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v7 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -1889,6 +2195,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       "plan_revisions",
       "grants",
       "waits",
+      "commit_history",
     ],
     ["terminal", "run_outputs", "failure"],
   );
@@ -2085,6 +2392,43 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         `wait record at position ${position} declares index ${wait.index}; wait record indexes must be contiguous from 1`,
       );
     }
+  }
+
+  // The commit provenance ledger (schema v8): exactly one entry per
+  // revision, dense from 1 to the run's revision, opening with
+  // `create_run`. The per-entry shape and references are validated above
+  // the journal level; the ledger-to-projection coherence replay runs at
+  // the end of this loader, after every projection check has passed.
+  if (!Array.isArray(obj.commit_history)) {
+    throw new PipelineV2StateError("pipeline v2 run state commit_history must be an array");
+  }
+  for (let position = 0; position < obj.commit_history.length; position++) {
+    if (obj.commit_history[position] === undefined) {
+      throw new PipelineV2StateError(
+        `pipeline v2 run state commit_history carries a hole at position ${position}`,
+      );
+    }
+  }
+  const commitHistory = obj.commit_history.map((entry, index) =>
+    validateCommitProvenanceEntry(entry, `pipeline v2 run state commit_history[${index}]`),
+  );
+  if (commitHistory.length !== revision) {
+    throw new PipelineV2StateError(
+      `pipeline v2 run state commit_history carries ${commitHistory.length} entries, but the run revision is ${revision}; exactly one entry per revision is required`,
+    );
+  }
+  for (let position = 0; position < commitHistory.length; position++) {
+    const entry = commitHistory[position]!;
+    if (entry.revision !== position + 1) {
+      throw new PipelineV2StateError(
+        `commit provenance entry at position ${position} declares revision ${entry.revision}; entries must be dense from revision 1`,
+      );
+    }
+  }
+  if (commitHistory[0] === undefined || commitHistory[0].kind !== "create_run") {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state commit_history must open with the create_run entry at revision 1",
+    );
   }
 
   // The waiting status, the "waiting" phase and an open last wait record
@@ -3256,6 +3600,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     plan_revisions: planRevisions,
     grants,
     waits,
+    commit_history: commitHistory,
   };
   if (terminal !== undefined) {
     state.terminal = terminal;
@@ -3266,8 +3611,732 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   if (failure !== undefined) {
     state.failure = failure;
   }
+  // The single ledger-to-projection coherence replay: the commit provenance
+  // ledger is bound to the fully validated projection as one ordered
+  // structural replay. It runs after every projection check above, so a
+  // document that fails any projection rule keeps that rule's diagnostic.
+  verifyCommitHistoryCoherence(state);
   return deepFreeze(state);
 }
+
+/**
+ * The single production coherence verifier of the commit provenance ledger
+ * (schema v8). It binds `commit_history` to the already-validated
+ * projection as one ordered structural replay — there is no second
+ * verifier and no set of independent partial scans. For every entry, in
+ * revision order, it checks that the claimed command was the kind of
+ * mutation the projection records at exactly that point of the journal
+ * replay: appends must claim the next unconsumed record of their journal
+ * and match its identity references, in-place mutations must name the
+ * execution/wait/generation the reducer would have mutated, the execution
+ * phase ladder and the reducer's sequencing rules (settled before
+ * transition, intent before wait-bound task revisions and grants,
+ * wait-bound closure before response, generation before iteration, plan
+ * before generation, no start off the cursor, no command after the
+ * finalizing entry) are enforced in replay order, every journal record
+ * must be claimed by exactly one entry, and every entry's claim must be
+ * compatible with the record fields it implies (durable session ids,
+ * outputs, decision results, cleanup pairs, phases). The replay never
+ * mutates the state and never touches the filesystem; it derives the
+ * exact dispatch order from the ledger alone — the ledger is the
+ * authority because the reducer appends each entry in the same atomic
+ * snapshot that applies the command.
+ *
+ * Note on reducer-equivalent orderings: two dispatch orders the reducer
+ * accepts equally (for example the rev-1 task/plan acceptance pair at one
+ * planning boundary, or the replanned generation closure anywhere in its
+ * proven window) are both structurally valid ledgers over the same
+ * projection. The ledger records which one actually happened; the loader
+ * rejects every ledger that is not a coherent journal — removals, gaps,
+ * duplicates, foreign kinds, wrong references, and claims incompatible
+ * with the projection — and cannot distinguish two reducer-equivalent
+ * orders from each other, because the projection is provably identical
+ * under both.
+ */
+function verifyCommitHistoryCoherence(state: PipelineV2RunState): void {
+  const history = state.commit_history;
+  const executions = state.executions;
+  const transitions = state.transitions;
+  const waits = state.waits;
+  const generations = state.generations;
+  const taskRevisions = state.task_revisions;
+  const planRevisions = state.plan_revisions;
+  const grants = state.grants;
+
+  const fail: (message: string) => never = (message) => {
+    throw new PipelineV2StateError(
+      `pipeline v2 run state commit_history is not coherent with the projection: ${message}`,
+    );
+  };
+  const require = (condition: unknown, message: string): void => {
+    if (!condition) {
+      fail(message);
+    }
+  };
+
+  // The replay's structural position: how much of every journal the
+  // claimed commands have consumed so far, which execution is started but
+  // not yet bound by its transition, which iteration is open, which wait
+  // is open, and where the cursor sits.
+  let executionsSeen = 0;
+  let transitionsSeen = 0;
+  let waitsSeen = 0;
+  let grantsSeen = 0;
+  let taskLedgerSeen = 0;
+  let planLedgerSeen = 0;
+  let generationsSeen = 0;
+  const generationIterationsOpened = new Map<number, number>();
+  const generationClosed = new Map<number, boolean>();
+  let openIterationGeneration: number | null = null;
+  let openIterationIndex: number | null = null;
+  let currentExecution: number | null = null;
+  let openWait: number | null = null;
+  let cursorState = state.pipeline.entry_state;
+  let terminalSeen = false;
+  let outputsPublished = false;
+  let finalizeSeen = false;
+  /** The last claimed phase of every started execution. */
+  const claimedPhase = new Map<number, string>();
+  /** The ladder steps claimed for every started execution. */
+  const claimedSteps = new Map<number, Set<string>>();
+  /** The revision at which each wait's intent was accepted, if at all. */
+  const intentAcceptedAt = new Map<number, number>();
+  /** The revision at which each (generation, wait) grant was recorded. */
+  const grantsClaimedAt = new Map<string, number>();
+  /** The wait indexes whose task revisions were accepted (replanned closures). */
+  const taskWaitsClaimed = new Set<number>();
+
+  const settledPhases = new Set<string>(["cleanup_completed", "evaluated"]);
+  const phaseOf = (executionIndex: number): string => {
+    const phase = claimedPhase.get(executionIndex);
+    if (phase === undefined) {
+      fail(`execution ${executionIndex} was never started by the ledger`);
+    }
+    return phase;
+  };
+
+  history.forEach((entry, position) => {
+    const { kind } = entry;
+    require(!finalizeSeen, `no command may follow the run's finalizing entry, found ${JSON.stringify(kind)}`);
+    if (kind === "create_run") {
+      require(position === 0, "create_run may only be the first commit provenance entry");
+      return;
+    }
+    require(position > 0, `${JSON.stringify(kind)} cannot precede create_run`);
+    switch (kind) {
+      case "start_agent_execution":
+      case "start_decision_execution": {
+        const expectedType = kind === "start_agent_execution" ? "agent" : "decision";
+        require(openWait === null, `a start command requires an active run, but wait ${openWait} is open`);
+        require(
+          currentExecution === null,
+          `a start command requires no unfinished execution, but execution ${currentExecution} is unfinished`,
+        );
+        require(
+          entry.execution_index === executionsSeen + 1 && entry.execution_index <= executions.length,
+          `a start command claims execution ${entry.execution_index}, but the projection has ${executions.length} executions with ${executionsSeen} started`,
+        );
+        const record = executions[entry.execution_index - 1]!;
+        require(record.type === expectedType, `execution ${entry.execution_index} is not a ${expectedType} execution`);
+        require(
+          record.state_id === entry.state_id,
+          `the start command names state ${JSON.stringify(entry.state_id)}, but execution ${entry.execution_index} records ${JSON.stringify(record.state_id)}`,
+        );
+        require(
+          entry.state_id === cursorState,
+          `the start command names state ${JSON.stringify(entry.state_id)}, but the replayed cursor is ${JSON.stringify(cursorState)}`,
+        );
+        executionsSeen = entry.execution_index;
+        currentExecution = entry.execution_index;
+        claimedPhase.set(entry.execution_index, expectedType === "agent" ? "started" : "evaluating");
+        claimedSteps.set(entry.execution_index, new Set<string>());
+        break;
+      }
+      case "agent_data_prepared":
+      case "agent_execution_session_created":
+      case "agent_tool_session_created":
+      case "agent_running":
+      case "agent_outputs_accepted":
+      case "agent_cleanup_completed":
+      case "agent_failed": {
+        const expectedPhase: Record<string, string> = {
+          agent_data_prepared: "data_prepared",
+          agent_execution_session_created: "execution_session_created",
+          agent_tool_session_created: "sessions_created",
+          agent_running: "running",
+          agent_outputs_accepted: "outputs_accepted",
+          agent_cleanup_completed: "cleanup_completed",
+          agent_failed: "failed",
+        };
+        require(
+          currentExecution !== null && entry.execution_index === currentExecution,
+          `${kind} claims execution ${entry.execution_index}, but the unfinished execution is ${currentExecution === null ? "none" : currentExecution}`,
+        );
+        const record = executions[entry.execution_index - 1]!;
+        if (record.type !== "agent") {
+          fail(`the ladder claim ${JSON.stringify(kind)} names execution ${entry.execution_index}, which is not an agent execution`);
+        }
+        const current = phaseOf(entry.execution_index);
+        const agentOrder: string[] = [
+          "started",
+          "data_prepared",
+          "execution_session_created",
+          "sessions_created",
+          "running",
+          "outputs_accepted",
+          "cleanup_completed",
+        ];
+        const target = expectedPhase[kind]!;
+        if (kind === "agent_failed") {
+          require(
+            current !== "cleanup_completed" && current !== "failed",
+            `execution ${entry.execution_index} cannot fail from phase ${JSON.stringify(current)}`,
+          );
+        } else {
+          const expectedPrevious = agentOrder[agentOrder.indexOf(target) - 1];
+          require(
+            current === expectedPrevious,
+            `${kind} requires the previous phase ${JSON.stringify(expectedPrevious)} for execution ${entry.execution_index}, got ${JSON.stringify(current)}`,
+          );
+        }
+        // The claim implies the durable record fields it produces.
+        if (kind === "agent_execution_session_created") {
+          require(
+            record.execution_session_id !== undefined,
+            `${kind} claims execution ${entry.execution_index}, but the record carries no execution session id`,
+          );
+        }
+        if (kind === "agent_tool_session_created") {
+          require(
+            record.tool_session_id !== undefined,
+            `${kind} claims execution ${entry.execution_index}, but the record carries no tool session id`,
+          );
+        }
+        if (kind === "agent_outputs_accepted") {
+          require(
+            record.outputs !== undefined,
+            `${kind} claims execution ${entry.execution_index}, but the record carries no accepted outputs`,
+          );
+        }
+        if (kind === "agent_cleanup_completed") {
+          require(
+            record.session_cleanup !== undefined,
+            `${kind} claims execution ${entry.execution_index}, but the record carries no session cleanup pair`,
+          );
+        }
+        claimedSteps.get(entry.execution_index)!.add(kind);
+        claimedPhase.set(entry.execution_index, target);
+        break;
+      }
+      case "decision_evaluated":
+      case "decision_failed": {
+        require(
+          currentExecution !== null && entry.execution_index === currentExecution,
+          `${kind} claims execution ${entry.execution_index}, but the unfinished execution is ${currentExecution === null ? "none" : currentExecution}`,
+        );
+        const record = executions[entry.execution_index - 1]!;
+        if (record.type !== "decision") {
+          fail(`the claim ${JSON.stringify(kind)} names execution ${entry.execution_index}, which is not a decision execution`);
+        }
+        const current = phaseOf(entry.execution_index);
+        if (kind === "decision_evaluated") {
+          require(
+            current === "evaluating",
+            `decision_evaluated requires the evaluating phase for execution ${entry.execution_index}, got ${JSON.stringify(current)}`,
+          );
+          require(
+            record.result !== undefined,
+            `decision_evaluated claims execution ${entry.execution_index}, but the record carries no decision result`,
+          );
+        } else {
+          require(
+            current === "evaluating",
+            `decision_failed requires the evaluating phase for execution ${entry.execution_index}, got ${JSON.stringify(current)}`,
+          );
+        }
+        claimedSteps.get(entry.execution_index)!.add(kind);
+        claimedPhase.set(entry.execution_index, kind === "decision_evaluated" ? "evaluated" : "failed");
+        break;
+      }
+      case "transition_committed": {
+        require(
+          entry.transition_index === transitionsSeen + 1 && entry.transition_index <= transitions.length,
+          `a transition claim names journal position ${entry.transition_index}, but ${transitionsSeen} transitions are consumed of ${transitions.length}`,
+        );
+        const record = transitions[entry.transition_index - 1]!;
+        require(
+          record.execution_index === entry.execution_index,
+          `the claimed transition ${entry.transition_index} commits execution ${record.execution_index}, not ${entry.execution_index}`,
+        );
+        require(
+          currentExecution === entry.execution_index,
+          `the claimed transition binds execution ${entry.execution_index}, but the unbound execution is ${currentExecution === null ? "none" : currentExecution}`,
+        );
+        const phase = phaseOf(entry.execution_index);
+        require(
+          settledPhases.has(phase),
+          `committing a transition requires the settled execution ${entry.execution_index}, got phase ${JSON.stringify(phase)}`,
+        );
+        transitionsSeen = entry.transition_index;
+        cursorState = record.to;
+        currentExecution = null;
+        break;
+      }
+      case "run_waiting": {
+        require(
+          entry.wait_index === waitsSeen + 1 && entry.wait_index <= waits.length,
+          `a wait claim names journal position ${entry.wait_index}, but ${waitsSeen} waits are consumed of ${waits.length}`,
+        );
+        const record = waits[entry.wait_index - 1]!;
+        require(openWait === null, `entering wait ${entry.wait_index} requires no open wait, but wait ${openWait} is open`);
+        require(
+          currentExecution === null && executionsSeen === transitionsSeen,
+          `entering a wait requires every execution to be settled and bound, at ${executionsSeen} executions and ${transitionsSeen} transitions`,
+        );
+        require(
+          record.transition_count === transitionsSeen,
+          `wait ${entry.wait_index} anchors at transition count ${record.transition_count}, but the replayed count is ${transitionsSeen}`,
+        );
+        require(
+          record.state_id === cursorState,
+          `wait ${entry.wait_index} names state ${JSON.stringify(record.state_id)}, but the replayed cursor is ${JSON.stringify(cursorState)}`,
+        );
+        waitsSeen = entry.wait_index;
+        openWait = entry.wait_index;
+        break;
+      }
+      case "wait_response_recorded": {
+        require(
+          entry.wait_index === waitsSeen && openWait === entry.wait_index,
+          `a response claim names wait ${entry.wait_index}, but the open wait is ${openWait === null ? "none" : openWait}`,
+        );
+        const record = waits[entry.wait_index - 1]!;
+        require(
+          record.response !== undefined,
+          `the response claim names wait ${entry.wait_index}, but the record carries no response`,
+        );
+        require(
+          openIterationIndex === null,
+          `recording a response requires no open iteration, but iteration ${openIterationIndex} of generation ${openIterationGeneration} is open`,
+        );
+        const action = record.actions.find((candidate) => candidate.id === record.response!.action_id);
+        require(
+          action !== undefined,
+          `the response of wait ${entry.wait_index} names action ${JSON.stringify(record.response!.action_id)}, which the wait does not declare`,
+        );
+        cursorState = action!.to;
+        openWait = null;
+        break;
+      }
+      case "terminal_reached": {
+        require(!terminalSeen, "the terminal state can be reached only once");
+        require(state.terminal !== undefined, "the terminal claim has no terminal record in the projection");
+        require(openWait === null, "reaching a terminal requires no open wait");
+        require(
+          currentExecution === null && executionsSeen === transitionsSeen,
+          `reaching a terminal requires every execution to be settled and bound, at ${executionsSeen} executions and ${transitionsSeen} transitions`,
+        );
+        require(
+          state.terminal!.state_id === cursorState,
+          `the terminal claim names state ${JSON.stringify(state.terminal!.state_id)}, but the replayed cursor is ${JSON.stringify(cursorState)}`,
+        );
+        terminalSeen = true;
+        break;
+      }
+      case "run_outputs_published": {
+        require(!outputsPublished, "run outputs can be published only once");
+        require(state.run_outputs !== undefined, "the publication claim has no run_outputs in the projection");
+        require(terminalSeen, "publishing run outputs requires a reached terminal state");
+        outputsPublished = true;
+        break;
+      }
+      case "run_succeeded": {
+        require(terminalSeen, "success requires a reached terminal state");
+        require(state.terminal!.result === "success", "the success claim contradicts the terminal result");
+        require(outputsPublished, "success requires published run outputs");
+        finalizeSeen = true;
+        break;
+      }
+      case "run_failed": {
+        require(state.failure !== undefined, "the failure claim has no failure record in the projection");
+        if (terminalSeen) {
+          // A reached terminal (of either result) may be followed by the
+          // run failure finalization — for example a publication or
+          // persistence fault after the terminal record. The failure
+          // reason's own record-level rules govern the terminal result.
+        } else {
+          // The reducer requires every execution to be settled: earlier
+          // executions are bound by their consumed transitions; the
+          // current one (if any) must be settled or failed.
+          if (currentExecution === null) {
+            require(
+              executionsSeen === transitionsSeen,
+              `a failure claim requires every execution to be settled, at ${executionsSeen} executions and ${transitionsSeen} transitions`,
+            );
+          } else {
+            const phase = phaseOf(currentExecution);
+            require(
+              settledPhases.has(phase) || phase === "failed",
+              `a failure claim requires the current execution ${currentExecution} to be settled or failed, got ${JSON.stringify(phase)}`,
+            );
+          }
+          const last = executions[executions.length - 1];
+          if (last !== undefined && last.type === "agent" && hasFailedSessionCleanup(last)) {
+            fail("a failed session cleanup finalizes with run_cleanup_failed, not run_failed");
+          }
+        }
+        finalizeSeen = true;
+        break;
+      }
+      case "run_cleanup_failed": {
+        require(
+          !terminalSeen,
+          "a run with a reached terminal state cannot end as a cleanup failure",
+        );
+        const last = executions[executions.length - 1];
+        if (
+          last === undefined ||
+          last.type !== "agent" ||
+          last.phase !== "failed" ||
+          !hasFailedSessionCleanup(last)
+        ) {
+          fail("a cleanup failure claim requires the last agent execution to have failed with an unconfirmed session cleanup");
+        }
+        finalizeSeen = true;
+        break;
+      }
+      case "stage_generation_opened": {
+        require(
+          entry.generation_index === generationsSeen + 1 && entry.generation_index <= generations.length,
+          `a generation claim opens generation ${entry.generation_index}, but ${generationsSeen} generations are consumed of ${generations.length}`,
+        );
+        const record = generations[entry.generation_index - 1]!;
+        require(openWait === null, "opening a stage generation requires no open wait");
+        require(
+          openIterationIndex === null,
+          `opening a stage generation requires the previous generation to be closed, but iteration ${openIterationIndex} is open`,
+        );
+        require(
+          generationsSeen === 0 || generationClosed.get(generationsSeen) === true,
+          `opening generation ${entry.generation_index} requires generation ${generationsSeen} to be closed`,
+        );
+        require(
+          currentExecution === null || settledPhases.has(phaseOf(currentExecution)),
+          "opening a stage generation requires the run's last execution to be settled",
+        );
+        require(
+          record.opened_transition_count === transitionsSeen,
+          `generation ${entry.generation_index} anchors at transition count ${record.opened_transition_count}, but the replayed count is ${transitionsSeen}`,
+        );
+        require(
+          planLedgerSeen > 0 && record.plan_sha256 === planRevisions[planLedgerSeen - 1]!.sha256,
+          `generation ${entry.generation_index} binds a plan digest that the replayed plan ledger has not accepted last`,
+        );
+        generationsSeen = entry.generation_index;
+        generationIterationsOpened.set(entry.generation_index, 0);
+        generationClosed.set(entry.generation_index, false);
+        break;
+      }
+      case "stage_iteration_opened": {
+        require(
+          entry.generation_index === generationsSeen,
+          `an iteration claim names generation ${entry.generation_index}, but the open generation is ${generationsSeen === 0 ? "none" : generationsSeen}`,
+        );
+        require(
+          generationClosed.get(entry.generation_index) === false,
+          `generation ${entry.generation_index} is closed; its iteration cannot open`,
+        );
+        const opened = generationIterationsOpened.get(entry.generation_index) ?? 0;
+        require(
+          entry.iteration_index === opened + 1 && entry.iteration_index <= generations[entry.generation_index - 1]!.iterations.length,
+          `an iteration claim opens iteration ${entry.iteration_index} of generation ${entry.generation_index}, but ${opened} iterations are consumed of ${generations[entry.generation_index - 1]!.iterations.length}`,
+        );
+        const record = generations[entry.generation_index - 1]!.iterations[entry.iteration_index - 1]!;
+        require(
+          record.opened_transition_count === transitionsSeen,
+          `iteration ${entry.iteration_index} of generation ${entry.generation_index} anchors at transition count ${record.opened_transition_count}, but the replayed count is ${transitionsSeen}`,
+        );
+        generationIterationsOpened.set(entry.generation_index, entry.iteration_index);
+        openIterationGeneration = entry.generation_index;
+        openIterationIndex = entry.iteration_index;
+        break;
+      }
+      case "stage_iteration_closed": {
+        require(
+          entry.generation_index === generationsSeen,
+          `an iteration closure names generation ${entry.generation_index}, but the open generation is ${generationsSeen === 0 ? "none" : generationsSeen}`,
+        );
+        require(
+          openIterationIndex === entry.iteration_index && openIterationGeneration === entry.generation_index,
+          `an iteration closure names iteration ${entry.iteration_index} of generation ${entry.generation_index}, but the open iteration is ${openIterationIndex === null ? "none" : openIterationIndex}`,
+        );
+        const record = generations[entry.generation_index - 1]!.iterations[entry.iteration_index - 1]!;
+        require(
+          record.closed !== undefined,
+          `the closure claim names iteration ${entry.iteration_index} of generation ${entry.generation_index}, but the record is open`,
+        );
+        const closed = record.closed!;
+        const waitBound = closed.wait_index !== undefined;
+        if (waitBound) {
+          const waitIndex = closed.wait_index!;
+          require(
+            openWait === waitIndex,
+            `the wait-bound closure of iteration ${entry.iteration_index} requires the open wait ${waitIndex}, but the open wait is ${openWait === null ? "none" : openWait}`,
+          );
+          const acceptedAt = intentAcceptedAt.get(waitIndex);
+          require(
+            acceptedAt !== undefined && acceptedAt < entry.revision,
+            `the wait-bound closure of iteration ${entry.iteration_index} requires the accepted intent of wait ${waitIndex}`,
+          );
+          if (closed.by === "grant") {
+            const grantedAt = grantsClaimedAt.get(`${entry.generation_index}:${waitIndex}`);
+            require(
+              grantedAt !== undefined && grantedAt < entry.revision,
+              `the grant-bound closure of iteration ${entry.iteration_index} requires the recorded grant of wait ${waitIndex}`,
+            );
+          } else {
+            require(
+              taskWaitsClaimed.has(waitIndex),
+              `the replanned closure of iteration ${entry.iteration_index} requires an accepted task revision of wait ${waitIndex}`,
+            );
+          }
+        } else {
+          require(
+            closed.by === "normal_close" || closed.by === "exhausted",
+            `the ordinary closure of iteration ${entry.iteration_index} carries the wait-bound reason ${JSON.stringify(closed.by)} without a wait index`,
+          );
+          require(openWait === null, "an ordinary iteration closure requires no open wait");
+        }
+        openIterationGeneration = null;
+        openIterationIndex = null;
+        break;
+      }
+      case "stage_generation_closed": {
+        require(
+          entry.generation_index === generationsSeen,
+          `a generation closure names generation ${entry.generation_index}, but the open generation is ${generationsSeen === 0 ? "none" : generationsSeen}`,
+        );
+        require(
+          generationClosed.get(entry.generation_index) === false,
+          `generation ${entry.generation_index} is already closed`,
+        );
+        require(
+          openIterationIndex === null,
+          `closing generation ${entry.generation_index} requires no open iteration, but iteration ${openIterationIndex} is open`,
+        );
+        const record = generations[entry.generation_index - 1]!;
+        require(record.closed !== undefined, `the closure claim names generation ${entry.generation_index}, but the record is open`);
+        require(
+          record.iterations.length > 0,
+          `generation ${entry.generation_index} carries no iterations; it cannot close`,
+        );
+        generationClosed.set(entry.generation_index, true);
+        break;
+      }
+      case "plan_intent_accepted": {
+        require(
+          entry.wait_index === waitsSeen && openWait === entry.wait_index,
+          `an intent claim names wait ${entry.wait_index}, but the open wait is ${openWait === null ? "none" : openWait}`,
+        );
+        const record = waits[entry.wait_index - 1]!;
+        require(
+          record.intent !== undefined,
+          `the intent claim names wait ${entry.wait_index}, but the record carries no accepted intent`,
+        );
+        require(
+          intentAcceptedAt.get(entry.wait_index) === undefined,
+          `wait ${entry.wait_index} accepts an intent only once`,
+        );
+        intentAcceptedAt.set(entry.wait_index, entry.revision);
+        break;
+      }
+      case "task_revision_accepted": {
+        require(
+          entry.task_index === taskLedgerSeen + 1 && entry.task_index <= taskRevisions.length,
+          `a task claim appends ledger position ${entry.task_index}, but ${taskLedgerSeen} task revisions are consumed of ${taskRevisions.length}`,
+        );
+        const record = taskRevisions[entry.task_index - 1]!;
+        if (record.wait_index !== undefined) {
+          require(
+            openWait === record.wait_index,
+            `the wait-bound task revision ${entry.task_index} requires the open wait ${record.wait_index}, but the open wait is ${openWait === null ? "none" : openWait}`,
+          );
+          const acceptedAt = intentAcceptedAt.get(record.wait_index);
+          require(
+            acceptedAt !== undefined && acceptedAt < entry.revision,
+            `the wait-bound task revision ${entry.task_index} requires the accepted intent of wait ${record.wait_index}`,
+          );
+          taskWaitsClaimed.add(record.wait_index);
+        } else {
+          require(
+            openWait === null,
+            `the planning-flow task revision ${entry.task_index} requires an active run, but wait ${openWait} is open`,
+          );
+        }
+        taskLedgerSeen = entry.task_index;
+        break;
+      }
+      case "plan_revision_accepted": {
+        require(
+          entry.plan_index === planLedgerSeen + 1 && entry.plan_index <= planRevisions.length,
+          `a plan claim appends ledger position ${entry.plan_index}, but ${planLedgerSeen} plan revisions are consumed of ${planRevisions.length}`,
+        );
+        const record = planRevisions[entry.plan_index - 1]!;
+        require(openWait === null, "accepting a plan revision requires no open wait");
+        require(
+          openIterationIndex === null,
+          "accepting a plan revision requires no open stage iteration",
+        );
+        require(
+          executionsSeen === transitionsSeen + 1,
+          `accepting a plan revision requires exactly one settled-but-unbound execution, at ${executionsSeen} executions and ${transitionsSeen} transitions`,
+        );
+        require(
+          currentExecution === executionsSeen && settledPhases.has(phaseOf(executionsSeen)),
+          "accepting a plan revision requires the last execution to be settled",
+        );
+        const origin = executions[executionsSeen - 1]!;
+        require(
+          origin.execution_role === "planning",
+          `the plan's origin execution ${executionsSeen} carries role ${JSON.stringify(origin.execution_role)}, not planning`,
+        );
+        require(
+          record.origin_execution === executionsSeen,
+          `the plan record names origin execution ${record.origin_execution}, but the ledger replay settles execution ${executionsSeen}`,
+        );
+        planLedgerSeen = entry.plan_index;
+        break;
+      }
+      case "iteration_grant_recorded": {
+        require(
+          entry.grant_index === grantsSeen + 1 && entry.grant_index <= grants.length,
+          `a grant claim appends ledger position ${entry.grant_index}, but ${grantsSeen} grants are consumed of ${grants.length}`,
+        );
+        const record = grants[entry.grant_index - 1]!;
+        require(
+          openWait === record.wait_index,
+          `the grant claim names wait ${record.wait_index}, but the open wait is ${openWait === null ? "none" : openWait}`,
+        );
+        const acceptedAt = intentAcceptedAt.get(record.wait_index);
+        require(
+          acceptedAt !== undefined && acceptedAt < entry.revision,
+          `the grant claim requires the accepted intent of wait ${record.wait_index}`,
+        );
+        grantsSeen = entry.grant_index;
+        grantsClaimedAt.set(`${record.generation_index}:${record.wait_index}`, entry.revision);
+        break;
+      }
+      default: {
+        fail(`the ledger claims the unknown command kind ${JSON.stringify((entry as { kind: unknown }).kind)}`);
+      }
+    }
+  });
+
+  // Every journal record must have been claimed by exactly one entry.
+  require(
+    executionsSeen === executions.length &&
+      transitionsSeen === transitions.length &&
+      waitsSeen === waits.length &&
+      grantsSeen === grants.length &&
+      taskLedgerSeen === taskRevisions.length &&
+      planLedgerSeen === planRevisions.length &&
+      generationsSeen === generations.length,
+    `the ledger consumes ${executionsSeen} executions, ${transitionsSeen} transitions, ${waitsSeen} waits, ${grantsSeen} grants, ${taskLedgerSeen} task revisions, ${planLedgerSeen} plan revisions and ${generationsSeen} generations, but the projection carries ${executions.length}, ${transitions.length}, ${waits.length}, ${grants.length}, ${taskRevisions.length}, ${planRevisions.length} and ${generations.length}`,
+  );
+  for (const generation of generations) {
+    const opened = generationIterationsOpened.get(generation.index) ?? 0;
+    require(
+      opened === generation.iterations.length,
+      `generation ${generation.index} carries ${generation.iterations.length} iterations, but the ledger claims ${opened}`,
+    );
+    require(
+      (generation.closed !== undefined) === (generationClosed.get(generation.index) === true),
+      `the ledger and the projection disagree about whether generation ${generation.index} is closed`,
+    );
+    if (generation.open_iteration !== undefined) {
+      require(
+        openIterationGeneration === generation.index && openIterationIndex === generation.open_iteration.index,
+        `the ledger and the projection disagree about generation ${generation.index}'s open iteration`,
+      );
+    } else {
+      require(
+        openIterationGeneration !== generation.index,
+        `the ledger claims an open iteration for generation ${generation.index}, but the projection records none`,
+      );
+    }
+  }
+  for (const execution of executions) {
+    const phase = claimedPhase.get(execution.index);
+    require(
+      phase !== undefined && phase === execution.phase,
+      `execution ${execution.index} records phase ${JSON.stringify(execution.phase)}, but the ledger's last claim for it is ${phase === undefined ? "absent" : JSON.stringify(phase)}`,
+    );
+    const steps = claimedSteps.get(execution.index);
+    if (steps === undefined) {
+      fail(`execution ${execution.index} was never started by the ledger`);
+    }
+    if (execution.type === "agent") {
+      require(
+        (execution.execution_session_id !== undefined) === steps.has("agent_execution_session_created"),
+        `the ledger and the projection disagree about execution ${execution.index}'s execution session`,
+      );
+      require(
+        (execution.tool_session_id !== undefined) === steps.has("agent_tool_session_created"),
+        `the ledger and the projection disagree about execution ${execution.index}'s tool session`,
+      );
+      require(
+        (execution.outputs !== undefined) === steps.has("agent_outputs_accepted"),
+        `the ledger and the projection disagree about execution ${execution.index}'s accepted outputs`,
+      );
+      require(
+        (execution.session_cleanup !== undefined) ===
+          (steps.has("agent_cleanup_completed") || steps.has("agent_failed")),
+        `the ledger and the projection disagree about execution ${execution.index}'s session cleanup`,
+      );
+    } else {
+      require(
+        (execution.result !== undefined) === steps.has("decision_evaluated"),
+        `the ledger and the projection disagree about execution ${execution.index}'s decision result`,
+      );
+    }
+  }
+  // The finalizing entry is unique and last, and the run's final status
+  // agrees with it. A waiting run's last entry is the command that put it
+  // or kept it waiting: the wait entry itself or one of the intervention
+  // commands the reducer accepts on a waiting run (an accepted intent, a
+  // task revision, a grant, or a wait-bound iteration closure).
+  const last = history[history.length - 1]!;
+  if (state.status === "waiting") {
+    require(
+      last.kind === "run_waiting" ||
+        last.kind === "plan_intent_accepted" ||
+        last.kind === "task_revision_accepted" ||
+        last.kind === "iteration_grant_recorded" ||
+        last.kind === "stage_iteration_closed",
+      `a waiting run's last commit entry is ${JSON.stringify(last.kind)}, not a command a waiting run accepts`,
+    );
+  } else if (state.status !== "active") {
+    const expectedFinalKind =
+      state.status === "success" ? "run_succeeded" : state.status === "cleanup_failed" ? "run_cleanup_failed" : undefined;
+    if (expectedFinalKind === undefined) {
+      require(
+        last.kind === "run_failed" || last.kind === "run_cleanup_failed",
+        `a failed run's last commit entry is ${JSON.stringify(last.kind)}, not a finalizing command`,
+      );
+    } else {
+      require(
+        last.kind === expectedFinalKind,
+        `a run with status ${JSON.stringify(state.status)} must finalize with ${JSON.stringify(expectedFinalKind)}, got ${JSON.stringify(last.kind)}`,
+      );
+    }
+  } else {
+    require(
+      last.kind !== "run_succeeded" && last.kind !== "run_failed" && last.kind !== "run_cleanup_failed",
+      `the run's status is ${JSON.stringify(state.status)}, but the ledger finalizes with ${JSON.stringify(last.kind)}`,
+    );
+  }
+}
+
 
 /**
  * The single open stage iteration of a validated run state, if any: the
@@ -3646,6 +4715,7 @@ function cloneState(state: PipelineV2RunState): PipelineV2RunState {
     plan_revisions: state.plan_revisions.map(clonePlanRevision),
     grants: state.grants.map(cloneIterationGrant),
     waits: state.waits.map(cloneWaitRecord),
+    commit_history: state.commit_history.map((entry) => ({ ...entry })),
   };
   if (state.terminal !== undefined) {
     clone.terminal = { ...state.terminal };
@@ -3966,6 +5036,7 @@ export function reducePipelineV2RunCommand(
       plan_revisions: [],
       grants: [],
       waits: [],
+      commit_history: [{ revision: 1, kind: "create_run" }],
     };
     return deepFreeze(state);
   }
@@ -5278,5 +6349,115 @@ export function reducePipelineV2RunCommand(
       throw new PipelineV2StateError(`unknown pipeline v2 run command: ${JSON.stringify(exhaustive)}`);
     }
   }
+  // The single commit provenance append: every successful reducer command
+  // adds exactly one entry carrying its post-commit revision and the
+  // command's discriminator plus its minimal content-free references, in
+  // the same atomic snapshot as the state projection itself. The entry is
+  // derived from the command and the already-computed next state; existing
+  // entries are never rewritten.
+  next.commit_history = [...next.commit_history, commitProvenanceEntry(commandKind, command, next)];
   return deepFreeze(next);
+}
+
+/**
+ * Derives the one commit provenance entry of a successfully applied
+ * command from the command discriminator and the computed next state.
+ * The post-commit revision is `next.revision`; the reference fields name
+ * the record the command appended or mutated, taken from the next state's
+ * journals (for appends) or from the command itself (for targeted
+ * mutations). This is the only provenance construction site.
+ */
+function commitProvenanceEntry(
+  commandKind: PipelineV2CommitProvenanceKind,
+  command: PipelineV2RunCommand,
+  next: PipelineV2RunState,
+): PipelineV2CommitProvenance {
+  const revision = next.revision;
+  const lastExecutionIndex = (): number => {
+    const last = next.executions[next.executions.length - 1];
+    if (last === undefined) {
+      throw new PipelineV2StateError("provenance derivation found no execution in the next state");
+    }
+    return last.index;
+  };
+  // The fields below were validated by the reducer's own case for the
+  // captured command kind; the structural reads only shape the access and
+  // never re-read the discriminator (the captured `commandKind` is the
+  // single authority for routing, so a hostile command object cannot make
+  // the provenance entry disagree with the command that was applied).
+  switch (commandKind) {
+    case "create_run":
+      return { revision, kind: "create_run" };
+    case "start_agent_execution":
+    case "start_decision_execution": {
+      const start = command as { stateId: string };
+      return {
+        revision,
+        kind: commandKind,
+        execution_index: next.executions.length,
+        state_id: start.stateId,
+      };
+    }
+    case "agent_data_prepared":
+    case "agent_execution_session_created":
+    case "agent_tool_session_created":
+    case "agent_running":
+    case "agent_outputs_accepted":
+    case "agent_cleanup_completed":
+    case "agent_failed":
+    case "decision_evaluated":
+    case "decision_failed":
+      return { revision, kind: commandKind, execution_index: lastExecutionIndex() };
+    case "transition_committed": {
+      const transition = command as { executionIndex: number };
+      return {
+        revision,
+        kind: "transition_committed",
+        execution_index: transition.executionIndex,
+        transition_index: next.transitions.length,
+      };
+    }
+    case "run_waiting":
+      return { revision, kind: "run_waiting", wait_index: next.waits.length };
+    case "wait_response_recorded": {
+      const response = command as { waitIndex: number };
+      return { revision, kind: "wait_response_recorded", wait_index: response.waitIndex };
+    }
+    case "terminal_reached":
+      return { revision, kind: "terminal_reached" };
+    case "run_outputs_published":
+      return { revision, kind: "run_outputs_published" };
+    case "run_succeeded":
+      return { revision, kind: "run_succeeded" };
+    case "run_failed":
+      return { revision, kind: "run_failed" };
+    case "run_cleanup_failed":
+      return { revision, kind: "run_cleanup_failed" };
+    case "stage_generation_opened":
+      return { revision, kind: "stage_generation_opened", generation_index: next.generations.length };
+    case "stage_iteration_opened":
+    case "stage_iteration_closed": {
+      const iteration = command as { generationIndex: number; iterationIndex: number };
+      return {
+        revision,
+        kind: commandKind,
+        generation_index: iteration.generationIndex,
+        iteration_index: iteration.iterationIndex,
+      };
+    }
+    case "stage_generation_closed": {
+      const generation = command as { generationIndex: number };
+      return { revision, kind: "stage_generation_closed", generation_index: generation.generationIndex };
+    }
+    case "plan_intent_accepted": {
+      const intent = command as { waitIndex: number };
+      return { revision, kind: "plan_intent_accepted", wait_index: intent.waitIndex };
+    }
+    case "task_revision_accepted":
+      return { revision, kind: "task_revision_accepted", task_index: next.task_revisions.length };
+    case "plan_revision_accepted":
+      return { revision, kind: "plan_revision_accepted", plan_index: next.plan_revisions.length };
+    case "iteration_grant_recorded":
+      return { revision, kind: "iteration_grant_recorded", grant_index: next.grants.length };
+  }
 }

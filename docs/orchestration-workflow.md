@@ -14,7 +14,7 @@ result identity, run state schema version 2). Pipeline schema v2 has its
 own production entrypoint now: `orchestrator run` (see the "The production
 pipeline v2 CLI" section) drives the assembled pipeline v2 stack —
 graph execution, the run-owned project copy, the data plane, decision
-states, the Docker Helper runtime adapter, the durable state schema v7,
+states, the Docker Helper runtime adapter, the durable state schema v8,
 and output publication — through the single production runner
 `runPipelineV2`. `agent-smoke` remains the v1 diagnostic command with its
 own schema version 1 loader; the bundled default pipeline has not been
@@ -200,10 +200,39 @@ orchestrator run \
   activations. The source directory is never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 7), and the published run outputs stay at the fixed
+  (state schema version 8), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
+- Schema v8 adds the reducer-owned commit provenance
+  (`state.commit_history`): exactly one entry per durable revision,
+  appended by the reducer in the same atomic snapshot that applies the
+  command. Each entry carries the post-commit `revision`, the command's
+  `kind` (the closed 28-kind vocabulary typed against the reducer's command
+  union), and minimal content-free references (execution, transition,
+  wait, generation/iteration, and ledger positions; the safe state id of a
+  start). This is the dense `revision -> command kind` mapping of the
+  run's lifecycle: the dispatch order is durable, not a controller
+  convention, and the two orders a v7 loader could not distinguish (the
+  rev-1 task/plan acceptance pair at one planning boundary; the replanned
+  generation closure inside its response window) now carry distinct
+  durable revisions. The loader binds the ledger to the projection as one
+  ordered coherence replay and rejects every non-coherent ledger
+  (removals, gaps, duplicates, foreign kinds, wrong references, claims the
+  projection cannot support). Crash semantics are unchanged and now
+  ledger-precise: a `not_committed` dispatch leaves no entry and the
+  previous revision authoritative; a `durability_unknown` commit leaves
+  the adopted candidate with its entry exactly once; retries after a
+  reopen dispatch only the missing suffix and never duplicate an entry;
+  read-only loads and `orchestrator inspect` append nothing. There is no
+  v7 migration: the exact v7 dispatch order of the two ambiguity clusters
+  is unrecoverable, so v7 documents are rejected with the established
+  typed legacy message and never rewritten. The provenance is an internal
+  durable-state contract only: no public events API, no worker-log
+  capture, and no inspect/HTTP/UI exposure exist yet — a read-only events
+  endpoint over this ledger is a separate future increment, and worker
+  logs remain ephemeral/unwired (docker-helper operation logs die with the
+  daemon and mix worker stderr into one stream).
 - The pipeline's agent states select the profiles; the worker image, the
   OpenCode configuration, and the exact environment bindings belong to those
   profiles. The user never sets mounts, container paths, Session
