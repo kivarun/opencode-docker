@@ -224,7 +224,9 @@ async function makeDirs(prefix: string): Promise<{ root: string; bundle: string;
   return { root, bundle, stateRoot };
 }
 
-const E2E_YAML = `
+/** The minimal agent bundle of the 66-command lifecycle E2E; shared
+ * with the browser UI events integration suite. */
+export const E2E_YAML = `
 schema_version: 2
 entry_state: architect
 max_transitions: 8
@@ -597,8 +599,11 @@ describe("events source restrictions", () => {
     const http = await readFile(new URL("../src/control_plane/http_server.ts", import.meta.url), "utf8");
     expect(http).not.toContain("commit_history");
     const ui = await readFile(new URL("../ui/app.js", import.meta.url), "utf8");
-    expect(ui.includes("/events")).toBe(false);
-    expect(ui.includes('"events"')).toBe(false);
+    // the browser UI consumes only the versioned HTTP events projection
+    // through its dedicated events client; the internal history name and
+    // every raw state document stay outside the UI module
+    expect(ui.includes("commit_history")).toBe(false);
+    expect(ui.includes("state.json")).toBe(false);
   });
 
   test("the round-trip through the real loader preserves the projected page byte-for-byte", async () => {

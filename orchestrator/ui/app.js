@@ -34,6 +34,15 @@
  *   are enabled and no mutation is in flight. Any other boundary, any
  *   error and any lost response stop it until an explicit user action;
  *   it never sends a mutating request and never retries one.
+ * - the lifecycle timeline (v4) renders the read-only events feed of
+ *   the selected run (`GET /v1/runs/:runId/events`) through its own
+ *   document parser and its own single-flight transport. It owns the
+ *   dense cursor/pagination merge, the explicit Load more / Reload /
+ *   Retry actions and the fail-closed error stop; the only automatic
+ *   fetch is the one tail request an applied authoritative inspect may
+ *   trigger when the timeline is caught up and behind. The timeline
+ *   never sends a mutating request, never creates a timer, never polls
+ *   on its own and never retries automatically.
  *
  * Security posture: all inserted content travels through textContent
  * (no direct HTML injection, no dynamic code evaluation, no external
@@ -54,6 +63,104 @@ const COMMAND_OUTCOMES = ["succeeded", "waiting", "plan_ready", "responded", "fa
 const COMMAND_EXIT_CODES = [0, 1, 130, 143];
 const ERROR_LAYERS = ["request", "registry", "binding", "transport"];
 const OUTPUT_TYPES = ["file", "directory", "json"];
+
+/** The fixed page limit of every timeline events request. */
+export const EVENTS_PAGE_LIMIT = 100;
+
+/**
+ * The closed public event-kind vocabulary of the lifecycle timeline:
+ * the 28 durable commit provenance kinds of pipeline state schema v8.
+ * The vocabulary is pinned against the real endpoint by the permanent
+ * integration suite; the timeline renders the public `kind` verbatim
+ * and carries no second display-label set.
+ */
+export const PIPELINE_V2_EVENT_KINDS = Object.freeze([
+  "create_run",
+  "start_agent_execution",
+  "agent_data_prepared",
+  "agent_execution_session_created",
+  "agent_tool_session_created",
+  "agent_running",
+  "agent_outputs_accepted",
+  "agent_cleanup_completed",
+  "agent_failed",
+  "start_decision_execution",
+  "decision_evaluated",
+  "decision_failed",
+  "transition_committed",
+  "run_waiting",
+  "wait_response_recorded",
+  "terminal_reached",
+  "run_outputs_published",
+  "run_succeeded",
+  "run_failed",
+  "run_cleanup_failed",
+  "stage_generation_opened",
+  "stage_iteration_opened",
+  "stage_iteration_closed",
+  "stage_generation_closed",
+  "plan_intent_accepted",
+  "task_revision_accepted",
+  "plan_revision_accepted",
+  "iteration_grant_recorded",
+]);
+
+/**
+ * The exact reference keys each event kind may carry (the minimal
+ * content-free provenance references of schema v8). Every entry must
+ * carry exactly its kind's keys — no more, no fewer.
+ */
+const EVENT_REFERENCE_KEYS = Object.freeze({
+  create_run: [],
+  start_agent_execution: ["execution_index", "state_id"],
+  start_decision_execution: ["execution_index", "state_id"],
+  agent_data_prepared: ["execution_index"],
+  agent_execution_session_created: ["execution_index"],
+  agent_tool_session_created: ["execution_index"],
+  agent_running: ["execution_index"],
+  agent_outputs_accepted: ["execution_index"],
+  agent_cleanup_completed: ["execution_index"],
+  agent_failed: ["execution_index"],
+  decision_evaluated: ["execution_index"],
+  decision_failed: ["execution_index"],
+  transition_committed: ["execution_index", "transition_index"],
+  run_waiting: ["wait_index"],
+  wait_response_recorded: ["wait_index"],
+  terminal_reached: [],
+  run_outputs_published: [],
+  run_succeeded: [],
+  run_failed: [],
+  run_cleanup_failed: [],
+  stage_generation_opened: ["generation_index"],
+  stage_iteration_opened: ["generation_index", "iteration_index"],
+  stage_iteration_closed: ["generation_index", "iteration_index"],
+  stage_generation_closed: ["generation_index"],
+  plan_intent_accepted: ["wait_index"],
+  task_revision_accepted: ["task_index"],
+  plan_revision_accepted: ["plan_index"],
+  iteration_grant_recorded: ["grant_index"],
+});
+
+/** The canonical presentation order of the reference columns. */
+const EVENT_REFERENCE_ORDER = Object.freeze([
+  "execution_index",
+  "state_id",
+  "transition_index",
+  "wait_index",
+  "generation_index",
+  "iteration_index",
+  "task_index",
+  "plan_index",
+  "grant_index",
+]);
+
+/** The exact reference keys of one event kind, or null when unknown. */
+export function eventReferenceKeys(kind) {
+  if (typeof kind !== "string" || !Object.hasOwn(EVENT_REFERENCE_KEYS, kind)) {
+    return null;
+  }
+  return EVENT_REFERENCE_KEYS[kind];
+}
 
 /** A UI-side contract violation: stable reason, no echoed values. */
 export class UiContractError extends Error {
@@ -244,6 +351,126 @@ function parseErrorDocument(document) {
   });
 }
 
+/* ------------------------------------------------------------------ */
+/* Lifecycle events (v4): the one events document contract owner.      */
+/* ------------------------------------------------------------------ */
+
+function expectPositiveInteger(record, key) {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new UiContractError("invalid_shape");
+  }
+  return value;
+}
+
+function parseEventEntry(entry) {
+  if (!isRecord(entry)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const kind = entry["kind"];
+  if (typeof kind !== "string" || !Object.hasOwn(EVENT_REFERENCE_KEYS, kind)) {
+    throw new UiContractError("unknown_event_kind");
+  }
+  const allowed = EVENT_REFERENCE_KEYS[kind];
+  const own = Object.keys(entry);
+  if (own.length !== allowed.length + 2 || !Object.hasOwn(entry, "revision")) {
+    throw new UiContractError("invalid_shape");
+  }
+  const projection = { revision: expectPositiveInteger(entry, "revision"), kind };
+  for (const key of allowed) {
+    if (!Object.hasOwn(entry, key)) {
+      throw new UiContractError("invalid_shape");
+    }
+    projection[key] = key === "state_id" ? expectString(entry, key) : expectPositiveInteger(entry, key);
+    if (key === "state_id" && !isSafeId(projection[key])) {
+      throw new UiContractError("invalid_shape");
+    }
+  }
+  return Object.freeze(projection);
+}
+
+/**
+ * The one parser of the versioned events document (schema 1). It
+ * accepts only `kind:"events"` with exact own keys at every level, a
+ * positive-safe-integer revision, exact reference shapes per event
+ * kind, and a `run_id` equal to the selected run. The history order is
+ * preserved verbatim; the returned projection is frozen and carries no
+ * raw response material.
+ */
+export function parseEventsDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "events") {
+    throw new UiContractError("unknown_kind");
+  }
+  expectShape(document, ["schema_version", "kind", "run_id", "revision", "events", "next_after"]);
+  const runId = expectString(document, "run_id");
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (typeof expectedRunId !== "string" || runId !== expectedRunId) {
+    throw new UiContractError("unexpected_run");
+  }
+  const events = expectArray(document, "events").map(parseEventEntry);
+  const nextAfter = document["next_after"];
+  if (nextAfter !== null && (typeof nextAfter !== "number" || !Number.isSafeInteger(nextAfter) || nextAfter < 1)) {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({
+    kind: "events",
+    runId,
+    revision: expectPositiveInteger(document, "revision"),
+    events: Object.freeze(events),
+    nextAfter,
+  });
+}
+
+/**
+ * The one document classifier of the events endpoint: a well-formed
+ * `events` document, or one of the endpoint's two documented failure
+ * envelopes (`error`, or the failed `command_result` of a rejected
+ * events read). A succeeded command result is unsuitable and fails
+ * closed; every other kind fails closed. The expected run id binds the
+ * events document and the failed command result to the selected run.
+ */
+function parseEventsEndpointDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "events") {
+    return parseEventsDocument(document, expectedRunId);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/** The one URL builder of every timeline events request. */
+export function eventsRequestPath(runId, after) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  return `/v1/runs/${runId}/events?after=${after}&limit=${EVENTS_PAGE_LIMIT}`;
+}
+
 /**
  * The one document classifier: schema_version 1 and a known kind are
  * required before any per-kind shape is read; anything else is a UI
@@ -394,14 +621,17 @@ async function readBoundedText(response) {
 }
 
 /**
- * The one browser API client owner. It checks the HTTP content type,
- * reads the body bounded, requires schema_version 1, classifies the
- * document only by `kind`, and returns the built UI model — the raw
- * response is never retained. A mutating request whose delivery is
- * unknown (network failure after send) is reported as `lost`, which the
- * caller must treat as outcome-unknown and recover through inspect only.
+ * The one wire owner of every API GET of the module: it checks the HTTP
+ * content type, reads the body bounded, requires JSON, and hands the
+ * parsed document to the endpoint's own document classifier — the
+ * general API client classifies with `parseApiDocument`, the events
+ * client with the events endpoint classifier, so the expected response
+ * kind stays bound to the called endpoint. A mutating request whose
+ * delivery is unknown (network failure after send) is reported as
+ * `lost`, which the caller must treat as outcome-unknown and recover
+ * through inspect only.
  */
-export async function requestApiJson(fetchImpl, path, init) {
+async function requestJsonDocument(fetchImpl, path, init, parseDocument) {
   const method = init !== undefined && init !== null && typeof init.method === "string" ? init.method : "GET";
   let response;
   try {
@@ -449,7 +679,7 @@ export async function requestApiJson(fetchImpl, path, init) {
     });
   }
   try {
-    return Object.freeze({ ok: true, lost: false, model: parseApiDocument(document) });
+    return Object.freeze({ ok: true, lost: false, model: parseDocument(document) });
   } catch (error) {
     if (error instanceof UiContractError) {
       return Object.freeze({
@@ -460,6 +690,25 @@ export async function requestApiJson(fetchImpl, path, init) {
     }
     throw error;
   }
+}
+
+/**
+ * The general API client: inspect, discovery and mutation endpoints.
+ * It never accepts an `events` document — the expected response kind
+ * stays bound to the called endpoint.
+ */
+export async function requestApiJson(fetchImpl, path, init) {
+  return requestJsonDocument(fetchImpl, path, init, parseApiDocument);
+}
+
+/**
+ * The events endpoint client: the lifecycle feed of one run. It accepts
+ * only the events document of that run (or the endpoint's documented
+ * failure envelopes) and never a run, discovery or succeeded mutation
+ * document.
+ */
+export async function requestEventsJson(fetchImpl, path, init, expectedRunId) {
+  return requestJsonDocument(fetchImpl, path, init, (document) => parseEventsEndpointDocument(document, expectedRunId));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1261,6 +1510,289 @@ export function liveStateLabel(state) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Lifecycle timeline (v4): cursor state, dense merge and the one      */
+/* single-flight events transport.                                     */
+/* ------------------------------------------------------------------ */
+
+/** The fresh timeline of one selected run: nothing loaded, cursor 0. */
+export function createTimelineState(runId) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  return Object.freeze({
+    runId,
+    cursor: 0,
+    snapshotRevision: 0,
+    events: Object.freeze([]),
+    nextAfter: null,
+    stopped: false,
+    error: null,
+  });
+}
+
+function isTimelineState(state) {
+  return isRecord(state) && isSafeId(state["runId"]) && typeof state["cursor"] === "number" && Number.isSafeInteger(state["cursor"]) && state["cursor"] >= 0 && Array.isArray(state["events"]);
+}
+
+/**
+ * The one dense merge of one validated events page into the timeline.
+ * `requestedAfter` is the exclusive cursor the request was built with:
+ * it must equal the applied cursor (a stale or misrouted page is a
+ * contract error, never a silent drop-in). The first entry — when
+ * present — must have `revision === after + 1`, every later revision
+ * must be exactly `previous + 1`; duplicates, gaps, regressions and
+ * out-of-order pages are contract errors. A non-null `nextAfter` must
+ * equal the last event revision of the page; a null `nextAfter` means
+ * the page reached the document revision, so an empty page is legal
+ * only when `after === revision`. The cursor advances only after the
+ * whole page validated; events keep their verbatim history order and
+ * are never merged, grouped or reordered.
+ */
+export function applyEventsPage(state, page, requestedAfter) {
+  if (!isTimelineState(state) || !isRecord(page) || page["kind"] !== "events") {
+    throw new UiContractError("invalid_state");
+  }
+  if (typeof requestedAfter !== "number" || !Number.isSafeInteger(requestedAfter) || requestedAfter < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  if (page["runId"] !== state["runId"]) {
+    throw new UiContractError("unexpected_run");
+  }
+  if (requestedAfter !== state["cursor"]) {
+    throw new UiContractError("stale_page");
+  }
+  if (page["revision"] < requestedAfter) {
+    throw new UiContractError("invalid_page");
+  }
+  const events = page["events"];
+  if (events.length === 0) {
+    if (page["nextAfter"] !== null || requestedAfter !== page["revision"]) {
+      throw new UiContractError("invalid_page");
+    }
+    return Object.freeze({
+      runId: state["runId"],
+      cursor: state["cursor"],
+      snapshotRevision: page["revision"],
+      events: state["events"],
+      nextAfter: null,
+      stopped: false,
+      error: null,
+    });
+  }
+  let expected = requestedAfter + 1;
+  for (const entry of events) {
+    if (!isRecord(entry) || entry["revision"] !== expected) {
+      throw new UiContractError("invalid_page");
+    }
+    expected += 1;
+  }
+  const lastRevision = events[events.length - 1]["revision"];
+  if (page["nextAfter"] !== null) {
+    if (page["nextAfter"] !== lastRevision) {
+      throw new UiContractError("invalid_page");
+    }
+  } else if (lastRevision !== page["revision"]) {
+    throw new UiContractError("invalid_page");
+  }
+  const cursor = page["nextAfter"] === null ? page["revision"] : page["nextAfter"];
+  return Object.freeze({
+    runId: state["runId"],
+    cursor,
+    snapshotRevision: page["revision"],
+    events: Object.freeze([...state["events"], ...events]),
+    nextAfter: page["nextAfter"],
+    stopped: false,
+    error: null,
+  });
+}
+
+/**
+ * Stops the timeline fail-closed on one classified failure. The state,
+ * cursor and rendered history stay untouched; only the automatic tail
+ * observation stops until an explicit user action.
+ */
+export function stopTimeline(state, failure) {
+  if (!isTimelineState(state)) {
+    throw new UiContractError("invalid_state");
+  }
+  const layer = isRecord(failure) && typeof failure["layer"] === "string" && failure["layer"] !== "" ? failure["layer"] : null;
+  const reason = isRecord(failure) && typeof failure["reason"] === "string" && failure["reason"] !== "" ? failure["reason"] : null;
+  if (layer === null || reason === null) {
+    throw new UiContractError("invalid_failure");
+  }
+  return Object.freeze({ ...state, stopped: true, error: Object.freeze({ layer, reason }) });
+}
+
+/**
+ * `invalid_cursor` stops the timeline without a retry path — the cursor
+ * contract itself is broken and only an explicit reload may recover;
+ * every other failure keeps the explicit `Retry timeline` action.
+ */
+export function timelineRetryAvailable(state) {
+  if (!isTimelineState(state) || state["stopped"] !== true || !isRecord(state["error"])) {
+    return false;
+  }
+  return !(state["error"]["layer"] === "request" && state["error"]["reason"] === "invalid_cursor");
+}
+
+/**
+ * The separated revision summary of the timeline: the last applied
+ * authoritative inspect revision and the event snapshot revision may
+ * briefly differ (a concurrent append makes the read-only events
+ * snapshot newer than the last inspect); both are shown separately.
+ */
+export function timelineSummary(state, inspectRevision) {
+  if (!isTimelineState(state)) {
+    throw new UiContractError("invalid_state");
+  }
+  const loaded = state["snapshotRevision"] > 0 || state["events"].length > 0;
+  return Object.freeze({
+    detailRevision: typeof inspectRevision === "number" && Number.isSafeInteger(inspectRevision) && inspectRevision >= 0 ? inspectRevision : null,
+    eventsRevision: state["snapshotRevision"],
+    cursor: state["cursor"],
+    caughtUp: loaded && state["nextAfter"] === null && state["stopped"] !== true,
+    hasMore: loaded && state["stopped"] !== true && state["nextAfter"] !== null,
+    stopped: state["stopped"] === true,
+  });
+}
+
+/**
+ * The aria-live policy of one applied page: the number of added
+ * events, reaching the caught-up state and the timeline error are
+ * announced; individual rows never are, and an unchanged page is
+ * silent.
+ */
+export function timelineAnnouncement(previous, next) {
+  if (!isTimelineState(previous) || !isTimelineState(next)) {
+    throw new UiContractError("invalid_state");
+  }
+  if (next["stopped"] === true) {
+    if (previous["stopped"] !== true) {
+      const error = isRecord(next["error"]) ? next["error"] : null;
+      const layer = error !== null && typeof error["layer"] === "string" && error["layer"] !== "" ? error["layer"] : "unknown";
+      const reason = error !== null && typeof error["reason"] === "string" && error["reason"] !== "" ? error["reason"] : "unknown_failure";
+      return `Lifecycle events error: ${layer}: ${reason}.`;
+    }
+    return null;
+  }
+  const added = next["events"].length - previous["events"].length;
+  const wasLoaded = previous["snapshotRevision"] > 0 || previous["events"].length > 0;
+  const isLoaded = next["snapshotRevision"] > 0 || next["events"].length > 0;
+  const wasCaughtUp = wasLoaded && previous["nextAfter"] === null;
+  const isCaughtUp = isLoaded && next["nextAfter"] === null;
+  if (added > 0) {
+    return isCaughtUp && !wasCaughtUp ? `Added ${added} lifecycle events. Caught up.` : `Added ${added} lifecycle events.`;
+  }
+  if (isCaughtUp && !wasCaughtUp) {
+    return "Lifecycle events caught up.";
+  }
+  return null;
+}
+
+/**
+ * The one single-flight admission owner of every events GET of the
+ * module: at most one unsettled events request for the selected run.
+ * A desire that arrives while a request is on the wire is refused
+ * without a second fetch (no queue, no coalesced follow-up, no
+ * retries); the automatic tail is re-derived from the next applied
+ * inspect, and an explicit user action may be repeated. Selection
+ * changes and `dispose()` invalidate the active result (its response
+ * is never applied); the abort is best effort and never frees the wire
+ * slot by itself — only the actual settlement does.
+ */
+export function createEventsTransport(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["fetchEvents"] !== "function" ||
+    typeof io["onStarted"] !== "function" ||
+    typeof io["onSettled"] !== "function"
+  ) {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const fetchEvents = io["fetchEvents"];
+  const onStarted = io["onStarted"];
+  const onSettled = io["onSettled"];
+  let active = null;
+  let disposed = false;
+
+  const startRequest = (request) => {
+    if (active !== null) {
+      throw new UiContractError("transport_slot_busy");
+    }
+    active = request;
+    const controller = new AbortController();
+    request.controller = controller;
+    onStarted(request.runId);
+    void (async () => {
+      let result;
+      try {
+        result = await fetchEvents(request.runId, request.after, controller.signal);
+      } catch {
+        result = undefined;
+      } finally {
+        settleActive(request, result);
+      }
+    })();
+  };
+
+  const settleActive = (request, result) => {
+    try {
+      if (!request.superseded) {
+        request.onApplied(result);
+      }
+    } finally {
+      active = null;
+      onSettled(request.runId);
+      request.resolve(result);
+    }
+  };
+
+  return Object.freeze({
+    /**
+     * Admits one events desire: started requests return
+     * `{started: true, settled}`; refused desires resolve without any
+     * fetch and without effects.
+     */
+    request(desire) {
+      const runId = isRecord(desire) && isSafeId(desire["runId"]) ? desire["runId"] : null;
+      const after = isRecord(desire) && typeof desire["after"] === "number" && Number.isSafeInteger(desire["after"]) && desire["after"] >= 0 ? desire["after"] : null;
+      const onApplied = isRecord(desire) && typeof desire["onApplied"] === "function" ? desire["onApplied"] : null;
+      let resolveResult = null;
+      const settled = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      if (disposed || runId === null || after === null || onApplied === null || active !== null) {
+        resolveResult(undefined);
+        return Object.freeze({ started: false, settled });
+      }
+      const request = { runId, after, onApplied, superseded: false, controller: null, resolve: resolveResult, settledPromise: settled };
+      startRequest(request);
+      return Object.freeze({ started: true, settled });
+    },
+    /**
+     * Supersedes the active result and aborts it best effort; the wire
+     * slot is freed only by the actual settlement. Returns the settled
+     * promise of the superseded request, or null when none was active.
+     */
+    invalidate() {
+      if (active === null) {
+        return null;
+      }
+      active.superseded = true;
+      active.controller.abort();
+      return active.settledPromise ?? null;
+    },
+    dispose() {
+      disposed = true;
+      if (active !== null) {
+        active.superseded = true;
+        active.controller.abort();
+      }
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Thin DOM adapter: createElement/textContent only.                   */
 /* ------------------------------------------------------------------ */
 
@@ -1391,6 +1923,215 @@ function renderRunDetail(model) {
   document.getElementById("outputs-table").hidden = false;
 }
 
+/* ------------------------------------------------------------------ */
+/* Lifecycle timeline (v4): the thin DOM adapter of the events feed.   */
+/* ------------------------------------------------------------------ */
+
+/** The verbatim reference text of one event: only the safe public
+ * references, in the canonical order, as `key=value` pairs. */
+function eventReferenceText(entry) {
+  const parts = [];
+  for (const key of EVENT_REFERENCE_ORDER) {
+    if (Object.hasOwn(entry, key)) {
+      parts.push(`${key}=${String(entry[key])}`);
+    }
+  }
+  return parts.join(", ");
+}
+
+function resetTimelineDom() {
+  document.getElementById("events-body").replaceChildren();
+  document.getElementById("events-status").textContent = "";
+  document.getElementById("events-load-more").hidden = true;
+  document.getElementById("events-retry").hidden = true;
+}
+
+/** The timeline of the selected run: created once per selection and
+ * reset on a reload; a run change discards the previous timeline and
+ * invalidates its in-flight events GET. */
+function ensureTimelineFor(runId) {
+  if (timeline !== null && timeline.runId === runId) {
+    document.getElementById("events-section").hidden = false;
+    return;
+  }
+  eventsTransport.invalidate();
+  timeline = createTimelineState(runId);
+  lastInspectRevision = null;
+  document.getElementById("events-section").hidden = false;
+  resetTimelineDom();
+  renderTimelineMeta();
+}
+
+function renderTimelineMeta() {
+  if (timeline === null) {
+    return;
+  }
+  const summary = timelineSummary(timeline, lastInspectRevision);
+  const detail = summary.detailRevision === null ? "–" : String(summary.detailRevision);
+  let text = `Detail revision: ${detail} · Events revision: ${summary.eventsRevision} · Cursor: ${summary.cursor} · `;
+  if (summary.stopped) {
+    text += "stopped";
+  } else if (summary.caughtUp) {
+    text += "caught up";
+  } else if (summary.hasMore) {
+    text += "more available";
+  } else {
+    text += "loading";
+  }
+  document.getElementById("events-meta").textContent = text;
+  document.getElementById("events-load-more").hidden = !summary.hasMore;
+  document.getElementById("events-retry").hidden = !(timeline.stopped && timelineRetryAvailable(timeline));
+}
+
+/** Append-only row rendering: only the not-yet-rendered events are
+ * added, so focus and scroll position survive every page. */
+function renderEventsDelta(previousCount) {
+  if (timeline === null) {
+    return;
+  }
+  const body = document.getElementById("events-body");
+  for (let index = previousCount; index < timeline.events.length; index += 1) {
+    const entry = timeline.events[index];
+    const row = document.createElement("tr");
+    row.appendChild(element("td", String(entry.revision)));
+    row.appendChild(element("td", entry.kind));
+    row.appendChild(element("td", eventReferenceText(entry)));
+    body.appendChild(row);
+  }
+}
+
+function announceTimeline(previous, next) {
+  const message = timelineAnnouncement(previous, next);
+  if (message !== null) {
+    document.getElementById("events-status").textContent = message;
+  }
+}
+
+/**
+ * The one application path of a settled events GET: the page merges
+ * only into the still-selected run's timeline, failures stop the
+ * timeline fail-closed (isolated from the inspect detail and the
+ * mutation controls) and `invalid_cursor` leaves no retry path.
+ */
+function applyEventsOutcome(runId, after, result) {
+  if (selectedRunId !== runId || timeline === null || timeline.runId !== runId) {
+    return;
+  }
+  const previous = timeline;
+  if (result === undefined) {
+    timeline = stopTimeline(timeline, { layer: "transport", reason: "network_error" });
+    finishTimelineUpdate(previous);
+    return;
+  }
+  if (result.ok === false) {
+    timeline = stopTimeline(timeline, result.failure);
+    finishTimelineUpdate(previous);
+    return;
+  }
+  const model = result.model;
+  if (model.kind === "error") {
+    timeline = stopTimeline(timeline, { layer: model.layer, reason: model.reason });
+    finishTimelineUpdate(previous);
+    return;
+  }
+  if (model.kind === "command_result") {
+    timeline = stopTimeline(
+      timeline,
+      model.runId === runId
+        ? { layer: "orchestrator", reason: model.reason ?? "unknown_failure" }
+        : { layer: "contract", reason: "unexpected_run" },
+    );
+    finishTimelineUpdate(previous);
+    return;
+  }
+  try {
+    timeline = applyEventsPage(timeline, model, after);
+  } catch (error) {
+    if (error instanceof UiContractError) {
+      timeline = stopTimeline(previous, { layer: "contract", reason: error.reason });
+      finishTimelineUpdate(previous);
+      return;
+    }
+    throw error;
+  }
+  renderEventsDelta(previous.events.length);
+  finishTimelineUpdate(previous);
+}
+
+function finishTimelineUpdate(previous) {
+  announceTimeline(previous, timeline);
+  renderTimelineMeta();
+}
+
+function requestTimelinePage(runId, after) {
+  if (!isSafeId(runId)) {
+    return;
+  }
+  eventsTransport.request({
+    runId,
+    after,
+    onApplied: (result) => {
+      applyEventsOutcome(runId, after, result);
+    },
+  });
+}
+
+/**
+ * The one automatic events fetch site: an applied authoritative inspect
+ * may pull exactly one tail page when the timeline is caught up, not
+ * stopped, and behind the inspect revision. The initial load (cursor 0)
+ * is the same rule at selection time; a partial page (`nextAfter`
+ * non-null) is continued only through the explicit Load more action.
+ */
+function maybeTailEvents(model) {
+  if (selectedRunId !== model.runId || timeline === null || timeline.runId !== model.runId) {
+    return;
+  }
+  if (timeline.stopped || timeline.nextAfter !== null) {
+    return;
+  }
+  if (model.revision <= timeline.cursor) {
+    return;
+  }
+  requestTimelinePage(model.runId, timeline.cursor);
+}
+
+function loadMoreEvents() {
+  if (timeline === null || timeline.stopped || timeline.nextAfter === null) {
+    return;
+  }
+  requestTimelinePage(timeline.runId, timeline.nextAfter);
+}
+
+/**
+ * The explicit reload: the timeline resets to the fresh state and the
+ * feed restarts from the beginning. An in-flight events GET of the
+ * discarded timeline is invalidated first and awaited, so the reload
+ * request always reaches the wire.
+ */
+async function reloadTimeline() {
+  const runId = selectedRunId;
+  if (runId === null || !isSafeId(runId)) {
+    return;
+  }
+  const pending = eventsTransport.invalidate();
+  timeline = createTimelineState(runId);
+  lastInspectRevision = null;
+  resetTimelineDom();
+  renderTimelineMeta();
+  if (pending !== null) {
+    await pending;
+  }
+  requestTimelinePage(runId, 0);
+}
+
+function retryTimeline() {
+  if (timeline === null || !timeline.stopped || !timelineRetryAvailable(timeline)) {
+    return;
+  }
+  requestTimelinePage(timeline.runId, timeline.cursor);
+}
+
 function showRunModel(model, options = {}) {
   const key = liveObservationDocumentKey(model);
   // A manual inspect reset the detail panel first, so its own result
@@ -1408,6 +2149,10 @@ function showRunModel(model, options = {}) {
   }
   refreshSequence += 1;
   updateLiveStateLine();
+  ensureTimelineFor(model.runId);
+  lastInspectRevision = model.revision;
+  renderTimelineMeta();
+  maybeTailEvents(model);
   return changed;
 }
 
@@ -1518,6 +2263,8 @@ function inspectRun(runId) {
   document.getElementById("run-detail").hidden = true;
   document.getElementById("outputs-table").hidden = true;
   document.getElementById("run-controls").replaceChildren();
+  ensureTimelineFor(runId);
+  requestTimelinePage(runId, 0);
   inspectTransport.request({
     runId,
     onApplied: (result) => {
@@ -1908,6 +2655,8 @@ let projectsState = null;
 let selectedRunId = null;
 let lastDocumentKey = null;
 let refreshSequence = 0;
+let timeline = null;
+let lastInspectRevision = null;
 const mutationGate = createMutationGate();
 const runsGuard = createGenerationGuard();
 const fetchImplementation = typeof fetch === "function" ? fetch : null;
@@ -1925,6 +2674,19 @@ const inspectTransport = createInspectTransport({
   },
   onInspectDropped: (runId) => {
     applySchedulerEffect(scheduler.inspectCancelled(runId));
+  },
+});
+const eventsTransport = createEventsTransport({
+  fetchEvents: (runId, after, signal) => requestEventsJson(fetchImplementation, eventsRequestPath(runId, after), { signal }, runId),
+  onStarted: () => {
+    for (const id of ["events-load-more", "events-reload", "events-retry"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["events-load-more", "events-reload", "events-retry"]) {
+      document.getElementById(id).disabled = false;
+    }
   },
 });
 
@@ -2002,6 +2764,15 @@ function boot() {
     void submitNewRun(event);
   });
   document.getElementById("input-rows").appendChild(addInputRow());
+  document.getElementById("events-load-more").addEventListener("click", () => {
+    loadMoreEvents();
+  });
+  document.getElementById("events-reload").addEventListener("click", () => {
+    void reloadTimeline();
+  });
+  document.getElementById("events-retry").addEventListener("click", () => {
+    retryTimeline();
+  });
   clearMessages();
 }
 

@@ -56,6 +56,23 @@
       </thead>
       <tbody id="outputs-body"></tbody>
     </table>
+    <div id="events-section" hidden>
+      <h3 id="events-heading">Lifecycle events</h3>
+      <p id="events-meta" class="events-meta"></p>
+      <p id="events-status" class="events-live" aria-live="polite"></p>
+      <table id="events-table">
+        <caption>Committed lifecycle events of the selected run</caption>
+        <thead>
+          <tr><th scope="col">Revision</th><th scope="col">Kind</th><th scope="col">References</th></tr>
+        </thead>
+        <tbody id="events-body"></tbody>
+      </table>
+      <div class="events-actions">
+        <button type="button" id="events-load-more" hidden>Load more</button>
+        <button type="button" id="events-reload" hidden>Reload timeline</button>
+        <button type="button" id="events-retry" hidden>Retry timeline</button>
+      </div>
+    </div>
   </section>
   <section id="new-run-section" aria-labelledby="new-run-heading">
     <h2 id="new-run-heading">New run</h2>

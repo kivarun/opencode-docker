@@ -92,21 +92,36 @@ describe("ui inspect http: the deferred fixture server", () => {
     }
   });
 
-  /** The client-side wire: measures the unsettled-fetch span exactly. */
+  let inspectActive = 0;
+  let inspectMaxActive = 0;
+  let inspectStarts = 0;
+  const INSPECT_PATH = /\/v1\/runs\/[^/?]+$/;
+
+  /** The client-side wire: measures the unsettled-fetch span exactly.
+   * The inspect GETs carry their own counters: since UI v4 the events
+   * transport runs its own single-flight GETs beside the inspect
+   * transport, so the inspect single-flight pins must not count them. */
   function harnessFetch(path: string, init?: RequestInit): Promise<Response> {
     clientEvents.push({ kind: "start", seq: clientEvents.length + 1 });
     clientActive += 1;
     clientStarts += 1;
     if (clientActive > clientMaxActive) clientMaxActive = clientActive;
+    const isInspect = (init === undefined || typeof init.method !== "string" || init.method === "GET") && INSPECT_PATH.test(path);
+    if (isInspect) {
+      inspectActive += 1;
+      inspectStarts += 1;
+      if (inspectActive > inspectMaxActive) inspectMaxActive = inspectActive;
+    }
     const seq = clientEvents.length;
     return realFetch(`http://127.0.0.1:${port}${path}`, init).finally(() => {
       clientActive -= 1;
+      if (isInspect) inspectActive -= 1;
       clientEvents.push({ kind: "finish", seq });
     });
   }
 
   function startCount(): number {
-    return clientStarts;
+    return inspectStarts;
   }
 
   /** Waits until every outstanding client fetch has settled. */
@@ -134,7 +149,7 @@ describe("ui inspect http: the deferred fixture server", () => {
     harness.clickRunInspect(0);
     await Bun.sleep(10);
     expect(held.has("run-a")).toBe(true);
-    expect(clientActive).toBe(1);
+    expect(inspectActive).toBe(1);
     // the Refresh takeover aborts the held request: its fetch settles
     // (rejection is a settlement), the slot frees and exactly one
     // follow-up GET runs over real HTTP
@@ -146,7 +161,7 @@ describe("ui inspect http: the deferred fixture server", () => {
     expect(held.has("run-a")).toBe(true);
     held.get("run-a")?.release();
     await waitForClientSettled();
-    expect(clientMaxActive).toBe(1);
+    expect(inspectMaxActive).toBe(1);
     // exactly one follow-up GET runs after the aborted slot is released
     expect(startCount() - startsBefore).toBe(1);
     expect(harness.element("detail-revision").textContent).toBe("6");
@@ -163,7 +178,7 @@ describe("ui inspect http: the deferred fixture server", () => {
     harness.clickRunInspect(0);
     await Bun.sleep(10);
     expect(held.has("run-a")).toBe(true);
-    expect(clientActive).toBe(1);
+    expect(inspectActive).toBe(1);
     const startsBefore = startCount();
     harness.click("inspect-selected");
     // synchronously after the takeover nothing has settled yet and the
@@ -173,7 +188,7 @@ describe("ui inspect http: the deferred fixture server", () => {
     // the superseded handler is orphaned server-side: release its gate
     held.get("run-a")?.release();
     await waitForClientSettled();
-    expect(clientMaxActive).toBe(1);
+    expect(inspectMaxActive).toBe(1);
     // exactly one follow-up GET runs after the aborted slot is released
     expect(startCount() - startsBefore).toBe(1);
     // the settled detail carries exactly the follow-up response, never
@@ -278,18 +293,29 @@ describe("ui inspect http: the real control-plane service", () => {
   let clientActive = 0;
   let clientMaxActive = 0;
   let clientStarts = 0;
+  let inspectActive = 0;
+  let inspectMaxActive = 0;
+  let inspectStarts = 0;
+  const INSPECT_PATH = /\/v1\/runs\/[^/?]+$/;
 
   function probeFetch(path: string, init?: RequestInit): Promise<Response> {
     clientActive += 1;
     clientStarts += 1;
     if (clientActive > clientMaxActive) clientMaxActive = clientActive;
+    const isInspect = (init === undefined || typeof init.method !== "string" || init.method === "GET") && INSPECT_PATH.test(path);
+    if (isInspect) {
+      inspectActive += 1;
+      inspectStarts += 1;
+      if (inspectActive > inspectMaxActive) inspectMaxActive = inspectActive;
+    }
     return realFetch(`http://127.0.0.1:${port}${path}`, init).finally(() => {
       clientActive -= 1;
+      if (isInspect) inspectActive -= 1;
     });
   }
 
   function startCount(): number {
-    return clientStarts;
+    return inspectStarts;
   }
 
   /** Bounded wait for a client-side condition (100 x 200 ms). */
@@ -345,7 +371,7 @@ describe("ui inspect http: the real control-plane service", () => {
     const before = fingerprintTree(runTree);
     harness.clickRunInspect(0);
     await waitFor(() => harness.element("run-detail").hidden === false && harness.element("detail-revision").textContent !== "");
-    expect(clientMaxActive).toBe(1);
+    expect(inspectMaxActive).toBe(1);
     expect(fingerprintTree(runTree)).toBe(before);
 
     // a takeover burst while a real GET is on the wire: with the burst
@@ -357,8 +383,8 @@ describe("ui inspect http: the real control-plane service", () => {
     harness.click("inspect-selected");
     harness.click("inspect-selected");
     harness.click("inspect-selected");
-    await waitFor(() => clientActive === 0);
-    expect(clientMaxActive).toBe(1);
+    await waitFor(() => inspectActive === 0);
+    expect(inspectMaxActive).toBe(1);
     // exactly one superseded request and one coalesced follow-up ran
     expect(startCount() - startsBefore).toBe(2);
     expect(harness.element("detail-revision").textContent !== "").toBe(true);

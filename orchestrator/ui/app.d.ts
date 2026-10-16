@@ -295,3 +295,126 @@ export declare function createSchedulerTimerAdapter(timers: UiSchedulerTimers, o
 export declare function liveObservationDocumentKey(model: unknown): string;
 export declare function livePollAnnouncement(previousDocumentKey: unknown, model: unknown): string | null;
 export declare function liveStateLabel(state: unknown): string;
+
+/* ------------------------------------------------------------------ */
+/* Lifecycle timeline (v4): the read-only events feed of one run.      */
+/* ------------------------------------------------------------------ */
+
+/** The fixed page limit of every timeline events request. */
+export declare const EVENTS_PAGE_LIMIT: 100;
+
+/** The closed public event-kind vocabulary of pipeline state schema v8. */
+export declare const PIPELINE_V2_EVENT_KINDS: readonly string[];
+
+/** The exact reference keys one event kind may carry; null when unknown. */
+export declare function eventReferenceKeys(kind: unknown): readonly string[] | null;
+
+export type UiEventEntry = { readonly revision: number; readonly kind: string } & { readonly [reference: string]: unknown };
+
+export interface UiEventsModel {
+  readonly kind: "events";
+  readonly runId: string;
+  readonly revision: number;
+  readonly events: readonly UiEventEntry[];
+  readonly nextAfter: number | null;
+}
+
+/**
+ * The one parser of the versioned events document: schema 1, exact own
+ * keys at every level, the 28 public kinds with their exact reference
+ * shapes, positive-safe-integer revisions, and a run id equal to the
+ * selected run. History order is preserved verbatim.
+ */
+export declare function parseEventsDocument(document: unknown, expectedRunId: string): UiEventsModel;
+
+export type UiEventsEndpointModel = UiEventsModel | UiErrorModel | UiCommandResultModel;
+
+export type UiEventsResult =
+  | { readonly ok: true; readonly lost: false; readonly model: UiEventsEndpointModel }
+  | { readonly ok: false; readonly lost: false; readonly failure: UiApiFailure };
+
+/**
+ * The events endpoint client: accepts only the events document of the
+ * expected run (or the endpoint's documented failure envelopes) and
+ * never satisfies an inspect, discovery or mutation request.
+ */
+export declare function requestEventsJson(
+  fetchImpl: (path: string, init?: RequestInit) => Promise<Response>,
+  path: string,
+  init: RequestInit,
+  expectedRunId: string,
+): Promise<UiEventsResult>;
+
+/** The one URL builder of every timeline events request. */
+export declare function eventsRequestPath(runId: string, after: number): string;
+
+export interface UiTimelineState {
+  readonly runId: string;
+  readonly cursor: number;
+  readonly snapshotRevision: number;
+  readonly events: readonly UiEventEntry[];
+  readonly nextAfter: number | null;
+  readonly stopped: boolean;
+  readonly error: UiApiFailure | null;
+}
+
+export declare function createTimelineState(runId: string): UiTimelineState;
+
+/**
+ * The one dense merge: exclusive cursor, first entry `after + 1`,
+ * strictly dense revisions, `nextAfter` bound to the last event, and
+ * an empty page only when the cursor reached the document revision.
+ */
+export declare function applyEventsPage(state: UiTimelineState, page: UiEventsModel, requestedAfter: number): UiTimelineState;
+
+export declare function stopTimeline(state: UiTimelineState, failure: UiApiFailure): UiTimelineState;
+
+/** False for every stop reason except the broken cursor contract. */
+export declare function timelineRetryAvailable(state: UiTimelineState): boolean;
+
+export interface UiTimelineSummary {
+  readonly detailRevision: number | null;
+  readonly eventsRevision: number;
+  readonly cursor: number;
+  readonly caughtUp: boolean;
+  readonly hasMore: boolean;
+  readonly stopped: boolean;
+}
+
+export declare function timelineSummary(state: UiTimelineState, inspectRevision: number | null): UiTimelineSummary;
+
+export declare function timelineAnnouncement(previous: UiTimelineState, next: UiTimelineState): string | null;
+
+export interface UiEventsTransportIo {
+  /** The only events GET site; receives the request's abort signal. */
+  readonly fetchEvents: (runId: string, after: number, signal: AbortSignal) => Promise<UiEventsResult | undefined>;
+  /** Fires exactly once per fetch start, before the request goes out. */
+  readonly onStarted: (runId: string) => void;
+  /** Fires exactly once per started request's settlement. */
+  readonly onSettled: (runId: string) => void;
+}
+
+export interface UiEventsDesire {
+  readonly runId: string;
+  readonly after: number;
+  /** Called only when the request settled and was never superseded. */
+  readonly onApplied: (result: UiEventsResult | undefined) => void;
+}
+
+export interface UiEventsTransport {
+  /**
+   * Admits one events desire: an idle wire slot starts the fetch
+   * immediately; a busy slot refuses the desire without a second
+   * fetch. Returns the started flag and the settled promise.
+   */
+  request(desire: UiEventsDesire): { readonly started: boolean; readonly settled: Promise<UiEventsResult | undefined> };
+  /**
+   * Supersedes the active result and aborts it best effort; returns
+   * the settled promise of the superseded request, or null.
+   */
+  invalidate(): Promise<UiEventsResult | undefined> | null;
+  /** Refuses every later desire and supersedes the active result. */
+  dispose(): void;
+}
+
+export declare function createEventsTransport(io: UiEventsTransportIo): UiEventsTransport;

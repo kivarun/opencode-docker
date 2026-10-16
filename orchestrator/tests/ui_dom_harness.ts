@@ -142,6 +142,14 @@ export interface UiHarness {
   detailStatus(): string;
   /** The `textContent` of every rendered run-controls child, joined by `|`. */
   controlsText(): string;
+  /** The `Revision|Kind|References` triple of every rendered event row. */
+  eventsRows(): string[];
+  /** The lifecycle events aria-live line. */
+  eventsStatus(): string;
+  /** The timeline meta line (detail revision, events revision, cursor). */
+  eventsMeta(): string;
+  /** The hidden/disabled state of one timeline action button. */
+  eventsButtonState(id: string): { hidden: boolean; disabled: boolean };
   readonly clock: UiHarnessClock | null;
   /** Clicks the Inspect button of the run row at `index` in the runs table. */
   clickRunInspect(index: number): void;
@@ -177,6 +185,14 @@ const UI_ELEMENT_IDS = [
   "live-state",
   "new-run-id",
   "submit-run",
+  "events-section",
+  "events-meta",
+  "events-status",
+  "events-table",
+  "events-body",
+  "events-load-more",
+  "events-reload",
+  "events-retry",
 ] as const;
 
 export interface UiHarnessOptions {
@@ -310,6 +326,14 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
     detailRunId: () => harness.element("detail-run-id").textContent,
     detailStatus: () => harness.element("detail-status").textContent,
     controlsText: () => harness.element("run-controls").children.map((node) => node.textContent).join("|"),
+    eventsRows: () =>
+      harness.element("events-body").children.map((row) => row.children.map((cell) => cell.textContent).join("|")),
+    eventsStatus: () => harness.element("events-status").textContent,
+    eventsMeta: () => harness.element("events-meta").textContent,
+    eventsButtonState: (id) => {
+      const button = harness.element(id);
+      return { hidden: button.hidden, disabled: button.disabled };
+    },
     clock,
     dispose: () => {
       if (disposed) {

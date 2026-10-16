@@ -31,6 +31,7 @@ import {
   isSafeId,
   lostResponseRecovery,
   parseApiDocument,
+  parseEventsDocument,
   requestApiJson,
   runMutationFlow,
   runsPagePath,
@@ -70,17 +71,41 @@ describe("ui model: document classification", () => {
     expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "mystery" }))).toBe("unknown_kind");
     expect(contractReason(() => parseApiDocument({ schema_version: 1 }))).toBe("unknown_kind");
     expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "run", extra: 1, run_id: "r", revision: 1, status: "running", boundary: {}, outputs: [] }))).toBe("invalid_shape");
-    // the browser UI boundary: the events feed stays API/CLI-only until a
-    // dedicated UI increment; the parser keeps failing closed on the kind
+    // the general API client boundary: the events feed stays owned by
+    // the dedicated events client; an events document never satisfies
+    // an inspect, discovery or mutation request
     expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "events", run_id: "r", revision: 1, events: [], next_after: null }))).toBe("unknown_kind");
   });
 
-  test("the browser UI never references the events endpoint or kind", async () => {
-    const { readFile } = await import("node:fs/promises");
-    const app = await readFile(new URL("../ui/app.js", import.meta.url), "utf8");
-    expect(app.includes("/events")).toBe(false);
-    expect(app.includes('"events"')).toBe(false);
-    expect(app.includes("kind: \"events\"")).toBe(false);
+  test("the general client keeps rejecting the events kind; the events client owns the endpoint", async () => {
+    const jsonResponse = (document: unknown): Response =>
+      new Response(JSON.stringify(document), { status: 200, headers: { "content-type": "application/json" } });
+    const eventsDocument = {
+      schema_version: 1,
+      kind: "events",
+      run_id: "run-a",
+      revision: 1,
+      events: [{ revision: 1, kind: "create_run" }],
+      next_after: null,
+    };
+    const result = await requestApiJson(async () => jsonResponse(eventsDocument), "/v1/runs/run-a/events?after=0&limit=100");
+    expect(result.ok).toBe(false);
+    expect((result as { failure: { layer: string; reason: string } }).failure).toEqual({ layer: "contract", reason: "unknown_kind" });
+    // the endpoint acceptance helpers never accept an events model either
+    const eventsModel = parseEventsDocument(eventsDocument, "run-a");
+    expect(eventsModel.kind).toBe("events");
+    expect(expectRunOrError({ ok: true, model: eventsModel } as unknown as Parameters<typeof expectRunOrError>[0])).toEqual({
+      ok: false,
+      failure: { layer: "contract", reason: "unexpected_kind" },
+    });
+    expect(expectDiscoveryModel({ ok: true, model: eventsModel } as unknown as Parameters<typeof expectDiscoveryModel>[0], "runs")).toEqual({
+      ok: false,
+      failure: { layer: "contract", reason: "unexpected_kind" },
+    });
+    expect(expectMutationResult({ ok: true, model: eventsModel } as unknown as Parameters<typeof expectMutationResult>[0])).toEqual({
+      ok: false,
+      failure: { layer: "contract", reason: "unexpected_kind" },
+    });
   });
 
   test("the model is frozen and repeated parses are structurally identical", () => {
@@ -494,6 +519,19 @@ describe("ui model: export surface and source restrictions", () => {
         "liveObservationDocumentKey",
         "livePollAnnouncement",
         "liveStateLabel",
+        "EVENTS_PAGE_LIMIT",
+        "PIPELINE_V2_EVENT_KINDS",
+        "eventReferenceKeys",
+        "parseEventsDocument",
+        "requestEventsJson",
+        "eventsRequestPath",
+        "createTimelineState",
+        "applyEventsPage",
+        "stopTimeline",
+        "timelineRetryAvailable",
+        "timelineSummary",
+        "timelineAnnouncement",
+        "createEventsTransport",
       ].sort(),
     );
   });

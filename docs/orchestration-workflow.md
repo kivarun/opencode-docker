@@ -526,8 +526,9 @@ orchestrator inspect --run-id SAFE_ID --config-root ABS [--json]
 
 The schema-v8 `commit_history` is exported as the stable public event
 schema 1 through three read-only surfaces: the CLI, the control-plane
-subprocess substrate, and the loopback HTTP service. The Browser UI is
-deliberately not connected yet — the wire contract stabilizes first.
+subprocess substrate, and the loopback HTTP service. The Browser UI
+consumes the same wire contract as the read-only lifecycle timeline
+(see "Browser UI v4" below).
 
 - Single projection owner: `orchestrator/src/pipeline_v2_events.ts`
   accepts only a loader-validated schema-v8 state and the pagination
@@ -6101,10 +6102,88 @@ rebuild the detail DOM, so focus and selection survive.
 
 Still unwired: polling beyond the one selected run (list aggregation,
 discovery sweeps), automatic mutations from any observation result,
-retries/backoff, an operation queue or 202 jobs, event/log streaming,
-input upload or a task-body editor, deletion/retention,
-authentication/RBAC/TLS/remote bind, registry hot reload, and any HTTP
-schema or orchestrator CLI change.
+retries/backoff, an operation queue or 202 jobs, durable worker-log
+streaming (the read-only lifecycle events feed is consumed by the
+Browser UI v4 timeline — see the next section), input upload or a
+task-body editor, deletion/retention, authentication/RBAC/TLS/remote
+bind, registry hot reload, and any HTTP schema or orchestrator CLI
+change.
+
+### Browser UI v4: read-only lifecycle timeline
+(implemented, production-wired)
+
+The run detail shows the durable lifecycle events feed of the selected
+run in a `Lifecycle events` section over the existing
+`GET /v1/runs/:runId/events` — no new endpoint, no schema change, no
+CLI change and no mutation. The section is read-only observation: it
+never POSTs, never interprets events and never captures worker logs
+(worker stdout/stderr stay ephemeral).
+
+One dedicated events contract owner (`parseEventsDocument`) accepts
+only `schema_version: 1` + `kind: "events"`, validates the exact own
+keys of the document and every event entry against the closed 28-kind
+vocabulary with the exact required reference fields per kind, checks
+`run_id` against the selected run, requires positive-safe-integer
+revisions and indices, rejects inherited/extra/missing keys and
+incompatible references, preserves the history order verbatim, and
+returns a frozen projection. The shared wire owner `requestJsonDocument`
+is the single `fetch` site; `requestApiJson` keeps rejecting the events
+kind for inspect/discovery/mutation, and `requestEventsJson` accepts
+only `events`/`error`/failed `command_result` for the events endpoint —
+the expected response kind stays bound to the endpoint. The public
+`kind` is shown verbatim; there is no second display-label set.
+
+Cursor and pagination: the initial load at run selection is exactly
+`GET /v1/runs/<runId>/events?after=0&limit=100`. The merge rules are
+`after` exclusive, the first entry `after + 1`, strictly dense
+revisions (duplicate/gap/regression/out-of-order are contract errors),
+`next_after` equal to the last event's revision or null meaning caught
+up to the response revision, an empty page only at
+`after === revision`; the cursor moves only after a fully validated
+merge. Explicit actions: `Load more` (one click = one page, no
+auto-drain), `Reload timeline` (reset and repeat from after=0) and
+`Retry timeline` after a read/network/contract error. `invalid_cursor`
+stops the timeline fail-closed until an explicit Reload — no retry
+button, no auto-reset, no auto-retry.
+
+The meta line shows the detail revision (the last authoritative
+inspect), the events revision, the applied cursor and
+`caught up`/`more available`/`loading`/`stopped` separately: the detail
+and the event snapshot may briefly diverge under a concurrent append
+and reconcile at the next manual or live inspect.
+
+The inspect→tail rule: after every applied authoritative inspect
+(manual, scheduled live poll, mutation recovery) the timeline fires at
+most one tail `events?after=<cursor>` exactly when it is caught up, not
+stopped and behind the inspect revision; a partial page is continued
+only through `Load more`. There is no second scheduler and no new
+timer — the tail reuses the existing inspect cadence, and an events
+response never triggers an inspect, a recursive tail or a mutation and
+never affects the live-inspect polling eligibility.
+
+Single-flight: the events transport admits at most one unsettled events
+GET; a repeated request is refused (not coalesced), a selection change
+and `dispose()` invalidate the active/pending result, a late response
+of a previous run never applies, aborts are best-effort and never free
+the slot themselves, and there are no retries/backoff.
+
+Error isolation: a timeline error renders only in the timeline region
+as a safe `layer: reason`/`contract: reason` diagnostic (an orchestrator
+failure presents as `orchestrator: <reason>`); it never breaks the
+inspect detail, never disables the mutation controls and never POSTs;
+the automatic tail stops until an explicit user action.
+
+Rendering: a table with `Revision`/`Kind`/`References` columns — the
+kind verbatim, only present references in a fixed canonical order.
+Rows are appended through `createElement`/`textContent` only (focus and
+scroll survive every page), `aria-live` announces only added counts,
+caught-up and timeline errors (never per row), and there is no forced
+auto-scroll and no timestamps, interpretation, paths, contents or
+worker logs in any row.
+
+Still unwired in the timeline: durable worker-log capture, events
+filtering/search/export, automatic mutations from any observation
+result, and any HTTP schema or orchestrator CLI change.
 
 ## Event and log handling
 
