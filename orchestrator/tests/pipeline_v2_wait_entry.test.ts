@@ -1202,6 +1202,7 @@ import {
   type PipelineV2RunOutcome,
 } from "../src/pipeline_v2_runner.ts";
 import type { AuthFetcher, CliRunner } from "../src/docker_helper.ts";
+import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
 import { preparePlanRevisionManifest, prepareTaskRevisionManifest } from "../src/pipeline_v2_run_plan_manifests.ts";
 import { preparePipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_candidate.ts";
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
@@ -1346,15 +1347,30 @@ function runnerDeps(harness: RunnerHarness): PipelineV2RunnerDeps {
     status: 200,
     body: { authority: "launcher", principal: "tester", launcher_id: EXPECTED_LAUNCHER_ID },
   });
+  // The stage worker declares no outputs; the fake worker operation
+  // completes without touching the outputs directory.
+  const operationRunner: PipelineV2WorkerOperationRunner = async () => ({
+    outcome: "completed",
+    capture: EMPTY_CAPTURE,
+  });
   return {
     cli,
     fetchAuth,
+    operationRunner,
     helperConfig: { socketPath: "/run/dh.sock", credentialFile: harness.credentialFile },
     baseEnv: { HOME: "/home/u", XDG_CONFIG_HOME: "/cfg", CODER_SOURCE_VAR_1: "coder-secret" },
     stateRootProjection: { localRoot: harness.stateRoot, daemonRoot: harness.stateRoot },
     now: nextTick,
   };
 }
+
+const EMPTY_CAPTURE = {
+  status: "unavailable" as const,
+  byteCount: 0,
+  tailBytes: new Uint8Array(0),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
 
 /**
  * The honest runner prefix up to the stage-entry cursor: plan r1 accepted,

@@ -35,6 +35,7 @@ import {
 } from "../src/pipeline_v2_state.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { runPipelineV2, resumePipelineV2, revisePipelineV2Task, resumePipelineV2PlanningRunPlan, type PipelineV2RunnerDeps, type PipelineV2RunOutcome } from "../src/pipeline_v2_runner.ts";
+import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
 import {
   acceptActivationOutputs,
   prepareActivationData,
@@ -933,57 +934,51 @@ function runnerDeps(harness: Harness, runId: string, options: { planBody?: strin
     if (args[0] === "session" && args[1] === "delete") {
       return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
     }
-    if (args[0] === "run") {
-      let mountStart = -1;
-      for (let i = 0; i < args.length; i += 1) {
-        if (args[i] === "--mount") {
-          mountStart = i;
-          break;
-        }
-      }
-      for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
-        const spec = args[i + 1] ?? "";
-        const [source, target] = spec.split(":");
-        if (target === "/pipeline/outputs") {
-          const parts = (source ?? "").split("/");
-          const activationIndex = parts[1]?.split("-")[0] ?? "";
-          const stateId = parts[1]?.split("-").slice(1).join("-") ?? "";
-          const dir = join(harness.runRoot, source ?? "");
-          await mkdir(dir, { recursive: true });
-          if (stateId === "architect") {
-            // the first planning execution proposes the initial plan; every
-            // later planning execution is the pointer-only replanning form
-            const proposal = activationIndex === "1"
-              ? {
-                  schema_version: 1,
-                  kind: "run_plan_proposal",
-                  stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
-                  new_tasks: [{ id: "task-a", body: planBody }],
-                }
-              : {
-                  schema_version: 1,
-                  kind: "run_plan_proposal",
-                  stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
-                  new_tasks: [],
-                };
-            await writeFile(join(dir, "plan"), JSON.stringify(proposal), { mode: 0o600 });
-          }
-          if (stateId === "planner2") {
-            await writeFile(join(dir, "plan2"), JSON.stringify({
-            schema_version: 1,
-            kind: "run_plan_proposal",
-            stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
-            new_tasks: [],
-          }), { mode: 0o600 });
-          }
-        }
-      }
-      return { code: 0 };
-    }
     return { code: 0 };
+  };
+  const operationRunner: PipelineV2WorkerOperationRunner = async (request) => {
+    const body = JSON.parse(request.body) as {
+      mounts?: Array<{ source?: string; target?: string }>;
+    };
+    const outputsMount = (body.mounts ?? []).find((mount) => mount.target === "/pipeline/outputs");
+    if (outputsMount !== undefined && typeof outputsMount.source === "string") {
+      const parts = outputsMount.source.split("/");
+      const activationIndex = parts[1]?.split("-")[0] ?? "";
+      const stateId = parts[1]?.split("-").slice(1).join("-") ?? "";
+      const dir = join(harness.runRoot, outputsMount.source);
+      await mkdir(dir, { recursive: true });
+      if (stateId === "architect") {
+        // the first planning execution proposes the initial plan; every
+        // later planning execution is the pointer-only replanning form
+        const proposal = activationIndex === "1"
+          ? {
+              schema_version: 1,
+              kind: "run_plan_proposal",
+              stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+              new_tasks: [{ id: "task-a", body: planBody }],
+            }
+          : {
+              schema_version: 1,
+              kind: "run_plan_proposal",
+              stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+              new_tasks: [],
+            };
+        await writeFile(join(dir, "plan"), JSON.stringify(proposal), { mode: 0o600 });
+      }
+      if (stateId === "planner2") {
+        await writeFile(join(dir, "plan2"), JSON.stringify({
+        schema_version: 1,
+        kind: "run_plan_proposal",
+        stages: [{ id: "stage-1", template: "development", tasks: [{ id: "task-a", depends_on: [] }] }],
+        new_tasks: [],
+      }), { mode: 0o600 });
+      }
+    }
+    return { outcome: "completed", capture: EMPTY_CAPTURE };
   };
   return {
     cli: cli as never,
+    operationRunner,
     fetchAuth: (async () => ({
       status: 200,
       body: { authority: "launcher", principal: "tester", launcher_id: EXPECTED_LAUNCHER_ID },
@@ -994,6 +989,14 @@ function runnerDeps(harness: Harness, runId: string, options: { planBody?: strin
     now: nextTick,
   };
 }
+
+const EMPTY_CAPTURE = {
+  status: "unavailable" as const,
+  byteCount: 0,
+  tailBytes: new Uint8Array(0),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
 
 const EXPECTED_LAUNCHER_ID = "dhl_plan_ready";
 

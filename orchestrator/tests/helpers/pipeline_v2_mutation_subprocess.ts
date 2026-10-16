@@ -17,6 +17,7 @@ import {
   runPipelineV2,
 } from "../../src/pipeline_v2_runner.ts";
 import type { AuthFetcher, CliRunner } from "../../src/docker_helper.ts";
+import type { PipelineV2WorkerOperationRunner } from "../../src/pipeline_v2_docker_runtime.ts";
 
 interface SubprocessSpec {
   command:
@@ -143,42 +144,37 @@ async function run(): Promise<void> {
       stats.pull += 1;
       return { code: 0 };
     }
-    if (args[0] === "run") {
-      stats.run += 1;
-      if (spec.gateWorkerRun) {
-        process.stdout.write("GATE run\n");
-        await stdin.next();
-      }
-      // The fake worker materializes the declared outputs into the
-      // activation outputs mount, exactly like a real worker would.
-      let mountStart = -1;
-      for (let i = 0; i < args.length; i += 1) {
-        if (args[i] === "--mount") {
-          mountStart = i;
-          break;
-        }
-      }
-      const runRoot = `${spec.stateRoot}/pipeline-runs/${spec.runId}`;
-      for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
-        const mountSpec = args[i + 1] ?? "";
-        const [source, target] = mountSpec.split(":");
-        if (target === "/pipeline/outputs") {
-          const segments = (source ?? "").split("/");
-          const dash = segments[1] ?? "";
-          const stateId = dash.slice(dash.indexOf("-") + 1);
-          const outputs = spec.workerOutputs?.[stateId];
-          if (outputs !== undefined) {
-            const dir = `${runRoot}/${source}`;
-            mkdirSync(dir, { recursive: true });
-            for (const [name, content] of Object.entries(outputs)) {
-              writeFileSync(`${dir}/${name}`, content);
-            }
-          }
-        }
-      }
-      return { code: spec.runCode ?? 1, timedOut: false };
-    }
     return { code: 1 };
+  };
+  // The fake worker operation: materializes the declared outputs into the
+  // activation outputs directory, exactly like a real worker would.
+  const operationRunner: PipelineV2WorkerOperationRunner =
+    async (request) => {
+    stats.run += 1;
+    if (spec.gateWorkerRun) {
+      process.stdout.write("GATE run\n");
+      await stdin.next();
+    }
+    const body = JSON.parse(request.body) as {
+      mounts?: Array<{ source?: string; target?: string }>;
+    };
+    const outputsMount = (body.mounts ?? []).find((mount) => mount.target === "/pipeline/outputs");
+    const runRoot = `${spec.stateRoot}/pipeline-runs/${spec.runId}`;
+    if (outputsMount !== undefined && typeof outputsMount.source === "string") {
+      const segments = outputsMount.source.split("/");
+      const dash = segments[1] ?? "";
+      const stateId = dash.slice(dash.indexOf("-") + 1);
+      const outputs = spec.workerOutputs?.[stateId];
+      if (outputs !== undefined) {
+        const dir = `${runRoot}/${outputsMount.source}`;
+        mkdirSync(dir, { recursive: true });
+        for (const [name, content] of Object.entries(outputs)) {
+          writeFileSync(`${dir}/${name}`, content);
+        }
+      }
+    }
+    const outcome = (spec.runCode ?? 1) === 0 ? "completed" : "worker_failed";
+    return { outcome, capture: { status: "unavailable", byteCount: 0, tailBytes: new Uint8Array(0), truncatedDaemon: false, truncatedLocal: false } };
   };
   const fetchAuth: AuthFetcher = async () => {
     stats.auth += 1;
@@ -196,6 +192,7 @@ async function run(): Promise<void> {
   const runnerDeps = {
     cli,
     fetchAuth,
+    operationRunner,
     helperConfig: {
       socketPath: "/run/docker-helper/docker-helper.sock",
       credentialFile: `${spec.configRoot}/credential.token`,

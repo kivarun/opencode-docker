@@ -354,34 +354,30 @@ function makeChain(stateRoot: string, resultBody: Record<string, unknown>, credF
         if (args[0] === "pull") {
           return { code: 0 };
         }
-        if (args[0] === "run") {
-          for (let i = 0; i < args.length; i += 1) {
-            if (args[i] !== "--mount") {
-              continue;
-            }
-            const spec = args[i + 1] ?? "";
-            const first = spec.indexOf(":");
-            const source = spec.slice(0, first);
-            const rest = spec.slice(first + 1);
-            const second = rest.indexOf(":");
-            const target = second === -1 ? rest : rest.slice(0, second);
-            if (target === "/pipeline/outputs" && workspace !== "") {
-              const segments = source.split("/");
-              const dash = segments[1] ?? "";
-              const stateId = dash.slice(dash.indexOf("-") + 1);
-              if (stateId === "architect") {
-                writeFileSync(join(workspace, source, "plan"), JSON.stringify(P1_PROPOSAL), { mode: 0o600 });
-              }
-              if (stateId === "execute") {
-                writeFileSync(join(workspace, source, "result"), `${JSON.stringify(resultBody)}\n`, { mode: 0o600 });
-              }
-            }
-          }
-          return { code: 0 };
-        }
         return { code: 1 };
       },
       killActive: () => false,
+    },
+    operationRunner: async (request: { body: string }) => {
+      const body = JSON.parse(request.body) as {
+        mounts?: Array<{ source?: string; target?: string }>;
+      };
+      const outputsMount = (body.mounts ?? []).find((mount) => mount.target === "/pipeline/outputs");
+      if (outputsMount !== undefined && typeof outputsMount.source === "string" && workspace !== "") {
+        const segments = outputsMount.source.split("/");
+        const dash = segments[1] ?? "";
+        const stateId = dash.slice(dash.indexOf("-") + 1);
+        if (stateId === "architect") {
+          writeFileSync(join(workspace, outputsMount.source, "plan"), JSON.stringify(P1_PROPOSAL), { mode: 0o600 });
+        }
+        if (stateId === "execute") {
+          writeFileSync(join(workspace, outputsMount.source, "result"), `${JSON.stringify(resultBody)}\n`, { mode: 0o600 });
+        }
+      }
+      return {
+        outcome: "completed" as const,
+        capture: { status: "unavailable" as const, byteCount: 0, tailBytes: new Uint8Array(0), truncatedDaemon: false, truncatedLocal: false },
+      };
     },
     fetchAuth: () =>
       Promise.resolve({ status: 200, body: { authority: "launcher", principal: "proof", launcher_id: LAUNCHER_ID } }),

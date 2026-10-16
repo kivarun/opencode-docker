@@ -53,6 +53,7 @@ import {
   type PipelineV2RunnerDeps,
   type PipelineV2RunOutcome,
 } from "../src/pipeline_v2_runner.ts";
+import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
 import {
   acceptActivationOutputs,
   prepareActivationData,
@@ -1427,42 +1428,39 @@ function autoRunnerDeps(harness: AutoHarness, runId: string, script: RunnerScrip
     if (args[0] === "pull") {
       return { code: 0 };
     }
-    if (args[0] === "run") {
-      runCalls += 1;
-      if (script.signalOnRunCall !== undefined && runCalls === script.signalOnRunCall) {
-        signalHandler?.(script.signalKind ?? "SIGINT");
-      }
-      let mountStart = -1;
-      for (let i = 0; i < args.length; i += 1) {
-        if (args[i] === "--mount") {
-          mountStart = i;
-          break;
-        }
-      }
-      for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
-        const spec = args[i + 1] ?? "";
-        const [source, target] = spec.split(":");
-        if (target === "/pipeline/outputs") {
-          const dash = (source ?? "").split("/")[1] ?? "";
-          const dashIndex = dash.indexOf("-");
-          const activationIndex = dashIndex === -1 ? "" : dash.slice(0, dashIndex);
-          const stateId = dashIndex === -1 ? dash : dash.slice(dashIndex + 1);
-          if (stateId === "architect" || stateId === "planner2") {
-            // the first architect activation proposes the initial plan; every
-            // later planning activation is the pointer-only replanning form
-            const proposal = stateId === "architect" && activationIndex === "1" ? PROPOSAL_ONE_TASK : POINTER_ONLY_R2;
-            const dir = join(runRootKnown, source ?? "");
-            await mkdir(dir, { recursive: true });
-            await writeFile(join(dir, stateId === "architect" ? "plan" : "plan2"), JSON.stringify(proposal), { mode: 0o600 });
-          }
-        }
-      }
-      return { code: script.runCode ?? 0 };
-    }
     return { code: 0 };
+  };
+  const operationRunner: PipelineV2WorkerOperationRunner = async (request) => {
+    runCalls += 1;
+    if (script.signalOnRunCall !== undefined && runCalls === script.signalOnRunCall) {
+      signalHandler?.(script.signalKind ?? "SIGINT");
+    }
+    const body = JSON.parse(request.body) as {
+      mounts?: Array<{ source?: string; target?: string }>;
+    };
+    const outputsMount = (body.mounts ?? []).find((mount) => mount.target === "/pipeline/outputs");
+    if (outputsMount !== undefined && typeof outputsMount.source === "string") {
+      const dash = outputsMount.source.split("/")[1] ?? "";
+      const dashIndex = dash.indexOf("-");
+      const activationIndex = dashIndex === -1 ? "" : dash.slice(0, dashIndex);
+      const stateId = dashIndex === -1 ? dash : dash.slice(dashIndex + 1);
+      if (stateId === "architect" || stateId === "planner2") {
+        // the first architect activation proposes the initial plan; every
+        // later planning activation is the pointer-only replanning form
+        const proposal = stateId === "architect" && activationIndex === "1" ? PROPOSAL_ONE_TASK : POINTER_ONLY_R2;
+        const dir = join(runRootKnown, outputsMount.source);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, stateId === "architect" ? "plan" : "plan2"), JSON.stringify(proposal), { mode: 0o600 });
+      }
+    }
+    if ((script.runCode ?? 0) !== 0) {
+      return { outcome: "worker_failed", capture: EMPTY_CAPTURE };
+    }
+    return { outcome: "completed", capture: EMPTY_CAPTURE };
   };
   return {
     cli: cli as never,
+    operationRunner,
     fetchAuth: (async () => ({
       status: 200,
       body: { authority: "launcher", principal: "tester", launcher_id: EXPECTED_LAUNCHER_ID },
@@ -1477,6 +1475,14 @@ function autoRunnerDeps(harness: AutoHarness, runId: string, script: RunnerScrip
     randomId: () => runId,
   };
 }
+
+const EMPTY_CAPTURE = {
+  status: "unavailable" as const,
+  byteCount: 0,
+  tailBytes: new Uint8Array(0),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
 
 function autoRunOptions(harness: AutoHarness): PipelineV2RunOptions {
   return {

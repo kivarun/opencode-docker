@@ -30,6 +30,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "bun:test";
 import type { AuthFetcher, CliResult, CliRunner, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
+import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
 import { runCli, type CliIo } from "../src/main.ts";
 import {
   continuePipelineV2Stage,
@@ -389,12 +390,30 @@ function fakeCli(script: Script, sessionCreates: string[]): CliRunner {
     if (first === "pull") {
       return { code: 1, stderr: "PULL-FAILED-BY-TEST" };
     }
-    if (first === "run") {
-      return { code: script.runCode ?? 0, timedOut: script.runTimedOut ?? false };
-    }
     return { code: 1 };
   };
 }
+
+/** The fake worker operation for the continue-stage runner tests. */
+function fakeWorkerOperation(script: Script): PipelineV2WorkerOperationRunner {
+  return async () => {
+    if (script.runTimedOut === true) {
+      return { outcome: "worker_timeout", capture: EMPTY_CAPTURE };
+    }
+    if ((script.runCode ?? 0) !== 0) {
+      return { outcome: "worker_failed", capture: EMPTY_CAPTURE };
+    }
+    return { outcome: "completed", capture: EMPTY_CAPTURE };
+  };
+}
+
+const EMPTY_CAPTURE = {
+  status: "unavailable" as const,
+  byteCount: 0,
+  tailBytes: new Uint8Array(0),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
 
 function runnerDeps(harness: Harness, script: Script = {}, sessionCreates: string[] = []): PipelineV2RunnerDeps {
   let handler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
@@ -411,6 +430,7 @@ function runnerDeps(harness: Harness, script: Script = {}, sessionCreates: strin
   return {
     cli: fakeCli(script, sessionCreates),
     fetchAuth,
+    operationRunner: fakeWorkerOperation(script),
     helperConfig: { socketPath: "/run/dh.sock", credentialFile: harness.credentialFile },
     baseEnv: { HOME: "/home/u", XDG_CONFIG_HOME: "/cfg", CODER_SOURCE_VAR_1: "tester-secret" },
     stateRootProjection: { localRoot: harness.stateRoot, daemonRoot: harness.stateRoot },
@@ -1249,6 +1269,10 @@ test("cumulative budget through the CLI: the unsafe request exits 1 without writ
   let cliSessions = 0;
   const io: CliIo = {
     baseEnv: { HOME: "/home/u", CODER_SOURCE_VAR_1: "tester-secret" },
+    operationRunner: async () => ({
+      outcome: "completed",
+      capture: { status: "unavailable" as const, byteCount: 0, tailBytes: new Uint8Array(0), truncatedDaemon: false, truncatedLocal: false },
+    }),
     runner: {
       run: async (args: string[]): Promise<CliResult> => {
         if (args[0] === "session" && args[1] === "create") {

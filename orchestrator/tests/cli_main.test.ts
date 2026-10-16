@@ -3380,6 +3380,10 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
         }
         return { code: 0 };
       };
+      io.operationRunner = async () => ({
+        outcome: "completed" as const,
+        capture: { status: "unavailable" as const, byteCount: 0, tailBytes: new Uint8Array(0), truncatedDaemon: false, truncatedLocal: false },
+      });
       io.resolveStateRootProjection = () => ({ localRoot: parts.stateRoot, daemonRoot: parts.stateRoot });
       io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile: parts.credentialFile });
       io.fetchAuth = () =>
@@ -3459,6 +3463,10 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
         }
         return { code: 0 };
       };
+      io.operationRunner = async () => ({
+        outcome: "completed" as const,
+        capture: { status: "unavailable" as const, byteCount: 0, tailBytes: new Uint8Array(0), truncatedDaemon: false, truncatedLocal: false },
+      });
       io.resolveStateRootProjection = () => ({ localRoot: parts.stateRoot, daemonRoot: parts.stateRoot });
       io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile: parts.credentialFile });
       io.fetchAuth = () =>
@@ -3535,7 +3543,7 @@ test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (ex
   // clock injection reaches the runner, so the fresh run id is a real
   // random uuid and the fake CLI discovers the run root from the state
   // root's single pipeline-runs entry.
-  const freshCli = (parts: Awaited<ReturnType<typeof buildFresh>>, sessionCreates: { count: number }, deletes: string[]) => {
+  const sessionsOnlyRunner = (sessionCreates: { count: number }, deletes: string[]): CliIo["runner"]["run"] => {
     const handler = async (args: readonly string[]) => {
       if (args[0] === "session" && args[1] === "create") {
         sessionCreates.count += 1;
@@ -3552,30 +3560,33 @@ test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (ex
         deletes.push(args[args.length - 1] ?? "");
         return { code: 0, stdout: JSON.stringify({ ok: true, deleted: true, id: args[args.length - 1] }) };
       }
-      if (args[0] === "run") {
-        let mountStart = -1;
-        for (let i = 0; i < args.length; i += 1) {
-          if (args[i] === "--mount") {
-            mountStart = i;
-            break;
-          }
-        }
-        const runs = readdirSync(join(parts.stateRoot, "pipeline-runs"));
-        const runRoot = join(parts.stateRoot, "pipeline-runs", runs[0] ?? "");
-        for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
-          const spec = args[i + 1] ?? "";
-          const [source, target] = spec.split(":");
-          if (target === "/pipeline/outputs") {
-            const dir = join(runRoot, source ?? "");
-            mkdirSync(dir, { recursive: true });
-            writeFileSync(join(dir, "plan"), "{}", { mode: 0o600 });
-          }
-        }
-        return { code: 0 };
-      }
       return { code: 0 };
     };
     return handler as unknown as CliIo["runner"]["run"];
+  };
+
+  const freshCli = (
+    parts: Awaited<ReturnType<typeof buildFresh>>,
+    sessionCreates: { count: number },
+    deletes: string[],
+  ): CliIo["operationRunner"] => {
+    void deletes;
+    const operationRunner = async (request: { body: string }) => {
+      const body = JSON.parse(request.body) as { mounts?: Array<{ source?: string; target?: string }> };
+      const outputsMount = (body.mounts ?? []).find((mount) => mount.target === "/pipeline/outputs");
+      if (outputsMount !== undefined && typeof outputsMount.source === "string") {
+        const runs = readdirSync(join(parts.stateRoot, "pipeline-runs"));
+        const runRoot = join(parts.stateRoot, "pipeline-runs", runs[0] ?? "");
+        const dir = join(runRoot, outputsMount.source);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "plan"), "{}", { mode: 0o600 });
+      }
+      return {
+        outcome: "completed" as const,
+        capture: { status: "unavailable" as const, byteCount: 0, tailBytes: new Uint8Array(0), truncatedDaemon: false, truncatedLocal: false },
+      };
+    };
+    return operationRunner as unknown as CliIo["operationRunner"];
   };
 
   const wireIo = (parts: Awaited<ReturnType<typeof buildFresh>>) => {
@@ -3583,7 +3594,8 @@ test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (ex
     io.baseEnv = { ...io.baseEnv, CODER_SOURCE_VAR_1: "tester-secret" };
     const sessionCreates = { count: 0 };
     const sessionDeletes: string[] = [];
-    io.runner.run = freshCli(parts, sessionCreates, sessionDeletes);
+    io.runner.run = sessionsOnlyRunner(sessionCreates, sessionDeletes);
+    io.operationRunner = freshCli(parts, sessionCreates, sessionDeletes);
     io.resolveStateRootProjection = () => ({ localRoot: parts.stateRoot, daemonRoot: parts.stateRoot });
     io.resolveHelperConfig = () => ({ socketPath: "/run/dh.sock", credentialFile: parts.credentialFile });
     io.fetchAuth = () =>

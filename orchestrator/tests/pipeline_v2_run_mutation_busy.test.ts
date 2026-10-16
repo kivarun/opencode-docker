@@ -21,6 +21,7 @@ import { respondPipelineV2Wait, type PipelineV2WaitResponseOutcome } from "../sr
 import { inspectPipelineV2Run } from "../src/pipeline_v2_inspect.ts";
 import { acquirePipelineV2RunMutationLock } from "../src/pipeline_v2_run_mutation_lock.ts";
 import type { AuthFetcher, CliRunner } from "../src/docker_helper.ts";
+import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
 import { faultIo, countingIo } from "./state_io_test_helpers.ts";
 import {
   buildHarness,
@@ -80,18 +81,31 @@ const FRESH_RUN_OPTIONS = (harness: Harness, runId: string) => ({
  */
 async function freshRunToWaiting(harness: Harness, runId: string): Promise<void> {
   const { deps } = makeDeps(harness);
+  const worker = workerCli(harness, runId, 0);
   const outcome = await runPipelineV2(FRESH_RUN_OPTIONS(harness, runId), {
     ...deps,
-    cli: workerCli(harness, runId, 0),
+    cli: worker.cli,
+    operationRunner: worker.operationRunner,
   });
   expect(outcome.exitCode).toBe(0);
   expect(outcome).toMatchObject({ waiting: true });
 }
 
-function workerCli(harness: Harness, runId: string, runCode: number): CliRunner {
+const EMPTY_CAPTURE = {
+  status: "unavailable" as const,
+  byteCount: 0,
+  tailBytes: new Uint8Array(0),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
+
+function workerCli(harness: Harness, runId: string, runCode: number): {
+  cli: CliRunner;
+  operationRunner: PipelineV2WorkerOperationRunner;
+} {
   let createIndex = 0;
   const processTag = Math.random().toString(36).slice(2, 8);
-  return async (args) => {
+  const cli: CliRunner = async (args) => {
     if (args[0] === "session" && args[1] === "create") {
       createIndex += 1;
       return {
@@ -109,37 +123,32 @@ function workerCli(harness: Harness, runId: string, runCode: number): CliRunner 
     if (args[0] === "pull") {
       return { code: 0 };
     }
-    if (args[0] === "run") {
-      let mountStart = -1;
-      for (let i = 0; i < args.length; i += 1) {
-        if (args[i] === "--mount") {
-          mountStart = i;
-          break;
-        }
-      }
-      const runRoot = join(harness.stateRoot, "pipeline-runs", runId);
-      for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
-        const spec = args[i + 1] ?? "";
-        const [source, target] = spec.split(":");
-        if (target === "/pipeline/outputs") {
-          const segments = (source ?? "").split("/");
-          const dash = segments[1] ?? "";
-          const stateId = dash.slice(dash.indexOf("-") + 1);
-          const outputs = (WORKER_OUTPUTS as Record<string, Record<string, string>>)[stateId];
-          if (outputs !== undefined) {
-            const { mkdir, writeFile } = await import("node:fs/promises");
-            const dir = join(runRoot, source ?? "");
-            await mkdir(dir, { recursive: true });
-            for (const [name, content] of Object.entries(outputs)) {
-              await writeFile(join(dir, name), content as string);
-            }
-          }
-        }
-      }
-      return { code: runCode, timedOut: false };
-    }
     return { code: 1 };
   };
+  const operationRunner: PipelineV2WorkerOperationRunner = async (request) => {
+    const body = JSON.parse(request.body) as { mounts?: Array<{ source?: string; target?: string }> };
+    const outputsMount = (body.mounts ?? []).find((mount) => mount.target === "/pipeline/outputs");
+    const runRoot = join(harness.stateRoot, "pipeline-runs", runId);
+    if (outputsMount !== undefined && typeof outputsMount.source === "string") {
+      const segments = outputsMount.source.split("/");
+      const dash = segments[1] ?? "";
+      const stateId = dash.slice(dash.indexOf("-") + 1);
+      const outputs = (WORKER_OUTPUTS as Record<string, Record<string, string>>)[stateId];
+      if (outputs !== undefined) {
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        const dir = join(runRoot, outputsMount.source);
+        await mkdir(dir, { recursive: true });
+        for (const [name, content] of Object.entries(outputs)) {
+          await writeFile(join(dir, name), content as string);
+        }
+      }
+    }
+    if (runCode !== 0) {
+      return { outcome: "worker_failed", capture: EMPTY_CAPTURE };
+    }
+    return { outcome: "completed", capture: EMPTY_CAPTURE };
+  };
+  return { cli, operationRunner };
 }
 
 async function holdLock(runRoot: string): Promise<() => void> {
@@ -178,7 +187,7 @@ test("resume on a locked run: the exact busy outcome with zero effects", async (
   const { deps, calls } = makeDeps(harness);
   const retried = await resumePipelineV2(
     { runId: "busy-run", configRoot: harness.configRoot },
-    { ...deps, cli: workerCli(harness, "busy-run", 0) },
+    { ...deps, ...workerCli(harness, "busy-run", 0) },
   );
   expect(retried).toMatchObject({ ok: false, waiting: true, exitCode: 0, runId: "busy-run" });
   expect(calls.auth).toBe(1);
@@ -254,7 +263,7 @@ test("resume-plan on a locked run: the exact busy outcome with zero effects", as
   const { deps } = makeDeps(harness);
   const outcome = await runPipelineV2(
     { ...FRESH_RUN_OPTIONS(harness, "busy-run"), pipelineRoot: harness.bundleManual },
-    { ...deps, cli: workerCli(harness, "busy-run", 0) },
+    { ...deps, ...workerCli(harness, "busy-run", 0) },
   );
   expect(outcome).toMatchObject({ planReady: true, exitCode: 0 });
   const runRoot = join(harness.stateRoot, "pipeline-runs", "busy-run");
@@ -400,7 +409,7 @@ test("different run ids run concurrently while one lock is held", async () => {
     const { deps } = makeDeps(harness);
     const other = await runPipelineV2(
       { ...FRESH_RUN_OPTIONS(harness, "busy-run-b"), runId: "busy-run-b" },
-      { ...deps, cli: workerCli(harness, "busy-run-b", 0) },
+      { ...deps, ...workerCli(harness, "busy-run-b", 0) },
     );
     expect(other).toMatchObject({ waiting: true, exitCode: 0, runId: "busy-run-b" });
   } finally {

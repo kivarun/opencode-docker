@@ -1173,10 +1173,10 @@ runs, and the run fails with exit 1 and a single cleanup. Retries, resume,
 and concurrency are still not implemented. The
 engine is not a second production path and not a generic workflow engine.
 
-The pipeline's `timeout_seconds` is enforced by the CLI runner on the
-signalable worker `docker-helper run` only; the deadline sends SIGTERM, the
-result is marked timed out, and the run fails normally with a single cleanup.
-`max_attempts` is 1, so no retries are implemented.
+The pipeline's `timeout_seconds` is enforced by the adapter-owned worker
+operation (see the next section); the deadline claims the first-wins signal
+slot, exactly one cancel request is sent, and the run fails normally with a
+single cleanup. `max_attempts` is 1, so no retries are implemented.
 
 **Pipeline v2 through the same engine (pure adapter implemented; the production
 runner uses it).** `executePipelineV2Graph(pipeline, executors)`
@@ -1948,14 +1948,16 @@ Implemented rules:
 - the orchestrator reads the OpenCode configuration and forwards it to the
   worker as `OPENCODE_CONFIG_CONTENT`;
 - profile files may reference secret environment-variable names but must never
-  contain secret values; resolved values reach the worker only as separate
-  `--env KEY=VALUE` arguments of the `docker-helper run` CLI call. Until
-  docker-helper issue #3 is implemented these values are visible in that CLI
-  process's argv (a consciously accepted temporary risk); they never appear in
-  the orchestrator's own diagnostics or state files, and the task body is never
-  placed into argv or env (the task travels by workspace path only). Raw worker
-  output remains an untrusted stream that may contain whatever the worker
-  chooses to print;
+  contain secret values; resolved values reach the worker only inside the
+  adapter-owned `POST /run` body's `environment` object (pipeline v2), never in
+  any process argv. The v1 diagnostic path (`agent-smoke`) still passes them as
+  separate `--env KEY=VALUE` arguments of the `docker-helper run` CLI call;
+  until docker-helper issue #3 is implemented those v1 values are visible in
+  that CLI process's argv (a consciously accepted temporary risk). Values never
+  appear in the orchestrator's own diagnostics or state files, and the task
+  body is never placed into argv or env (the task travels by workspace path
+  only). Raw worker output remains an untrusted stream that may contain
+  whatever the worker chooses to print;
 - the profile comes from the pipeline's agent state (`agent-smoke` has no
   `--profile` flag) and each state's workspace input paths come from the
   pipeline's declared inputs (no `--task` flag); an external pipeline bundle
@@ -1966,6 +1968,65 @@ Implemented rules:
 
 Profile-selected file projections, resource limits, and profile inheritance
 are not implemented yet.
+
+## Adapter-owned worker operations (implemented)
+
+The production pipeline v2 worker path no longer spawns `docker-helper run`.
+The Docker Helper runtime adapter itself owns the whole worker operation
+lifecycle over the Docker Helper HTTP API on the helper Unix socket, using
+the Execution Session bearer as the only credential:
+
+```
+runtime adapter
+  -> POST /run                          (exactly once, never retried)
+  -> GET /operations/:id/logs?offset=N  (single drain owner, offset cursor)
+  -> GET /operations/:id                (single status poll owner)
+  -> POST /operations/:id/cancel        (exactly one on abort or deadline)
+```
+
+Properties of the operation state machine:
+
+- The `POST /run` body preserves the exact request parity with the
+  docker-helper CLI 2.3.1: the same field set and field order (`image`,
+  `entrypoint`, `workdir`, `command`, `environment`, `mounts`,
+  `helper_socket`), the same mount order (project RW, activation inputs RO,
+  activation outputs RW), and the same resolved environment values keyed by
+  their destination names in sorted key order. No ambient environment is
+  inherited; environment values never appear in any process argv.
+- The outcome is classified only from the authoritative operation status:
+  `succeeded` with a zero `exit_code`/`result_code` completes; a
+  contradictory `succeeded` with a non-zero code, `failed`, `cancelled`,
+  and an unreachable/malformed/unknown status all fail closed as
+  `worker_failed`; the deadline yields `worker_timeout`.
+- Log retrieval is outcome-neutral: a `/logs` 404/500, a malformed or
+  oversized log response, a log timeout, daemon head eviction or a
+  disappeared log never change the already established worker result.
+  Status unreachability is a transport/worker failure, not a
+  log-capture failure.
+- Worker output bytes are forwarded to the orchestrator's stderr exactly
+  once per chunk by the same drain owner that builds the internal capture;
+  `--json` stdout stays exactly one JSON document.
+- The internal log capture is in-memory and bounded: a frozen
+  `{status: captured|truncated|unavailable, byteCount, tailBytes,
+  truncatedDaemon, truncatedLocal}` with a fixed 8 MiB UTF-8-byte tail
+  bound (head eviction marks `truncatedLocal`; daemon `truncated: true`
+  marks `truncatedDaemon`). `captured` never means complete — daemon-side
+  eviction outside the observed window cannot be proven absent. The
+  capture is not published durably yet; stdout/stderr stay mixed.
+- Signals and the deadline arbitrate through a runner-owned first-wins
+  hub: SIGINT/SIGTERM cancel the operation exactly once and finalize
+  130/143 as before; a signal that loses to the deadline is neither
+  delivered nor recorded; cancel failures never override the fixed
+  outcome; no cancel is sent after a terminal status; a hung log fetch
+  is aborted by the same signal/deadline path.
+- The operation id lives only inside one operation call — never returned,
+  persisted, logged or written to the run tree. There is no durable
+  operation identity yet: a lost create response is never retried (the
+  daemon may have accepted the operation, which can remain orphaned), and
+  a process crash loses the id and any captured bytes. Durable
+  publication of worker logs (a schema v9, HTTP/API/UI surface) is a
+  later increment; worker logs are NOT available to a user after a
+  restart today.
 
 ## Transport boundary (direction, not implementation)
 

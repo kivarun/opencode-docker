@@ -49,7 +49,13 @@ interface SessionRecord {
 }
 const sessions = new Map<string, SessionRecord>();
 const sessionsByToken = new Map<string, SessionRecord>();
-const operations = new Map<string, { status: Record<string, unknown> }>();
+interface OperationRecord {
+  id: string;
+  state: "running" | "succeeded" | "failed" | "cancelled";
+  exitCode: number;
+  log: string;
+}
+const operations = new Map<string, OperationRecord>();
 const architectRunsByWorkspace = new Map<string, number>();
 let counter = 0;
 
@@ -60,20 +66,32 @@ function json(response: unknown, status = 200): Response {
   });
 }
 
-function executeWorker(workspace: string, mounts: Array<{ source: string; target: string }>): number {
+async function executeWorker(operation: OperationRecord, workspace: string, mounts: Array<{ source: string; target: string }>): Promise<void> {
+  operation.log = `WORKER-START ${operation.id}\n`;
   const inputs = mounts.find((m) => m.target === "/pipeline/inputs");
   const outputs = mounts.find((m) => m.target === "/pipeline/outputs");
-  if (inputs === undefined || outputs === undefined) return 1;
+  if (inputs === undefined || outputs === undefined) {
+    operation.exitCode = 1;
+    operation.state = "failed";
+    operation.log += "WORKER-FAILED missing mounts\n";
+    return;
+  }
   let stateId = "";
   try {
     const doc = readFileSync(join(workspace, inputs.source, ".orchestrator", "execution.md"), "utf8");
     const match = doc.match(/^state_id: "(.+)"$/m);
     if (match) stateId = match[1] as string;
   } catch {
-    return 1;
+    operation.exitCode = 1;
+    operation.state = "failed";
+    operation.log += "WORKER-FAILED unreadable execution document\n";
+    return;
   }
+  operation.log += `WORKER-RUNNING state=${stateId}\n`;
   if (stateId === "dev_entry") {
-    Bun.sleepSync(devEntryDelayMs);
+    // Non-blocking: the daemon stays responsive for log drains and
+    // status polls while the stage worker runs.
+    await Bun.sleep(devEntryDelayMs);
   }
   const outputsRoot = join(workspace, outputs.source);
   mkdirSync(outputsRoot, { recursive: true });
@@ -86,7 +104,9 @@ function executeWorker(workspace: string, mounts: Array<{ source: string; target
   } else if (stateId === "review_entry") {
     writeFileSync(join(outputsRoot, "report"), "SMOKE-REPORT\n", { mode: 0o600 });
   }
-  return 0;
+  operation.log += `WORKER-DONE state=${stateId}\n`;
+  operation.exitCode = 0;
+  operation.state = "succeeded";
 }
 
 Bun.serve({
@@ -119,7 +139,33 @@ Bun.serve({
       const parts = url.pathname.split("/");
       const operation = operations.get(parts[2] ?? "");
       if (operation === undefined) return json({ error: "unknown operation" }, 404);
-      return json(operation.status);
+      if (parts[3] === "logs") {
+        const offset = Number(url.searchParams.get("offset") ?? "0");
+        if (!Number.isSafeInteger(offset) || offset < 0) return json({ error: "invalid offset" }, 400);
+        const total = Buffer.byteLength(operation.log, "utf8");
+        if (operation.state === "running") {
+          if (offset >= total) {
+            return json({ logs: "", offset, next_offset: offset });
+          }
+          const chunk = operation.log.slice(offset, Math.min(total, offset + 4096));
+          return json({ logs: chunk, offset, next_offset: offset + Buffer.byteLength(chunk, "utf8") });
+        }
+        // terminal: one response carries everything remaining and ends
+        // the stream with next_offset null
+        return json({ logs: operation.log.slice(offset), offset, next_offset: null });
+      }
+      if (parts[3] === "cancel" && request.method === "POST") {
+        if (operation.state === "running") {
+          operation.state = "cancelled";
+        }
+        return json({ ok: true, operation_id: operation.id, status: operation.state });
+      }
+      const status: Record<string, unknown> = { status: operation.state };
+      if (operation.state === "succeeded" || operation.state === "failed") {
+        status["exit_code"] = operation.exitCode;
+        status["result_code"] = String(operation.exitCode);
+      }
+      return json(status);
     }
     if (url.pathname === "/pull" && request.method === "POST") {
       return json({ ok: true });
@@ -129,12 +175,17 @@ Bun.serve({
       const record = sessionsByToken.get(bearer);
       if (record === undefined) return json({ error: "unknown session token" }, 403);
       counter += 1;
-      const operationId = `op-${counter}`;
-      const exitCode = executeWorker(record.workspace, body.mounts ?? []);
-      operations.set(operationId, {
-        status: { status: "succeeded", exit_code: exitCode, result_code: exitCode === 0 ? "0" : "1" },
-      });
-      return json({ ok: true, operation_id: operationId });
+      const operation: OperationRecord = {
+        id: `op-${counter}`,
+        state: "running",
+        exitCode: 0,
+        log: "",
+      };
+      operations.set(operation.id, operation);
+      // The operation runs after the create response, exactly like the
+      // production daemon: status polls observe running before terminal.
+      void executeWorker(operation, record.workspace, body.mounts ?? []);
+      return json({ ok: true, operation_id: operation.id });
     }
     return json({ error: `no route ${request.method} ${url.pathname}` }, 404);
   },

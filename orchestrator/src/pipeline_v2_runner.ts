@@ -123,6 +123,8 @@ import {
   signalExitCode,
   lifecycleAuthority,
 } from "./lifecycle.ts";
+import { WorkerSignalHub } from "./worker_signals.ts";
+import type { PipelineV2WorkerOperationRunner } from "./pipeline_v2_docker_runtime.ts";
 import type { HelperConfig } from "./launcher.ts";
 import { loadProfile, type ResolvedProfile } from "./profile.ts";
 import { isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
@@ -225,6 +227,11 @@ export interface PipelineV2RunnerDeps {
   readonly onSignal?: (handler: (signal: "SIGINT" | "SIGTERM") => void) => void;
   readonly now?: () => Date;
   readonly randomId?: () => string;
+  /**
+   * The worker operation runner seam. The production default is the real
+   * adapter-owned HTTP operation; runner-level tests inject a fake.
+   */
+  readonly operationRunner?: PipelineV2WorkerOperationRunner;
 }
 
 /**
@@ -658,6 +665,7 @@ export async function runPipelineV2(
   };
 
   let gate: RunCauseGate;
+  let workerSignalsOfThisRun: WorkerSignalHub = new WorkerSignalHub();
   let callerRunId: string | undefined;
   try {
     callerRunId = validateRunnerContract(options, deps);
@@ -668,7 +676,22 @@ export async function runPipelineV2(
     if (capturedOnSignal !== undefined && typeof capturedOnSignal !== "function") {
       throw new Error("pipeline v2 runner deps.onSignal must be a function");
     }
-    gate = new RunCauseGate(capturedOnSignal);
+    // The worker signal hub is created with the gate: a user signal is
+    // first forwarded to the active worker operation (first-wins against
+    // the operation's own deadline) and only then recorded as a lifecycle
+    // abort.
+    const workerSignals = new WorkerSignalHub();
+    gate = new RunCauseGate((register) => {
+      if (capturedOnSignal === undefined) {
+        return;
+      }
+      capturedOnSignal((signal) => {
+        if (workerSignals.forwardUserSignal(signal)) {
+          register(signal);
+        }
+      });
+    });
+    workerSignalsOfThisRun = workerSignals;
   } catch (cause) {
     return preflightFailure(cause);
   }
@@ -867,6 +890,8 @@ export async function runPipelineV2(
     operatorEnv: authority.baseOperatorEnv,
     expectedLauncherId: authority.auth.launcher_id,
     runRootProjection: { localRoot: runRoot.localRunRoot, daemonRoot: runRoot.daemonRunRoot },
+    workerSignals: workerSignalsOfThisRun,
+    operationRunner: deps.operationRunner,
   };
   try {
     sinkOrNull = new PipelineV2RunStateSink({
@@ -1138,6 +1163,7 @@ interface CapturedExistingRunContract {
   readonly onSignal: ((handler: (signal: "SIGINT" | "SIGTERM") => void) => void) | undefined;
   readonly now: (() => Date) | undefined;
   readonly randomId: (() => string) | undefined;
+  readonly operationRunner: PipelineV2WorkerOperationRunner | undefined;
 }
 
 /** The caller-policy kind of an existing-run entrypoint. */
@@ -1257,6 +1283,10 @@ function captureExistingRunContract(
   if (onSignal !== undefined && typeof onSignal !== "function") {
     throw new Error(`${contractName} deps.onSignal must be a function`);
   }
+  const operationRunner = deps["operationRunner"];
+  if (operationRunner !== undefined && typeof operationRunner !== "function") {
+    throw new Error(`${contractName} deps.operationRunner must be a function`);
+  }
   let callerPolicy: ExistingRunCallerPolicy;
   if (callerPolicyKind === "continue_stage") {
     callerPolicy = deepFreeze({
@@ -1301,6 +1331,7 @@ function captureExistingRunContract(
     onSignal: onSignal as CapturedExistingRunContract["onSignal"],
     now: now as (() => Date) | undefined,
     randomId: randomId as (() => string) | undefined,
+    operationRunner: operationRunner as PipelineV2WorkerOperationRunner | undefined,
   }) as CapturedExistingRunContract;
 }
 
@@ -1668,10 +1699,22 @@ async function runExistingPipelineV2(
   };
 
   let gate: RunCauseGate;
+  let workerSignalsOfThisRun = new WorkerSignalHub();
   let contract: CapturedExistingRunContract;
   try {
     contract = captureExistingRunContract(options, deps, flow.contractName, flow.callerPolicyKind);
-    gate = new RunCauseGate(contract.onSignal);
+    const capturedOnSignal = contract.onSignal;
+    workerSignalsOfThisRun = new WorkerSignalHub();
+    gate = new RunCauseGate((register) => {
+      if (capturedOnSignal === undefined) {
+        return;
+      }
+      capturedOnSignal((signal) => {
+        if (workerSignalsOfThisRun.forwardUserSignal(signal)) {
+          register(signal);
+        }
+      });
+    });
   } catch (cause) {
     return preflightFailure(cause);
   }
@@ -1888,6 +1931,8 @@ async function runExistingPipelineV2(
       operatorEnv: authority.baseOperatorEnv,
       expectedLauncherId: authority.auth.launcher_id,
       runRootProjection: { localRoot: runRoot.localRunRoot, daemonRoot: runRoot.daemonRunRoot },
+      workerSignals: workerSignalsOfThisRun,
+      operationRunner: contract.operationRunner,
     });
   } catch (cause) {
     if (recordedSignal() !== null) {

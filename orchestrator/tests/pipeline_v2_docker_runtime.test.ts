@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { createServer } from "node:net";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isCleanAbsolutePath } from "../src/clean_path.ts";
@@ -20,6 +21,8 @@ import {
   type PipelineV2ProjectionFailureReason,
 } from "../src/pipeline_v2_docker_runtime.ts";
 import type { CliRunOptions, CliRunner, CliStdio } from "../src/docker_helper.ts";
+import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
+import { WorkerSignalHub } from "../src/worker_signals.ts";
 import { DockerHelperError } from "../src/docker_helper.ts";
 import type { ResolvedProfile } from "../src/profile.ts";
 import type { PipelineV2ExecutionSession, PipelineV2ToolSession } from "../src/pipeline_v2_coordinator.ts";
@@ -238,10 +241,23 @@ interface FakeCliOptions {
   deleteStderr?: string;
 }
 
+interface RecordedOperationRequest {
+  readonly socketPath: string;
+  readonly bearer: string;
+  readonly body: string;
+  readonly timeoutSeconds: number;
+}
+
 function makeFakeCli(
   options: FakeCliOptions = {},
-): { cli: CliRunner; calls: RecordedCall[] } {
+): {
+  cli: CliRunner;
+  operationRunner: PipelineV2WorkerOperationRunner;
+  calls: RecordedCall[];
+  operationRequests: RecordedOperationRequest[];
+} {
   const calls: RecordedCall[] = [];
+  const operationRequests: RecordedOperationRequest[] = [];
   let sessionCounter = 0;
   const launcherIdFor = (sessionNumber: number): string => {
     const configured = options.createLauncherId;
@@ -284,34 +300,73 @@ function makeFakeCli(
     if (args[0] === "pull") {
       return { code: options.pullCode ?? 0 };
     }
-    if (args[0] === "run") {
-      return { code: options.runCode ?? 0, timedOut: options.runTimedOut ?? false };
-    }
     return { code: 1 };
   };
-  return { cli, calls };
+  const operationRunner: PipelineV2WorkerOperationRunner = async (request) => {
+    operationRequests.push({
+      socketPath: request.socketPath,
+      bearer: request.bearer,
+      body: request.body,
+      timeoutSeconds: request.timeoutSeconds,
+    });
+    if (options.runTimedOut === true) {
+      return { outcome: "worker_timeout", capture: EMPTY_CAPTURE };
+    }
+    if ((options.runCode ?? 0) !== 0) {
+      return { outcome: "worker_failed", capture: EMPTY_CAPTURE };
+    }
+    return { outcome: "completed", capture: EMPTY_CAPTURE };
+  };
+  return { cli, operationRunner, calls, operationRequests };
+}
+
+const EMPTY_CAPTURE = {
+  status: "unavailable" as const,
+  byteCount: 0,
+  tailBytes: new Uint8Array(0),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
+
+function operationBody(requests: RecordedOperationRequest[]): Record<string, unknown> {
+  expect(requests.length).toBeGreaterThanOrEqual(1);
+  return JSON.parse(requests[0]?.body ?? "") as Record<string, unknown>;
+}
+
+function operationRequest(requests: RecordedOperationRequest[]): RecordedOperationRequest {
+  expect(requests.length).toBeGreaterThanOrEqual(1);
+  return requests[0] as RecordedOperationRequest;
 }
 
 function makeRuntime(
   setup_: Setup,
-  cli: CliRunner,
+  fake: { cli: CliRunner; operationRunner: PipelineV2WorkerOperationRunner },
   overrides: {
     profiles?: Map<string, ResolvedProfile>;
     expectedLauncherId?: string;
     runRootProjection?: { localRoot: string; daemonRoot: string };
+    operationRunner?: PipelineV2WorkerOperationRunner;
+    /** Use the production adapter-owned HTTP operation instead of the fake. */
+    productionOperationRunner?: boolean;
+    /** Overrides the helper config socket path (request-parity tests). */
+    socketPath?: string;
   } = {},
 ) {
   return createDockerHelperPipelineV2Runtime({
     pipeline: setup_.pipeline,
     profiles: overrides.profiles ?? setup_.profiles,
-    cli,
-    helperConfig: { socketPath: SOCKET, credentialFile: CREDENTIAL_FILE },
+    cli: fake.cli,
+    ...(overrides.productionOperationRunner === true
+      ? {}
+      : { operationRunner: overrides.operationRunner ?? fake.operationRunner }),
+    helperConfig: { socketPath: overrides.socketPath ?? SOCKET, credentialFile: CREDENTIAL_FILE },
     operatorEnv: OPERATOR_ENV,
     expectedLauncherId: overrides.expectedLauncherId ?? EXPECTED_LAUNCHER_ID,
     runRootProjection: overrides.runRootProjection ?? {
       localRoot: setup_.runRoot,
       daemonRoot: setup_.runRoot,
     },
+    workerSignals: new WorkerSignalHub(),
   });
 }
 
@@ -324,13 +379,14 @@ async function driveCoderActivation(
   tool: PipelineV2ToolSession;
   result: Awaited<ReturnType<PipelineV2ExecutionSession["runAgent"]>>;
   calls: RecordedCall[];
+  operationRequests: RecordedOperationRequest[];
 }> {
   const fake = makeFakeCli(overrides);
-  const runtime = makeRuntime(setup_, fake.cli);
+  const runtime = makeRuntime(setup_, fake);
   const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
   const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
   const result = await execution.runAgent(tool);
-  return { runtime, execution, tool, result, calls: fake.calls };
+  return { runtime, execution, tool, result, calls: fake.calls, operationRequests: fake.operationRequests };
 }
 
 function runCall(calls: RecordedCall[]): RecordedCall {
@@ -345,37 +401,24 @@ function pullCall(calls: RecordedCall[]): RecordedCall {
   return call as RecordedCall;
 }
 
-const CODER_RUN_ARGS = [
-  "run",
-  "--endpoint",
-  SOCKET,
-  "--entrypoint",
-  "opencode",
-  "--workdir",
-  "/workspace",
-  "--helper-socket",
-  "--mount",
-  "project:/workspace",
-  "--mount",
-  "activations/1-coder/data/inputs:/pipeline/inputs:ro",
-  "--mount",
-  "activations/1-coder/data/outputs:/pipeline/outputs",
-  "--env-from",
-  `DOCKER_HELPER_SESSION_TOKEN=${PIPELINE_V2_TOOL_SESSION_TOKEN_SOURCE}`,
-  "--env-from",
-  `OPENCODE_CONFIG_CONTENT=${PIPELINE_V2_OPENCODE_CONFIG_SOURCE}`,
-  "--env-from",
-  "MODEL_API_KEY=ORCHESTRATOR_V2_PROFILE_MODEL_API_KEY",
-  "--env-from",
-  "SHARED_SETTING=ORCHESTRATOR_V2_PROFILE_SHARED_SETTING",
-  "ghcr.io/example/coder:1",
-  "--",
-  "run",
-  "--format",
-  "json",
-  "--auto",
-  INSTRUCTION,
-];
+const CODER_RUN_BODY = {
+  image: "ghcr.io/example/coder:1",
+  entrypoint: "opencode",
+  workdir: "/workspace",
+  command: ["run", "--format", "json", "--auto", INSTRUCTION],
+  environment: {
+    DOCKER_HELPER_SESSION_TOKEN: "dhc_2",
+    MODEL_API_KEY: "sk-coder-secret",
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({ model: "coder-model" }),
+    SHARED_SETTING: "shared-value-1",
+  },
+  mounts: [
+    { source: "project", target: "/workspace" },
+    { source: "activations/1-coder/data/inputs", target: "/pipeline/inputs", read_only: true },
+    { source: "activations/1-coder/data/outputs", target: "/pipeline/outputs" },
+  ],
+  helper_socket: true,
+};
 
 test("1. the factory rejects a missing profile before any helper or filesystem side effect", async () => {
   const setup_ = await setup();
@@ -385,7 +428,7 @@ test("1. the factory rejects a missing profile before any helper or filesystem s
       [...setup_.profiles.entries()].filter(([name]) => name === "coder"),
     );
     expect(() =>
-      makeRuntime(setup_, fake.cli, { profiles: onlyCoder }),
+      makeRuntime(setup_, fake, { profiles: onlyCoder }),
     ).toThrow(/agent state "architect" requires profile "architect" which is not loaded/);
     expect(fake.calls.length).toBe(0);
   } finally {
@@ -397,7 +440,7 @@ test("2. profile snapshots are immune to mutations of the source map and profile
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     // mutate the source map and the source profile objects after the
     // factory snapshot was taken
     setup_.profiles.delete("architect");
@@ -411,11 +454,12 @@ test("2. profile snapshots are immune to mutations of the source map and profile
     const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
     const result = await execution.runAgent(tool);
     expect(result).toEqual({ status: "completed" });
-    const run = runCall(fake.calls);
-    expect(run.args).toEqual(CODER_RUN_ARGS);
-    expect(run.env[PIPELINE_V2_OPENCODE_CONFIG_SOURCE]).toBe(JSON.stringify({ model: "coder-model" }));
-    expect(run.env.ORCHESTRATOR_V2_PROFILE_MODEL_API_KEY).toBe("sk-coder-secret");
-    expect(run.env.ORCHESTRATOR_V2_PROFILE_SHARED_SETTING).toBe("shared-value-1");
+    const body = operationBody(fake.operationRequests);
+    expect((body["environment"] as Record<string, unknown>)["OPENCODE_CONFIG_CONTENT"]).toBe(
+      JSON.stringify({ model: "coder-model" }),
+    );
+    expect((body["environment"] as Record<string, unknown>)["MODEL_API_KEY"]).toBe("sk-coder-secret");
+    expect((body["environment"] as Record<string, unknown>)["SHARED_SETTING"]).toBe("shared-value-1");
     // user objects are never frozen or modified by the factory
     expect(Object.isFrozen(coderProfile)).toBe(false);
     expect(Object.isFrozen(setup_.profiles)).toBe(false);
@@ -428,7 +472,7 @@ test("3. the Execution Session is created with the daemon-visible run-root works
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     expect(fake.calls.length).toBe(1);
     const call = fake.calls[0]!;
@@ -456,7 +500,7 @@ test("4. the Tool Session is created with the daemon-visible project-root worksp
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
     expect(execution.sessionId).not.toBe(tool.sessionId);
@@ -483,11 +527,13 @@ test("5. the two sessions carry different ids and tokens, and the handles expose
     const driven = await driveCoderActivation(setup_);
     expect(driven.execution.sessionId).toBe("dhs_1");
     expect(driven.tool.sessionId).toBe("dhs_2");
-    const run = runCall(driven.calls);
-    // the CLI authorizes with the Execution bearer; the worker receives the
-    // Tool bearer under its destination name
-    expect(run.env["DOCKER_HELPER_SESSION_TOKEN"]).toBe("dhc_1");
-    expect(run.env[PIPELINE_V2_TOOL_SESSION_TOKEN_SOURCE]).toBe("dhc_2");
+    const request = operationRequest(driven.operationRequests);
+    // the operation authorizes with the Execution bearer; the worker
+    // receives the Tool bearer under its destination name in the body
+    expect(request.bearer).toBe("dhc_1");
+    expect((JSON.parse(request.body) as Record<string, unknown>)["environment"]).toMatchObject({
+      DOCKER_HELPER_SESSION_TOKEN: "dhc_2",
+    });
     expect(Object.keys(driven.execution).sort()).toEqual(["cleanup", "runAgent", "sessionId"]);
     expect(Object.keys(driven.tool).sort()).toEqual(["cleanup", "sessionId"]);
     await driven.execution.cleanup();
@@ -501,7 +547,7 @@ test("6. a launcher ownership mismatch deletes the known session and throws", as
   const setup_ = await setup();
   try {
     const fake = makeFakeCli({ createLauncherId: "dhl_other" });
-    const runtime = makeRuntime(setup_, fake.cli, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
+    const runtime = makeRuntime(setup_, fake, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
     let failure: unknown;
     try {
       await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -529,7 +575,7 @@ test("6. a launcher ownership mismatch deletes the known session and throws", as
       createLauncherId: (sessionNumber) =>
         sessionNumber === 1 ? EXPECTED_LAUNCHER_ID : "dhl_other",
     });
-    const runtime2 = makeRuntime(setup_, fake2.cli, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
+    const runtime2 = makeRuntime(setup_, fake2, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
     const execution2 = await runtime2.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     let toolFailure: unknown;
     try {
@@ -565,7 +611,7 @@ test("6a. an Execution session mismatch with a failing delete surfaces cli_failu
       deleteCode: 1,
       deleteStderr: "error: API error (status 403, code forbidden): delete rejected",
     });
-    const runtime = makeRuntime(setup_, fake.cli, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
+    const runtime = makeRuntime(setup_, fake, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
     let failure: unknown;
     try {
       await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -607,7 +653,7 @@ test("6b. a Tool session mismatch with a failing delete surfaces cli_failure and
       deleteCode: 2,
       deleteStderr: "error: helper daemon unreachable",
     });
-    const runtime = makeRuntime(setup_, fake.cli, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
+    const runtime = makeRuntime(setup_, fake, { expectedLauncherId: EXPECTED_LAUNCHER_ID });
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     let toolFailure: unknown;
     try {
@@ -667,27 +713,22 @@ test("7. the pull uses the exact argv and the Execution bearer only", async () =
   }
 });
 
-test("8. the worker run uses the exact argv with the fixed mount order and :ro only on inputs", async () => {
+test("8. the worker operation carries the exact request body with the fixed mount order and read-only only on inputs", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
-    const run = runCall(driven.calls);
-    expect(run.args).toEqual(CODER_RUN_ARGS);
-    expect(run.stdio).toBe("inherit");
-    expect(run.opts).toEqual({ signalOnAbort: true, timeoutSeconds: 60 });
-    const mounts: string[] = [];
-    for (let index = 0; index < run.args.length; index += 1) {
-      if (run.args[index] === "--mount") {
-        mounts.push(run.args[index + 1] ?? "");
-      }
-    }
-    expect(mounts).toEqual([
-      "project:/workspace",
-      "activations/1-coder/data/inputs:/pipeline/inputs:ro",
-      "activations/1-coder/data/outputs:/pipeline/outputs",
+    const request = operationRequest(driven.operationRequests);
+    expect(request.timeoutSeconds).toBe(60);
+    expect(request.socketPath).toBe(SOCKET);
+    expect(JSON.parse(request.body)).toEqual(CODER_RUN_BODY);
+    expect((JSON.parse(request.body) as { mounts: unknown[] })["mounts"]).toEqual([
+      { source: "project", target: "/workspace" },
+      { source: "activations/1-coder/data/inputs", target: "/pipeline/inputs", read_only: true },
+      { source: "activations/1-coder/data/outputs", target: "/pipeline/outputs" },
     ]);
-    // `:ro` appears exactly once — on the inputs mount
-    expect(run.args.filter((arg) => arg.endsWith(":ro")).length).toBe(1);
+    // the read-only flag appears exactly once — on the inputs mount
+    const mounts = (JSON.parse(request.body) as { mounts: Array<Record<string, unknown>> })["mounts"];
+    expect(mounts.filter((mount) => mount["read_only"] === true).length).toBe(1);
     await driven.execution.cleanup();
     await driven.tool.cleanup();
   } finally {
@@ -695,12 +736,14 @@ test("8. the worker run uses the exact argv with the fixed mount order and :ro o
   }
 });
 
-test("9. the helper socket is projected exactly once", async () => {
+test("9. the helper socket reaches the operation exactly once as the transport endpoint", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
-    const run = runCall(driven.calls);
-    expect(run.args.filter((arg) => arg === "--helper-socket").length).toBe(1);
+    expect(driven.operationRequests).toHaveLength(1);
+    expect(driven.operationRequests[0]?.socketPath).toBe(SOCKET);
+    const body = JSON.stringify(operationBody(driven.operationRequests));
+    expect(body.includes(SOCKET)).toBe(false);
     await driven.execution.cleanup();
     await driven.tool.cleanup();
   } finally {
@@ -708,26 +751,24 @@ test("9. the helper socket is projected exactly once", async () => {
   }
 });
 
-test("10./11./12. authority separation: tool bearer to the worker, execution bearer for the CLI, launcher credential nowhere", async () => {
+test("10./11./12. authority separation: tool bearer to the worker, execution bearer for the operation, launcher credential nowhere", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
-    const run = runCall(driven.calls);
+    const request = operationRequest(driven.operationRequests);
     const pull = pullCall(driven.calls);
     // 10: the worker receives the Tool bearer under the session token name
-    const tokenFrom = run.args[run.args.indexOf("--env-from") + 1];
-    expect(tokenFrom).toBe("DOCKER_HELPER_SESSION_TOKEN=ORCHESTRATOR_V2_TOOL_SESSION_TOKEN");
-    expect(run.env[PIPELINE_V2_TOOL_SESSION_TOKEN_SOURCE]).toBe("dhc_2");
-    // 11: the CLI process authorizes with the Execution bearer
-    expect(run.env["DOCKER_HELPER_SESSION_TOKEN"]).toBe("dhc_1");
+    const environment = (JSON.parse(request.body) as { environment: Record<string, unknown> })["environment"];
+    expect(environment["DOCKER_HELPER_SESSION_TOKEN"]).toBe("dhc_2");
+    // 11: the operation authorizes with the Execution bearer
+    expect(request.bearer).toBe("dhc_1");
     expect(pull.env["DOCKER_HELPER_SESSION_TOKEN"]).toBe("dhc_1");
     // 12: the launcher credential (path or content) never reaches the
-    // worker env or argv
-    const runEnvValues = Object.values(run.env);
-    expect(runEnvValues).not.toContain(CREDENTIAL_FILE);
-    expect(run.env).not.toHaveProperty("DOCKER_HELPER_CONFIG");
-    expect(run.args).not.toContain(CREDENTIAL_FILE);
-    expect(JSON.stringify(run.env)).not.toContain("credential");
+    // worker environment or the request
+    expect(Object.values(environment)).not.toContain(CREDENTIAL_FILE);
+    expect(environment).not.toHaveProperty("DOCKER_HELPER_CONFIG");
+    expect(request.body).not.toContain(CREDENTIAL_FILE);
+    expect(request.body).not.toContain("credential");
     await driven.execution.cleanup();
     await driven.tool.cleanup();
   } finally {
@@ -735,29 +776,25 @@ test("10./11./12. authority separation: tool bearer to the worker, execution bea
   }
 });
 
-test("13./14. no secret values, prompt bodies or input bodies in argv; no prompt or input bodies in env", async () => {
+test("13./14. the operation request carries no prompt or input bodies; the resolved values travel only in the environment", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
-    const run = runCall(driven.calls);
-    const argvText = run.args.join("\n");
-    // 13: profile secrets, the OpenCode config content and both tokens are
-    // absent from argv
-    expect(run.args).not.toContain("sk-coder-secret");
-    expect(run.args).not.toContain("sk-architect-secret");
-    expect(run.args).not.toContain(JSON.stringify({ model: "coder-model" }));
-    expect(argvText.includes("dhc_1")).toBe(false);
-    expect(argvText.includes("dhc_2")).toBe(false);
-    // 14: the prompt body and the input file bodies never appear in argv
-    // or env
-    expect(argvText.includes("implement the task")).toBe(false);
-    expect(argvText.includes(TASK_JSON)).toBe(false);
-    expect(JSON.stringify(run.env).includes("implement the task")).toBe(false);
-    expect(JSON.stringify(run.env)).not.toContain(TASK_JSON);
-    expect(JSON.stringify(run.env)).not.toContain('"goal"');
-    // by design the env carries the secrets under private source names
-    // (never in argv); verify the private names are the only carriers
-    expect(run.env[PIPELINE_V2_OPENCODE_CONFIG_SOURCE]).toBe(JSON.stringify({ model: "coder-model" }));
+    const request = operationRequest(driven.operationRequests);
+    // 13: the prompt body and the input file bodies never appear in the
+    // request
+    expect(request.body.includes("implement the task")).toBe(false);
+    expect(request.body.includes(TASK_JSON)).toBe(false);
+    expect(request.body).not.toContain('"goal"');
+    // 14: by design the environment carries the resolved values — the
+    // config content and the profile env values — while the tool bearer
+    // travels under its destination name
+    const environment = (JSON.parse(request.body) as { environment: Record<string, unknown> })["environment"];
+    expect(environment["OPENCODE_CONFIG_CONTENT"]).toBe(JSON.stringify({ model: "coder-model" }));
+    expect(environment["MODEL_API_KEY"]).toBe("sk-coder-secret");
+    expect(environment["DOCKER_HELPER_SESSION_TOKEN"]).toBe("dhc_2");
+    // the Execution bearer is never part of the body
+    expect(request.body.includes("dhc_1")).toBe(false);
     await driven.execution.cleanup();
     await driven.tool.cleanup();
   } finally {
@@ -786,7 +823,7 @@ test("17. forged, cross-runtime and cross-activation tool handles are rejected b
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const callsAfterExecutionCreate = fake.calls.length;
     const realTool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
@@ -824,7 +861,7 @@ test("17. forged, cross-runtime and cross-activation tool handles are rejected b
 
     // a second runtime instance's tool handle is unregistered here
     const fakeB = makeFakeCli();
-    const runtimeB = makeRuntime(setup_, fakeB.cli);
+    const runtimeB = makeRuntime(setup_, fakeB);
     const executionB = await runtimeB.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const toolB = await runtimeB.createToolSession(setup_.coderView, setup_.coderPrepared);
     await expect(execution.runAgent(toolB)).rejects.toThrow(
@@ -871,7 +908,7 @@ test("17. forged, cross-runtime and cross-activation tool handles are rejected b
     // a tool session cannot be created without the uncleaned execution
     // session of the same activation
     const fakeC = makeFakeCli();
-    const runtimeC = makeRuntime(setup_, fakeC.cli);
+    const runtimeC = makeRuntime(setup_, fakeC);
     await expect(
       runtimeC.createToolSession(setup_.coderView, setup_.coderPrepared),
     ).rejects.toThrow(/the Tool Session requires the uncleaned Execution Session/);
@@ -910,7 +947,7 @@ test("19. session cleanup is memoized: repeated calls delete exactly once", asyn
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     await Promise.all([execution.cleanup(), execution.cleanup(), execution.cleanup()]);
     await execution.cleanup();
@@ -978,21 +1015,23 @@ test("23. a nonzero worker run reports worker_failed", async () => {
   }
 });
 
-test("24. a successful worker run reports completed and the stdout never participates", async () => {
+test("24. a successful worker operation reports completed with the exact request contract", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
     expect(driven.result).toEqual({ status: "completed" });
-    const run = runCall(driven.calls);
-    expect(run.opts).toEqual({ signalOnAbort: true, timeoutSeconds: 60 });
-    // the run subprocess environment contains exactly the Execution bearer
-    // for the CLI authority and the private --env-from source variables
-    expect(Object.keys(run.env).sort()).toEqual([
-      "DOCKER_HELPER_SESSION_TOKEN",
-      "ORCHESTRATOR_V2_OPENCODE_CONFIG_CONTENT",
-      "ORCHESTRATOR_V2_PROFILE_MODEL_API_KEY",
-      "ORCHESTRATOR_V2_PROFILE_SHARED_SETTING",
-      "ORCHESTRATOR_V2_TOOL_SESSION_TOKEN",
+    expect(driven.operationRequests).toHaveLength(1);
+    const request = driven.operationRequests[0];
+    expect(request?.timeoutSeconds).toBe(60);
+    expect(request?.bearer).toBe("dhc_1");
+    expect(Object.keys(JSON.parse(request?.body ?? "{}") as Record<string, unknown>).sort()).toEqual([
+      "command",
+      "entrypoint",
+      "environment",
+      "helper_socket",
+      "image",
+      "mounts",
+      "workdir",
     ]);
     await driven.execution.cleanup();
     await driven.tool.cleanup();
@@ -1005,7 +1044,7 @@ test("25. different agent states use their own image, env and config", async () 
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     // coder activation first
     const coderExecution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const coderTool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
@@ -1034,16 +1073,31 @@ test("25. different agent states use their own image, env and config", async () 
     const architectTool = await runtime.createToolSession(architectView, architectPrepared);
     expect(await architectExecution.runAgent(architectTool)).toEqual({ status: "completed" });
 
-    const coderRun = runCall(fake.calls.filter((call) => call.args.includes("ghcr.io/example/coder:1")));
-    const architectRun = runCall(fake.calls.filter((call) => call.args.includes("ghcr.io/example/architect:1")));
-    expect(coderRun.env[PIPELINE_V2_OPENCODE_CONFIG_SOURCE]).toBe(JSON.stringify({ model: "coder-model" }));
-    expect(coderRun.env.ORCHESTRATOR_V2_PROFILE_MODEL_API_KEY).toBe("sk-coder-secret");
-    expect(coderRun.env.ORCHESTRATOR_V2_PROFILE_SHARED_SETTING).toBe("shared-value-1");
-    expect(architectRun.env[PIPELINE_V2_OPENCODE_CONFIG_SOURCE]).toBe(JSON.stringify({ model: "architect-model" }));
-    expect(architectRun.env.ORCHESTRATOR_V2_PROFILE_MODEL_API_KEY).toBe("sk-architect-secret");
-    expect(architectRun.env.ORCHESTRATOR_V2_PROFILE_ARCH_ONLY).toBe("arch-only-value");
-    expect(architectRun.args).toContain("activations/2-architect/data/inputs:/pipeline/inputs:ro");
-    expect(architectRun.opts).toEqual({ signalOnAbort: true, timeoutSeconds: 30 });
+    expect(fake.operationRequests).toHaveLength(2);
+    const coderBody = JSON.parse(fake.operationRequests[0]?.body ?? "{}") as {
+      image: string;
+      environment: Record<string, unknown>;
+      mounts: Array<Record<string, unknown>>;
+    };
+    const architectBody = JSON.parse(fake.operationRequests[1]?.body ?? "{}") as {
+      image: string;
+      environment: Record<string, unknown>;
+      mounts: Array<Record<string, unknown>>;
+    };
+    expect(coderBody.image).toBe("ghcr.io/example/coder:1");
+    expect(coderBody.environment["OPENCODE_CONFIG_CONTENT"]).toBe(JSON.stringify({ model: "coder-model" }));
+    expect(coderBody.environment["MODEL_API_KEY"]).toBe("sk-coder-secret");
+    expect(coderBody.environment["SHARED_SETTING"]).toBe("shared-value-1");
+    expect(architectBody.image).toBe("ghcr.io/example/architect:1");
+    expect(architectBody.environment["OPENCODE_CONFIG_CONTENT"]).toBe(JSON.stringify({ model: "architect-model" }));
+    expect(architectBody.environment["MODEL_API_KEY"]).toBe("sk-architect-secret");
+    expect(architectBody.environment["ARCH_ONLY"]).toBe("arch-only-value");
+    expect(architectBody.mounts).toContainEqual({
+      source: "activations/2-architect/data/inputs",
+      target: "/pipeline/inputs",
+      read_only: true,
+    });
+    expect(fake.operationRequests[1]?.timeoutSeconds).toBe(30);
 
     await coderTool.cleanup();
     await coderExecution.cleanup();
@@ -1058,7 +1112,7 @@ test("26. env-from source names are stable across activations and never collide 
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     const coderExecution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const coderTool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
     expect(await coderExecution.runAgent(coderTool)).toEqual({ status: "completed" });
@@ -1085,43 +1139,22 @@ test("26. env-from source names are stable across activations and never collide 
     const architectTool = await runtime.createToolSession(architectView, architectPrepared);
     expect(await architectExecution.runAgent(architectTool)).toEqual({ status: "completed" });
 
-    const coderRun = runCall(fake.calls.filter((call) => call.args.includes("ghcr.io/example/coder:1")));
-    const architectRun = runCall(fake.calls.filter((call) => call.args.includes("ghcr.io/example/architect:1")));
-    const sourcesOf = (run: RecordedCall): string[] => {
-      const pairs: string[] = [];
-      for (let index = 0; index < run.args.length; index += 1) {
-        if (run.args[index] === "--env-from") {
-          pairs.push(run.args[index + 1] ?? "");
-        }
-      }
-      return pairs;
-    };
-    const coderPairs = sourcesOf(coderRun);
-    const architectPairs = sourcesOf(architectRun);
-    // the fixed pairs are identical across states and activations
-    expect(coderPairs.slice(0, 2)).toEqual([
-      `DOCKER_HELPER_SESSION_TOKEN=${PIPELINE_V2_TOOL_SESSION_TOKEN_SOURCE}`,
-      `OPENCODE_CONFIG_CONTENT=${PIPELINE_V2_OPENCODE_CONFIG_SOURCE}`,
-    ]);
-    expect(architectPairs.slice(0, 2)).toEqual(coderPairs.slice(0, 2));
-    // profile pairs keep the destination-sorted order
-    expect(coderPairs.slice(2)).toEqual([
-      "MODEL_API_KEY=ORCHESTRATOR_V2_PROFILE_MODEL_API_KEY",
-      "SHARED_SETTING=ORCHESTRATOR_V2_PROFILE_SHARED_SETTING",
-    ]);
-    expect(architectPairs.slice(2)).toEqual([
-      "ARCH_ONLY=ORCHESTRATOR_V2_PROFILE_ARCH_ONLY",
-      "MODEL_API_KEY=ORCHESTRATOR_V2_PROFILE_MODEL_API_KEY",
-    ]);
-    // no source name equals any destination name
-    for (const pair of [...coderPairs, ...architectPairs]) {
-      const separator = pair.indexOf("=");
-      const destination = pair.slice(0, separator);
-      const source = pair.slice(separator + 1);
-      expect(source.startsWith("ORCHESTRATOR_V2_")).toBe(true);
-      expect(destination.startsWith("ORCHESTRATOR_V2_")).toBe(false);
-      expect(destination).not.toBe(source);
-    }
+    expect(fake.operationRequests).toHaveLength(2);
+    const keysOf = (bodyText: string | undefined): string[] =>
+      Object.keys((JSON.parse(bodyText ?? "{}") as { environment: Record<string, unknown> })["environment"]).sort();
+    const coderKeys = keysOf(fake.operationRequests[0]?.body);
+    const architectKeys = keysOf(fake.operationRequests[1]?.body);
+    // the fixed destinations are present for every state
+    expect(coderKeys).toContain("DOCKER_HELPER_SESSION_TOKEN");
+    expect(coderKeys).toContain("OPENCODE_CONFIG_CONTENT");
+    expect(architectKeys).toContain("DOCKER_HELPER_SESSION_TOKEN");
+    expect(architectKeys).toContain("OPENCODE_CONFIG_CONTENT");
+    // the environment map is canonical: keys in sorted order, matching the
+    // CLI's sorted map marshaling
+    expect(coderKeys).toEqual([...coderKeys].sort());
+    expect(architectKeys).toEqual([...architectKeys].sort());
+    expect(coderKeys).toEqual(["DOCKER_HELPER_SESSION_TOKEN", "MODEL_API_KEY", "OPENCODE_CONFIG_CONTENT", "SHARED_SETTING"]);
+    expect(architectKeys).toEqual(["ARCH_ONLY", "DOCKER_HELPER_SESSION_TOKEN", "MODEL_API_KEY", "OPENCODE_CONFIG_CONTENT"]);
     await coderTool.cleanup();
     await coderExecution.cleanup();
     await architectTool.cleanup();
@@ -1131,28 +1164,20 @@ test("26. env-from source names are stable across activations and never collide 
   }
 });
 
-test("27. the run argv carries no absolute host paths", async () => {
+test("27. the operation request carries no absolute host paths", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
-    const run = runCall(driven.calls);
-    for (const arg of run.args) {
-      expect(arg.includes(setup_.runRoot)).toBe(false);
-      expect(arg.includes(setup_.root)).toBe(false);
-      expect(arg.includes(setup_.bundle)).toBe(false);
-    }
+    const request = operationRequest(driven.operationRequests);
+    expect(request.body.includes(setup_.runRoot)).toBe(false);
+    expect(request.body.includes(setup_.root)).toBe(false);
+    expect(request.body.includes(setup_.bundle)).toBe(false);
     // every mount source is a clean workspace-relative path
-    const mountArgs: string[] = [];
-    for (let index = 0; index < run.args.length; index += 1) {
-      if (run.args[index] === "--mount") {
-        mountArgs.push(run.args[index + 1] ?? "");
-      }
-    }
-    for (const mount of mountArgs) {
-      expect(mount.startsWith("/")).toBe(false);
-      const sourcePart = mount.slice(0, mount.indexOf(":"));
-      expect(sourcePart.split("/")).not.toContain("..");
-      expect(sourcePart.split("/")).not.toContain("");
+    const mounts = (JSON.parse(request.body) as { mounts: Array<{ source: string }> })["mounts"];
+    for (const mount of mounts) {
+      expect(mount.source.startsWith("/")).toBe(false);
+      expect(mount.source.split("/")).not.toContain("..");
+      expect(mount.source.split("/")).not.toContain("");
     }
     await driven.execution.cleanup();
     await driven.tool.cleanup();
@@ -1165,7 +1190,7 @@ test("28. host-mode projection: identical roots pass and the workspaces are the 
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli, {
+    const runtime = makeRuntime(setup_, fake, {
       runRootProjection: { localRoot: setup_.runRoot, daemonRoot: setup_.runRoot },
     });
     await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1183,7 +1208,7 @@ test("29. an activation run root that is not the projection local root fails clo
     const other = await mkdtemp(join(tmpdir(), "pipeline-v2-projection-other-"));
     try {
       const fake = makeFakeCli();
-      const runtime = makeRuntime(setup_, fake.cli, {
+      const runtime = makeRuntime(setup_, fake, {
         runRootProjection: { localRoot: other, daemonRoot: other },
       });
       let failure: unknown;
@@ -1207,7 +1232,7 @@ test("30. a missing daemonRoot fails closed before any session", async () => {
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli, {
+    const runtime = makeRuntime(setup_, fake, {
       runRootProjection: { localRoot: setup_.runRoot, daemonRoot: join(setup_.root, "absent") },
     });
     let failure: unknown;
@@ -1232,7 +1257,7 @@ test("31. a symlinked daemonRoot to the same directory is rejected before any se
     const alias = join(setup_.root, "run-alias");
     await symlink(setup_.runRoot, alias);
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli, {
+    const runtime = makeRuntime(setup_, fake, {
       runRootProjection: { localRoot: setup_.runRoot, daemonRoot: alias },
     });
     let failure: unknown;
@@ -1256,7 +1281,7 @@ test("32. a file in place of daemonRoot and different-directory roots both fail 
     const filePath = join(setup_.root, "not-a-dir");
     await writeFile(filePath, "x");
     const fakeFile = makeFakeCli();
-    const runtimeFile = makeRuntime(setup_, fakeFile.cli, {
+    const runtimeFile = makeRuntime(setup_, fakeFile, {
       runRootProjection: { localRoot: setup_.runRoot, daemonRoot: filePath },
     });
     let fileFailure: unknown;
@@ -1274,7 +1299,7 @@ test("32. a file in place of daemonRoot and different-directory roots both fail 
     const otherDir = join(setup_.root, "other-root");
     await mkdir(otherDir, { mode: 0o700 });
     const fakeDir = makeFakeCli();
-    const runtimeDir = makeRuntime(setup_, fakeDir.cli, {
+    const runtimeDir = makeRuntime(setup_, fakeDir, {
       runRootProjection: { localRoot: setup_.runRoot, daemonRoot: otherDir },
     });
     let dirFailure: unknown;
@@ -1325,7 +1350,7 @@ test("33. a missing projection pair object fails closed naming the pair, for eve
         }
         void kind;
         const fake = makeFakeCli();
-        const runtime = makeRuntime(missingSetup, fake.cli);
+        const runtime = makeRuntime(missingSetup, fake);
         let failure: unknown;
         try {
           await runtime.createExecutionSession(missingSetup.coderView, missingSetup.coderPrepared);
@@ -1351,7 +1376,7 @@ test("34. mutating the projection object after factory creation cannot influence
   try {
     const projection = { localRoot: setup_.runRoot, daemonRoot: setup_.runRoot };
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli, { runRootProjection: projection });
+    const runtime = makeRuntime(setup_, fake, { runRootProjection: projection });
     projection.localRoot = "/totally/other/root";
     projection.daemonRoot = "/totally/other/daemon";
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1360,8 +1385,8 @@ test("34. mutating the projection object after factory creation cannot influence
     expect(fake.calls[1]!.args).toContain(setup_.coderPrepared.project_root);
     const result = await execution.runAgent(tool);
     expect(result).toEqual({ status: "completed" });
-    const run = runCall(fake.calls);
-    expect(JSON.stringify(run.args)).not.toContain("/totally/other");
+    expect(JSON.stringify(operationBody(fake.operationRequests))).not.toContain("/totally/other");
+    expect(fake.operationRequests[0]?.socketPath).toBe(SOCKET);
     await execution.cleanup();
     await tool.cleanup();
   } finally {
@@ -1373,11 +1398,9 @@ test("35. neither projection root appears in the worker argv or env, nor in the 
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
-    const run = runCall(driven.calls);
-    const serializedArgs = JSON.stringify(run.args);
-    const serializedEnv = JSON.stringify(run.env);
-    expect(serializedArgs).not.toContain(setup_.runRoot);
-    expect(serializedEnv).not.toContain(setup_.runRoot);
+    const request = operationRequest(driven.operationRequests);
+    expect(request.body).not.toContain(setup_.runRoot);
+    expect(request.body).not.toContain(setup_.root);
     const document = await readFile(setup_.coderPrepared.execution_document.host_path, "utf8");
     expect(document).not.toContain(setup_.runRoot);
     await driven.execution.cleanup();
@@ -1391,12 +1414,12 @@ test("36. the factory rejects a projection without absolute clean roots before a
   const setup_ = await setup();
   try {
     expect(() =>
-      makeRuntime(setup_, makeFakeCli().cli, {
+      makeRuntime(setup_, makeFakeCli(), {
         runRootProjection: { localRoot: "relative/path", daemonRoot: setup_.runRoot },
       }),
     ).toThrow("must be absolute clean paths");
     expect(() =>
-      makeRuntime(setup_, makeFakeCli().cli, {
+      makeRuntime(setup_, makeFakeCli(), {
         runRootProjection: { localRoot: "", daemonRoot: setup_.runRoot },
       }),
     ).toThrow("must be a non-empty string");
@@ -1414,7 +1437,7 @@ test("37. a symlink substituted for a pair object fails even when both projectio
     await rm(setup_.coderPrepared.outputs_root, { recursive: true });
     await symlink(setup_.root, setup_.coderPrepared.outputs_root);
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     let failure: unknown;
     try {
       await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1438,7 +1461,7 @@ test("38. a FIFO and a unix socket in place of pair objects are rejected before 
     await rm(setup_.coderPrepared.data_root, { recursive: true });
     execSync(["mkfifo", setup_.coderPrepared.data_root].join(" "));
     const fakeFifo = makeFakeCli();
-    const runtimeFifo = makeRuntime(setup_, fakeFifo.cli);
+    const runtimeFifo = makeRuntime(setup_, fakeFifo);
     let fifoFailure: unknown;
     try {
       await runtimeFifo.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1460,7 +1483,7 @@ test("38. a FIFO and a unix socket in place of pair objects are rejected before 
     await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
     try {
       const fakeSocket = makeFakeCli();
-      const runtimeSocket = makeRuntime(setup_, fakeSocket.cli);
+      const runtimeSocket = makeRuntime(setup_, fakeSocket);
       let socketFailure: unknown;
       try {
         await runtimeSocket.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1487,7 +1510,7 @@ test("39. a swapped file/directory substitution is rejected for both expected ki
     await rm(setup_.coderPrepared.data_root, { recursive: true });
     await writeFile(setup_.coderPrepared.data_root, "not a directory\n");
     const fakeFile = makeFakeCli();
-    const runtimeFile = makeRuntime(setup_, fakeFile.cli);
+    const runtimeFile = makeRuntime(setup_, fakeFile);
     let fileFailure: unknown;
     try {
       await runtimeFile.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1509,7 +1532,7 @@ test("39. a swapped file/directory substitution is rejected for both expected ki
     await rm(documentSetup.coderPrepared.execution_document.host_path);
     await mkdir(documentSetup.coderPrepared.execution_document.host_path);
     const fakeDir = makeFakeCli();
-    const runtimeDir = makeRuntime(documentSetup, fakeDir.cli);
+    const runtimeDir = makeRuntime(documentSetup, fakeDir);
     let dirFailure: unknown;
     try {
       await runtimeDir.createExecutionSession(documentSetup.coderView, documentSetup.coderPrepared);
@@ -1539,7 +1562,7 @@ test("40. a symlinked parent with an external sentinel tree is rejected by the c
       await rm(join(setup_.runRoot, "activations"), { recursive: true });
       await symlink(external, join(setup_.runRoot, "activations"));
       const fake = makeFakeCli();
-      const runtime = makeRuntime(setup_, fake.cli);
+      const runtime = makeRuntime(setup_, fake);
       let failure: unknown;
       try {
         await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1568,7 +1591,7 @@ test("41. a revisit agent activation carries its own new global execution index 
   try {
     const revisitPrepared = await prepareActivationData(setup_.pipeline, setup_.snap, [], "coder", 2);
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     await runtime.createExecutionSession(setup_.coderView, revisitPrepared);
     const tool = await runtime.createToolSession(setup_.coderView, revisitPrepared);
     const executionCreate = fake.calls[0]!;
@@ -1607,7 +1630,7 @@ test("42. mutations of the profile map and the projection object after the facto
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     setup_.profiles.delete("coder");
     setup_.profiles.set("coder", {
       profileName: "coder",
@@ -1634,7 +1657,7 @@ test("43. the state id cannot inject argv: the policy paths are derived from the
   const setup_ = await setup();
   try {
     const fake = makeFakeCli();
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     // a hostile state id in a hand-built execution view never reaches the
     // roots: the view must name the activation's own state
     const hostileView = {
@@ -1755,7 +1778,7 @@ test("46. a session-create failure creates no handle, no record and triggers no 
   const setup_ = await setup();
   try {
     const fake = makeFakeCli({ createCode: 3, createStderr: "error: policy rejected" });
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     let failure: unknown;
     try {
       await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
@@ -1784,7 +1807,7 @@ test("47. a Tool create rejection leaves the Execution session cleanable exactly
       createCode: (sessionNumber) => (sessionNumber === 2 ? 1 : 0),
       createStderr: "error: invalid_filesystem_policy",
     });
-    const runtime = makeRuntime(setup_, fake.cli);
+    const runtime = makeRuntime(setup_, fake);
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     let failure: unknown;
     try {
@@ -1802,6 +1825,78 @@ test("47. a Tool create rejection leaves the Execution session cleanable exactly
     expect(deletes.length).toBe(1);
     expect(deletes[0]!.args).toContain(execution.sessionId);
   } finally {
+    await dispose(setup_);
+  }
+});
+
+test("47b. request parity: the production adapter sends the exact POST /run body the docker-helper CLI 2.3.1 sends", async () => {
+  // The golden body was captured from the real docker-helper CLI 2.3.1
+  // (run through the production adapter path against a recording daemon).
+  // The production operation runner (the real HTTP transport) is used
+  // here — no injected fake.
+  const setup_ = await setup();
+  const root = mkdtempSync(join(tmpdir(), "parity-op-"));
+  const socketPath = join(root, "parity.sock");
+  const recorded: Array<{ bearer: string; body: string }> = [];
+  const server = Bun.serve({
+    unix: socketPath,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const bearer = (request.headers.get("Authorization") ?? "").replace(/^Bearer /, "");
+      const body = await request.text();
+      if (url.pathname === "/run") {
+        recorded.push({ bearer, body });
+        return new Response(JSON.stringify({ ok: true, operation_id: "op-parity-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/operations/op-parity-1/logs") {
+        const offset = Number(url.searchParams.get("offset") ?? "0");
+        return new Response(JSON.stringify({ logs: "", offset, next_offset: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/operations/op-parity-1") {
+        return new Response(JSON.stringify({ status: "succeeded", exit_code: 0, result_code: "0" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname.endsWith("/cancel")) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ error: "no route" }), { status: 404 });
+    },
+  });
+  try {
+    const runtime = makeRuntime(setup_, makeFakeCli(), { productionOperationRunner: true, socketPath });
+    const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
+    const result = await execution.runAgent(tool);
+    expect(result).toEqual({ status: "completed" });
+    expect(recorded).toHaveLength(1);
+    const request = recorded[0];
+    expect(request?.bearer).toBe("dhc_1");
+    const body = JSON.parse(request?.body ?? "{}") as Record<string, unknown>;
+    expect(body).toEqual(CODER_RUN_BODY);
+    // the top-level field order matches the CLI's struct order exactly
+    const keyOrder = Object.keys(JSON.parse(request?.body ?? "{}") as Record<string, unknown>);
+    expect(keyOrder).toEqual(["image", "entrypoint", "workdir", "command", "environment", "mounts", "helper_socket"]);
+    // the environment map is key-sorted, matching the CLI's map marshaling
+    const environmentKeys = Object.keys((body["environment"] ?? {}) as Record<string, unknown>);
+    expect(environmentKeys).toEqual([...environmentKeys].sort());
+    // the tool bearer resolves under its destination name in the body
+    expect((body["environment"] as Record<string, unknown>)["DOCKER_HELPER_SESSION_TOKEN"]).toBe("dhc_2");
+    await execution.cleanup();
+    await tool.cleanup();
+  } finally {
+    server.stop(true);
+    rmSync(root, { recursive: true, force: true });
     await dispose(setup_);
   }
 });

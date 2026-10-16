@@ -85,20 +85,23 @@
  * the registry lookup before any field is read and before any helper CLI
  * call — getters and Proxy traps are never invoked.
  *
- * Worker launch follows the fixed CLI 2.2.0-rc.10 contract: `pull` and
- * `run` through the Execution Session, `--helper-socket` exactly once,
- * mounts in the fixed order (project RW, activation inputs RO, activation
- * outputs RW) with clean workspace-relative sources verified against the
- * prepared activation before the CLI call, and no secret value in argv —
- * the Tool bearer, every profile env value and `OPENCODE_CONFIG_CONTENT`
- * travel only through `--env-from` from deterministically named private
- * source variables of the run subprocess environment. Known boundary:
- * while `--env-from` keeps secret values out of the adapter's argv, the
- * legacy daemon-side Docker CLI may still see resolved values in its own
- * argv; that risk is documented, not eliminated here. The issuance-time
- * Session filesystem policy above is what makes this exact mount set
- * workable: the project source is writable through the Session, the
- * inputs source is read-only, and the outputs source is writable.
+ * Worker execution is adapter-owned: the only helper CLI call left in
+ * the worker path is the image `pull` through the Execution Session.
+ * The worker itself runs as one Docker Helper HTTP operation over the
+ * helper Unix socket (`POST /run`, `GET /operations/:id/logs`,
+ * `GET /operations/:id`, `POST /operations/:id/cancel`) owned by the
+ * internal `runWorkerOperation` state machine: the outcome is classified
+ * only from the authoritative operation status, the operation id lives
+ * only inside one operation call (never returned, persisted or logged),
+ * log failures are outcome-neutral, and the bounded in-memory log tail
+ * is kept for the durable publication increment. The `POST /run` body
+ * preserves the exact request parity with the docker-helper CLI 2.3.1:
+ * the same field set and order, the same mount order (project RW,
+ * activation inputs RO, activation outputs RW) with clean
+ * workspace-relative sources verified against the prepared activation,
+ * and the same resolved environment values (sorted object keys, matching
+ * the CLI's map marshaling) with no ambient env inheritance. Worker
+ * output bytes are forwarded to the orchestrator's stderr as received.
  *
  * Every created Session is cleaned through memoized Launcher-authority
  * deletes: the physical delete runs at most once, repeated cleanup calls
@@ -160,7 +163,24 @@ import type {
 } from "./pipeline_v2_coordinator.ts";
 import type { V2AgentExecutionView } from "./pipeline_engine.ts";
 import type { ResolvedProfile } from "./profile.ts";
+import {
+  runWorkerOperation,
+  type WorkerLogCapture,
+  type WorkerOperationRequest,
+  type WorkerOperationResult,
+} from "./worker_operation.ts";
+import type { WorkerSignalHub } from "./worker_signals.ts";
 import { OPENCODE_CONFIG_CONTENT_ENV, SESSION_TOKEN_ENV } from "./worker.ts";
+
+/**
+ * The worker operation runner seam. The production value runs the real
+ * adapter-owned HTTP operation (`runWorkerOperation`); runner-level tests
+ * inject a fake that records the request and returns a scripted outcome.
+ * The Docker Helper runtime adapter remains the lifecycle owner.
+ */
+export type PipelineV2WorkerOperationRunner = (
+  request: Omit<WorkerOperationRequest, "transport">,
+) => Promise<WorkerOperationResult>;
 
 export interface DockerHelperPipelineV2RuntimeParams {
   /** The exact deep-frozen snapshot a successful `loadPipelineV2` returned. */
@@ -192,6 +212,18 @@ export interface DockerHelperPipelineV2RuntimeParams {
     readonly localRoot: string;
     readonly daemonRoot: string;
   };
+  /**
+   * The runner-owned first-wins hub: a user signal is forwarded to the
+   * active worker operation and the operation's own deadline claims the
+   * same first-wins slot. Required — without it a worker operation could
+   * not be cancelled or timed out.
+   */
+  readonly workerSignals: WorkerSignalHub;
+  /**
+   * The worker operation runner. Defaults to the production
+   * adapter-owned HTTP operation; runner-level tests inject a fake.
+   */
+  readonly operationRunner?: PipelineV2WorkerOperationRunner;
 }
 
 /** Stable fail-closed reasons of the runtime projection contract. */
@@ -225,6 +257,21 @@ export const PIPELINE_V2_OPENCODE_CONFIG_SOURCE = "ORCHESTRATOR_V2_OPENCODE_CONF
 const PROFILE_SOURCE_PREFIX = "ORCHESTRATOR_V2_PROFILE_";
 
 const WORKER_ENTRYPOINT = "opencode";
+
+/**
+ * The production worker operation runner: the adapter-owned HTTP operation
+ * with the production transport (the transport default inside
+ * `runWorkerOperation`).
+ */
+const defaultOperationRunner: PipelineV2WorkerOperationRunner = (request) => runWorkerOperation(request);
+
+/**
+ * The production worker output sink: worker bytes flow to the
+ * orchestrator's stderr exactly as the inherited CLI child wrote them.
+ */
+const workerOutputSink = (chunk: Uint8Array): void => {
+  void process.stderr.write(chunk);
+};
 const WORKER_WORKDIR = "/workspace";
 
 /** Workspace-relative path of the shared run-owned project directory. */
@@ -270,6 +317,12 @@ interface SessionRecord {
   cleaned: boolean;
   cleanupPromise: Promise<void> | null;
   ran: boolean;
+  /**
+   * The internal bounded log capture of the worker operation, available
+   * to the durable publication increment. Not persisted, not part of any
+   * public handle, never serialized.
+   */
+  capture: WorkerLogCapture | null;
 }
 
 function requireNonEmptyString(value: unknown, what: string): string {
@@ -526,6 +579,19 @@ export function createDockerHelperPipelineV2Runtime(
   if (typeof cli !== "function") {
     throw new Error("pipeline v2 agent runtime factory requires a CLI runner function");
   }
+
+  const workerSignals = params.workerSignals;
+  if (
+    workerSignals === null ||
+    typeof workerSignals !== "object" ||
+    typeof workerSignals.register !== "function" ||
+    typeof workerSignals.unregister !== "function" ||
+    typeof workerSignals.forwardUserSignal !== "function" ||
+    typeof workerSignals.claimTimeout !== "function"
+  ) {
+    throw new Error("pipeline v2 agent runtime factory requires the worker signal hub");
+  }
+  const operationRunner = params.operationRunner ?? defaultOperationRunner;
 
   if (!isRecord(params.helperConfig)) {
     throw new Error("pipeline v2 agent runtime factory requires a helper config");
@@ -813,6 +879,7 @@ export function createDockerHelperPipelineV2Runtime(
       cleaned: false,
       cleanupPromise: null,
       ran: false,
+      capture: null,
     };
     return record;
   };
@@ -908,61 +975,62 @@ export function createDockerHelperPipelineV2Runtime(
     const inputsSource = policyPaths.inputs;
     const outputsSource = policyPaths.outputs;
 
-    // docker-helper 2.2.0-rc.10 grammar: the image is the one required
-    // positional operand of `run` (`run [flags] IMAGE [--] [COMMAND...]`).
-    const args: string[] = [
-      "run",
-      "--endpoint",
-      helperConfig.socketPath,
-      "--entrypoint",
-      WORKER_ENTRYPOINT,
-      "--workdir",
-      WORKER_WORKDIR,
-      "--helper-socket",
-      "--mount",
-      `${projectSource}:${PROJECT_MOUNT_TARGET}`,
-      "--mount",
-      `${inputsSource}:${ACTIVATION_INPUTS_ROOT}:ro`,
-      "--mount",
-      `${outputsSource}:${ACTIVATION_OUTPUTS_ROOT}`,
-      "--env-from",
-      `${SESSION_TOKEN_ENV}=${PIPELINE_V2_TOOL_SESSION_TOKEN_SOURCE}`,
-      "--env-from",
-      `${OPENCODE_CONFIG_CONTENT_ENV}=${PIPELINE_V2_OPENCODE_CONFIG_SOURCE}`,
-    ];
-    for (const entry of profileData.envEntries) {
-      args.push("--env-from", `${entry.destination}=${profileSourceName(entry.destination)}`);
-    }
-    args.push(profileData.image);
-    args.push(
-      "--",
-      "run",
-      "--format",
-      "json",
-      "--auto",
-      `Read ${PIPELINE_V2_EXECUTION_DOCUMENT_CONTAINER_PATH} and follow it exactly.`,
-    );
-
-    // The run subprocess environment: the Execution bearer for the CLI
-    // authority, the private source variables referenced by --env-from,
-    // and nothing else.
-    const runEnv: Record<string, string> = {
-      [SESSION_TOKEN_ENV]: executionRecord.token,
-      [PIPELINE_V2_TOOL_SESSION_TOKEN_SOURCE]: toolRecord.token,
-      [PIPELINE_V2_OPENCODE_CONFIG_SOURCE]: profileData.opencodeConfigContent,
+    // The exact `POST /run` request body — the request-parity contract
+    // with the docker-helper CLI 2.3.1: the same field set, the same
+    // field order, the same mount order with the read-only inputs mount,
+    // and the same resolved environment values (object keys in sorted
+    // order, matching the CLI's map marshaling).
+    const environment: Record<string, string> = {
+      [SESSION_TOKEN_ENV]: toolRecord.token,
+      [OPENCODE_CONFIG_CONTENT_ENV]: profileData.opencodeConfigContent,
     };
     for (const entry of profileData.envEntries) {
-      runEnv[profileSourceName(entry.destination)] = entry.value;
+      environment[entry.destination] = entry.value;
     }
-
-    const runResult = await cli(args, runEnv, "inherit", {
-      signalOnAbort: true,
-      timeoutSeconds: agentState.timeout_seconds,
+    const environmentKeys = Object.keys(environment).sort();
+    const sortedEnvironment: Record<string, string> = {};
+    for (const key of environmentKeys) {
+      const value = environment[key];
+      if (value !== undefined) {
+        sortedEnvironment[key] = value;
+      }
+    }
+    const runBody = JSON.stringify({
+      image: profileData.image,
+      entrypoint: WORKER_ENTRYPOINT,
+      workdir: WORKER_WORKDIR,
+      command: [
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        `Read ${PIPELINE_V2_EXECUTION_DOCUMENT_CONTAINER_PATH} and follow it exactly.`,
+      ],
+      environment: sortedEnvironment,
+      mounts: [
+        { source: projectSource, target: PROJECT_MOUNT_TARGET },
+        { source: inputsSource, target: ACTIVATION_INPUTS_ROOT, read_only: true },
+        { source: outputsSource, target: ACTIVATION_OUTPUTS_ROOT },
+      ],
+      helper_socket: true,
     });
-    if (runResult.timedOut === true) {
+
+    // The adapter-owned worker operation: the outcome is classified only
+    // from the authoritative operation status, the operation id never
+    // leaves the operation call, and every log failure is outcome-neutral.
+    const operation = await operationRunner({
+      socketPath: helperConfig.socketPath,
+      bearer: executionRecord.token,
+      body: runBody,
+      timeoutSeconds: agentState.timeout_seconds,
+      workerSignals,
+      outputSink: workerOutputSink,
+    });
+    executionRecord.capture = operation.capture;
+    if (operation.outcome === "worker_timeout") {
       return { status: "failed", reason: "worker_timeout" };
     }
-    if (runResult.code !== 0) {
+    if (operation.outcome === "worker_failed") {
       return { status: "failed", reason: "worker_failed" };
     }
     return { status: "completed" };

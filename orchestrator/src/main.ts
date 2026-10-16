@@ -70,6 +70,7 @@ import {
   type CliStdio,
   SubprocessCliRunner,
 } from "./docker_helper.ts";
+import type { PipelineV2WorkerOperationRunner } from "./pipeline_v2_docker_runtime.ts";
 import { resolveHelperConfig, type HelperConfig } from "./launcher.ts";
 import { runAgentSmoke, type AgentSmokeOptions } from "./agent_smoke.ts";
 import { runSmoke } from "./smoke.ts";
@@ -107,6 +108,12 @@ import {
  */
 export interface CliIo {
   baseEnv: Readonly<Record<string, string | undefined>>;
+  /**
+   * The optional worker operation runner seam (production default: the
+   * real adapter-owned HTTP operation). Test-only; never set in
+   * production CLI IO.
+   */
+  operationRunner?: PipelineV2WorkerOperationRunner;
   runner: {
     run: CliRunner;
     killActive: (signal: "SIGINT" | "SIGTERM") => boolean;
@@ -389,6 +396,7 @@ function pipelineV2CommandDeps(
     helperConfig: configuration.config,
     baseEnv: io.baseEnv,
     stateRootProjection: configuration.stateRootProjection,
+    operationRunner: io.operationRunner,
     onSignal: (handler) => {
       v1SignalRegistration(io, handler);
     },

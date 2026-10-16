@@ -19,6 +19,7 @@ import {
   type PipelineV2RunnerDeps,
 } from "../src/pipeline_v2_runner.ts";
 import type { AuthFetcher, CliRunner, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
+import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
 import {
   acceptActivationOutputs,
   collectRunOutputs,
@@ -618,6 +619,53 @@ const DEFAULT_BASE_ENV: Readonly<Record<string, string>> = {
   CODER_SOURCE_VAR_1: SECRET_ENV_VALUE,
 };
 
+/**
+ * The fake worker operation: materializes the declared outputs into the
+ * activation outputs directory and maps the run-code options onto the
+ * operation-outcome contract.
+ */
+function fakeWorkerOperation(
+  harness: Harness,
+  runId: string,
+  script: ResumeScript,
+): PipelineV2WorkerOperationRunner {
+  return async (request) => {
+    await script.onRun?.();
+    const body = JSON.parse(request.body) as {
+      mounts?: Array<{ source?: string; target?: string }>;
+    };
+    const outputsMount = (body.mounts ?? []).find((mount) => mount.target === "/pipeline/outputs");
+    if (outputsMount !== undefined && typeof outputsMount.source === "string") {
+      const segments = outputsMount.source.split("/");
+      const dash = segments[1] ?? "";
+      const stateId = dash.slice(dash.indexOf("-") + 1);
+      const outputs = script.workerOutputs?.[stateId];
+      if (outputs !== undefined) {
+        const dir = join(harness.runRoot(runId), outputsMount.source);
+        await mkdir(dir, { recursive: true });
+        for (const [name, content] of Object.entries(outputs)) {
+          await writeFile(join(dir, name), content);
+        }
+      }
+    }
+    if (script.runTimedOut === true) {
+      return { outcome: "worker_timeout", capture: EMPTY_CAPTURE };
+    }
+    if ((script.runCode ?? 0) !== 0) {
+      return { outcome: "worker_failed", capture: EMPTY_CAPTURE };
+    }
+    return { outcome: "completed", capture: EMPTY_CAPTURE };
+  };
+}
+
+const EMPTY_CAPTURE = {
+  status: "unavailable" as const,
+  byteCount: 0,
+  tailBytes: new Uint8Array(0),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
+
 function fakeCliTransport(
   harness: Harness,
   runId: string,
@@ -653,34 +701,6 @@ function fakeCliTransport(
     if (args[0] === "pull") {
       return { code: 0 };
     }
-    if (args[0] === "run") {
-      await script.onRun?.();
-      let mountStart = -1;
-      for (let i = 0; i < args.length; i += 1) {
-        if (args[i] === "--mount") {
-          mountStart = i;
-          break;
-        }
-      }
-      for (let i = mountStart; i >= 0 && i < args.length && args[i] === "--mount"; i += 2) {
-        const spec = args[i + 1] ?? "";
-        const [source, target] = spec.split(":");
-        if (target === "/pipeline/outputs") {
-          const segments = (source ?? "").split("/");
-          const dash = segments[1] ?? "";
-          const stateId = dash.slice(dash.indexOf("-") + 1);
-          const outputs = script.workerOutputs?.[stateId];
-          if (outputs !== undefined) {
-            const dir = join(harness.runRoot(runId), source ?? "");
-            await mkdir(dir, { recursive: true });
-            for (const [name, content] of Object.entries(outputs)) {
-              await writeFile(join(dir, name), content);
-            }
-          }
-        }
-      }
-      return { code: script.runCode ?? 0, timedOut: script.runTimedOut ?? false };
-    }
     return { code: 1 };
   };
 }
@@ -693,6 +713,7 @@ async function runResume(
   let handlerCalls = 0;
   const calls: RecordedCall[] = [];
   const cli = fakeCliTransport(harness, runId, script, calls);
+  const operationRunner = fakeWorkerOperation(harness, runId, script);
   let authCalls = 0;
   const fetchAuth: AuthFetcher = async () => {
     authCalls += 1;
@@ -709,6 +730,7 @@ async function runResume(
   const deps: PipelineV2RunnerDeps = {
     cli,
     fetchAuth,
+    operationRunner,
     helperConfig: {
       socketPath: "/run/docker-helper/docker-helper.sock",
       credentialFile: harness.credentialFile,
