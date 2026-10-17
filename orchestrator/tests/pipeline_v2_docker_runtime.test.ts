@@ -1859,7 +1859,7 @@ test("47b. request parity: the production adapter sends the exact POST /run body
         });
       }
       if (url.pathname === "/operations/op-parity-1") {
-        return new Response(JSON.stringify({ status: "succeeded", exit_code: 0, result_code: "0" }), {
+        return new Response(JSON.stringify({ status: "succeeded", exit_code: null, result_code: "succeeded" }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });

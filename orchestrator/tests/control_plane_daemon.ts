@@ -161,9 +161,13 @@ Bun.serve({
         return json({ ok: true, operation_id: operation.id, status: operation.state });
       }
       const status: Record<string, unknown> = { status: operation.state };
-      if (operation.state === "succeeded" || operation.state === "failed") {
-        status["exit_code"] = operation.exitCode;
-        status["result_code"] = String(operation.exitCode);
+      if (operation.state === "succeeded") {
+        status["exit_code"] = null;
+        status["result_code"] = "succeeded";
+      }
+      if (operation.state === "failed") {
+        status["exit_code"] = operation.exitCode === 0 ? null : operation.exitCode;
+        status["result_code"] = operation.exitCode === 0 ? "docker_run_failed" : "container_exit_nonzero";
       }
       return json(status);
     }

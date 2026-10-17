@@ -59,6 +59,8 @@ interface FixtureConfig {
   createRefused?: boolean;
   /** POST /operations/:id/cancel fails with this status. */
   cancelFault?: "none" | "status500";
+  /** Overrides the terminal result_code (contradictory-shape tests). */
+  resultOverride?: string;
 }
 
 interface Fixture {
@@ -121,9 +123,10 @@ function startFixture(config: FixtureConfig): Fixture {
         }
         if (id.match(/^[A-Za-z0-9-]{1,128}$/) === null) {
           // an invalid id is still handed out; the client must fail closed
-          return json({ ok: true, operation_id: id });
+          return json({ ok: true, operation_id: id }, 201);
         }
-        return json({ ok: true, operation_id: id });
+        // the daemon answers POST /run with 201 Created
+        return json({ ok: true, operation_id: id }, 201);
       }
       const parts = url.pathname.split("/");
       const operation = operations.get(parts[2] ?? "");
@@ -144,8 +147,11 @@ function startFixture(config: FixtureConfig): Fixture {
         }
         const total = Buffer.byteLength(operation.log, "utf8");
         if (config.logFault === "stall" && operation.state !== "running") {
-          // a terminal daemon that never ends the stream with null
-          return json({ logs: operation.log.slice(offset), offset, next_offset: Math.max(total, offset) });
+          // a terminal daemon that never ends the stream: the first drain
+          // hands out the bytes, later drains answer empty pages whose
+          // cursor keeps advancing without bytes
+          const next = offset >= total ? offset + 1 : Math.max(total, offset);
+          return json({ logs: operation.log.slice(offset, Math.max(total, offset)), offset, next_offset: next });
         }
         if (operation.state === "running") {
           if (offset >= total) {
@@ -180,9 +186,15 @@ function startFixture(config: FixtureConfig): Fixture {
       if (config.statusFault === "unknown") return json({ status: "detonating" });
       if (config.statusFault === "omitExit") return json({ status: operation.state });
       const status: Record<string, unknown> = { status: operation.state };
-      if (operation.state === "succeeded" || operation.state === "failed") {
-        status["exit_code"] = operation.exitCode;
-        status["result_code"] = String(operation.exitCode);
+      if (operation.state === "succeeded") {
+        // the real daemon shape: success carries the "succeeded" result
+        // code; exit_code stays null/absent unless a container exit exists
+        status["exit_code"] = operation.exitCode === 0 ? null : operation.exitCode;
+        status["result_code"] = config.resultOverride ?? (operation.exitCode === 0 ? "succeeded" : "container_exit_nonzero");
+      }
+      if (operation.state === "failed") {
+        status["exit_code"] = operation.exitCode === 0 ? null : operation.exitCode;
+        status["result_code"] = operation.exitCode === 0 ? "docker_run_failed" : "container_exit_nonzero";
       }
       return json(status);
     },
@@ -298,25 +310,18 @@ test("contradictory succeeded with a non-zero exit code can never become a succe
   }
 });
 
-test("succeeded with a non-zero result_code is contradictory even with exit_code 0", async () => {
-  const fixture = startFixture({ terminal: "succeeded", exitCode: 0, log: "x\n" });
+test("succeeded with a failure result_code is contradictory even with a null exit_code", async () => {
+  const fixture = startFixture({
+    terminal: "succeeded",
+    exitCode: 0,
+    resultOverride: "container_exit_nonzero",
+    log: "x\n",
+  });
   try {
-    // rewrite the terminal status to carry a non-zero result_code only
-    fixture.close();
-    const fixture2 = startFixture({ terminal: "succeeded", exitCode: 0, log: "x\n" });
-    try {
-      const operation = fixture2.operations.get("op-1");
-      if (operation !== undefined) {
-        operation.exitCode = 0;
-      }
-      void operation;
-      const result = await runOperation(fixture2, { timeoutSeconds: 10 });
-      expect(result.outcome).toBe("completed");
-    } finally {
-      fixture2.close();
-    }
+    const result = await runOperation(fixture);
+    expect(result.outcome).toBe("worker_failed");
   } finally {
-    void fixture;
+    fixture.close();
   }
 });
 
@@ -541,12 +546,27 @@ test("a hanging log fetch cannot outlive the worker deadline and the outcome sta
   }
 });
 
-test("a terminal daemon that never sends next_offset null stops draining and reports truncated", async () => {
+test("a terminal daemon that reports a caught-up empty page instead of null completes the stream", async () => {
+  // the real daemon's terminal shape: an empty page with next_offset ===
+  // offset is the end-of-stream signal together with null
+  const fixture = startFixture({ log: "stalled-stream\n" });
+  try {
+    const result = await runOperation(fixture);
+    expect(result.outcome).toBe("completed");
+    expect(result.capture.status).toBe("captured");
+    expect(new TextDecoder().decode(result.capture.tailBytes)).toBe("stalled-stream\n");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("a terminal daemon whose empty page keeps advancing the cursor without bytes stops draining", async () => {
   const fixture = startFixture({ logFault: "stall", log: "stalled-stream\n" });
   try {
     const result = await runOperation(fixture);
     expect(result.outcome).toBe("completed");
     expect(result.capture.status).toBe("truncated");
+    expect(new TextDecoder().decode(result.capture.tailBytes)).toBe("stalled-stream\n");
   } finally {
     fixture.close();
   }

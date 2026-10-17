@@ -47,8 +47,9 @@ export type WorkerLogCaptureStatus = "captured" | "truncated" | "unavailable";
 export interface WorkerLogCapture {
   /**
    * `captured` — the terminal status was reached, the final drain chain
-   * ended with `next_offset: null`, no log error happened and neither
-   * daemon nor local truncation was observed. It never means "complete":
+   * ended with `next_offset: null` or the daemon's caught-up empty page,
+   * no log error happened and neither daemon nor local truncation was
+   * observed. It never means "complete":
    * daemon-side eviction outside the observed window cannot be proven
    * absent.
    * `truncated` — bytes were received but the stream is not proven
@@ -107,9 +108,15 @@ interface OperationStatus {
   readonly resultCode: string | null;
 }
 
-const OPERATION_ID_PATTERN = /^[A-Za-z0-9-]{1,128}$/;
+// Real daemon operation ids are `op_` + lowercase hex (underscore is part
+// of the id grammar); the shape stays URL-safe.
+const OPERATION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const STATUS_VALUES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
-const RESULT_CODE_PATTERN = /^[0-9]+$/;
+// Real daemon result codes are lowercase identifier strings (verified live
+// against Docker Helper 2.3.1: "succeeded", "container_exit_nonzero", ...),
+// not digit strings.
+const RESULT_CODE_PATTERN = /^[a-z][a-z0-9_]*$/;
+const SUCCESS_RESULT_CODE = "succeeded";
 
 /**
  * Runs one worker operation to its terminal classification. The outcome
@@ -270,7 +277,9 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
         capture: captureSnapshot("unavailable"),
       };
     }
-    if (createResponse.status !== 200) {
+    // The daemon answers POST /run with 201 Created (async operation
+    // acceptance); 200 is tolerated for API parity.
+    if (createResponse.status !== 201 && createResponse.status !== 200) {
       return { outcome: createOutcome(), capture: captureSnapshot("unavailable") };
     }
     const created = parseHelperJsonObject(createResponse.bodyText, "docker-helper run response");
@@ -293,7 +302,12 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
       };
     }
 
-    const drainOnce = async (): Promise<void> => {
+    /**
+     * One drain exchange. During the running phase an empty caught-up page
+     * is normal (no new bytes yet); in the terminal chain it is the
+     * daemon's end-of-stream signal together with `next_offset: null`.
+     */
+    const drainOnce = async (terminal: boolean): Promise<void> => {
       let response: HelperHttpResponse;
       try {
         response = await transport({
@@ -357,10 +371,29 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
         drainComplete = true;
         return;
       }
+      if (logsValue.length === 0 && nextValue > cursor) {
+        // An empty page that advances the cursor delivers nothing and can
+        // never make progress: the bytes received stay real, but the
+        // stream is not proven complete — stop instead of spinning
+        // forever.
+        drainStalled = true;
+        return;
+      }
       if (nextValue === cursor && logsValue.length === 0) {
-        // A terminal daemon that never ends its stream with null: the
-        // bytes received stay real, but the stream is not proven
-        // complete — stop instead of spinning forever.
+        if (terminal) {
+          // The daemon reports the stream caught up with an empty page
+          // instead of null: the bytes received are the whole stream as
+          // far as the daemon exposes it.
+          drainComplete = true;
+          return;
+        }
+        // Running phase: no new bytes yet, nothing to advance.
+        return;
+      }
+      if (nextValue === cursor) {
+        // A non-empty page that does not advance the cursor cannot make
+        // progress; stop instead of spinning forever. The bytes received
+        // stay real, but the stream is not proven complete.
         drainStalled = true;
         return;
       }
@@ -398,7 +431,11 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
         return null;
       }
       const exitValue = statusResponse["exit_code"];
-      if (exitValue !== undefined && (typeof exitValue !== "number" || !Number.isSafeInteger(exitValue))) {
+      if (
+        exitValue !== undefined &&
+        exitValue !== null &&
+        (typeof exitValue !== "number" || !Number.isSafeInteger(exitValue))
+      ) {
         return null;
       }
       const resultValue = statusResponse["result_code"];
@@ -414,11 +451,12 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
 
     const classify = (status: OperationStatus): WorkerOperationOutcome => {
       if (status.state === "succeeded") {
-        // Contradictory success: a non-zero exit or result code can never
-        // become a success.
+        // Contradictory success can never become a success: a present
+        // non-zero exit code, or a result code other than the daemon's
+        // success code, fails closed.
         if (
           (status.exitCode !== null && status.exitCode !== 0) ||
-          (status.resultCode !== null && status.resultCode !== "0")
+          (status.resultCode !== null && status.resultCode !== SUCCESS_RESULT_CODE)
         ) {
           return "worker_failed";
         }
@@ -433,7 +471,7 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
         break cycle;
       }
       if (!drainComplete && !drainFailed) {
-        await drainOnce();
+        await drainOnce(false);
       }
       if (abortCause !== null) {
         break cycle;
@@ -451,7 +489,7 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
       }
       // Terminal status reached: finish the drain chain, then classify.
       while (!drainComplete && !drainFailed && !drainStalled) {
-        await drainOnce();
+        await drainOnce(true);
       }
       outcome = classify(status);
       break cycle;
