@@ -332,3 +332,31 @@ test("events rejects hostile and invalid command shapes", () => {
   expectRoutingError({ kind: "events", runId: "r", limit: -3 }, "invalid_command");
   expectRoutingError({ kind: "events", runId: "r", ghost: 1 } as never, "invalid_command");
 });
+
+test("logs routes the execution scalars only and rejects hostile shapes", () => {
+  const list = routeOrchestratorCommand({ kind: "logs", runId: "cp-run-1" }, ROUTING_CONFIG);
+  expect(list.argv).toEqual(["logs", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config", "--json"]);
+  expect(list.expectedRunId).toBe("cp-run-1");
+  const chunk = routeOrchestratorCommand(
+    { kind: "logs", runId: "cp-run-1", executionIndex: 3, offset: 128, limit: 4096 },
+    ROUTING_CONFIG,
+  );
+  expect(chunk.argv).toEqual([
+    "logs", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config",
+    "--execution-index", "3", "--offset", "128", "--limit", "4096", "--json",
+  ]);
+  const zeroOffset = routeOrchestratorCommand({ kind: "logs", runId: "cp-run-1", executionIndex: 1, offset: 0 }, ROUTING_CONFIG);
+  expect(zeroOffset.argv).toEqual([
+    "logs", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config",
+    "--execution-index", "1", "--offset", "0", "--json",
+  ]);
+  for (const bad of [
+    { kind: "logs", runId: "cp-run-1", offset: 4 },
+    { kind: "logs", runId: "cp-run-1", limit: 4 },
+    { kind: "logs", runId: "cp-run-1", executionIndex: 0 },
+    { kind: "logs", runId: "../escape" },
+    { kind: "logs", runId: "cp-run-1", ghost: 1 },
+  ] as unknown as OrchestratorCommand[]) {
+    expect(() => routeOrchestratorCommand(bad, ROUTING_CONFIG)).toThrow(OrchestratorSubprocessClientError);
+  }
+});

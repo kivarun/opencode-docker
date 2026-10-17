@@ -1432,3 +1432,157 @@ test("usage documents the read-only events command", () => {
   expect(text).toContain("takes no mutation lock, never");
   expect(text).toContain("Worker stdout/stderr and durable log capture are not part of this");
 });
+
+// --- logs parser -------------------------------------------------------------
+
+const logsParserBase = ["--run-id", "some-run", "--config-root", "/cfg"];
+
+test("the logs parser: the exact success shapes in both flag forms", () => {
+  const base = logsParserBase;
+    const list = parseCommand("logs", base);
+    expect(list).toEqual({
+      kind: "logs",
+      runId: "some-run",
+      configRoot: "/cfg",
+      executionIndex: null,
+      offset: 0,
+      limit: 65536,
+      json: false,
+    });
+    const equalsForm = parseCommand("logs", ["--run-id=some-run", "--config-root=/cfg"]);
+    expect(equalsForm).toEqual(list);
+    const chunk = parseCommand("logs", [
+      "--run-id", "some-run",
+      "--config-root", "/cfg",
+      "--execution-index", "3",
+      "--offset", "128",
+      "--limit", "4096",
+      "--json",
+    ]);
+    expect(chunk).toEqual({
+      kind: "logs",
+      runId: "some-run",
+      configRoot: "/cfg",
+      executionIndex: 3,
+      offset: 128,
+      limit: 4096,
+      json: true,
+    });
+    const equalsChunk = parseCommand("logs", [
+      "--run-id=some-run",
+      "--config-root=/cfg",
+      "--execution-index=3",
+      "--offset=128",
+      "--limit=4096",
+      "--json",
+    ]);
+    expect(equalsChunk).toEqual(chunk);
+  });
+
+  test("the canonical decimal grammars", () => {
+    const base = logsParserBase;
+    expect(() => parseCommand("logs", [...base, "--execution-index", "0"])).toThrow(
+      "--execution-index must be a positive decimal integer",
+    );
+    expect(() => parseCommand("logs", [...base, "--execution-index", "01"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--execution-index", "1.5"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--execution-index", "1e3"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--execution-index", "+2"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--execution-index", " -2"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--execution-index", "  "])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--offset", "-1"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--offset", "00"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--offset", "0.0"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--offset", "1e2"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--limit", "0"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--limit", "007"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--limit", "2.5"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--limit", "1e6"])).toThrow();
+    // the safe-integer boundary and the fixed chunk maximum
+    expect(() => parseCommand("logs", [...base, "--execution-index", "9007199254740993"])).toThrow();
+    expect(() => parseCommand("logs", [...base, "--offset", "9007199254740993"])).toThrow();
+    expect(parseCommand("logs", [...base, "--execution-index", "1", "--limit", "262144"])).toBeTruthy();
+    expect(() => parseCommand("logs", [...base, "--execution-index", "1", "--limit", "262145"])).toThrow(
+      "--limit must be a positive safe integer up to 262144",
+    );
+  });
+
+  test("offset and limit require the execution index", () => {
+    const base = logsParserBase;
+    expect(() => parseCommand("logs", [...base, "--offset", "4"])).toThrow("--offset requires --execution-index");
+    expect(() => parseCommand("logs", [...base, "--limit", "4"])).toThrow("--limit requires --execution-index");
+    expect(() => parseCommand("logs", [...base, "--offset", "4", "--limit", "4"])).toThrow(
+      "--offset requires --execution-index",
+    );
+  });
+
+  test("duplicates and value forms reject", () => {
+    const base = logsParserBase;
+    expect(() => parseCommand("logs", [...base, "--run-id", "other"])).toThrow("--run-id may be given at most once");
+    expect(() => parseCommand("logs", ["--run-id", "r", "--run-id=r", "--config-root", "/cfg"])).toThrow(
+      "--run-id may be given at most once",
+    );
+    expect(() => parseCommand("logs", [...base, "--config-root", "/other"])).toThrow(
+      "--config-root may be given at most once",
+    );
+    expect(() => parseCommand("logs", [...base, "--execution-index", "1", "--execution-index=2"])).toThrow(
+      "--execution-index may be given at most once",
+    );
+    expect(() => parseCommand("logs", [...base, "--json", "--json"])).toThrow("--json may be given at most once");
+    expect(() => parseCommand("logs", [...base, "--json=true"])).toThrow("--json does not take a value");
+    expect(() => parseCommand("logs", ["--config-root", "/cfg"])).toThrow("--run-id SAFE_ID is required for logs");
+    expect(() => parseCommand("logs", ["--run-id", "r"])).toThrow("--config-root ABS is required for logs");
+  });
+
+  test("the relative config root and unsafe run id reject", () => {
+    const base = logsParserBase;
+    expect(() => parseCommand("logs", ["--run-id", "r", "--config-root", "cfg"])).toThrow(
+      "--config-root must be an absolute path",
+    );
+    expect(() => parseCommand("logs", ["--run-id", "../escape", "--config-root", "/cfg"])).toThrow(
+      "--run-id must be a safe identifier",
+    );
+  });
+
+  test("every foreign flag rejects with its scoped message", () => {
+    const base = logsParserBase;
+    const rejected: Array<[string, string]> = [
+      ["--launcher-id", "logs does not accept --launcher-id; it performs no Launcher authentication"],
+      ["--pipeline-root", "logs does not accept --pipeline-root"],
+      ["--project", "logs does not accept --project"],
+      ["--input", "logs does not accept --input"],
+      ["--workspace", "logs does not accept --workspace"],
+      ["--image", "logs does not accept --image"],
+      ["--profile", "logs does not accept --profile"],
+      ["--task", "logs does not accept --task"],
+      ["--stage-id", "logs does not accept --stage-id"],
+      ["--initial-budget", "logs does not accept --initial-budget"],
+      ["--wait-index", "logs does not accept --wait-index"],
+      ["--action", "logs does not accept --action"],
+      ["--additional-iterations", "logs does not accept --additional-iterations"],
+      ["--task-id", "logs does not accept --task-id"],
+      ["--task-file", "logs does not accept --task-file"],
+      ["--task-body", "logs does not accept --task-body"],
+      ["--after", "logs does not accept --after"],
+      ["--state-root", "logs does not accept --state-root"],
+      ["--daemon-state-root", "logs does not accept --daemon-state-root"],
+    ];
+    for (const [flag, message] of rejected) {
+      expect(() => parseCommand("logs", [...base, flag, "x"]), `${flag} value form`).toThrow(message);
+      expect(() => parseCommand("logs", [...base, `${flag}=x`]), `${flag}= form`).toThrow(message);
+    }
+    expect(() => parseCommand("logs", [...base, "--ghost"])).toThrow("unknown argument: --ghost");
+    expect(() => parseCommand("logs", [...base, "stray"])).toThrow("unknown argument: stray");
+  });
+
+  test("usage documents the read-only logs command", () => {
+    const text = usage();
+    expect(text).toContain("logs         read-only versioned worker logs of one durable run");
+    expect(text).toContain("logs flags (production pipeline v2, read-only)");
+    expect(text).toContain("[--execution-index N]   read one agent execution's worker log");
+    expect(text).toContain("raw payload byte offset (default 0)");
+    expect(text).toContain("maximum raw-byte chunk size (default 65536, maximum");
+    expect(text).toContain("secret-bearing and unredacted by design");
+    expect(text).toContain("no log content");
+    expect(text).toContain("reaches headers, errors, state, events, inspect or discovery");
+  });

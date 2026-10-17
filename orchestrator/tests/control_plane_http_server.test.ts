@@ -1660,3 +1660,282 @@ describe("control-plane HTTP: lifecycle events route", () => {
     expect(response.body).not.toContain(envRoot);
   });
 });
+
+describe("control-plane HTTP: worker logs routes", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-logs-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const storeRoot = join(envRoot, "bindings");
+  const projectDir = join(envRoot, "project");
+  let registry: Awaited<ReturnType<typeof loadControlPlaneProjectRegistry>>;
+  const calls: unknown[] = [];
+  let nextResult: OrchestratorCallResult = {
+    ok: true,
+    projection: {
+      kind: "logs",
+      schemaVersion: 1,
+      runId: "logs-run",
+      revision: 25,
+      logs: [
+        { executionIndex: 1, stateId: "architect", status: "captured", sha256: "a".repeat(64), byteCount: 47, truncatedDaemon: false, truncatedLocal: false },
+        { executionIndex: 4, stateId: "architect", status: "pending" },
+      ],
+    },
+  };
+
+  beforeAll(async () => {
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    registry = await loadControlPlaneProjectRegistry(registryPath);
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "logs-run", projectId: "project-a" });
+    await store.claim({ runId: "gone-project-run", projectId: "project-removed" });
+  }, 20000);
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  const callHandler = async (path: string, method = "GET", headers: Record<string, string> = {}, body?: string): Promise<RawResponse> => {
+    const fakeClient = {
+      run: async (command: unknown): Promise<OrchestratorCallResult> => {
+        calls.push(command);
+        return nextResult;
+      },
+    } as unknown as OrchestratorSubprocessClient;
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: fakeClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+    };
+    const request = new Request(`http://127.0.0.1:4711${path}`, {
+      method,
+      headers: { host: "127.0.0.1:4711", ...headers },
+      ...(body === undefined ? {} : { body }),
+    });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    return { status: response.status, headers: Object.fromEntries(response.headers.entries()), body: await response.text() };
+  };
+  const get = (path: string, headers: Record<string, string> = {}): Promise<RawResponse> => callHandler(path, "GET", headers);
+
+  test("a bound run serves the logs list with the exact snake_case schema and no run root", async () => {
+    const response = await get("/v1/runs/logs-run/logs");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(body).toEqual({
+      schema_version: 1,
+      kind: "worker_logs",
+      run_id: "logs-run",
+      revision: 25,
+      logs: [
+        { execution_index: 1, state_id: "architect", status: "captured", sha256: "a".repeat(64), byte_count: 47, truncated_daemon: false, truncated_local: false },
+        { execution_index: 4, state_id: "architect", status: "pending" },
+      ],
+    });
+    expect(response.body).not.toContain("run_root");
+    expect(response.body).not.toContain("data_base64");
+    expect(calls).toEqual([{ kind: "logs", runId: "logs-run" }]);
+  });
+
+  test("the execution route maps the query to typed command fields", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "logsChunk",
+        schemaVersion: 1,
+        runId: "logs-run",
+        revision: 25,
+        executionIndex: 1,
+        stateId: "architect",
+        status: "captured",
+        sha256: "a".repeat(64),
+        byteCount: 47,
+        truncatedDaemon: false,
+        truncatedLocal: false,
+        offset: 16,
+        dataBase64: Buffer.from("chunk-bytes").toString("base64"),
+        nextOffset: null,
+      },
+    };
+    calls.length = 0;
+    const response = await get("/v1/runs/logs-run/logs/1?offset=16&limit=8");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(body["kind"]).toBe("worker_log");
+    expect(body["execution_index"]).toBe(1);
+    expect(body["data_base64"]).toBe(Buffer.from("chunk-bytes").toString("base64"));
+    expect(body["next_offset"]).toBe(null);
+    expect(response.body).not.toContain("run_root");
+    expect(calls).toEqual([{ kind: "logs", runId: "logs-run", executionIndex: 1, offset: 16, limit: 8 }]);
+    // the query order is semantically irrelevant
+    calls.length = 0;
+    await get("/v1/runs/logs-run/logs/1?limit=8&offset=16");
+    expect(calls).toEqual([{ kind: "logs", runId: "logs-run", executionIndex: 1, offset: 16, limit: 8 }]);
+    // omitted scalars reach the command only when present
+    calls.length = 0;
+    await get("/v1/runs/logs-run/logs/1");
+    expect(calls).toEqual([{ kind: "logs", runId: "logs-run", executionIndex: 1 }]);
+  });
+
+  test("the pending/unavailable execution response carries the status keys only", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "logsExecution",
+        schemaVersion: 1,
+        runId: "logs-run",
+        revision: 25,
+        executionIndex: 4,
+        stateId: "architect",
+        status: "pending",
+      },
+    };
+    const response = await get("/v1/runs/logs-run/logs/4");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      "execution_index", "kind", "revision", "run_id", "schema_version", "state_id", "status",
+    ]);
+  });
+
+  test("the execution query parser accepts only offset and limit with the exact grammar", async () => {
+    for (const bad of [
+      "?after=1",
+      "?offset",
+      "?offset=",
+      "?offset=+1",
+      "?offset=01",
+      "?offset=1.5",
+      "?offset=1e2",
+      "?offset=-1",
+      "?offset=9007199254740992",
+      "?limit=0",
+      "?limit=262145",
+      "?limit=2&limit=2",
+      "?offset=1&offset=1",
+      "?ghost=1",
+      "?%6ffset=1",
+    ]) {
+      const response = await get(`/v1/runs/logs-run/logs/1${bad}`);
+      expect(response.status, bad).toBe(400);
+      expect(JSON.parse(response.body)["reason"], bad).toBe("invalid_request");
+    }
+    // the list route accepts no query at all
+    const listQuery = await get("/v1/runs/logs-run/logs?offset=0");
+    expect(listQuery.status).toBe(400);
+    // the safe-integer boundary value is accepted
+    calls.length = 0;
+    const okBoundary = await get("/v1/runs/logs-run/logs/1?offset=9007199254740991&limit=262144");
+    expect(okBoundary.status).toBe(200);
+  });
+
+  test("a typed invalid_cursor is the explicit request-layer 400, never a 502", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "logsFailure", exitCode: 1, runId: "logs-run", runRoot: "/secret/root", reason: "invalid_cursor" },
+    };
+    const response = await get("/v1/runs/logs-run/logs/1?offset=999");
+    expect(response.status).toBe(400);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_cursor" });
+    expect(response.body).not.toContain("/secret/root");
+  });
+
+  test("other logs failures follow the command-result precedent", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "logsFailure", exitCode: 1, runId: "logs-run", runRoot: null, reason: "artifact_modified" },
+    };
+    const response = await get("/v1/runs/logs-run/logs");
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      schema_version: 1,
+      kind: "command_result",
+      run_id: "logs-run",
+      outcome: "failed",
+      exit_code: 1,
+      reason: "artifact_modified",
+    });
+  });
+
+  test("the routes are GET-only and reject a GET body", async () => {
+    calls.length = 0;
+    const post = await callHandler("/v1/runs/logs-run/logs", "POST");
+    expect(post.status).toBe(405);
+    const postChunk = await callHandler("/v1/runs/logs-run/logs/1", "POST");
+    expect(postChunk.status).toBe(405);
+    const body = await callHandler("/v1/runs/logs-run/logs", "GET", { "content-length": "2" }, "{}");
+    expect(body.status).toBe(400);
+    expect(calls.length).toBe(0);
+  });
+
+  test("an unbound CLI-created run and a removed project fail closed before any subprocess", async () => {
+    calls.length = 0;
+    const unbound = await get("/v1/runs/unbound-run/logs");
+    expect(unbound.status).toBe(404);
+    expect(JSON.parse(unbound.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_not_found" });
+    const removed = await get("/v1/runs/gone-project-run/logs");
+    expect(removed.status).toBe(409);
+    expect(JSON.parse(removed.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "project_unavailable" });
+    const removedChunk = await get("/v1/runs/gone-project-run/logs/1");
+    expect(removedChunk.status).toBe(409);
+    expect(calls).toEqual([]);
+  });
+
+  test("the existing Host/Origin gates apply to the logs routes", async () => {
+    const wrongHost = await get("/v1/runs/logs-run/logs", { host: "evil.example:4711" });
+    expect(wrongHost.status).toBe(400);
+    const evilOrigin = await get("/v1/runs/logs-run/logs", { origin: "https://evil.example" });
+    expect(evilOrigin.status).toBe(400);
+    expect(calls.length).toBe(0);
+  });
+
+  test("no log payload canary leaks through any logs response", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "logsChunk",
+        schemaVersion: 1,
+        runId: "logs-run",
+        revision: 25,
+        executionIndex: 1,
+        stateId: "architect",
+        status: "captured",
+        sha256: "a".repeat(64),
+        byteCount: 47,
+        truncatedDaemon: false,
+        truncatedLocal: false,
+        offset: 0,
+        dataBase64: Buffer.from(CANARY).toString("base64"),
+        nextOffset: null,
+      },
+    };
+    const response = await get("/v1/runs/logs-run/logs/1");
+    expect(response.status).toBe(200);
+    // the base64 content channel is the only carrier; the raw canary never
+    // appears in headers or body text
+    expect(response.body).not.toContain(CANARY);
+    expect(response.body).toContain("data_base64");
+    const listResponse = await get("/v1/runs/logs-run/logs");
+    expect(listResponse.body).not.toContain(CANARY);
+  });
+});

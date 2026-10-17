@@ -566,7 +566,9 @@ test("one worker-log serializer/parser owner and one digest-domain owner", () =>
     (name) => name.endsWith(".ts") && /function (prepare|parse)WorkerLogArtifact/.test(sourceOf(name)),
   );
   expect(owners).toEqual(["pipeline_v2_worker_log.ts"]);
-  const domains = readdirSync(SRC).filter((name) => name.endsWith(".ts") && sourceOf(name).includes("pipeline-v2-worker-log"));
+  const domains = readdirSync(SRC).filter(
+    (name) => name.endsWith(".ts") && /WORKER_LOG_DIGEST_DOMAIN\s*=\s*"pipeline-v2-worker-log\\0"/.test(sourceOf(name)),
+  );
   expect(domains).toEqual(["pipeline_v2_worker_log.ts"]);
   // the state module never touches the artifact format
   expect(sourceOf("pipeline_v2_state.ts")).not.toContain("payload_base64");
@@ -596,19 +598,20 @@ test("no new commit-history or event kind and no operation id in the state", () 
   expect(events).not.toContain("byte_count");
 });
 
-test("no HTTP/UI logs route and no log bytes in the public surfaces", () => {
-  const http = sourceOf(pjoin("control_plane", "http_server.ts"));
-  expect(http).not.toContain("workerlog");
-  expect(http).not.toContain("logs/");
-  expect(http).not.toContain("worker_log");
-  const routing = sourceOf(pjoin("control_plane", "routing.ts"));
-  expect(routing).not.toContain("workerlog");
-  for (const name of ["app.ts-model", "app.js"]) {
-    void name;
-  }
+test("no UI logs route, no artifact paths in HTTP responses, and no log bytes in the non-logs surfaces", () => {
+  // the browser UI never calls the logs endpoints and never renders logs
   const ui = readFileSync(pjoin(SRC, "..", "ui", "app.js"), "utf8");
   expect(ui).not.toContain("workerlog");
   expect(ui).not.toContain("worker_log");
+  expect(ui).not.toContain("/logs");
+  // the routing layer never names the artifact format or its namespace
+  const routing = sourceOf(pjoin("control_plane", "routing.ts"));
+  expect(routing).not.toContain("workerlog");
+  // the events and inspect projections stay free of worker-log metadata
+  const events = sourceOf("pipeline_v2_events.ts");
+  expect(events).not.toContain("worker_log");
+  const state = sourceOf("pipeline_v2_state.ts");
+  expect(state).not.toContain("payload_base64");
 });
 
 test("no direct directory enumeration outside the substrate IO and no durable registry", () => {

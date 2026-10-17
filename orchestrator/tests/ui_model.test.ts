@@ -1065,3 +1065,15 @@ describe("ui v2: the one mutation flow", () => {
 function asResultLike(model: unknown): { ok: true; lost: false; model: unknown } {
   return { ok: true, lost: false, model };
 }
+
+test("the new worker-log API kinds stay fail-closed for the browser UI parser", () => {
+  // The worker-log endpoints are CLI/API-only in this increment: the UI
+  // parser accepts no worker_logs or worker_log document and the UI asset
+  // source never calls the logs routes.
+  expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "worker_logs", run_id: "r", revision: 1, logs: [] }))).toBe("unknown_kind");
+  expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "worker_log", run_id: "r", revision: 1, execution_index: 1, state_id: "s", status: "captured" }))).toBe("unknown_kind");
+  const appJs = readFileSync(new URL("../ui/app.js", import.meta.url).pathname, "utf8");
+  expect(appJs).not.toContain("/logs");
+  expect(appJs).not.toContain("worker_log");
+  expect(appJs).not.toContain("data_base64");
+});

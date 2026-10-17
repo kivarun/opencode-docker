@@ -148,6 +148,54 @@ export type OrchestratorEventsProjection =
       readonly reason: string;
     };
 
+/**
+ * The projected result of one `logs` call: the versioned worker-logs
+ * projection (the metadata union passes through as frozen JSON; the raw
+ * `runRoot` is dropped before the HTTP layer; `dataBase64` is the only
+ * content-bearing field and carries exactly the requested bounded chunk)
+ * or the typed logs failure outcome of the CLI itself.
+ */
+export type OrchestratorLogsProjection =
+  | {
+      readonly kind: "logs";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly logs: readonly OrchestratorJsonValue[];
+    }
+  | {
+      readonly kind: "logsExecution";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly executionIndex: number;
+      readonly stateId: string;
+      readonly status: "pending" | "unavailable";
+    }
+  | {
+      readonly kind: "logsChunk";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly executionIndex: number;
+      readonly stateId: string;
+      readonly status: "captured" | "truncated";
+      readonly sha256: string;
+      readonly byteCount: number;
+      readonly truncatedDaemon: boolean;
+      readonly truncatedLocal: boolean;
+      readonly offset: number;
+      readonly dataBase64: string;
+      readonly nextOffset: number | null;
+    }
+  | {
+      readonly kind: "logsFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly runRoot: string | null;
+      readonly reason: string;
+    };
+
 /** A transport failure: not a durable run outcome, no stderr or body contents. */
 export interface OrchestratorTransportFailure {
   readonly reason: OrchestratorTransportReason;
@@ -163,7 +211,14 @@ export interface OrchestratorTransportFailure {
  * through `inspect` when a run id was known.
  */
 export type OrchestratorCallResult =
-  | { readonly ok: true; readonly projection: OrchestratorRunProjection | OrchestratorInspectProjection | OrchestratorEventsProjection }
+  | {
+      readonly ok: true;
+      readonly projection:
+        | OrchestratorRunProjection
+        | OrchestratorInspectProjection
+        | OrchestratorEventsProjection
+        | OrchestratorLogsProjection;
+    }
   | { readonly ok: false; readonly failure: OrchestratorTransportFailure };
 
 export interface OrchestratorCallOptions {
@@ -301,6 +356,55 @@ const EVENTS_REPORT_KEYS = [
   "schemaVersion",
 ] as const;
 const EVENTS_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+const LOGS_LIST_KEYS = [
+  "exitCode",
+  "logs",
+  "ok",
+  "revision",
+  "runId",
+  "runRoot",
+  "schemaVersion",
+] as const;
+const LOGS_STATUS_KEYS = [
+  "exitCode",
+  "executionIndex",
+  "ok",
+  "revision",
+  "runId",
+  "runRoot",
+  "schemaVersion",
+  "stateId",
+  "status",
+] as const;
+const LOGS_CHUNK_KEYS = [
+  "byteCount",
+  "dataBase64",
+  "exitCode",
+  "executionIndex",
+  "nextOffset",
+  "offset",
+  "ok",
+  "revision",
+  "runId",
+  "runRoot",
+  "schemaVersion",
+  "sha256",
+  "stateId",
+  "status",
+  "truncatedDaemon",
+  "truncatedLocal",
+] as const;
+const LOGS_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+const LOGS_METADATA_STATUS_KEYS = ["executionIndex", "stateId", "status"] as const;
+const LOGS_METADATA_CONTENT_KEYS = [
+  "byteCount",
+  "executionIndex",
+  "sha256",
+  "stateId",
+  "status",
+  "truncatedDaemon",
+  "truncatedLocal",
+] as const;
 
 function expectExactKeys(document: Record<string, unknown>, expected: readonly string[]): void {
   const actual = Object.keys(document);
@@ -494,6 +598,192 @@ function parseOutcomeDocument(
           revision: parsed["revision"] as number,
           events: deepFreezeValue(parsed["events"] as OrchestratorJsonValue[]),
           nextAfter: nextAfterValue as number | null,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "logs") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, LOGS_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const runRootValue = parsed["runRoot"];
+        if (runRootValue !== null && typeof runRootValue !== "string") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs failure runRoot must be a string or null");
+        }
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "logsFailure",
+            exitCode: 1,
+            runId,
+            runRoot: runRootValue as string | null,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "logs projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      const runRoot = expectStringField(parsed, "runRoot");
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs revision must be a positive safe integer");
+      }
+      const revision = parsed["revision"] as number;
+      const hasLogs = Object.hasOwn(parsed, "logs");
+      const hasExecutionIndex = Object.hasOwn(parsed, "executionIndex");
+      if (hasLogs === hasExecutionIndex) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs outcome has an unexpected shape");
+      }
+      if (hasLogs) {
+        expectExactKeys(parsed, LOGS_LIST_KEYS);
+        if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs outcome has an unexpected shape");
+        }
+        if (!Array.isArray(parsed["logs"])) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs must be an array");
+        }
+        for (const entry of parsed["logs"] as unknown[]) {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+            throw new OrchestratorSubprocessClientError("unexpected_output_shape", "every logs entry must be an object");
+          }
+          const record = entry as Record<string, unknown>;
+          const status = record["status"];
+          if (status !== "pending" && status !== "unavailable" && status !== "captured" && status !== "truncated") {
+            throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs entry status must be a known worker-log status");
+          }
+          const expectedKeys = status === "captured" || status === "truncated" ? LOGS_METADATA_CONTENT_KEYS : LOGS_METADATA_STATUS_KEYS;
+          expectExactKeys(record, expectedKeys);
+          if (!isPositiveSafeInteger(record["executionIndex"])) {
+            throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs entry executionIndex must be a positive safe integer");
+          }
+          if (typeof record["stateId"] !== "string" || record["stateId"] === "") {
+            throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs entry stateId must be a non-empty string");
+          }
+          if (status === "captured" || status === "truncated") {
+            if (typeof record["sha256"] !== "string" || !isLowercaseSha256(record["sha256"])) {
+              throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs entry sha256 must be a lowercase SHA-256 digest");
+            }
+            if (typeof record["byteCount"] !== "number" || !Number.isSafeInteger(record["byteCount"]) || record["byteCount"] < 0) {
+              throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs entry byteCount must be a non-negative safe integer");
+            }
+            if (typeof record["truncatedDaemon"] !== "boolean" || typeof record["truncatedLocal"] !== "boolean") {
+              throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs entry truncation flags must be booleans");
+            }
+          }
+        }
+        // The raw run root never reaches the HTTP layer: the projection
+        // carries the run identity and the metadata list only.
+        void runRoot;
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "logs",
+            schemaVersion: 1,
+            runId,
+            revision,
+            logs: deepFreezeValue(parsed["logs"] as OrchestratorJsonValue[]),
+          }),
+        };
+      }
+      const executionIndexValue = parsed["executionIndex"];
+      if (!isPositiveSafeInteger(executionIndexValue)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs executionIndex must be a positive safe integer");
+      }
+      const stateId = expectStringField(parsed, "stateId");
+      if (stateId === "") {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs stateId must be a non-empty string");
+      }
+      const status = parsed["status"];
+      if (status === "pending" || status === "unavailable") {
+        expectExactKeys(parsed, LOGS_STATUS_KEYS);
+        if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs outcome has an unexpected shape");
+        }
+        void runRoot;
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "logsExecution",
+            schemaVersion: 1,
+            runId,
+            revision,
+            executionIndex: executionIndexValue,
+            stateId,
+            status,
+          }),
+        };
+      }
+      if (status !== "captured" && status !== "truncated") {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs status must be a known worker-log status");
+      }
+      expectExactKeys(parsed, LOGS_CHUNK_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs outcome has an unexpected shape");
+      }
+      const sha256 = expectStringField(parsed, "sha256");
+      if (!isLowercaseSha256(sha256)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs sha256 must be a lowercase SHA-256 digest");
+      }
+      const byteCount = parsed["byteCount"];
+      const offset = parsed["offset"];
+      const nextOffsetValue = parsed["nextOffset"];
+      if (typeof byteCount !== "number" || !Number.isSafeInteger(byteCount) || byteCount < 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs byteCount must be a non-negative safe integer");
+      }
+      if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs offset must be a non-negative safe integer");
+      }
+      if (
+        nextOffsetValue !== null &&
+        (typeof nextOffsetValue !== "number" || !Number.isSafeInteger(nextOffsetValue) || nextOffsetValue < 0)
+      ) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs nextOffset must be a non-negative safe integer or null");
+      }
+      if (typeof parsed["truncatedDaemon"] !== "boolean" || typeof parsed["truncatedLocal"] !== "boolean") {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "logs truncation flags must be booleans");
+      }
+      const dataBase64 = expectStringField(parsed, "dataBase64");
+      // The raw run root never reaches the HTTP layer; the chunk carries
+      // the base64 content only.
+      void runRoot;
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "logsChunk",
+          schemaVersion: 1,
+          runId,
+          revision,
+          executionIndex: executionIndexValue,
+          stateId,
+          status,
+          sha256,
+          byteCount,
+          truncatedDaemon: parsed["truncatedDaemon"] as boolean,
+          truncatedLocal: parsed["truncatedLocal"] as boolean,
+          offset,
+          dataBase64,
+          nextOffset: nextOffsetValue as number | null,
         }),
       };
     } catch (cause) {

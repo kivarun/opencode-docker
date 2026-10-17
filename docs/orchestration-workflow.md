@@ -6309,6 +6309,65 @@ The default behavior should persist bounded normalized lifecycle information
 and validated results. Persistence and retention of raw agent output require an
 explicit operator setting.
 
+## Read-only worker logs API
+
+The durable worker-log artifacts of schema v9
+(`<run-root>/logs/<execution-index>.workerlog.json`) are served through the
+versioned read-only Worker Logs API. The surface has three faces over one
+shared implementation:
+
+- the CLI command `orchestrator logs`
+  (`--run-id`, `--config-root`, optional `--execution-index`, `--offset`,
+  `--limit`, `--json`);
+- the control-plane subprocess command (`logs` in the closed command union);
+- the loopback HTTP routes `GET /v1/runs/:runId/logs` (metadata list) and
+  `GET /v1/runs/:runId/logs/:executionIndex?offset=N&limit=N` (status or
+  bounded content chunk).
+
+Semantics:
+
+- the metadata list carries every agent execution in execution-index order;
+  decision executions carry no log and never appear;
+- `worker_log: null` (before the terminal worker result) reads as `pending`;
+  `{status: "unavailable"}` reads as `unavailable`; a `captured` or
+  `truncated` binding is confirmed against its immutable artifact before any
+  byte is served;
+- content is served as bounded base64 chunks of the verified raw payload
+  (default limit 65536 raw bytes, maximum 262144); `offset` is a raw-byte
+  cursor (`offset == byteCount` returns an empty chunk and `nextOffset:
+  null`; `offset > byteCount` fails with `invalid_cursor`); offsets are raw
+  payload bytes, never UTF-8 code points and never base64 characters;
+- every read goes through one read-only chain: run-root verification, the
+  read-only state load, the pipeline reload and identity comparison, and
+  the shared worker-log binding/namespace verifier. A missing, modified,
+  extra, symlinked, wrong-mode or malformed artifact fails every read
+  closed before any byte leaves the host;
+- reads are zero-write and byte-identical across repeats and restarts; no
+  mutation lock is taken and no Docker Helper, Launcher credential or
+  Session is involved.
+
+Security contract (deliberate, documented):
+
+- the logs are secret-bearing and are served verbatim; there is no
+  redaction. The HTTP endpoints are reachable only through the existing
+  loopback binding authority (durable run binding -> frozen registry
+  project -> subprocess client -> CLI -> shared verifier); a caller cannot
+  pass a project id, config root, pipeline root, artifact path or host
+  path;
+- base64 preserves NUL bytes, ANSI escapes, invalid UTF-8 sequences and
+  payloads without a trailing newline;
+- log content never reaches HTTP headers, error documents, filenames, the
+  durable state, the events feed, `inspect` or the discovery routes; the
+  browser UI never calls the logs endpoints;
+- diagnostics never echo payload fragments, cursor values, paths or the
+  artifact envelope;
+- `captured` never means upstream completeness: daemon-side eviction
+  outside the observed window cannot be proven absent, and there is no
+  `complete` status.
+
+Not implemented (future increments): a browser UI logs viewer,
+streaming/tailing, download routes, a redaction policy, and retention.
+
 ## Failure and recovery
 
 Failures do not create implicit delayed work.

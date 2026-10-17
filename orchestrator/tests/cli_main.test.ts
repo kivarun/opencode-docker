@@ -34,6 +34,9 @@ import {
   eventsPipelineV2Run,
   type PipelineV2EventsOutcome,
 } from "../src/pipeline_v2_events.ts";
+import {
+  type PipelineV2LogsOutcome,
+} from "../src/pipeline_v2_logs.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
@@ -116,6 +119,9 @@ function makeIo(): Recorder {
     eventsPipelineV2Run: (async () => {
       throw new Error("fake eventsPipelineV2Run not configured");
     }) as unknown as CliIo["eventsPipelineV2Run"],
+    logsPipelineV2Run: (async () => {
+      throw new Error("fake logsPipelineV2Run not configured");
+    }) as unknown as CliIo["logsPipelineV2Run"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake respondPipelineV2Wait not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -3931,4 +3937,109 @@ test("events resolver failure is exit 2 with the API never called", async () => 
   expect(called).toBe(0);
   expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
   expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
+}, 15000);
+
+// --- logs dispatcher ---------------------------------------------------------
+
+function logsListReport(overrides: Partial<Extract<PipelineV2LogsOutcome, { ok: true }>> = {}): PipelineV2LogsOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    runRoot: "/state/root/pipeline-runs/run_x",
+    revision: 25,
+    logs: [
+      { executionIndex: 1, stateId: "architect", status: "captured", sha256: "a".repeat(64), byteCount: 47, truncatedDaemon: false, truncatedLocal: false },
+      { executionIndex: 4, stateId: "architect", status: "pending" },
+    ],
+    ...overrides,
+  } as PipelineV2LogsOutcome;
+}
+
+test("logs dispatches exactly once with the parsed scalars and uses no runner", async () => {
+  const rec = makeIo();
+  const logsCalls: unknown[] = [];
+  rec.io.logsPipelineV2Run = (async (options: unknown) => {
+    logsCalls.push(options);
+    return logsListReport();
+  }) as unknown as CliIo["logsPipelineV2Run"];
+  const exit = await runCli(["logs", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
+  expect(exit).toBe(0);
+  expect(logsCalls).toHaveLength(1);
+  expect(logsCalls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root" });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: logs ok (run run_x, revision 25, agent logs 2)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("logs execution mode maps the chunk scalars and reports the status line", async () => {
+  const rec = makeIo();
+  const logsCalls: unknown[] = [];
+  rec.io.logsPipelineV2Run = (async (options: unknown) => {
+    logsCalls.push(options);
+    return {
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 1,
+      runId: "run_x",
+      runRoot: "/state/root/pipeline-runs/run_x",
+      revision: 25,
+      executionIndex: 1,
+      stateId: "architect",
+      status: "captured",
+      sha256: "a".repeat(64),
+      byteCount: 47,
+      truncatedDaemon: false,
+      truncatedLocal: false,
+      offset: 0,
+      dataBase64: "aGVsbG8=",
+      nextOffset: 16,
+    } as PipelineV2LogsOutcome;
+  }) as unknown as CliIo["logsPipelineV2Run"];
+  const exit = await runCli(
+    ["logs", "--run-id", "run_x", "--config-root", "/cfg", "--execution-index", "1", "--offset", "0", "--limit", "16", "--json"],
+    rec.io,
+  );
+  expect(exit).toBe(0);
+  expect(logsCalls).toHaveLength(1);
+  expect(logsCalls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root", executionIndex: 1, offset: 0, limit: 16 });
+  expect(rec.out).toHaveLength(1);
+  const parsed = JSON.parse(rec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "byteCount", "dataBase64", "executionIndex", "exitCode", "nextOffset", "offset", "ok",
+    "revision", "runId", "runRoot", "schemaVersion", "sha256", "stateId", "status", "truncatedDaemon", "truncatedLocal",
+  ]);
+  expect(rec.err).toHaveLength(0);
+}, 15000);
+
+test("logs pending execution reports the status line and the failure line maps the reason", async () => {
+  const rec = makeIo();
+  rec.io.logsPipelineV2Run = (async () => ({
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    runRoot: "/state/root/pipeline-runs/run_x",
+    revision: 25,
+    executionIndex: 4,
+    stateId: "architect",
+    status: "pending",
+  })) as unknown as CliIo["logsPipelineV2Run"];
+  const exit = await runCli(["logs", "--run-id", "run_x", "--config-root", "/cfg", "--execution-index", "4"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.err).toEqual(["orchestrator: logs ok (run run_x, execution 4, status pending)"]);
+
+  const failureRec = makeIo();
+  failureRec.io.logsPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    runRoot: null,
+    reason: "artifact_modified",
+  })) as unknown as CliIo["logsPipelineV2Run"];
+  const failureExit = await runCli(["logs", "--run-id", "run_x", "--config-root", "/cfg"], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: logs failed (run run_x, reason artifact_modified)"]);
+  expect(failureRec.out).toHaveLength(0);
 }, 15000);

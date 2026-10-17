@@ -674,3 +674,81 @@ test("projects an events failure outcome without classifying the reason", async 
   expect(result.projection.reason).toBe("invalid_cursor");
   expect(result.projection.runRoot).toBeNull();
 }, 15000);
+
+// --- logs projection -----------------------------------------------------------
+
+function logsScenario(scenario: string): { kind: "logs"; runId: string } {
+  return { kind: "logs", runId: `sc-${scenario}` };
+}
+
+test("projects the logs list with the run root dropped and the metadata frozen", async () => {
+  const client = makeClient();
+  const result = await client.run(logsScenario("logs-list"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "logs") throw new Error("unreachable");
+  expect(projection.schemaVersion).toBe(1);
+  expect(projection.runId).toBe("cp-child-run");
+  expect(projection.revision).toBe(25);
+  expect(projection.logs).toHaveLength(4);
+  expect(Object.isFrozen(projection)).toBe(true);
+  expect(JSON.stringify(projection)).not.toContain("runRoot");
+  expect(JSON.stringify(projection)).not.toContain("/tmp/cp-child-run");
+}, 15000);
+
+test("projects the logs chunk with the base64 content and the cursor", async () => {
+  const client = makeClient();
+  const result = await client.run({ kind: "logs", runId: "sc-logs-chunk", executionIndex: 1, offset: 0, limit: 16 });
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "logsChunk") throw new Error("unreachable");
+  expect(projection.status).toBe("captured");
+  expect(projection.sha256).toBe("a".repeat(64));
+  expect(projection.byteCount).toBe(47);
+  expect(projection.offset).toBe(0);
+  expect(Buffer.from(projection.dataBase64, "base64").toString()).toBe("hello\0world");
+  expect(projection.nextOffset).toBe(16);
+  expect(JSON.stringify(projection)).not.toContain("runRoot");
+}, 15000);
+
+test("projects the logs status document for a pending execution", async () => {
+  const client = makeClient();
+  const result = await client.run({ kind: "logs", runId: "sc-logs-status", executionIndex: 4 });
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "logsExecution") throw new Error("unreachable");
+  expect(projection.status).toBe("pending");
+  expect(projection.executionIndex).toBe(4);
+  expect(Object.keys(projection).sort()).toEqual([
+    "executionIndex", "kind", "revision", "runId", "schemaVersion", "stateId", "status",
+  ]);
+}, 15000);
+
+test("projects the logs failure without classifying the reason", async () => {
+  const client = makeClient();
+  const result = await client.run(logsScenario("logs-failure"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  expect(result.projection.kind).toBe("logsFailure");
+  if (result.projection.kind !== "logsFailure") throw new Error("unreachable");
+  expect(result.projection.reason).toBe("artifact_modified");
+  expect(result.projection.runRoot).toBeNull();
+}, 15000);
+
+test("a logs metadata entry with an unknown status is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(logsScenario("logs-bad-shape")), "unexpected_output_shape");
+}, 15000);
+
+test("a logs projection with schemaVersion 2 is unsupported_contract", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(logsScenario("logs-bad-version")), "unsupported_contract");
+}, 15000);
+
+test("a logs document carrying an extra unknown field is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(logsScenario("logs-root-leak")), "unexpected_output_shape");
+}, 15000);

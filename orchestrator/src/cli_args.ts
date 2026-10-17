@@ -90,6 +90,16 @@ export interface ParsedPipelineInspectArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineLogsArgs {
+  readonly kind: "logs";
+  readonly runId: string;
+  readonly configRoot: string;
+  readonly executionIndex: number | null;
+  readonly offset: number;
+  readonly limit: number;
+  readonly json: boolean;
+}
+
 export interface ParsedPipelineEventsArgs {
   readonly kind: "events";
   readonly runId: string;
@@ -109,7 +119,8 @@ export type ParsedCommand =
   | ParsedPipelineReviseTaskArgs
   | ParsedPipelineResumePlanArgs
   | ParsedPipelineInspectArgs
-  | ParsedPipelineEventsArgs;
+  | ParsedPipelineEventsArgs
+  | ParsedPipelineLogsArgs;
 
 export function usage(): string {
   return [
@@ -141,6 +152,11 @@ export function usage(): string {
     "               schema-v8 commit history projected as public event schema 1",
     "               with an exclusive revision cursor - no worker, no Launcher",
     "               credential, no mutation lock and no durable change",
+    "  logs         read-only versioned worker logs of one durable run: the",
+    "               schema-v9 bindings of the agent executions projected as",
+    "               public logs schema 1 with bounded base64 content chunks -",
+    "               no worker, no Launcher credential, no mutation lock and",
+    "               no durable change",
     "  respond      production pipeline v2 wait response: record the user's answer to",
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
@@ -445,6 +461,43 @@ export function usage(): string {
   "  writes, and a repeated read over an unchanged run is byte-identical.",
   "  Worker stdout/stderr and durable log capture are not part of this",
   "  command.",
+  "",
+  "logs flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID        the run id of the durable run to read; required; a",
+  "                          safe identifier (letters, digits, '_', '.', '-', at most",
+  "                          128 characters)",
+  "  --config-root PATH      non-empty absolute configuration root; required by the",
+  "                          shared command grammar but not used by logs (no",
+  "                          profile is loaded, no Launcher credential is read)",
+  "  [--execution-index N]   read one agent execution's worker log instead of the",
+  "                          metadata list; a positive decimal integer without sign,",
+  "                          leading zeros, fraction, exponent or whitespace",
+  "  [--offset N]            raw payload byte offset (default 0); requires",
+  "                          --execution-index; offsets are raw bytes, never UTF-8",
+  "                          code points and never base64 characters",
+  "  [--limit N]             maximum raw-byte chunk size (default 65536, maximum",
+  "                          262144); requires --execution-index",
+  "  --json                  print exactly one JSON versioned logs document on",
+  "                          stdout (no progress lines); errors and diagnostics go",
+  "                          to stderr; the exit code is 1 only when the logs read",
+  "                          itself could not be performed, never because of the",
+  "                          run's own state.",
+  "",
+  "  logs project the durable schema-v9 worker-log bindings of the agent",
+  "  executions as the versioned public logs surface (schemaVersion 1): the",
+  "  metadata list carries every agent execution in execution-index order",
+  "  (decision executions carry no log and never appear), a null binding",
+  "  before the terminal worker result reads as 'pending', an unavailable",
+  "  capture reads as 'unavailable', and a captured or truncated binding is",
+  "  confirmed against its immutable artifact before any byte is served.",
+  "  Content is served as bounded base64 chunks of the verified raw payload;",
+  "  offset is a raw-byte cursor ('invalid_cursor' beyond the payload), the",
+  "  captured digest is over the 'pipeline-v2-worker-log' domain, and",
+  "  'captured' never means upstream completeness. The logs are",
+  "  secret-bearing and unredacted by design; they are served only through",
+  "  this read-only chain (no mutation lock, no Docker Helper involvement,",
+  "  no Launcher credential and no durable change), and no log content",
+  "  reaches headers, errors, state, events, inspect or discovery.",
   "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
@@ -866,8 +919,157 @@ function parseEventsArgs(argv: string[]): ParsedPipelineEventsArgs {
   };
 }
 
+function parseLogsArgs(argv: string[]): ParsedPipelineLogsArgs {
+  let runId: string | null = null;
+  let configRoot: string | null = null;
+  let executionIndex: number | null = null;
+  let offset: number | null = null;
+  let limit: number | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--execution-index" || arg.startsWith("--execution-index=")) {
+      const { value, next } = parseValue(argv, i, "--execution-index");
+      requireSingleton(executionIndex, "--execution-index");
+      executionIndex = parsePositiveDecimalSafeInteger(value, "--execution-index");
+      i = next;
+    } else if (arg === "--offset" || arg.startsWith("--offset=")) {
+      const { value, next } = parseValue(argv, i, "--offset");
+      requireSingleton(offset, "--offset");
+      offset = parseNonNegativeDecimalSafeInteger(value, "--offset");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > 262144) {
+        throw new Error("--limit must be a positive safe integer up to 262144");
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      throw new Error(
+        "logs does not accept --launcher-id; it performs no Launcher authentication",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "logs does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error("logs does not accept --project; the run-owned project copy already exists");
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error("logs does not accept --input; the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error("logs does not accept --workspace; no worker is launched by logs");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("logs does not accept --image; no worker is launched by logs");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error("logs does not accept --profile; no profile is loaded by logs");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("logs does not accept --task; there is no task input on a logs read");
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      throw new Error(
+        "logs does not accept --stage-id; stage selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      throw new Error(
+        "logs does not accept --initial-budget; budget selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      throw new Error(
+        "logs does not accept --wait-index; wait selection belongs to the response and intervention commands",
+      );
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "logs does not accept --action; it changes nothing and records no response",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "logs does not accept --additional-iterations; grants belong to 'continue-stage'",
+      );
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      throw new Error("logs does not accept --task-id; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      throw new Error("logs does not accept --task-file; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error("logs does not accept --task-body; task revisions belong to 'revise-task'");
+    } else if (arg === "--after" || arg.startsWith("--after=")) {
+      throw new Error("logs does not accept --after; the events cursor belongs to 'events'");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "logs does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "logs does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for logs");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for logs");
+  }
+  if (offset !== null && executionIndex === null) {
+    throw new Error("--offset requires --execution-index");
+  }
+  if (limit !== null && executionIndex === null) {
+    throw new Error("--limit requires --execution-index");
+  }
+  return {
+    kind: "logs",
+    runId,
+    configRoot,
+    executionIndex,
+    offset: offset ?? 0,
+    limit: limit ?? 65536,
+    json,
+  };
+}
+
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -893,6 +1095,9 @@ export function parseCommand(
   }
   if (kind === "events") {
     return parseEventsArgs(argv);
+  }
+  if (kind === "logs") {
+    return parseLogsArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;

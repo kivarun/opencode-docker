@@ -161,6 +161,8 @@ interface ParsedRoute {
     | "fresh_run"
     | "inspect"
     | "events"
+    | "logs_list"
+    | "logs_execution"
     | "resume"
     | "resume_plan"
     | "continue_stage"
@@ -173,6 +175,8 @@ interface ParsedRoute {
     | "ui_style_css";
   readonly projectId: string | null;
   readonly runId: string | null;
+  /** The execution index of the logs execution route (null elsewhere). */
+  readonly executionIndex?: number;
 }
 
 /**
@@ -324,6 +328,34 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
       return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
     }
     return { kind: "events", projectId: null, runId };
+  }
+  if (matchesShape(["v1", "runs", "*", "logs"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the logs route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    return { kind: "logs_list", projectId: null, runId };
+  }
+  if (matchesShape(["v1", "runs", "*", "logs", "*"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the logs route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    const executionSegment = rest[4];
+    if (executionSegment === undefined || !/^(0|[1-9][0-9]*)$/.test(executionSegment)) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the execution index must be a non-negative decimal integer");
+    }
+    const executionIndex = Number(executionSegment);
+    if (!Number.isSafeInteger(executionIndex) || executionIndex < 1) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the execution index must be a positive safe integer");
+    }
+    return { kind: "logs_execution", projectId: null, runId, executionIndex };
   }
   if (matchesShape(["v1", "runs", "*", "*"])) {
     const action = rest[3];
@@ -685,6 +717,85 @@ export function parseEventsQuery(
   return { after, limit };
 }
 
+/**
+ * The logs list query: the list route accepts no query at all — any
+ * query string is a request failure.
+ */
+export function parseLogsListQuery(
+  search: string,
+): { readonly ok: true } | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { ok: true };
+  }
+  return new ControlPlaneHttpRequestError("invalid_request", "the logs list route accepts no query");
+}
+
+/**
+ * The logs execution query: an optional non-negative safe integer offset
+ * (default 0, a raw payload byte offset) and an optional positive safe
+ * integer limit (default 65536, maximum 262144, applied to raw payload
+ * bytes). The raw query string is parsed strictly — no percent-encoding,
+ * no bare keys, no duplicates, no empty values, no sign, fraction or
+ * exponent, and no unknown fields; the order of the fields is
+ * semantically irrelevant.
+ */
+export function parseLogsExecutionQuery(
+  search: string,
+): { readonly offset: number | null; readonly limit: number | null } | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { offset: null, limit: null };
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the logs query must not carry encoded components");
+  }
+  let offset: number | null = null;
+  let limit: number | null = null;
+  for (const part of search.split("&")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) {
+      return new ControlPlaneHttpRequestError("invalid_request", "every logs query field must carry exactly one value");
+    }
+    const key = part.slice(0, separator);
+    const value = part.slice(separator + 1);
+    if (key === "offset") {
+      if (offset !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the logs query fields must be unique");
+      }
+      if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the logs query offset must be a non-negative safe integer");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the logs query offset must be a non-negative safe integer");
+      }
+      offset = parsed;
+      continue;
+    }
+    if (key === "limit") {
+      if (limit !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the logs query fields must be unique");
+      }
+      if (!/^[1-9][0-9]*$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the logs query limit must be a positive safe integer");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed > 262144) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the logs query limit must be a positive safe integer up to 262144");
+      }
+      limit = parsed;
+      continue;
+    }
+    return new ControlPlaneHttpRequestError("invalid_request", "the logs query carries an unknown field");
+  }
+  return { offset, limit };
+}
+
 /** The projects discovery projection: declaration-order ids only. */
 export interface ProjectsDiscoveryProjection {
   readonly schema_version: 1;
@@ -783,7 +894,16 @@ export function projectControlPlaneCommandResult(
     return { layer: "transport", reason: result.failure.reason };
   }
   const projection = result.projection;
-  if (projection.kind === "inspect" || projection.kind === "inspectFailure" || projection.kind === "events" || projection.kind === "eventsFailure") {
+  if (
+    projection.kind === "inspect" ||
+    projection.kind === "inspectFailure" ||
+    projection.kind === "events" ||
+    projection.kind === "eventsFailure" ||
+    projection.kind === "logs" ||
+    projection.kind === "logsExecution" ||
+    projection.kind === "logsChunk" ||
+    projection.kind === "logsFailure"
+  ) {
     return { layer: "transport", reason: "internal_error" };
   }
   if (projection.kind === "success") {
@@ -816,6 +936,155 @@ interface RunProjection {
   readonly status: string;
   readonly boundary: unknown;
   readonly outputs: unknown;
+}
+
+export interface WorkerLogsProjection {
+  readonly schema_version: 1;
+  readonly kind: "worker_logs";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly logs: readonly unknown[];
+}
+
+export interface WorkerLogProjection {
+  readonly schema_version: 1;
+  readonly kind: "worker_log";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly execution_index: number;
+  readonly state_id: string;
+  readonly status: string;
+  readonly sha256?: string;
+  readonly byte_count?: number;
+  readonly truncated_daemon?: boolean;
+  readonly truncated_local?: boolean;
+  readonly offset?: number;
+  readonly data_base64?: string;
+  readonly next_offset?: number | null;
+}
+
+/** The one snake_case metadata mapper for one validated logs entry. */
+function workerLogMetadataEntry(entry: unknown): Record<string, unknown> {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+    return { layer: "transport", reason: "internal_error" } as never;
+  }
+  const record = entry as Record<string, unknown>;
+  const status = record["status"];
+  const base: Record<string, unknown> = {
+    execution_index: record["executionIndex"],
+    state_id: record["stateId"],
+    status,
+  };
+  if (status === "captured" || status === "truncated") {
+    base["sha256"] = record["sha256"];
+    base["byte_count"] = record["byteCount"];
+    base["truncated_daemon"] = record["truncatedDaemon"];
+    base["truncated_local"] = record["truncatedLocal"];
+  }
+  return base;
+}
+
+/**
+ * The one projection builder for a verified schemaVersion-1 logs list:
+ * the metadata union maps to its snake_case equivalent and the raw run
+ * root stays dropped. Anything that is not a verified logs projection is
+ * a defensive internal failure, never a guessed document.
+ */
+export function projectControlPlaneLogsList(
+  result: OrchestratorCallResult,
+): WorkerLogsProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "logsFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "logs" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "worker_logs",
+    run_id: projection.runId,
+    revision: projection.revision,
+    logs: projection.logs.map(workerLogMetadataEntry),
+  };
+}
+
+/**
+ * The one projection builder for a verified schemaVersion-1 logs
+ * execution read: a pending/unavailable execution carries the status
+ * keys only, a captured/truncated chunk carries the digest, count and
+ * truncation flags plus the bounded base64 slice and the cursor; the raw
+ * run root stays dropped. Anything else is a defensive internal failure.
+ */
+export function projectControlPlaneLogsExecution(
+  result: OrchestratorCallResult,
+): WorkerLogProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "logsFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "logsExecution" && projection.kind !== "logsChunk") {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  if (projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  if (projection.kind === "logsExecution") {
+    return {
+      schema_version: 1,
+      kind: "worker_log",
+      run_id: projection.runId,
+      revision: projection.revision,
+      execution_index: projection.executionIndex,
+      state_id: projection.stateId,
+      status: projection.status,
+    };
+  }
+  if (projection.kind !== "logsChunk") {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "worker_log",
+    run_id: projection.runId,
+    revision: projection.revision,
+    execution_index: projection.executionIndex,
+    state_id: projection.stateId,
+    status: projection.status,
+    sha256: projection.sha256,
+    byte_count: projection.byteCount,
+    truncated_daemon: projection.truncatedDaemon,
+    truncated_local: projection.truncatedLocal,
+    offset: projection.offset,
+    data_base64: projection.dataBase64,
+    next_offset: projection.nextOffset,
+  };
 }
 
 /**
@@ -909,7 +1178,15 @@ export function projectControlPlaneEvents(
 }
 
 function projectionResponse(
-  projection: CommandOutcomeProjection | RunProjection | ProjectsDiscoveryProjection | RunsDiscoveryProjection | EventsProjection | ControlPlaneHttpFailure,
+  projection:
+    | CommandOutcomeProjection
+    | RunProjection
+    | ProjectsDiscoveryProjection
+    | RunsDiscoveryProjection
+    | EventsProjection
+    | WorkerLogsProjection
+    | WorkerLogProjection
+    | ControlPlaneHttpFailure,
 ): Response {
   if ("layer" in projection && "reason" in projection && !("kind" in projection)) {
     return failureResponse(projection as ControlPlaneHttpFailure);
@@ -1007,7 +1284,14 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
     if (parsed instanceof ControlPlaneHttpRequestError) {
       return respondUi(requestFailure(parsed.reason));
     }
-    if (parsed.kind !== "projects" && parsed.kind !== "runs" && parsed.kind !== "events" && url.search !== "") {
+    if (
+      parsed.kind !== "projects" &&
+      parsed.kind !== "runs" &&
+      parsed.kind !== "events" &&
+      parsed.kind !== "logs_list" &&
+      parsed.kind !== "logs_execution" &&
+      url.search !== ""
+    ) {
       return respondUi(requestFailure("invalid_path"));
     }
     if (request.method === "POST") {
@@ -1033,7 +1317,11 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       bodyText = body.text;
     }
     return await dispatchControlPlaneRoute(
-      parsed.kind === "projects" || parsed.kind === "runs" || parsed.kind === "events"
+      parsed.kind === "projects" ||
+      parsed.kind === "runs" ||
+      parsed.kind === "events" ||
+      parsed.kind === "logs_list" ||
+      parsed.kind === "logs_execution"
         ? { ...deps, discoveryQuery: url.search }
         : deps,
       parsed,
@@ -1103,6 +1391,30 @@ async function dispatchControlPlaneRoute(
       };
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneEvents(result));
+    }
+    case "logs_list": {
+      const query = parseLogsListQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const result = await deps.client.run({ kind: "logs", runId });
+      return projectionResponse(projectControlPlaneLogsList(result));
+    }
+    case "logs_execution": {
+      const query = parseLogsExecutionQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const executionIndex = route.executionIndex as number;
+      const command: OrchestratorCommand = {
+        kind: "logs",
+        runId,
+        executionIndex,
+        ...(query.offset === null ? {} : { offset: query.offset }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneLogsExecution(result));
     }
     case "resume": {
       parseEmptyBody(parseJsonBody(bodyText));

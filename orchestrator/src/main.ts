@@ -101,6 +101,10 @@ import {
   eventsPipelineV2Run,
   type PipelineV2EventsOutcome,
 } from "./pipeline_v2_events.ts";
+import {
+  logsPipelineV2Run,
+  type PipelineV2LogsOutcome,
+} from "./pipeline_v2_logs.ts";
 
 /**
  * The per-call seam of the dispatcher. The production default builds one
@@ -129,6 +133,7 @@ export interface CliIo {
   respondPipelineV2Wait: typeof respondPipelineV2Wait;
   inspectPipelineV2Run: typeof inspectPipelineV2Run;
   eventsPipelineV2Run: typeof eventsPipelineV2Run;
+  logsPipelineV2Run: typeof logsPipelineV2Run;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
   /**
@@ -163,6 +168,7 @@ function productionCliIo(): CliIo {
     respondPipelineV2Wait,
     inspectPipelineV2Run,
     eventsPipelineV2Run,
+    logsPipelineV2Run,
     runSmoke,
     runAgentSmoke,
     readTaskFile: (path: string) => readFile(path, "utf8"),
@@ -195,7 +201,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "logs"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -210,7 +216,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "revise-task" &&
     command !== "resume-plan" &&
     command !== "inspect" &&
-    command !== "events"
+    command !== "events" &&
+    command !== "logs"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -267,6 +274,16 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // dependencies and no mutating command deps object are built for it.
     return await runPipelineV2EventsCommand(parsed, io);
   }
+  if (parsed.kind === "logs") {
+    // The read-only pipeline v2 worker logs command: like inspect and
+    // events, it resolves only the state-root projection (no helper
+    // configuration, no Launcher credential, no auth, no subprocess, no
+    // signal registration, no mutation lock, no durable change) and
+    // invokes the logs production API exactly once. No
+    // SubprocessCliRunner command dependencies and no mutating command
+    // deps object are built for it.
+    return await runPipelineV2LogsCommand(parsed, io);
+  }
   if (parsed.kind === "continue-stage") {
     // The production pipeline v2 continue-stage intervention: the same
     // protected CLI-configuration boundary and per-call dependency
@@ -320,6 +337,9 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     return outcome.exitCode;
   }
 
+  if (parsed.kind !== "agent-smoke") {
+    throw new Error(`unhandled command kind: ${parsed.kind}`);
+  }
   const options: AgentSmokeOptions = {
     workspace: parsed.workspace,
     configRoot: parsed.configRoot,
@@ -720,6 +740,50 @@ async function runPipelineV2EventsCommand(
   } else {
     io.writeError(
       `orchestrator: events failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+async function runPipelineV2LogsCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "logs" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2LogsOutcome = await io.logsPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    ...(parsed.executionIndex === null ? {} : { executionIndex: parsed.executionIndex }),
+    ...(parsed.executionIndex === null ? {} : { offset: parsed.offset }),
+    ...(parsed.executionIndex === null ? {} : { limit: parsed.limit }),
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    if ("logs" in outcome) {
+      io.writeError(
+        `orchestrator: logs ok (run ${outcome.runId}, revision ${outcome.revision}, agent logs ${outcome.logs.length})`,
+      );
+    } else {
+      io.writeError(
+        `orchestrator: logs ok (run ${outcome.runId}, execution ${outcome.executionIndex}, status ${outcome.status})`,
+      );
+    }
+  } else {
+    io.writeError(
+      `orchestrator: logs failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

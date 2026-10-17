@@ -52,6 +52,13 @@ export type OrchestratorCommand =
       readonly after?: number;
       readonly limit?: number;
     }
+  | {
+      readonly kind: "logs";
+      readonly runId: string;
+      readonly executionIndex?: number;
+      readonly offset?: number;
+      readonly limit?: number;
+    }
   | { readonly kind: "resume"; readonly runId: string; readonly launcherId?: string }
   | {
       readonly kind: "resume_plan";
@@ -152,6 +159,8 @@ interface CapturedCommand {
   readonly actionId: string;
   readonly after: number | null;
   readonly limit: number | null;
+  readonly executionIndex: number | null;
+  readonly offset: number | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -258,6 +267,8 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
     taskFile: "",
     actionId: "",
     after: null,
+    executionIndex: null,
+    offset: null,
     limit: null,
   };
   switch (kind) {
@@ -320,6 +331,38 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
       const limitField = optionalField(command, "limit");
       const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
       return { ...empty, kind, runId: expectSafeIdField(command, "runId", "runId"), after, limit };
+    }
+    case "logs": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "executionIndex" && key !== "offset" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on logs command");
+        }
+      }
+      if (!Object.hasOwn(command, "runId")) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "missing field runId on logs command");
+      }
+      const executionField = optionalField(command, "executionIndex");
+      const executionIndex = executionField.present
+        ? expectPositiveIntegerField({ executionIndex: executionField.value }, "executionIndex", "executionIndex")
+        : null;
+      const offsetField = optionalField(command, "offset");
+      const offset = offsetField.present ? expectNonNegativeIntegerField({ offset: offsetField.value }, "offset", "offset") : null;
+      const limitField = optionalField(command, "limit");
+      const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
+      if (offset !== null && executionIndex === null) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "offset requires executionIndex on logs command");
+      }
+      if (limit !== null && executionIndex === null) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "limit requires executionIndex on logs command");
+      }
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        executionIndex,
+        offset,
+        limit,
+      };
     }
     case "resume": {
       for (const key of Object.keys(command)) {
@@ -463,6 +506,12 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
     case "events":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
       if (captured.after !== null) argv.push("--after", String(captured.after));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
+      break;
+    case "logs":
+      argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
+      if (captured.executionIndex !== null) argv.push("--execution-index", String(captured.executionIndex));
+      if (captured.offset !== null) argv.push("--offset", String(captured.offset));
       if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       break;
     case "resume":
