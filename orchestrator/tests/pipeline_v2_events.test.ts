@@ -1,6 +1,6 @@
 /**
  * The versioned read-only lifecycle events API: the stable external
- * projection of the schema-v8 `commit_history`.
+ * projection of the schema-v9 `commit_history`.
  *
  * These tests pin: the single projection owner (cursor semantics, exact
  * entry pass-through, frozen pages, typed invalid_cursor), the read-only
@@ -29,7 +29,12 @@ import {
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { pipelineV2RunPipelineIdentity } from "../src/pipeline_v2_digest.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
-import { apply, IDENTITY, lifecycleCommands } from "./pipeline_v2_commit_history.test.ts";
+import {
+  apply,
+  IDENTITY,
+  lifecycleCommands,
+} from "./pipeline_v2_commit_history_fixture.ts";
+import { E2E_YAML } from "./pipeline_v2_events_fixture.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
 
 const ROOTS: string[] = [];
@@ -223,48 +228,6 @@ async function makeDirs(prefix: string): Promise<{ root: string; bundle: string;
   await mkdir(stateRoot, { recursive: true });
   return { root, bundle, stateRoot };
 }
-
-/** The minimal agent bundle of the 66-command lifecycle E2E; shared
- * with the browser UI events integration suite. */
-export const E2E_YAML = `
-schema_version: 2
-entry_state: architect
-max_transitions: 8
-inputs: []
-outputs: []
-states:
-  - id: architect
-    type: agent
-    profile: architect
-    prompt: prompts/architect.md
-    inputs: []
-    outputs:
-      - id: plan
-        type: json
-        schema: schemas/plan.schema.json
-    timeout_seconds: 60
-    max_attempts: 1
-    transitions:
-      - outcome: completed
-        to: dev_entry
-  - id: dev_entry
-    type: agent
-    profile: coder
-    prompt: prompts/coder.md
-    inputs: []
-    outputs:
-      - id: report
-        type: json
-        schema: schemas/plan.schema.json
-    timeout_seconds: 60
-    max_attempts: 1
-    transitions:
-      - outcome: completed
-        to: done
-  - id: done
-    type: terminal
-    result: success
-`;
 
 const SIMPLE_YAML = `
 schema_version: 2
