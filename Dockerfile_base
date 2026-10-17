@@ -8,6 +8,12 @@ USER root
 RUN addgroup -g 1000 opencode \
     && adduser -D -u 1000 -G opencode opencode
 
+# Pin the runtime home explicitly. The upstream image sets no HOME and no
+# passwd entry, so the container runtime derives HOME=/ for this uid and
+# OpenCode then fails with EACCES on /.local. The passwd home matches, so
+# one ENV keeps the contract independent of upstream image config.
+ENV HOME=/home/opencode
+
 RUN install -d \
       -m 0755 \
       -o opencode \

@@ -124,7 +124,7 @@ Repo of Dockerfiles for OpenCode agent images (published to GHCR via CI) plus an
 - For `agent-smoke`, exit code 0 or agent JSON events alone never mean success: validate the per-activation `result.json` schema (exact fields only, schema version 2), the `run_id`/`state_id`/`activation_index`/`attempt` identity, artifact existence and workspace confinement (including symlinks), unchanged protected inputs, and the outcome transition to a success terminal before accepting the result.
 - Every created child Session must be cleaned up on all controlled exit paths, including errors and cancellation. Cleanup failure makes the overall run unsuccessful, even when the worker succeeded.
 - Trusted execution profiles: implementation, deterministic tests and the end-to-end profile-backed `agent-smoke` UAT (real launcher credential, real docker-helper, real OpenCode/LLM run, `local/glm53-flash`, report from 2026-09-11) are complete; the UAT verified the full v1 path including durable state, cleanup and secret containment.
-- `base`/`go26`/`dotnet10`/`orchestrator` run as non-root `opencode` user (uid/gid 1000); `gdk` follows its upstream GDK image user model.
+- `base`/`go26`/`dotnet10`/`orchestrator` run as non-root `opencode` user (uid/gid 1000); `gdk` follows its upstream GDK image user model. `Dockerfile_base` pins `ENV HOME=/home/opencode`: the upstream `ghcr.io/anomalyco/opencode` image sets no `HOME` and no passwd entry, so the container runtime would derive `HOME=/` and OpenCode fails with `EACCES` on `/.local` (the passwd home matches, one `ENV` keeps the contract independent of upstream config).
 
 ## Docs pointers
 
