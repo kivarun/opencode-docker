@@ -265,7 +265,7 @@ async function buildPrefix(): Promise<Prefix> {
     }
     await writeFile(join(prep1.outputs_root, "plan"), JSON.stringify(R1_PROPOSAL), { mode: 0o600 });
     const records1: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline1, prep1);
-    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
 
     const accepted1 = await acceptPipelineV2PlanningRunPlan({ pipeline: pipeline1, runRoot: fixture.runRoot, sink: recording });
@@ -281,7 +281,7 @@ async function buildPrefix(): Promise<Prefix> {
       { kind: "agent_execution_session_created", sessionId: "sess-2-stage" },
       { kind: "agent_tool_session_created", sessionId: "tool-2-stage" },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
     ] as PipelineV2RunCommand[]) {
       await recording.dispatch(command);
@@ -341,7 +341,7 @@ async function buildPrefix(): Promise<Prefix> {
     }
     await writeFile(join(prep2.outputs_root, "plan"), JSON.stringify(R2_PROPOSAL), { mode: 0o600 });
     const records2: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline2, prep2);
-    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
     const state = sink.snapshot as PipelineV2RunState;
     const validated = parsePipelineV2RunState(JSON.stringify(state));
@@ -892,7 +892,7 @@ test("10a. a successor execution started after the handoff is never an S5 retry"
       { kind: "agent_execution_session_created", sessionId: "sess-4-stage" },
       { kind: "agent_tool_session_created", sessionId: "tool-4-stage" },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
     ] as PipelineV2RunCommand[]) {
       await progressed.dispatch(command);
@@ -920,7 +920,7 @@ test("10b. a new wait after the handoff is never an S5 retry", async () => {
       { kind: "agent_execution_session_created", sessionId: "sess-5-stage" },
       { kind: "agent_tool_session_created", sessionId: "tool-5-stage" },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
     ] as PipelineV2RunCommand[]) {
       await waitRecording.dispatch(command);
@@ -1537,7 +1537,7 @@ async function buildCycledPrefix(cycles: number): Promise<Prefix> {
     }
     await writeFile(join(prep1.outputs_root, "plan"), JSON.stringify(R1_PROPOSAL), { mode: 0o600 });
     const records1: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline1, prep1);
-    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
 
     const accepted1 = await acceptPipelineV2PlanningRunPlan({ pipeline: pipeline1, runRoot: fixture.runRoot, sink: recording });
@@ -1553,7 +1553,7 @@ async function buildCycledPrefix(cycles: number): Promise<Prefix> {
       { kind: "agent_execution_session_created", sessionId: nextSession("stage") },
       { kind: "agent_tool_session_created", sessionId: nextSession("stage") },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
     ] as PipelineV2RunCommand[]) {
       await recording.dispatch(command);
@@ -1615,7 +1615,7 @@ async function buildCycledPrefix(cycles: number): Promise<Prefix> {
     }
     await writeFile(join(prep2.outputs_root, "plan"), JSON.stringify(R2_PROPOSAL), { mode: 0o600 });
     const records2: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipelineAfterIntervention, prep2);
-    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
 
     // The first handoff through the facade.
@@ -1650,7 +1650,7 @@ async function buildCycledPrefix(cycles: number): Promise<Prefix> {
         { kind: "agent_execution_session_created", sessionId: nextSession("stage") },
         { kind: "agent_tool_session_created", sessionId: nextSession("stage") },
         { kind: "agent_running" },
-        { kind: "agent_outputs_accepted", outputs: [] },
+        { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
         { kind: "agent_cleanup_completed" },
       ] as PipelineV2RunCommand[]) {
         await recording.dispatch(command);
@@ -1715,7 +1715,7 @@ async function buildCycledPrefix(cycles: number): Promise<Prefix> {
       }
       await writeFile(join(prep.outputs_root, "plan"), JSON.stringify(pointerProposal(["task-a", "task-b", "task-c"])), { mode: 0o600 });
       const records: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipelineAfterIntervention, prep);
-      await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records.map((r) => ({ id: r.output, digest: r.digest })) });
+      await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
       await recording.dispatch({ kind: "agent_cleanup_completed" });
       void staleCompiledPlan1;
       staleCompiledPlan1 = null;
@@ -1941,7 +1941,7 @@ async function buildTwoStagePrefix(stageCount: 2 | 3 | 4): Promise<Omit<Prefix, 
       ],
     }), { mode: 0o600 });
     const records1: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline1, prep1);
-    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
 
     const accepted1 = await acceptPipelineV2PlanningRunPlan({ pipeline: pipeline1, runRoot: fixture.runRoot, sink: recording });
@@ -1957,7 +1957,7 @@ async function buildTwoStagePrefix(stageCount: 2 | 3 | 4): Promise<Omit<Prefix, 
       { kind: "agent_execution_session_created", sessionId: nextSession("stage") },
       { kind: "agent_tool_session_created", sessionId: nextSession("stage") },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
     ] as PipelineV2RunCommand[]) {
       await recording.dispatch(command);
@@ -2017,7 +2017,7 @@ async function buildTwoStagePrefix(stageCount: 2 | 3 | 4): Promise<Omit<Prefix, 
     }
     await writeFile(join(prep2.outputs_root, "plan2"), JSON.stringify(twoStageProposal(stageCount)), { mode: 0o600 });
     const records2: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline2, prep2);
-    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })) });
+    await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records2.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
     const state = sink.snapshot as PipelineV2RunState;
     const validated = parsePipelineV2RunState(JSON.stringify(state));
@@ -3151,7 +3151,7 @@ async function buildInitialPrefix(): Promise<Prefix> {
   }
   await writeFile(join(prep1.outputs_root, "plan"), JSON.stringify(R1_PROPOSAL), { mode: 0o600 });
   const records1: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline1, prep1);
-  await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })) });
+  await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records1.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
   await recording.dispatch({ kind: "agent_cleanup_completed" });
   return { fixture, recording, pipeline1, staleCompiledPlan1: null, revisionAtBoundary: (recording.snapshot as PipelineV2RunState).revision };
 }

@@ -314,7 +314,7 @@ async function runPlanningActivation(
   const records = await acceptActivationOutputs(pipeline, activation);
   await sink.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   } as never);
   await sink.dispatch({ kind: "agent_cleanup_completed" } as never);
   return [...accepted, ...records];
@@ -342,7 +342,7 @@ async function runRawStageActivation(
     { kind: "agent_execution_session_created", sessionId: `exec-${executionIndex}` },
     { kind: "agent_tool_session_created", sessionId: `tool-${executionIndex}` },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [] },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ] as never[]) {
     await sink.dispatch(command);

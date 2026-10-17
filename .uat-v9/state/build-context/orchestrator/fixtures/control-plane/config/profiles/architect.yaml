@@ -1,0 +1,7 @@
+schema_version: 1
+image: ghcr.io/example/worker:1
+opencode_config: opencode/architect.json
+env:
+  MODEL_API_KEY:
+    from_env: ARCHITECT_SOURCE_VAR_1
+    required: true

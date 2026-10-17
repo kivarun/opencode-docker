@@ -165,7 +165,7 @@ describe("events projection owner", () => {
         { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [] },
         { kind: "start_agent_execution", stateId: "architect", profile: "p", executionRole: "planning" },
         { kind: "agent_data_prepared" },
-        { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "not_required", tool: "not_required" } },
+        { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "not_required", tool: "not_required" }, workerLog: { status: "unavailable" }  },
         { kind: "run_failed", reason: "worker_failed" },
       ]),
     );
@@ -180,7 +180,7 @@ describe("events projection owner", () => {
         { kind: "agent_execution_session_created", sessionId: "s" },
         { kind: "agent_tool_session_created", sessionId: "t" },
         { kind: "agent_running" },
-        { kind: "agent_failed", reason: "session_cleanup_failed", sessionCleanup: { execution: "completed", tool: "failed" } },
+        { kind: "agent_failed", reason: "session_cleanup_failed", sessionCleanup: { execution: "completed", tool: "failed" }, workerLog: { status: "unavailable" }  },
         { kind: "run_cleanup_failed" },
       ]),
     );
@@ -526,7 +526,7 @@ describe("events across crash windows and concurrent appends", () => {
     const state = validatePipelineV2RunState(
       apply([
         ...base,
-        { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+        { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
         { kind: "run_failed", reason: "worker_failed" },
       ]),
     );
@@ -548,8 +548,8 @@ describe("events leakage matrix", () => {
       { kind: "agent_execution_session_created", sessionId: SESSION },
       { kind: "agent_tool_session_created", sessionId: "tool-CANARY" },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: DIGEST }] },
-      { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+      { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: DIGEST }], workerLog: { status: "unavailable" }  },
+      { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
       { kind: "run_failed", reason: "worker_failed" },
     ];
     const state = validatePipelineV2RunState(apply(commands));
@@ -688,4 +688,37 @@ describe("events end to end through the real CLI subprocess", () => {
     },
     30000,
   );
+});
+
+describe("worker-log bindings stay invisible to the events projection", () => {
+  test("a captured binding adds no event and leaks no metadata into the pages", () => {
+    const commands = lifecycleCommands().map((command) => {
+      if (command.kind === "agent_outputs_accepted") {
+        return {
+          ...command,
+          workerLog: {
+            status: "captured" as const,
+            sha256: "b".repeat(64),
+            byte_count: 10,
+            truncated_daemon: false,
+            truncated_local: false,
+          },
+        };
+      }
+      return command;
+    });
+    const state = validatePipelineV2RunState(apply(commands));
+    const page = projectPipelineV2Events(state, { after: 0, limit: 200 });
+    // the commit-history vocabulary is unchanged: no binding event exists
+    const kinds = new Set<string>(page.events.map((event) => event.kind));
+    expect(kinds.has("worker_log_recorded")).toBe(false);
+    for (const event of page.events) {
+      expect(Object.keys(event).filter((key) => key.startsWith("worker"))).toEqual([]);
+    }
+    expect(JSON.stringify(page)).not.toContain("worker_log");
+    expect(JSON.stringify(page)).not.toContain("workerlog");
+    expect(JSON.stringify(page)).not.toContain("b".repeat(64));
+    expect(page.revision).toBe(state.revision);
+    expect(page.nextAfter).toBeNull();
+  });
 });

@@ -14,7 +14,7 @@ result identity, run state schema version 2). Pipeline schema v2 has its
 own production entrypoint now: `orchestrator run` (see the "The production
 pipeline v2 CLI" section) drives the assembled pipeline v2 stack —
 graph execution, the run-owned project copy, the data plane, decision
-states, the Docker Helper runtime adapter, the durable state schema v8,
+states, the Docker Helper runtime adapter, the durable state schema v9,
 and output publication — through the single production runner
 `runPipelineV2`. `agent-smoke` remains the v1 diagnostic command with its
 own schema version 1 loader; the bundled default pipeline has not been
@@ -200,7 +200,7 @@ orchestrator run \
   activations. The source directory is never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 8), and the published run outputs stay at the fixed
+  (state schema version 9), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
@@ -230,8 +230,48 @@ orchestrator run \
   typed legacy message and never rewritten. The provenance is an internal
   durable-state contract: the read-only external exposure is the versioned
   lifecycle events API (see "The read-only lifecycle events API" below) —
-  worker logs remain ephemeral/unwired (docker-helper operation logs die
-  with the daemon and mix worker stderr into one stream).
+  the public event feed is unchanged by the worker-log capture below.
+- Schema v9 adds the durable worker-log artifact and execution binding:
+  every agent execution carries the required immutable `worker_log` field —
+  `null` until the terminal worker result, then exactly one non-null
+  binding written atomically by the same command that fixes the terminal
+  worker result (`agent_outputs_accepted` on success, `agent_failed` on
+  failure). The binding is one of `null`,
+  `{status: "captured"|"truncated", sha256, byte_count, truncated_daemon,
+  truncated_local}`, or `{status: "unavailable"}`; there is no `complete`
+  status and `captured` never means upstream completeness. No operation
+  id, session id, path, timestamp, log content, or diagnostic message
+  enters the state, and the commit-history vocabulary stays the existing
+  28 kinds (no new event kind; Events API v1 stays byte-compatible).
+  The bounded capture itself is stored as ONE self-describing immutable
+  artifact per execution index at the fixed layout
+  `<state-root>/pipeline-runs/<run-id>/logs/<execution_index>.workerlog.json`
+  (logs directory 0700, artifact 0600): a canonical JSON envelope with the
+  artifact schema version, the execution index, the capture status, both
+  truncation flags, and the raw captured payload as canonical base64,
+  whose payload digest lives over the separate `pipeline-v2-worker-log`
+  domain. Publication reuses the immutable-document substrate (exclusive
+  temp, write-all, file fsync, exclusive `link()`, parent fsync,
+  read-back verification, EEXIST -> byte-exact adoption, no rename
+  overwrite), so a crash between publication and the binding command
+  (C5) is recovered by parsing and verifying the artifact and adopting
+  its binding exactly once; a damaged or foreign already-published
+  artifact is a typed integrity defect that fails closed and is never
+  masked as `unavailable`. Capture and publication failures are
+  outcome-neutral: the binding becomes `unavailable` and the worker's
+  own success/failure stands — only a failure of the authoritative state
+  commit itself stays `state_persist_failed`. The artifact is a
+  secret-bearing untrusted record stored verbatim: there is no redaction
+  of any kind. The recovery windows `agent-in-flight` (phase `running`)
+  and `worker-settled` (phase `outputs_accepted`) belong to stage
+  executions whose worker already ran in a previous process — the worker
+  is never re-run; the in-flight window deletes both durable sessions by
+  id and finalizes honestly, the settled window cleans the sessions and
+  commits the missing transition. `orchestrator inspect` verifies every
+  recorded artifact byte-exactly (and refuses a damaged tolerated orphan)
+  without changing its public projection (schemaVersion 1, no worker-log
+  fields, no log endpoint); public logs API and Browser UI log routes
+  remain unwired.
 - The pipeline's agent states select the profiles; the worker image, the
   OpenCode configuration, and the exact environment bindings belong to those
   profiles. The user never sets mounts, container paths, Session

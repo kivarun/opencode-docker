@@ -56,7 +56,7 @@ function planningLadder(session: string, tool: string): PipelineV2RunCommand[] {
     { kind: "agent_execution_session_created", sessionId: session },
     { kind: "agent_tool_session_created", sessionId: tool },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ];
 }
@@ -68,7 +68,7 @@ function stageLadder(session: string, tool: string, iteration: number): Pipeline
     { kind: "agent_execution_session_created", sessionId: session },
     { kind: "agent_tool_session_created", sessionId: tool },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [{ id: "report", digest: hex("e") }] },
+    { kind: "agent_outputs_accepted", outputs: [{ id: "report", digest: hex("e") }], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ];
 }
@@ -260,7 +260,7 @@ describe("pipeline v2 commit provenance: the 66-command lifecycle oracle", () =>
     expect(state.status).toBe("success");
     expect(state.revision).toBe(66);
     expect(state.schema_version).toBe(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(8);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(9);
     expect(state.commit_history).toHaveLength(66);
     state.commit_history.forEach((entry, index) => {
       expect(entry.revision).toBe(index + 1);
@@ -474,7 +474,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
     {
       kind: "agent_failed",
       reason: "worker_failed",
-      sessionCleanup: { execution: "not_required", tool: "not_required" },
+      sessionCleanup: { execution: "not_required", tool: "not_required" }, workerLog: { status: "unavailable" }
     },
     { kind: "run_failed", reason: "worker_failed" },
   ];
@@ -487,7 +487,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
     {
       kind: "agent_failed",
       reason: "session_cleanup_failed",
-      sessionCleanup: { execution: "failed", tool: "completed" },
+      sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }
     },
     { kind: "run_cleanup_failed" },
   ];
@@ -806,6 +806,7 @@ describe("pipeline v2 commit provenance: the loader coherence replay", () => {
     expectRejected((draft) => {
       const executions = draft["executions"] as Array<Record<string, unknown>>;
       executions[0]!.phase = "running";
+      executions[0]!.worker_log = null;
     }, "already records a session cleanup outcome");
     expectRejected((draft) => {
       const history = draft["commit_history"] as Array<Record<string, unknown>>;
@@ -821,6 +822,7 @@ describe("pipeline v2 commit provenance: the loader coherence replay", () => {
       executions.push({
         index: 6,
         type: "agent",
+        worker_log: null,
         state_id: "architect",
         attempt: 1,
         profile: "architect",
@@ -986,7 +988,7 @@ describe("pipeline v2 commit provenance: state size and leakage", () => {
       { kind: "agent_execution_session_created", sessionId: `sess-${canary}` },
       { kind: "agent_tool_session_created", sessionId: `tool-${canary}` },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+      { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
       transition("architect", "dev_entry", 1),
       {

@@ -135,6 +135,8 @@ const PIPELINE_V2_RESUME_REFUSAL_REASONS = [
   "run_layout_invalid",
   "run_input_modified",
   "accepted_output_modified",
+  "artifact_missing",
+  "artifact_modified",
   "internal_error",
 ] as const;
 

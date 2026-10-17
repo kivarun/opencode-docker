@@ -32,12 +32,35 @@ import type { WorkerOperationCause, WorkerOperationHandle, WorkerSignalHub } fro
 
 /** Fixed per-execution capture bound in UTF-8 bytes (8 MiB). */
 export const WORKER_LOG_CAPTURE_BOUND_BYTES = 8 * 1024 * 1024;
-/** Fixed bound for a single helper HTTP response body in bytes. */
-export const WORKER_LOG_RESPONSE_BOUND_BYTES = 8 * 1024 * 1024;
+/**
+ * Fixed bound for a single helper HTTP response body in bytes.
+ *
+ * The honest pair with the capture bound: the `/logs` response carries the
+ * payload JSON-encoded, and the worst-case JSON escaping is six bytes per
+ * payload byte (every control character becomes `\u00XX`; quotes and
+ * backslashes double). The bound is therefore the full worst-case encoding
+ * of a complete capture payload plus envelope slack, so a legitimate
+ * worst-case log response is never rejected as oversized while the memory
+ * bound stays finite.
+ */
+export const WORKER_LOG_RESPONSE_BOUND_BYTES = 6 * WORKER_LOG_CAPTURE_BOUND_BYTES + 65_536;
 /** Bounded delay between operation cycles. */
 export const WORKER_OPERATION_POLL_DELAY_MS = 100;
-/** Hard bound for a single HTTP exchange inside the operation loop. */
-const OPERATION_REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * Hard bound for the create and status exchanges inside the operation
+ * loop. The create request is never retried and is never wired to the
+ * abort signal, so this constant is its exact finite wall-clock bound
+ * (further bounded by the remaining worker deadline).
+ */
+export const OPERATION_REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * Hard bound for one log-drain exchange, deliberately shorter than the
+ * create/status bound. Log observation must not own the worker outcome: a
+ * hanging `/logs` costs at most this bound once (the drain then stops
+ * permanently) and can never eat the worker deadline, so a terminal
+ * status is still reached before the overall timeout.
+ */
+export const OPERATION_DRAIN_TIMEOUT_MS = 2_000;
 /** Hard bound for the one best-effort cancel request. */
 const OPERATION_CANCEL_TIMEOUT_MS = 2_000;
 
@@ -315,7 +338,7 @@ export async function runWorkerOperation(request: WorkerOperationRequest): Promi
           bearer,
           method: "GET",
           path: `/operations/${operationId}/logs?offset=${cursor}`,
-          timeoutMs: requestTimeout(),
+          timeoutMs: Math.min(OPERATION_DRAIN_TIMEOUT_MS, remainingMs()),
           maxResponseBytes: WORKER_LOG_RESPONSE_BOUND_BYTES,
           signal: controller.signal,
         });

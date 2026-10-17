@@ -1823,7 +1823,7 @@ test("revise-task end-to-end with the real production runner: the honest waiting
       const records = await acceptActivationOutputs(pipeline, activation);
       await sink.dispatch({
         kind: "agent_outputs_accepted",
-        outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+        outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
       });
       await sink.dispatch({ kind: "agent_cleanup_completed" });
       if (commit) {
@@ -2127,7 +2127,7 @@ test("continue-stage end-to-end with the real production runner: the honest wait
       const records = await acceptActivationOutputs(pipeline, activation);
       await sink.dispatch({
         kind: "agent_outputs_accepted",
-        outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+        outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
       });
       await sink.dispatch({ kind: "agent_cleanup_completed" });
       if (commit) {
@@ -2691,7 +2691,7 @@ async function cliPlanningActivation(
   const records = await acceptActivationOutputs(pipeline, activation);
   await sink.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   } as never);
   await sink.dispatch({ kind: "agent_cleanup_completed" } as never);
   return [...accepted, ...records];
@@ -2719,7 +2719,7 @@ async function cliRawStageActivation(
     { kind: "agent_execution_session_created", sessionId: `exec-${executionIndex}` },
     { kind: "agent_tool_session_created", sessionId: `tool-${executionIndex}` },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [] },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ] as never[]) {
     await sink.dispatch(command);
@@ -3302,7 +3302,7 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
     const records = await acceptActivationOutputs(pipeline, activation);
     await sink.dispatch({
       kind: "agent_outputs_accepted",
-      outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await sink.dispatch({ kind: "agent_cleanup_completed" });
     const taskA = prepareTaskRevisionManifest({

@@ -958,7 +958,7 @@ export function createDockerHelperPipelineV2Runtime(
       "inherit",
     );
     if (pullResult.code !== 0) {
-      return { status: "failed", reason: "worker_failed" };
+      return { status: "failed", reason: "worker_failed", capture: executionRecord.capture };
     }
 
     // Mount sources: the single shared computation over the provenance-
@@ -1028,12 +1028,12 @@ export function createDockerHelperPipelineV2Runtime(
     });
     executionRecord.capture = operation.capture;
     if (operation.outcome === "worker_timeout") {
-      return { status: "failed", reason: "worker_timeout" };
+      return { status: "failed", reason: "worker_timeout", capture: operation.capture };
     }
     if (operation.outcome === "worker_failed") {
-      return { status: "failed", reason: "worker_failed" };
+      return { status: "failed", reason: "worker_failed", capture: operation.capture };
     }
-    return { status: "completed" };
+    return { status: "completed", capture: operation.capture };
   };
 
   const createExecutionSession = async (
@@ -1171,8 +1171,39 @@ export function createDockerHelperPipelineV2Runtime(
     return handle;
   };
 
+  /**
+   * The worker-log recovery path: deletes the two durably recorded
+   * sessions of an interrupted agent execution by their durable ids,
+   * Tool first, each exactly once. The launcher operator credential is
+   * the authority (the same `session delete` path the live cleanup
+   * uses); a failed delete reports the slot `failed`, never `completed`.
+   */
+  const cleanupSessionsByIds = async (
+    executionSessionId: string,
+    toolSessionId: string,
+  ): Promise<{ execution: "completed" | "failed"; tool: "completed" | "failed" }> => {
+    if (typeof executionSessionId !== "string" || executionSessionId === "") {
+      throw new Error("pipeline v2 agent runtime contract violated: the execution session id must be a non-empty string");
+    }
+    if (typeof toolSessionId !== "string" || toolSessionId === "") {
+      throw new Error("pipeline v2 agent runtime contract violated: the tool session id must be a non-empty string");
+    }
+    const deleteOne = async (sessionId: string): Promise<"completed" | "failed"> => {
+      try {
+        await deleteChildSession(cli, helperConfig, sessionId, { ...operatorEnv });
+        return "completed";
+      } catch {
+        return "failed";
+      }
+    };
+    const tool = await deleteOne(toolSessionId);
+    const execution = await deleteOne(executionSessionId);
+    return { execution, tool };
+  };
+
   return {
     createExecutionSession,
     createToolSession,
+    cleanupSessionsByIds,
   };
 }

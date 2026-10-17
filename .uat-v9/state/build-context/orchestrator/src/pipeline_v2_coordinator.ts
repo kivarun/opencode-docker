@@ -1,0 +1,2977 @@
+/**
+ * Production-neutral coordinator for pipeline schema version 2: the first
+ * orchestration layer that assembles the already existing v2 components —
+ * `executePipelineV2Graph`, the v2 data plane, the decision evaluator, the
+ * execution snapshot/digest, the durable state schema v5, the run state
+ * sink and the typed runtime failures — into one coordination flow.
+ *
+ * The coordinator owns the durable run state end to end: it creates the
+ * run-input snapshot itself (`snapshotRunInputs` — a caller-provided
+ * snapshot is never accepted, so the durable `create_run.inputs` always
+ * rests on the object the coordinator just received), dispatches every
+ * command through the injected state sink, and drives the graph strictly
+ * through the single engine `executePipelineV2Graph`. There is no second
+ * graph loop, no manual transition search and no coordinator-owned cursor:
+ * the engine selects the next state, applies the fixed agent lifecycle
+ * outcome `completed` after the void agent callback, and the transition
+ * commit hook is the only writer of transitions.
+ *
+ * The agent runtime boundary follows the two-session capability model: an
+ * injected `PipelineV2AgentRuntime` creates the orchestrator-owned
+ * Execution Session (run-root scope; it launches the worker and is never
+ * handed to the worker) and the Tool Session (project scope; its bearer is
+ * the worker's only authority) for one agent-state activation. The
+ * Execution session reports the worker run result through `runAgent(tool)`
+ * (completed, or a typed worker failure) and both sessions expose a
+ * `cleanup()`. The cleanup order is fixed: the Tool session first — it
+ * revokes the authority handed to the worker — then the Execution
+ * session. The runtime never sees transitions, transition targets,
+ * accepted records or any right to choose an outcome, and the concrete
+ * runtime keeps bearers in private state; the coordinator sees only
+ * opaque session objects, ids and lifecycle methods. Runtime and session
+ * contract functions are captured exactly once before the first side
+ * effect and again right after each Session is created (cleanup first,
+ * then the session id, then the run entry point), so swapping methods
+ * while a callback is pending cannot change the dispatch; user objects
+ * are never frozen or modified.
+ *
+ * Failure policy is classification by typed errors and context only — no
+ * message parsing. Every expected failure becomes the reason of the
+ * durable state; an agent execution records `agent_failed` with the two
+ * independent session cleanup outcomes (a durable slot says `completed`
+ * or `failed`; a never-durably-recorded slot says `not_required`), a
+ * decision execution records `decision_failed`, a durably failed session
+ * cleanup takes priority and finalizes the run as `run_cleanup_failed`,
+ * and everything unexpected is `internal_error`. The cleanup sequence is
+ * never interrupted by a first cleanup error: the second session is
+ * still cleaned exactly once.
+ *
+ * Every failure/final write is outcome-aware: one internal helper
+ * distinguishes a committed write, a not-committed write (the previous
+ * snapshot stays authoritative) and a durability-unknown write (the
+ * rename landed, the sink is poisoned) instead of swallowing commit
+ * outcomes. The unfinished-execution tracking clears only after a
+ * confirmed `agent_failed`/`decision_failed` commit, a knowingly
+ * incompatible run-level write is never attempted, and any unconfirmed
+ * failure or final-status write reports `state_persist_failed` on the
+ * last authoritative snapshot. No recursive finalization: a failed
+ * failure-write admits exactly one bounded `run_failed:
+ * state_persist_failed` attempt when the reducer still accepts it from
+ * the committed snapshot; after a durability-unknown commit the sink is
+ * poisoned, the visible snapshot is adopted, all state writes stop and
+ * the run fails with `state_persist_failed`.
+ *
+ * The result contract mirrors the durable state: `ok: true` is returned
+ * only after a confirmed `run_succeeded` commit, and a failed terminal —
+ * whose run outputs are still published — returns
+ * `{ok: false, reason: "terminal_failed", state}` with the durable failed
+ * state. Whenever the returned reason is not `state_persist_failed`, it
+ * equals the final `state.failure.reason`.
+ *
+ * Signal control is a required, production-neutral synchronous boundary
+ * (`PipelineV2CoordinatorControl`): the owner of the signal state (the
+ * runner's shared `RunCauseGate`) provides `currentSignal` and
+ * `freezeSignal`, both captured exactly once after the provenance gate and
+ * before any side effect. Synchronous checkpoints run before the project
+ * copy, after the copy, after the input snapshot and at its post-snapshot
+ * check (both inside the pre-`create_run` signal handling, so a signal
+ * noticed after a successful snapshot still yields the pre-`create_run`
+ * signal outcome with no state document and no escaping abort marker),
+ * after `create_run`, at the start of every execution, immediately before
+ * each Session create, before the worker run, before the decision
+ * evaluation and after the engine completes — no await between a
+ * checkpoint and the guarded call. A signal accepted up to `create_run`
+ * keeps the state document absent; a signal after `create_run` finalizes
+ * durably. After the durable state exists, every completion path freezes
+ * signal acceptance exactly once through one memoized cutoff call whose
+ * snapshot is reused everywhere; the cutoff sits synchronously after
+ * cleanup has settled (failure paths) and before the single final
+ * run-status write (both terminal results). A durably failed session
+ * cleanup outranks a signal, a signal outranks the classified cause, and
+ * a frozen signal at the cutoff of a success terminal finalizes the run
+ * as a signal failure (published outputs stay). A failed terminal is
+ * already determined and cannot be rewritten by a signal. No checkpoint
+ * runs between a settled execution and its `transition_committed` write.
+ *
+ * Continuation from an existing run shares the exact same implementations
+ * through one internal continuation chain (`continuePipelineV2Coordination`):
+ * fresh coordination performs its own pre-run phases (project copy → input
+ * snapshot → `create_run`) and then enters the chain with the entry state
+ * and an empty history; `resumePipelineV2Run` opens an already durable
+ * run — the sink must be a non-poisoned sink holding an existing snapshot
+ * bound to the same run id and the run must sit on the clean active
+ * boundary — restores the runtime context through the read-only
+ * `restorePipelineV2RuntimeContext` (which revalidates the durable state,
+ * the pipeline identity, the run layout, the run-input snapshot and the
+ * full accepted-output history without reading any original user binding)
+ * and enters the same chain with the restored cursor, the restored input
+ * snapshot, the restored accepted history and the restored next execution
+ * index. The chain owns the single engine invocation, the single
+ * transition-commit hook, the single failure finalizer, the single
+ * terminal publisher and the single signal cutoff; there is no second
+ * coordinator execution loop, no second budget model and no re-reading of
+ * user sources. Every pre-resume refusal (poisoned or missing sink
+ * snapshot, run-id mismatch, a non-active boundary, waiting runs, and
+ * every typed restore failure) returns before any durable write, Session
+ * or engine callback and leaves the state file untouched — a damaged or
+ * incompatible run is not a new execution fact. This module is wired
+ * through the production runner (`pipeline_v2_runner.ts`) and the CLI
+ * production commands (`orchestrator run`/`resume`/`continue-stage`/
+ * `revise-task`/`resume-plan`); `agent-smoke` and the default pipeline
+ * keep executing v1.
+ */
+import { isAbsolute } from "node:path";
+import { validateSafeId } from "./pipeline.ts";
+import {
+  executePipelineV2Graph,
+  executePipelineV2GraphResume,
+  PipelineExecutionError,
+  type PipelineV2GraphExecutors,
+  type PipelineV2GraphResumeSeed,
+  type TransitionStep,
+  type V2AgentExecutionView,
+  type V2DecisionExecutionView,
+} from "./pipeline_engine.ts";
+import { compiledTransitionFor } from "./pipeline_engine.ts";
+import { pipelineV2RunPipelineIdentity } from "./pipeline_v2_digest.ts";
+import { compiledExecutionRoleFor, type CompiledPipelineV2StageWait } from "./pipeline_v2_orchestration.ts";
+import { restorePipelineV2AcceptedRunPlan } from "./pipeline_v2_run_plan_restore.ts";
+import { restorePipelineV2PlanningAcceptanceContext } from "./pipeline_v2_resume_context.ts";
+import { enterPipelineV2Wait, PipelineV2WaitControllerError } from "./pipeline_v2_wait_controller.ts";
+import type { PipelineV2WaitManifestAction } from "./pipeline_v2_wait_manifest.ts";
+import { pipelineV2OpenStageIteration } from "./pipeline_v2_state.ts";
+import {
+  acceptActivationOutputs,
+  collectOrAdoptRunOutputs,
+  collectRunOutputs,
+  evaluatePreparedDecisionState,
+  prepareActivationData,
+  prepareDecisionStateData,
+  prepareRunProject,
+  snapshotRunInputs,
+  type AcceptedStateOutput,
+  type PreparedActivationData,
+  type RunInputBinding,
+  type RunInputsSnapshot,
+  type RunOutputSnapshotEntry,
+} from "./pipeline_v2_runtime.ts";
+import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
+import {
+  classifyPipelineV2ResumeRecovery,
+  type PipelineV2ExecutableRecovery,
+} from "./pipeline_v2_recovery.ts";
+import {
+  PipelineV2RuntimeContextRestoreError,
+  restorePipelineV2RuntimeContext,
+  type RestoredPipelineV2RuntimeContext,
+} from "./pipeline_v2_resume_context.ts";
+import {
+  PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
+  PIPELINE_V2_TERMINAL_FAILURE_REASON,
+  type PipelineDecisionStateRecord,
+  type PipelineV2AgentExecutionState,
+  type PipelineV2ExecutionState,
+  type PipelineV2FailureReason,
+  type PipelineV2RunCommand,
+  type PipelineV2RunOutputState,
+  type PipelineV2RunState,
+  type PipelineV2SessionCleanup,
+  type PipelineV2SessionCleanupPair,
+} from "./pipeline_v2_state.ts";
+import {
+  PipelineV2RunStateDurabilityError,
+  PipelineV2RunStateStoreError,
+} from "./pipeline_v2_state_store.ts";
+import {
+  bindingOfParsedWorkerLog,
+  loadPipelineV2WorkerLog,
+  PipelineV2WorkerLogStoreError,
+  publishPipelineV2WorkerLog,
+} from "./pipeline_v2_worker_log_store.ts";
+import {
+  PipelineV2WorkerLogArtifactError,
+  parseWorkerLogArtifact,
+} from "./pipeline_v2_worker_log.ts";
+import type { PipelineV2WorkerLogState } from "./pipeline_v2_state.ts";
+import type { WorkerLogCapture } from "./worker_operation.ts";
+import {
+  requireResolvedPipelineV2Provenance,
+  type PipelineDecisionStateResult,
+  type ResolvedPipelineV2,
+} from "./pipeline_v2.ts";
+
+/**
+ * Lifecycle result of one worker run, reported by the injected Execution
+ * Session. It carries no stdout, no artifacts and no outcome string: after
+ * a completed run the engine applies its own fixed `completed` outcome,
+ * and a typed worker failure fails the execution. The optional `capture`
+ * is the runtime adapter's frozen in-memory bounded log capture of the
+ * finished operation (`undefined`/`null` when the worker never ran or the
+ * adapter obtained nothing verifiable); the coordinator publishes it as
+ * the run-root worker-log artifact and binds it atomically with the
+ * terminal worker result. The capture never crosses back to the runtime.
+ */
+export type PipelineV2WorkerRunResult =
+  | { readonly status: "completed"; readonly capture?: WorkerLogCapture | null }
+  | {
+      readonly status: "failed";
+      readonly reason: "worker_failed" | "worker_timeout";
+      readonly capture?: WorkerLogCapture | null;
+    };
+
+/**
+ * The Tool Session of one activation: project scope, its bearer is the
+ * worker's only authority. The coordinator never receives the bearer and
+ * only releases the session exactly once.
+ */
+export interface PipelineV2ToolSession {
+  readonly sessionId: string;
+  cleanup(): Promise<void>;
+}
+
+/**
+ * The orchestrator-owned Execution Session of one activation: run-root
+ * scope, it launches the worker and is never handed to the worker. The
+ * Tool Session object is passed to `runAgent` as the worker's authority;
+ * the concrete runtime keeps both bearers in private state.
+ */
+export interface PipelineV2ExecutionSession {
+  readonly sessionId: string;
+  runAgent(toolSession: PipelineV2ToolSession): Promise<PipelineV2WorkerRunResult>;
+  cleanup(): Promise<void>;
+}
+
+/**
+ * Production-neutral agent runtime boundary of the two-session capability
+ * model. The coordinator captures `createExecutionSession` and
+ * `createToolSession` exactly once before their first side effect; the
+ * runtime never sees transitions, transition targets, accepted records or
+ * any right to choose an outcome.
+ */
+export interface PipelineV2AgentRuntime {
+  createExecutionSession(
+    state: V2AgentExecutionView,
+    activation: PreparedActivationData,
+  ): Promise<PipelineV2ExecutionSession>;
+
+  createToolSession(
+    state: V2AgentExecutionView,
+    activation: PreparedActivationData,
+  ): Promise<PipelineV2ToolSession>;
+
+  /**
+   * Deletes the two durably recorded sessions of an interrupted agent
+   * execution by their durable ids (the worker-log recovery only): the
+   * Tool session first, then the Execution session, each exactly once,
+   * mirroring the live cleanup order. The per-slot outcomes are honest —
+   * a failed delete reports `failed`, never `completed`. Optional:
+   * runtimes that cannot delete by id never silently claim a cleanup.
+   */
+  cleanupSessionsByIds?(
+    executionSessionId: string,
+    toolSessionId: string,
+  ): Promise<{ execution: "completed" | "failed"; tool: "completed" | "failed" }>;
+}
+
+/**
+ * The minimal structural view of the durable run state sink the
+ * coordinator needs. The production `PipelineV2RunStateSink` satisfies it
+ * structurally; tests inject equivalent fakes with fault injection.
+ */
+export interface PipelineV2CoordinatorStateSink {
+  readonly snapshot: PipelineV2RunState | null;
+  readonly poisoned: boolean;
+  dispatch(command: PipelineV2RunCommand): Promise<void>;
+}
+
+export interface PipelineV2CoordinatorParams {
+  /** The exact deep-frozen snapshot a successful `loadPipelineV2` returned. */
+  readonly pipeline: ResolvedPipelineV2;
+  readonly runId: string;
+  /** Canonical orchestrator-owned run root. */
+  readonly runRoot: string;
+  /**
+   * The caller-provided project source directory. The coordinator prepares
+   * the run-owned `<runRoot>/project` copy from it itself; the source is
+   * never modified, its path never enters the pipeline, execution
+   * document, worker env/argv, durable state or results, and a ready-made
+   * `PreparedRunProject` is never accepted.
+   */
+  readonly projectSourcePath: string;
+  /** The original run-input bindings, bound once by the caller. */
+  readonly inputBindings: readonly RunInputBinding[];
+  readonly sink: PipelineV2CoordinatorStateSink;
+  readonly runtime: PipelineV2AgentRuntime;
+}
+
+/**
+ * Parameters of the production-neutral resume entrypoint
+ * (`resumePipelineV2Run`). The resume takes no project source, no input
+ * bindings, no caller-built snapshot or accepted history, no new run id
+ * and no caller-supplied cursor or execution index: everything it
+ * continues is derived from the opened existing sink snapshot and the
+ * trusted pipeline alone. The sink must be an opened existing sink (a
+ * non-poisoned sink whose snapshot is the durable state of this run).
+ */
+export interface PipelineV2CoordinatorResumeParams {
+  /** The exact deep-frozen snapshot a successful `loadPipelineV2` returned. */
+  readonly pipeline: ResolvedPipelineV2;
+  /** The run id the opened sink already owns (must match the durable state). */
+  readonly runId: string;
+  /** The canonical orchestrator-owned run root (same run as the sink). */
+  readonly runRoot: string;
+  readonly sink: PipelineV2CoordinatorStateSink;
+  readonly runtime: PipelineV2AgentRuntime;
+}
+
+/**
+ * The closed refusal vocabulary of a pre-resume rejection. Every member is
+ * typed by structure and class, never by message text. The restore failure
+ * reasons are the existing typed `PipelineV2RuntimeContextRestoreError`
+ * reasons; `missing_state`, `run_input_modified`, `accepted_output_modified`
+ * and `internal_error` coincide with existing v6 failure-reason strings;
+ * `sink_poisoned`, `run_id_mismatch`, `invalid_state`, `pipeline_mismatch`
+ * and `run_layout_invalid` name the remaining structural refusals of this
+ * entrypoint. None of these labels is ever written to the durable state as
+ * a failure reason: a pre-resume refusal is not a new execution fact.
+ */
+export type PipelineV2ResumeRefusalReason =
+  | "missing_state"
+  | "sink_poisoned"
+  | "run_id_mismatch"
+  | "invalid_state"
+  | "pipeline_mismatch"
+  | "run_layout_invalid"
+  | "run_input_modified"
+  | "accepted_output_modified"
+  | "artifact_missing"
+  | "artifact_modified"
+  | "internal_error";
+
+/**
+ * Result of `resumePipelineV2Run`. A refusal (`refused: true`) happened
+ * strictly before the successful restore: zero durable writes, zero
+ * Sessions, zero engine callbacks and no signal cutoff — the returned
+ * state (when available, the sink's authoritative snapshot) was not
+ * modified, and a damaged or incompatible run is never finalized as
+ * failed by a resume attempt. After a successful restore the ordinary
+ * coordination result applies: execution failures carry their existing
+ * durable semantics. A waiting result (`waiting: true`) reports the
+ * controlled suspension at the trusted stage-wait boundary — the run is
+ * durably waiting and every consumer must check it before the ordinary
+ * `ok:false` branches. A plan-ready result (`planReady: true`) reports the
+ * controlled suspension after a fully successful planning execution — the
+ * settled-but-unbound planning boundary that `orchestrator resume-plan`
+ * consumes; it is checked together with the waiting branch before the
+ * ordinary `ok:false` branches.
+ */
+export type PipelineV2ResumeCoordinationResult =
+  | {
+      readonly ok: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly waiting: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly planReady: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly refused: true;
+      readonly reason: PipelineV2ResumeRefusalReason;
+      readonly state: PipelineV2RunState | null;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: PipelineV2FailureReason;
+      readonly state: PipelineV2RunState | null;
+    };
+
+/**
+ * Production-neutral synchronous signal control boundary of the
+ * coordinator. `currentSignal` reports the currently accepted run-level
+ * signal (null when none); `freezeSignal` atomically snapshots the
+ * accepted signal and closes signal acceptance, returning the frozen
+ * signal (null when none was accepted). Both functions are captured
+ * exactly once by the coordinator after the provenance gate and before
+ * the first side effect; rebinding or replacing the control's methods
+ * later cannot influence a running coordination. The owner of the
+ * underlying signal state is the runner (the shared `RunCauseGate`); the
+ * coordinator never registers signal handlers itself.
+ */
+export interface PipelineV2CoordinatorControl {
+  readonly currentSignal: () => "SIGINT" | "SIGTERM" | null;
+  readonly freezeSignal: () => "SIGINT" | "SIGTERM" | null;
+}
+
+/**
+ * Result of one coordination. `ok: true` means only a confirmed terminal
+ * `run_succeeded`; the waiting branch (`waiting: true`) reports the
+ * controlled suspension at the trusted stage-wait boundary (the durable
+ * state carries the committed `run_waiting`); the plan-ready branch
+ * (`planReady: true`) reports the controlled suspension after a fully
+ * successful planning execution (settled but unbound — no transition, no
+ * accepted plan); every consumer must check both before the ordinary
+ * `ok:false` failure branch; every other `ok: false` result is a durable
+ * or persistence failure classified into the closed failure-reason
+ * vocabulary.
+ */
+export type PipelineV2CoordinationResult =
+  | {
+      readonly ok: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly waiting: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly planReady: true;
+      readonly state: PipelineV2RunState;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: PipelineV2FailureReason;
+      readonly state: PipelineV2RunState | null;
+    };
+
+/** Internal abort marker after a failure was already durably recorded. */
+class CoordinationAbortedError extends Error {
+  constructor() {
+    super("pipeline v2 coordination aborted: the failure was already recorded durably");
+    this.name = "CoordinationAbortedError";
+  }
+}
+
+/**
+ * The private controlled-suspension marker of the coordinator. The class
+ * is never exported: the runtime, the worker and every downstream layer
+ * can neither obtain an instance nor construct a look-alike, so the
+ * coordinator's catch recognizes the exact private identity and nothing
+ * else. The closed suspension kinds:
+ *
+ * - `waiting` — the controlled suspension at the trusted stage-wait
+ *   boundary (the durable `run_waiting` is committed). When `entryFailure`
+ *   is defined the wait entry itself failed — the coordinator reports the
+ *   failure without any durable `run_failed`.
+ * - `plan_ready` — the controlled suspension after a fully successful
+ *   planning execution (durable `agent_cleanup_completed`, settled but
+ *   unbound): no transition is committed, no plan is accepted and the
+ *   operator applies `resume-plan` next.
+ */
+type CoordinatorSuspensionKind = "waiting" | "plan_ready";
+
+class CoordinatorSuspension extends Error {
+  readonly kind: CoordinatorSuspensionKind;
+  readonly entryFailure?: { readonly cause: unknown; readonly state: PipelineV2RunState | null };
+  constructor(kind: CoordinatorSuspensionKind, entryFailure?: { readonly cause: unknown; readonly state: PipelineV2RunState | null }) {
+    super(
+      kind === "waiting"
+        ? "pipeline v2 coordination suspended at the trusted stage-wait boundary"
+        : "pipeline v2 coordination suspended at the plan-ready planning boundary",
+    );
+    this.name = "CoordinatorSuspension";
+    this.kind = kind;
+    this.entryFailure = entryFailure;
+  }
+}
+
+/**
+ * Internal abort marker for a signal accepted while coordination was in
+ * flight. It carries the signal literal only; the coordinator maps it onto
+ * the closed `signal_sigint`/`signal_sigterm` failure reasons and never
+ * records the signal in the durable state beyond that reason.
+ */
+class CoordinatorSignalAbort extends Error {
+  readonly signal: "SIGINT" | "SIGTERM";
+  constructor(signal: "SIGINT" | "SIGTERM") {
+    super(`pipeline v2 coordination aborted by ${signal}`);
+    this.name = "CoordinatorSignalAbort";
+    this.signal = signal;
+  }
+}
+
+function signalFailureReason(signal: "SIGINT" | "SIGTERM"): PipelineV2FailureReason {
+  return signal === "SIGINT" ? "signal_sigint" : "signal_sigterm";
+}
+
+function describeValue(value: unknown): string {
+  return value === null ? "null" : typeof value;
+}
+
+/**
+ * Captures one contract function of an injected object exactly once,
+ * before any side effect: the function is read one time, checked against
+ * the contract, and bound to its owner. Reassigning the property later
+ * cannot change the dispatch, and the user object is never frozen or
+ * modified.
+ */
+function captureContractFunction<O extends object>(owner: O, name: string, ownerLabel: string): unknown {
+  const value = (owner as unknown as Record<string, unknown>)[name];
+  if (typeof value !== "function") {
+    throw new Error(
+      `${ownerLabel} contract violated: ${name} must be a function, got ${describeValue(value)}`,
+    );
+  }
+  return (value as (...args: never[]) => unknown).bind(owner);
+}
+
+type CapturedCreateExecutionSession = (
+  state: V2AgentExecutionView,
+  activation: PreparedActivationData,
+) => Promise<PipelineV2ExecutionSession>;
+
+type CapturedCreateToolSession = (
+  state: V2AgentExecutionView,
+  activation: PreparedActivationData,
+) => Promise<PipelineV2ToolSession>;
+
+function captureCreateExecutionSession(runtime: PipelineV2AgentRuntime): CapturedCreateExecutionSession {
+  return captureContractFunction(
+    runtime,
+    "createExecutionSession",
+    "pipeline v2 agent runtime",
+  ) as CapturedCreateExecutionSession;
+}
+
+function captureCreateToolSession(runtime: PipelineV2AgentRuntime): CapturedCreateToolSession {
+  return captureContractFunction(
+    runtime,
+    "createToolSession",
+    "pipeline v2 agent runtime",
+  ) as CapturedCreateToolSession;
+}
+
+/**
+ * Captures one session contract member exactly once: the property is read
+ * one time (a throwing getter is a contract violation, never propagated),
+ * checked against the contract, and bound to its owner. Reassigning the
+ * property later cannot change the dispatch, and the user object is never
+ * frozen or modified. Diagnostics carry no values.
+ */
+function captureSessionFunction(
+  session: PipelineV2ExecutionSession | PipelineV2ToolSession,
+  name: "runAgent" | "cleanup",
+): unknown {
+  let value: unknown;
+  try {
+    value = (session as unknown as Record<string, unknown>)[name];
+  } catch {
+    throw new Error(
+      `pipeline v2 agent session contract violated: ${name} must be a function`,
+    );
+  }
+  if (typeof value !== "function") {
+    throw new Error(
+      `pipeline v2 agent session contract violated: ${name} must be a function`,
+    );
+  }
+  return (value as (...args: never[]) => unknown).bind(session);
+}
+
+/**
+ * Captures one session contract member exactly once, right after the
+ * Session is created. Reassigning the property later cannot change the
+ * dispatch; the violation diagnostics never echo values.
+ */
+function captureSessionId(
+  session: PipelineV2ExecutionSession | PipelineV2ToolSession,
+): string {
+  let sessionId: unknown;
+  try {
+    sessionId = session.sessionId;
+  } catch {
+    throw new Error(
+      "pipeline v2 agent session contract violated: sessionId must be a non-empty string",
+    );
+  }
+  if (typeof sessionId !== "string" || sessionId === "") {
+    throw new Error(
+      "pipeline v2 agent session contract violated: sessionId must be a non-empty string",
+    );
+  }
+  return sessionId;
+}
+
+/**
+ * The exact worker run result shapes. Anything else — arrays, missing or
+ * extra fields, wrong literals, throwing getters — is rejected without
+ * echoing the offending value or field names.
+ */
+type ParsedWorkerRunResult =
+  | { readonly status: "completed" }
+  | { readonly status: "failed"; readonly reason: "worker_failed" | "worker_timeout" };
+
+function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  let keys: string[];
+  let status: unknown;
+  try {
+    keys = Object.keys(value);
+    status = (value as Record<string, unknown>).status;
+  } catch {
+    return undefined;
+  }
+  if (status === "completed") {
+    return keys.length === 1 ||
+      (keys.length === 2 && keys.includes("capture") && keys.includes("status"))
+      ? { status: "completed" }
+      : undefined;
+  }
+  if (
+    status !== "failed" ||
+    keys.length < 2 ||
+    keys.length > 3 ||
+    !keys.includes("reason") ||
+    (keys.length === 3 && !keys.includes("capture"))
+  ) {
+    return undefined;
+  }
+  let reason: unknown;
+  try {
+    reason = (value as Record<string, unknown>).reason;
+  } catch {
+    return undefined;
+  }
+  if (reason === "worker_failed" || reason === "worker_timeout") {
+    return { status: "failed", reason };
+  }
+  return undefined;
+}
+
+/**
+ * Extracts the worker-log capture of a parsed run result defensively: an
+ * absent, null or malformed capture is an honest `null` (no verifiable
+ * bytes), a well-shaped frozen record passes through unchanged. The
+ * capture object itself is never copied, frozen or mutated here.
+ */
+function extractWorkerLogCapture(value: unknown): WorkerLogCapture | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const candidate = value as Record<string, unknown>;
+  try {
+    const status = candidate.status;
+    if (status !== "captured" && status !== "truncated" && status !== "unavailable") {
+      return null;
+    }
+    const byteCount = candidate.byteCount;
+    if (typeof byteCount !== "number" || !Number.isSafeInteger(byteCount) || byteCount < 0) {
+      return null;
+    }
+    if (!(candidate.tailBytes instanceof Uint8Array)) {
+      return null;
+    }
+    if (typeof candidate.truncatedDaemon !== "boolean" || typeof candidate.truncatedLocal !== "boolean") {
+      return null;
+    }
+    return value as WorkerLogCapture;
+  } catch {
+    return null;
+  }
+}
+
+/** Reads the optional capture member of a raw run result defensively. */
+function readWorkerCaptureSafely(outcome: unknown): WorkerLogCapture | null {
+  if (typeof outcome !== "object" || outcome === null) {
+    return null;
+  }
+  try {
+    return extractWorkerLogCapture((outcome as { capture?: unknown }).capture);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Classifies one unexpected failure by typed errors and context only —
+ * never by parsing messages. The typed data-plane reasons, the engine
+ * reasons (all of which exist in state schema v5) and the store/durability
+ * failures keep their reasons; everything else is `internal_error`.
+ */
+function classifyCause(cause: unknown): PipelineV2FailureReason {
+  if (cause instanceof CoordinatorSignalAbort) {
+    return signalFailureReason(cause.signal);
+  }
+  if (cause instanceof PipelineV2RuntimeContextRestoreError) {
+    // A planning-acceptance verification failure of the plan-ready seam:
+    // the data-plane modification reasons keep their existing typed
+    // reasons (the same failure the next activation would have reported),
+    // every structural mismatch falls to the existing internal_error
+    // catch-all.
+    return cause.reason === "run_input_modified" || cause.reason === "accepted_output_modified"
+      ? cause.reason
+      : "internal_error";
+  }
+  if (cause instanceof PipelineV2RuntimeError) {
+    return cause.reason;
+  }
+  if (cause instanceof PipelineExecutionError) {
+    return cause.reason;
+  }
+  if (
+    cause instanceof PipelineV2RunStateDurabilityError ||
+    cause instanceof PipelineV2RunStateStoreError
+  ) {
+    return "state_persist_failed";
+  }
+  return "internal_error";
+}
+
+/**
+ * The failure reason of one failed wait-entry attempt, mapped by typed
+ * class and typed fields only — never by message text. A wait controller
+ * persistence failure keeps the existing `state_persist_failed` reason;
+ * every other wait-controller refusal/conflict and every unexpected
+ * downstream error falls to the existing `internal_error` catch-all. No
+ * new failure reason is introduced and no durable `run_failed` is written
+ * for any of them: the active boundary stays retryable.
+ */
+function waitEntryFailureReason(cause: unknown): PipelineV2FailureReason {
+  if (cause instanceof PipelineV2WaitControllerError) {
+    return cause.reason === "state_persist_failed" ? "state_persist_failed" : "internal_error";
+  }
+  return classifyCause(cause);
+}
+
+/**
+ * The execution-level failure vocabulary is a closed subset of the run
+ * reasons; a classified reason outside it (for example a state-store
+ * failure during an execution) is recorded as `internal_error` on the
+ * execution while the run-level finalize keeps the true reason.
+ */
+const AGENT_EXECUTION_REASONS: readonly PipelineV2FailureReason[] = [
+  "internal_error",
+  "run_input_invalid",
+  "run_input_modified",
+  "activation_prepare_failed",
+  "worker_failed",
+  "worker_timeout",
+  "activation_output_invalid",
+  "accepted_output_modified",
+  "unknown_outcome",
+  "invalid_outcome",
+  "session_cleanup_failed",
+  "signal_sigint",
+  "signal_sigterm",
+];
+
+const DECISION_EXECUTION_REASONS: readonly PipelineV2FailureReason[] = [
+  "internal_error",
+  "run_input_invalid",
+  "run_input_modified",
+  "accepted_output_modified",
+  "decision_input_invalid",
+  "unknown_outcome",
+  "invalid_outcome",
+  "signal_sigint",
+  "signal_sigterm",
+];
+
+function executionReasonFor(
+  kind: "agent" | "decision",
+  reason: PipelineV2FailureReason,
+): PipelineV2FailureReason {
+  const allowed = kind === "agent" ? AGENT_EXECUTION_REASONS : DECISION_EXECUTION_REASONS;
+  return allowed.includes(reason) ? reason : "internal_error";
+}
+
+/** The durable, content-free record form of one evaluated decision state. */
+function toDecisionRecord(result: PipelineDecisionStateResult): PipelineDecisionStateRecord {
+  switch (result.status) {
+    case "selected":
+      return {
+        status: "selected",
+        outcome: result.outcome,
+        decision: result.decision,
+        rule_id: result.rule_id,
+        active_constraint_ids: [...result.active_constraint_ids],
+      };
+    case "uncovered":
+      return {
+        status: "uncovered",
+        outcome: "uncovered",
+        active_constraint_ids: [...result.active_constraint_ids],
+      };
+    case "inconsistent_facts":
+      return {
+        status: "inconsistent_facts",
+        outcome: "inconsistent_facts",
+        violated_relation_ids: [...result.violated_relation_ids],
+      };
+    case "invalid_facts": {
+      const record: PipelineDecisionStateRecord = {
+        status: "invalid_facts",
+        outcome: "invalid_facts",
+        reason: result.reason,
+      };
+      if (result.fact_id !== undefined && result.actual_type !== undefined) {
+        return { ...record, fact_id: result.fact_id, actual_type: result.actual_type };
+      }
+      if (result.fact_id !== undefined) {
+        return { ...record, fact_id: result.fact_id };
+      }
+      if (result.actual_type !== undefined) {
+        return { ...record, actual_type: result.actual_type };
+      }
+      return record;
+    }
+  }
+}
+
+/** One durable run-output entry without the internal snapshot path. */
+function toRunOutputState(entry: RunOutputSnapshotEntry): PipelineV2RunOutputState {
+  if (entry.present) {
+    return {
+      id: entry.id,
+      type: entry.type,
+      required: entry.required,
+      present: true,
+      digest: entry.digest,
+    };
+  }
+  return { id: entry.id, type: entry.type, required: false, present: false };
+}
+
+function deepFreeze<T>(value: T): T {
+  if (Array.isArray(value)) {
+    for (const item of value) deepFreeze(item);
+    return Object.freeze(value) as T;
+  }
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      deepFreeze(record[key]);
+    }
+    return Object.freeze(record) as unknown as T;
+  }
+  return value;
+}
+
+/**
+ * The three explicit outcomes of one durable state write inside the
+ * failure finalizer. Nothing is ever swallowed: `committed` means the
+ * reducer accepted the command and the commit is confirmed,
+ * `not_committed` means the rename did not happen and the previous
+ * snapshot stays authoritative, and `durability_unknown` means the rename
+ * landed while its crash survival is unknown (the sink is poisoned).
+ */
+type DispatchOutcome =
+  | { readonly outcome: "committed" }
+  | { readonly outcome: "not_committed"; readonly durabilityUnknown: boolean };
+
+/** A run-level finalize command the reducer can still accept. */
+type RunFinalizeCommand =
+  | { readonly kind: "run_cleanup_failed" }
+  | { readonly kind: "run_failed"; readonly reason: PipelineV2FailureReason };
+
+/** An execution whose phase can never change again (mirrors the reducer). */
+function executionSettled(execution: PipelineV2ExecutionState): boolean {
+  if (execution.type === "agent") {
+    return execution.phase === "cleanup_completed" || execution.phase === "failed";
+  }
+  return execution.phase === "evaluated" || execution.phase === "failed";
+}
+
+/**
+ * Whether the reducer would still accept a `run_failed` with the given
+ * reason from the given committed snapshot, decided by typed context
+ * only — never by parsing messages. Mirrors the reducer's admissibility:
+ * every execution must be settled, a durably failed session cleanup
+ * finalizes only with `run_cleanup_failed`, and a failed terminal with
+ * published run outputs finalizes only with the terminal failure reason.
+ */
+function runFailedAdmissible(
+  state: PipelineV2RunState,
+  reason: PipelineV2FailureReason,
+): boolean {
+  for (const execution of state.executions) {
+    if (!executionSettled(execution)) {
+      return false;
+    }
+  }
+  const last = state.executions[state.executions.length - 1];
+  if (
+    last !== undefined &&
+    last.type === "agent" &&
+    last.phase === "failed" &&
+    hasDurableFailedCleanup(last)
+  ) {
+    return false;
+  }
+  const terminalFailedPublished =
+    state.terminal !== undefined &&
+    state.terminal.result === "failed" &&
+    state.run_outputs !== undefined;
+  if (terminalFailedPublished) {
+    return reason === PIPELINE_V2_TERMINAL_FAILURE_REASON;
+  }
+  return reason !== PIPELINE_V2_TERMINAL_FAILURE_REASON;
+}
+
+/** Mirrors the loader: at least one durable cleanup slot failed. */
+function hasDurableFailedCleanup(execution: PipelineV2AgentExecutionState): boolean {
+  const cleanup = execution.session_cleanup;
+  return cleanup !== undefined && (cleanup.execution === "failed" || cleanup.tool === "failed");
+}
+
+/** The two independent cleanup slots of one agent execution. */
+interface SessionSlotTracking {
+  /** The captured cleanup; null until the session object existed. */
+  cleanup: (() => Promise<void>) | null;
+  /** The captured cleanup ran exactly once (successfully or not). */
+  cleanupDone: boolean;
+  cleanupFailed: boolean;
+}
+
+interface AgentSessionTracking {
+  execution: SessionSlotTracking;
+  tool: SessionSlotTracking;
+  /** The execution session id was durably recorded. */
+  executionCreatedDurably: boolean;
+  /** The tool session id was durably recorded. */
+  toolCreatedDurably: boolean;
+}
+
+interface ExecutionTracking {
+  kind: "agent" | "decision" | null;
+  /** An execution record exists that no transition has committed yet. */
+  unfinished: boolean;
+  session: AgentSessionTracking | null;
+  /**
+   * The worker-log binding fixed for the current agent execution, or
+   * `null` before the worker ran. Once fixed it joins the same
+   * `agent_outputs_accepted`/`agent_failed` command as the terminal
+   * worker result; it is never rewritten.
+   */
+  workerLog: PipelineV2WorkerLogState | null;
+}
+
+/**
+ * Coordinates one fresh pipeline v2 run end to end. The result is
+ * deep-frozen and carries no raw error messages, stdout/stderr, facts,
+ * prompt or input bodies, credentials or environment values.
+ */
+export async function coordinatePipelineV2Run(
+  params: PipelineV2CoordinatorParams,
+  control: PipelineV2CoordinatorControl,
+): Promise<PipelineV2CoordinationResult> {
+  // The provenance gate is the first statement and runs before any side
+  // effect: a forged pipeline is rejected before the sink is read or
+  // dispatched, before the runtime callbacks are captured, before the
+  // control functions are captured, before any filesystem operation and
+  // before any Session. The pipeline is never re-compiled or re-validated
+  // here; provenance is the structural trust anchor established by
+  // `loadPipelineV2`.
+  try {
+    requireResolvedPipelineV2Provenance(params.pipeline, "pipeline v2 coordinator");
+  } catch {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
+  const { pipeline, runId, runRoot, sink, runtime } = params;
+
+  // Production v2 dispatch requires the compiled orchestration metadata:
+  // every start command carries the exact compiled execution role, and a
+  // pipeline without it has no role source. The gate runs before any
+  // side effect — before the sink is read, before the project copy, any
+  // state document, and any Session.
+  if (pipeline.orchestration === undefined) {
+    return deepFreeze({ ok: false as const, reason: "invalid_graph" as const, state: null });
+  }
+
+  // Caller contract: a fresh sink for a new run; resume is not supported.
+  if (sink.poisoned || sink.snapshot !== null) {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+  try {
+    validateSafeId(runId, "pipeline v2 coordinator run id");
+  } catch {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+  if (typeof runRoot !== "string" || runRoot === "" || !isAbsolute(runRoot)) {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
+  // The signal control functions are captured exactly once, together with
+  // the runtime contract functions and before the first filesystem or
+  // state side effect. Replacing the control's methods later cannot
+  // influence this coordination.
+  let capturedCurrentSignal: () => "SIGINT" | "SIGTERM" | null;
+  let capturedFreezeSignal: () => "SIGINT" | "SIGTERM" | null;
+  try {
+    capturedCurrentSignal = captureContractFunction(
+      control,
+      "currentSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+    capturedFreezeSignal = captureContractFunction(
+      control,
+      "freezeSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+  } catch {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
+  /**
+   * Synchronous signal checkpoint: throws the internal abort marker when a
+   * signal was accepted. Checkpoints never await; the marker propagates
+   * into the failure policy, which maps it onto the signal reason. No
+   * checkpoint runs between a settled execution and its
+   * `transition_committed` write: a committed transition already belongs
+   * to the engine and must stay durable.
+   */
+  const checkSignal = (): void => {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      throw new CoordinatorSignalAbort(signal);
+    }
+  };
+
+  /**
+   * The single signal cutoff of the coordination. After the durable run
+   * state exists, every completion path freezes signal acceptance exactly
+   * once: the first call wins and its snapshot is reused by every later
+   * decision — including `finalizeFailure`, which never freezes again. A
+   * hostile control whose second `freezeSignal` call would throw or
+   * return a different signal therefore never reaches that second call.
+   */
+  let cutoffTaken = false;
+  let cutoffSignal: "SIGINT" | "SIGTERM" | null = null;
+  const takeCutoff = (): "SIGINT" | "SIGTERM" | null => {
+    if (cutoffTaken) {
+      return cutoffSignal;
+    }
+    cutoffTaken = true;
+    cutoffSignal = capturedFreezeSignal();
+    return cutoffSignal;
+  };
+
+  // The runtime contract functions are captured exactly once, before the
+  // first filesystem or state side effect.
+  let capturedCreateExecutionSession: CapturedCreateExecutionSession;
+  let capturedCreateToolSession: CapturedCreateToolSession;
+  try {
+    capturedCreateExecutionSession = captureCreateExecutionSession(runtime);
+    capturedCreateToolSession = captureCreateToolSession(runtime);
+  } catch {
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
+  // Phase 0a: the run-owned project copy is prepared by the coordinator
+  // from the caller's project source. The source is never modified; the
+  // copy is published atomically as `<runRoot>/project`. A preparation
+  // failure reaches no command and no Session: the run fails with
+  // `run_input_invalid` and no state document, and the staging tree is
+  // removed by the data plane. A signal accepted up to and including the
+  // copy keeps the state document absent; the signal reason wins over the
+  // classified failure (the priority below the session-cleanup failure,
+  // which cannot exist before any Session).
+  try {
+    checkSignal();
+    await prepareRunProject(params.projectSourcePath, runRoot);
+  } catch (cause) {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      return deepFreeze({
+        ok: false as const,
+        reason: signalFailureReason(signal),
+        state: null,
+      });
+    }
+    if (cause instanceof PipelineV2RuntimeError && cause.reason === "run_input_invalid") {
+      return deepFreeze({ ok: false as const, reason: "run_input_invalid" as const, state: null });
+    }
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
+  // Phase 0: the run-input snapshot is created here, by the coordinator;
+  // a caller-provided snapshot is never accepted. An already published
+  // project copy stays in the run root for diagnostics when this or the
+  // state creation below fails. A signal accepted during the snapshot —
+  // or noticed at the post-snapshot checkpoint after it completed — keeps
+  // the state document absent, wins over the classified failure and is
+  // handled inside this region, so no abort marker can escape the
+  // coordinator before `create_run`.
+  let runInputs: RunInputsSnapshot;
+  try {
+    checkSignal();
+    runInputs = await snapshotRunInputs(pipeline, params.inputBindings, runRoot);
+    // Checkpoint after the successful snapshot: the published project
+    // copy and input snapshot stay in the run root; the signal outcome
+    // precedes `create_run`, so no state document exists yet.
+    checkSignal();
+  } catch (cause) {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      return deepFreeze({
+        ok: false as const,
+        reason: signalFailureReason(signal),
+        state: null,
+      });
+    }
+    return deepFreeze({ ok: false as const, reason: classifyCause(cause), state: null });
+  }
+
+  // Phase 1: the durable run state is created from the snapshot the
+  // coordinator itself just received.
+  const runInputStates = runInputs.inputs.map((entry) => ({
+    id: entry.id,
+    type: entry.type,
+    protected: entry.protected,
+    digest: entry.digest,
+  }));
+  try {
+    await sink.dispatch({
+      kind: "create_run",
+      runId,
+      pipeline: pipelineV2RunPipelineIdentity(pipeline),
+      inputs: runInputStates,
+    });
+  } catch (cause) {
+    if (cause instanceof PipelineV2RunStateDurabilityError) {
+      // The rename landed; the visible candidate snapshot is adopted and
+      // the sink is poisoned. The shared memoized cutoff is taken exactly
+      // once before returning, so no signal acceptance stays open after
+      // this completion path — but an accepted signal never masks the
+      // confirmed durability-unknown failure: no durable status was
+      // committed, and the authoritative reason stays
+      // `state_persist_failed`. No further durable dispatch follows.
+      try {
+        takeCutoff();
+      } catch {
+        // A hostile cutoff control cannot change the durable outcome.
+      }
+      return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
+    }
+    // A not-committed failure means no durable state exists at all: the
+    // snapshot stays null and the cutoff is not required here.
+    return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: null });
+  }
+
+  // Fresh and resume meet here: the single internal continuation chain
+  // owns the engine invocation, the transition hook, the failure
+  // finalizer, the terminal publisher and the signal cutoff for both
+  // entrypoints. Fresh enters with the entry state, an empty accepted
+  // history and no expected execution index.
+  return await continuePipelineV2Coordination({
+    pipeline,
+    sink,
+    runRoot,
+    runInputs,
+    acceptedInitial: [],
+    seed: null,
+    expectedNextExecutionIndex: null,
+    recovery: null,
+    readPendingSignal: () => capturedCurrentSignal(),
+    checkSignal,
+    takeCutoff,
+    createExecutionSession: capturedCreateExecutionSession,
+    createToolSession: capturedCreateToolSession,
+    cleanupSessionsByIds: runtime.cleanupSessionsByIds,
+  });
+}
+
+/**
+ * The shared continuation chain of fresh coordination and resume. It owns
+ * exactly one of everything the two entrypoints must not duplicate: the
+ * engine invocation through the single graph loop (`executePipelineV2Graph`
+ * for a fresh run, `executePipelineV2GraphResume` with the restored cursor
+ * for a resumed one), the transition-commit hook, the failure finalizer,
+ * the session cleanups, the terminal phase (record → collect → publish →
+ * final status) and the memoized signal cutoff. A fresh run passes
+ * `seed: null` and starts with an empty accepted history; a resumed run
+ * passes the restored cursor seed, the provenance-restored input snapshot,
+ * the restored accepted-output history and the restored next execution
+ * index, which every execution callback must confirm exactly before it
+ * starts. There is no second coordinator execution loop, no second budget
+ * model and no re-read of any original user source.
+ */
+interface PipelineV2ContinuationSetup {
+  readonly pipeline: ResolvedPipelineV2;
+  readonly sink: PipelineV2CoordinatorStateSink;
+  /** The canonical orchestrator-owned run root (the wait store's boundary). */
+  readonly runRoot: string;
+  /** Fresh: the coordinator-built snapshot; resume: the restored one. */
+  readonly runInputs: RunInputsSnapshot;
+  /** Fresh: empty; resume: the restored accepted-output history. */
+  readonly acceptedInitial: readonly AcceptedStateOutput[];
+  /** Fresh: null (engine starts at the entry state); resume: the restored cursor. */
+  readonly seed: PipelineV2GraphResumeSeed | null;
+  /** Fresh: null; resume: the restored next global execution index. */
+  readonly expectedNextExecutionIndex: number | null;
+  /**
+   * Resume recovery: the classified post-commit crash window whose
+   * missing durable suffix the chain completes before the engine; null
+   * for the fresh and the ordinary resumable paths.
+   */
+  readonly recovery: PipelineV2ExecutableRecovery | null;
+  /**
+   * The non-throwing signal read of the recovery boundary: a pending
+   * SIGINT/SIGTERM before the first recovery effect returns the signal
+   * failure result with zero durable writes.
+   */
+  readonly readPendingSignal: () => "SIGINT" | "SIGTERM" | null;
+  readonly checkSignal: () => void;
+  readonly takeCutoff: () => "SIGINT" | "SIGTERM" | null;
+  readonly createExecutionSession: CapturedCreateExecutionSession;
+  readonly createToolSession: CapturedCreateToolSession;
+  /**
+   * The runtime's durable-session deletion capability (the worker-log
+   * recovery only); captured exactly once with the other runtime members.
+   */
+  readonly cleanupSessionsByIds: PipelineV2AgentRuntime["cleanupSessionsByIds"];
+}
+
+async function continuePipelineV2Coordination(
+  setup: PipelineV2ContinuationSetup,
+): Promise<PipelineV2CoordinationResult> {
+  const { pipeline, sink } = setup;
+  const runRoot = setup.runRoot;
+  const runInputs = setup.runInputs;
+  const checkSignal = setup.checkSignal;
+  const takeCutoff = setup.takeCutoff;
+
+  // --- shared coordination state -----------------------------------------
+
+  let stateAbandoned = false;
+  let finalized = false;
+  let failureReason: PipelineV2FailureReason | undefined;
+  const tracking: ExecutionTracking = { kind: null, unfinished: false, session: null, workerLog: null };
+  const accepted: AcceptedStateOutput[] = [...setup.acceptedInitial];
+
+  /**
+   * The restored next execution index of a resumed run: the first execution
+   * callback must derive exactly this index from the durable snapshot, and
+   * every later callback the previous index plus one. Fresh runs start with
+   * no expectation and establish the chain at their first execution. The
+   * check is a defensive coherence invariant over the shared durable
+   * snapshot — the coordinator never accepts a caller-supplied execution
+   * index.
+   */
+  let nextExpectedExecutionIndex: number | null = setup.expectedNextExecutionIndex;
+  const assertExecutionIndexChain = (index: number): void => {
+    if (nextExpectedExecutionIndex !== null && index !== nextExpectedExecutionIndex) {
+      throw new Error(
+        `the pipeline v2 execution index ${index} does not match the restored next execution index ${nextExpectedExecutionIndex}`,
+      );
+    }
+    nextExpectedExecutionIndex = index + 1;
+  };
+
+  const dispatchState = async (command: PipelineV2RunCommand): Promise<void> => {
+    try {
+      await sink.dispatch(command);
+    } catch (cause) {
+      if (cause instanceof PipelineV2RunStateDurabilityError) {
+        stateAbandoned = true;
+      }
+      throw cause;
+    }
+  };
+
+  const requireSnapshot = (): PipelineV2RunState => {
+    const state = sink.snapshot;
+    if (state === null) {
+      throw new Error("the pipeline v2 run state snapshot disappeared");
+    }
+    return state;
+  };
+
+  const requireLastExecutionIndex = (): number => {
+    const state = requireSnapshot();
+    const last = state.executions[state.executions.length - 1];
+    if (last === undefined) {
+      throw new Error("the pipeline v2 run state records no execution");
+    }
+    return last.index;
+  };
+
+  /**
+   * One outcome-aware durable state write for the failure finalizer: it
+   * distinguishes a committed write, a not-committed write and a
+   * durability-unknown write instead of swallowing the commit outcome.
+   * When the state is already abandoned the command is never dispatched.
+   * A reducer rejection and a store failure are both `not_committed` —
+   * nothing was durably changed.
+   */
+  const dispatchOutcomeAware = async (
+    command: PipelineV2RunCommand,
+  ): Promise<DispatchOutcome> => {
+    if (stateAbandoned) {
+      return { outcome: "not_committed", durabilityUnknown: true };
+    }
+    try {
+      await sink.dispatch(command);
+    } catch (cause) {
+      if (cause instanceof PipelineV2RunStateDurabilityError) {
+        stateAbandoned = true;
+        return { outcome: "not_committed", durabilityUnknown: true };
+      }
+      return { outcome: "not_committed", durabilityUnknown: false };
+    }
+    return { outcome: "committed" };
+  };
+
+  /**
+   * The durable cleanup pair the authoritative record can honestly
+   * claim: a slot whose session was never durably recorded (never
+   * created, or the durable write was not confirmed) is `not_required`
+   * — the record never claims the session existed; a durably recorded
+   * slot is `completed` when its cleanup succeeded and `failed` when it
+   * did not.
+   */
+  const durableCleanupPair = (session: AgentSessionTracking | null): PipelineV2SessionCleanupPair => {
+    if (session === null) {
+      return { execution: "not_required", tool: "not_required" };
+    }
+    const slotOutcome = (slot: SessionSlotTracking, createdDurably: boolean): PipelineV2SessionCleanup =>
+      createdDurably ? (slot.cleanupFailed ? "failed" : "completed") : "not_required";
+    return {
+      execution: slotOutcome(session.execution, session.executionCreatedDurably),
+      tool: slotOutcome(session.tool, session.toolCreatedDurably),
+    };
+  };
+
+  /** At least one durable cleanup slot failed (mirrors the loader). */
+  const durableCleanupFailed = (): boolean => {
+    const pair = durableCleanupPair(tracking.session);
+    return pair.execution === "failed" || pair.tool === "failed";
+  };
+
+  /** The agent_failed command for the still-unfinished agent execution. */
+  const agentFailureCommand = (reason: PipelineV2FailureReason): PipelineV2RunCommand => {
+    const sessionCleanup = durableCleanupPair(tracking.session);
+    // The session cleanup failure reason is used if and only if at least
+    // one durable cleanup outcome failed; a durably failed slot forces
+    // the priority reason, everything else keeps the classified reason.
+    const recordReason = durableCleanupFailed()
+      ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+      : executionReasonFor("agent", reason);
+    return {
+      kind: "agent_failed",
+      reason: recordReason,
+      sessionCleanup,
+      workerLog: tracking.workerLog ?? { status: "unavailable" },
+    };
+  };
+
+  /**
+   * The publish-then-bind composition of one finished agent worker: the
+   * frozen in-memory capture becomes at most one self-describing
+   * run-root artifact, and the verified binding joins the SAME reducer
+   * command that fixes the terminal worker result. The outcome is never
+   * changed by capture or publication problems:
+   *
+   *   - no capture / unavailable / zero bytes → `{status: "unavailable"}`,
+   *     no artifact, no filesystem effect;
+   *   - a publication failure (`io_failure`, `invalid_layout`) or a
+   *     formation error → `{status: "unavailable"}`, the pipeline keeps
+   *     the original worker outcome;
+   *   - a `durability_unknown` outcome keeps the visible candidate: its
+   *     exact canonical bytes are parsed and the binding is rebuilt from
+   *     them (an exact retry confirms the durability);
+   *   - a store `conflict` — an existing artifact with different bytes,
+   *     a substituted object, a wrong mode — is an integrity defect and
+   *     fails closed: the already-published artifact is never masked as
+   *     unavailable. The failure is classified by typed fields only.
+   *
+   * The preflight state check runs before the first filesystem effect.
+   */
+  const recordWorkerLog = async (
+    executionIndex: number,
+    capture: WorkerLogCapture | null,
+  ): Promise<PipelineV2WorkerLogState> => {
+    if (capture === null || capture.status === "unavailable" || capture.byteCount === 0) {
+      return { status: "unavailable" };
+    }
+    // Preflight state checks before the first filesystem effect: the
+    // execution must be the still-unfinished running agent execution with
+    // no binding yet.
+    const snapshot = requireSnapshot();
+    const execution = snapshot.executions[executionIndex - 1];
+    if (
+      execution === undefined ||
+      execution.type !== "agent" ||
+      execution.phase !== "running" ||
+      execution.worker_log !== null
+    ) {
+      throw new Error(
+        "pipeline v2 worker log preflight failed: the execution is not an unfinished running agent execution",
+      );
+    }
+    try {
+      const published = await publishPipelineV2WorkerLog(runRoot, executionIndex, capture);
+      if (published === null) {
+        return { status: "unavailable" };
+      }
+      return published.binding;
+    } catch (cause) {
+      if (cause instanceof PipelineV2WorkerLogStoreError && cause.reason === "conflict") {
+        // An integrity defect of an already-published artifact: never
+        // masked as unavailable, never rewritten. Typed-field classified.
+        throw cause;
+      }
+      if (
+        cause instanceof PipelineV2WorkerLogStoreError &&
+        cause.outcome === "durability_unknown" &&
+        cause.candidate !== undefined
+      ) {
+        // The visible candidate carries the exact canonical bytes: the
+        // binding is rebuilt from them honestly; an exact retry confirms
+        // the durability of the published file.
+        const parsed = parseWorkerLogArtifact(cause.candidate.canonical_json, executionIndex);
+        return {
+          status: parsed.status,
+          sha256: parsed.sha256,
+          byte_count: parsed.byte_count,
+          truncated_daemon: parsed.truncated_daemon,
+          truncated_local: parsed.truncated_local,
+        };
+      }
+      // Every other capture/formation/publication failure is
+      // outcome-neutral: the binding is honestly unavailable and the
+      // original worker outcome stands.
+      return { status: "unavailable" };
+    }
+  };
+
+  /**
+   * Records one failure exactly once, outcome-aware: best-effort cleanup
+   * of every created session (the only allowed side effect after a
+   * failed durable write), the execution-level failure record for a
+   * still-unfinished execution — whose commit must be confirmed before
+   * the execution counts as settled — and the run-level finalize. A
+   * not-committed failure write never clears the tracking, never
+   * triggers a knowingly incompatible run-level write, and reports
+   * `state_persist_failed` on the last authoritative snapshot. Exactly
+   * one bounded `run_failed: state_persist_failed` attempt follows a
+   * not-committed first finalize, only when the reducer still accepts it
+   * from the committed snapshot. No recursive finalization; after a
+   * durability-unknown commit all further writes stop.
+   */
+  const finalizeFailure = async (
+    cause: unknown,
+    reasonOverride?: PipelineV2FailureReason,
+  ): Promise<void> => {
+    if (finalized) {
+      return;
+    }
+    finalized = true;
+    let reason = reasonOverride ?? classifyCause(cause);
+
+    // Best-effort cleanup of every created session, exactly once, tool
+    // first; the first error never blocks the second. The cleanup
+    // outcomes then decide the session-cleanup failure priority.
+    await runSessionCleanups();
+    if (durableCleanupFailed()) {
+      reason = PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON;
+    }
+
+    // The signal cutoff, taken at most once per run: if the terminal
+    // phase already froze acceptance, its snapshot is reused here without
+    // a second `freezeSignal` call. Cleanup has settled; the cutoff
+    // snapshot is read synchronously with no await between reading the
+    // accepted signal and closing acceptance. A durably failed session
+    // cleanup keeps its first-wins priority over a signal; otherwise an
+    // accepted signal becomes the failure reason, outranking the
+    // classified cause. Any signal delivered from here on is late and can
+    // no longer change the recorded failure.
+    const frozenSignal = takeCutoff();
+    if (frozenSignal !== null && reason !== PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON) {
+      reason = signalFailureReason(frozenSignal);
+    }
+    failureReason = reason;
+
+    if (tracking.unfinished && tracking.kind !== null && !stateAbandoned) {
+      const kind = tracking.kind;
+      const outcome = kind === "agent"
+        ? await dispatchOutcomeAware(agentFailureCommand(reason))
+        : await dispatchOutcomeAware({
+            kind: "decision_failed",
+            reason: executionReasonFor("decision", reason),
+          });
+      if (outcome.outcome !== "committed") {
+        // The execution stays unfinished in the authoritative snapshot;
+        // no knowingly incompatible run-level write is attempted.
+        failureReason = "state_persist_failed";
+        return;
+      }
+      tracking.unfinished = false;
+    }
+
+    if (stateAbandoned) {
+      return;
+    }
+
+    // The run-level finalize: never a knowingly incompatible command. A
+    // durably failed session cleanup finalizes with run_cleanup_failed.
+    const cleanupFailedDurably = durableCleanupFailed();
+    if (!cleanupFailedDurably) {
+      const state = sink.snapshot;
+      if (state !== null && !runFailedAdmissible(state, reason)) {
+        failureReason = "state_persist_failed";
+        return;
+      }
+    }
+    const finalizeCommand: RunFinalizeCommand = cleanupFailedDurably
+      ? { kind: "run_cleanup_failed" }
+      : { kind: "run_failed", reason };
+    const finalizeOutcome = await dispatchOutcomeAware(finalizeCommand);
+    if (finalizeOutcome.outcome === "committed") {
+      failureReason =
+        finalizeCommand.kind === "run_cleanup_failed"
+          ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+          : finalizeCommand.reason;
+      return;
+    }
+    if (finalizeOutcome.durabilityUnknown) {
+      // The caller reports state_persist_failed on the adopted candidate.
+      return;
+    }
+    // One bounded attempt at the normalized state failure, only when the
+    // reducer still accepts it from the committed snapshot; no recursive
+    // finalization beyond that.
+    const snapshot = sink.snapshot;
+    if (snapshot !== null && runFailedAdmissible(snapshot, "state_persist_failed")) {
+      await dispatchOutcomeAware({ kind: "run_failed", reason: "state_persist_failed" });
+    }
+    failureReason = "state_persist_failed";
+  };
+
+  /**
+   * The captured cleanups of the current agent execution, run in the
+   * fixed order — the Tool session first (it revokes the worker's
+   * authority), then the Execution session — each exactly once; the
+   * first error never blocks the second.
+   */
+  const runSessionCleanups = async (): Promise<void> => {
+    const session = tracking.session;
+    if (session === null) {
+      return;
+    }
+    const cleanupSlot = async (slot: SessionSlotTracking): Promise<void> => {
+      if (slot.cleanup === null || slot.cleanupDone) {
+        return;
+      }
+      slot.cleanupDone = true;
+      try {
+        await slot.cleanup();
+      } catch {
+        slot.cleanupFailed = true;
+      }
+    };
+    await cleanupSlot(session.tool);
+    await cleanupSlot(session.execution);
+  };
+
+  // --- the single execution flow through the engine -----------------------
+
+  /**
+   * The compiled execution role of one state, resolved only through the
+   * trusted orchestration resolver, plus the durable open iteration a
+   * stage start must name. A stage start requires the open generation's
+   * open iteration and the matching compiled stage template; a planning
+   * or control start requires no open iteration. Every violation refuses
+   * before the start command, so no execution record, no Session and no
+   * worker run is ever created from a mismatched lifecycle.
+   */
+  const resolveExecutionStart = (
+    stateId: string,
+  ): { readonly executionRole: "planning" | "control" | "stage"; readonly iterationIndex?: number } => {
+    const role = compiledExecutionRoleFor(pipeline, stateId);
+    const open = pipelineV2OpenStageIteration(requireSnapshot());
+    if (role.role === "stage") {
+      if (open === null) {
+        throw new PipelineExecutionError(
+          "invalid_graph",
+          `the stage execution for state ${JSON.stringify(stateId)} requires an open stage generation with an open iteration`,
+        );
+      }
+      if (open.template_id !== role.stage_template) {
+        throw new PipelineExecutionError(
+          "invalid_graph",
+          `the stage execution for state ${JSON.stringify(stateId)} belongs to stage template ${JSON.stringify(role.stage_template)}, but the open generation carries template ${JSON.stringify(open.template_id)}`,
+        );
+      }
+      return { executionRole: "stage", iterationIndex: open.iteration_index };
+    }
+    if (open !== null) {
+      throw new PipelineExecutionError(
+        "invalid_graph",
+        `the ${JSON.stringify(role.role)} execution for state ${JSON.stringify(stateId)} cannot start inside the open iteration of generation ${open.generation_index}`,
+      );
+    }
+    return { executionRole: role.role };
+  };
+
+  /**
+   * The exact stage→planning wait-entry boundary of the trusted
+   * `stage_wait` policy, recognized structurally on the authoritative
+   * snapshot — never by message text and never from caller policy. The
+   * destination state must resolve to the exact compiled planning role
+   * carrying the trusted stage-wait policy; the current open generation
+   * (never a historical one) must carry an open iteration the settled
+   * stage execution belongs to; the last committed transition must bind
+   * that execution and lead exactly to the cursor; and no wait may be
+   * open. Every other boundary — the initial planning boundary, a
+   * planning completion without an open iteration, a stage→control or
+   * stage→terminal edge, a failed or in-flight execution, a
+   * settled-but-unbound execution, a malformed or progressed boundary and
+   * an already waiting run — is not recognized, and the ordinary
+   * coordination semantics apply unchanged.
+   */
+  const stageWaitBoundary = (
+    state: PipelineV2RunState,
+  ):
+    | { readonly match: false }
+    | { readonly match: true; readonly open: NonNullable<ReturnType<typeof pipelineV2OpenStageIteration>>; readonly stageWait: CompiledPipelineV2StageWait } => {
+    if (state.status !== "active" || state.phase !== "running") {
+      return { match: false };
+    }
+    if (state.terminal !== undefined || state.failure !== undefined || state.run_outputs !== undefined) {
+      return { match: false };
+    }
+    // An open wait never coexists with the active boundary (the loader's
+    // biconditional); the defensive record check keeps the recognizer
+    // self-contained.
+    const lastWait = state.waits[state.waits.length - 1];
+    if (lastWait !== undefined && lastWait.response === undefined) {
+      return { match: false };
+    }
+    const open = pipelineV2OpenStageIteration(state);
+    if (open === null) {
+      return { match: false };
+    }
+    if (state.executions.length !== state.transitions.length) {
+      return { match: false };
+    }
+    if (state.cursor.transition_count !== state.transitions.length) {
+      return { match: false };
+    }
+    const lastExecution = state.executions[state.executions.length - 1];
+    if (lastExecution === undefined || lastExecution.type !== "agent") {
+      return { match: false };
+    }
+    if (lastExecution.execution_role !== "stage" || lastExecution.phase !== "cleanup_completed") {
+      return { match: false };
+    }
+    if (lastExecution.iteration_index !== open.iteration_index) {
+      return { match: false };
+    }
+    const lastTransition = state.transitions[state.transitions.length - 1];
+    if (lastTransition === undefined) {
+      return { match: false };
+    }
+    if (
+      lastTransition.execution_index !== lastExecution.index ||
+      lastTransition.from !== lastExecution.state_id ||
+      lastTransition.outcome !== "completed" ||
+      lastTransition.to !== state.cursor.current_state
+    ) {
+      return { match: false };
+    }
+    let role: ReturnType<typeof compiledExecutionRoleFor>;
+    try {
+      role = compiledExecutionRoleFor(pipeline, state.cursor.current_state);
+    } catch {
+      return { match: false };
+    }
+    if (role.role !== "planning") {
+      return { match: false };
+    }
+    // A compiled planning role always carries the trusted stage-wait
+    // policy; the defensive check keeps an ungrounded entry impossible.
+    if (role.stage_wait === undefined) {
+      return { match: false };
+    }
+    return { match: true, open, stageWait: role.stage_wait };
+  };
+
+  /**
+   * The wait-entry policy derivation without any caller policy: the
+   * trusted compiled `stage_wait` of the destination planning role
+   * provides the reason and the declared action order verbatim; the
+   * targets are derived from the durable run alone — `continue_stage`
+   * from the open generation's bound stage of the accepted compiled plan
+   * (its template entry state), `revise_task` from the destination
+   * planning state (the cursor). The accepted compiled plan is restored
+   * through the single existing public restore; no plan/task artifact is
+   * read manually, no manifest is parsed and no new compiled-plan cache
+   * or registry exists. Every binding of the open generation (template,
+   * declaration position, plan digest) must match the restored plan
+   * exactly, and an unknown action id — impossible after the trusted
+   * load — fails closed before any publication.
+   */
+  const deriveStageWaitRequest = async (
+    state: PipelineV2RunState,
+    open: NonNullable<ReturnType<typeof pipelineV2OpenStageIteration>>,
+    stageWait: CompiledPipelineV2StageWait,
+  ): Promise<{ readonly reason: string; readonly actions: readonly PipelineV2WaitManifestAction[] }> => {
+    const restored = await restorePipelineV2AcceptedRunPlan({ pipeline, runRoot, state });
+    const compiledPlan = restored.compiled_plan;
+    const violation = (detail: string): Error =>
+      new Error(`pipeline v2 stage-wait entry invariant violated: ${detail}`);
+    const generation = state.generations[open.generation_index - 1];
+    if (generation === undefined || generation.index !== open.generation_index) {
+      throw violation("the open generation is not the durable generation record");
+    }
+    if (generation.plan_sha256 !== compiledPlan.plan_sha256) {
+      throw violation("the open generation does not belong to the accepted plan revision");
+    }
+    const stageIndex = compiledPlan.stages.findIndex((stage) => stage.id === open.stage_id);
+    const stage = stageIndex >= 0 ? compiledPlan.stages[stageIndex] : undefined;
+    if (stageIndex < 0 || stage === undefined) {
+      throw violation("the open generation's stage is not part of the accepted plan revision");
+    }
+    if (stage.template !== open.template_id) {
+      throw violation("the open generation's stage template does not match the accepted plan");
+    }
+    if (stageIndex + 1 !== generation.stage_position) {
+      throw violation("the open generation's stage position does not match the accepted plan");
+    }
+    const actions: PipelineV2WaitManifestAction[] = [];
+    for (const actionId of stageWait.actions) {
+      if (actionId === "continue_stage") {
+        actions.push({ id: actionId, to: stage.entry_state });
+      } else if (actionId === "revise_task") {
+        actions.push({ id: actionId, to: state.cursor.current_state });
+      } else {
+        throw violation("the compiled stage-wait policy declares an unknown action id");
+      }
+    }
+    return { reason: stageWait.reason, actions };
+  };
+
+  /**
+   * The documented result shape of a successful `enterPipelineV2Wait`;
+   * verified defensively before the authoritative snapshot is returned —
+   * no false identity claim is ever made about the controller's own
+   * result object.
+   */
+  const verifyEnteredWaitResult = (entered: unknown): void => {
+    if (typeof entered !== "object" || entered === null || Array.isArray(entered)) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result is not a record");
+    }
+    const keys = Object.keys(entered);
+    if (
+      keys.length !== 3 ||
+      !keys.includes("wait_index") ||
+      !keys.includes("request_sha256") ||
+      !keys.includes("state")
+    ) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries foreign fields");
+    }
+    const record = entered as Record<string, unknown>;
+    const waitIndex = record.wait_index;
+    if (typeof waitIndex !== "number" || !Number.isSafeInteger(waitIndex) || waitIndex < 1) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries no valid wait index");
+    }
+    const digest = record.request_sha256;
+    if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries no valid request digest");
+    }
+    if (typeof record.state !== "object" || record.state === null || Array.isArray(record.state)) {
+      throw new Error("pipeline v2 stage-wait entry invariant violated: the wait entry result carries no durable state");
+    }
+  };
+
+  /**
+   * The one wait-entry attempt of both the live and the restart path: the
+   * exact boundary recognizer, the policy derivation and the single
+   * public `enterPipelineV2Wait`. The function never throws — the
+   * controlled suspension and every wait-entry failure are returned as
+   * typed outcomes; the caller maps them onto the private suspension
+   * marker or the failure result without any durable `run_failed`.
+   */
+  const attemptStageWaitEntry = async (): Promise<
+    | { readonly outcome: "not-boundary" }
+    | { readonly outcome: "suspended" }
+    | { readonly outcome: "failed"; readonly cause: unknown; readonly state: PipelineV2RunState | null }
+  > => {
+    try {
+      const state = sink.snapshot;
+      if (state === null) {
+        return { outcome: "not-boundary" };
+      }
+      const boundary = stageWaitBoundary(state);
+      if (!boundary.match) {
+        return { outcome: "not-boundary" };
+      }
+      const derived = await deriveStageWaitRequest(state, boundary.open, boundary.stageWait);
+      const entered = await enterPipelineV2Wait({
+        runRoot,
+        sink,
+        reason: derived.reason,
+        actions: derived.actions,
+      });
+      verifyEnteredWaitResult(entered);
+      return { outcome: "suspended" };
+    } catch (cause) {
+      // The sink is never re-read after it poisoned itself: a wait
+      // controller persistence error already carries the authoritative
+      // (adopted) snapshot; every other cause reads the sink's current
+      // snapshot exactly once here.
+      const failureState =
+        cause instanceof PipelineV2WaitControllerError ? cause.state : sink.snapshot;
+      return { outcome: "failed", cause, state: failureState };
+    }
+  };
+
+  /**
+   * The exact own-key shape and bindings of a successful
+   * `restorePipelineV2PlanningAcceptanceContext`, verified defensively
+   * before the plan-ready suspension: a malformed or hostile restore
+   * result never produces a suspension and never escapes as a native
+   * `TypeError`. `restored.state` is the validator's normalized copy, so
+   * the correspondence to the authoritative snapshot is structural (a
+   * local recursive own-key comparator, never serialization).
+   */
+  const verifyRestoredPlanningContext = (
+    restored: unknown,
+    authoritative: PipelineV2RunState,
+    stateId: string,
+    planOutput: string,
+  ): void => {
+    const violation = (detail: string): Error =>
+      new Error(`pipeline v2 plan-ready verification invariant violated: ${detail}`);
+    if (typeof restored !== "object" || restored === null || Array.isArray(restored)) {
+      throw violation("the planning acceptance context is not a record");
+    }
+    const keys = Object.keys(restored).sort();
+    if (
+      keys.length !== 5 ||
+      keys[0] !== "accepted_outputs" ||
+      keys[1] !== "cursor" ||
+      keys[2] !== "planning_execution_index" ||
+      keys[3] !== "run_inputs" ||
+      keys[4] !== "state"
+    ) {
+      throw violation("the planning acceptance context carries foreign or missing fields");
+    }
+    const record = restored as Record<string, unknown>;
+    const structurallyEqual = (left: unknown, right: unknown): boolean => {
+      if (left === right) {
+        return true;
+      }
+      if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
+        return false;
+      }
+      if (Array.isArray(left) !== Array.isArray(right)) {
+        return false;
+      }
+      const leftKeys = Object.keys(left as Record<string, unknown>);
+      const rightKeys = Object.keys(right as Record<string, unknown>);
+      if (leftKeys.length !== rightKeys.length) {
+        return false;
+      }
+      for (const key of leftKeys) {
+        if (!Object.prototype.hasOwnProperty.call(right, key)) {
+          return false;
+        }
+        if (!structurallyEqual((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key])) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!structurallyEqual(record.state, authoritative)) {
+      throw violation("the restored state does not structurally match the authoritative snapshot");
+    }
+    if (
+      typeof record.planning_execution_index !== "number" ||
+      !Number.isSafeInteger(record.planning_execution_index) ||
+      record.planning_execution_index !== authoritative.executions.length
+    ) {
+      throw violation("the restored planning execution index does not name the last execution");
+    }
+    if (
+      typeof record.cursor !== "object" ||
+      record.cursor === null ||
+      Array.isArray(record.cursor) ||
+      (record.cursor as Record<string, unknown>).current_state !== authoritative.cursor.current_state ||
+      (record.cursor as Record<string, unknown>).transition_count !== authoritative.cursor.transition_count
+    ) {
+      throw violation("the restored cursor does not match the authoritative cursor");
+    }
+    if (!Array.isArray(record.accepted_outputs)) {
+      throw violation("the restored accepted history is not a list");
+    }
+    const acceptedRecord = (record.accepted_outputs as readonly unknown[]).find(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        !Array.isArray(entry) &&
+        (entry as Record<string, unknown>)["state"] === stateId &&
+        (entry as Record<string, unknown>)["output"] === planOutput &&
+        (entry as Record<string, unknown>)["activation_index"] === record.planning_execution_index,
+    );
+    if (acceptedRecord === undefined) {
+      throw violation("the restored accepted history does not carry the planning execution's accepted output");
+    }
+    if (typeof record.run_inputs !== "object" || record.run_inputs === null || Array.isArray(record.run_inputs)) {
+      throw violation("the restored run-input snapshot is not a record");
+    }
+  };
+
+  /**
+   * The plan-ready suspension seam of a fully successful planning
+   * execution: after the durable `agent_cleanup_completed` the coordinator
+   * stops before the engine can apply the transition, when the planning
+   * state's declared `completed` transition targets a stage state — the
+   * exact shape whose stage start would otherwise fail `invalid_graph`
+   * because the plan has not been accepted yet. The boundary is verified
+   * through the single existing public
+   * `restorePipelineV2PlanningAcceptanceContext` before the suspension.
+   *
+   * Planning transitions into control or terminal states are not affected:
+   * those flows never need the accepted plan, so they keep committing
+   * their transition and continue exactly as before (control and stage
+   * executions are untouched by this seam). A failed planning execution
+   * never reaches this seam; a verification failure propagates through
+   * the existing failure-finalization chain (no transition, the existing
+   * typed reason mapping). No plan output is read and no
+   * proposal/acceptance machinery runs here — the plan acceptance belongs
+   * to the existing `resume-plan` controller.
+   */
+  const maybePlanReadySuspension = async (stateId: string): Promise<void> => {
+    const role = compiledExecutionRoleFor(pipeline, stateId);
+    if (role.role !== "planning") {
+      return;
+    }
+    const edge = compiledTransitionFor(pipeline, stateId, "completed");
+    // The target's compiled role read from the trusted resolved snapshot:
+    // terminal states carry no role entry, so the lookup stays terminal-safe.
+    const targetRole = pipeline.orchestration?.execution_roles.find(
+      (entry) => entry.state_id === edge.to,
+    )?.role;
+    if (targetRole !== "stage") {
+      return;
+    }
+    // The plan-ready signal checkpoint: a signal accepted up to this point
+    // wins with the previous 130/143 outcome and no transition is recorded.
+    checkSignal();
+    const state = requireSnapshot();
+    if (state.status !== "active" || state.phase !== "running") {
+      return;
+    }
+    if (state.terminal !== undefined || state.failure !== undefined || state.run_outputs !== undefined) {
+      return;
+    }
+    const lastWait = state.waits[state.waits.length - 1];
+    if (lastWait !== undefined && lastWait.response === undefined) {
+      return;
+    }
+    if (state.executions.length !== state.transitions.length + 1) {
+      return;
+    }
+    const last = state.executions[state.executions.length - 1];
+    if (
+      last === undefined ||
+      last.type !== "agent" ||
+      last.execution_role !== "planning" ||
+      last.iteration_index !== undefined ||
+      last.state_id !== stateId ||
+      last.state_id !== state.cursor.current_state
+    ) {
+      return;
+    }
+    const restored = await restorePipelineV2PlanningAcceptanceContext(pipeline, state, runRoot);
+    verifyRestoredPlanningContext(restored, state, stateId, role.plan_output);
+    throw new CoordinatorSuspension("plan_ready");
+  };
+
+  /**
+   * The single terminal-lifecycle owner of the whole coordination: the
+   * `terminal_reached` record, the run-output publication, the single
+   * signal cutoff and the final run-status command. The live engine
+   * result and the recovery suffix of a resumed run both finalize the
+   * terminal exclusively through this function — there is no second
+   * terminal publication owner and no second final-status writer.
+   *
+   * `recordTerminal` records `terminal_reached` (the live path and the
+   * recovery window whose cursor reached the terminal without the
+   * record); `publication` selects the run-output publication:
+   * `fresh` publishes into the absent fixed target (the live contract),
+   * `adopt-or-fresh` publishes into the absent target and adopts an
+   * already published tree only when it is byte-exactly the expected
+   * publication (the recovery path), and `skip` trusts the durable
+   * `run_outputs_published` record (the recovery path past it).
+   */
+  const runTerminalPhase = async (
+    terminal: { readonly stateId: string; readonly result: "success" | "failed" },
+    options: {
+      readonly recordTerminal: boolean;
+      readonly publication: "fresh" | "adopt-or-fresh" | "skip";
+    },
+  ): Promise<PipelineV2CoordinationResult> => {
+    if (options.recordTerminal) {
+      // 1. terminal_reached
+      await dispatchState({
+        kind: "terminal_reached",
+        terminalStateId: terminal.stateId,
+        terminalResult: terminal.result,
+      });
+    }
+
+    // 2./3. collect and publish the run outputs (both terminal results)
+    if (options.publication !== "skip") {
+      const runOutputs = options.publication === "fresh"
+        ? await collectRunOutputs(pipeline, runInputs, accepted)
+        : await collectOrAdoptRunOutputs(pipeline, runInputs, accepted);
+      await dispatchState({
+        kind: "run_outputs_published",
+        outputs: runOutputs.outputs.map(toRunOutputState),
+      });
+    }
+
+    // The single signal cutoff of the run, taken once here — synchronously
+    // before the final run-status write — and reused by every remaining
+    // decision. A signal accepted while the terminal outputs were
+    // collected finalizes the run as a signal failure; the already
+    // atomically published outputs are not rolled back. A signal
+    // delivered from here on — including while the final write is in
+    // flight — is late and can no longer change the recorded outcome. For
+    // a failed terminal the outcome is already determined: the reducer
+    // finalizes a failed terminal with published run outputs with the
+    // terminal failure reason only, so a frozen signal cannot rewrite it.
+    const cutoff = takeCutoff();
+    if (cutoff !== null && terminal.result === "success") {
+      await finalizeFailure(new CoordinatorSignalAbort(cutoff));
+      if (stateAbandoned) {
+        return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
+      }
+      const reason = failureReason ?? signalFailureReason(cutoff);
+      return deepFreeze({ ok: false as const, reason, state: sink.snapshot });
+    }
+
+    // 4./5. finalize the run status. `ok: true` is reserved for a
+    // confirmed `run_succeeded` commit; a failed terminal still publishes
+    // its outputs and returns the durable failed state with the terminal
+    // failure reason — never a second finalize after the committed write.
+    if (terminal.result === "success") {
+      await dispatchState({ kind: "run_succeeded" });
+      const state = requireSnapshot();
+      return deepFreeze({ ok: true as const, state });
+    }
+    await dispatchState({ kind: "run_failed", reason: PIPELINE_V2_TERMINAL_FAILURE_REASON });
+    const state = requireSnapshot();
+    return deepFreeze({
+      ok: false as const,
+      reason: PIPELINE_V2_TERMINAL_FAILURE_REASON,
+      state,
+    });
+  };
+
+  /**
+   * The worker-log recovery suffixes (schema v9): both windows belong to
+   * an agent execution whose worker already ran in a previous process and
+   * is never re-run.
+   *
+   *   - `agent-in-flight` (phase `running`): the published artifact is
+   *     adopted when one exists (C5) and becomes the honest binding;
+     *     with no artifact the binding is `unavailable` (C2/C3/C4). A
+   *     damaged or foreign artifact is an integrity defect and fails
+   *     closed before any dispatch — it is never masked as unavailable.
+   *     Both durable sessions are deleted by id (Tool first), the
+   *     execution fails with `agent_failed` carrying the binding, and
+   *     the run finalizes with the existing failure semantics.
+   *   - `worker-settled` (phase `outputs_accepted`): the acceptance is
+   *     durable, so only the session cleanup and the transition are
+   *     missing; the binding and the outputs are never touched (C6/C7).
+   *     A failed session delete records the session cleanup failure and
+   *     finalizes the run with `run_cleanup_failed`.
+   *
+   * The recovery runtime must be able to delete sessions by id; a
+   * runtime without that capability never silently claims a cleanup.
+   */
+  const runWorkerLogRecovery = async (
+    recovery: Extract<PipelineV2ExecutableRecovery, { kind: "worker-settled" | "agent-in-flight" }>,
+  ): Promise<PipelineV2CoordinationResult | null> => {
+    const cleanupSessionsByIds = setup.cleanupSessionsByIds;
+    if (typeof cleanupSessionsByIds !== "function") {
+      throw new Error(
+        "pipeline v2 worker log recovery requires a runtime that can delete sessions by durable id",
+      );
+    }
+    if (recovery.kind === "agent-in-flight") {
+      // 1. Adopt the published artifact when one exists; integrity
+      //    conflicts fail closed before any dispatch.
+      let workerLog: PipelineV2WorkerLogState;
+      try {
+        const parsed = await loadPipelineV2WorkerLog(runRoot, recovery.executionIndex);
+        workerLog =
+          parsed === null
+            ? { status: "unavailable" }
+            : {
+                status: parsed.status,
+                sha256: parsed.sha256,
+                byte_count: parsed.byte_count,
+                truncated_daemon: parsed.truncated_daemon,
+                truncated_local: parsed.truncated_local,
+              };
+      } catch (cause) {
+        if (
+          (cause instanceof PipelineV2WorkerLogStoreError && cause.reason === "conflict") ||
+          cause instanceof PipelineV2WorkerLogArtifactError
+        ) {
+          // A damaged or foreign published artifact is an integrity
+          // defect: never masked as unavailable, never rewritten. (The
+          // restore's zero-write verification normally refuses before
+          // this point; this is defense-in-depth for the racing case.)
+          throw cause;
+        }
+        // A read failure of an absent-or-unreadable artifact is
+        // outcome-neutral here: the honest binding is unavailable.
+        workerLog = { status: "unavailable" };
+      }
+      // 2. Delete both durable sessions (Tool first inside).
+      const cleanup = await cleanupSessionsByIds(
+        recovery.executionSessionId,
+        recovery.toolSessionId,
+      );
+      const cleanupFailed = cleanup.execution === "failed" || cleanup.tool === "failed";
+      // 3. The execution failure carries the binding atomically.
+      const failed = await dispatchOutcomeAware({
+        kind: "agent_failed",
+        reason: cleanupFailed
+          ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+          : ("worker_failed" as const),
+        sessionCleanup: cleanup,
+        workerLog,
+      });
+      if (failed.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      // 4. The run finalizes with the existing failure semantics.
+      const finalized = await dispatchOutcomeAware(
+        cleanupFailed
+          ? ({ kind: "run_cleanup_failed" } as const)
+          : ({ kind: "run_failed", reason: "worker_failed" } as const),
+      );
+      if (finalized.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      return deepFreeze({
+        ok: false as const,
+        reason: cleanupFailed ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON : ("worker_failed" as const),
+        state: requireSnapshot(),
+      });
+    }
+    // worker-settled: the acceptance is durable; cleanup + transition.
+    // The durable binding is immutable: a post-acceptance failure carries
+    // exactly the already-bound record.
+    const current = requireSnapshot();
+    const settledExecution = current.executions[recovery.executionIndex - 1];
+    const durableBinding =
+      settledExecution !== undefined && settledExecution.type === "agent"
+        ? settledExecution.worker_log
+        : null;
+    if (durableBinding === null) {
+      throw new Error(
+        "pipeline v2 worker log recovery requires the settled execution's durable worker log binding",
+      );
+    }
+    const cleanup = await cleanupSessionsByIds(
+      recovery.executionSessionId,
+      recovery.toolSessionId,
+    );
+    const cleanupFailed = cleanup.execution === "failed" || cleanup.tool === "failed";
+    if (cleanupFailed) {
+      const failed = await dispatchOutcomeAware({
+        kind: "agent_failed",
+        reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
+        sessionCleanup: cleanup,
+        workerLog: durableBinding,
+      });
+      if (failed.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      const finalized = await dispatchOutcomeAware({ kind: "run_cleanup_failed" });
+      if (finalized.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      return deepFreeze({
+        ok: false as const,
+        reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
+        state: requireSnapshot(),
+      });
+    }
+    const cleaned = await dispatchOutcomeAware({ kind: "agent_cleanup_completed" });
+    if (cleaned.outcome !== "committed") {
+      return deepFreeze({
+        ok: false as const,
+        reason: "state_persist_failed" as const,
+        state: sink.snapshot,
+      });
+    }
+    // The stage agent's fixed lifecycle outcome: the same shared kernel
+    // the live engine hook uses, including the post-commit signal
+    // checkpoint and the trusted stage-wait attempt.
+    let step: TransitionStep;
+    try {
+      step = compiledTransitionFor(pipeline, recovery.stateId, "completed");
+    } catch (cause) {
+      if (cause instanceof PipelineExecutionError) {
+        throw cause;
+      }
+      throw cause;
+    }
+    const applied = await applyTransitionCommit(step, recovery.executionIndex);
+    if (applied.outcome === "suspended-waiting") {
+      return deepFreeze({ ok: false as const, waiting: true as const, state: requireSnapshot() });
+    }
+    if (applied.outcome === "wait-entry-failed") {
+      return deepFreeze({
+        ok: false as const,
+        reason: waitEntryFailureReason(applied.cause),
+        state: applied.state ?? sink.snapshot,
+      });
+    }
+    // The transition is durably committed; the engine continues from the
+    // authoritative post-suffix cursor (the restored seed predates it).
+    const after = requireSnapshot();
+    postSuffixSeed = deepFreeze({
+      current_state: after.cursor.current_state,
+      transition_count: after.cursor.transition_count,
+    });
+    return null;
+  };
+
+  /**
+   * The exact recovery-suffix execution of one classified post-commit
+   * crash window, run inside the single continuation chain so every
+   * durable write, signal checkpoint, wait entry, finalization and
+   * terminal publication is the SAME implementation the live
+   * coordination uses — there is no second recovery owner.
+   *
+   * The recovery block runs strictly before the engine invocation and
+   * strictly before the pre-engine signal checkpoint. Its own first
+   * action is the recovery signal boundary: a pending SIGINT/SIGTERM
+   * before the first recovery effect returns the existing signal failure
+   * result with zero durable writes (the run stays retryable; the
+   * recorded signal never creates a Session and never dispatches).
+   *
+   *   - `run-finalization` dispatches exactly one run-level finalization
+   *     command carrying the durable failure reason (outcome-aware: a
+   *     not-committed or durability-unknown write reports the existing
+   *     `state_persist_failed` semantics on the authoritative snapshot).
+   *   - `terminal` runs the single terminal phase with the recovery
+   *     flags (record the missing `terminal_reached`, publish-or-adopt
+   *     the missing outputs, or trust the durable outputs record) and
+   *     returns its existing result shape.
+   *   - `transition` applies the exactly one missing `transition_committed`
+   *     through the shared kernel (including the post-commit signal
+   *     checkpoint and the trusted stage-wait attempt) and falls through
+   *     to the engine, which continues from the post-suffix cursor.
+   */
+  // A worker-settled recovery suffix commits its own transition, so the
+  // engine must continue from the authoritative post-suffix cursor — the
+  // restored seed predates the suffix. The worker-settled tail writes this
+  // holder from the authoritative snapshot after the commit; every other
+  // window leaves it null (the transition window's seed is precomputed).
+  let postSuffixSeed: PipelineV2GraphResumeSeed | null = null;
+  const runRecoverySuffix = async (
+    recovery: PipelineV2ExecutableRecovery,
+  ): Promise<PipelineV2CoordinationResult | null> => {
+    // The recovery signal boundary: a pending signal before the first
+    // recovery effect is 130/143 with zero durable writes.
+    const pending = setup.readPendingSignal();
+    if (pending !== null) {
+      return deepFreeze({
+        ok: false as const,
+        reason: signalFailureReason(pending),
+        state: requireSnapshot(),
+      });
+    }
+    if (recovery.kind === "run-finalization") {
+      const outcome = await dispatchOutcomeAware(recovery.command);
+      if (outcome.outcome !== "committed") {
+        // Nothing was durably changed (or the adopted candidate is the
+        // visible snapshot after a durability-unknown write): the
+        // existing persistence-failure semantics on the authoritative
+        // snapshot, no further dispatch.
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      const state = requireSnapshot();
+      return deepFreeze({
+        ok: false as const,
+        reason:
+          recovery.command.kind === "run_cleanup_failed"
+            ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+            : recovery.command.reason,
+        state,
+      });
+    }
+    if (recovery.kind === "worker-settled" || recovery.kind === "agent-in-flight") {
+      return await runWorkerLogRecovery(recovery);
+    }
+    if (recovery.kind === "terminal") {
+      return await runTerminalPhase(
+        { stateId: recovery.terminalStateId, result: recovery.terminalResult },
+        {
+          recordTerminal: !recovery.terminalRecorded,
+          publication: recovery.outputsRecorded ? "skip" : "adopt-or-fresh",
+        },
+      );
+    }
+    const applied = await applyTransitionCommit(recovery.step, recovery.executionIndex);
+    if (applied.outcome === "suspended-waiting") {
+      // The recovered stage→planning transition durably entered the
+      // trusted stage wait: the ordinary waiting result.
+      return deepFreeze({ ok: false as const, waiting: true as const, state: requireSnapshot() });
+    }
+    if (applied.outcome === "wait-entry-failed") {
+      // The same no-run_failed retryability as the live restart path: the
+      // active boundary stays retryable for a fresh resume.
+      return deepFreeze({
+        ok: false as const,
+        reason: waitEntryFailureReason(applied.cause),
+        state: applied.state ?? sink.snapshot,
+      });
+    }
+    // The transition is durably committed; the engine continues from the
+    // post-suffix cursor the coordinator passed as the seed.
+    return null;
+  };
+
+  const executors: PipelineV2GraphExecutors = {
+    executeAgent: async (view: V2AgentExecutionView): Promise<void> => {
+      // Execution-start checkpoint: a signal accepted between states stops
+      // here, before any new execution record or Session; the previous
+      // transition is already durable and stays.
+      checkSignal();
+      tracking.kind = "agent";
+      tracking.unfinished = false;
+      tracking.workerLog = null;
+      const sessionTracking: AgentSessionTracking = {
+        execution: { cleanup: null, cleanupDone: false, cleanupFailed: false },
+        tool: { cleanup: null, cleanupDone: false, cleanupFailed: false },
+        executionCreatedDurably: false,
+        toolCreatedDurably: false,
+      };
+      tracking.session = sessionTracking;
+
+      // 1. start_agent_execution with the exact compiled execution role
+      //    (and, for a stage execution, exactly the open iteration)
+      const start = resolveExecutionStart(view.id);
+      await dispatchState({
+        kind: "start_agent_execution",
+        stateId: view.id,
+        profile: view.profile,
+        executionRole: start.executionRole,
+        ...(start.iterationIndex !== undefined ? { iterationIndex: start.iterationIndex } : {}),
+      });
+      tracking.unfinished = true;
+
+      // 2. the committed execution index comes from the durable snapshot —
+      //    for a resumed run it must be exactly the restored next execution
+      //    index (the first callback) or the previous index plus one
+      const executionIndex = requireLastExecutionIndex();
+      assertExecutionIndexChain(executionIndex);
+
+      // 3. prepare the activation data through the existing data plane
+      //    (it re-verifies the protected inputs and the accepted outputs)
+      const activation = await prepareActivationData(pipeline, runInputs, accepted, view.id, executionIndex);
+
+      // 4. agent_data_prepared
+      await dispatchState({ kind: "agent_data_prepared" });
+
+      // 5. runtime.createExecutionSession (captured once at coordination
+      //    start). The session contract is captured exactly once, right
+      //    after the Session is created, in a fixed order: the cleanup
+      //    first — when a later member violates the contract, the
+      //    already-captured cleanup is still runnable exactly once — then
+      //    the session id, then the run entry point. All captures happen
+      //    before the durable write, so a durably recorded session always
+      //    has a captured cleanup. Reassigning any member afterwards
+      //    cannot change the dispatch. The signal checkpoint sits
+      //    synchronously before the create call: a signal accepted up to
+      //    this point never creates a Session.
+      checkSignal();
+      const executionSession = await setup.createExecutionSession(view, activation);
+      let executionCleanup: () => Promise<void>;
+      try {
+        executionCleanup = captureSessionFunction(executionSession, "cleanup") as () => Promise<void>;
+      } catch {
+        // A missing or non-callable cleanup is a trusted runtime contract
+        // violation: nothing runnable exists, so the coordinator must not
+        // claim a confirmed cleanup.
+        sessionTracking.execution.cleanupDone = true;
+        throw new Error(
+          "pipeline v2 agent session contract violated: cleanup must be a function",
+        );
+      }
+      sessionTracking.execution.cleanup = executionCleanup;
+      const executionSessionId = captureSessionId(executionSession);
+      const capturedRunAgent = captureSessionFunction(executionSession, "runAgent") as (
+        toolSession: PipelineV2ToolSession,
+      ) => Promise<unknown>;
+
+      // 6. agent_execution_session_created — recorded immediately
+      await dispatchState({
+        kind: "agent_execution_session_created",
+        sessionId: executionSessionId,
+      });
+      sessionTracking.executionCreatedDurably = true;
+
+      // 7. runtime.createToolSession — the worker's authority is created
+      //    only after the Execution Session is durably recorded. The
+      //    signal checkpoint sits synchronously before the create call.
+      checkSignal();
+      const toolSession = await setup.createToolSession(view, activation);
+      let toolCleanup: () => Promise<void>;
+      try {
+        toolCleanup = captureSessionFunction(toolSession, "cleanup") as () => Promise<void>;
+      } catch {
+        sessionTracking.tool.cleanupDone = true;
+        throw new Error(
+          "pipeline v2 agent session contract violated: cleanup must be a function",
+        );
+      }
+      sessionTracking.tool.cleanup = toolCleanup;
+      const toolSessionId = captureSessionId(toolSession);
+
+      // 8. agent_tool_session_created — recorded immediately
+      await dispatchState({
+        kind: "agent_tool_session_created",
+        sessionId: toolSessionId,
+      });
+      sessionTracking.toolCreatedDurably = true;
+
+      // 9. agent_running — both sessions are durably recorded
+      await dispatchState({ kind: "agent_running" });
+
+      // 10. executionSession.runAgent(toolSession) — only the lifecycle
+      //     result crosses the boundary. The signal checkpoint sits
+      //     synchronously before the call with no await in between: a
+      //     signal accepted up to this point never starts the worker.
+      checkSignal();
+      const outcome = await capturedRunAgent(toolSession);
+      const parsed = parseWorkerRunResult(outcome);
+      if (parsed === undefined) {
+        throw new Error(
+          "pipeline v2 agent session contract violated: runAgent must return a completed or a typed failed result",
+        );
+      }
+      // 10b. publish-then-bind: the frozen in-memory capture becomes at
+      //      most one run-root artifact and the verified binding joins
+      //      the SAME command that fixes the terminal worker result
+      //      (below). Capture and publication problems never change the
+      //      worker outcome; an integrity conflict fails closed.
+      tracking.workerLog = null;
+      const workerCapture = readWorkerCaptureSafely(outcome);
+      const workerLog = await recordWorkerLog(executionIndex, workerCapture);
+      tracking.workerLog = workerLog;
+      if (parsed.status === "failed") {
+        // Both sessions are cleaned exactly once, tool first; the
+        // failure is recorded durably and the engine stops before any
+        // transition.
+        await runSessionCleanups();
+        await finalizeFailure(undefined, parsed.reason);
+        throw new CoordinationAbortedError();
+      }
+
+      // 11. accept the activation outputs (the worker held them read-write)
+      const records = await acceptActivationOutputs(pipeline, activation);
+
+      // 12. agent_outputs_accepted — the terminal worker result and the
+      //     worker-log binding are fixed by this one atomic commit
+      await dispatchState({
+        kind: "agent_outputs_accepted",
+        outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+        workerLog,
+      });
+
+      // 13./14. cleanup the Tool session, then the Execution session,
+      // each exactly once; the first error never blocks the second.
+      await runSessionCleanups();
+
+      // A durably failed cleanup becomes the agent failure; the run
+      // finalizes with run_cleanup_failed and no transition is recorded.
+      if (durableCleanupFailed()) {
+        await finalizeFailure(undefined);
+        throw new CoordinationAbortedError();
+      }
+
+      // 15. agent_cleanup_completed — both sessions were confirmed
+      //     cleaned
+      await dispatchState({ kind: "agent_cleanup_completed" });
+      tracking.unfinished = false;
+
+      // 15b. the plan-ready suspension seam: a fully successful planning
+      //      execution stops here — no transition is committed, no plan is
+      //      accepted; the operator applies `resume-plan` next. Non-
+      //      planning executions pass through untouched.
+      await maybePlanReadySuspension(view.id);
+
+      // 16. the accepted records join the runner-owned history
+      accepted.push(...records);
+
+      // 17. return void: the engine applies its own fixed completed outcome
+    },
+
+    executeDecision: async (view: V2DecisionExecutionView): Promise<string> => {
+      // Execution-start checkpoint: a signal accepted between states stops
+      // here, before any new execution record; the previous transition is
+      // already durable and stays.
+      checkSignal();
+      tracking.kind = "decision";
+      tracking.unfinished = false;
+      tracking.session = null;
+      tracking.workerLog = null;
+
+      // 1. the next global execution index — for a resumed run exactly the
+      //    restored next execution index (the first callback), afterwards
+      //    the previous index plus one
+      const executionIndex = requireSnapshot().executions.length + 1;
+      assertExecutionIndexChain(executionIndex);
+
+      // 2. prepare the decision data (the input is read exactly once)
+      const prepared = await prepareDecisionStateData(pipeline, runInputs, accepted, view.id, executionIndex);
+
+      // 3. start_decision_execution with the prepared input digest and
+      //    the exact compiled execution role
+      const start = resolveExecutionStart(view.id);
+      await dispatchState({
+        kind: "start_decision_execution",
+        stateId: view.id,
+        inputDigest: prepared.input_digest,
+        executionRole: start.executionRole,
+        ...(start.iterationIndex !== undefined ? { iterationIndex: start.iterationIndex } : {}),
+      });
+      tracking.unfinished = true;
+
+      // 4. evaluate the prepared decision state (no second read). The
+      //    signal checkpoint sits synchronously before the evaluation.
+      checkSignal();
+      const result = evaluatePreparedDecisionState(pipeline, prepared);
+
+      // 5. decision_evaluated with the content-free record form
+      await dispatchState({ kind: "decision_evaluated", result: toDecisionRecord(result) });
+      tracking.unfinished = false;
+
+      // 6. only the outcome is returned to the engine; the transition
+      //    table owns the routing
+      return result.outcome;
+    },
+  };
+
+  /**
+   * The single transition-application kernel of the whole coordination:
+   * one `transition_committed` dispatch with the settled execution's
+   * index, followed by the shared post-commit sequence (the signal
+   * checkpoint and the trusted stage-wait boundary attempt). The live
+   * engine hook and the recovery suffix of a resumed run both apply
+   * their transitions exclusively through this kernel — there is no
+   * second transition writer and no second post-commit policy. The
+   * outcome is a discriminated result instead of an exception so the
+   * recovery path can return the controlled waiting suspension directly;
+   * the live hook converts the suspension into the established
+   * `CoordinatorSuspension` unwinding.
+   */
+  const applyTransitionCommit = async (
+    step: TransitionStep,
+    executionIndex: number,
+  ): Promise<
+    | { readonly outcome: "committed" }
+    | { readonly outcome: "suspended-waiting" }
+    | { readonly outcome: "wait-entry-failed"; readonly cause: unknown; readonly state: PipelineV2RunState | null }
+  > => {
+    await dispatchState({ kind: "transition_committed", step, executionIndex });
+    tracking.unfinished = false;
+    // The post-commit checkpoint (previously owned by the next callback's
+    // start): a signal accepted during the worker run is caught here with
+    // the exact same durable semantics — the settled execution and its
+    // transition stay durable and the run finalizes with the signal
+    // reason. Only a quiet checkpoint proceeds to the wait-entry attempt.
+    checkSignal();
+    const attempt = await attemptStageWaitEntry();
+    if (attempt.outcome === "suspended") {
+      return { outcome: "suspended-waiting" };
+    }
+    if (attempt.outcome === "failed") {
+      return { outcome: "wait-entry-failed", cause: attempt.cause, state: attempt.state };
+    }
+    return { outcome: "committed" };
+  };
+
+  /**
+   * The transition commit hook is the only writer of transitions: it
+   * dispatches `transition_committed` with the index of the last settled
+   * execution and must complete before the engine moves the cursor. A
+   * hook failure stops the graph before the next callback; the failure
+   * policy finalizes the run — except the exact trusted stage-wait
+   * boundary recognized right after the committed transition: the wait
+   * entry suspends the coordination through the private sentinel and no
+   * planning callback ever starts.
+   */
+  const onTransitionCommit = async (step: TransitionStep): Promise<void> => {
+    const applied = await applyTransitionCommit(step, requireLastExecutionIndex());
+    if (applied.outcome === "suspended-waiting") {
+      throw new CoordinatorSuspension("waiting");
+    }
+    if (applied.outcome === "wait-entry-failed") {
+      throw new CoordinatorSuspension("waiting", { cause: applied.cause, state: applied.state });
+    }
+  };
+
+  try {
+    // The recovery suffix of a classified post-commit crash window, run
+    // strictly before the engine: the missing durable commands are
+    // completed by the same single implementations the live coordination
+    // uses. A finalization or terminal suffix ends the coordination with
+    // the existing result shape; a committed recovery transition falls
+    // through to the engine (the post-commit stage-wait attempt already
+    // ran inside the shared kernel).
+    if (setup.recovery !== null) {
+      const recovered = await runRecoverySuffix(setup.recovery);
+      if (recovered !== null) {
+        return recovered;
+      }
+    }
+
+    // Checkpoint before the engine: fresh this is after `create_run` (the
+    // run state document exists from here on, so a signal accepted now
+    // finalizes durably); resume it is after the successful restore. Every
+    // execution is settled and its transition is durable in both cases.
+    checkSignal();
+
+    // The restart path of the trusted stage-wait boundary: when the durable
+    // transition into a planning state is already committed while the wait
+    // is absent (a crash between the commit and the wait entry), the same
+    // exact recognizer enters the wait here — before the engine can start
+    // any planning callback. A fresh run carries no durable transition and
+    // never reaches this point. A recovery suffix skips it: the shared
+    // kernel already ran the post-commit attempt for the recovered
+    // transition.
+    if (setup.seed !== null && setup.recovery === null) {
+      const restartAttempt = await attemptStageWaitEntry();
+      if (restartAttempt.outcome === "suspended") {
+        return deepFreeze({ ok: false as const, waiting: true as const, state: requireSnapshot() });
+      }
+      if (restartAttempt.outcome === "failed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: waitEntryFailureReason(restartAttempt.cause),
+          state: restartAttempt.state ?? sink.snapshot,
+        });
+      }
+    }
+
+    // The single engine invocation of the chain: a fresh run enters the
+    // loop at the entry state with transition count 0; a resumed run
+    // continues from the restored durable cursor with the shared budget.
+    // Both call sites compile through the same single `runCompiledGraph`.
+    const engineResult = setup.seed === null
+      ? await executePipelineV2Graph(pipeline, executors, { onTransitionCommit })
+      : await executePipelineV2GraphResume(pipeline, executors, postSuffixSeed ?? setup.seed, { onTransitionCommit });
+
+    // Checkpoint after the engine, before the terminal record and the run
+    // output publication: a signal accepted while the engine ran stops the
+    // terminal phase here; every execution is settled and its transition
+    // is durable.
+    checkSignal();
+
+    // --- terminal phase ---------------------------------------------------
+    return await runTerminalPhase(
+      { stateId: engineResult.terminalStateId, result: engineResult.terminalResult },
+      { recordTerminal: true, publication: "fresh" },
+    );
+  } catch (cause) {
+    // The private controlled-suspension sentinel is recognized by exact
+    // identity first: the runtime, the worker and every downstream layer
+    // can neither obtain nor construct the private marker class, so no
+    // forged error can turn a real failure into a suspension result.
+    if (cause instanceof CoordinatorSuspension) {
+      if (cause.kind === "waiting") {
+        if (cause.entryFailure === undefined) {
+          // The run is durably waiting: the authoritative snapshot after the
+          // committed `run_waiting` is returned on the waiting branch — no
+          // failure finalization, no signal cutoff, no further dispatch.
+          const state = requireSnapshot();
+          return deepFreeze({ ok: false as const, waiting: true as const, state });
+        }
+        // A failed wait-entry attempt never writes a durable `run_failed`:
+        // the active stage→planning boundary stays retryable for a fresh
+        // resume (the same recognizer re-enters the wait there), a poisoned
+        // sink is never re-read (the failure already carries the adopted
+        // snapshot), and an actually durable `run_waiting` is visible to
+        // every fresh reopen. The reason mapping is the existing closed
+        // vocabulary — no new failure reason.
+        const failure = cause.entryFailure as { readonly cause: unknown; readonly state: PipelineV2RunState | null };
+        return deepFreeze({
+          ok: false as const,
+          reason: waitEntryFailureReason(failure.cause),
+          state: failure.state ?? sink.snapshot,
+        });
+      }
+      // The plan-ready suspension: the settled-but-unbound planning
+      // boundary is fully durable (the cleanup committed, no transition);
+      // the operator applies `orchestrator resume-plan` next. No failure
+      // finalization, no signal cutoff, no further dispatch.
+      const state = requireSnapshot();
+      return deepFreeze({ ok: false as const, planReady: true as const, state });
+    }
+    await finalizeFailure(cause);
+    if (stateAbandoned) {
+      return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: sink.snapshot });
+    }
+    const reason = failureReason ?? classifyCause(cause);
+    return deepFreeze({ ok: false as const, reason, state: sink.snapshot });
+  }
+}
+
+/**
+ * The exact typed refusal result of one pre-resume rejection: it carries
+ * the closed refusal reason and the authoritative snapshot the sink
+ * already held (null only when no snapshot existed). A refusal is
+ * content-free and never writes, never creates a Session, never runs an
+ * engine callback and never takes the signal cutoff.
+ */
+function resumeRefusal(
+  reason: PipelineV2ResumeRefusalReason,
+  state: PipelineV2RunState | null,
+): PipelineV2ResumeCoordinationResult {
+  return deepFreeze({ ok: false as const, refused: true as const, reason, state });
+}
+
+/**
+ * Continues an already durable pipeline v2 run from its clean active
+ * boundary through the same single continuation chain fresh coordination
+ * uses. The entrypoint is wired into the production runner
+ * (`pipeline_v2_runner.ts`, the CLI commands `orchestrator run`, `orchestrator
+ * resume` and the composition controllers) and it never re-reads any
+ * original user source — the project source, the input bindings, the
+ * original cursor and the execution indexes are all derived from the
+ * durable state alone.
+ *
+ * Exact ordering (fail-closed, every refusal before any side effect):
+ *
+ *   1. the pipeline provenance gate is the very first action — the sink,
+ *      the runtime, the control and the filesystem are not touched before
+ *      it (a forged pipeline causes no getter or trap invocation);
+ *   2. the runtime and control contract functions are captured exactly
+ *      once, per the existing rules, before any side effect;
+ *   3. the sink contract: the sink must be a non-poisoned sink holding an
+ *      existing snapshot (an opened existing run — `PipelineV2RunStateSink.open`);
+ *   4. the run id/root binding: the parameters must name the run the
+ *      durable state belongs to;
+ *   5. the active-boundary precheck on the validated durable snapshot:
+ *      only `status: "active"` with `phase: "running"` may continue — an
+ *      open waiting run (whose only owner of `wait_response_recorded` is
+ *      the wait controller), a publishing phase, a final status or a
+ *      reached terminal is refused here, before any filesystem read;
+ *   6. `restorePipelineV2RuntimeContext(pipeline, snapshot, runRoot)` —
+ *      the read-only restoration revalidates the durable state, the exact
+ *      pipeline identity, the run-root layout, the provenance-restored
+ *      input snapshot and the full accepted-output history (including
+ *      every old non-winning record) before the context is returned;
+ *   7. only after the full restore succeeds does the shared continuation
+ *      chain run: durable writes, Sessions and engine callbacks become
+ *      possible. The engine starts from the restored cursor and shared
+ *      transition budget, the first execution index must be exactly the
+ *      restored next global index, the accepted history starts from the
+ *      restored records and is extended by new ones, and the restored
+ *      run-input snapshot is used without re-reading any original user
+ *      binding.
+ *
+ * Terminal handling, output collection, session cleanup, the signal
+ * cutoff and the failure finalization are the same implementations fresh
+ * coordination uses. Unexpected errors during the pre-resume phase are
+ * refusals (`internal_error`), never durable failures: a damaged or
+ * incompatible run is not a new execution fact, so the state file is not
+ * finalized before the restore succeeded.
+ */
+export async function resumePipelineV2Run(
+  params: PipelineV2CoordinatorResumeParams,
+  control: PipelineV2CoordinatorControl,
+): Promise<PipelineV2ResumeCoordinationResult> {
+  // 1. The provenance gate is the very first action: no sink read, no
+  //    runtime or control read, no filesystem call before it. A forged
+  //    pipeline causes no getter or trap invocation.
+  try {
+    requireResolvedPipelineV2Provenance(params.pipeline, "pipeline v2 resume coordinator");
+  } catch {
+    return resumeRefusal("internal_error", null);
+  }
+
+  const { pipeline, runId, runRoot, sink, runtime } = params;
+
+  // Production v2 dispatch requires the compiled orchestration metadata.
+  // The gate runs before the runtime and control captures (no getter is
+  // read), before the sink is read and before any filesystem access.
+  if (pipeline.orchestration === undefined) {
+    return resumeRefusal("pipeline_mismatch", null);
+  }
+
+  // 2. The runtime and control contract functions are captured exactly
+  //    once, per the existing rules, before any side effect. Rebinding or
+  //    replacing them later cannot influence this coordination.
+  let capturedCurrentSignal: () => "SIGINT" | "SIGTERM" | null;
+  let capturedFreezeSignal: () => "SIGINT" | "SIGTERM" | null;
+  let capturedCreateExecutionSession: CapturedCreateExecutionSession;
+  let capturedCreateToolSession: CapturedCreateToolSession;
+  try {
+    capturedCurrentSignal = captureContractFunction(
+      control,
+      "currentSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+    capturedFreezeSignal = captureContractFunction(
+      control,
+      "freezeSignal",
+      "pipeline v2 coordinator control",
+    ) as () => "SIGINT" | "SIGTERM" | null;
+    capturedCreateExecutionSession = captureCreateExecutionSession(runtime);
+    capturedCreateToolSession = captureCreateToolSession(runtime);
+  } catch {
+    return resumeRefusal("internal_error", null);
+  }
+
+  const checkSignal = (): void => {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      throw new CoordinatorSignalAbort(signal);
+    }
+  };
+  let cutoffTaken = false;
+  let cutoffSignal: "SIGINT" | "SIGTERM" | null = null;
+  const takeCutoff = (): "SIGINT" | "SIGTERM" | null => {
+    if (cutoffTaken) {
+      return cutoffSignal;
+    }
+    cutoffTaken = true;
+    cutoffSignal = capturedFreezeSignal();
+    return cutoffSignal;
+  };
+
+  // 3. The sink contract: a non-poisoned sink holding an existing snapshot.
+  if (sink.poisoned) {
+    return resumeRefusal("sink_poisoned", sink.snapshot);
+  }
+  if (sink.snapshot === null) {
+    return resumeRefusal("missing_state", null);
+  }
+  const durableState: PipelineV2RunState = sink.snapshot;
+
+  // 4. The run id/root binding. The durable state must belong to the run
+  //    the caller named; the run root path must be an absolute path (its
+  //    canonical identity is verified by the restore).
+  try {
+    validateSafeId(runId, "pipeline v2 resume run id");
+  } catch {
+    return resumeRefusal("internal_error", durableState);
+  }
+  if (typeof runRoot !== "string" || runRoot === "" || !isAbsolute(runRoot)) {
+    return resumeRefusal("internal_error", durableState);
+  }
+  if (durableState.run_id !== runId) {
+    return resumeRefusal("run_id_mismatch", durableState);
+  }
+
+  // 5. The recovery classification over the validated durable snapshot:
+  //    the single catch-free classifier decides whether the run sits on
+  //    a post-commit crash window whose missing durable suffix this
+  //    resume completes. A classifier pipeline mismatch is refused
+  //    before any dispatch; a recovery window skips the active-boundary
+  //    precheck (its shapes — a settled-but-unbound stage/control
+  //    execution, a durably failed execution, a reached terminal — are
+  //    not clean running boundaries) and takes the recovery restore and
+  //    the recovery-enabled chain below; every other shape keeps the
+  //    exact established plain flow.
+  const recovery = classifyPipelineV2ResumeRecovery(pipeline, durableState);
+  if (recovery.kind === "pipeline-mismatch") {
+    return resumeRefusal("pipeline_mismatch", durableState);
+  }
+  const recovering = recovery.kind !== "none";
+
+  // 5b. The active-boundary precheck of the ordinary path on the
+  //     validated durable snapshot: only a clean active running boundary
+  //     may continue. An open waiting run is refused here — the wait
+  //     controller remains the single owner of `wait_response_recorded`
+  //     — and so are a publishing phase, a final status and a reached
+  //     terminal, before any filesystem read. A classified recovery
+  //     window bypasses this precheck: its shapes are the post-commit
+  //     crash windows this resume completes, and the recovery restore's
+  //     boundary policy re-derives the same classification.
+  if (!recovering && (durableState.status !== "active" || durableState.phase !== "running")) {
+    return resumeRefusal("invalid_state", durableState);
+  }
+
+  // 6. The read-only restoration: durable state coherence, exact pipeline
+  //    identity, run layout, provenance-restored input snapshot and the
+  //    full accepted-output history. The sink's authoritative snapshot is
+  //    passed as the single source of truth; nothing is written.
+  let restored: RestoredPipelineV2RuntimeContext;
+  try {
+    restored = await restorePipelineV2RuntimeContext(pipeline, durableState, runRoot);
+  } catch (cause) {
+    if (cause instanceof PipelineV2RuntimeContextRestoreError) {
+      return resumeRefusal(cause.reason, durableState);
+    }
+    return resumeRefusal("internal_error", durableState);
+  }
+
+  // 7. The shared continuation chain: restored cursor seed, restored input
+  //    snapshot, restored accepted history and restored next execution
+  //    index. From here on the ordinary coordination semantics apply. A
+  //    recovery window passes the classified suffix: the chain completes
+  //    the missing durable commands with the same single implementations
+  //    the live coordination uses, before the engine continues from the
+  //    post-suffix cursor.
+  return await continuePipelineV2Coordination({
+    pipeline,
+    sink,
+    runRoot,
+    runInputs: restored.run_inputs,
+    acceptedInitial: restored.accepted_outputs,
+    seed: recovering && recovery.kind === "transition"
+      ? deepFreeze({
+          current_state: recovery.step.to,
+          transition_count: durableState.cursor.transition_count + 1,
+        })
+      : restored.cursor,
+    expectedNextExecutionIndex: restored.next_execution_index,
+    recovery: recovering ? recovery : null,
+    readPendingSignal: () => capturedCurrentSignal(),
+    checkSignal,
+    takeCutoff,
+    createExecutionSession: capturedCreateExecutionSession,
+    createToolSession: capturedCreateToolSession,
+    cleanupSessionsByIds: runtime.cleanupSessionsByIds,
+  });
+}

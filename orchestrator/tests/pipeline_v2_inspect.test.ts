@@ -44,6 +44,10 @@ import {
   restorePipelineV2RuntimeContext,
 } from "../src/pipeline_v2_resume_context.ts";
 import { classifyPipelineV2ResumeRecovery } from "../src/pipeline_v2_recovery.ts";
+import type { WorkerLogCapture } from "../src/worker_operation.ts";
+import type { PipelineV2WorkerLogState } from "../src/pipeline_v2_state.ts";
+import { parseWorkerLogArtifact } from "../src/pipeline_v2_worker_log.ts";
+import { publishPipelineV2WorkerLog } from "../src/pipeline_v2_worker_log_store.ts";
 
 /**
  * The versioned read-only `orchestrator inspect` command. Every state of
@@ -619,11 +623,13 @@ interface FakeRuntimeHandle {
   runtime: PipelineV2AgentRuntime;
   createCalls: Array<{ stateId: string; session: "execution" | "tool" }>;
   runCalls: string[];
+  cleanupCalls: Array<{ execution: string; tool: string }>;
 }
 
-function fakeRuntime(): FakeRuntimeHandle {
+function fakeRuntime(cleanup: { failExecution?: boolean; failTool?: boolean } = {}): FakeRuntimeHandle {
   const createCalls: FakeRuntimeHandle["createCalls"] = [];
   const runCalls: string[] = [];
+  const cleanupCalls: FakeRuntimeHandle["cleanupCalls"] = [];
   let n = 0;
   const make = (stateId: string, kind: "execution" | "tool"): FakeSession => {
     n += 1;
@@ -646,9 +652,17 @@ function fakeRuntime(): FakeRuntimeHandle {
         createCalls.push({ stateId: state.id, session: "tool" });
         return make(state.id, "tool");
       },
+      cleanupSessionsByIds: async (executionSessionId: string, toolSessionId: string) => {
+        cleanupCalls.push({ execution: executionSessionId, tool: toolSessionId });
+        return {
+          execution: cleanup.failExecution ? ("failed" as const) : ("completed" as const),
+          tool: cleanup.failTool ? ("failed" as const) : ("completed" as const),
+        };
+      },
     } as unknown as PipelineV2AgentRuntime,
     createCalls,
     runCalls,
+    cleanupCalls,
   };
 }
 
@@ -755,7 +769,14 @@ async function runAgentActivation(
   accepted: AcceptedStateOutput[],
   stateId: string,
   executionIndex: number,
-  options: { commitTransition?: boolean; outputs?: Record<string, string>; phases?: number } = {},
+  options: {
+    commitTransition?: boolean;
+    outputs?: Record<string, string>;
+    phases?: number;
+    stopAfter?: "running" | "accepted";
+    publishCapture?: WorkerLogCapture;
+    bindingFromArtifact?: boolean;
+  } = {},
 ): Promise<AcceptedStateOutput[]> {
   const activation = await prepareActivationData(harness.pipeline, runInputs, accepted, stateId, executionIndex);
   const state = harness.pipeline.states.find((entry) => entry.id === stateId);
@@ -780,11 +801,35 @@ async function runAgentActivation(
   }
   const worker = new PrefixWorker(activation, options.outputs);
   await worker.run();
+  if (options.publishCapture !== undefined) {
+    await publishPipelineV2WorkerLog(harness.dirs.runRoot, executionIndex, options.publishCapture);
+  }
+  if (options.stopAfter === "running") {
+    return accepted;
+  }
   const records = await acceptActivationOutputs(harness.pipeline, activation);
+  let workerLog: PipelineV2WorkerLogState = { status: "unavailable" };
+  if (options.bindingFromArtifact === true) {
+    const artifact = parseWorkerLogArtifact(
+      await readFile(join(harness.dirs.runRoot, "logs", `${executionIndex}.workerlog.json`), "utf8"),
+      executionIndex,
+    );
+    workerLog = {
+      status: artifact.status,
+      sha256: artifact.sha256,
+      byte_count: artifact.byte_count,
+      truncated_daemon: artifact.truncated_daemon,
+      truncated_local: artifact.truncated_local,
+    };
+  }
   await harness.recording.dispatch({
     kind: "agent_outputs_accepted",
     outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    workerLog,
   } as never);
+  if (options.stopAfter === "accepted") {
+    return [...accepted, ...records];
+  }
   await harness.recording.dispatch({ kind: "agent_cleanup_completed" } as never);
   if (options.commitTransition !== false) {
     await harness.recording.dispatch({
@@ -1072,7 +1117,7 @@ test("H: a durably failed execution awaiting finalization is resumable", async (
       { kind: "agent_execution_session_created", sessionId: "exec-1" },
       { kind: "agent_tool_session_created", sessionId: "tool-1" },
       { kind: "agent_running" },
-      { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+      { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
     ]) {
       await harness.recording.dispatch(command as never);
     }
@@ -1224,7 +1269,7 @@ test("L: a finalized failed run inspects successfully with the failed boundary",
       { kind: "agent_execution_session_created", sessionId: "exec-1" },
       { kind: "agent_tool_session_created", sessionId: "tool-1" },
       { kind: "agent_running" },
-      { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+      { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
     ]) {
       await harness.recording.dispatch(command as never);
     }
@@ -1848,6 +1893,180 @@ test("the repeated inspect over a damaged publication returns byte-identical err
     expectFailure(first, "artifact_modified", { runRoot: harness.dirs.runRoot });
     expect(JSON.stringify(second)).toBe(JSON.stringify(first));
     expect(Object.isFrozen(first)).toBe(true);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+// --- schema v9 worker-log integrity verification (read-only) ----------------
+
+const INSP_LOG_CAPTURE: WorkerLogCapture = {
+  status: "captured",
+  byteCount: 10,
+  tailBytes: new TextEncoder().encode("worker-log"),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
+
+async function prefixSettledStage(
+  harness: Harness,
+  options: { workerLog?: "artifact" } = {},
+): Promise<void> {
+  const runInputs = await prefixCreateRun(harness);
+  const accepted = await prefixStageEntry(harness, runInputs);
+  await runAgentActivation(harness, runInputs, accepted, "dev_entry", 2, {
+    stopAfter: "accepted",
+    publishCapture: options.workerLog === "artifact" ? INSP_LOG_CAPTURE : undefined,
+    bindingFromArtifact: options.workerLog === "artifact",
+  });
+}
+
+test("W1: a captured stage binding inspects as resumable with the artifact verified", async () => {
+  const harness = await setupHarness(stageToDoneYaml(false), "insp-w1");
+  try {
+    await prefixSettledStage(harness, { workerLog: "artifact" });
+    const { before, after, outcome } = await inspectRun(harness);
+    const report = expectReport(outcome);
+    expect(report.boundary).toEqual({
+      kind: "in_flight",
+      executionIndex: 2,
+      stateId: "dev_entry",
+      executionRole: "stage",
+      phase: "outputs_accepted",
+    });
+    expect(before).toBe(after);
+    // the public projection carries no worker-log fields
+    expect(JSON.stringify(report)).not.toContain("worker_log");
+    expect(JSON.stringify(report)).not.toContain("workerlog");
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("W2: a missing recorded artifact fails inspect as artifact_missing with zero writes", async () => {
+  const harness = await setupHarness(stageToDoneYaml(false), "insp-w2");
+  try {
+    await prefixSettledStage(harness, { workerLog: "artifact" });
+    await rm(join(harness.dirs.runRoot, "logs", "2.workerlog.json"));
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_missing", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("W3: a modified artifact fails inspect as artifact_modified with zero writes", async () => {
+  const harness = await setupHarness(stageToDoneYaml(false), "insp-w3");
+  try {
+    await prefixSettledStage(harness, { workerLog: "artifact" });
+    await writeFile(join(harness.dirs.runRoot, "logs", "2.workerlog.json"), '{"damaged":true}');
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("W4: an extra logs entry fails inspect as artifact_modified with zero writes", async () => {
+  const harness = await setupHarness(stageToDoneYaml(false), "insp-w4");
+  try {
+    await prefixSettledStage(harness, { workerLog: "artifact" });
+    await writeFile(join(harness.dirs.runRoot, "logs", "99.workerlog.json"), "{}");
+    const { before, after, outcome } = await inspectRun(harness);
+    expectFailure(outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("W5: an unavailable record without an artifact inspects normally", async () => {
+  const harness = await setupHarness(stageToDoneYaml(false), "insp-w5");
+  try {
+    await prefixSettledStage(harness);
+    const { before, after, outcome } = await inspectRun(harness);
+    const report = expectReport(outcome);
+    expect(report.boundary).toEqual({
+      kind: "in_flight",
+      executionIndex: 2,
+      stateId: "dev_entry",
+      executionRole: "stage",
+      phase: "outputs_accepted",
+    });
+    expect(before).toBe(after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("W6: an in-flight stage execution with a published orphan stays in_flight with the artifact verified", async () => {
+  const harness = await setupHarness(stageToDoneYaml(false), "insp-w6");
+  try {
+    const runInputs = await prefixCreateRun(harness);
+    const accepted = await prefixStageEntry(harness, runInputs);
+    await runAgentActivation(harness, runInputs, accepted, "dev_entry", 2, {
+      stopAfter: "running",
+      publishCapture: INSP_LOG_CAPTURE,
+    });
+    const { before, after, outcome } = await inspectRun(harness);
+    const report = expectReport(outcome);
+    expect(report.boundary).toEqual({
+      kind: "in_flight",
+      executionIndex: 2,
+      stateId: "dev_entry",
+      executionRole: "stage",
+      phase: "running",
+    });
+    expect(before).toBe(after);
+    // a damaged tolerated orphan still refuses typed and zero-write
+    await writeFile(join(harness.dirs.runRoot, "logs", "2.workerlog.json"), '{"x":1}');
+    const damaged = await inspectRun(harness);
+    expectFailure(damaged.outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(damaged.before).toBe(damaged.after);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+});
+
+test("W7: a finalized succeeded run verifies its log artifacts read-only before the succeeded boundary", async () => {
+  const harness = await setupHarness(stageToDoneYaml(false), "insp-w7");
+  try {
+    const runInputs = await prefixCreateRun(harness);
+    const accepted = await prefixStageEntry(harness, runInputs);
+    await runAgentActivation(harness, runInputs, accepted, "dev_entry", 2, {
+      stopAfter: "accepted",
+      publishCapture: INSP_LOG_CAPTURE,
+      bindingFromArtifact: true,
+    });
+    // finish the run through the ordinary resume (cleanup + transition + terminal)
+    const reopened = await reopenHarness(harness);
+    const fake = fakeRuntime();
+    const resumed = await resumePipelineV2Run({
+      pipeline: harness.pipeline,
+      runId: RUN_ID,
+      runRoot: harness.dirs.runRoot,
+      sink: reopened as never,
+      runtime: fake.runtime,
+    }, NEUTRAL_CONTROL);
+    if (!resumed.ok) {
+      throw new Error(`expected a successful resume, got ${JSON.stringify(resumed)}`);
+    }
+    // the intact artifact inspects as the succeeded boundary
+    const intact = await inspectRun(harness);
+    expect(expectReport(intact.outcome).boundary).toEqual({ kind: "succeeded", terminalStateId: "done" });
+    expect(intact.before).toBe(intact.after);
+    // a tampered artifact is the typed zero-write failure, never a false success
+    await writeFile(join(harness.dirs.runRoot, "logs", "2.workerlog.json"), '{"tampered":true}');
+    const damaged = await inspectRun(harness);
+    expectFailure(damaged.outcome, "artifact_modified", { runRoot: harness.dirs.runRoot });
+    expect(damaged.before).toBe(damaged.after);
+    // the same for a missing artifact
+    await rm(join(harness.dirs.runRoot, "logs", "2.workerlog.json"));
+    const missing = await inspectRun(harness);
+    expectFailure(missing.outcome, "artifact_missing", { runRoot: harness.dirs.runRoot });
+    expect(missing.before).toBe(missing.after);
   } finally {
     await rm(harness.dirs.root, { recursive: true, force: true });
   }

@@ -259,7 +259,7 @@ async function prefixAgentStep(
   const records = await acceptActivationOutputs(pipeline, activation);
   await sink.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await worker.cleanup();
   await sink.dispatch({ kind: "agent_cleanup_completed" });
@@ -345,7 +345,7 @@ async function reviseResumeReady(options: { advance?: "r0" | "r4" } = {}): Promi
     const records1 = await acceptActivationOutputs(pipeline, activation1);
     await recording.dispatch({
       kind: "agent_outputs_accepted",
-      outputs: records1.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: records1.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await worker1.cleanup();
     await recording.dispatch({ kind: "agent_cleanup_completed" });

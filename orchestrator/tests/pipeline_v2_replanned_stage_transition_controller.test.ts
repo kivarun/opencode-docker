@@ -165,7 +165,7 @@ function agentPhases(label: string): PipelineV2RunCommand[] {
     { kind: "agent_execution_session_created", sessionId: `sess-${n}-${label}` },
     { kind: "agent_tool_session_created", sessionId: `tool-${n}-${label}` },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ];
 }

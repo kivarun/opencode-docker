@@ -1,0 +1,103 @@
+schema_version: 2
+entry_state: architect
+max_transitions: 40
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+
+outputs:
+  - id: report
+    required: true
+    source:
+      state_output:
+        state: review_entry
+        output: report
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: dev_entry
+    - id: review
+      entry_state: review_entry
+  execution_roles:
+    - state_id: architect
+      role: planning
+      plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+    - state_id: planner2
+      role: planning
+      plan_output: plan2
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+    - state_id: dev_entry
+      role: stage
+      stage_template: development
+    - state_id: review_entry
+      role: stage
+      stage_template: review
+
+states:
+  - id: architect
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs: []
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
+    timeout_seconds: 120
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: dev_entry
+  - id: dev_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 120
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: planner2
+  - id: planner2
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs: []
+    outputs:
+      - id: plan2
+        type: json
+        schema: schemas/plan2.schema.json
+    timeout_seconds: 120
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: review_entry
+  - id: review_entry
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs: []
+    outputs:
+      - id: report
+        type: file
+    timeout_seconds: 120
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+  - id: done
+    type: terminal
+    result: success

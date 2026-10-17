@@ -81,7 +81,7 @@ const PLANNING_PHASES: readonly PipelineV2RunCommand[] = [
   { kind: "agent_execution_session_created", sessionId: "sess-1" },
   { kind: "agent_tool_session_created", sessionId: "tool-1" },
   { kind: "agent_running" },
-  { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+  { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
   { kind: "agent_cleanup_completed" },
 ];
 
@@ -104,7 +104,7 @@ function failedStageState(): PipelineV2RunState {
     { kind: "stage_iteration_opened", generationIndex: 1, iterationIndex: 1, transitionCount: 1 },
     { kind: "start_agent_execution", stateId: "dev_entry", profile: "coder", executionRole: "stage", iterationIndex: 1 },
     ...STAGE_PHASES,
-    { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+    { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
   ]);
 }
 
@@ -117,7 +117,7 @@ function failedPlanningState(): PipelineV2RunState {
     { kind: "agent_execution_session_created", sessionId: "sess-1" },
     { kind: "agent_tool_session_created", sessionId: "tool-1" },
     { kind: "agent_running" },
-    { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+    { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
   ]);
 }
 
@@ -142,7 +142,7 @@ function cleanupFailedState(): PipelineV2RunState {
     { kind: "agent_execution_session_created", sessionId: "sess-1" },
     { kind: "agent_tool_session_created", sessionId: "tool-1" },
     { kind: "agent_running" },
-    { kind: "agent_failed", reason: "session_cleanup_failed", sessionCleanup: { execution: "failed", tool: "completed" } },
+    { kind: "agent_failed", reason: "session_cleanup_failed", sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }  },
   ]);
 }
 
@@ -156,9 +156,9 @@ const NON_FINALIZER_COMMANDS: readonly PipelineV2RunCommand[] = [
   { kind: "agent_execution_session_created", sessionId: "sess-x" },
   { kind: "agent_tool_session_created", sessionId: "tool-x" },
   { kind: "agent_running" },
-  { kind: "agent_outputs_accepted", outputs: [] },
+  { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
   { kind: "agent_cleanup_completed" },
-  { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+  { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
   { kind: "start_decision_execution", stateId: "gate", inputDigest: hex("f"), executionRole: "control" },
   {
     kind: "decision_evaluated",
@@ -467,7 +467,7 @@ describe("pipeline v2 post-failure successor gate", () => {
       { kind: "agent_execution_session_created", sessionId: "sess-2" },
       { kind: "agent_tool_session_created", sessionId: "tool-2" },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+      { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
     ]);
     // serialize -> loader round-trip of the successful flow

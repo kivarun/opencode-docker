@@ -17,6 +17,7 @@ import {
   type PipelineV2RunState,
 } from "./pipeline_v2_state.ts";
 import { PipelineV2RunStateStore } from "./pipeline_v2_state_store.ts";
+import { verifyPipelineV2WorkerLogBindings } from "./pipeline_v2_worker_log_store.ts";
 import {
   verifyPublishedRunOutputs,
   verifyPublishedRunOutputsAgainstRecord,
@@ -210,7 +211,10 @@ function mapRestoreReason(
       return "artifact_missing";
     case "run_input_modified":
     case "accepted_output_modified":
+    case "artifact_modified":
       return "artifact_modified";
+    case "artifact_missing":
+      return "artifact_missing";
   }
 }
 
@@ -515,6 +519,10 @@ async function classifyInspectBoundary(
     if (state.terminal === undefined) {
       return "run_state_invalid";
     }
+    const logDefect = await verifyPipelineV2WorkerLogBindings(runRoot, state.executions);
+    if (logDefect !== null) {
+      return logDefect.kind === "missing" ? "artifact_missing" : "artifact_modified";
+    }
     const outputsReason = await verifyFinalizedRunOutputs(pipeline, state, runRoot);
     if (outputsReason !== null) {
       return outputsReason;
@@ -524,6 +532,10 @@ async function classifyInspectBoundary(
   if (state.status === "failed" || state.status === "cleanup_failed") {
     if (state.failure === undefined) {
       return "run_state_invalid";
+    }
+    const logDefect = await verifyPipelineV2WorkerLogBindings(runRoot, state.executions);
+    if (logDefect !== null) {
+      return logDefect.kind === "missing" ? "artifact_missing" : "artifact_modified";
     }
     if (state.run_outputs !== undefined) {
       const outputsReason = await verifyFinalizedRunOutputs(pipeline, state, runRoot);
@@ -619,8 +631,31 @@ async function classifyInspectBoundary(
   }
 
   // 5. A genuinely in-flight execution (never a settled recovery window).
+  //    A stage execution in one of the two worker-log windows (schema v9,
+  //    phase `running` or `outputs_accepted` with both durable sessions)
+  //    carries or tolerates run-root artifacts: the zero-write integrity
+  //    verification runs through the single authoritative restore first,
+  //    while the public boundary stays the established `in_flight` — the
+  //    one safe external action remains `orchestrator resume`, and no
+  //    worker-log field ever enters the projection.
   const last = state.executions[state.executions.length - 1];
   if (last !== undefined && isInFlightExecution(last)) {
+    if (
+      last.type === "agent" &&
+      last.execution_role === "stage" &&
+      (last.phase === "running" || last.phase === "outputs_accepted") &&
+      last.execution_session_id !== undefined &&
+      last.tool_session_id !== undefined
+    ) {
+      try {
+        await restorePipelineV2RuntimeContext(pipeline, state, runRoot);
+      } catch (cause) {
+        if (cause instanceof PipelineV2RuntimeContextRestoreError) {
+          return mapRestoreReason(cause.reason);
+        }
+        return "internal_error";
+      }
+    }
     return deepFreezeValue({
       kind: "in_flight" as const,
       executionIndex: last.index,

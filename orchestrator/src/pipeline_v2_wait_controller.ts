@@ -315,7 +315,7 @@ function captureBoundary(
     throw controllerError("invalid_state", operation, "no durable pipeline v2 run state exists yet", null);
   }
   if (
-    snapshot["schema_version"] !== 8 ||
+    snapshot["schema_version"] !== 9 ||
     !isRecord(snapshot["pipeline"]) ||
     (snapshot["pipeline"] as Record<string, unknown>)["schema_version"] !== 2
   ) {

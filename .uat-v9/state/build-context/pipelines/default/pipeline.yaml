@@ -1,0 +1,26 @@
+schema_version: 1
+entry_state: execute
+max_transitions: 1
+
+inputs:
+  - id: task
+    path: TASK.md
+    protected: true
+
+states:
+  - id: execute
+    type: agent
+    profile: default
+    prompt: prompts/execute.md
+    inputs:
+      - task
+    result_schema: schemas/agent-result.schema.json
+    timeout_seconds: 3600
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: completed
+
+  - id: completed
+    type: terminal
+    result: success

@@ -491,7 +491,7 @@ function agentRun(sessionLabel: string): PipelineV2RunCommand[] {
     { kind: "agent_execution_session_created", sessionId: `sess-${n}-${sessionLabel}` },
     { kind: "agent_tool_session_created", sessionId: `tool-${n}-${sessionLabel}` },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ];
 }
@@ -674,7 +674,7 @@ const FAILED_COMMANDS: PipelineV2RunCommand[] = [
   {
     kind: "agent_failed",
     reason: "worker_failed",
-    sessionCleanup: { execution: "completed", tool: "completed" },
+    sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }
   },
   { kind: "run_failed", reason: "worker_failed" },
 ];
@@ -967,7 +967,7 @@ test("10. a failed agent execution is rejected", async () => {
       {
         kind: "agent_failed",
         reason: "worker_failed",
-        sessionCleanup: { execution: "completed", tool: "completed" },
+        sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }
       },
     ]);
     const candidate = singleStageCandidate(1);

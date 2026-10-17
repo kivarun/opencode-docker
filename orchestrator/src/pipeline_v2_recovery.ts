@@ -82,10 +82,26 @@ export type PipelineV2RecoveryFinalizeCommand =
 /**
  * The executable recovery classifications the continuation chain
  * completes; `none` and `pipeline-mismatch` are decided before the chain.
+ *
+ * The two worker-log windows (schema v9) recover an agent execution whose
+ * worker already ran in a previous process — the worker is never re-run:
+ *
+ *   - `worker-settled` — the durable acceptance is complete (phase
+ *     `outputs_accepted`); the missing suffix is exactly the session
+ *     cleanup of the two durably recorded sessions and the execution's
+ *     transition. The binding and outputs stay untouched.
+ *   - `agent-in-flight` — the execution is in phase `running` (the worker
+ *     operation was in flight or had finished when the process died): the
+ *     worker outcome is unverifiable without a re-run, so the recovery
+ *     adopts the published log artifact when one exists (C5), records the
+ *     honest binding, deletes both durable sessions and fails the
+ *     execution (`agent_failed`), after which the run finalizes with the
+ *     existing failure semantics. Phases before the worker ran stay the
+ *     existing refusal (C0: the existing recovery behavior).
  */
 export type PipelineV2ExecutableRecovery = Extract<
   PipelineV2RecoveryClassification,
-  { kind: "transition" | "run-finalization" | "terminal" }
+  { kind: "transition" | "run-finalization" | "terminal" | "worker-settled" | "agent-in-flight" }
 >;
 
 /** The failure-only finalization commands of the `run-finalization` window. */
@@ -120,6 +136,22 @@ export type PipelineV2RecoveryClassification =
       readonly outputsRecorded: boolean;
       /** The final run-status command after the (remaining) publication. */
       readonly finalize: PipelineV2RecoveryFinalizeCommand;
+    }
+  | {
+      /** The accepted agent execution (schema v9): cleanup + transition missing. */
+      readonly kind: "worker-settled";
+      readonly executionIndex: number;
+      readonly stateId: string;
+      readonly executionSessionId: string;
+      readonly toolSessionId: string;
+    }
+  | {
+      /** The in-flight agent execution at phase `running`: adopt the artifact, fail the execution. */
+      readonly kind: "agent-in-flight";
+      readonly executionIndex: number;
+      readonly stateId: string;
+      readonly executionSessionId: string;
+      readonly toolSessionId: string;
     };
 
 const NONE: PipelineV2RecoveryClassification = deepFreezeValue({ kind: "none" });
@@ -259,12 +291,6 @@ export function classifyPipelineV2ResumeRecovery(
       command: { kind: "run_failed", reason } as const,
     });
   }
-  if (!isSettledExecution(last)) {
-    // A genuinely in-flight execution (prepared, sessions created,
-    // running, evaluated-without-record) is never recovered in this
-    // increment: the existing refusal stays the owner.
-    return NONE;
-  }
   if (last.type === "agent") {
     // A settled-but-unbound planning execution is the plan-ready
     // boundary — the existing planning chains own it, never a generic
@@ -272,6 +298,46 @@ export function classifyPipelineV2ResumeRecovery(
     if (last.execution_role === "planning") {
       return NONE;
     }
+    if (last.execution_role === "stage") {
+      // The worker-log recovery windows (schema v9) sit BEFORE the
+      // settled gate: phases `running` and `outputs_accepted` are exactly
+      // the post-worker crash windows this recovery owns — the worker
+      // already ran in a previous process and is never re-run. Both
+      // windows require the two durably recorded sessions; a divergent
+      // shape is defensive `none`.
+      if (last.phase === "running") {
+        if (last.execution_session_id === undefined || last.tool_session_id === undefined) {
+          return NONE;
+        }
+        return deepFreezeValue({
+          kind: "agent-in-flight" as const,
+          executionIndex: last.index,
+          stateId: last.state_id,
+          executionSessionId: last.execution_session_id,
+          toolSessionId: last.tool_session_id,
+        });
+      }
+      if (last.phase === "outputs_accepted") {
+        if (last.execution_session_id === undefined || last.tool_session_id === undefined) {
+          return NONE;
+        }
+        return deepFreezeValue({
+          kind: "worker-settled" as const,
+          executionIndex: last.index,
+          stateId: last.state_id,
+          executionSessionId: last.execution_session_id,
+          toolSessionId: last.tool_session_id,
+        });
+      }
+    }
+  }
+  if (!isSettledExecution(last)) {
+    // A genuinely in-flight execution (prepared, sessions created,
+    // running, evaluated-without-record) is never recovered in this
+    // increment: the existing refusal stays the owner.
+    return NONE;
+  }
+  if (last.type === "agent") {
     if (last.execution_role !== "stage") {
       return NONE;
     }

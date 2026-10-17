@@ -314,7 +314,7 @@ async function runAgentActivation(
   const accepted = await acceptActivationOutputs(base.pipeline, prepared);
   dispatchClock(drive, base.clock, {
     kind: "agent_outputs_accepted",
-    outputs: accepted.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: accepted.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   drive.records.push(...accepted);
   dispatchClock(drive, base.clock, { kind: "agent_cleanup_completed" });
@@ -1087,7 +1087,7 @@ test("27. in-flight agent executions are rejected", async () => {
       { kind: "agent_execution_session_created", sessionId: "sess-1" },
       { kind: "agent_tool_session_created", sessionId: "tool-1" },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [] as { id: string; digest: string }[] },
+      { kind: "agent_outputs_accepted", outputs: [] as { id: string; digest: string }[], workerLog: { status: "unavailable" }  },
     ] as PipelineV2RunCommand[]) {
       dispatchClock(base.drive, base.clock, command);
       const cause = await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot).catch(
@@ -1185,7 +1185,7 @@ test("29. terminal, publishing, success, failed and cleanup-failed states: the r
     dispatchClock(cleanup.drive, cleanup.clock, {
       kind: "agent_failed",
       reason: "session_cleanup_failed",
-      sessionCleanup: { execution: "failed", tool: "completed" },
+      sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     dispatchClock(cleanup.drive, cleanup.clock, { kind: "run_cleanup_failed" });
     expectRestoreError(
@@ -2046,7 +2046,7 @@ async function runStageAgentPhases(base: StageBase, stateId: string): Promise<nu
     }
     base.drive.records.push(...accepted);
   }
-  dispatchStage(base, { kind: "agent_outputs_accepted", outputs });
+  dispatchStage(base, { kind: "agent_outputs_accepted", outputs, workerLog: { status: "unavailable" }  });
   dispatchStage(base, { kind: "agent_cleanup_completed" });
   return executionIndex;
 }
@@ -2511,7 +2511,7 @@ async function runUnboundPlanningActivation(
   const accepted = await acceptActivationOutputs(base.pipeline, prepared);
   dispatchClock(drive, base.clock, {
     kind: "agent_outputs_accepted",
-    outputs: accepted.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: accepted.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   drive.records.push(...accepted);
   dispatchClock(drive, base.clock, { kind: "agent_cleanup_completed" });

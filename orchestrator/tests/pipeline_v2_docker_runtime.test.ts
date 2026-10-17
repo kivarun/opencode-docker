@@ -420,6 +420,19 @@ const CODER_RUN_BODY = {
   helper_socket: true,
 };
 
+
+/** The frozen capture a fixture worker operation leaves behind. */
+function expectCaptureCaptured(result: unknown): void {
+  const capture = (result as { capture?: { status?: string } }).capture;
+  expect(capture).toBeDefined();
+  expect(capture?.status).toBe("unavailable");
+}
+
+function expectCaptureUnavailable(result: unknown): void {
+  const capture = (result as { capture?: unknown }).capture;
+  expect(capture === null || capture === undefined || (capture as { status?: string }).status === "unavailable").toBe(true);
+}
+
 test("1. the factory rejects a missing profile before any helper or filesystem side effect", async () => {
   const setup_ = await setup();
   try {
@@ -453,7 +466,8 @@ test("2. profile snapshots are immune to mutations of the source map and profile
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
     const result = await execution.runAgent(tool);
-    expect(result).toEqual({ status: "completed" });
+    expect(result.status).toBe("completed");
+    expectCaptureCaptured(result);
     const body = operationBody(fake.operationRequests);
     expect((body["environment"] as Record<string, unknown>)["OPENCODE_CONFIG_CONTENT"]).toBe(
       JSON.stringify({ model: "coder-model" }),
@@ -982,7 +996,9 @@ test("21. a pull failure is a worker failure and never reaches the worker run", 
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_, { pullCode: 1 });
-    expect(driven.result).toEqual({ status: "failed", reason: "worker_failed" });
+    expect(driven.result.status).toBe("failed");
+    expect((driven.result as { reason?: string }).reason).toBe("worker_failed");
+    expect((driven.result as { capture?: unknown }).capture).toBe(null);
     expect(driven.calls.filter((call) => call.args[0] === "run").length).toBe(0);
     await driven.execution.cleanup();
     await driven.tool.cleanup();
@@ -995,7 +1011,9 @@ test("22. a timed-out worker run reports worker_timeout", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_, { runTimedOut: true });
-    expect(driven.result).toEqual({ status: "failed", reason: "worker_timeout" });
+    expect(driven.result.status).toBe("failed");
+    expect((driven.result as { reason?: string }).reason).toBe("worker_timeout");
+    expectCaptureUnavailable(driven.result);
     await driven.execution.cleanup();
     await driven.tool.cleanup();
   } finally {
@@ -1007,7 +1025,9 @@ test("23. a nonzero worker run reports worker_failed", async () => {
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_, { runCode: 7 });
-    expect(driven.result).toEqual({ status: "failed", reason: "worker_failed" });
+    expect(driven.result.status).toBe("failed");
+    expect((driven.result as { reason?: string }).reason).toBe("worker_failed");
+    expectCaptureUnavailable(driven.result);
     await driven.execution.cleanup();
     await driven.tool.cleanup();
   } finally {
@@ -1019,7 +1039,8 @@ test("24. a successful worker operation reports completed with the exact request
   const setup_ = await setup();
   try {
     const driven = await driveCoderActivation(setup_);
-    expect(driven.result).toEqual({ status: "completed" });
+    expect(driven.result.status).toBe("completed");
+    expectCaptureCaptured(driven.result);
     expect(driven.operationRequests).toHaveLength(1);
     const request = driven.operationRequests[0];
     expect(request?.timeoutSeconds).toBe(60);
@@ -1048,7 +1069,9 @@ test("25. different agent states use their own image, env and config", async () 
     // coder activation first
     const coderExecution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const coderTool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
-    expect(await coderExecution.runAgent(coderTool)).toEqual({ status: "completed" });
+    const coderResult = await coderExecution.runAgent(coderTool);
+    expect(coderResult.status).toBe("completed");
+    expectCaptureCaptured(coderResult);
 
     // architect activation with the accepted coder outputs
     await writeFile(join(setup_.coderPrepared.outputs_root, "patch"), "PATCH");
@@ -1071,7 +1094,9 @@ test("25. different agent states use their own image, env and config", async () 
     };
     const architectExecution = await runtime.createExecutionSession(architectView, architectPrepared);
     const architectTool = await runtime.createToolSession(architectView, architectPrepared);
-    expect(await architectExecution.runAgent(architectTool)).toEqual({ status: "completed" });
+    const architectResult = await architectExecution.runAgent(architectTool);
+    expect(architectResult.status).toBe("completed");
+    expectCaptureCaptured(architectResult);
 
     expect(fake.operationRequests).toHaveLength(2);
     const coderBody = JSON.parse(fake.operationRequests[0]?.body ?? "{}") as {
@@ -1115,7 +1140,9 @@ test("26. env-from source names are stable across activations and never collide 
     const runtime = makeRuntime(setup_, fake);
     const coderExecution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const coderTool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
-    expect(await coderExecution.runAgent(coderTool)).toEqual({ status: "completed" });
+    const coderResult = await coderExecution.runAgent(coderTool);
+    expect(coderResult.status).toBe("completed");
+    expectCaptureCaptured(coderResult);
 
     await writeFile(join(setup_.coderPrepared.outputs_root, "patch"), "PATCH");
     const coderRecords = await acceptActivationOutputs(setup_.pipeline, setup_.coderPrepared);
@@ -1137,7 +1164,9 @@ test("26. env-from source names are stable across activations and never collide 
     };
     const architectExecution = await runtime.createExecutionSession(architectView, architectPrepared);
     const architectTool = await runtime.createToolSession(architectView, architectPrepared);
-    expect(await architectExecution.runAgent(architectTool)).toEqual({ status: "completed" });
+    const architectResult = await architectExecution.runAgent(architectTool);
+    expect(architectResult.status).toBe("completed");
+    expectCaptureCaptured(architectResult);
 
     expect(fake.operationRequests).toHaveLength(2);
     const keysOf = (bodyText: string | undefined): string[] =>
@@ -1384,7 +1413,8 @@ test("34. mutating the projection object after factory creation cannot influence
     expect(fake.calls[0]!.args).toContain(setup_.runRoot);
     expect(fake.calls[1]!.args).toContain(setup_.coderPrepared.project_root);
     const result = await execution.runAgent(tool);
-    expect(result).toEqual({ status: "completed" });
+    expect(result.status).toBe("completed");
+    expectCaptureCaptured(result);
     expect(JSON.stringify(operationBody(fake.operationRequests))).not.toContain("/totally/other");
     expect(fake.operationRequests[0]?.socketPath).toBe(SOCKET);
     await execution.cleanup();
@@ -1878,7 +1908,8 @@ test("47b. request parity: the production adapter sends the exact POST /run body
     const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
     const result = await execution.runAgent(tool);
-    expect(result).toEqual({ status: "completed" });
+    expect(result.status).toBe("completed");
+    expectCaptureCaptured(result);
     expect(recorded).toHaveLength(1);
     const request = recorded[0];
     expect(request?.bearer).toBe("dhc_1");

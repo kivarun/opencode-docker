@@ -1,0 +1,1 @@
+{"$schema":"https://opencode.ai/config.json","model":"local/glm53-flash","provider":{"local":{"npm":"@ai-sdk/openai-compatible","name":"local","options":{"baseURL":"https://llm.office.lan:443/v1","apiKey":"sk-kMFqAiIuB5FtFePM1ooGpw"},"models":{"glm53-flash":{"name":"GLM 53 Flash"}}}}}

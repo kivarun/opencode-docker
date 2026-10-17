@@ -76,7 +76,7 @@ export function successCommands(runId = "run-1"): PipelineV2RunCommand[] {
     { kind: "agent_execution_session_created", sessionId: "sess-1" },
     { kind: "agent_tool_session_created", sessionId: "tool-1" },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
     {
       kind: "transition_committed",
@@ -114,7 +114,7 @@ export function successCommands(runId = "run-1"): PipelineV2RunCommand[] {
     { kind: "agent_execution_session_created", sessionId: "sess-2" },
     { kind: "agent_tool_session_created", sessionId: "tool-2" },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [] },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
     {
       kind: "transition_committed",

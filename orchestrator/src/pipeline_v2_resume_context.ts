@@ -23,6 +23,7 @@ import {
   type PipelineV2RunIdentityField,
 } from "./pipeline_v2_identity_compare.ts";
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
+import { verifyPipelineV2WorkerLogBindings } from "./pipeline_v2_worker_log_store.ts";
 import {
   mintRestoredRunInputsSnapshot,
   verifyRestoredAcceptedHistory,
@@ -175,7 +176,9 @@ export type PipelineV2RuntimeContextRestoreFailureReason =
   | "pipeline_mismatch"
   | "run_layout_invalid"
   | "run_input_modified"
-  | "accepted_output_modified";
+  | "accepted_output_modified"
+  | "artifact_missing"
+  | "artifact_modified";
 
 export class PipelineV2RuntimeContextRestoreError extends Error {
   readonly reason: PipelineV2RuntimeContextRestoreFailureReason;
@@ -318,7 +321,9 @@ function checkResumableBoundary(pipeline: ResolvedPipelineV2, state: PipelineV2R
   if (
     recovery.kind === "transition" ||
     recovery.kind === "run-finalization" ||
-    recovery.kind === "terminal"
+    recovery.kind === "terminal" ||
+    recovery.kind === "worker-settled" ||
+    recovery.kind === "agent-in-flight"
   ) {
     return;
   }
@@ -910,6 +915,39 @@ async function restoreContextCore(
       throw restoreError("invalid_state", "the durable accepted history is not coherent with the trusted pipeline");
     }
     throw cause;
+  }
+  // 10. The worker-log artifact verification (schema v9): every recorded
+  //     binding must match its immutable run-root artifact byte-exactly,
+  //     an unavailable binding must have no artifact, and the logs
+  //     namespace must carry no unexpected entries. Artifacts of
+  //     null-binding agent executions are tolerated as publish-then-bind
+  //     orphans (the recovery adopts them); they are not verified here.
+  const requiredLogIndexes: number[] = [];
+  const toleratedLogIndexes: number[] = [];
+  for (const execution of validated.executions) {
+    if (execution.type !== "agent") {
+      continue;
+    }
+    if (execution.worker_log !== null && execution.worker_log.status !== "unavailable") {
+      requiredLogIndexes.push(execution.index);
+    } else if (execution.worker_log === null) {
+      toleratedLogIndexes.push(execution.index);
+    }
+  }
+  // The one shared integrity verification (single owner in the worker-log
+  // store): every captured/truncated binding must match its artifact,
+  // tolerated orphans must be undamaged, and the namespace must carry no
+  // unexpected entry. The typed defect maps onto the restore's closed
+  // reasons here.
+  const defect = await verifyPipelineV2WorkerLogBindings(
+    runRootCanonical,
+    validated.executions,
+  );
+  if (defect !== null) {
+    if (defect.kind === "missing") {
+      throw restoreError("artifact_missing", "the recorded worker log artifact is missing");
+    }
+    throw restoreError("artifact_modified", "the worker log artifact does not match its durable binding");
   }
   return { validated, runInputs, acceptedOutputs };
 }

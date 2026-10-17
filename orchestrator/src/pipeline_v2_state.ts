@@ -117,7 +117,7 @@ import {
   isPositiveSafeInteger,
 } from "./pipeline_v2_scalar.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 8;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 9;
 
 /** The closed execution-role vocabulary fixed on every execution at start. */
 export const PIPELINE_V2_EXECUTION_ROLES = ["planning", "control", "stage"] as const;
@@ -308,6 +308,31 @@ export interface PipelineV2AgentOutputState {
   digest: string;
 }
 
+/**
+ * Content-free durable binding of one agent execution's worker-log
+ * capture (schema v9). The binding is written atomically by the same
+ * reducer command that fixes the execution's terminal worker result
+ * (`agent_outputs_accepted` or `agent_failed`), so exactly one immutable
+ * binding exists per agent execution once the worker outcome is durable.
+ *
+ * `captured`/`truncated` name the published artifact: `captured` never
+ * means upstream completeness (daemon-side eviction outside the observed
+ * window cannot be proven absent), and `truncated` marks a stream that is
+ * not proven complete. `unavailable` records honestly that no bytes can
+ * be verified — no artifact exists for it. Operation ids, session ids,
+ * paths, timestamps, log contents and diagnostics never enter the
+ * binding; the raw payload lives only in the run-root artifact.
+ */
+export type PipelineV2WorkerLogState =
+  | {
+      status: "captured" | "truncated";
+      sha256: string;
+      byte_count: number;
+      truncated_daemon: boolean;
+      truncated_local: boolean;
+    }
+  | { status: "unavailable" };
+
 export interface PipelineV2AgentExecutionState {
   index: number;
   type: "agent";
@@ -325,6 +350,12 @@ export interface PipelineV2AgentExecutionState {
   tool_session_id?: string;
   /** Independent cleanup outcomes of both durable sessions. */
   session_cleanup?: PipelineV2SessionCleanupPair;
+  /**
+   * The immutable worker-log binding (schema v9): explicit `null` until
+   * the terminal worker result, then exactly one non-null binding written
+   * atomically by `agent_outputs_accepted`/`agent_failed`.
+   */
+  worker_log: PipelineV2WorkerLogState | null;
   outputs?: PipelineV2AgentOutputState[];
   failure_reason?: PipelineV2FailureReason;
 }
@@ -568,7 +599,7 @@ export type PipelineDecisionStateRecord =
     };
 
 export interface PipelineV2RunState {
-  schema_version: 8;
+  schema_version: 9;
   revision: number;
   run_id: string;
   status: PipelineV2RunStatus;
@@ -632,12 +663,19 @@ export type PipelineV2RunCommand =
   | { kind: "agent_execution_session_created"; sessionId: string }
   | { kind: "agent_tool_session_created"; sessionId: string }
   | { kind: "agent_running" }
-  | { kind: "agent_outputs_accepted"; outputs: readonly PipelineV2AgentOutputState[] }
+  | {
+      kind: "agent_outputs_accepted";
+      outputs: readonly PipelineV2AgentOutputState[];
+      /** The immutable worker-log binding, written atomically with the acceptance (schema v9). */
+      workerLog: PipelineV2WorkerLogState;
+    }
   | { kind: "agent_cleanup_completed" }
   | {
       kind: "agent_failed";
       reason: PipelineV2FailureReason;
       sessionCleanup: PipelineV2SessionCleanupPair;
+      /** The immutable worker-log binding, written atomically with the failure (schema v9). */
+      workerLog: PipelineV2WorkerLogState;
     }
   | {
       kind: "start_decision_execution";
@@ -1094,6 +1132,51 @@ function expectSafeNonNegativeInteger(value: unknown, what: string): number {
   return value;
 }
 
+/**
+ * The one validator for the durable worker-log binding (schema v9),
+ * shared by the reducer command payloads and the loader's execution
+ * records. A `captured`/`truncated` record carries the exact five keys;
+ * an `unavailable` record carries only its status.
+ */
+function parseWorkerLogBinding(value: unknown, what: string): PipelineV2WorkerLogState | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new PipelineV2StateError(`${what} must be an object or null, got ${JSON.stringify(value)}`);
+  }
+  const obj = value as Record<string, unknown>;
+  const status = obj.status;
+  if (status === "unavailable") {
+    expectExactObject(value, what, ["status"]);
+    return { status: "unavailable" };
+  }
+  if (status !== "captured" && status !== "truncated") {
+    throw new PipelineV2StateError(
+      `${what}.status must be "captured", "truncated" or "unavailable", got ${JSON.stringify(status)}`,
+    );
+  }
+  const record = expectExactObject(value, what, [
+    "status",
+    "sha256",
+    "byte_count",
+    "truncated_daemon",
+    "truncated_local",
+  ]);
+  if (typeof record.truncated_daemon !== "boolean" || typeof record.truncated_local !== "boolean") {
+    throw new PipelineV2StateError(
+      `${what}.truncated_daemon and ${what}.truncated_local must both be booleans`,
+    );
+  }
+  return {
+    status,
+    sha256: expectSha256(record.sha256, `${what}.sha256`),
+    byte_count: expectSafeNonNegativeInteger(record.byte_count, `${what}.byte_count`),
+    truncated_daemon: record.truncated_daemon,
+    truncated_local: record.truncated_local,
+  };
+}
+
 function expectSafeIdList(value: unknown, what: string): string[] {
   if (!Array.isArray(value)) {
     throw new PipelineV2StateError(`${what} must be an array`);
@@ -1240,37 +1323,42 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 9 is the supported contract; no v2 migration exists)",
     );
   }
   if (version === 3) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v3 migration exists)",
     );
   }
   if (version === 4) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v4 migration exists)",
     );
   }
   if (version === 5) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v5 migration exists)",
     );
   }
   if (version === 6) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v6 migration exists)",
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v6 migration exists)",
     );
   }
   if (version === 7) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v7 migration exists)",
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v7 migration exists)",
+    );
+  }
+  if (version === 8) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v8 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -1343,7 +1431,7 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
   const obj = expectExactObject(
     value,
     what,
-    ["index", "type", "state_id", "attempt", "profile", "phase", "execution_role"],
+    ["index", "type", "state_id", "attempt", "profile", "phase", "execution_role", "worker_log"],
     ["iteration_index", "execution_session_id", "tool_session_id", "session_cleanup", "outputs", "failure_reason"],
   );
   if (obj.type !== "agent") {
@@ -1362,10 +1450,26 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
       `${what}.execution_role`,
     ),
     phase,
+    worker_log: null,
   };
   if (execution.attempt !== 1) {
     throw new PipelineV2StateError(
       `execution ${execution.index} declares attempt ${execution.attempt}; only attempt 1 is supported`,
+    );
+  }
+  // The immutable worker-log binding (schema v9): explicit null until the
+  // terminal worker result, then exactly one non-null binding written
+  // atomically by the acceptance/failure command. The biconditional is
+  // phase-keyed, so a forged running execution can never already carry a
+  // binding and a settled one can never stay null.
+  execution.worker_log = parseWorkerLogBinding(obj.worker_log, `${what}.worker_log`);
+  const workerLogRecorded = execution.worker_log !== null;
+  const workerOutcomeRecorded = phase === "outputs_accepted" || phase === "cleanup_completed" || phase === "failed";
+  if (workerLogRecorded !== workerOutcomeRecorded) {
+    throw new PipelineV2StateError(
+      workerLogRecorded
+        ? `${what} has phase ${JSON.stringify(phase)} but already records a worker log binding`
+        : `${what} has phase ${JSON.stringify(phase)} but does not record its worker log binding`,
     );
   }
   if (obj.execution_session_id !== undefined) {
@@ -3817,11 +3921,21 @@ function verifyCommitHistoryCoherence(state: PipelineV2RunState): void {
             record.outputs !== undefined,
             `${kind} claims execution ${entry.execution_index}, but the record carries no accepted outputs`,
           );
+          require(
+            record.worker_log !== null,
+            `${kind} claims execution ${entry.execution_index}, but the record carries no worker log binding`,
+          );
         }
         if (kind === "agent_cleanup_completed") {
           require(
             record.session_cleanup !== undefined,
             `${kind} claims execution ${entry.execution_index}, but the record carries no session cleanup pair`,
+          );
+        }
+        if (kind === "agent_failed") {
+          require(
+            record.worker_log !== null,
+            `${kind} claims execution ${entry.execution_index}, but the record carries no worker log binding`,
           );
         }
         claimedSteps.get(entry.execution_index)!.add(kind);
@@ -4289,6 +4403,10 @@ function verifyCommitHistoryCoherence(state: PipelineV2RunState): void {
         `the ledger and the projection disagree about execution ${execution.index}'s accepted outputs`,
       );
       require(
+        (execution.worker_log !== null) === (steps.has("agent_outputs_accepted") || steps.has("agent_failed")),
+        `the ledger and the projection disagree about execution ${execution.index}'s worker log binding`,
+      );
+      require(
         (execution.session_cleanup !== undefined) ===
           (steps.has("agent_cleanup_completed") || steps.has("agent_failed")),
         `the ledger and the projection disagree about execution ${execution.index}'s session cleanup`,
@@ -4567,6 +4685,20 @@ function cloneSessionCleanupPair(
   return { execution: pair.execution, tool: pair.tool };
 }
 
+/** A fresh structural copy of one worker-log binding; no aliasing. */
+function cloneWorkerLogBinding(binding: PipelineV2WorkerLogState): PipelineV2WorkerLogState {
+  if (binding.status === "unavailable") {
+    return { status: "unavailable" };
+  }
+  return {
+    status: binding.status,
+    sha256: binding.sha256,
+    byte_count: binding.byte_count,
+    truncated_daemon: binding.truncated_daemon,
+    truncated_local: binding.truncated_local,
+  };
+}
+
 function cloneExecution(execution: PipelineV2ExecutionState): PipelineV2ExecutionState {
   if (execution.type === "agent") {
     const clone: PipelineV2AgentExecutionState = { ...execution };
@@ -4575,6 +4707,9 @@ function cloneExecution(execution: PipelineV2ExecutionState): PipelineV2Executio
     }
     if (execution.outputs !== undefined) {
       clone.outputs = execution.outputs.map(cloneAgentOutput);
+    }
+    if (execution.worker_log !== null) {
+      clone.worker_log = cloneWorkerLogBinding(execution.worker_log);
     }
     return clone;
   }
@@ -5123,6 +5258,7 @@ export function reducePipelineV2RunCommand(
         profile: command.profile,
         execution_role: role,
         phase: "started",
+        worker_log: null,
         ...(iterationIndex !== undefined ? { iteration_index: iterationIndex } : {}),
       };
       next.executions = [...next.executions, execution];
@@ -5188,6 +5324,12 @@ export function reducePipelineV2RunCommand(
       if (!Array.isArray(command.outputs)) {
         throw new PipelineV2StateError("agent_outputs_accepted requires an outputs array");
       }
+      const workerLog = parseWorkerLogBinding(command.workerLog, "agent_outputs_accepted workerLog");
+      if (workerLog === null) {
+        throw new PipelineV2StateError(
+          "agent_outputs_accepted requires a non-null worker log binding; the terminal worker result fixes it",
+        );
+      }
       const seen = new Set<string>();
       const outputs = command.outputs.map((entry, index) => {
         const output = expectExactObject(entry, `agent_outputs_accepted outputs[${index}]`, ["id", "digest"]);
@@ -5203,6 +5345,7 @@ export function reducePipelineV2RunCommand(
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
       last.phase = "outputs_accepted";
       last.outputs = outputs;
+      last.worker_log = cloneWorkerLogBinding(workerLog);
       break;
     }
     case "agent_cleanup_completed": {
@@ -5278,10 +5421,34 @@ export function reducePipelineV2RunCommand(
       ) {
         fail(current, 'a failed session cleanup requires the session cleanup failure reason');
       }
+      const workerLog = parseWorkerLogBinding(command.workerLog, "agent_failed workerLog");
+      if (workerLog === null) {
+        throw new PipelineV2StateError(
+          "agent_failed requires a non-null worker log binding; the terminal worker result fixes it",
+        );
+      }
+      if (execution.worker_log !== null) {
+        // The binding is immutable: a failure recorded after a durable
+        // acceptance must carry exactly the already-bound record.
+        if (
+          workerLog.status !== execution.worker_log.status ||
+          (workerLog.status !== "unavailable" &&
+            (execution.worker_log.status === "unavailable" ||
+              workerLog.sha256 !== execution.worker_log.sha256 ||
+              workerLog.byte_count !== execution.worker_log.byte_count ||
+              workerLog.truncated_daemon !== execution.worker_log.truncated_daemon ||
+              workerLog.truncated_local !== execution.worker_log.truncated_local))
+        ) {
+          fail(current, "the worker log binding is immutable and cannot be rewritten by agent_failed");
+        }
+      }
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
       last.phase = "failed";
       last.failure_reason = reason;
       last.session_cleanup = cloneSessionCleanupPair(sessionCleanup);
+      if (last.worker_log === null) {
+        last.worker_log = cloneWorkerLogBinding(workerLog);
+      }
       break;
     }
     case "start_decision_execution": {

@@ -41,6 +41,7 @@ import type {
   PipelineV2RunState,
 } from "../src/pipeline_v2_state.ts";
 import type { PipelineStateIo } from "../src/run_snapshot_store.ts";
+import type { WorkerLogCapture } from "../src/worker_operation.ts";
 import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 
 /**
@@ -2310,6 +2311,13 @@ interface FakeSessionSpec {
     | "string"
     | "getter_throw";
   runError?: unknown;
+  /**
+   * The worker-log capture the session reports next to its terminal
+   * result (schema v9 publish-then-bind): `undefined` keeps the plain
+   * result shape; an explicit capture is attached to completed/failed
+   * results exactly like the production adapter does.
+   */
+  capture?: WorkerLogCapture | null;
   executionCleanup?: "throw";
   toolCleanup?: "throw";
   onRun?: (session: FakeAgentSession) => void | Promise<void>;
@@ -2368,9 +2376,9 @@ class FakeAgentSession {
     }
     switch (this.spec.run) {
       case "worker_failed":
-        return { status: "failed", reason: "worker_failed" };
+        return this.finish({ status: "failed", reason: "worker_failed" });
       case "worker_timeout":
-        return { status: "failed", reason: "worker_timeout" };
+        return this.finish({ status: "failed", reason: "worker_timeout" });
       case "throw":
         throw this.spec.runError ?? new Error("WORKER-EXPLODED");
       case "invalid":
@@ -2398,8 +2406,16 @@ class FakeAgentSession {
           },
         } as unknown as PipelineV2WorkerRunResult;
       default:
-        return { status: "completed" };
+        return this.finish({ status: "completed" });
     }
+  }
+
+  /** Attaches the spec's capture to a terminal result, adapter-style. */
+  private finish(result: PipelineV2WorkerRunResult): PipelineV2WorkerRunResult {
+    if (this.spec.capture === undefined) {
+      return result;
+    }
+    return { ...result, capture: this.spec.capture } as PipelineV2WorkerRunResult;
   }
 
   async cleanup(): Promise<void> {
@@ -3231,4 +3247,198 @@ test("32. a stage execution without an open lifecycle fails the run as invalid_g
   expect(fake.pairs[0]?.execution.cleanupCount).toBe(1);
   expect(fake.pairs[0]?.tool.cleanupCount).toBe(1);
   expect(state.failure).toEqual({ reason: "invalid_graph" });
+}, 15000);
+
+// --- schema v9 worker-log composition (publish-then-bind) -------------------
+
+import { chmod, stat as fstat } from "node:fs/promises";
+import {
+  parseWorkerLogArtifact,
+} from "../src/pipeline_v2_worker_log.ts";
+import { publishPipelineV2WorkerLog } from "../src/pipeline_v2_worker_log_store.ts";
+import {
+  parsePipelineV2RunState,
+  validatePipelineV2RunState,
+} from "../src/pipeline_v2_state.ts";
+
+const WORKER_LOG_CAPTURE: WorkerLogCapture = {
+  status: "captured",
+  byteCount: 10,
+  tailBytes: new TextEncoder().encode("worker-log"),
+  truncatedDaemon: false,
+  truncatedLocal: false,
+};
+
+function expectPlanReady(result: PipelineV2CoordinationResult): PipelineV2RunState {
+  const record = result as Record<string, unknown>;
+  expect(Object.keys(record).sort()).toEqual(["ok", "planReady", "state"]);
+  expect(record.planReady).toBe(true);
+  const state = record.state as PipelineV2RunState;
+  expect(state.status).toBe("active");
+  expect(state.phase).toBe("running");
+  return state;
+}
+
+test("41. the captured planning worker publishes the artifact and binds it atomically", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  try {
+    const fake = fakeRuntime([{ capture: WORKER_LOG_CAPTURE }]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectOk(result);
+    const execution = agentAt(state, 0);
+    expect(execution.worker_log).toEqual({
+      status: "captured",
+      sha256: expect.any(String) as unknown as string,
+      byte_count: 10,
+      truncated_daemon: false,
+      truncated_local: false,
+    });
+    // the artifact exists exactly once in the deterministic namespace and
+    // carries the same binding
+    const logs = join(harness.dirs.runRoot, "logs");
+    const entries = await readdir(logs);
+    expect(entries).toEqual(["1.workerlog.json"]);
+    const artifact = parseWorkerLogArtifact(
+      await readFile(join(logs, "1.workerlog.json"), "utf8"),
+      1,
+    );
+    expect(artifact.payload).toEqual(new TextEncoder().encode("worker-log"));
+    expect(execution.worker_log).toEqual({
+      status: artifact.status,
+      sha256: artifact.sha256,
+      byte_count: artifact.byte_count,
+      truncated_daemon: artifact.truncated_daemon,
+      truncated_local: artifact.truncated_local,
+    });
+    const logsStat = await fstat(logs);
+    const artifactStat = await fstat(join(logs, "1.workerlog.json"));
+    expect(logsStat.mode & 0o777).toBe(0o700);
+    expect(artifactStat.mode & 0o777).toBe(0o600);
+    // the durable state file round-trips through the v9 loader
+    const durable = parsePipelineV2RunState(
+      await readFile(join(harness.dirs.stateRoot, "pipeline-runs", "coord-run", "state.json"), "utf8"),
+    );
+    expect((durable.executions[0] as PipelineV2AgentExecutionState | undefined)?.worker_log).toEqual(execution.worker_log);
+    validatePipelineV2RunState(JSON.parse(JSON.stringify(durable)));
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+}, 15000);
+
+test("42. the failed worker's captured log binds on agent_failed and the artifact stays", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  try {
+    const fake = fakeRuntime([{ run: "worker_failed", capture: WORKER_LOG_CAPTURE }]);
+    const result = await coordinate(harness, fake.runtime);
+    expectFailedState(result, "worker_failed");
+    const execution = agentAt(result.state as PipelineV2RunState, 0);
+    expect(execution.phase).toBe("failed");
+    expect(execution.worker_log).toEqual({
+      status: "captured",
+      sha256: expect.any(String) as unknown as string,
+      byte_count: 10,
+      truncated_daemon: false,
+      truncated_local: false,
+    });
+    const entries = await readdir(join(harness.dirs.runRoot, "logs"));
+    expect(entries).toEqual(["1.workerlog.json"]);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+}, 15000);
+
+test("43. an absent, null or zero-byte capture records unavailable without any artifact", async () => {
+  for (const capture of [undefined, null]) {
+    const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+    try {
+      const fake = fakeRuntime([{ capture: capture as WorkerLogCapture | null | undefined }]);
+      const result = await coordinate(harness, fake.runtime);
+      const state = expectOk(result);
+      expect(agentAt(state, 0).worker_log).toEqual({ status: "unavailable" });
+      let absent = false;
+      try {
+        await fstat(join(harness.dirs.runRoot, "logs"));
+      } catch {
+        absent = true;
+      }
+      expect(absent).toBe(true);
+    } finally {
+      await rm(harness.dirs.root, { recursive: true, force: true });
+    }
+  }
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  try {
+    const fake = fakeRuntime([
+      {
+        capture: {
+          status: "captured",
+          byteCount: 0,
+          tailBytes: new Uint8Array(0),
+          truncatedDaemon: false,
+          truncatedLocal: false,
+        },
+      },
+    ]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectOk(result);
+    expect(agentAt(state, 0).worker_log).toEqual({ status: "unavailable" });
+    let absent = false;
+    try {
+      await fstat(join(harness.dirs.runRoot, "logs"));
+    } catch {
+      absent = true;
+    }
+    expect(absent).toBe(true);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+}, 15000);
+
+test("44. a capture publication failure is outcome-neutral: the worker success stands", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  try {
+    const fake = fakeRuntime([
+      {
+        capture: WORKER_LOG_CAPTURE,
+        onRun: async () => {
+          // The publish substrate cannot write inside a non-writable logs
+          // namespace; the failure must be outcome-neutral while the run's
+          // own terminal publication still succeeds.
+          await mkdir(join(harness.dirs.runRoot, "logs"), { recursive: true });
+          await chmod(join(harness.dirs.runRoot, "logs"), 0o500);
+        },
+      },
+    ]);
+    const result = await coordinate(harness, fake.runtime);
+    const state = expectOk(result);
+    expect(agentAt(state, 0).worker_log).toEqual({ status: "unavailable" });
+    expect(state.failure).toBeUndefined();
+  } finally {
+    await chmod(join(harness.dirs.runRoot, "logs"), 0o700).catch(() => {});
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
+}, 15000);
+
+test("45. a foreign published artifact is an integrity conflict: fail closed, never unavailable", async () => {
+  const harness = await setupHarness(PIPELINE_AGENT_DECISION);
+  try {
+    // A valid but foreign artifact already occupies the deterministic
+    // path: the adoption compares bytes and must conflict.
+    await publishPipelineV2WorkerLog(
+      harness.dirs.runRoot,
+      1,
+      { ...WORKER_LOG_CAPTURE, tailBytes: new TextEncoder().encode("FOREIGN-BYTES") },
+    );
+    const foreign = await readFile(join(harness.dirs.runRoot, "logs", "1.workerlog.json"), "utf8");
+    const fake = fakeRuntime([{ capture: WORKER_LOG_CAPTURE }]);
+    const result = await coordinate(harness, fake.runtime);
+    expectFailedState(result, "internal_error");
+    const execution = agentAt(result.state as PipelineV2RunState, 0);
+    expect(execution.phase).toBe("failed");
+    expect(execution.worker_log).toEqual({ status: "unavailable" });
+    // the foreign artifact was never rewritten
+    expect(await readFile(join(harness.dirs.runRoot, "logs", "1.workerlog.json"), "utf8")).toBe(foreign);
+  } finally {
+    await rm(harness.dirs.root, { recursive: true, force: true });
+  }
 }, 15000);

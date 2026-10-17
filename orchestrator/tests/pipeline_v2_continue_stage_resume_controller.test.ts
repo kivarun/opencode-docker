@@ -336,7 +336,7 @@ async function prefixAgentStep(
   const records = await acceptActivationOutputs(harness.pipeline, activation);
   await harness.recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await worker.cleanup();
   await harness.recording.dispatch({ kind: "agent_cleanup_completed" });

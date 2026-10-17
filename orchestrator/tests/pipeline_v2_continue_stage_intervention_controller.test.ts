@@ -210,7 +210,7 @@ function agentPhases(label: string): PipelineV2RunCommand[] {
     { kind: "agent_execution_session_created", sessionId: `sess-${n}-${label}` },
     { kind: "agent_tool_session_created", sessionId: `tool-${n}-${label}` },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ];
 }
@@ -1067,6 +1067,7 @@ test("14. a state after an already started successor execution is never an inter
     startedState.executions.push({
       index: 4,
       type: "agent",
+      worker_log: null,
       state_id: "dev_entry",
       execution_role: "stage",
       iteration_index: 2,

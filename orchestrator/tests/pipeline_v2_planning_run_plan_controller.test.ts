@@ -320,7 +320,7 @@ async function playPlanningExecution(
   const records = await acceptActivationOutputs(pipeline, prep);
   await recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await recording.dispatch({ kind: "agent_cleanup_completed" });
   return records;
@@ -614,7 +614,7 @@ test("2. the pointer-only completed boundary recognizes the accepted plan; r3 is
     const records2 = await acceptActivationOutputs(pipeline, prep2);
     await recording.dispatch({
       kind: "agent_outputs_accepted",
-      outputs: records2.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: records2.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
     const result2 = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot: dirs.runRoot, sink: recording });

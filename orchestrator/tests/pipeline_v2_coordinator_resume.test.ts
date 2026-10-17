@@ -634,7 +634,7 @@ async function prefixAgentStep(
   const records = await acceptActivationOutputs(harness.pipeline, activation);
   await harness.recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await worker.cleanup();
   await worker.cleanup();
@@ -1633,7 +1633,7 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
   const records = await acceptActivationOutputs(unbound2.pipeline, activation);
   await unbound2.recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await unbound2.recording.dispatch({ kind: "agent_cleanup_completed" });
   const fpUnbound = await fingerprint(unbound2.dirs.runRoot);
@@ -1968,7 +1968,7 @@ test("the reducer's state schema stays v6 and resume never dispatches create_run
   expect(allCommands.filter((command) => command.kind === "create_run")).toHaveLength(1);
   expect(allCommands.filter((command) => String(command.kind).startsWith("wait_"))).toHaveLength(0);
   const durable = await readDurableState(harness);
-  expect(durable.schema_version).toBe(8);
+  expect(durable.schema_version).toBe(9);
 });
 
 test("a malformed durable state document refuses the reopen without side effects", async () => {
@@ -2280,7 +2280,7 @@ test("the resumed stage execution carries the compiled role and the open iterati
   accepted.push(...architectRecords);
   await harness.recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await harness.recording.dispatch({ kind: "agent_cleanup_completed" });
   await harness.recording.dispatch({
@@ -2433,7 +2433,7 @@ test("the full continue-stage handoff survives two restarts: the restart-aware i
   accepted.push(...architectRecords);
   await harness.recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await architectWorker.cleanup();
   await harness.recording.dispatch({ kind: "agent_cleanup_completed" });

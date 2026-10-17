@@ -1,0 +1,281 @@
+{
+  "schema_version": 9,
+  "revision": 24,
+  "run_id": "dec15683-4a9e-472f-9a9d-1dff1d92a3dc",
+  "status": "success",
+  "phase": "finished",
+  "started_at": "2026-10-17T09:50:00.013Z",
+  "updated_at": "2026-10-17T09:50:30.933Z",
+  "pipeline": {
+    "schema_version": 2,
+    "bundle_root": "/opt/orchestrator/pipelines/default-v2",
+    "execution_snapshot_sha256": "41ce957320f7a0a2ca60bd0469cac05dfb28b5b629da010b17eddf8052c6b5b9",
+    "entry_state": "architect",
+    "max_transitions": 40
+  },
+  "inputs": [
+    {
+      "id": "task",
+      "type": "file",
+      "protected": true,
+      "digest": "8d973d714ceddfabc0459230289f646394eceadf00190d91f8d93e24d85da217"
+    }
+  ],
+  "cursor": {
+    "current_state": "done",
+    "transition_count": 2
+  },
+  "executions": [
+    {
+      "index": 1,
+      "type": "agent",
+      "state_id": "architect",
+      "attempt": 1,
+      "profile": "default",
+      "execution_role": "planning",
+      "phase": "cleanup_completed",
+      "worker_log": {
+        "status": "captured",
+        "sha256": "2a4063d93e134da02fc98c752cd573709134688821d98213289ef8a0298b7c7c",
+        "byte_count": 19512,
+        "truncated_daemon": false,
+        "truncated_local": false
+      },
+      "execution_session_id": "dhs_fca168038282965527d35d83c83b19b8",
+      "tool_session_id": "dhs_10e2754140772d7ca5a7ca83eb794225",
+      "outputs": [
+        {
+          "id": "plan",
+          "digest": "70177fe57e8084543d7f0c7cc8901379e1cefdf639f8bd7f163a104a7bfe8a1e"
+        }
+      ],
+      "session_cleanup": {
+        "execution": "completed",
+        "tool": "completed"
+      }
+    },
+    {
+      "index": 2,
+      "type": "agent",
+      "state_id": "execute",
+      "attempt": 1,
+      "profile": "default",
+      "execution_role": "stage",
+      "phase": "cleanup_completed",
+      "worker_log": {
+        "status": "captured",
+        "sha256": "ed636e005da006248282831c5bce005654b03956b5c3f461df15896896659b1e",
+        "byte_count": 14402,
+        "truncated_daemon": false,
+        "truncated_local": false
+      },
+      "iteration_index": 1,
+      "execution_session_id": "dhs_4c9c8d72a46a176514d3d5aea26ec4b2",
+      "tool_session_id": "dhs_1a45407ede7b3a647f7dac49934660d7",
+      "outputs": [
+        {
+          "id": "result",
+          "digest": "385830bba32ee571e3af69f71463719a04a02fb9ab5d07a6fb65ced031639fed"
+        }
+      ],
+      "session_cleanup": {
+        "execution": "completed",
+        "tool": "completed"
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "index": 0,
+      "from": "architect",
+      "outcome": "completed",
+      "to": "execute",
+      "execution_index": 1
+    },
+    {
+      "index": 0,
+      "from": "execute",
+      "outcome": "completed",
+      "to": "done",
+      "execution_index": 2
+    }
+  ],
+  "generations": [
+    {
+      "index": 1,
+      "stage_id": "stage-1",
+      "stage_position": 1,
+      "template_id": "development",
+      "plan_sha256": "12141791d2a19367c01cde55aae5a510b980c300abf7b1b7579099403227a65b",
+      "initial_budget": 1,
+      "opened_transition_count": 0,
+      "iteration_count": 1,
+      "iterations": [
+        {
+          "index": 1,
+          "opened_transition_count": 0
+        }
+      ],
+      "open_iteration": {
+        "index": 1,
+        "opened_transition_count": 0
+      }
+    }
+  ],
+  "task_revisions": [
+    {
+      "index": 1,
+      "task_id": "task-1",
+      "revision": 1,
+      "sha256": "5752006305bc93aa5f5d5087b032417974753e49ece6c743cf02a671178a07d2",
+      "previous_sha256": null
+    }
+  ],
+  "plan_revisions": [
+    {
+      "index": 1,
+      "revision": 1,
+      "sha256": "12141791d2a19367c01cde55aae5a510b980c300abf7b1b7579099403227a65b",
+      "previous_sha256": null,
+      "origin_execution": 1
+    }
+  ],
+  "grants": [],
+  "waits": [],
+  "commit_history": [
+    {
+      "revision": 1,
+      "kind": "create_run"
+    },
+    {
+      "revision": 2,
+      "kind": "start_agent_execution",
+      "execution_index": 1,
+      "state_id": "architect"
+    },
+    {
+      "revision": 3,
+      "kind": "agent_data_prepared",
+      "execution_index": 1
+    },
+    {
+      "revision": 4,
+      "kind": "agent_execution_session_created",
+      "execution_index": 1
+    },
+    {
+      "revision": 5,
+      "kind": "agent_tool_session_created",
+      "execution_index": 1
+    },
+    {
+      "revision": 6,
+      "kind": "agent_running",
+      "execution_index": 1
+    },
+    {
+      "revision": 7,
+      "kind": "agent_outputs_accepted",
+      "execution_index": 1
+    },
+    {
+      "revision": 8,
+      "kind": "agent_cleanup_completed",
+      "execution_index": 1
+    },
+    {
+      "revision": 9,
+      "kind": "task_revision_accepted",
+      "task_index": 1
+    },
+    {
+      "revision": 10,
+      "kind": "plan_revision_accepted",
+      "plan_index": 1
+    },
+    {
+      "revision": 11,
+      "kind": "stage_generation_opened",
+      "generation_index": 1
+    },
+    {
+      "revision": 12,
+      "kind": "stage_iteration_opened",
+      "generation_index": 1,
+      "iteration_index": 1
+    },
+    {
+      "revision": 13,
+      "kind": "transition_committed",
+      "execution_index": 1,
+      "transition_index": 1
+    },
+    {
+      "revision": 14,
+      "kind": "start_agent_execution",
+      "execution_index": 2,
+      "state_id": "execute"
+    },
+    {
+      "revision": 15,
+      "kind": "agent_data_prepared",
+      "execution_index": 2
+    },
+    {
+      "revision": 16,
+      "kind": "agent_execution_session_created",
+      "execution_index": 2
+    },
+    {
+      "revision": 17,
+      "kind": "agent_tool_session_created",
+      "execution_index": 2
+    },
+    {
+      "revision": 18,
+      "kind": "agent_running",
+      "execution_index": 2
+    },
+    {
+      "revision": 19,
+      "kind": "agent_outputs_accepted",
+      "execution_index": 2
+    },
+    {
+      "revision": 20,
+      "kind": "agent_cleanup_completed",
+      "execution_index": 2
+    },
+    {
+      "revision": 21,
+      "kind": "transition_committed",
+      "execution_index": 2,
+      "transition_index": 2
+    },
+    {
+      "revision": 22,
+      "kind": "terminal_reached"
+    },
+    {
+      "revision": 23,
+      "kind": "run_outputs_published"
+    },
+    {
+      "revision": 24,
+      "kind": "run_succeeded"
+    }
+  ],
+  "terminal": {
+    "state_id": "done",
+    "result": "success"
+  },
+  "run_outputs": [
+    {
+      "id": "result",
+      "type": "json",
+      "required": true,
+      "present": true,
+      "digest": "4e0ef12bdcb13f5d5939d66f670de38e75bec6636086aaa61d1fe20bad136497"
+    }
+  ]
+}

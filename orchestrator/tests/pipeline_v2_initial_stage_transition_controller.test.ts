@@ -525,7 +525,7 @@ async function runPlanningActivation(
   }
   await writeFile(join(activation.outputs_root, outputId), JSON.stringify(proposal), { mode: 0o600 });
   const records = await acceptActivationOutputs(pipeline, activation);
-  await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records.map((r) => ({ id: r.output, digest: r.digest })) });
+  await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records.map((r) => ({ id: r.output, digest: r.digest })), workerLog: { status: "unavailable" }  });
   await recording.dispatch({ kind: "agent_cleanup_completed" });
   return [...accepted, ...records];
 }
@@ -1013,7 +1013,7 @@ describe("openPipelineV2InitialStageTransition", () => {
       ] as PipelineV2RunCommand[]) {
         await recording.dispatch(command);
       }
-      await recording.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+      await recording.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
       await recording.dispatch({ kind: "run_failed", reason: "worker_failed" });
       const taskDigest = runInputs.inputs[0]!.digest;
       const taskManifest = prepareTaskRevisionManifest({ schema_version: 1, kind: "task_revision", run_id: RUN_ID, task_id: "task-a", revision: 1, previous_sha256: null, origin: "planning_proposal", body: "Body A" });
@@ -1141,7 +1141,7 @@ describe("openPipelineV2InitialStageTransition", () => {
       ] as PipelineV2RunCommand[]) {
         await ctx.recording.dispatch(command);
       }
-      await ctx.recording.dispatch({ kind: "agent_outputs_accepted", outputs: [] });
+      await ctx.recording.dispatch({ kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  });
       await ctx.recording.dispatch({ kind: "agent_cleanup_completed" });
       const commandsBefore = ctx.recording.commands.length;
       const cause = await callTransition(ctx).catch((error) => error);

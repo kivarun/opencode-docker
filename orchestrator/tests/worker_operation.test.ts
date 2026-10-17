@@ -14,8 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, expect, test } from "bun:test";
 import {
+  OPERATION_DRAIN_TIMEOUT_MS,
+  OPERATION_REQUEST_TIMEOUT_MS,
   runWorkerOperation,
   WORKER_LOG_CAPTURE_BOUND_BYTES,
+  WORKER_LOG_RESPONSE_BOUND_BYTES,
   type WorkerOperationOutcome,
 } from "../src/worker_operation.ts";
 import { WorkerSignalHub } from "../src/worker_signals.ts";
@@ -45,7 +48,7 @@ interface FixtureConfig {
   /** Daemon head eviction reported through `truncated: true`. */
   truncated?: boolean;
   /** Faults injected per endpoint. */
-  logFault?: "none" | "status404" | "status500" | "malformed" | "oversized" | "hang" | "stall";
+  logFault?: "none" | "status404" | "status500" | "malformed" | "oversized" | "hang" | "hangAfterFirst" | "stall";
   /** The drain page size in bytes (default 4096). */
   pageBytes?: number;
   statusFault?: "none" | "status404" | "status500" | "malformed" | "unknown" | "hang" | "omitExit";
@@ -137,6 +140,12 @@ function startFixture(config: FixtureConfig): Fixture {
         if (config.logFault === "status404") return json({ error: "gone" }, 404);
         if (config.logFault === "status500") return json({ error: "boom" }, 500);
         if (config.logFault === "hang") return new Promise(() => undefined);
+        if (config.logFault === "hangAfterFirst") {
+          const priorLogs = requests.filter((request) => request.path.includes("/logs"));
+          if (priorLogs.length > 1) {
+            return new Promise(() => undefined);
+          }
+        }
         if (config.logFault === "malformed") return new Response("<not json>", { status: 200 });
         if (config.logFault === "oversized") {
           return json({ logs: "y".repeat(9 * 1024 * 1024), offset: 0, next_offset: 9 * 1024 * 1024 });
@@ -404,6 +413,75 @@ test("a refused create response is a worker failure with zero cancels", async ()
   }
 });
 
+test("G1: a hung create resolves at the exact finite create bound and never retries", async () => {
+  // the daemon accepts the connection and never answers; the create
+  // request's own bound (min(OPERATION_REQUEST_TIMEOUT_MS, remaining))
+  // resolves it finitely even though the create is deliberately not
+  // wired to the abort signal (aborting it would lose the only chance to
+  // learn the operation id and cancel).
+  const fixture = startFixture({ createHang: true });
+  try {
+    const startedAt = Date.now();
+    const result = await runOperation(fixture, { timeoutSeconds: 30 });
+    const elapsed = Date.now() - startedAt;
+    expect(result.outcome).toBe("worker_failed");
+    expect(result.capture.status).toBe("unavailable");
+    // the exact finite wall-clock bound: the create cap
+    expect(elapsed).toBeGreaterThanOrEqual(9_000);
+    expect(elapsed).toBeLessThan(15_000);
+    // POST /run is never retried; without an operation id no cancel exists
+    expect(createRequestsOf(fixture)).toHaveLength(1);
+    expect(cancelRequestsOf(fixture)).toHaveLength(0);
+  } finally {
+    fixture.close();
+  }
+}, 20_000);
+
+test("G1: SIGINT and SIGTERM during a hung create both resolve finitely", async () => {
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    const fixture = startFixture({ createHang: true });
+    try {
+      const result = await runOperation(fixture, {
+        timeoutSeconds: 1,
+        forwardSignal: signal,
+        signalAfterMs: 150,
+      });
+      expect(result.outcome).toBe("worker_failed");
+      expect(result.capture.status).toBe("unavailable");
+      // exactly one create, never retried, and no cancel (the operation
+      // id was never learned)
+      expect(createRequestsOf(fixture)).toHaveLength(1);
+      expect(cancelRequestsOf(fixture)).toHaveLength(0);
+    } finally {
+      fixture.close();
+    }
+  }
+});
+
+test("G1: the worker deadline claims a hung create as a timeout with no cancel", async () => {
+  const fixture = startFixture({ createHang: true });
+  try {
+    const startedAt = Date.now();
+    const result = await runOperation(fixture, { timeoutSeconds: 1 });
+    const elapsed = Date.now() - startedAt;
+    expect(result.outcome).toBe("worker_timeout");
+    expect(result.capture.status).toBe("unavailable");
+    // bounded by the remaining worker deadline, not forever
+    expect(elapsed).toBeLessThan(4_000);
+    expect(createRequestsOf(fixture)).toHaveLength(1);
+    expect(cancelRequestsOf(fixture)).toHaveLength(0);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("G1: the create and drain bounds are exported finite constants", () => {
+  expect(OPERATION_REQUEST_TIMEOUT_MS).toBe(10_000);
+  expect(OPERATION_DRAIN_TIMEOUT_MS).toBe(2_000);
+  expect(Number.isSafeInteger(OPERATION_REQUEST_TIMEOUT_MS)).toBe(true);
+  expect(Number.isSafeInteger(OPERATION_DRAIN_TIMEOUT_MS)).toBe(true);
+});
+
 test("an invalid operation id shape fails closed before any further request", async () => {
   const fixture = startFixture({ operationId: "bad id/slash", log: "x\n" });
   try {
@@ -536,11 +614,60 @@ test("log failures are outcome-neutral: 404, 500 and malformed logs never change
 });
 
 test("a hanging log fetch cannot outlive the worker deadline and the outcome stays authoritative", async () => {
-  const fixture = startFixture({ logFault: "hang", log: "early-bytes\n" });
+  // the operation stays running past the deadline, so the deadline claims
+  // the hung drain deterministically (the drain's own shorter bound would
+  // otherwise only fail the drain and continue polling)
+  const fixture = startFixture({ logFault: "hang", holdMs: 5_000, log: "early-bytes\n" });
   try {
     const result = await runOperation(fixture, { timeoutSeconds: 1 });
     expect(result.outcome).toBe("worker_timeout");
     expect(cancelRequestsOf(fixture)).toHaveLength(1);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("G2: a hung /logs never delays the terminal status or eats the worker deadline", async () => {
+  // the operation is already terminal daemon-side; every /logs request
+  // hangs forever. The drain's own bounded cap fails the drain once, the
+  // loop stops draining and the authoritative status still arrives well
+  // before the overall worker deadline: log observation cannot own the
+  // worker outcome.
+  const fixture = startFixture({ logFault: "hang", log: "early-bytes\n" });
+  try {
+    const startedAt = Date.now();
+    const result = await runOperation(fixture, { timeoutSeconds: 5 });
+    const elapsed = Date.now() - startedAt;
+    expect(result.outcome).toBe("completed");
+    // strictly before the 5 s deadline, and bounded by the drain cap plus
+    // the poll cycle rather than the deadline
+    expect(elapsed).toBeLessThan(4_500);
+    expect(result.capture.status === "truncated" || result.capture.status === "unavailable").toBe(true);
+    // the hung drain is attempted exactly once and never retried
+    expect(
+      fixture.requests.filter((request) => request.path.includes("/logs")),
+    ).toHaveLength(1);
+    // no cancel is sent after the terminal status was classified
+    expect(cancelRequestsOf(fixture)).toHaveLength(0);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("G2: a hung terminal-phase drain also cannot turn a succeeded operation into a timeout", async () => {
+  // the daemon stays running for a while and only then reaches its
+  // terminal; the first drain succeeds, later drains hang forever, the
+  // terminal drain chain stops at its bound and the success survives
+  const fixture = startFixture({ logFault: "hangAfterFirst", holdMs: 500, log: "delivered-early\n" });
+  try {
+    const startedAt = Date.now();
+    const result = await runOperation(fixture, { timeoutSeconds: 6 });
+    const elapsed = Date.now() - startedAt;
+    expect(result.outcome).toBe("completed");
+    expect(elapsed).toBeLessThan(5_500);
+    expect(result.capture.status).toBe("truncated");
+    expect(new TextDecoder().decode(result.capture.tailBytes)).toBe("delivered-early\n");
+    expect(cancelRequestsOf(fixture)).toHaveLength(0);
   } finally {
     fixture.close();
   }
@@ -818,3 +945,74 @@ test("the capture object is frozen and the byte view is the retained tail", asyn
     fixture.close();
   }
 });
+
+// --- G3: the honest capture/response bound pair -------------------------------
+
+test("G3: the response bound is the worst-case JSON encoding of a full capture payload", () => {
+  // every control character escapes to six ASCII bytes (`\u00XX`), quotes
+  // and backslashes double; the envelope adds a bounded constant. The
+  // response bound must therefore admit the worst-case encoding of a
+  // complete capture payload, or a legitimate worst-case log response
+  // would be rejected as oversized.
+  expect(WORKER_LOG_RESPONSE_BOUND_BYTES).toBe(6 * WORKER_LOG_CAPTURE_BOUND_BYTES + 65_536);
+  expect(Number.isSafeInteger(WORKER_LOG_CAPTURE_BOUND_BYTES)).toBe(true);
+  expect(Number.isSafeInteger(WORKER_LOG_RESPONSE_BOUND_BYTES)).toBe(true);
+});
+
+test("G3: a control-character-heavy payload that the old 8 MiB response bound would reject now delivers byte-exactly", async () => {
+  // 2 MiB of NUL bytes encode to a ~12 MiB JSON response: larger than the
+  // former 8 MiB response bound, well under the honest pair's bound.
+  const payload = "\u0000".repeat(2 * 1024 * 1024);
+  const fixture = startFixture({ log: payload, pageBytes: 2 * 1024 * 1024 });
+  try {
+    const result = await runOperation(fixture, { timeoutSeconds: 30 });
+    expect(result.outcome).toBe("completed");
+    expect(result.capture.status).toBe("captured");
+    expect(result.capture.byteCount).toBe(2 * 1024 * 1024);
+    expect(result.capture.truncatedDaemon).toBe(false);
+    expect(result.capture.truncatedLocal).toBe(false);
+    expect(result.capture.tailBytes.byteLength).toBe(2 * 1024 * 1024);
+    // byte-exact: every retained byte is NUL
+    expect(Buffer.from(result.capture.tailBytes).equals(Buffer.alloc(2 * 1024 * 1024, 0))).toBe(true);
+  } finally {
+    fixture.close();
+  }
+}, 20_000);
+
+test("G3: a full 8 MiB worst-case payload survives the response bound as captured", async () => {
+  // the honest full-scale proof: a complete 8 MiB capture payload of NUL
+  // bytes encodes to ~48 MiB of JSON response — exactly the worst case the
+  // bound pair admits — and is never rejected as oversized.
+  const payload = "\u0000".repeat(WORKER_LOG_CAPTURE_BOUND_BYTES);
+  const fixture = startFixture({ log: payload, pageBytes: WORKER_LOG_CAPTURE_BOUND_BYTES });
+  try {
+    const result = await runOperation(fixture, { timeoutSeconds: 40 });
+    expect(result.outcome).toBe("completed");
+    expect(result.capture.status).toBe("captured");
+    expect(result.capture.byteCount).toBe(WORKER_LOG_CAPTURE_BOUND_BYTES);
+    expect(result.capture.truncatedDaemon).toBe(false);
+    expect(result.capture.truncatedLocal).toBe(false);
+    expect(result.capture.tailBytes.byteLength).toBe(WORKER_LOG_CAPTURE_BOUND_BYTES);
+  } finally {
+    fixture.close();
+  }
+}, 40_000);
+
+test("G3: quotes, backslashes, controls and multibyte UTF-8 pass through the bounded drain byte-exactly", async () => {
+  // a mixed worst-case payload: every escaping class at once
+  const parts: string[] = [];
+  for (let index = 0; index < 200_000; index += 1) {
+    parts.push('"', "\\", "\u0000", "\u0001", "é", "😀");
+  }
+  const payload = parts.join("");
+  const fixture = startFixture({ log: payload, pageBytes: 3 * 1024 * 1024 });
+  try {
+    const result = await runOperation(fixture, { timeoutSeconds: 30 });
+    expect(result.outcome).toBe("completed");
+    expect(result.capture.status).toBe("captured");
+    expect(result.capture.byteCount).toBe(Buffer.byteLength(payload, "utf8"));
+    expect(new TextDecoder().decode(result.capture.tailBytes)).toBe(payload);
+  } finally {
+    fixture.close();
+  }
+}, 20_000);

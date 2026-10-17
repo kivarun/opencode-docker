@@ -183,6 +183,18 @@ import {
   PipelineV2RunStateStoreError,
 } from "./pipeline_v2_state_store.ts";
 import {
+  bindingOfParsedWorkerLog,
+  loadPipelineV2WorkerLog,
+  PipelineV2WorkerLogStoreError,
+  publishPipelineV2WorkerLog,
+} from "./pipeline_v2_worker_log_store.ts";
+import {
+  PipelineV2WorkerLogArtifactError,
+  parseWorkerLogArtifact,
+} from "./pipeline_v2_worker_log.ts";
+import type { PipelineV2WorkerLogState } from "./pipeline_v2_state.ts";
+import type { WorkerLogCapture } from "./worker_operation.ts";
+import {
   requireResolvedPipelineV2Provenance,
   type PipelineDecisionStateResult,
   type ResolvedPipelineV2,
@@ -192,11 +204,20 @@ import {
  * Lifecycle result of one worker run, reported by the injected Execution
  * Session. It carries no stdout, no artifacts and no outcome string: after
  * a completed run the engine applies its own fixed `completed` outcome,
- * and a typed worker failure fails the execution.
+ * and a typed worker failure fails the execution. The optional `capture`
+ * is the runtime adapter's frozen in-memory bounded log capture of the
+ * finished operation (`undefined`/`null` when the worker never ran or the
+ * adapter obtained nothing verifiable); the coordinator publishes it as
+ * the run-root worker-log artifact and binds it atomically with the
+ * terminal worker result. The capture never crosses back to the runtime.
  */
 export type PipelineV2WorkerRunResult =
-  | { readonly status: "completed" }
-  | { readonly status: "failed"; readonly reason: "worker_failed" | "worker_timeout" };
+  | { readonly status: "completed"; readonly capture?: WorkerLogCapture | null }
+  | {
+      readonly status: "failed";
+      readonly reason: "worker_failed" | "worker_timeout";
+      readonly capture?: WorkerLogCapture | null;
+    };
 
 /**
  * The Tool Session of one activation: project scope, its bearer is the
@@ -237,6 +258,19 @@ export interface PipelineV2AgentRuntime {
     state: V2AgentExecutionView,
     activation: PreparedActivationData,
   ): Promise<PipelineV2ToolSession>;
+
+  /**
+   * Deletes the two durably recorded sessions of an interrupted agent
+   * execution by their durable ids (the worker-log recovery only): the
+   * Tool session first, then the Execution session, each exactly once,
+   * mirroring the live cleanup order. The per-slot outcomes are honest —
+   * a failed delete reports `failed`, never `completed`. Optional:
+   * runtimes that cannot delete by id never silently claim a cleanup.
+   */
+  cleanupSessionsByIds?(
+    executionSessionId: string,
+    toolSessionId: string,
+  ): Promise<{ execution: "completed" | "failed"; tool: "completed" | "failed" }>;
 }
 
 /**
@@ -310,6 +344,8 @@ export type PipelineV2ResumeRefusalReason =
   | "run_layout_invalid"
   | "run_input_modified"
   | "accepted_output_modified"
+  | "artifact_missing"
+  | "artifact_modified"
   | "internal_error";
 
 /**
@@ -586,9 +622,18 @@ function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined
     return undefined;
   }
   if (status === "completed") {
-    return keys.length === 1 && keys[0] === "status" ? { status: "completed" } : undefined;
+    return keys.length === 1 ||
+      (keys.length === 2 && keys.includes("capture") && keys.includes("status"))
+      ? { status: "completed" }
+      : undefined;
   }
-  if (status !== "failed" || keys.length !== 2 || !keys.includes("reason")) {
+  if (
+    status !== "failed" ||
+    keys.length < 2 ||
+    keys.length > 3 ||
+    !keys.includes("reason") ||
+    (keys.length === 3 && !keys.includes("capture"))
+  ) {
     return undefined;
   }
   let reason: unknown;
@@ -601,6 +646,53 @@ function parseWorkerRunResult(value: unknown): ParsedWorkerRunResult | undefined
     return { status: "failed", reason };
   }
   return undefined;
+}
+
+/**
+ * Extracts the worker-log capture of a parsed run result defensively: an
+ * absent, null or malformed capture is an honest `null` (no verifiable
+ * bytes), a well-shaped frozen record passes through unchanged. The
+ * capture object itself is never copied, frozen or mutated here.
+ */
+function extractWorkerLogCapture(value: unknown): WorkerLogCapture | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const candidate = value as Record<string, unknown>;
+  try {
+    const status = candidate.status;
+    if (status !== "captured" && status !== "truncated" && status !== "unavailable") {
+      return null;
+    }
+    const byteCount = candidate.byteCount;
+    if (typeof byteCount !== "number" || !Number.isSafeInteger(byteCount) || byteCount < 0) {
+      return null;
+    }
+    if (!(candidate.tailBytes instanceof Uint8Array)) {
+      return null;
+    }
+    if (typeof candidate.truncatedDaemon !== "boolean" || typeof candidate.truncatedLocal !== "boolean") {
+      return null;
+    }
+    return value as WorkerLogCapture;
+  } catch {
+    return null;
+  }
+}
+
+/** Reads the optional capture member of a raw run result defensively. */
+function readWorkerCaptureSafely(outcome: unknown): WorkerLogCapture | null {
+  if (typeof outcome !== "object" || outcome === null) {
+    return null;
+  }
+  try {
+    return extractWorkerLogCapture((outcome as { capture?: unknown }).capture);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -858,6 +950,13 @@ interface ExecutionTracking {
   /** An execution record exists that no transition has committed yet. */
   unfinished: boolean;
   session: AgentSessionTracking | null;
+  /**
+   * The worker-log binding fixed for the current agent execution, or
+   * `null` before the worker ran. Once fixed it joins the same
+   * `agent_outputs_accepted`/`agent_failed` command as the terminal
+   * worker result; it is never rewritten.
+   */
+  workerLog: PipelineV2WorkerLogState | null;
 }
 
 /**
@@ -1082,6 +1181,7 @@ export async function coordinatePipelineV2Run(
     takeCutoff,
     createExecutionSession: capturedCreateExecutionSession,
     createToolSession: capturedCreateToolSession,
+    cleanupSessionsByIds: runtime.cleanupSessionsByIds,
   });
 }
 
@@ -1129,6 +1229,11 @@ interface PipelineV2ContinuationSetup {
   readonly takeCutoff: () => "SIGINT" | "SIGTERM" | null;
   readonly createExecutionSession: CapturedCreateExecutionSession;
   readonly createToolSession: CapturedCreateToolSession;
+  /**
+   * The runtime's durable-session deletion capability (the worker-log
+   * recovery only); captured exactly once with the other runtime members.
+   */
+  readonly cleanupSessionsByIds: PipelineV2AgentRuntime["cleanupSessionsByIds"];
 }
 
 async function continuePipelineV2Coordination(
@@ -1145,7 +1250,7 @@ async function continuePipelineV2Coordination(
   let stateAbandoned = false;
   let finalized = false;
   let failureReason: PipelineV2FailureReason | undefined;
-  const tracking: ExecutionTracking = { kind: null, unfinished: false, session: null };
+  const tracking: ExecutionTracking = { kind: null, unfinished: false, session: null, workerLog: null };
   const accepted: AcceptedStateOutput[] = [...setup.acceptedInitial];
 
   /**
@@ -1256,7 +1361,92 @@ async function continuePipelineV2Coordination(
     const recordReason = durableCleanupFailed()
       ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
       : executionReasonFor("agent", reason);
-    return { kind: "agent_failed", reason: recordReason, sessionCleanup };
+    return {
+      kind: "agent_failed",
+      reason: recordReason,
+      sessionCleanup,
+      workerLog: tracking.workerLog ?? { status: "unavailable" },
+    };
+  };
+
+  /**
+   * The publish-then-bind composition of one finished agent worker: the
+   * frozen in-memory capture becomes at most one self-describing
+   * run-root artifact, and the verified binding joins the SAME reducer
+   * command that fixes the terminal worker result. The outcome is never
+   * changed by capture or publication problems:
+   *
+   *   - no capture / unavailable / zero bytes → `{status: "unavailable"}`,
+   *     no artifact, no filesystem effect;
+   *   - a publication failure (`io_failure`, `invalid_layout`) or a
+   *     formation error → `{status: "unavailable"}`, the pipeline keeps
+   *     the original worker outcome;
+   *   - a `durability_unknown` outcome keeps the visible candidate: its
+   *     exact canonical bytes are parsed and the binding is rebuilt from
+   *     them (an exact retry confirms the durability);
+   *   - a store `conflict` — an existing artifact with different bytes,
+   *     a substituted object, a wrong mode — is an integrity defect and
+   *     fails closed: the already-published artifact is never masked as
+   *     unavailable. The failure is classified by typed fields only.
+   *
+   * The preflight state check runs before the first filesystem effect.
+   */
+  const recordWorkerLog = async (
+    executionIndex: number,
+    capture: WorkerLogCapture | null,
+  ): Promise<PipelineV2WorkerLogState> => {
+    if (capture === null || capture.status === "unavailable" || capture.byteCount === 0) {
+      return { status: "unavailable" };
+    }
+    // Preflight state checks before the first filesystem effect: the
+    // execution must be the still-unfinished running agent execution with
+    // no binding yet.
+    const snapshot = requireSnapshot();
+    const execution = snapshot.executions[executionIndex - 1];
+    if (
+      execution === undefined ||
+      execution.type !== "agent" ||
+      execution.phase !== "running" ||
+      execution.worker_log !== null
+    ) {
+      throw new Error(
+        "pipeline v2 worker log preflight failed: the execution is not an unfinished running agent execution",
+      );
+    }
+    try {
+      const published = await publishPipelineV2WorkerLog(runRoot, executionIndex, capture);
+      if (published === null) {
+        return { status: "unavailable" };
+      }
+      return published.binding;
+    } catch (cause) {
+      if (cause instanceof PipelineV2WorkerLogStoreError && cause.reason === "conflict") {
+        // An integrity defect of an already-published artifact: never
+        // masked as unavailable, never rewritten. Typed-field classified.
+        throw cause;
+      }
+      if (
+        cause instanceof PipelineV2WorkerLogStoreError &&
+        cause.outcome === "durability_unknown" &&
+        cause.candidate !== undefined
+      ) {
+        // The visible candidate carries the exact canonical bytes: the
+        // binding is rebuilt from them honestly; an exact retry confirms
+        // the durability of the published file.
+        const parsed = parseWorkerLogArtifact(cause.candidate.canonical_json, executionIndex);
+        return {
+          status: parsed.status,
+          sha256: parsed.sha256,
+          byte_count: parsed.byte_count,
+          truncated_daemon: parsed.truncated_daemon,
+          truncated_local: parsed.truncated_local,
+        };
+      }
+      // Every other capture/formation/publication failure is
+      // outcome-neutral: the binding is honestly unavailable and the
+      // original worker outcome stands.
+      return { status: "unavailable" };
+    }
   };
 
   /**
@@ -1887,6 +2077,197 @@ async function continuePipelineV2Coordination(
   };
 
   /**
+   * The worker-log recovery suffixes (schema v9): both windows belong to
+   * an agent execution whose worker already ran in a previous process and
+   * is never re-run.
+   *
+   *   - `agent-in-flight` (phase `running`): the published artifact is
+   *     adopted when one exists (C5) and becomes the honest binding;
+     *     with no artifact the binding is `unavailable` (C2/C3/C4). A
+   *     damaged or foreign artifact is an integrity defect and fails
+   *     closed before any dispatch — it is never masked as unavailable.
+   *     Both durable sessions are deleted by id (Tool first), the
+   *     execution fails with `agent_failed` carrying the binding, and
+   *     the run finalizes with the existing failure semantics.
+   *   - `worker-settled` (phase `outputs_accepted`): the acceptance is
+   *     durable, so only the session cleanup and the transition are
+   *     missing; the binding and the outputs are never touched (C6/C7).
+   *     A failed session delete records the session cleanup failure and
+   *     finalizes the run with `run_cleanup_failed`.
+   *
+   * The recovery runtime must be able to delete sessions by id; a
+   * runtime without that capability never silently claims a cleanup.
+   */
+  const runWorkerLogRecovery = async (
+    recovery: Extract<PipelineV2ExecutableRecovery, { kind: "worker-settled" | "agent-in-flight" }>,
+  ): Promise<PipelineV2CoordinationResult | null> => {
+    const cleanupSessionsByIds = setup.cleanupSessionsByIds;
+    if (typeof cleanupSessionsByIds !== "function") {
+      throw new Error(
+        "pipeline v2 worker log recovery requires a runtime that can delete sessions by durable id",
+      );
+    }
+    if (recovery.kind === "agent-in-flight") {
+      // 1. Adopt the published artifact when one exists; integrity
+      //    conflicts fail closed before any dispatch.
+      let workerLog: PipelineV2WorkerLogState;
+      try {
+        const parsed = await loadPipelineV2WorkerLog(runRoot, recovery.executionIndex);
+        workerLog =
+          parsed === null
+            ? { status: "unavailable" }
+            : {
+                status: parsed.status,
+                sha256: parsed.sha256,
+                byte_count: parsed.byte_count,
+                truncated_daemon: parsed.truncated_daemon,
+                truncated_local: parsed.truncated_local,
+              };
+      } catch (cause) {
+        if (
+          (cause instanceof PipelineV2WorkerLogStoreError && cause.reason === "conflict") ||
+          cause instanceof PipelineV2WorkerLogArtifactError
+        ) {
+          // A damaged or foreign published artifact is an integrity
+          // defect: never masked as unavailable, never rewritten. (The
+          // restore's zero-write verification normally refuses before
+          // this point; this is defense-in-depth for the racing case.)
+          throw cause;
+        }
+        // A read failure of an absent-or-unreadable artifact is
+        // outcome-neutral here: the honest binding is unavailable.
+        workerLog = { status: "unavailable" };
+      }
+      // 2. Delete both durable sessions (Tool first inside).
+      const cleanup = await cleanupSessionsByIds(
+        recovery.executionSessionId,
+        recovery.toolSessionId,
+      );
+      const cleanupFailed = cleanup.execution === "failed" || cleanup.tool === "failed";
+      // 3. The execution failure carries the binding atomically.
+      const failed = await dispatchOutcomeAware({
+        kind: "agent_failed",
+        reason: cleanupFailed
+          ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON
+          : ("worker_failed" as const),
+        sessionCleanup: cleanup,
+        workerLog,
+      });
+      if (failed.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      // 4. The run finalizes with the existing failure semantics.
+      const finalized = await dispatchOutcomeAware(
+        cleanupFailed
+          ? ({ kind: "run_cleanup_failed" } as const)
+          : ({ kind: "run_failed", reason: "worker_failed" } as const),
+      );
+      if (finalized.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      return deepFreeze({
+        ok: false as const,
+        reason: cleanupFailed ? PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON : ("worker_failed" as const),
+        state: requireSnapshot(),
+      });
+    }
+    // worker-settled: the acceptance is durable; cleanup + transition.
+    // The durable binding is immutable: a post-acceptance failure carries
+    // exactly the already-bound record.
+    const current = requireSnapshot();
+    const settledExecution = current.executions[recovery.executionIndex - 1];
+    const durableBinding =
+      settledExecution !== undefined && settledExecution.type === "agent"
+        ? settledExecution.worker_log
+        : null;
+    if (durableBinding === null) {
+      throw new Error(
+        "pipeline v2 worker log recovery requires the settled execution's durable worker log binding",
+      );
+    }
+    const cleanup = await cleanupSessionsByIds(
+      recovery.executionSessionId,
+      recovery.toolSessionId,
+    );
+    const cleanupFailed = cleanup.execution === "failed" || cleanup.tool === "failed";
+    if (cleanupFailed) {
+      const failed = await dispatchOutcomeAware({
+        kind: "agent_failed",
+        reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
+        sessionCleanup: cleanup,
+        workerLog: durableBinding,
+      });
+      if (failed.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      const finalized = await dispatchOutcomeAware({ kind: "run_cleanup_failed" });
+      if (finalized.outcome !== "committed") {
+        return deepFreeze({
+          ok: false as const,
+          reason: "state_persist_failed" as const,
+          state: sink.snapshot,
+        });
+      }
+      return deepFreeze({
+        ok: false as const,
+        reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
+        state: requireSnapshot(),
+      });
+    }
+    const cleaned = await dispatchOutcomeAware({ kind: "agent_cleanup_completed" });
+    if (cleaned.outcome !== "committed") {
+      return deepFreeze({
+        ok: false as const,
+        reason: "state_persist_failed" as const,
+        state: sink.snapshot,
+      });
+    }
+    // The stage agent's fixed lifecycle outcome: the same shared kernel
+    // the live engine hook uses, including the post-commit signal
+    // checkpoint and the trusted stage-wait attempt.
+    let step: TransitionStep;
+    try {
+      step = compiledTransitionFor(pipeline, recovery.stateId, "completed");
+    } catch (cause) {
+      if (cause instanceof PipelineExecutionError) {
+        throw cause;
+      }
+      throw cause;
+    }
+    const applied = await applyTransitionCommit(step, recovery.executionIndex);
+    if (applied.outcome === "suspended-waiting") {
+      return deepFreeze({ ok: false as const, waiting: true as const, state: requireSnapshot() });
+    }
+    if (applied.outcome === "wait-entry-failed") {
+      return deepFreeze({
+        ok: false as const,
+        reason: waitEntryFailureReason(applied.cause),
+        state: applied.state ?? sink.snapshot,
+      });
+    }
+    // The transition is durably committed; the engine continues from the
+    // authoritative post-suffix cursor (the restored seed predates it).
+    const after = requireSnapshot();
+    postSuffixSeed = deepFreeze({
+      current_state: after.cursor.current_state,
+      transition_count: after.cursor.transition_count,
+    });
+    return null;
+  };
+
+  /**
    * The exact recovery-suffix execution of one classified post-commit
    * crash window, run inside the single continuation chain so every
    * durable write, signal checkpoint, wait entry, finalization and
@@ -1913,6 +2294,12 @@ async function continuePipelineV2Coordination(
    *     checkpoint and the trusted stage-wait attempt) and falls through
    *     to the engine, which continues from the post-suffix cursor.
    */
+  // A worker-settled recovery suffix commits its own transition, so the
+  // engine must continue from the authoritative post-suffix cursor — the
+  // restored seed predates the suffix. The worker-settled tail writes this
+  // holder from the authoritative snapshot after the commit; every other
+  // window leaves it null (the transition window's seed is precomputed).
+  let postSuffixSeed: PipelineV2GraphResumeSeed | null = null;
   const runRecoverySuffix = async (
     recovery: PipelineV2ExecutableRecovery,
   ): Promise<PipelineV2CoordinationResult | null> => {
@@ -1948,6 +2335,9 @@ async function continuePipelineV2Coordination(
             : recovery.command.reason,
         state,
       });
+    }
+    if (recovery.kind === "worker-settled" || recovery.kind === "agent-in-flight") {
+      return await runWorkerLogRecovery(recovery);
     }
     if (recovery.kind === "terminal") {
       return await runTerminalPhase(
@@ -1986,6 +2376,7 @@ async function continuePipelineV2Coordination(
       checkSignal();
       tracking.kind = "agent";
       tracking.unfinished = false;
+      tracking.workerLog = null;
       const sessionTracking: AgentSessionTracking = {
         execution: { cleanup: null, cleanupDone: false, cleanupFailed: false },
         tool: { cleanup: null, cleanupDone: false, cleanupFailed: false },
@@ -2096,6 +2487,15 @@ async function continuePipelineV2Coordination(
           "pipeline v2 agent session contract violated: runAgent must return a completed or a typed failed result",
         );
       }
+      // 10b. publish-then-bind: the frozen in-memory capture becomes at
+      //      most one run-root artifact and the verified binding joins
+      //      the SAME command that fixes the terminal worker result
+      //      (below). Capture and publication problems never change the
+      //      worker outcome; an integrity conflict fails closed.
+      tracking.workerLog = null;
+      const workerCapture = readWorkerCaptureSafely(outcome);
+      const workerLog = await recordWorkerLog(executionIndex, workerCapture);
+      tracking.workerLog = workerLog;
       if (parsed.status === "failed") {
         // Both sessions are cleaned exactly once, tool first; the
         // failure is recorded durably and the engine stops before any
@@ -2108,10 +2508,12 @@ async function continuePipelineV2Coordination(
       // 11. accept the activation outputs (the worker held them read-write)
       const records = await acceptActivationOutputs(pipeline, activation);
 
-      // 12. agent_outputs_accepted
+      // 12. agent_outputs_accepted — the terminal worker result and the
+      //     worker-log binding are fixed by this one atomic commit
       await dispatchState({
         kind: "agent_outputs_accepted",
         outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+        workerLog,
       });
 
       // 13./14. cleanup the Tool session, then the Execution session,
@@ -2150,6 +2552,7 @@ async function continuePipelineV2Coordination(
       tracking.kind = "decision";
       tracking.unfinished = false;
       tracking.session = null;
+      tracking.workerLog = null;
 
       // 1. the next global execution index — for a resumed run exactly the
       //    restored next execution index (the first callback), afterwards
@@ -2295,7 +2698,7 @@ async function continuePipelineV2Coordination(
     // Both call sites compile through the same single `runCompiledGraph`.
     const engineResult = setup.seed === null
       ? await executePipelineV2Graph(pipeline, executors, { onTransitionCommit })
-      : await executePipelineV2GraphResume(pipeline, executors, setup.seed, { onTransitionCommit });
+      : await executePipelineV2GraphResume(pipeline, executors, postSuffixSeed ?? setup.seed, { onTransitionCommit });
 
     // Checkpoint after the engine, before the terminal record and the run
     // output publication: a signal accepted while the engine ran stops the
@@ -2569,5 +2972,6 @@ export async function resumePipelineV2Run(
     takeCutoff,
     createExecutionSession: capturedCreateExecutionSession,
     createToolSession: capturedCreateToolSession,
+    cleanupSessionsByIds: runtime.cleanupSessionsByIds,
   });
 }

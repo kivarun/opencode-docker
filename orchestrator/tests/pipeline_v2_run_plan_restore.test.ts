@@ -237,7 +237,7 @@ function executionPhases(sessionIndex: number): PipelineV2RunCommand[] {
 function planningPhases(sessionIndex: number): PipelineV2RunCommand[] {
   return [
     ...executionPhases(sessionIndex),
-    { kind: "agent_outputs_accepted", outputs: [] },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ];
 }
@@ -1637,7 +1637,7 @@ test("11. the bridge: the durable ledger and manifests restore the compiled plan
     accepted.push(...architectRecords);
     await dispatch(harness, {
       kind: "agent_outputs_accepted",
-      outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: architectRecords.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await dispatch(harness, { kind: "agent_cleanup_completed" });
 
@@ -1704,7 +1704,7 @@ test("11. the bridge: the durable ledger and manifests restore the compiled plan
     const stageRecords = await acceptActivationOutputs(harness.pipeline, stageActivation);
     await dispatch(harness, {
       kind: "agent_outputs_accepted",
-      outputs: stageRecords.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: stageRecords.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await dispatch(harness, { kind: "agent_cleanup_completed" });
     accepted.push(...stageRecords);

@@ -284,7 +284,7 @@ async function drivePrefix(
     const records = await acceptActivationOutputs(pipeline, activation);
     await rec.dispatch({
       kind: "agent_outputs_accepted",
-      outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await rec.dispatch({ kind: "agent_cleanup_completed" });
     if (commit) {
@@ -694,7 +694,7 @@ test("derivation refusals happen before any pipeline, profile, authority or runt
   const records3 = await acceptActivationOutputs(pipeline2, activation3);
   await rec2.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records3.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records3.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await rec2.dispatch({ kind: "agent_cleanup_completed" });
   await rec2.dispatch({

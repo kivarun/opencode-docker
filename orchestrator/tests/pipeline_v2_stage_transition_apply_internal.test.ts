@@ -69,7 +69,7 @@ async function seedSettledExecution(sink: PipelineV2RunStateSink, pipeline: Reso
     { kind: "agent_execution_session_created", sessionId: "exec-1" },
     { kind: "agent_tool_session_created", sessionId: "tool-1" },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [] },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ] as PipelineV2RunCommand[]) {
     await sink.dispatch(command);

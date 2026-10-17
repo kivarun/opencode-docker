@@ -376,7 +376,7 @@ async function playPlanningExecution(recording: RecordingSink): Promise<number> 
   }
   await recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: [{ id: "plan", digest: hex("d") }],
+    outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }
   });
   await recording.dispatch({ kind: "agent_cleanup_completed" });
   return index;
@@ -630,7 +630,7 @@ async function setupRuntimeProposal(): Promise<RuntimeProposalFixture> {
   accepted.push(...records);
   await recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await recording.dispatch({ kind: "agent_cleanup_completed" });
   return { dirs, pipeline, recording, protectedDigest: protectedInput.digest, records };
@@ -692,7 +692,7 @@ async function setupReplanning(): Promise<ReplanningFixture> {
   }
   await reopened.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: [{ id: "plan", digest: hex("e") }],
+    outputs: [{ id: "plan", digest: hex("e") }], workerLog: { status: "unavailable" }
   });
   await reopened.dispatch({ kind: "agent_cleanup_completed" });
   return { harness, plan1, taskA1, state: reopened.snapshot as PipelineV2RunState };
@@ -2021,7 +2021,7 @@ test("14. the origin is the last durable execution regardless of its role — th
     }
     await dispatch(harness, {
       kind: "agent_outputs_accepted",
-      outputs: [],
+      outputs: [], workerLog: { status: "unavailable" }
     });
     await dispatch(harness, { kind: "agent_cleanup_completed" });
 
@@ -2218,7 +2218,7 @@ async function setupAnchoredRuntime(): Promise<AnchoredFixture> {
   accepted.push(...records);
   await recording.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await recording.dispatch({ kind: "agent_cleanup_completed" });
 
@@ -2467,7 +2467,7 @@ test("16b. the pointer-only completed boundary recognizes the accepted plan inst
     const records = await acceptActivationOutputs(pipeline, prep);
     await recording.dispatch({
       kind: "agent_outputs_accepted",
-      outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
     const firstProposal = preparePipelineV2RunPlanProposal(PROPOSAL_DOC);
@@ -2512,7 +2512,7 @@ test("16b. the pointer-only completed boundary recognizes the accepted plan inst
     const records2 = await acceptActivationOutputs(pipeline, prep2);
     await recording.dispatch({
       kind: "agent_outputs_accepted",
-      outputs: records2.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: records2.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await recording.dispatch({ kind: "agent_cleanup_completed" });
 

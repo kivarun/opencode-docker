@@ -160,7 +160,7 @@ const COVERAGE_B_COMMANDS = [
   { kind: "agent_execution_session_created", sessionId: "sess-b-1" },
   { kind: "agent_tool_session_created", sessionId: "tool-b-1" },
   { kind: "agent_running" },
-  { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex64("b") }] },
+  { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex64("b") }], workerLog: { status: "unavailable" }  },
   { kind: "agent_cleanup_completed" },
   { kind: "transition_committed", step: { from: "architect", outcome: "completed", to: "gate", transition_index: 0 }, executionIndex: 1 },
   { kind: "start_decision_execution", stateId: "gate", inputDigest: hex64("d"), executionRole: "control" },
@@ -171,7 +171,7 @@ const COVERAGE_B_COMMANDS = [
   { kind: "agent_execution_session_created", sessionId: "sess-b-2" },
   { kind: "agent_tool_session_created", sessionId: "tool-b-2" },
   { kind: "agent_running" },
-  { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+  { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
   { kind: "run_failed", reason: "worker_failed" },
 ] as const;
 
@@ -182,7 +182,7 @@ const COVERAGE_C_COMMANDS = [
   { kind: "agent_execution_session_created", sessionId: "sess-c-1" },
   { kind: "agent_tool_session_created", sessionId: "tool-c-1" },
   { kind: "agent_running" },
-  { kind: "agent_failed", reason: "session_cleanup_failed", sessionCleanup: { execution: "completed", tool: "failed" } },
+  { kind: "agent_failed", reason: "session_cleanup_failed", sessionCleanup: { execution: "completed", tool: "failed" }, workerLog: { status: "unavailable" }  },
   { kind: "run_cleanup_failed" },
 ] as const;
 
@@ -193,7 +193,7 @@ const COVERAGE_D_COMMANDS = [
   { kind: "agent_execution_session_created", sessionId: "sess-d-1" },
   { kind: "agent_tool_session_created", sessionId: "tool-d-1" },
   { kind: "agent_running" },
-  { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex64("e") }] },
+  { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex64("e") }], workerLog: { status: "unavailable" }  },
   { kind: "agent_cleanup_completed" },
   { kind: "transition_committed", step: { from: "architect", outcome: "completed", to: "gate", transition_index: 0 }, executionIndex: 1 },
   { kind: "start_decision_execution", stateId: "gate", inputDigest: hex64("f"), executionRole: "control" },

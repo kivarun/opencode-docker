@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  PIPELINE_V2_COMMIT_PROVENANCE_KINDS,
   PIPELINE_V2_RUN_STATE_SCHEMA_VERSION,
   PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
   PIPELINE_V2_TERMINAL_FAILURE_REASON,
@@ -143,7 +144,7 @@ function startAgent(
 }
 
 function acceptOutputs(driver: Driver, outputs: readonly { id: string; digest: string }[]): void {
-  driver.apply({ kind: "agent_outputs_accepted", outputs: [...outputs] });
+  driver.apply({ kind: "agent_outputs_accepted", outputs: [...outputs], workerLog: { status: "unavailable" }  });
   driver.apply({ kind: "agent_cleanup_completed" });
 }
 
@@ -299,7 +300,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver();
     playSuccessRun(driver);
     const state = driver.current as PipelineV2RunState;
-    expect(state.schema_version).toBe(8);
+    expect(state.schema_version).toBe(9);
     expect(state.revision).toBe(23);
     expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
@@ -320,7 +321,7 @@ describe("pipeline v2 run state schema v6", () => {
       { index: 0, from: "check", outcome: "approved", to: "ship", execution_index: 2 },
       { index: 0, from: "ship", outcome: "completed", to: "done", execution_index: 3 },
     ]);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(8);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(9);
   });
 
   test("every accepted command grows the revision by exactly one and refreshes updated_at", () => {
@@ -665,7 +666,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver();
     driver.apply(createRun());
     startAgent(driver, "implement", { execution: "sess-1" });
-    driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  });
     driver.reject(
       {
         kind: "transition_committed",
@@ -694,7 +695,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver();
     driver.apply(createRun());
     startAgent(driver, "implement", { execution: "sess-1" });
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
     driver.reject(
       {
         kind: "transition_committed",
@@ -861,7 +862,7 @@ describe("pipeline v2 run state schema v6", () => {
       "a cleanup failure requires the last agent execution to have failed with an unconfirmed session cleanup",
     );
     startAgent(driver, "implement", { execution: "sess-1" });
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
     driver.reject(
       { kind: "run_cleanup_failed" },
       "a cleanup failure requires the last agent execution to have failed with an unconfirmed session cleanup",
@@ -877,7 +878,7 @@ describe("pipeline v2 run state schema v6", () => {
     driver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: { execution: "completed", tool: "failed" },
+      sessionCleanup: { execution: "completed", tool: "failed" }, workerLog: { status: "unavailable" }
     });
     driver.apply({ kind: "run_cleanup_failed" });
     const state = driver.current as PipelineV2RunState;
@@ -893,7 +894,7 @@ describe("pipeline v2 run state schema v6", () => {
     driver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: { execution: "failed", tool: "completed" },
+      sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     driver.reject(
       { kind: "run_failed", reason: "worker_failed" },
@@ -940,7 +941,7 @@ describe("pipeline v2 run state schema v6", () => {
     const sessionsCreated = driver.current as PipelineV2RunState;
     driver.apply({ kind: "agent_running" });
     const running = driver.current as PipelineV2RunState;
-    driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  });
     const outputsAccepted = driver.current as PipelineV2RunState;
     driver.apply({ kind: "agent_cleanup_completed" });
     const cleanupCompleted = driver.current as PipelineV2RunState;
@@ -1014,7 +1015,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
     startAgent(driver, "implement", { execution: "sess-1" });
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
     const failed = driver.current as PipelineV2RunState;
     expectInvalid(failed, (draft) => {
       delete draft.executions[0].failure_reason;
@@ -1170,6 +1171,7 @@ describe("pipeline v2 run state schema v6", () => {
     // (b) "execution_session_created" phase coherence in both directions.
     expectInvalid(state, (draft) => {
       draft.executions[0].phase = "execution_session_created";
+      draft.executions[0].worker_log = null;
       draft.executions[0].execution_session_id = undefined;
       draft.executions[0].tool_session_id = undefined;
       draft.executions[0].session_cleanup = undefined;
@@ -1177,6 +1179,7 @@ describe("pipeline v2 run state schema v6", () => {
     }, 'has phase "execution_session_created" but records no execution session');
     expectInvalid(state, (draft) => {
       draft.executions[0].phase = "execution_session_created";
+      draft.executions[0].worker_log = null;
       draft.executions[0].session_cleanup = undefined;
       draft.executions[0].outputs = undefined;
     }, 'has phase "execution_session_created" but already records a tool session');
@@ -1198,7 +1201,7 @@ describe("pipeline v2 run state schema v6", () => {
     failedDriver.apply({
       kind: "agent_failed",
       reason: "worker_failed",
-      sessionCleanup: { execution: "completed", tool: "completed" },
+      sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
     const failedState = failedDriver.current as PipelineV2RunState;
@@ -1230,7 +1233,7 @@ describe("pipeline v2 run state schema v6", () => {
     noSessionDriver.apply({
       kind: "agent_failed",
       reason: "internal_error",
-      sessionCleanup: { execution: "not_required", tool: "not_required" },
+      sessionCleanup: { execution: "not_required", tool: "not_required" }, workerLog: { status: "unavailable" }
     });
     noSessionDriver.apply({ kind: "run_failed", reason: "internal_error" });
     const noSessionState = noSessionDriver.current as PipelineV2RunState;
@@ -1356,7 +1359,7 @@ describe("pipeline v2 run state schema v6", () => {
     cleanupDriver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: { execution: "failed", tool: "completed" },
+      sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     cleanupDriver.apply({ kind: "run_cleanup_failed" });
     const cleanupFailed = cleanupDriver.current as PipelineV2RunState;
@@ -1368,40 +1371,40 @@ describe("pipeline v2 run state schema v6", () => {
 
   test("parse rejects schema versions 1, 2, 3, 4, 5, 6 and 7 without any migration", () => {
     expect(() => parsePipelineV2RunState('{"schema_version":1}')).toThrow(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v1 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":2}')).toThrow(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 9 is the supported contract; no v2 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 2 })).toThrow(
-      "not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
+      "not a pipeline v2 run state (schema version 9 is the supported contract; no v2 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":3}')).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v3 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 3 })).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v3 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":4}')).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v4 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 4 })).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v4 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":5}')).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v5 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 5 })).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v5 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":6}')).toThrow(
-      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v6 migration exists)",
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v6 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":7}')).toThrow(
-      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v7 migration exists)",
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v7 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":10}')).toThrow(
-      "pipeline v2 run state has schema_version 10, expected 8",
+      "pipeline v2 run state has schema_version 10, expected 9",
     );
   });
 
@@ -1436,7 +1439,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v3Document);
     expect(() => parsePipelineV2RunState(v3Document)).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v3 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v3Document);
     await rm(root, { recursive: true, force: true });
@@ -1462,7 +1465,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v4Document);
     expect(() => parsePipelineV2RunState(v4Document)).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v4 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v4Document);
     await rm(root, { recursive: true, force: true });
@@ -1495,7 +1498,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v5Document);
     expect(() => parsePipelineV2RunState(v5Document)).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v5 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v5Document);
     await rm(root, { recursive: true, force: true });
@@ -1654,7 +1657,7 @@ describe("pipeline v2 run state schema v6", () => {
       "agent_execution_session_created applies to an agent execution, but execution 2 is a decision execution",
     );
     driver.reject(
-      { kind: "agent_outputs_accepted", outputs: [] },
+      { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
       "agent_outputs_accepted applies to an agent execution, but execution 2 is a decision execution",
     );
 
@@ -1682,15 +1685,15 @@ describe("pipeline v2 run state schema v6", () => {
     driver.apply({ kind: "start_agent_execution", stateId: "implement", profile: "coder", executionRole: "planning" });
     driver.apply({ kind: "agent_data_prepared" });
     driver.reject(
-      { kind: "agent_failed", reason: "decision_input_invalid", sessionCleanup: { execution: "not_required", tool: "not_required" } },
+      { kind: "agent_failed", reason: "decision_input_invalid", sessionCleanup: { execution: "not_required", tool: "not_required" }, workerLog: { status: "unavailable" }  },
       "agent_failed reason must be one of",
     );
     driver.reject(
-      { kind: "agent_failed", reason: "state_persist_failed", sessionCleanup: { execution: "not_required", tool: "not_required" } },
+      { kind: "agent_failed", reason: "state_persist_failed", sessionCleanup: { execution: "not_required", tool: "not_required" }, workerLog: { status: "unavailable" }  },
       "agent_failed reason must be one of",
     );
     driver.reject(
-      { kind: "agent_failed", reason: "terminal_failed", sessionCleanup: { execution: "not_required", tool: "not_required" } },
+      { kind: "agent_failed", reason: "terminal_failed", sessionCleanup: { execution: "not_required", tool: "not_required" }, workerLog: { status: "unavailable" }  },
       "agent_failed reason must be one of",
     );
 
@@ -1715,7 +1718,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
     startAgent(driver, "implement", { execution: "sess-1" });
-    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+    driver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
     driver.apply({ kind: "run_failed", reason: "worker_failed" });
     const state = driver.current as PipelineV2RunState;
     expectInvalid(state, (draft) => {
@@ -1895,18 +1898,18 @@ describe("pipeline v2 run state schema v6", () => {
         outputs: [
           { id: "plan", digest: hex("d") },
           { id: "plan", digest: hex("e") },
-        ],
+        ], workerLog: { status: "unavailable" }
       },
       'agent_outputs_accepted declares output id "plan" more than once',
     );
     driver.reject(
       {
         kind: "agent_outputs_accepted",
-        outputs: [{ id: "plan", digest: "not-a-digest" }],
+        outputs: [{ id: "plan", digest: "not-a-digest" }], workerLog: { status: "unavailable" }
       },
       "digest must be a lowercase hex SHA-256 digest",
     );
-    driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  });
     driver.apply({ kind: "agent_cleanup_completed" });
 
     const loaderDriver = createDriver();
@@ -1924,11 +1927,11 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver(identity, []);
     driver.apply(createRun(identity, []));
     startAgent(driver, "implement", { execution: "sess-1" });
-    driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  });
     driver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: { execution: "failed", tool: "completed" },
+      sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     driver.apply({ kind: "run_cleanup_failed" });
     const state = driver.current as PipelineV2RunState;
@@ -1975,7 +1978,7 @@ describe("pipeline v2 run state schema v6", () => {
     driver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: { execution: "failed", tool: "completed" },
+      sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     driver.apply({ kind: "run_cleanup_failed" });
     const state = driver.current as PipelineV2RunState;
@@ -2007,7 +2010,7 @@ describe("pipeline v2 run state schema v6", () => {
     const failedDriver = createDriver(identity, INPUTS);
     failedDriver.apply(createRun(identity, INPUTS));
     startAgent(failedDriver, "implement", { execution: "sess-1" });
-    failedDriver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+    failedDriver.apply({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
     failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
     const failed = failedDriver.current as PipelineV2RunState;
 
@@ -2220,7 +2223,7 @@ describe("pipeline v2 run state loader: the unbound execution is bound to the re
     driver.apply({
       kind: "agent_failed",
       reason: "worker_failed",
-      sessionCleanup: { execution: "completed", tool: "completed" },
+      sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     const state = driver.current as PipelineV2RunState;
     expect(state.executions[0]).toMatchObject({ index: 1, phase: "failed" });
@@ -2261,7 +2264,7 @@ describe("pipeline v2 run state loader: the unbound execution is bound to the re
     failed.apply({
       kind: "agent_failed",
       reason: "worker_failed",
-      sessionCleanup: { execution: "completed", tool: "completed" },
+      sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     requireLoadableSnapshot(failed.current as PipelineV2RunState);
   });
@@ -2807,7 +2810,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
     failedDriver.apply({
       kind: "agent_failed",
       reason: "worker_failed",
-      sessionCleanup: { execution: "completed", tool: "completed" },
+      sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
     failedDriver.reject(
@@ -2958,7 +2961,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
     failedDriver.apply({
       kind: "agent_failed",
       reason: "worker_failed",
-      sessionCleanup: { execution: "completed", tool: "completed" },
+      sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
     expectInvalid(failedDriver.current as PipelineV2RunState, (draft) => {
@@ -2980,7 +2983,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
     cleanupDriver.apply({
       kind: "agent_failed",
       reason: PIPELINE_V2_SESSION_CLEANUP_FAILURE_REASON,
-      sessionCleanup: { execution: "failed", tool: "completed" },
+      sessionCleanup: { execution: "failed", tool: "completed" }, workerLog: { status: "unavailable" }
     });
     cleanupDriver.apply({ kind: "run_cleanup_failed" });
     expectInvalid(cleanupDriver.current as PipelineV2RunState, (draft) => {
@@ -3154,6 +3157,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
         profile: "coder",
         execution_role: "planning",
         phase: "cleanup_completed",
+        worker_log: { status: "unavailable" },
         execution_session_id: "sess-2",
         tool_session_id: "tool-2",
         session_cleanup: { execution: "completed", tool: "completed" },
@@ -3270,6 +3274,7 @@ describe("pipeline v2 run state schema v6: durable user wait and response", () =
         profile: "coder",
         execution_role: "planning",
         phase: "cleanup_completed",
+        worker_log: { status: "unavailable" },
         execution_session_id: "sess-1",
         tool_session_id: "tool-1",
         session_cleanup: { execution: "completed", tool: "completed" },
@@ -3525,7 +3530,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     driver.apply({ kind: "agent_execution_session_created", sessionId: `exec-${number}` });
     driver.apply({ kind: "agent_tool_session_created", sessionId: `tool-${number}` });
     driver.apply({ kind: "agent_running" });
-    driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  });
     driver.apply({ kind: "agent_cleanup_completed" });
   }
 
@@ -4126,7 +4131,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     driver.apply({ kind: "agent_execution_session_created", sessionId: "exec-9" });
     driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-9" });
     driver.apply({ kind: "agent_running" });
-    driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  });
     driver.apply({ kind: "agent_cleanup_completed" });
     // the plan revision is accepted on the active boundary (Design A)
     driver.apply(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 6 }));
@@ -4193,7 +4198,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     driver.apply({ kind: "agent_tool_session_created", sessionId: "tool-2" });
     driver.apply({ kind: "agent_running" });
     driver.reject(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 3 }), 'has phase "running"; plan acceptance requires the settled phase "cleanup_completed"');
-    driver.apply({ kind: "agent_outputs_accepted", outputs: [] });
+    driver.apply({ kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  });
     driver.apply({ kind: "agent_cleanup_completed" });
     // the origin is the last execution: accepted
     driver.apply(planAccepted({ planRevision: 2, planSha256: PLAN_R2, originExecution: 3 }));
@@ -4205,13 +4210,13 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     playStageRun(driver);
     const raw = JSON.stringify(driver.current);
     const exact = {
-      1: "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v1 migration exists)",
-      2: "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 8 is the supported contract; no v2 migration exists)",
-      3: "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v3 migration exists)",
-      4: "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v4 migration exists)",
-      5: "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v5 migration exists)",
-      6: "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v6 migration exists)",
-      7: "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 8 is the supported contract; no v7 migration exists)",
+      1: "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v1 migration exists)",
+      2: "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 9 is the supported contract; no v2 migration exists)",
+      3: "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v3 migration exists)",
+      4: "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v4 migration exists)",
+      5: "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v5 migration exists)",
+      6: "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v6 migration exists)",
+      7: "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v7 migration exists)",
     };
     for (const [version, message] of Object.entries(exact)) {
       const draft = JSON.parse(raw) as Record<string, unknown>;
@@ -4760,6 +4765,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
         execution_role: "stage",
         iteration_index: 1,
         phase: "cleanup_completed",
+        worker_log: { status: "unavailable" },
         execution_session_id: `exec-${number}`,
         tool_session_id: `tool-${number}`,
         session_cleanup: { execution: "completed", tool: "completed" },
@@ -4830,6 +4836,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
         execution_role: "stage",
         iteration_index: 1,
         phase: "cleanup_completed",
+        worker_log: { status: "unavailable" },
         execution_session_id: `exec-${number}`,
         tool_session_id: `tool-${number}`,
         session_cleanup: { execution: "completed", tool: "completed" },
@@ -5057,6 +5064,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
         profile: "coder",
         execution_role: "stage",
         phase: "started",
+        worker_log: null,
         iteration_index: 1,
       });
     }, 'execution 5 has the "stage" role but no iteration is open at committed transition count 4');
@@ -5074,6 +5082,7 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
         profile: "coder",
         execution_role: "stage",
         phase: "started",
+        worker_log: null,
         iteration_index: 1,
       });
     }, "execution 5 references iteration 1, which is not the open iteration 2 at committed transition count 4");
@@ -5403,5 +5412,278 @@ describe("pipelineV2StageIterationEffectiveBudget (the single budget formula)", 
         [] as Array<{ generation_index: number; additional_iterations: number }>,
       ),
     ).toEqual({ representable: false });
+  });
+});
+
+describe("schema v9 worker-log binding", () => {
+  const CAPTURED = {
+    status: "captured" as const,
+    sha256: hex("f"),
+    byte_count: 7,
+    truncated_daemon: false,
+    truncated_local: false,
+  };
+  const TRUNCATED = {
+    status: "truncated" as const,
+    sha256: hex("e"),
+    byte_count: 8 * 1024 * 1024,
+    truncated_daemon: true,
+    truncated_local: true,
+  };
+  const UNAVAILABLE = { status: "unavailable" as const };
+
+  test("the schema version is 9 and v8 is rejected typed, exact and without migration", () => {
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(9);
+    expect(() => parsePipelineV2RunState('{"schema_version":8}')).toThrow(
+      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 9 is the supported contract; no v8 migration exists)",
+    );
+  });
+
+  test("the commit-history vocabulary stays the existing 28 kinds with no worker-log event", () => {
+    expect(PIPELINE_V2_COMMIT_PROVENANCE_KINDS.length).toBe(28);
+    expect(PIPELINE_V2_COMMIT_PROVENANCE_KINDS).not.toContain("worker_log_recorded");
+  });
+
+  test("every worker_log union form binds atomically and survives the loader round-trip", () => {
+    for (const binding of [CAPTURED, TRUNCATED, UNAVAILABLE]) {
+      const driver = createDriver();
+      driver.apply(createRun());
+      startAgent(driver, "implement", { execution: "sess-1" });
+      driver.apply({
+        kind: "agent_outputs_accepted",
+        outputs: [{ id: "plan", digest: hex("d") }],
+        workerLog: binding,
+      });
+      driver.apply({ kind: "agent_cleanup_completed" });
+      const state = driver.current as PipelineV2RunState;
+      const execution = state.executions[0]!;
+      if (execution.type !== "agent") {
+        throw new Error("expected an agent execution");
+      }
+      expect(execution.worker_log).toEqual(binding);
+      requireLoadableSnapshot(state);
+    }
+  });
+
+  test("the binding is immutable: a later agent_failed must carry exactly the accepted record", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({
+      kind: "agent_outputs_accepted",
+      outputs: [{ id: "plan", digest: hex("d") }],
+      workerLog: CAPTURED,
+    });
+    driver.reject(
+      {
+        kind: "agent_failed",
+        reason: "session_cleanup_failed",
+        sessionCleanup: { execution: "failed", tool: "completed" },
+        workerLog: TRUNCATED,
+      },
+      "the worker log binding is immutable and cannot be rewritten by agent_failed",
+    );
+    driver.reject(
+      {
+        kind: "agent_failed",
+        reason: "session_cleanup_failed",
+        sessionCleanup: { execution: "failed", tool: "completed" },
+        workerLog: UNAVAILABLE,
+      },
+      "the worker log binding is immutable and cannot be rewritten by agent_failed",
+    );
+    // The exact accepted record is the only admissible rewrite.
+    driver.apply({
+      kind: "agent_failed",
+      reason: "session_cleanup_failed",
+      sessionCleanup: { execution: "failed", tool: "completed" },
+      workerLog: CAPTURED,
+    });
+    const state = driver.current as PipelineV2RunState;
+    const execution = state.executions[0]!;
+    if (execution.type !== "agent") {
+      throw new Error("expected an agent execution");
+    }
+    expect(execution.worker_log).toEqual(CAPTURED);
+    requireLoadableSnapshot(state);
+  });
+
+  test("both binding commands require a non-null terminal worker result", () => {
+    for (const kind of ["agent_outputs_accepted", "agent_failed"] as const) {
+      const driver = createDriver();
+      driver.apply(createRun());
+      startAgent(driver, "implement", { execution: "sess-1" });
+      driver.reject(
+        (kind === "agent_outputs_accepted"
+          ? { kind, outputs: [], workerLog: null }
+          : {
+              kind,
+              reason: "worker_failed",
+              sessionCleanup: { execution: "completed", tool: "completed" },
+              workerLog: null,
+            }) as unknown as PipelineV2RunCommand,
+        "requires a non-null worker log binding; the terminal worker result fixes it",
+      );
+    }
+  });
+
+  test("malformed binding values fail closed in the commands and the loader", () => {
+    const malformed: Array<{ value: unknown; messagePart: string }> = [
+      { value: { status: "complete" }, messagePart: 'must be "captured", "truncated" or "unavailable"' },
+      { value: { status: "captured" }, messagePart: 'is missing required field "sha256"' },
+      {
+        value: { ...CAPTURED, sha256: "nothex" },
+        messagePart: "must be a lowercase hex SHA-256 digest",
+      },
+      { value: { ...CAPTURED, byte_count: -1 }, messagePart: "byte_count must be" },
+      { value: { ...CAPTURED, truncated_daemon: "yes" }, messagePart: "must both be booleans" },
+      { value: { ...UNAVAILABLE, sha256: hex("f") }, messagePart: 'has unknown field "sha256"' },
+      { value: [], messagePart: "must be an object or null" },
+      { value: "captured", messagePart: "must be an object or null" },
+    ];
+    for (const { value, messagePart } of malformed) {
+      const driver = createDriver();
+      driver.apply(createRun());
+      startAgent(driver, "implement", { execution: "sess-1" });
+      driver.reject(
+        {
+          kind: "agent_outputs_accepted",
+          outputs: [],
+          workerLog: value as never,
+        },
+        messagePart,
+      );
+      // the loader rejects the same forged shapes on a stored record
+      driver.apply({
+        kind: "agent_outputs_accepted",
+        outputs: [],
+        workerLog: UNAVAILABLE,
+      });
+      driver.apply({ kind: "agent_cleanup_completed" });
+      const state = driver.current as PipelineV2RunState;
+      if (value === null || typeof value === "string" || Array.isArray(value)) {
+        continue; // non-object shapes cannot be grafted onto a settled record
+      }
+      expectInvalid(state, (draft) => {
+        (draft.executions[0] as Record<string, unknown>).worker_log = value;
+      }, messagePart);
+    }
+  });
+
+  test("phase legality: null before the terminal worker result, non-null after", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({
+      kind: "agent_outputs_accepted",
+      outputs: [],
+      workerLog: UNAVAILABLE,
+    });
+    const settled = driver.current as PipelineV2RunState;
+    expectInvalid(settled, (draft) => {
+      (draft.executions[0] as Record<string, unknown>).worker_log = null;
+    }, "but does not record its worker log binding");
+    // a forged in-flight execution can never already carry a binding
+    driver.apply({ kind: "agent_cleanup_completed" });
+    commitTransition(driver, "implement", "completed", "check", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
+    const decisionRunning = driver.current as PipelineV2RunState;
+    expectInvalid(decisionRunning, (draft) => {
+      const agent = draft.executions.find((entry: { type: string }) => entry.type === "agent");
+      agent.phase = "running";
+      agent.worker_log = CAPTURED;
+    }, 'but already records a worker log binding');
+  });
+
+  test("decision executions never carry a worker log binding", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({
+      kind: "agent_outputs_accepted",
+      outputs: [],
+      workerLog: UNAVAILABLE,
+    });
+    driver.apply({ kind: "agent_cleanup_completed" });
+    commitTransition(driver, "implement", "completed", "check", 1);
+    driver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
+    driver.apply({
+      kind: "decision_evaluated",
+      result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
+    });
+    const state = driver.current as PipelineV2RunState;
+    const decision = state.executions.find((entry) => entry.type === "decision")!;
+    expect("worker_log" in decision).toBe(false);
+    expectInvalid(state, (draft) => {
+      (draft.executions[1] as Record<string, unknown>).worker_log = UNAVAILABLE;
+    }, 'has unknown field "worker_log"');
+  });
+
+  test("the state document never carries raw log bytes or an artifact path", () => {
+    const driver = createDriver();
+    driver.apply(createRun());
+    startAgent(driver, "implement", { execution: "sess-1" });
+    driver.apply({
+      kind: "agent_outputs_accepted",
+      outputs: [],
+      workerLog: CAPTURED,
+    });
+    const raw = JSON.stringify(driver.current);
+    expect(raw).not.toContain("payload");
+    expect(raw).not.toContain("logs/");
+    expect(raw).not.toContain("op_");
+    expect(raw).not.toContain("SECRET-BEARER-dht_deadbeef");
+  });
+
+  test("the success and failure binding commands produce loader-valid history over the full lifecycle", () => {
+    // failure path
+    const failedDriver = createDriver();
+    failedDriver.apply(createRun());
+    startAgent(failedDriver, "implement", { execution: "sess-1" });
+    failedDriver.apply({
+      kind: "agent_failed",
+      reason: "worker_failed",
+      sessionCleanup: { execution: "completed", tool: "completed" },
+      workerLog: TRUNCATED,
+    });
+    failedDriver.apply({ kind: "run_failed", reason: "worker_failed" });
+    const failedState = failedDriver.current as PipelineV2RunState;
+    expect(failedState.status).toBe("failed");
+    requireLoadableSnapshot(failedState);
+    const failedExecution = failedState.executions[0]!;
+    if (failedExecution.type !== "agent") {
+      throw new Error("expected an agent execution");
+    }
+    expect(failedExecution.worker_log).toEqual(TRUNCATED);
+    // success path through the terminal
+    const successDriver = createDriver();
+    successDriver.apply(createRun());
+    startAgent(successDriver, "implement", { execution: "sess-1" });
+    successDriver.apply({
+      kind: "agent_outputs_accepted",
+      outputs: [{ id: "plan", digest: hex("d") }],
+      workerLog: CAPTURED,
+    });
+    successDriver.apply({ kind: "agent_cleanup_completed" });
+    commitTransition(successDriver, "implement", "completed", "check", 1);
+    successDriver.apply({ kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" });
+    successDriver.apply({
+      kind: "decision_evaluated",
+      result: { status: "uncovered", outcome: "uncovered", active_constraint_ids: [] },
+    });
+    commitTransition(successDriver, "check", "uncovered", "ship", 2);
+    startAgent(successDriver, "ship", { execution: "sess-2" });
+    successDriver.apply({ kind: "agent_outputs_accepted", outputs: [], workerLog: UNAVAILABLE });
+    successDriver.apply({ kind: "agent_cleanup_completed" });
+    commitTransition(successDriver, "ship", "completed", "done", 3);
+    successDriver.apply({ kind: "terminal_reached", terminalStateId: "done", terminalResult: "success" });
+    successDriver.apply({
+      kind: "run_outputs_published",
+      outputs: [{ id: "plan", type: "file", required: true, present: true, digest: hex("d") }],
+    });
+    successDriver.apply({ kind: "run_succeeded" });
+    const successState = successDriver.current as PipelineV2RunState;
+    expect(successState.status).toBe("success");
+    requireLoadableSnapshot(successState);
   });
 });

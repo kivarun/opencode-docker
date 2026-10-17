@@ -278,7 +278,7 @@ async function drivePrefix(
     const records = await acceptActivationOutputs(pipeline, activation);
     await rec.dispatch({
       kind: "agent_outputs_accepted",
-      outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+      outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
     });
     await rec.dispatch({ kind: "agent_cleanup_completed" });
     if (commit) {

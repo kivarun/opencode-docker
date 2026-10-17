@@ -358,7 +358,7 @@ function agentPhases(label: string): PipelineV2RunCommand[] {
     { kind: "agent_execution_session_created", sessionId: `sess-${n}-${label}` },
     { kind: "agent_tool_session_created", sessionId: `tool-${n}-${label}` },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }] },
+    { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ];
 }
@@ -1758,7 +1758,7 @@ describe("pipeline v2 stage iteration controller", () => {
         ] as PipelineV2RunCommand[]) {
           await ctx.sink.dispatch(command);
         }
-        await ctx.sink.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+        await ctx.sink.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
         const before = ctx.sink.snapshot as PipelineV2RunState;
         const recording = recordingSink(ctx.sink, ctx.fixture, false);
         const cause = await catchEnsure(() =>
@@ -1793,7 +1793,7 @@ describe("pipeline v2 stage iteration controller", () => {
           { kind: "agent_execution_session_created", sessionId: "sess-stage-1" },
           { kind: "agent_tool_session_created", sessionId: "tool-stage-1" },
           { kind: "agent_running" },
-          { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+          { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }], workerLog: { status: "unavailable" }  },
           { kind: "agent_cleanup_completed" },
         ] as PipelineV2RunCommand[]) {
           await ctx.sink.dispatch(command);
@@ -1832,7 +1832,7 @@ describe("pipeline v2 stage iteration controller", () => {
       { kind: "agent_execution_session_created", sessionId: "sess-stage-close" },
       { kind: "agent_tool_session_created", sessionId: "tool-stage-close" },
       { kind: "agent_running" },
-      { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+      { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }], workerLog: { status: "unavailable" }  },
       { kind: "agent_cleanup_completed" },
     ] as PipelineV2RunCommand[]) {
       await ctx.sink.dispatch(command);
@@ -2424,7 +2424,7 @@ describe("pipeline v2 stage iteration controller", () => {
               ] as PipelineV2RunCommand[]) {
                 await ctx.sink.dispatch(command);
               }
-              await ctx.sink.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } });
+              await ctx.sink.dispatch({ kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  });
             } else {
               await ensurePipelineV2StageIteration({ compiledPlan: ctx.compiledPlan, stageId: "stage-1", initialBudget: 3, sink: ctx.sink });
               await ctx.sink.dispatch({
@@ -2515,7 +2515,7 @@ describe("pipeline v2 stage iteration controller", () => {
             { kind: "agent_execution_session_created", sessionId: "sess-test-entry" },
             { kind: "agent_tool_session_created", sessionId: "tool-test-entry" },
             { kind: "agent_running" },
-            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }], workerLog: { status: "unavailable" }  },
             { kind: "agent_cleanup_completed" },
           ] as PipelineV2RunCommand[]) {
             await ctx.sink.dispatch(command);
@@ -2643,7 +2643,7 @@ describe("pipeline v2 stage iteration controller", () => {
             { kind: "agent_execution_session_created", sessionId: "sess-gen1" },
             { kind: "agent_tool_session_created", sessionId: "tool-gen1" },
             { kind: "agent_running" },
-            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }], workerLog: { status: "unavailable" }  },
             { kind: "agent_cleanup_completed" },
           ] as PipelineV2RunCommand[]) {
             await ctx.sink.dispatch(command);
@@ -2662,7 +2662,7 @@ describe("pipeline v2 stage iteration controller", () => {
             { kind: "agent_execution_session_created", sessionId: "sess-gen2" },
             { kind: "agent_tool_session_created", sessionId: "tool-gen2" },
             { kind: "agent_running" },
-            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("6") }] },
+            { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("6") }], workerLog: { status: "unavailable" }  },
             { kind: "agent_cleanup_completed" },
           ] as PipelineV2RunCommand[]) {
             await ctx.sink.dispatch(command);
@@ -2927,7 +2927,7 @@ describe("pipeline v2 stage iteration controller", () => {
         { kind: "agent_execution_session_created", sessionId: `sess-${label}` },
         { kind: "agent_tool_session_created", sessionId: `tool-${label}` },
         { kind: "agent_running" },
-        { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }] },
+        { kind: "agent_outputs_accepted", outputs: [{ id: "result", digest: hex("5") }], workerLog: { status: "unavailable" }  },
         { kind: "agent_cleanup_completed" },
       ] as PipelineV2RunCommand[]) {
         await ctx.sink.dispatch(command);

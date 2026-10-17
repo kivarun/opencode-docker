@@ -315,7 +315,7 @@ async function runPlanningActivation(
   }
   await writeFile(join(prep.outputs_root, outputId), JSON.stringify(proposal), { mode: 0o600 });
   const records: readonly AcceptedStateOutput[] = await acceptActivationOutputs(pipeline, prep);
-  await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records.map((record) => ({ id: record.output, digest: record.digest })) });
+  await recording.dispatch({ kind: "agent_outputs_accepted", outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }  });
   await recording.dispatch({ kind: "agent_cleanup_completed" });
   return [...accepted, ...records];
 }
@@ -334,7 +334,7 @@ async function runRawStageActivation(
     { kind: "agent_execution_session_created", sessionId: nextSession(sessionLabel) },
     { kind: "agent_tool_session_created", sessionId: nextSession(sessionLabel) },
     { kind: "agent_running" },
-    { kind: "agent_outputs_accepted", outputs: [] },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" }  },
     { kind: "agent_cleanup_completed" },
   ] as PipelineV2RunCommand[]) {
     await recording.dispatch(command);

@@ -503,7 +503,7 @@ async function prefixAgentStep(
   const records = await acceptActivationOutputs(prefix.pipeline, activation);
   await prefix.sink.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await prefix.sink.dispatch({ kind: "agent_cleanup_completed" });
   const target = state.transitions[0];
@@ -1083,7 +1083,7 @@ test("8. waiting, in-flight, publishing and final states refuse without mutation
   const records = await acceptActivationOutputs(prefixU.pipeline, activation);
   await prefixU.sink.dispatch({
     kind: "agent_outputs_accepted",
-    outputs: records.map((record) => ({ id: record.output, digest: record.digest })),
+    outputs: records.map((record) => ({ id: record.output, digest: record.digest })), workerLog: { status: "unavailable" }
   });
   await prefixU.sink.dispatch({ kind: "agent_cleanup_completed" });
   const fpUnbound = await fingerprint(unbound.stateRoot);
@@ -1571,7 +1571,7 @@ test("20. the runner completes the failed execution's missing run finalization (
     { kind: "agent_execution_session_created", sessionId: "pfx-exec-1" },
     { kind: "agent_tool_session_created", sessionId: "pfx-tool-1" },
     { kind: "agent_running" },
-    { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" } },
+    { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" }  },
   ]) {
     await prefix.sink.dispatch(command as never);
   }
