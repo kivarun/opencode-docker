@@ -418,3 +418,172 @@ export interface UiEventsTransport {
 }
 
 export declare function createEventsTransport(io: UiEventsTransportIo): UiEventsTransport;
+
+/* ------------------------------------------------------------------ */
+/* Worker logs (v5): the bounded read-only viewer of the durable       */
+/* schema-v9 worker-log artifacts.                                     */
+/* ------------------------------------------------------------------ */
+
+export type UiWorkerLogStatus = "pending" | "unavailable" | "captured" | "truncated";
+
+export interface UiWorkerLogMetadata {
+  readonly executionIndex: number;
+  readonly stateId: string;
+  readonly status: UiWorkerLogStatus;
+  readonly sha256?: string;
+  readonly byteCount?: number;
+  readonly truncatedDaemon?: boolean;
+  readonly truncatedLocal?: boolean;
+}
+
+export interface UiWorkerLogsModel {
+  readonly kind: "worker_logs";
+  readonly runId: string;
+  readonly revision: number;
+  readonly logs: readonly UiWorkerLogMetadata[];
+}
+
+export interface UiWorkerLogContent {
+  readonly status: "captured" | "truncated";
+  readonly sha256: string;
+  readonly byteCount: number;
+  readonly truncatedDaemon: boolean;
+  readonly truncatedLocal: boolean;
+  readonly offset: number;
+  readonly dataBase64: string;
+  readonly nextOffset: number | null;
+}
+
+export interface UiWorkerLogModel {
+  readonly kind: "worker_log";
+  readonly runId: string;
+  readonly revision: number;
+  readonly executionIndex: number;
+  readonly stateId: string;
+  readonly status: UiWorkerLogStatus;
+  readonly sha256?: string;
+  readonly byteCount?: number;
+  readonly truncatedDaemon?: boolean;
+  readonly truncatedLocal?: boolean;
+  readonly offset?: number;
+  readonly dataBase64?: string;
+  readonly nextOffset?: number | null;
+}
+
+/** The worker-logs list document of one run (metadata union only). */
+export declare function parseWorkerLogsDocument(document: unknown, expectedRunId: string): UiWorkerLogsModel;
+
+/** One execution's status document or bounded content chunk document. */
+export declare function parseWorkerLogDocument(document: unknown, expectedRunId: string): UiWorkerLogModel;
+
+export type UiWorkerLogsEndpointModel = UiWorkerLogsModel | UiWorkerLogModel | UiErrorModel | UiCommandResultModel;
+
+export type UiWorkerLogsResult =
+  | { readonly ok: true; readonly lost: false; readonly model: UiWorkerLogsEndpointModel }
+  | { readonly ok: false; readonly lost: false; readonly failure: UiApiFailure };
+
+/**
+ * The worker-logs endpoint client: accepts only the two logs documents
+ * of the expected run (or the endpoint's documented failure envelopes)
+ * and never satisfies an inspect, discovery or mutation request.
+ */
+export declare function requestWorkerLogsJson(
+  fetchImpl: (path: string, init?: RequestInit) => Promise<Response>,
+  path: string,
+  init: RequestInit,
+  expectedRunId: string,
+): Promise<UiWorkerLogsResult>;
+
+/** The one URL builder of every worker-logs request. */
+export declare function workerLogsRequestPath(
+  runId: string,
+  executionIndex: number | null,
+  offset: number,
+  limit: number,
+): string;
+
+export interface UiWorkerLogsState {
+  readonly runId: string;
+  readonly snapshotRevision: number | null;
+  readonly logs: readonly UiWorkerLogMetadata[];
+  readonly selectedExecutionIndex: number | null;
+  readonly content: UiWorkerLogContent | null;
+  readonly requestState: "idle" | "loading" | "ready" | "failed";
+  readonly error: { readonly layer: string; readonly reason: string } | null;
+}
+
+export interface UiLogsTransportIo {
+  /** The only logs GET site; the run id comes from the desire. */
+  readonly fetchLogs: (runId: string, path: string, signal: AbortSignal) => Promise<UiWorkerLogsResult | undefined>;
+  /** Fires exactly once per fetch start, before the request goes out. */
+  readonly onStarted: (runId: string) => void;
+  /** Fires exactly once per started request's settlement. */
+  readonly onSettled: (runId: string) => void;
+}
+
+export interface UiLogsDesire {
+  readonly runId: string;
+  readonly path: string;
+  /** Called only when the request settled and was never superseded. */
+  readonly onApplied: (result: UiWorkerLogsResult | undefined) => void;
+}
+
+export interface UiLogsTransport {
+  /**
+   * Admits one logs desire: an idle wire slot starts the fetch; a busy
+   * slot supersedes the active request (its response is dropped) and
+   * runs this desire as the single follow-up.
+   */
+  request(desire: UiLogsDesire): Promise<UiWorkerLogsResult | undefined>;
+  /** Supersedes the active request and withdraws the queued desire. */
+  invalidate(): void;
+  /** Refuses every later desire and supersedes the active request. */
+  dispose(): void;
+}
+
+export declare function createLogsTransport(io: UiLogsTransportIo): UiLogsTransport;
+
+/** The empty logs state of one run selection. */
+export declare function createWorkerLogsState(runId: string): UiWorkerLogsState;
+
+export interface UiWorkerLogViewerIo {
+  readonly transport: UiLogsTransport;
+  /** Publishes the current state after every transition. */
+  readonly onState: (state: UiWorkerLogsState | null) => void;
+  /** The authoritative inspect snapshot of the selected run. */
+  readonly snapshot: () => { readonly boundaryKind: string | null };
+  /** True exactly while a mutating POST is in flight. */
+  readonly mutatingInFlight: () => boolean;
+}
+
+export interface UiWorkerLogViewer {
+  /** Selection change / reset; discards state and the in-flight GET. */
+  transitionToLogsView(runId: string): void;
+  /** Leaves the logs view without a run binding. */
+  dropView(): void;
+  /** The explicit metadata load; never automatic. */
+  fetchLogsList(): void;
+  /** One execution selection; content stays until a chunk is loaded. */
+  selectExecution(index: number): void;
+  /** The explicit next-chunk load under the capture gate. */
+  fetchChunk(): void;
+  /** One retry click of the last failed chunk desire. */
+  retryLastChunkRequest(): void;
+  /** The read-only projection for the DOM adapter. */
+  currentState(): UiWorkerLogsState | null;
+}
+
+export declare function createWorkerLogViewer(io: UiWorkerLogViewerIo): UiWorkerLogViewer;
+
+/**
+ * The safe render contract: the literal base64 decoded to text with a
+ * non-fatal UTF-8 decoder; control bytes can never become markup.
+ */
+export declare function decodeLogChunkText(dataBase64: string): string;
+
+/** The chunk gate: captured/truncated content of an active run only. */
+export declare function logsCaptureGate(
+  state: UiWorkerLogsState | null,
+  boundaryKind: string | null,
+  mutatingInFlight: () => boolean,
+): boolean;

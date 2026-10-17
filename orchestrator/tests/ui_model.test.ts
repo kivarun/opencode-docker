@@ -532,6 +532,15 @@ describe("ui model: export surface and source restrictions", () => {
         "timelineSummary",
         "timelineAnnouncement",
         "createEventsTransport",
+        "parseWorkerLogsDocument",
+        "parseWorkerLogDocument",
+        "requestWorkerLogsJson",
+        "workerLogsRequestPath",
+        "createWorkerLogsState",
+        "createLogsTransport",
+        "createWorkerLogViewer",
+        "decodeLogChunkText",
+        "logsCaptureGate",
       ].sort(),
     );
   });
@@ -1066,14 +1075,14 @@ function asResultLike(model: unknown): { ok: true; lost: false; model: unknown }
   return { ok: true, lost: false, model };
 }
 
-test("the new worker-log API kinds stay fail-closed for the browser UI parser", () => {
-  // The worker-log endpoints are CLI/API-only in this increment: the UI
-  // parser accepts no worker_logs or worker_log document and the UI asset
-  // source never calls the logs routes.
+test("the worker-log kinds stay fail-closed for the general UI client", () => {
+  // The worker logs are consumed only through the dedicated logs endpoint
+  // client (v5): the general inspect/discovery/mutation client still
+  // accepts no worker_logs or worker_log document, and the UI asset never
+  // touches the durable artifact envelope or its payload field.
   expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "worker_logs", run_id: "r", revision: 1, logs: [] }))).toBe("unknown_kind");
   expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "worker_log", run_id: "r", revision: 1, execution_index: 1, state_id: "s", status: "captured" }))).toBe("unknown_kind");
   const appJs = readFileSync(new URL("../ui/app.js", import.meta.url).pathname, "utf8");
-  expect(appJs).not.toContain("/logs");
-  expect(appJs).not.toContain("worker_log");
-  expect(appJs).not.toContain("data_base64");
+  expect(appJs).not.toContain("payload_base64");
+  expect(appJs).not.toContain("workerlog.json");
 });

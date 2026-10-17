@@ -572,9 +572,9 @@ describe("ui v3: source restrictions of the live observation", () => {
     // module wiring, one abort-controller site, one fetch start
     expect(appSource.split("export function createInspectTransport(").length - 1).toBe(1);
     expect(appSource.split("createInspectTransport({").length - 1).toBe(1);
-    // two abort-controller sites: the inspect transport and the events
-    // transport each own their request's abort controller
-    expect(appSource.split("new AbortController(").length - 1).toBe(2);
+    // three abort-controller sites: the inspect, events and logs
+    // transports each own their request's abort controller
+    expect(appSource.split("new AbortController(").length - 1).toBe(3);
     expect(appSource.split("await fetchInspect(").length - 1).toBe(1);
     expect(appSource.split("fetchInspect:").length - 1).toBe(1);
     // the inspect GET path is constructed only for the transport and the
@@ -628,7 +628,9 @@ describe("ui v3: source restrictions of the live observation", () => {
 
   test("s4. the transport region owns admission without queues, timers or retries", () => {
     const start = appSource.indexOf("Inspect transport: the one single-flight admission owner");
-    const end = appSource.indexOf("Live observation (v3)");
+    // the worker-logs section (v5) sits between the inspect transport and
+    // the live-observation region; the region ends at its header
+    const end = appSource.indexOf("Worker logs (v5)");
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     const region = appSource.slice(start, end);

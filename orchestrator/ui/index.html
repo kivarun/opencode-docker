@@ -56,6 +56,26 @@
       </thead>
       <tbody id="outputs-body"></tbody>
     </table>
+    <div id="worker-logs-section" hidden>
+      <h3 id="worker-logs-heading">Worker logs</h3>
+      <p class="logs-note">Read-only view of the durable worker-log records. The payload is secret-bearing, unredacted agent output; only manual, bounded chunks of a captured or truncated execution load, and only while the run is active.</p>
+      <button type="button" id="logs-load">Load logs</button>
+      <p id="logs-empty" class="logs-meta"></p>
+      <table id="logs-table" hidden>
+        <caption>Worker log metadata of the selected run</caption>
+        <thead>
+          <tr><th scope="col">Execution</th><th scope="col">State</th><th scope="col">Status</th><th scope="col">Bytes</th><th scope="col">Truncated</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr>
+        </thead>
+        <tbody id="logs-body"></tbody>
+      </table>
+      <p id="logs-cursor" class="logs-meta"></p>
+      <pre id="logs-content" hidden></pre>
+      <p id="logs-status" class="logs-live" aria-live="polite"></p>
+      <div class="events-actions">
+        <button type="button" id="logs-next-chunk" hidden>Load next chunk</button>
+        <button type="button" id="logs-retry" hidden>Retry</button>
+      </div>
+    </div>
     <div id="events-section" hidden>
       <h3 id="events-heading">Lifecycle events</h3>
       <p id="events-meta" class="events-meta"></p>

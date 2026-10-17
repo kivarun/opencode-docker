@@ -1174,6 +1174,658 @@ export function createInspectTransport(io) {
   });
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Worker logs (v5): the one bounded read-only viewer of the durable   */
+/* schema-v9 worker-log artifacts over the two existing endpoints.     */
+/* ------------------------------------------------------------------ */
+
+const WORKER_LOG_STATUSES = ["pending", "unavailable", "captured", "truncated"];
+const WORKER_LOG_METADATA_STATUS_KEYS = ["execution_index", "state_id", "status"];
+const WORKER_LOG_METADATA_CONTENT_KEYS = [
+  "byte_count",
+  "execution_index",
+  "sha256",
+  "state_id",
+  "status",
+  "truncated_daemon",
+  "truncated_local",
+];
+const WORKER_LOG_STATUS_KEYS = ["execution_index", "revision", "run_id", "schema_version", "kind", "state_id", "status"];
+const WORKER_LOG_CHUNK_KEYS = [
+  "byte_count",
+  "data_base64",
+  "execution_index",
+  "kind",
+  "next_offset",
+  "offset",
+  "revision",
+  "run_id",
+  "schema_version",
+  "sha256",
+  "state_id",
+  "status",
+  "truncated_daemon",
+  "truncated_local",
+];
+
+function parseWorkerLogMetadata(entry) {
+  if (!isRecord(entry)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const status = expectOneOf(entry, "status", WORKER_LOG_STATUSES);
+  const keys = status === "captured" || status === "truncated" ? WORKER_LOG_METADATA_CONTENT_KEYS : WORKER_LOG_METADATA_STATUS_KEYS;
+  expectShape(entry, keys);
+  const model = Object.freeze({
+    executionIndex: expectPositiveInteger(entry, "execution_index"),
+    stateId: expectString(entry, "state_id"),
+    status,
+  });
+  if (status !== "captured" && status !== "truncated") {
+    return model;
+  }
+  const sha256 = expectString(entry, "sha256");
+  if (!/^[0-9a-f]{64}$/.test(sha256)) {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({
+    ...model,
+    sha256,
+    byteCount: expectNonNegativeInteger(entry, "byte_count"),
+    truncatedDaemon: expectBoolean(entry, "truncated_daemon"),
+    truncatedLocal: expectBoolean(entry, "truncated_local"),
+  });
+}
+
+/**
+ * The worker-logs list document: the metadata union of every agent
+ * execution of one run, in execution-index order. The run id must match
+ * the expected run; the revision is the authoritative state snapshot
+ * revision the list was read at.
+ */
+export function parseWorkerLogsDocument(document, expectedRunId) {
+  expectShape(document, ["schema_version", "kind", "run_id", "revision", "logs"]);
+  const runId = expectString(document, "run_id");
+  if (runId !== expectedRunId) {
+    throw new UiContractError("run_mismatch");
+  }
+  return Object.freeze({
+    kind: "worker_logs",
+    runId,
+    revision: expectNonNegativeInteger(document, "revision"),
+    logs: Object.freeze(expectArray(document, "logs").map(parseWorkerLogMetadata)),
+  });
+}
+
+/**
+ * The worker-log execution document: the status of one execution
+ * (`pending`/`unavailable`, no content keys) or one bounded content
+ * chunk (`captured`/`truncated`). The chunk fields must be coherent
+ * with the raw-byte cursor: the decoded chunk length never exceeds the
+ * remaining bytes and `next_offset` is exactly the end of the returned
+ * slice whenever a tail exists.
+ */
+export function parseWorkerLogDocument(document, expectedRunId) {
+  const status = expectOneOf(document, "status", WORKER_LOG_STATUSES);
+  const keys = status === "captured" || status === "truncated" ? WORKER_LOG_CHUNK_KEYS : WORKER_LOG_STATUS_KEYS;
+  expectShape(document, keys);
+  const runId = expectString(document, "run_id");
+  if (runId !== expectedRunId) {
+    throw new UiContractError("run_mismatch");
+  }
+  const model = Object.freeze({
+    kind: "worker_log",
+    runId,
+    revision: expectNonNegativeInteger(document, "revision"),
+    executionIndex: expectPositiveInteger(document, "execution_index"),
+    stateId: expectString(document, "state_id"),
+    status,
+  });
+  if (status !== "captured" && status !== "truncated") {
+    return model;
+  }
+  const sha256 = expectString(document, "sha256");
+  if (!/^[0-9a-f]{64}$/.test(sha256)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const byteCount = expectNonNegativeInteger(document, "byte_count");
+  const offset = expectNonNegativeInteger(document, "offset");
+  const nextOffsetValue = document["next_offset"];
+  if (nextOffsetValue !== null && !Object.hasOwn(document, "next_offset")) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (
+    nextOffsetValue !== null &&
+    (typeof nextOffsetValue !== "number" || !Number.isSafeInteger(nextOffsetValue) || nextOffsetValue < 0)
+  ) {
+    throw new UiContractError("invalid_shape");
+  }
+  const dataBase64 = expectString(document, "data_base64");
+  const decodedLength = base64ByteLength(dataBase64);
+  if (decodedLength < 0 || decodedLength > byteCount - offset) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (nextOffsetValue !== null && (decodedLength === 0 || offset + decodedLength !== nextOffsetValue)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (nextOffsetValue === null && offset !== byteCount && decodedLength !== byteCount - offset) {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({
+    ...model,
+    sha256,
+    byteCount,
+    truncatedDaemon: expectBoolean(document, "truncated_daemon"),
+    truncatedLocal: expectBoolean(document, "truncated_local"),
+    offset,
+    dataBase64,
+    nextOffset: nextOffsetValue,
+  });
+}
+
+/** The decoded byte length of one base64 string; -1 when malformed. */
+function base64ByteLength(text) {
+  if (text.length % 4 !== 0) {
+    return -1;
+  }
+  let padding = 0;
+  if (text.endsWith("==")) {
+    padding = 2;
+  } else if (text.endsWith("=")) {
+    padding = 1;
+  }
+  const body = text.slice(0, text.length - padding);
+  if (!/^[A-Za-z0-9+/]*$/.test(body)) {
+    return -1;
+  }
+  return Math.floor((body.length * 3) / 4) + padding - padding;
+}
+
+/** The logs endpoint parser: only the two logs kinds of one run, the
+ * endpoint failure envelopes, and nothing else. */
+function parseWorkerLogsEndpointDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "worker_logs") {
+    return parseWorkerLogsDocument(document, expectedRunId);
+  }
+  if (document["kind"] === "worker_log") {
+    return parseWorkerLogDocument(document, expectedRunId);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/** The one URL builder of every worker-logs request. */
+export function workerLogsRequestPath(runId, executionIndex, offset, limit) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  if (executionIndex === null) {
+    // the list route carries no query; the offset/limit arguments stay unused
+    return `/v1/runs/${runId}/logs`;
+  }
+  if (!Number.isSafeInteger(executionIndex) || executionIndex < 1) {
+    throw new UiContractError("invalid_execution_index");
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new UiContractError("invalid_offset");
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 262144) {
+    throw new UiContractError("invalid_limit");
+  }
+  return `/v1/runs/${runId}/logs/${executionIndex}?offset=${offset}&limit=${limit}`;
+}
+
+/** The worker-logs endpoint client: kind-bound like the events client. */
+export async function requestWorkerLogsJson(fetchImpl, path, init, expectedRunId) {
+  return requestJsonDocument(fetchImpl, path, init, (document) => parseWorkerLogsEndpointDocument(document, expectedRunId));
+}
+
+/**
+ * The bounded single-flight logs transport: at most one unsettled logs
+ * GET at any instant. A new desire supersedes the active request (its
+ * response is dropped, the abort is best effort) and runs as the single
+ * follow-up when the slot is released. There is no auto-retry, no
+ * retries and no streaming; `dispose` withdraws everything.
+ */
+export function createLogsTransport(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["fetchLogs"] !== "function" ||
+    typeof io["onStarted"] !== "function" ||
+    typeof io["onSettled"] !== "function"
+  ) {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const fetchLogs = io["fetchLogs"];
+  const onStarted = io["onStarted"];
+  const onSettled = io["onSettled"];
+  let active = null;
+  let desired = null;
+  let disposed = false;
+
+  const startRequest = (request) => {
+    if (active !== null) {
+      throw new UiContractError("transport_slot_busy");
+    }
+    active = request;
+    const controller = new AbortController();
+    request.controller = controller;
+    onStarted(request.runId);
+    void (async () => {
+      let result;
+      try {
+        result = await fetchLogs(request.runId, request.path, controller.signal);
+      } catch {
+        result = undefined;
+      } finally {
+        settleActive(request, result);
+      }
+    })();
+  };
+
+  const settleActive = (request, result) => {
+    try {
+      if (request.superseded) {
+        if (desired === null) {
+          onSettled(request.runId);
+        }
+      } else {
+        request.onApplied(result);
+        onSettled(request.runId);
+      }
+    } finally {
+      active = null;
+      const followUp = desired;
+      desired = null;
+      request.resolve(result);
+      if (followUp !== null && !disposed) {
+        startRequest(followUp);
+      }
+    }
+  };
+
+  return Object.freeze({
+    request(desire) {
+      const runId = isRecord(desire) && isSafeId(desire["runId"]) ? desire["runId"] : null;
+      const path = isRecord(desire) && typeof desire["path"] === "string" ? desire["path"] : null;
+      const onApplied = isRecord(desire) && typeof desire["onApplied"] === "function" ? desire["onApplied"] : null;
+      let resolveResult = null;
+      const settled = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      if (disposed || runId === null || path === null || onApplied === null) {
+        resolveResult(undefined);
+        return settled;
+      }
+      const request = { runId, path, onApplied, superseded: false, controller: null, resolve: resolveResult };
+      if (active === null) {
+        startRequest(request);
+      } else {
+        active.superseded = true;
+        active.controller.abort();
+        const replaced = desired;
+        desired = request;
+        if (replaced !== null) {
+          replaced.resolve(undefined);
+        }
+      }
+      return settled;
+    },
+    invalidate() {
+      if (active !== null) {
+        active.superseded = true;
+        active.controller.abort();
+      }
+      const withdrawn = desired;
+      desired = null;
+      if (withdrawn !== null) {
+        withdrawn.resolve(undefined);
+      }
+    },
+    dispose() {
+      disposed = true;
+      this.invalidate();
+    },
+  });
+}
+
+/** The empty logs state of one run selection. */
+export function createWorkerLogsState(runId) {
+  return Object.freeze({
+    runId,
+    snapshotRevision: null,
+    logs: [],
+    selectedExecutionIndex: null,
+    content: null,
+    requestState: "idle",
+    error: null,
+  });
+}
+
+/**
+ * The closed viewer state machine of the Worker logs section. It owns
+ * no fetch and no URL: `fetchLogsList`/`fetchChunk` hand one prepared
+ * desire to the single-flight logs transport, and every transition
+ * accepts only an already validated logs document of the same run. The
+ * list loads only on an explicit button press; a chunk loads only on an
+ * explicit `Load next chunk` press, and only for a captured/truncated
+ * execution while the authoritative inspect boundary shows the run as
+ * running/plan-ready/waiting and no mutating POST is in flight — a
+ * settled run's captured payloads are never rendered here.
+ */
+export function createWorkerLogViewer(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["transport"] !== "object" ||
+    typeof io["onState"] !== "function" ||
+    typeof io["snapshot"] !== "function" ||
+    typeof io["mutatingInFlight"] !== "function"
+  ) {
+    throw new UiContractError("invalid_viewer_io");
+  }
+  const transport = io["transport"];
+  const onState = io["onState"];
+  const snapshot = io["snapshot"];
+  const mutatingInFlight = io["mutatingInFlight"];
+  let state = null;
+  let lastChunkDesire = null;
+
+  const publish = () => {
+    onState(state);
+  };
+
+  const enter = (runId) => {
+    transport.invalidate();
+    state = createWorkerLogsState(runId);
+    lastChunkDesire = null;
+    publish();
+  };
+
+  /** An endpoint failure envelope (error or failed command result) becomes
+   * the state failure; any other kind is a contract violation. */
+  const endpointFailure = (model) => {
+    if (model !== null && typeof model === "object" && model.kind === "error") {
+      return { ok: false, failure: { layer: model.layer, reason: model.reason } };
+    }
+    if (model !== null && typeof model === "object" && model.kind === "command_result") {
+      return { ok: false, failure: { layer: "orchestrator", reason: model.reason ?? "failed" } };
+    }
+    return { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } };
+  };
+
+  const applyFailure = (result) => {
+    if (result === undefined) {
+      // a superseded or disposed request: no state change
+      return;
+    }
+    if (result.ok) {
+      return;
+    }
+    state = Object.freeze({
+      ...state,
+      requestState: "failed",
+      error: Object.freeze({ layer: result.failure.layer, reason: result.failure.reason }),
+    });
+    publish();
+  };
+
+  return Object.freeze({
+    /** Selection change / reset: discards state and invalidates the wire. */
+    transitionToLogsView(runId) {
+      if (!isSafeId(runId)) {
+        throw new UiContractError("invalid_run_id");
+      }
+      enter(runId);
+    },
+    dropView() {
+      transport.invalidate();
+      state = null;
+      lastChunkDesire = null;
+    },
+    /**
+     * The explicit metadata load: one bounded GET of the list endpoint.
+     * Never automatic.
+     */
+    fetchLogsList() {
+      if (state === null || state.requestState === "loading") {
+        return;
+      }
+      state = Object.freeze({ ...state, requestState: "loading", error: null });
+      publish();
+      const requestedRunId = state.runId;
+      transport.request({
+        runId: state.runId,
+        path: workerLogsRequestPath(state.runId, null, 0, 0),
+        onApplied: (result) => {
+          if (state === null || state.runId !== requestedRunId) {
+            return;
+          }
+          if (result === undefined) {
+            return;
+          }
+          if (!result.ok) {
+            applyFailure(result);
+            return;
+          }
+          const model = result.model;
+          if (model.kind !== "worker_logs") {
+            applyFailure(endpointFailure(model));
+            return;
+          }
+          if (model.runId !== state.runId) {
+            applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+            return;
+          }
+          state = Object.freeze({
+            ...state,
+            snapshotRevision: model.revision,
+            logs: model.logs,
+            selectedExecutionIndex: null,
+            content: null,
+            requestState: "ready",
+            error: null,
+          });
+          publish();
+        },
+      });
+    },
+    /** One execution selection: content stays until a chunk is loaded. */
+    selectExecution(index) {
+      if (state === null || !Number.isSafeInteger(index) || index < 1) {
+        return;
+      }
+      const entry = state.logs.find((item) => item.executionIndex === index) ?? null;
+      if (entry === null) {
+        return;
+      }
+      state = Object.freeze({ ...state, selectedExecutionIndex: index, content: null, error: null });
+      publish();
+    },
+    /**
+     * The explicit next-chunk load of the selected execution. The
+     * capture gate: only while the authoritative inspect boundary shows
+     * the run as running/plan-ready/waiting and no mutating POST is in
+     * flight; only a captured/truncated execution carries content.
+     */
+    fetchChunk() {
+      if (state === null || state.selectedExecutionIndex === null || state.requestState === "loading") {
+        return;
+      }
+      const entry = state.logs.find((item) => item.executionIndex === state.selectedExecutionIndex) ?? null;
+      if (entry === null || (entry.status !== "captured" && entry.status !== "truncated")) {
+        return;
+      }
+      const boundaryKind = snapshot().boundaryKind;
+      if (boundaryKind !== "in_flight" && boundaryKind !== "plan_ready" && boundaryKind !== "waiting") {
+        state = Object.freeze({
+          ...state,
+          requestState: "failed",
+          error: Object.freeze({ layer: "viewer", reason: "capture_gate_refused" }),
+        });
+        publish();
+        return;
+      }
+      if (mutatingInFlight()) {
+        return;
+      }
+      const offset = state.content === null ? 0 : state.content.nextOffset === null ? null : state.content.nextOffset;
+      if (offset === null) {
+        return;
+      }
+      const executionIndex = state.selectedExecutionIndex;
+      state = Object.freeze({ ...state, requestState: "loading", error: null });
+      publish();
+      const desire = { executionIndex, offset };
+      const requestedRunId = state.runId;
+      lastChunkDesire = desire;
+      transport.request({
+        runId: state.runId,
+        path: workerLogsRequestPath(state.runId, executionIndex, offset, 65536),
+        onApplied: (result) => {
+          if (state === null || state.runId !== requestedRunId) {
+            return;
+          }
+          if (result === undefined) {
+            return;
+          }
+          if (!result.ok) {
+            applyFailure(result);
+            return;
+          }
+          const model = result.model;
+          if (model.kind !== "worker_log" || model.runId !== state.runId || model.executionIndex !== desire.executionIndex) {
+            applyFailure(model.kind === "worker_log" || model.kind === "error" || model.kind === "command_result"
+              ? { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }
+              : endpointFailure(model));
+            return;
+          }
+          if (model.status !== "captured" && model.status !== "truncated") {
+            applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+            return;
+          }
+          lastChunkDesire = null;
+          state = Object.freeze({
+            ...state,
+            snapshotRevision: model.revision,
+            content: Object.freeze({
+              status: model.status,
+              sha256: model.sha256,
+              byteCount: model.byteCount,
+              truncatedDaemon: model.truncatedDaemon,
+              truncatedLocal: model.truncatedLocal,
+              offset: model.offset,
+              dataBase64: model.dataBase64,
+              nextOffset: model.nextOffset,
+            }),
+            requestState: "ready",
+            error: null,
+          });
+          publish();
+        },
+      });
+    },
+    /** One retry click: exactly one re-request of the last failed chunk desire. */
+    retryLastChunkRequest() {
+      if (state === null || state.requestState !== "failed" || lastChunkDesire === null) {
+        return;
+      }
+      const retryOffset = lastChunkDesire.offset;
+      const retryExecutionIndex = lastChunkDesire.executionIndex;
+      state = Object.freeze({ ...state, requestState: "loading", error: null });
+      publish();
+      const requestedRunId = state.runId;
+      transport.request({
+        runId: state.runId,
+        path: workerLogsRequestPath(state.runId, lastChunkDesire.executionIndex, retryOffset, 65536),
+        onApplied: (result) => {
+          if (state === null || state.runId !== requestedRunId) {
+            return;
+          }
+          if (result === undefined) {
+            return;
+          }
+          if (!result.ok) {
+            applyFailure(result);
+            return;
+          }
+          const model = result.model;
+          if (model.kind !== "worker_log" || model.runId !== state.runId || model.executionIndex !== retryExecutionIndex || model.offset !== retryOffset) {
+            applyFailure(model.kind === "worker_log" || model.kind === "error" || model.kind === "command_result"
+              ? { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }
+              : endpointFailure(model));
+            return;
+          }
+          lastChunkDesire = null;
+          state = Object.freeze({
+            ...state,
+            snapshotRevision: model.revision,
+            content: Object.freeze({
+              status: model.status,
+              sha256: model.sha256,
+              byteCount: model.byteCount,
+              truncatedDaemon: model.truncatedDaemon,
+              truncatedLocal: model.truncatedLocal,
+              offset: model.offset,
+              dataBase64: model.dataBase64,
+              nextOffset: model.nextOffset,
+            }),
+            requestState: "ready",
+            error: null,
+          });
+          publish();
+        },
+      });
+    },
+    /** The read-only projection for the DOM adapter. */
+    currentState() {
+      return state;
+    },
+  });
+}
+
+/**
+ * The safe render contract of one bounded chunk: the literal base64 is
+ * decoded and rendered as plain text through `textContent` only. NUL
+ * bytes, ANSI escapes and invalid UTF-8 sequences can never become
+ * markup, and the payload is never logged, announced or embedded in a
+ * diagnostic. The rendered text of a chunk that is not a validated
+ * `worker_log` document is a contract error, never a fallback.
+ */
+export function decodeLogChunkText(dataBase64) {
+  const bytes = Uint8Array.from(atob(dataBase64), (char) => char.charCodeAt(0));
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+export function logsCaptureGate(state, boundaryKind, mutatingInFlight) {
+  if (state === null || state.selectedExecutionIndex === null) {
+    return false;
+  }
+  const entry = state.logs.find((item) => item.executionIndex === state.selectedExecutionIndex) ?? null;
+  if (entry === null || (entry.status !== "captured" && entry.status !== "truncated")) {
+    return false;
+  }
+  if (state.content !== null && state.content.nextOffset === null) {
+    return false;
+  }
+  const gate = boundaryKind === "in_flight" || boundaryKind === "plan_ready" || boundaryKind === "waiting";
+  return gate && !mutatingInFlight();
+}
+
 /* ------------------------------------------------------------------ */
 /* Live observation (v3): bounded read-only polling of one selected    */
 /* run while the authoritative inspect shows `running` + `in_flight`.  */
@@ -2150,9 +2802,12 @@ function showRunModel(model, options = {}) {
   refreshSequence += 1;
   updateLiveStateLine();
   ensureTimelineFor(model.runId);
+  ensureWorkerLogsFor(model.runId);
   lastInspectRevision = model.revision;
+  lastBoundaryKind = model.boundary.kind;
   renderTimelineMeta();
   maybeTailEvents(model);
+  renderWorkerLogs(workerLogViewer === null ? null : workerLogViewer.currentState());
   return changed;
 }
 
@@ -2657,6 +3312,7 @@ let lastDocumentKey = null;
 let refreshSequence = 0;
 let timeline = null;
 let lastInspectRevision = null;
+let lastBoundaryKind = null;
 const mutationGate = createMutationGate();
 const runsGuard = createGenerationGuard();
 const fetchImplementation = typeof fetch === "function" ? fetch : null;
@@ -2689,6 +3345,140 @@ const eventsTransport = createEventsTransport({
     }
   },
 });
+
+
+/* ------------------------------------------------------------------ */
+/* Worker logs (v5): the thin DOM adapter of the logs viewer.          */
+/* ------------------------------------------------------------------ */
+
+let workerLogViewer = null;
+
+const logsTransport = createLogsTransport({
+  fetchLogs: (runId, path, signal) => requestWorkerLogsJson(fetchImplementation, path, { signal }, runId),
+  onStarted: () => {
+    for (const id of ["logs-load", "logs-next-chunk", "logs-retry"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["logs-load", "logs-next-chunk", "logs-retry"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+/** The section of the selected run: created once per selection; a run
+ * change discards the previous viewer and invalidates its in-flight
+ * logs GET. The list is never loaded automatically. */
+function ensureWorkerLogsFor(runId) {
+  const current = workerLogViewer === null ? null : workerLogViewer.currentState();
+  if (current !== null && current.runId === runId) {
+    document.getElementById("worker-logs-section").hidden = false;
+    return;
+  }
+  if (workerLogViewer === null) {
+    workerLogViewer = createWorkerLogViewer({
+      transport: logsTransport,
+      onState: (state) => renderWorkerLogs(state),
+      snapshot: () => ({ boundaryKind: lastBoundaryKind }),
+      mutatingInFlight: () => mutationGate.isInFlight(),
+    });
+  }
+  workerLogViewer.transitionToLogsView(runId);
+  document.getElementById("worker-logs-section").hidden = false;
+  resetWorkerLogsDom();
+}
+
+function resetWorkerLogsDom() {
+  document.getElementById("logs-body").replaceChildren();
+  document.getElementById("logs-content").textContent = "";
+  document.getElementById("logs-content").hidden = true;
+  document.getElementById("logs-status").textContent = "";
+  document.getElementById("logs-retry").hidden = true;
+  document.getElementById("logs-next-chunk").hidden = true;
+  document.getElementById("logs-empty").textContent = "The metadata list is not loaded yet; use Load logs.";
+  document.getElementById("logs-table").hidden = true;
+}
+
+/** One metadata row: the execution identity, the status and, for a
+ * captured/truncated execution, the confirmed byte count. */
+function workerLogRow(entry) {
+  const row = document.createElement("tr");
+  row.appendChild(element("td", String(entry.executionIndex)));
+  row.appendChild(element("td", entry.stateId));
+  row.appendChild(element("td", entry.status));
+  row.appendChild(element("td", entry.byteCount === undefined ? "" : String(entry.byteCount)));
+  row.appendChild(element("td", entry.truncatedDaemon === true || entry.truncatedLocal === true ? "yes" : ""));
+  const actions = document.createElement("td");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "View";
+  button.addEventListener("click", () => {
+    clearMessages();
+    if (workerLogViewer !== null) {
+      workerLogViewer.selectExecution(entry.executionIndex);
+    }
+  });
+  actions.appendChild(button);
+  row.appendChild(actions);
+  return row;
+}
+
+function renderWorkerLogs(state) {
+  if (state === null) {
+    return;
+  }
+  const body = document.getElementById("logs-body");
+  body.replaceChildren();
+  for (const entry of state.logs) {
+    body.appendChild(workerLogRow(entry));
+  }
+  document.getElementById("logs-table").hidden = state.logs.length === 0;
+  const empty = document.getElementById("logs-empty");
+  const showHint = state.requestState === "idle" || (state.requestState === "ready" && state.logs.length === 0);
+  empty.hidden = !showHint;
+  empty.textContent = showHint
+    ? state.requestState === "ready"
+      ? "This run has no agent executions with worker logs."
+      : "The metadata list is not loaded yet; use Load logs."
+    : "";
+  const status = document.getElementById("logs-status");
+  let text = "";
+  if (state.requestState === "loading") {
+    text = "Loading…";
+  } else if (state.requestState === "failed" && state.error !== null) {
+    text = `failed (${state.error.layer}: ${state.error.reason})`;
+  } else if (state.snapshotRevision !== null) {
+    text = `snapshot revision ${state.snapshotRevision}`;
+  }
+  status.textContent = text;
+  const retry = document.getElementById("logs-retry");
+  retry.hidden = !(state.requestState === "failed" && state.error !== null && state.error.layer !== "viewer");
+  // the content frame: only a validated captured/truncated chunk renders
+  const content = state.content;
+  const pre = document.getElementById("logs-content");
+  if (content === null) {
+    pre.hidden = true;
+    pre.textContent = "";
+  } else {
+    pre.hidden = false;
+    // safe render: plain text via textContent, never markup
+    pre.textContent = decodeLogChunkText(content.dataBase64);
+    const cursor = content.nextOffset === null
+      ? `bytes ${content.offset}–${content.offset + (content.byteCount - content.offset)} (end)`
+      : `bytes ${content.offset}–${content.nextOffset} of ${content.byteCount}`;
+    document.getElementById("logs-cursor").textContent =
+      `execution ${state.selectedExecutionIndex} · ${content.status} · sha256 ${content.sha256.slice(0, 12)}… · ${cursor}` +
+      (content.truncatedDaemon || content.truncatedLocal ? " · truncated" : "");
+  }
+  const next = document.getElementById("logs-next-chunk");
+  const gate = logsCaptureGate(
+    state,
+    lastBoundaryKind,
+    () => mutationGate.isInFlight(),
+  );
+  next.hidden = !gate;
+}
 
 function setStatus(text) {
   document.getElementById("status").textContent = text;
@@ -2772,6 +3562,24 @@ function boot() {
   });
   document.getElementById("events-retry").addEventListener("click", () => {
     retryTimeline();
+  });
+  document.getElementById("logs-load").addEventListener("click", () => {
+    clearMessages();
+    if (workerLogViewer !== null) {
+      workerLogViewer.fetchLogsList();
+    }
+  });
+  document.getElementById("logs-next-chunk").addEventListener("click", () => {
+    clearMessages();
+    if (workerLogViewer !== null) {
+      workerLogViewer.fetchChunk();
+    }
+  });
+  document.getElementById("logs-retry").addEventListener("click", () => {
+    clearMessages();
+    if (workerLogViewer !== null) {
+      workerLogViewer.retryLastChunkRequest();
+    }
   });
   clearMessages();
 }

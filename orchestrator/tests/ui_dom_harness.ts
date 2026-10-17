@@ -150,6 +150,18 @@ export interface UiHarness {
   eventsMeta(): string;
   /** The hidden/disabled state of one timeline action button. */
   eventsButtonState(id: string): { hidden: boolean; disabled: boolean };
+  /** The `Execution|State|Status|Bytes|Truncated` rows of the logs table. */
+  logsRows(): string[];
+  /** The worker-logs aria-live status line. */
+  logsStatus(): string;
+  /** The decoded content text of the logs frame. */
+  logsContent(): string;
+  /** The logs cursor meta line. */
+  logsCursor(): string;
+  /** The logs empty-hint line. */
+  logsEmpty(): string;
+  /** The hidden/disabled state of one logs action button. */
+  logsButtonState(id: string): { hidden: boolean; disabled: boolean };
   readonly clock: UiHarnessClock | null;
   /** Clicks the Inspect button of the run row at `index` in the runs table. */
   clickRunInspect(index: number): void;
@@ -193,6 +205,16 @@ const UI_ELEMENT_IDS = [
   "events-load-more",
   "events-reload",
   "events-retry",
+  "worker-logs-section",
+  "logs-load",
+  "logs-empty",
+  "logs-table",
+  "logs-body",
+  "logs-cursor",
+  "logs-content",
+  "logs-status",
+  "logs-next-chunk",
+  "logs-retry",
 ] as const;
 
 export interface UiHarnessOptions {
@@ -331,6 +353,16 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
     eventsStatus: () => harness.element("events-status").textContent,
     eventsMeta: () => harness.element("events-meta").textContent,
     eventsButtonState: (id) => {
+      const button = harness.element(id);
+      return { hidden: button.hidden, disabled: button.disabled };
+    },
+    logsRows: () =>
+      harness.element("logs-body").children.map((row) => row.children.map((cell) => cell.textContent).join("|")),
+    logsStatus: () => harness.element("logs-status").textContent,
+    logsContent: () => harness.element("logs-content").textContent,
+    logsCursor: () => harness.element("logs-cursor").textContent,
+    logsEmpty: () => harness.element("logs-empty").textContent,
+    logsButtonState: (id) => {
       const button = harness.element(id);
       return { hidden: button.hidden, disabled: button.disabled };
     },

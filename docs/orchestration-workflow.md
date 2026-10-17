@@ -6358,15 +6358,58 @@ Security contract (deliberate, documented):
   payloads without a trailing newline;
 - log content never reaches HTTP headers, error documents, filenames, the
   durable state, the events feed, `inspect` or the discovery routes; the
-  browser UI never calls the logs endpoints;
+  general browser API client never accepts a logs document (the browser
+  consumes the endpoints only through the dedicated v5 viewer below);
 - diagnostics never echo payload fragments, cursor values, paths or the
   artifact envelope;
 - `captured` never means upstream completeness: daemon-side eviction
   outside the observed window cannot be proven absent, and there is no
   `complete` status.
 
-Not implemented (future increments): a browser UI logs viewer,
-streaming/tailing, download routes, a redaction policy, and retention.
+Not implemented (future increments): streaming/tailing, download routes,
+a redaction policy, and retention.
+
+## Browser UI v5: bounded read-only worker-log viewer
+(implemented, production-wired)
+
+The run detail gains a manual, pagination-only "Worker logs" section
+consuming only the two existing versioned logs endpoints. The UI model
+lives in `orchestrator/ui/app.js` as one closed logs model
+(`createWorkerLogViewer` over the state shape `{runId, snapshotRevision,
+logs, selectedExecutionIndex, content, requestState, error}`), mirrored
+exactly in `orchestrator/ui/app.d.ts`:
+
+- the dedicated logs endpoint client (`requestWorkerLogsJson`) accepts only
+  the two logs documents of the expected run (or the endpoint failure
+  envelopes); the general inspect/discovery/mutation client still rejects
+  both kinds, and the durable artifact envelope (`payload_base64`,
+  `workerlog.json`) never enters the browser layer;
+- the bounded single-flight logs transport (`createLogsTransport`) keeps
+  exactly one unsettled logs GET: a new desire supersedes the active
+  request (its response is dropped), `invalidate`/`dispose` withdraw
+  everything, and there is no auto-retry, backoff or streaming;
+- loading is manual only: the metadata list loads on an explicit
+  "Load logs" press (never automatically, never on selection), and a chunk
+  loads on an explicit "Load next chunk" press of a selected
+  captured/truncated execution — one bounded GET per click (limit 65536
+  raw bytes), cursor via `next_offset`, disabled at the terminal chunk;
+- the capture gate: a captured/truncated chunk request requires the
+  authoritative inspect boundary of the selected run to be
+  `in_flight`/`plan_ready`/`waiting` and no mutating POST in flight; a
+  settled run's captured payloads are never rendered (the gate refusal is
+  a typed `viewer: capture_gate_refused` state, never a fetch);
+- stale responses of another run or execution are dropped before they
+  become state (run-change invalidation plus run/execution guards in every
+  transition), and lost GETs settle as typed `transport: network_error`
+  failures with exactly one manual Retry click per retry;
+- the safe render contract: the literal base64 is decoded with a
+  non-fatal UTF-8 decoder and rendered through `textContent` only — NUL
+  bytes, ANSI escapes, invalid UTF-8 sequences and payloads without a
+  trailing newline can never become markup; no payload fragment ever
+  enters a diagnostic, storage or URL;
+- the section declares its read-only, secret-bearing, unredacted nature;
+  there is no download, export, search, redaction or retention.
+
 
 ## Failure and recovery
 

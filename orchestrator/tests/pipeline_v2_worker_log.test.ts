@@ -598,12 +598,13 @@ test("no new commit-history or event kind and no operation id in the state", () 
   expect(events).not.toContain("byte_count");
 });
 
-test("no UI logs route, no artifact paths in HTTP responses, and no log bytes in the non-logs surfaces", () => {
-  // the browser UI never calls the logs endpoints and never renders logs
+test("no artifact paths in HTTP responses, and no log bytes in the non-logs surfaces", () => {
+  // the browser UI (v5 viewer) reads only the two versioned logs endpoints
+  // and never the durable artifact layout, its filename or its raw envelope
   const ui = readFileSync(pjoin(SRC, "..", "ui", "app.js"), "utf8");
   expect(ui).not.toContain("workerlog");
-  expect(ui).not.toContain("worker_log");
-  expect(ui).not.toContain("/logs");
+  expect(ui).not.toContain("payload_base64");
+  expect(ui).not.toContain(".workerlog");
   // the routing layer never names the artifact format or its namespace
   const routing = sourceOf(pjoin("control_plane", "routing.ts"));
   expect(routing).not.toContain("workerlog");
