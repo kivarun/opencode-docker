@@ -1126,6 +1126,235 @@ describe("control-plane HTTP: production entrypoint", () => {
 });
 
 
+describe("control-plane HTTP: listen address contract", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-listen-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const storeRoot = join(envRoot, "bindings");
+  const projectDir = join(envRoot, "project");
+  const inputRoot = join(envRoot, "inputs");
+  const configRoot = join(envRoot, "config");
+  const pipelineRoot = join(envRoot, "bundle");
+  const fixtureRoot = join(import.meta.dir, "..", "fixtures", "control-plane");
+
+  beforeAll(() => {
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(inputRoot, { mode: 0o700 });
+    mkdirSync(configRoot, { mode: 0o700 });
+    mkdirSync(pipelineRoot, { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(join(inputRoot, "task.md"), "LISTEN-TASK\n", { mode: 0o600 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(fixtureRoot, "config"),
+            pipeline_root: join(fixtureRoot, "bundle"),
+            launcher_id: null,
+            input_roots: [{ id: "tasks", root: inputRoot }],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+  });
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  const buildConfig = (listenAddress?: "127.0.0.1" | "0.0.0.0") => ({
+    registryPath,
+    bindingStoreRoot: storeRoot,
+    client: {
+      bunExecutable: process.execPath,
+      orchestratorEntrypoint: join(import.meta.dir, "..", "src", "main.ts"),
+      workingDirectory: envRoot,
+      baseEnv: { PATH: "/usr/bin:/bin", HOME: envRoot },
+      stdoutLimitBytes: 1_000_000,
+      stderrLimitBytes: 1_000_000,
+      sigintGraceMs: 1000,
+    },
+    port: 0,
+    bodyLimitBytes: 4096,
+    ...(listenAddress === undefined ? {} : { listenAddress }),
+  });
+
+  /** A real TCP probe against the non-primary loopback address 127.0.0.2. */
+  function probeSecondaryLoopback(port: number, hostHeader: string): Promise<{ reachable: boolean; status: number }> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        req.destroy();
+        resolve({ reachable: false, status: 0 });
+      }, 2000);
+      const req = httpRequest({ host: "127.0.0.2", port, method: "GET", path: "/", headers: { host: hostHeader } }, (res) => {
+        clearTimeout(timer);
+        res.resume();
+        resolve({ reachable: true, status: res.statusCode ?? 0 });
+      });
+      req.on("error", () => {
+        clearTimeout(timer);
+        resolve({ reachable: false, status: 0 });
+      });
+      req.end();
+    });
+  }
+
+  test(
+    "l1. the default configuration binds the loopback address only",
+    async () => {
+      const service = await startControlPlaneHttpService(buildConfig());
+      try {
+        const local = await rawRequest(service.port, "GET", `/v1/runs/neverbound`, { host: `127.0.0.1:${service.port}` });
+        expect(local.status).toBe(404);
+        expect(JSON.parse(local.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_not_found" });
+        const secondary = await probeSecondaryLoopback(service.port, `127.0.0.2:${service.port}`);
+        expect(secondary.reachable).toBe(false);
+      } finally {
+        await service.stop();
+      }
+    },
+    30000,
+  );
+
+  test(
+    "l2. an explicit 127.0.0.1 behaves exactly like the default",
+    async () => {
+      const service = await startControlPlaneHttpService(buildConfig("127.0.0.1"));
+      try {
+        const local = await rawRequest(service.port, "GET", `/v1/runs/neverbound`, { host: `127.0.0.1:${service.port}` });
+        expect(local.status).toBe(404);
+        const secondary = await probeSecondaryLoopback(service.port, `127.0.0.2:${service.port}`);
+        expect(secondary.reachable).toBe(false);
+      } finally {
+        await service.stop();
+      }
+    },
+    30000,
+  );
+
+  test(
+    "l3. an explicit 0.0.0.0 accepts container-interface connections while the authority gate stays 127.0.0.1",
+    async () => {
+      const service = await startControlPlaneHttpService(buildConfig("0.0.0.0"));
+      try {
+        const local = await rawRequest(service.port, "GET", `/v1/runs/neverbound`, { host: `127.0.0.1:${service.port}` });
+        expect(local.status).toBe(404);
+        // The container interface is now reachable, but the Host header
+        // still decides the authority: a foreign Host is refused, the
+        // established browser authority passes.
+        const foreign = await probeSecondaryLoopback(service.port, `127.0.0.2:${service.port}`);
+        expect(foreign.reachable).toBe(true);
+        expect(foreign.status).toBe(400);
+        expect((await probeSecondaryLoopback(service.port, `127.0.0.1:${service.port}`)).status).toBe(200);
+      } finally {
+        await service.stop();
+      }
+    },
+    30000,
+  );
+
+  test("l4. an invalid configured listen address fails closed before any socket", async () => {
+    for (const value of ["localhost", "::", "", "0.0.0.0:80", "0.0.0.0 "]) {
+      let message = "";
+      try {
+        await startControlPlaneHttpService(buildConfig(value as never));
+      } catch (cause) {
+        message = cause instanceof Error ? cause.message : String(cause);
+      }
+      expect(message).toBe("the listen address must be exactly 127.0.0.1 or 0.0.0.0");
+    }
+  });
+
+  test(
+    "l5. the operator entrypoint accepts both exact values and prints the bound address",
+    async () => {
+      for (const [flag, expectedAddress] of [
+        [["--listen-address", "0.0.0.0"], "0.0.0.0"],
+        [["--listen-address=0.0.0.0"], "0.0.0.0"],
+        [["--listen-address", "127.0.0.1"], "127.0.0.1"],
+      ] as const) {
+        const port = 40000 + Math.floor(Math.random() * 20000);
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            join(import.meta.dir, "..", "src", "control_plane", "server_main.ts"),
+            "--registry",
+            registryPath,
+            "--binding-store",
+            storeRoot,
+            "--port",
+            String(port),
+            ...flag,
+            "--env",
+            "PATH=/usr/bin:/bin",
+            "--env",
+            `HOME=${envRoot}`,
+          ],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        const reader = child.stdout.getReader();
+        const decoder = new TextDecoder();
+        let stdout = "";
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          stdout += decoder.decode(value);
+          if (stdout.includes("listening on")) break;
+        }
+        expect(stdout).toBe(`control-plane: listening on ${expectedAddress}:${port}\n`);
+        const unbound = await rawRequest(port, "GET", "/v1/runs/neverbound", { host: `127.0.0.1:${port}` });
+        expect(unbound.status).toBe(404);
+        child.kill("SIGTERM");
+        expect(await child.exited).toBe(0);
+      }
+    },
+    60000,
+  );
+
+  test(
+    "l6. the operator entrypoint refuses missing, empty, duplicate and unknown listen addresses before starting",
+    async () => {
+      for (const [flag, expectedMessage] of [
+        [["--env", "PATH=/usr/bin:/bin", "--listen-address"], "--listen-address requires a value"],
+        [["--listen-address="], "--listen-address requires a value"],
+        [["--listen-address", "127.0.0.1", "--listen-address", "0.0.0.0"], "--listen-address must not repeat"],
+        [["--listen-address", "localhost"], "--listen-address must be exactly 127.0.0.1 or 0.0.0.0"],
+        [["--listen-address", "0.0.0.0:80"], "--listen-address must be exactly 127.0.0.1 or 0.0.0.0"],
+        [["--listen-address", "::"], "--listen-address must be exactly 127.0.0.1 or 0.0.0.0"],
+      ] as const) {
+        const port = 40000 + Math.floor(Math.random() * 20000);
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            join(import.meta.dir, "..", "src", "control_plane", "server_main.ts"),
+            "--registry",
+            registryPath,
+            "--binding-store",
+            storeRoot,
+            "--port",
+            String(port),
+            ...flag,
+          ],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        const stdout = await new Response(child.stdout).text();
+        const stderr = await new Response(child.stderr).text();
+        expect(await child.exited).toBe(2);
+        expect(stdout).toBe("");
+        expect(stderr).toContain(`control-plane: ${expectedMessage}`);
+        expect(stderr).toContain("usage: bun server_main.ts");
+        expect(stderr).toContain("--listen-address");
+      }
+    },
+    60000,
+  );
+});
+
+
 describe("control-plane HTTP: discovery (projects and bound runs)", () => {
   const envRoot = mkdtempSync(join(tmpdir(), `cp-http-discovery-${CANARY}-`));
   const registryPath = join(envRoot, "registry.json");

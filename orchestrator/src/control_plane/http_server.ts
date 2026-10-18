@@ -1471,6 +1471,9 @@ async function dispatchControlPlaneRoute(
   }
 }
 
+/** The exact listen-address vocabulary: loopback (default) or the container wildcard. */
+export type ControlPlaneListenAddress = "127.0.0.1" | "0.0.0.0";
+
 /**
  * The non-routing runtime configuration of the one subprocess client:
  * the routing authority (config root and pipeline-root form) is derived
@@ -1493,6 +1496,14 @@ export interface ControlPlaneHttpServiceConfig {
   readonly client: ControlPlaneHttpServiceClientRuntime;
   readonly port: number;
   readonly bodyLimitBytes: number;
+  /**
+   * The exact bind address of the single `Bun.serve` socket. Absent means
+   * the established loopback default (`127.0.0.1`); the only other
+   * accepted value is `0.0.0.0`, which allows a container port
+   * forwarding to reach the service. The browser authority (the
+   * `Host`/`Origin` gates) stays `127.0.0.1:<port>` in both modes.
+   */
+  readonly listenAddress?: ControlPlaneListenAddress;
 }
 
 /** A running service: the actual bound port plus the opened authorities. */
@@ -1516,8 +1527,11 @@ function requireCleanPath(value: unknown, what: string): string {
  * the registry once, proves the single routing authority across every
  * declared project, opens the binding store once, builds the one
  * immutable subprocess client, captures the static UI assets once and
- * serves the versioned routes plus the UI assets on
- * `127.0.0.1`. There is no hot reload, no discovery and no second
+ * serves the versioned routes plus the UI assets. The bind address is
+ * the established loopback default (`127.0.0.1`) unless the
+ * configuration explicitly selects the container wildcard (`0.0.0.0`);
+ * the browser authority (`Host`/`Origin` gates) is `127.0.0.1:<port>` in
+ * both modes. There is no hot reload, no discovery and no second
  * execution path.
  */
 export async function startControlPlaneHttpService(config: ControlPlaneHttpServiceConfig): Promise<RunningControlPlaneHttpService> {
@@ -1533,6 +1547,10 @@ export async function startControlPlaneHttpService(config: ControlPlaneHttpServi
   const bodyLimitBytes = config.bodyLimitBytes;
   if (!isPositiveSafeInteger(bodyLimitBytes)) {
     throw new ControlPlaneHttpServiceError("invalid_service_config", "the body limit must be a positive safe integer");
+  }
+  const listenAddress = config.listenAddress === undefined ? "127.0.0.1" : config.listenAddress;
+  if (listenAddress !== "127.0.0.1" && listenAddress !== "0.0.0.0") {
+    throw new ControlPlaneHttpServiceError("invalid_service_config", "the listen address must be exactly 127.0.0.1 or 0.0.0.0");
   }
   const clientConfig = config.client;
   if (typeof clientConfig !== "object" || clientConfig === null) {
@@ -1588,7 +1606,7 @@ export async function startControlPlaneHttpService(config: ControlPlaneHttpServi
   const depsRef: { current: ControlPlaneHttpServiceDeps | null } = { current: null };
   const server = Bun.serve({
     port,
-    hostname: "127.0.0.1",
+    hostname: listenAddress,
     async fetch(request: Request): Promise<Response> {
       const deps = depsRef.current;
       if (deps === null) {

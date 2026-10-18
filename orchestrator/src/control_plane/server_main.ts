@@ -4,18 +4,24 @@
  * This module is the runnable operator entrypoint: it parses its own
  * strict operator flags, loads the registry once, opens the durable run
  * binding store once, builds the one immutable subprocess client and
- * serves the seven versioned routes on the loopback address. It never
+ * serves the seven versioned routes on the exact configured bind address
+ * (loopback by default, or the container wildcard `0.0.0.0` for port
+ * forwarding). It never
  * accepts project or run paths through HTTP, never prints registry
  * contents, credentials or absolute project/input paths, and never
  * executes orchestration itself — the subprocess client remains the sole
  * execution substrate.
  *
  * usage: bun server_main.ts --registry ABS --binding-store ABS --port N
- *                            [--env KEY=VALUE ...]
+ *                            [--listen-address 127.0.0.1|0.0.0.0] [--env KEY=VALUE ...]
  *
  *   --registry       absolute path of the versioned project registry file
  *   --binding-store  absolute path of the durable run binding store root
- *   --port           the loopback listen port (1..65535)
+ *   --port           the listen port (1..65535)
+ *   --listen-address the exact bind address: 127.0.0.1 (default) or
+ *                    0.0.0.0 (allows a container port forwarding to reach
+ *                    the service; the browser Host/Origin authority stays
+ *                    127.0.0.1:<port>)
  *   --env KEY=VALUE  the exact environment of the CLI child processes;
  *                    repeatable, split at the first `=`, duplicates
  *                    rejected — there is no ambient inheritance
@@ -28,7 +34,11 @@
 
 import { join } from "node:path";
 import { isCleanAbsolutePath } from "../clean_path.ts";
-import { startControlPlaneHttpService, type ControlPlaneHttpServiceConfig } from "./http_server.ts";
+import {
+  startControlPlaneHttpService,
+  type ControlPlaneListenAddress,
+  type ControlPlaneHttpServiceConfig,
+} from "./http_server.ts";
 
 /** The fixed request-body byte limit of the service. */
 const BODY_LIMIT_BYTES = 65536;
@@ -43,15 +53,17 @@ export interface ParsedControlPlaneServerArgs {
   readonly registryPath: string;
   readonly bindingStoreRoot: string;
   readonly port: number;
+  readonly listenAddress: ControlPlaneListenAddress;
   readonly env: Readonly<Record<string, string>>;
 }
 
 function usage(): string {
   return [
-    "usage: bun server_main.ts --registry ABS --binding-store ABS --port N [--env KEY=VALUE ...]",
+    "usage: bun server_main.ts --registry ABS --binding-store ABS --port N [--listen-address 127.0.0.1|0.0.0.0] [--env KEY=VALUE ...]",
     "  --registry       absolute path of the versioned project registry file",
     "  --binding-store  absolute path of the durable run binding store root",
-    "  --port           the loopback listen port (1..65535)",
+    "  --port           the listen port (1..65535)",
+    "  --listen-address the exact bind address: 127.0.0.1 (default) or 0.0.0.0 (container port forwarding)",
     "  --env KEY=VALUE  the exact CLI child environment; repeatable, no ambient inheritance",
   ].join("\n");
 }
@@ -75,6 +87,7 @@ export function parseControlPlaneServerArgs(argv: readonly string[]): ParsedCont
   let registryPath: string | null = null;
   let bindingStoreRoot: string | null = null;
   let port: number | null = null;
+  let listenAddress: ControlPlaneListenAddress | null = null;
   const env: Record<string, string> = {};
   const seenEnvKeys: string[] = [];
   let index = 0;
@@ -127,6 +140,15 @@ export function parseControlPlaneServerArgs(argv: readonly string[]): ParsedCont
       port = parsedPort;
       continue;
     }
+    const listenValue = takeValue("--listen-address");
+    if (listenValue !== null) {
+      if (listenAddress !== null) failUsage("--listen-address must not repeat");
+      if (listenValue !== "127.0.0.1" && listenValue !== "0.0.0.0") {
+        failUsage("--listen-address must be exactly 127.0.0.1 or 0.0.0.0");
+      }
+      listenAddress = listenValue;
+      continue;
+    }
     const envValue = takeValue("--env");
     if (envValue !== null) {
       const separator = envValue.indexOf("=");
@@ -145,7 +167,7 @@ export function parseControlPlaneServerArgs(argv: readonly string[]): ParsedCont
   if (registryPath === null) failUsage("--registry is required");
   if (bindingStoreRoot === null) failUsage("--binding-store is required");
   if (port === null) failUsage("--port is required");
-  return { registryPath, bindingStoreRoot, port, env };
+  return { registryPath, bindingStoreRoot, port, listenAddress: listenAddress ?? "127.0.0.1", env };
 }
 
 export function buildControlPlaneServerConfig(args: ParsedControlPlaneServerArgs): ControlPlaneHttpServiceConfig {
@@ -163,6 +185,7 @@ export function buildControlPlaneServerConfig(args: ParsedControlPlaneServerArgs
     },
     port: args.port,
     bodyLimitBytes: BODY_LIMIT_BYTES,
+    listenAddress: args.listenAddress,
   };
 }
 
@@ -170,7 +193,7 @@ if (import.meta.main) {
   const args = parseControlPlaneServerArgs(process.argv.slice(2));
   try {
     const service = await startControlPlaneHttpService(buildControlPlaneServerConfig(args));
-    process.stdout.write(`control-plane: listening on 127.0.0.1:${service.port}\n`);
+    process.stdout.write(`control-plane: listening on ${args.listenAddress}:${service.port}\n`);
     let exiting = false;
     const shutdown = (): void => {
       if (exiting) return;
