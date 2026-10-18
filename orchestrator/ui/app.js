@@ -2666,11 +2666,14 @@ function resetTimelineDom() {
 
 /** The timeline of the selected run: created once per selection and
  * reset on a reload; a run change discards the previous timeline and
- * invalidates its in-flight events GET. */
+ * invalidates its in-flight events GET. Returns whether a fresh
+ * timeline snapshot was created — the exact moment the initial
+ * `after=0` load belongs to, and the only ordinary-inspect path that
+ * may start one. An existing timeline is never reset here. */
 function ensureTimelineFor(runId) {
   if (timeline !== null && timeline.runId === runId) {
     document.getElementById("events-section").hidden = false;
-    return;
+    return false;
   }
   eventsTransport.invalidate();
   timeline = createTimelineState(runId);
@@ -2678,6 +2681,7 @@ function ensureTimelineFor(runId) {
   document.getElementById("events-section").hidden = false;
   resetTimelineDom();
   renderTimelineMeta();
+  return true;
 }
 
 function renderTimelineMeta() {
@@ -2987,8 +2991,15 @@ function inspectRun(runId) {
   document.getElementById("run-detail").hidden = true;
   document.getElementById("outputs-table").hidden = true;
   document.getElementById("run-controls").replaceChildren();
-  ensureTimelineFor(runId);
-  requestTimelinePage(runId, 0);
+  // The initial `after=0` load belongs to the operation that creates a
+  // new timeline snapshot: the first selection of a run (or its
+  // re-selection after a full reset). An ordinary Inspect of an
+  // already-selected run never resets the timeline and never restarts
+  // the feed from the beginning — the applied authoritative inspect
+  // tails the existing timeline through `maybeTailEvents` instead.
+  if (ensureTimelineFor(runId)) {
+    requestTimelinePage(runId, 0);
+  }
   inspectTransport.request({
     runId,
     onApplied: (result) => {

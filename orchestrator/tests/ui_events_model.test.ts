@@ -358,6 +358,21 @@ describe("ui events model: the one dense merge", () => {
     expect(state.events.length).toBe(0);
     expect(state.cursor).toBe(0);
   });
+
+  test("m16. a manually fed page with a mismatched requested cursor is still stale_page", () => {
+    const loaded = applyEventsPage(createTimelineState("run-a"), page("run-a", 2, ["create_run", "start_agent_execution"], null), 0);
+    // a dense, otherwise valid page for the beginning of the history
+    // never merges into an advanced timeline, in either direction
+    expect(contractReason(() => applyEventsPage(loaded, page("run-a", 9, ["create_run", "start_agent_execution"], null), 0))).toBe("stale_page");
+    expect(contractReason(() => applyEventsPage(loaded, page("run-a", 11, ["agent_running"], 10), 10))).toBe("stale_page");
+    // the rejected page never mutates the timeline state
+    expect(loaded.cursor).toBe(2);
+    expect(loaded.events.length).toBe(2);
+    expect(loaded.stopped).toBe(false);
+    // the contract stop of a stale page keeps the explicit retry path
+    const stopped = stopTimeline(loaded, { layer: "contract", reason: "stale_page" });
+    expect(timelineRetryAvailable(stopped)).toBe(true);
+  });
 });
 
 describe("ui events model: stop, retry policy, summary and announcements", () => {
@@ -493,5 +508,32 @@ describe("ui events model: source restrictions of the events layer", () => {
   test("s4. the page limit is the fixed module constant", () => {
     expect(EVENTS_PAGE_LIMIT).toBe(100);
     expect(appSource.includes(`limit=${"EVENTS_PAGE_LIMIT"}`) || appSource.includes("limit=${EVENTS_PAGE_LIMIT}")).toBe(true);
+  });
+
+  test("s5. the after=0 request intent belongs only to the initial and reload owners", () => {
+    // The exact request-intent multiset of the one events fetch owner:
+    // the literal zero cursor appears at exactly two call sites — the
+    // fresh-selection initial load and the explicit Reload — while
+    // every other site passes a state-derived cursor or next cursor.
+    expect(appSource.split("requestTimelinePage(runId, 0)").length - 1).toBe(2);
+    expect(appSource.split("requestTimelinePage(model.runId, timeline.cursor)").length - 1).toBe(1);
+    expect(appSource.split("requestTimelinePage(timeline.runId, timeline.nextAfter)").length - 1).toBe(1);
+    expect(appSource.split("requestTimelinePage(timeline.runId, timeline.cursor)").length - 1).toBe(1);
+    // the definition plus the five accounted call sites: no unaccounted
+    // events request intent exists anywhere in the module
+    expect(appSource.split("requestTimelinePage(").length - 1).toBe(6);
+    // the inspect success path carries the initial load only inside the
+    // created-snapshot branch of the fresh-selection owner
+    const inspectStart = appSource.indexOf("function inspectRun(");
+    const inspectEnd = appSource.indexOf("\nasync function refreshRuns(", inspectStart);
+    const inspectBody = appSource.slice(inspectStart, inspectEnd);
+    expect(inspectBody.split("requestTimelinePage(").length - 1).toBe(1);
+    const guardAt = inspectBody.indexOf("if (ensureTimelineFor(runId)) {");
+    const requestAt = inspectBody.indexOf("requestTimelinePage(");
+    expect(guardAt).toBeGreaterThan(-1);
+    expect(requestAt).toBeGreaterThan(guardAt);
+    // the stale-page contract error is owned once by the merge: no
+    // other code path names, catches or masks it
+    expect(appSource.split('"stale_page"').length - 1).toBe(1);
   });
 });

@@ -622,3 +622,200 @@ describe("ui events wiring: the stale-response stress battery", () => {
     }
   });
 });
+
+/**
+ * The timeline corrective matrix: an ordinary Inspect (manual, polled
+ * or a mutation recovery) never resets the timeline and never requests
+ * `after=0`; only the operation that creates a new timeline snapshot
+ * (the first selection of a run, its re-selection after a full reset
+ * and the explicit Reload) starts the feed from the beginning, and an
+ * applied authoritative inspect tails the existing timeline through
+ * the one `maybeTailEvents` owner.
+ */
+describe("ui events wiring: a manual Inspect never restarts the timeline", () => {
+  test("t1 (A). a manual re-Inspect at the same revision pulls no events page", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [{ revision: 9 }, { revision: 9 }, { revision: 9 }],
+      [{ revision: 9, kinds: NINE_EVENTS, nextAfter: null }],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(probe.eventsGets).toEqual([{ path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 }]);
+    expect(harness.eventsMeta()).toBe("Detail revision: 9 · Events revision: 9 · Cursor: 9 · caught up");
+    // the manual detail Inspect of the shown run
+    harness.click("inspect-selected");
+    await Bun.sleep(5);
+    expect(probe.eventsCount()).toBe(1);
+    expect(harness.eventsRows().length).toBe(9);
+    expect(harness.eventsMeta()).toBe("Detail revision: 9 · Events revision: 9 · Cursor: 9 · caught up");
+    expect(harness.eventsStatus()).toBe("Added 9 lifecycle events. Caught up.");
+    // the run-row Inspect button drives the same inspect path
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(probe.eventsCount()).toBe(1);
+    expect(harness.eventsRows().length).toBe(9);
+    expect(harness.eventsMeta()).toBe("Detail revision: 9 · Events revision: 9 · Cursor: 9 · caught up");
+    harness.dispose();
+  });
+
+  test("t2 (B). a manual re-Inspect at a higher revision pulls exactly one tail at the cursor", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [{ revision: 9 }, { revision: 11 }],
+      [
+        { revision: 9, kinds: NINE_EVENTS, nextAfter: null },
+        { revision: 11, kinds: ["stage_generation_opened", "stage_iteration_opened"], startRevision: 10, nextAfter: null },
+      ],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness.eventsMeta()).toBe("Detail revision: 9 · Events revision: 9 · Cursor: 9 · caught up");
+    harness.click("inspect-selected");
+    await Bun.sleep(5);
+    expect(probe.eventsGets).toEqual([
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+      { path: "/v1/runs/run-a/events?after=9&limit=100", after: 9 },
+    ]);
+    expect(harness.eventsRows().length).toBe(11);
+    expect(harness.eventsMeta()).toBe("Detail revision: 11 · Events revision: 11 · Cursor: 11 · caught up");
+    expect(harness.eventsStatus()).toBe("Added 2 lifecycle events.");
+    harness.dispose();
+  });
+
+  test("t3 (C). a manual re-Inspect never bypasses Load more on a partial timeline", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [{ revision: 4 }, { revision: 4 }],
+      [{ revision: 4, kinds: NINE_EVENTS.slice(0, 2), nextAfter: 2 }],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness.eventsMeta()).toBe("Detail revision: 4 · Events revision: 4 · Cursor: 2 · more available");
+    harness.click("inspect-selected");
+    await Bun.sleep(5);
+    expect(probe.eventsCount()).toBe(1);
+    expect(harness.eventsRows().length).toBe(2);
+    expect(harness.eventsMeta()).toBe("Detail revision: 4 · Events revision: 4 · Cursor: 2 · more available");
+    expect(harness.eventsButtonState("events-load-more")).toEqual({ hidden: false, disabled: false });
+    harness.dispose();
+  });
+
+  test("t4 (D). a manual re-Inspect never revives a stopped timeline; Reload resets with one after=0", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [{ revision: 4 }, { revision: 6 }],
+      [
+        { revision: 2, kinds: NINE_EVENTS.slice(0, 2), nextAfter: null },
+        { revision: 2, fail: "invalid_cursor" },
+        { revision: 6, kinds: NINE_EVENTS.slice(0, 6), nextAfter: null },
+      ],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(4);
+    // the tail after the first inspect fails fail-closed
+    expect(probe.eventsGets).toEqual([
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+      { path: "/v1/runs/run-a/events?after=2&limit=100", after: 2 },
+    ]);
+    expect(harness.eventsStatus()).toBe("Lifecycle events error: request: invalid_cursor.");
+    expect(harness.eventsMeta()).toContain("stopped");
+    // the manual Inspect leaves the stopped timeline alone
+    harness.click("inspect-selected");
+    await Bun.sleep(5);
+    expect(probe.eventsCount()).toBe(2);
+    expect(harness.eventsRows().length).toBe(2);
+    expect(harness.eventsMeta()).toContain("stopped");
+    expect(harness.eventsButtonState("events-retry")).toEqual({ hidden: true, disabled: false });
+    // the explicit Reload resets and restarts exactly once from after=0
+    harness.click("events-reload");
+    await Bun.sleep(4);
+    expect(probe.eventsGets).toEqual([
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+      { path: "/v1/runs/run-a/events?after=2&limit=100", after: 2 },
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+    ]);
+    expect(harness.eventsRows().length).toBe(6);
+    expect(harness.eventsMeta()).toBe("Detail revision: – · Events revision: 6 · Cursor: 6 · caught up");
+    expect(harness.eventsStatus()).toBe("Added 6 lifecycle events. Caught up.");
+    harness.dispose();
+  });
+
+  test("t5 (E). a late inspect response of the previous run never touches the new selection", async () => {
+    const probe = makeProbe(
+      ["run-a", "run-b"],
+      [
+        { revision: 9, hold: true },
+        { revision: 2 },
+      ],
+      [
+        { revision: 9, kinds: NINE_EVENTS, nextAfter: null },
+        { revision: 2, kinds: ["create_run", "start_agent_execution"], nextAfter: null },
+      ],
+    );
+    const harness = await boot(probe, null, ["run-a", "run-b"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(3);
+    expect(harness.eventsRows().length).toBe(9);
+    expect(harness.detailRunId()).toBe("Run run-a");
+    // selecting run-b: its own timeline snapshot and its own initial
+    // after=0, while run-a's inspect is still on the wire
+    harness.clickRunInspect(1);
+    await Bun.sleep(3);
+    expect(harness.detailRunId()).toBe("Run run-b");
+    expect(harness.eventsRows().length).toBe(2);
+    // run-a's late inspect response is dropped by the selection guard
+    probe.releaseInspects();
+    await Bun.sleep(3);
+    expect(harness.detailRunId()).toBe("Run run-b");
+    expect(harness.eventsRows().length).toBe(2);
+    expect(harness.eventsMeta()).toBe("Detail revision: 2 · Events revision: 2 · Cursor: 2 · caught up");
+    expect(probe.eventsGets).toEqual([
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+      { path: "/v1/runs/run-b/events?after=0&limit=100", after: 0 },
+    ]);
+    harness.dispose();
+  });
+
+  test("t6 (F). the unsettled initial after=0 survives a completed manual Inspect", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [{ revision: 9 }, { revision: 9 }, { revision: 11 }],
+      [
+        { revision: 9, kinds: NINE_EVENTS, nextAfter: null, hold: true },
+        { revision: 11, kinds: ["stage_generation_opened", "stage_iteration_opened"], startRevision: 10, nextAfter: null },
+      ],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(2);
+    // the initial after=0 is still unsettled on the wire
+    expect(probe.eventsCount()).toBe(1);
+    // the manual Inspect completes while the initial GET is in flight:
+    // the single-flight transport refuses the coalesced desire, so no
+    // second after=0 ever reaches the wire
+    harness.click("inspect-selected");
+    await Bun.sleep(4);
+    expect(harness.detailRunId()).toBe("Run run-a");
+    expect(probe.eventsCount()).toBe(1);
+    // the initial page settles and applies: a valid caught-up timeline
+    probe.releaseEvents();
+    await Bun.sleep(4);
+    expect(harness.eventsRows().length).toBe(9);
+    expect(harness.eventsMeta()).toBe("Detail revision: 9 · Events revision: 9 · Cursor: 9 · caught up");
+    // the next manual Inspect tails from the current cursor
+    harness.click("inspect-selected");
+    await Bun.sleep(4);
+    expect(probe.eventsGets).toEqual([
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+      { path: "/v1/runs/run-a/events?after=9&limit=100", after: 9 },
+    ]);
+    expect(harness.eventsRows().length).toBe(11);
+    expect(harness.eventsMeta()).toBe("Detail revision: 11 · Events revision: 11 · Cursor: 11 · caught up");
+    harness.dispose();
+  });
+});
