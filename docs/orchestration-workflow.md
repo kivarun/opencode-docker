@@ -6376,8 +6376,9 @@ The run detail gains a manual, pagination-only "Worker logs" section
 consuming only the two existing versioned logs endpoints. The UI model
 lives in `orchestrator/ui/app.js` as one closed logs model
 (`createWorkerLogViewer` over the state shape `{runId, snapshotRevision,
-logs, selectedExecutionIndex, content, requestState, error}`), mirrored
-exactly in `orchestrator/ui/app.d.ts`:
+logs, selectedExecutionIndex, content, requestState, error}`, where
+`content` carries the accumulated decoded `text`), mirrored exactly in
+`orchestrator/ui/app.d.ts`:
 
 - the dedicated logs endpoint client (`requestWorkerLogsJson`) accepts only
   the two logs documents of the expected run (or the endpoint failure
@@ -6385,28 +6386,44 @@ exactly in `orchestrator/ui/app.d.ts`:
   both kinds, and the durable artifact envelope (`payload_base64`,
   `workerlog.json`) never enters the browser layer;
 - the bounded single-flight logs transport (`createLogsTransport`) keeps
-  exactly one unsettled logs GET: a new desire supersedes the active
-  request (its response is dropped), `invalidate`/`dispose` withdraw
-  everything, and there is no auto-retry, backoff or streaming;
-- loading is manual only: the metadata list loads on an explicit
-  "Load logs" press (never automatically, never on selection), and a chunk
-  loads on an explicit "Load next chunk" press of a selected
-  captured/truncated execution — one bounded GET per click (limit 65536
-  raw bytes), cursor via `next_offset`, disabled at the terminal chunk;
-- the capture gate: a captured/truncated chunk request requires the
-  authoritative inspect boundary of the selected run to be
-  `in_flight`/`plan_ready`/`waiting` and no mutating POST in flight; a
-  settled run's captured payloads are never rendered (the gate refusal is
-  a typed `viewer: capture_gate_refused` state, never a fetch);
+  exactly one unsettled logs GET and arbitrates two priority kinds: an
+  automatic metadata desire never cancels an in-flight manual content
+  request (it queues as the single coalesced follow-up), a content desire
+  supersedes an active metadata refresh, equal kinds supersede and
+  coalesce to the latest; `invalidate`/`dispose` withdraw everything and
+  there is no auto-retry, retry loop or streaming;
+- the metadata list follows the applied authoritative inspects
+  automatically: the first successful inspect of the selected run issues
+  exactly one list GET, every later applied inspect issues one only when
+  its revision is strictly greater than the last requested one; a failed
+  application never re-triggers for the same revision. The automatic
+  metadata path never loads payload bytes; an explicit "Load logs" press
+  stays a safe manual refresh;
+- the viewer carries no boundary classifier: after ANY successful
+  authoritative inspect a captured/truncated chunk loads on the explicit
+  "Load log" press of the selected execution on every run boundary,
+  including succeeded, failed and resumable runs — one bounded GET per
+  click (limit 65536 raw bytes), cursor via `next_offset`, disabled at
+  the terminal chunk;
+- the immutable binding of a loaded execution is checked on every
+  metadata application: an unchanged binding preserves the loaded
+  content, the selection and the decoder state; a changed binding fails
+  closed as the typed `viewer: invalid_log_binding` state instead of
+  silently mixing bytes from two different artifacts;
 - stale responses of another run or execution are dropped before they
   become state (run-change invalidation plus run/execution guards in every
   transition), and lost GETs settle as typed `transport: network_error`
   failures with exactly one manual Retry click per retry;
-- the safe render contract: the literal base64 is decoded with a
-  non-fatal UTF-8 decoder and rendered through `textContent` only — NUL
-  bytes, ANSI escapes, invalid UTF-8 sequences and payloads without a
-  trailing newline can never become markup; no payload fragment ever
-  enters a diagnostic, storage or URL;
+- the one incremental UTF-8 decoder owner (`createLogChunkDecoder`):
+  exactly one non-fatal decoder per selected execution, every non-final
+  chunk decoded with `{stream: true}` and the terminal chunk with
+  `{stream: false}`, so multi-byte sequences split across a chunk
+  boundary decode correctly and a retried offset can never duplicate
+  already applied text;
+- the safe render contract: the accumulated decoded text renders through
+  `textContent` only — NUL bytes, ANSI escapes, invalid UTF-8 sequences
+  and payloads without a trailing newline can never become markup; no
+  payload fragment ever enters a diagnostic, storage or URL;
 - the section declares its read-only, secret-bearing, unredacted nature;
   there is no download, export, search, redaction or retention.
 

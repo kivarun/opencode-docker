@@ -58,7 +58,7 @@
     </table>
     <div id="worker-logs-section" hidden>
       <h3 id="worker-logs-heading">Worker logs</h3>
-      <p class="logs-note">Read-only view of the durable worker-log records. The payload is secret-bearing, unredacted agent output; only manual, bounded chunks of a captured or truncated execution load, and only while the run is active.</p>
+      <p class="logs-note">Read-only view of the durable worker-log records. The payload is secret-bearing, unredacted agent output. The metadata list follows the applied inspect revisions automatically; a bounded chunk of a captured or truncated execution loads on the explicit Load log press at any run boundary.</p>
       <button type="button" id="logs-load">Load logs</button>
       <p id="logs-empty" class="logs-meta"></p>
       <table id="logs-table" hidden>
@@ -68,11 +68,12 @@
         </thead>
         <tbody id="logs-body"></tbody>
       </table>
+      <p id="logs-hint" class="logs-meta"></p>
       <p id="logs-cursor" class="logs-meta"></p>
       <pre id="logs-content" hidden></pre>
       <p id="logs-status" class="logs-live" aria-live="polite"></p>
       <div class="events-actions">
-        <button type="button" id="logs-next-chunk" hidden>Load next chunk</button>
+        <button type="button" id="logs-next-chunk" hidden>Load log</button>
         <button type="button" id="logs-retry" hidden>Retry</button>
       </div>
     </div>

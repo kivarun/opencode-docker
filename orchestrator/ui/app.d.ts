@@ -444,14 +444,16 @@ export interface UiWorkerLogsModel {
 }
 
 export interface UiWorkerLogContent {
+  readonly executionIndex: number;
   readonly status: "captured" | "truncated";
   readonly sha256: string;
   readonly byteCount: number;
   readonly truncatedDaemon: boolean;
   readonly truncatedLocal: boolean;
   readonly offset: number;
-  readonly dataBase64: string;
   readonly nextOffset: number | null;
+  /** The incrementally decoded text accumulated over every applied chunk. */
+  readonly text: string;
 }
 
 export interface UiWorkerLogModel {
@@ -524,6 +526,12 @@ export interface UiLogsTransportIo {
 export interface UiLogsDesire {
   readonly runId: string;
   readonly path: string;
+  /**
+   * The priority kind of the desire: a metadata desire never supersedes
+   * an in-flight content request (it queues as the single coalesced
+   * follow-up); a content desire supersedes an active metadata refresh.
+   */
+  readonly kind: "metadata" | "content";
   /** Called only when the request settled and was never superseded. */
   readonly onApplied: (result: UiWorkerLogsResult | undefined) => void;
 }
@@ -550,10 +558,6 @@ export interface UiWorkerLogViewerIo {
   readonly transport: UiLogsTransport;
   /** Publishes the current state after every transition. */
   readonly onState: (state: UiWorkerLogsState | null) => void;
-  /** The authoritative inspect snapshot of the selected run. */
-  readonly snapshot: () => { readonly boundaryKind: string | null };
-  /** True exactly while a mutating POST is in flight. */
-  readonly mutatingInFlight: () => boolean;
 }
 
 export interface UiWorkerLogViewer {
@@ -561,11 +565,19 @@ export interface UiWorkerLogViewer {
   transitionToLogsView(runId: string): void;
   /** Leaves the logs view without a run binding. */
   dropView(): void;
-  /** The explicit metadata load; never automatic. */
+  /** The explicit metadata load or refresh; never automatic on its own. */
   fetchLogsList(): void;
-  /** One execution selection; content stays until a chunk is loaded. */
+  /**
+   * The automatic metadata refresh driven by the applied authoritative
+   * inspect path: the first successful inspect of the selected run
+   * issues exactly one list GET; every later applied inspect issues one
+   * only when its revision is strictly greater than the last requested
+   * one. Never loads payload bytes.
+   */
+  inspectApplied(model: unknown): void;
+  /** One execution selection; content and the decoder start fresh. */
   selectExecution(index: number): void;
-  /** The explicit next-chunk load under the capture gate. */
+  /** The explicit `Load log` press; any boundary may read a durable log. */
   fetchChunk(): void;
   /** One retry click of the last failed chunk desire. */
   retryLastChunkRequest(): void;
@@ -576,14 +588,15 @@ export interface UiWorkerLogViewer {
 export declare function createWorkerLogViewer(io: UiWorkerLogViewerIo): UiWorkerLogViewer;
 
 /**
- * The safe render contract: the literal base64 decoded to text with a
- * non-fatal UTF-8 decoder; control bytes can never become markup.
+ * The one incremental UTF-8 decoder owner of the logs viewer: exactly
+ * one non-fatal UTF-8 decoder per selected execution. Every non-final
+ * chunk is decoded with `{stream: true}`; the terminal chunk is decoded
+ * with `{stream: false}`, which flushes any multi-byte sequence split
+ * across a chunk boundary.
  */
-export declare function decodeLogChunkText(dataBase64: string): string;
+export declare interface UiLogChunkDecoder {
+  decodeChunk(dataBase64: string, isFinal: boolean): string;
+  reset(): void;
+}
 
-/** The chunk gate: captured/truncated content of an active run only. */
-export declare function logsCaptureGate(
-  state: UiWorkerLogsState | null,
-  boundaryKind: string | null,
-  mutatingInFlight: () => boolean,
-): boolean;
+export declare function createLogChunkDecoder(): UiLogChunkDecoder;

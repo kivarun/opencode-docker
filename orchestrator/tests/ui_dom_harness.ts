@@ -158,6 +158,8 @@ export interface UiHarness {
   logsContent(): string;
   /** The logs cursor meta line. */
   logsCursor(): string;
+  /** The read-only status explanation of the selected execution. */
+  logsHint(): string;
   /** The logs empty-hint line. */
   logsEmpty(): string;
   /** The hidden/disabled state of one logs action button. */
@@ -211,6 +213,7 @@ const UI_ELEMENT_IDS = [
   "logs-table",
   "logs-body",
   "logs-cursor",
+  "logs-hint",
   "logs-content",
   "logs-status",
   "logs-next-chunk",
@@ -361,6 +364,7 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
     logsStatus: () => harness.element("logs-status").textContent,
     logsContent: () => harness.element("logs-content").textContent,
     logsCursor: () => harness.element("logs-cursor").textContent,
+    logsHint: () => harness.element("logs-hint").textContent,
     logsEmpty: () => harness.element("logs-empty").textContent,
     logsButtonState: (id) => {
       const button = harness.element(id);

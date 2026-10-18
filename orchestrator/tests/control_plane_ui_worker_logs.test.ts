@@ -3,7 +3,8 @@
  * the real `app.js` viewer consumes the real logs endpoints (the real
  * CLI subprocess over the loopback service) against runs with durable
  * schema-v9 worker-log artifacts — captured, truncated, pending and
- * unavailable — through the bounded chunk flow, with the capture gate,
+ * unavailable — through the bounded chunk flow, with the inspect-driven
+ * automatic metadata refresh, terminal log access on every boundary,
  * zero-write fingerprints, authority failures and the leakage scan.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -13,10 +14,7 @@ import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  createLogsTransport,
-  createWorkerLogViewer,
-  decodeLogChunkText,
-  logsCaptureGate,
+  createLogChunkDecoder,
   parseWorkerLogDocument,
   parseWorkerLogsDocument,
   workerLogsRequestPath,
@@ -160,7 +158,7 @@ const ghostRun = `wl-ghost-${suffix}`;
 
 // The main run: execution 1 captured (artifact published), execution 2
 // started and left in flight (its worker_log stays pending). The run
-// boundary is `in_flight`, so the capture gate admits chunk loads.
+// boundary is `in_flight`; the read-only viewer serves both executions.
 const MAIN_CAPTURE_PAYLOAD = new TextEncoder().encode("captured-output\0with\x1b[31mcontrol\x1b[0m-bytes");
 const MAIN_COMMANDS = [
   { kind: "create_run", inputs: [], outputs: [] },
@@ -184,8 +182,8 @@ const MAIN_COMMANDS = [
 ] as const;
 
 // The failed run: execution 1 truncated (artifact published, local tail
-// truncation), run failed. A settled run's captured/truncated payloads
-// are never rendered through the capture gate.
+// truncation), run failed. A settled run's durable logs stay readable:
+// the truncated tail loads through the same explicit flow.
 const FAILED_PAYLOAD = new TextEncoder().encode("truncated-tail");
 const FAILED_COMMANDS = [
   { kind: "create_run", inputs: [], outputs: [] },
@@ -384,7 +382,7 @@ describe("control-plane ui worker logs: the real logs endpoints through the UI v
     expect(model.status).toBe("captured");
     expect(model.offset).toBe(0);
     expect(model.nextOffset).toBeNull();
-    expect(decodeLogChunkText(model.dataBase64!)).toBe(new TextDecoder().decode(MAIN_CAPTURE_PAYLOAD));
+    expect(createLogChunkDecoder().decodeChunk(model.dataBase64!, true)).toBe(new TextDecoder().decode(MAIN_CAPTURE_PAYLOAD));
     expect(fingerprintTree(stateRoot)).toBe(before);
   });
 
@@ -401,14 +399,17 @@ describe("control-plane ui worker logs: the real logs endpoints through the UI v
     harness.clickRunInspect(harness.runRows().indexOf(mainRun));
     await waitFor(() => harness.detailStatus() === "running");
     expect(harness.element("worker-logs-section").hidden).toBe(false);
-    // nothing loads automatically
-    harness.click("logs-load");
+    // the first successful inspect drives exactly one automatic metadata
+    // GET; the explicit Load logs press stays a safe manual refresh that
+    // settles back to the ready state before the next explicit action
     await waitFor(() => harness.logsRows().length === 2);
+    harness.click("logs-load");
+    await waitFor(() => harness.logsStatus().startsWith("snapshot revision"));
     expect(harness.logsRows()[0]).toBe(`1|architect|captured|${MAIN_CAPTURE_PAYLOAD.length}||`);
     expect(harness.logsRows()[1]).toBe("3|worker|pending|||");
     expect(harness.logsButtonState("logs-next-chunk").hidden).toBe(true); // no selection yet
     harness.clickButton("logs-body", "View");
-    await waitFor(() => !harness.logsButtonState("logs-next-chunk").hidden); // in_flight admits the chunk
+    await waitFor(() => !harness.logsButtonState("logs-next-chunk").hidden); // any boundary may read
     harness.click("logs-next-chunk");
     await waitFor(() => harness.logsContent() !== "");
     expect(harness.logsContent()).toBe(new TextDecoder().decode(MAIN_CAPTURE_PAYLOAD));
@@ -423,7 +424,7 @@ describe("control-plane ui worker logs: the real logs endpoints through the UI v
     harness.dispose();
   }, 20000);
 
-  test("l4. a settled run renders metadata but the capture gate refuses chunks", async () => {
+  test("l4. a settled run renders metadata and loads the durable tail", async () => {
     // the CLI subprocess roundtrips are real: allow a generous test budget
 
     const realFetch = globalThis.fetch;
@@ -439,20 +440,23 @@ describe("control-plane ui worker logs: the real logs endpoints through the UI v
       }
       return harness.detailStatus() !== "";
     });
-    console.log("DEBUG l4 detailStatus:", JSON.stringify(harness.detailStatus()));
-    harness.click("logs-load");
+    // the failed boundary drives the same automatic metadata refresh;
+    // the explicit Load logs press stays a safe manual refresh that
+    // settles back to the ready state before the next explicit action
     await waitFor(() => harness.logsRows().length === 2);
+    harness.click("logs-load");
+    await waitFor(() => harness.logsStatus().startsWith("snapshot revision"));
     // the agent executions only: truncated (1) and unavailable (3); the
     // decision execution carries no worker log
     expect(harness.logsRows()).toHaveLength(2);
     expect(harness.logsRows()[0]).toContain("truncated");
     expect(harness.logsRows()[1]).toContain("unavailable");
     harness.clickButton("logs-body", "View"); // selects execution 1 (truncated)
-    await Bun.sleep(50);
+    await waitFor(() => !harness.logsButtonState("logs-next-chunk").hidden);
     harness.click("logs-next-chunk");
-    await waitFor(() => harness.logsStatus().includes("capture_gate_refused"));
-    expect(harness.logsStatus()).toContain("viewer: capture_gate_refused");
-    expect(harness.logsContent()).toBe("");
+    await waitFor(() => harness.logsContent() !== "");
+    expect(harness.logsContent()).toBe("truncated-tail");
+    expect(harness.logsCursor()).toContain("truncated");
     harness.dispose();
   }, 20000);
 
@@ -481,22 +485,6 @@ describe("control-plane ui worker logs: the real logs endpoints through the UI v
     const chunk = await rawRequest(port, "GET", workerLogsRequestPath(mainRun, 1, 0, 65536));
     const failed = await rawRequest(port, "GET", `/v1/runs/${failedRun}/logs`);
     expectNoLeak(list.body + chunk.body + failed.body, secrets);
-  });
-
-  test("l8. the capture gate is a pure function of the boundary and the mutation state", () => {
-    expect(logsCaptureGate(null, "in_flight", () => false)).toBe(false);
-    const state = {
-      runId: mainRun,
-      snapshotRevision: 24,
-      logs: [{ executionIndex: 1, stateId: "architect", status: "captured" as const }],
-      selectedExecutionIndex: 1,
-      content: null,
-      requestState: "ready" as const,
-      error: null,
-    };
-    expect(logsCaptureGate(state, "in_flight", () => false)).toBe(true);
-    expect(logsCaptureGate(state, "waiting", () => false)).toBe(true);
-    expect(logsCaptureGate(state, "succeeded", () => false)).toBe(false);
   });
 });
 

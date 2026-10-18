@@ -539,8 +539,7 @@ describe("ui model: export surface and source restrictions", () => {
         "createWorkerLogsState",
         "createLogsTransport",
         "createWorkerLogViewer",
-        "decodeLogChunkText",
-        "logsCaptureGate",
+        "createLogChunkDecoder",
       ].sort(),
     );
   });

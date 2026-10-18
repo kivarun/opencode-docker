@@ -1460,21 +1460,39 @@ export function createLogsTransport(io) {
   };
 
   return Object.freeze({
+    /**
+     * Admits one logs desire carrying its priority kind. Arbitration:
+     * an in-flight manual content request is never cancelled by a
+     * metadata desire — the metadata is kept as at most one coalesced
+     * follow-up; a content desire supersedes an active metadata
+     * refresh (the user's explicit read wins and the metadata
+     * re-derives from the next applied inspect); equal kinds supersede
+     * and coalesce to the latest. The wire slot stays single and is
+     * freed only by the actual settlement.
+     */
     request(desire) {
       const runId = isRecord(desire) && isSafeId(desire["runId"]) ? desire["runId"] : null;
       const path = isRecord(desire) && typeof desire["path"] === "string" ? desire["path"] : null;
+      const kind = isRecord(desire) && (desire["kind"] === "metadata" || desire["kind"] === "content") ? desire["kind"] : null;
       const onApplied = isRecord(desire) && typeof desire["onApplied"] === "function" ? desire["onApplied"] : null;
       let resolveResult = null;
       const settled = new Promise((resolve) => {
         resolveResult = resolve;
       });
-      if (disposed || runId === null || path === null || onApplied === null) {
+      if (disposed || runId === null || path === null || kind === null || onApplied === null) {
         resolveResult(undefined);
         return settled;
       }
-      const request = { runId, path, onApplied, superseded: false, controller: null, resolve: resolveResult };
+      const request = { runId, path, kind, onApplied, superseded: false, controller: null, resolve: resolveResult };
       if (active === null) {
         startRequest(request);
+      } else if (active.kind === "content" && kind === "metadata") {
+        // the manual chunk read is protected; queue the metadata instead
+        const replaced = desired;
+        desired = request;
+        if (replaced !== null) {
+          replaced.resolve(undefined);
+        }
       } else {
         active.superseded = true;
         active.controller.abort();
@@ -1518,32 +1536,70 @@ export function createWorkerLogsState(runId) {
 }
 
 /**
+ * The one incremental UTF-8 decoder owner of the logs viewer: exactly
+ * one non-fatal UTF-8 decoder per selected execution. Every non-final
+ * chunk is decoded with `{stream: true}`; the terminal chunk is decoded
+ * with `{stream: false}`, which flushes any multi-byte sequence split
+ * across a chunk boundary. Invalid byte sequences become replacement
+ * characters; NUL bytes, ANSI escapes and markup-looking text can never
+ * become markup because the rendered value goes through `textContent`.
+ */
+export function createLogChunkDecoder() {
+  let decoder = new TextDecoder("utf-8", { fatal: false });
+  return Object.freeze({
+    decodeChunk(dataBase64, isFinal) {
+      const bytes = Uint8Array.from(atob(dataBase64), (char) => char.charCodeAt(0));
+      return decoder.decode(bytes, { stream: !isFinal });
+    },
+    reset() {
+      decoder = new TextDecoder("utf-8", { fatal: false });
+    },
+  });
+}
+
+/**
  * The closed viewer state machine of the Worker logs section. It owns
- * no fetch and no URL: `fetchLogsList`/`fetchChunk` hand one prepared
- * desire to the single-flight logs transport, and every transition
- * accepts only an already validated logs document of the same run. The
- * list loads only on an explicit button press; a chunk loads only on an
- * explicit `Load next chunk` press, and only for a captured/truncated
- * execution while the authoritative inspect boundary shows the run as
- * running/plan-ready/waiting and no mutating POST is in flight — a
- * settled run's captured payloads are never rendered here.
+ * no fetch and no URL: every desire is handed to the single-flight
+ * logs transport with its priority kind, and every transition accepts
+ * only an already validated logs document of the same run.
+ *
+ * The viewer is read-only over the already authorized worker-log API
+ * and carries no boundary classifier: after ANY successful
+ * authoritative inspect of the selected run it serves the metadata
+ * list (first inspect: exactly one automatic list GET; later inspects:
+ * one automatic list GET per strictly greater inspect revision) and a
+ * captured/truncated chunk loads on the explicit `Load log` press of
+ * the selected execution on every boundary, including succeeded, failed
+ * and resumable runs. The automatic metadata path never loads payload
+ * bytes, never cancels an in-flight manual content request (the
+ * transport queues it) and never disturbs the inspect, events or
+ * mutation surfaces: a metadata failure settles as this section's own
+ * typed failure state.
+ *
+ * The immutable binding of a loaded execution is checked on every
+ * metadata application: a changed status, digest or byte count fails
+ * closed as `invalid_log_binding` instead of silently mixing bytes from
+ * two different artifacts. An unchanged binding preserves the loaded
+ * content, the selection and the incremental decoder state.
  */
 export function createWorkerLogViewer(io) {
   if (
     !isRecord(io) ||
     typeof io["transport"] !== "object" ||
-    typeof io["onState"] !== "function" ||
-    typeof io["snapshot"] !== "function" ||
-    typeof io["mutatingInFlight"] !== "function"
+    typeof io["onState"] !== "function"
   ) {
     throw new UiContractError("invalid_viewer_io");
   }
   const transport = io["transport"];
   const onState = io["onState"];
-  const snapshot = io["snapshot"];
-  const mutatingInFlight = io["mutatingInFlight"];
   let state = null;
+  let decoder = createLogChunkDecoder();
   let lastChunkDesire = null;
+  // The last inspect revision an automatic metadata refresh was issued
+  // for; every strictly greater applied inspect revision issues exactly
+  // one automatic list GET, and a failed application never re-triggers
+  // for the same revision.
+  let requestedRevision = 0;
 
   const publish = () => {
     onState(state);
@@ -1552,7 +1608,9 @@ export function createWorkerLogViewer(io) {
   const enter = (runId) => {
     transport.invalidate();
     state = createWorkerLogsState(runId);
+    decoder = createLogChunkDecoder();
     lastChunkDesire = null;
+    requestedRevision = 0;
     publish();
   };
 
@@ -1584,6 +1642,112 @@ export function createWorkerLogViewer(io) {
     publish();
   };
 
+  /**
+   * One metadata application: the list of the same run. The immutable
+   * binding of a loaded execution is verified before the list is
+   * accepted; an unchanged binding preserves the loaded content, the
+   * selection and the decoder state.
+   */
+  const applyMetadataResult = (result, requestedRunId) => {
+    if (state === null || state.runId !== requestedRunId || result === undefined) {
+      return;
+    }
+    if (!result.ok) {
+      applyFailure(result);
+      return;
+    }
+    const model = result.model;
+    if (model.kind !== "worker_logs") {
+      applyFailure(endpointFailure(model));
+      return;
+    }
+    if (model.runId !== state.runId) {
+      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+      return;
+    }
+    if (state.content !== null) {
+      const entry = model.logs.find((item) => item.executionIndex === state.content.executionIndex) ?? null;
+      const bindingUnchanged = entry !== null
+        && entry.status === state.content.status
+        && entry.sha256 === state.content.sha256
+        && entry.byteCount === state.content.byteCount
+        && entry.truncatedDaemon === state.content.truncatedDaemon
+        && entry.truncatedLocal === state.content.truncatedLocal;
+      if (!bindingUnchanged) {
+        state = Object.freeze({
+          ...state,
+          requestState: "failed",
+          error: Object.freeze({ layer: "viewer", reason: "invalid_log_binding" }),
+        });
+        publish();
+        return;
+      }
+    }
+    requestedRevision = Math.max(requestedRevision, model.revision);
+    state = Object.freeze({
+      ...state,
+      snapshotRevision: model.revision,
+      logs: model.logs,
+      requestState: "ready",
+      error: null,
+    });
+    publish();
+  };
+
+  /**
+   * One content application: a validated chunk of the selected
+   * execution, decoded through the one incremental decoder. A chunk
+   * that does not continue the expected raw-byte cursor is stale or
+   * duplicated: it is settled as a typed contract failure without
+   * touching the decoder, so a retried offset can never duplicate
+   * already applied text.
+   */
+  const applyChunkResult = (result, requestedRunId, executionIndex, expectedOffset) => {
+    if (state === null || state.runId !== requestedRunId || result === undefined) {
+      return;
+    }
+    if (!result.ok) {
+      applyFailure(result);
+      return;
+    }
+    const model = result.model;
+    if (model.kind !== "worker_log" || model.runId !== state.runId || model.executionIndex !== executionIndex) {
+      applyFailure(model.kind === "worker_log" || model.kind === "error" || model.kind === "command_result"
+        ? { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }
+        : endpointFailure(model));
+      return;
+    }
+    if (model.status !== "captured" && model.status !== "truncated") {
+      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+      return;
+    }
+    if (model.offset !== expectedOffset || (state.content !== null && state.content.executionIndex !== executionIndex)) {
+      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+      return;
+    }
+    const isFinal = model.nextOffset === null;
+    const decodedPart = decoder.decodeChunk(model.dataBase64, isFinal);
+    lastChunkDesire = null;
+    state = Object.freeze({
+      ...state,
+      snapshotRevision: model.revision,
+      content: Object.freeze({
+        executionIndex,
+        status: model.status,
+        sha256: model.sha256,
+        byteCount: model.byteCount,
+        truncatedDaemon: model.truncatedDaemon,
+        truncatedLocal: model.truncatedLocal,
+        offset: model.offset,
+        nextOffset: model.nextOffset,
+        text: (state.content === null ? "" : state.content.text) + decodedPart,
+      }),
+      requestState: "ready",
+      error: null,
+    });
+    publish();
+  };
+
   return Object.freeze({
     /** Selection change / reset: discards state and invalidates the wire. */
     transitionToLogsView(runId) {
@@ -1598,8 +1762,8 @@ export function createWorkerLogViewer(io) {
       lastChunkDesire = null;
     },
     /**
-     * The explicit metadata load: one bounded GET of the list endpoint.
-     * Never automatic.
+     * The explicit metadata load or refresh: one bounded GET of the
+     * list endpoint. Never automatic on its own.
      */
     fetchLogsList() {
       if (state === null || state.requestState === "loading") {
@@ -1610,41 +1774,42 @@ export function createWorkerLogViewer(io) {
       const requestedRunId = state.runId;
       transport.request({
         runId: state.runId,
+        kind: "metadata",
         path: workerLogsRequestPath(state.runId, null, 0, 0),
         onApplied: (result) => {
-          if (state === null || state.runId !== requestedRunId) {
-            return;
-          }
-          if (result === undefined) {
-            return;
-          }
-          if (!result.ok) {
-            applyFailure(result);
-            return;
-          }
-          const model = result.model;
-          if (model.kind !== "worker_logs") {
-            applyFailure(endpointFailure(model));
-            return;
-          }
-          if (model.runId !== state.runId) {
-            applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
-            return;
-          }
-          state = Object.freeze({
-            ...state,
-            snapshotRevision: model.revision,
-            logs: model.logs,
-            selectedExecutionIndex: null,
-            content: null,
-            requestState: "ready",
-            error: null,
-          });
-          publish();
+          applyMetadataResult(result, requestedRunId);
         },
       });
     },
-    /** One execution selection: content stays until a chunk is loaded. */
+    /**
+     * The automatic metadata refresh driven by the applied
+     * authoritative inspect path. The first successful inspect of the
+     * selected run issues exactly one list GET; every later applied
+     * inspect issues one list GET only when its revision is strictly
+     * greater than the last requested one. Never loads payload bytes.
+     */
+    inspectApplied(model) {
+      if (state === null || !isRecord(model) || model.runId !== state.runId) {
+        return;
+      }
+      const revision = model.revision;
+      if (!Number.isSafeInteger(revision) || revision <= requestedRevision) {
+        return;
+      }
+      requestedRevision = revision;
+      const requestedRunId = state.runId;
+      transport.request({
+        runId: state.runId,
+        kind: "metadata",
+        path: workerLogsRequestPath(state.runId, null, 0, 0),
+        onApplied: (result) => {
+          applyMetadataResult(result, requestedRunId);
+        },
+      });
+    },
+    /** One execution selection: fresh content and a fresh decoder; an
+     * in-flight content desire of the previous selection is foreign and
+     * its late response is dropped by the transition guard. */
     selectExecution(index) {
       if (state === null || !Number.isSafeInteger(index) || index < 1) {
         return;
@@ -1653,14 +1818,17 @@ export function createWorkerLogViewer(io) {
       if (entry === null) {
         return;
       }
+      if (state.selectedExecutionIndex === index) {
+        return;
+      }
+      decoder.reset();
       state = Object.freeze({ ...state, selectedExecutionIndex: index, content: null, error: null });
       publish();
     },
     /**
-     * The explicit next-chunk load of the selected execution. The
-     * capture gate: only while the authoritative inspect boundary shows
-     * the run as running/plan-ready/waiting and no mutating POST is in
-     * flight; only a captured/truncated execution carries content.
+     * The explicit `Load log` press of the selected execution: one
+     * bounded chunk GET continuing the raw-byte cursor. Read-only over
+     * the already authorized API: any boundary may read a durable log.
      */
     fetchChunk() {
       if (state === null || state.selectedExecutionIndex === null || state.requestState === "loading") {
@@ -1670,78 +1838,35 @@ export function createWorkerLogViewer(io) {
       if (entry === null || (entry.status !== "captured" && entry.status !== "truncated")) {
         return;
       }
-      const boundaryKind = snapshot().boundaryKind;
-      if (boundaryKind !== "in_flight" && boundaryKind !== "plan_ready" && boundaryKind !== "waiting") {
-        state = Object.freeze({
-          ...state,
-          requestState: "failed",
-          error: Object.freeze({ layer: "viewer", reason: "capture_gate_refused" }),
-        });
-        publish();
-        return;
-      }
-      if (mutatingInFlight()) {
-        return;
-      }
-      const offset = state.content === null ? 0 : state.content.nextOffset === null ? null : state.content.nextOffset;
-      if (offset === null) {
-        return;
+      if (state.content !== null && state.content.nextOffset === null) {
+        return; // the artifact is fully read
       }
       const executionIndex = state.selectedExecutionIndex;
+      const expectedOffset = state.content === null ? 0 : state.content.nextOffset;
       state = Object.freeze({ ...state, requestState: "loading", error: null });
       publish();
-      const desire = { executionIndex, offset };
+      lastChunkDesire = { executionIndex, offset: expectedOffset };
       const requestedRunId = state.runId;
-      lastChunkDesire = desire;
       transport.request({
         runId: state.runId,
-        path: workerLogsRequestPath(state.runId, executionIndex, offset, 65536),
+        kind: "content",
+        path: workerLogsRequestPath(state.runId, executionIndex, expectedOffset, 65536),
         onApplied: (result) => {
-          if (state === null || state.runId !== requestedRunId) {
-            return;
+          if (state === null || state.selectedExecutionIndex !== executionIndex) {
+            return; // a foreign content desire of a previous selection
           }
-          if (result === undefined) {
-            return;
-          }
-          if (!result.ok) {
-            applyFailure(result);
-            return;
-          }
-          const model = result.model;
-          if (model.kind !== "worker_log" || model.runId !== state.runId || model.executionIndex !== desire.executionIndex) {
-            applyFailure(model.kind === "worker_log" || model.kind === "error" || model.kind === "command_result"
-              ? { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }
-              : endpointFailure(model));
-            return;
-          }
-          if (model.status !== "captured" && model.status !== "truncated") {
-            applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
-            return;
-          }
-          lastChunkDesire = null;
-          state = Object.freeze({
-            ...state,
-            snapshotRevision: model.revision,
-            content: Object.freeze({
-              status: model.status,
-              sha256: model.sha256,
-              byteCount: model.byteCount,
-              truncatedDaemon: model.truncatedDaemon,
-              truncatedLocal: model.truncatedLocal,
-              offset: model.offset,
-              dataBase64: model.dataBase64,
-              nextOffset: model.nextOffset,
-            }),
-            requestState: "ready",
-            error: null,
-          });
-          publish();
+          applyChunkResult(result, requestedRunId, executionIndex, expectedOffset);
         },
       });
     },
-    /** One retry click: exactly one re-request of the last failed chunk desire. */
+    /** One retry click: exactly one re-request of the last failed chunk
+     * desire of the still-selected execution. The failed chunk never
+     * touched the decoder, so the retry cannot duplicate text. */
     retryLastChunkRequest() {
       if (state === null || state.requestState !== "failed" || lastChunkDesire === null) {
+        return;
+      }
+      if (state.selectedExecutionIndex !== lastChunkDesire.executionIndex) {
         return;
       }
       const retryOffset = lastChunkDesire.offset;
@@ -1751,43 +1876,13 @@ export function createWorkerLogViewer(io) {
       const requestedRunId = state.runId;
       transport.request({
         runId: state.runId,
-        path: workerLogsRequestPath(state.runId, lastChunkDesire.executionIndex, retryOffset, 65536),
+        kind: "content",
+        path: workerLogsRequestPath(state.runId, retryExecutionIndex, retryOffset, 65536),
         onApplied: (result) => {
-          if (state === null || state.runId !== requestedRunId) {
+          if (state === null || state.selectedExecutionIndex !== retryExecutionIndex) {
             return;
           }
-          if (result === undefined) {
-            return;
-          }
-          if (!result.ok) {
-            applyFailure(result);
-            return;
-          }
-          const model = result.model;
-          if (model.kind !== "worker_log" || model.runId !== state.runId || model.executionIndex !== retryExecutionIndex || model.offset !== retryOffset) {
-            applyFailure(model.kind === "worker_log" || model.kind === "error" || model.kind === "command_result"
-              ? { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }
-              : endpointFailure(model));
-            return;
-          }
-          lastChunkDesire = null;
-          state = Object.freeze({
-            ...state,
-            snapshotRevision: model.revision,
-            content: Object.freeze({
-              status: model.status,
-              sha256: model.sha256,
-              byteCount: model.byteCount,
-              truncatedDaemon: model.truncatedDaemon,
-              truncatedLocal: model.truncatedLocal,
-              offset: model.offset,
-              dataBase64: model.dataBase64,
-              nextOffset: model.nextOffset,
-            }),
-            requestState: "ready",
-            error: null,
-          });
-          publish();
+          applyChunkResult(result, requestedRunId, retryExecutionIndex, retryOffset);
         },
       });
     },
@@ -1798,38 +1893,9 @@ export function createWorkerLogViewer(io) {
   });
 }
 
-/**
- * The safe render contract of one bounded chunk: the literal base64 is
- * decoded and rendered as plain text through `textContent` only. NUL
- * bytes, ANSI escapes and invalid UTF-8 sequences can never become
- * markup, and the payload is never logged, announced or embedded in a
- * diagnostic. The rendered text of a chunk that is not a validated
- * `worker_log` document is a contract error, never a fallback.
- */
-export function decodeLogChunkText(dataBase64) {
-  const bytes = Uint8Array.from(atob(dataBase64), (char) => char.charCodeAt(0));
-  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-}
-
-export function logsCaptureGate(state, boundaryKind, mutatingInFlight) {
-  if (state === null || state.selectedExecutionIndex === null) {
-    return false;
-  }
-  const entry = state.logs.find((item) => item.executionIndex === state.selectedExecutionIndex) ?? null;
-  if (entry === null || (entry.status !== "captured" && entry.status !== "truncated")) {
-    return false;
-  }
-  if (state.content !== null && state.content.nextOffset === null) {
-    return false;
-  }
-  const gate = boundaryKind === "in_flight" || boundaryKind === "plan_ready" || boundaryKind === "waiting";
-  return gate && !mutatingInFlight();
-}
-
-/* ------------------------------------------------------------------ */
 /* Live observation (v3): bounded read-only polling of one selected    */
-/* run while the authoritative inspect shows `running` + `in_flight`.  */
-/* ------------------------------------------------------------------ */
+/* run; the corrective worker-logs viewer sits before this region and  */
+/* carries no scheduler, timer or mutation capability of its own.      */
 
 export const LIVE_OBSERVATION_POLL_DELAY_MS = 2000;
 
@@ -2804,9 +2870,12 @@ function showRunModel(model, options = {}) {
   ensureTimelineFor(model.runId);
   ensureWorkerLogsFor(model.runId);
   lastInspectRevision = model.revision;
-  lastBoundaryKind = model.boundary.kind;
   renderTimelineMeta();
   maybeTailEvents(model);
+  // the applied authoritative inspect drives the automatic metadata
+  // refresh of the logs viewer (first inspect: exactly one list GET;
+  // later inspects: one per strictly greater revision)
+  workerLogViewer.inspectApplied(model);
   renderWorkerLogs(workerLogViewer === null ? null : workerLogViewer.currentState());
   return changed;
 }
@@ -3312,7 +3381,6 @@ let lastDocumentKey = null;
 let refreshSequence = 0;
 let timeline = null;
 let lastInspectRevision = null;
-let lastBoundaryKind = null;
 const mutationGate = createMutationGate();
 const runsGuard = createGenerationGuard();
 const fetchImplementation = typeof fetch === "function" ? fetch : null;
@@ -3369,7 +3437,9 @@ const logsTransport = createLogsTransport({
 
 /** The section of the selected run: created once per selection; a run
  * change discards the previous viewer and invalidates its in-flight
- * logs GET. The list is never loaded automatically. */
+ * logs GET. The metadata list follows the applied authoritative
+ * inspects automatically (the viewer's `inspectApplied`); payload bytes
+ * load only on the explicit `Load log` press. */
 function ensureWorkerLogsFor(runId) {
   const current = workerLogViewer === null ? null : workerLogViewer.currentState();
   if (current !== null && current.runId === runId) {
@@ -3380,8 +3450,6 @@ function ensureWorkerLogsFor(runId) {
     workerLogViewer = createWorkerLogViewer({
       transport: logsTransport,
       onState: (state) => renderWorkerLogs(state),
-      snapshot: () => ({ boundaryKind: lastBoundaryKind }),
-      mutatingInFlight: () => mutationGate.isInFlight(),
     });
   }
   workerLogViewer.transitionToLogsView(runId);
@@ -3424,6 +3492,20 @@ function workerLogRow(entry) {
   return row;
 }
 
+/** The read-only status explanation of one selected execution. */
+function workerLogStatusText(status) {
+  if (status === "captured") {
+    return "Captured artifact; upstream completeness is not guaranteed";
+  }
+  if (status === "truncated") {
+    return "Captured tail; earlier bytes were discarded";
+  }
+  if (status === "unavailable") {
+    return "content was not durably captured";
+  }
+  return "execution has no terminal durable log binding yet";
+}
+
 function renderWorkerLogs(state) {
   if (state === null) {
     return;
@@ -3452,6 +3534,11 @@ function renderWorkerLogs(state) {
     text = `snapshot revision ${state.snapshotRevision}`;
   }
   status.textContent = text;
+  // the read-only status explanation of the selected execution
+  const selected = state.selectedExecutionIndex === null
+    ? null
+    : state.logs.find((item) => item.executionIndex === state.selectedExecutionIndex) ?? null;
+  document.getElementById("logs-hint").textContent = selected === null ? "" : workerLogStatusText(selected.status);
   const retry = document.getElementById("logs-retry");
   retry.hidden = !(state.requestState === "failed" && state.error !== null && state.error.layer !== "viewer");
   // the content frame: only a validated captured/truncated chunk renders
@@ -3462,8 +3549,13 @@ function renderWorkerLogs(state) {
     pre.textContent = "";
   } else {
     pre.hidden = false;
-    // safe render: plain text via textContent, never markup
-    pre.textContent = decodeLogChunkText(content.dataBase64);
+    // safe render: the incrementally decoded plain text via textContent,
+    // never markup; the scroll position survives every refresh
+    const previousScroll = typeof pre.scrollTop === "number" ? pre.scrollTop : 0;
+    pre.textContent = content.text;
+    if (previousScroll > 0) {
+      pre.scrollTop = previousScroll;
+    }
     const cursor = content.nextOffset === null
       ? `bytes ${content.offset}–${content.offset + (content.byteCount - content.offset)} (end)`
       : `bytes ${content.offset}–${content.nextOffset} of ${content.byteCount}`;
@@ -3471,13 +3563,12 @@ function renderWorkerLogs(state) {
       `execution ${state.selectedExecutionIndex} · ${content.status} · sha256 ${content.sha256.slice(0, 12)}… · ${cursor}` +
       (content.truncatedDaemon || content.truncatedLocal ? " · truncated" : "");
   }
+  // the explicit Load log action: any boundary may read a durable log
   const next = document.getElementById("logs-next-chunk");
-  const gate = logsCaptureGate(
-    state,
-    lastBoundaryKind,
-    () => mutationGate.isInFlight(),
-  );
-  next.hidden = !gate;
+  const loadable = selected !== null
+    && (selected.status === "captured" || selected.status === "truncated")
+    && (content === null || content.nextOffset !== null);
+  next.hidden = !loadable;
 }
 
 function setStatus(text) {

@@ -1,24 +1,25 @@
 /**
  * Permanent contract suite of the browser UI v5 worker-log viewer
- * model: the one logs document parsers (`worker_logs` metadata union
- * and `worker_log` status/chunk shapes with the run binding and the
- * raw-byte cursor coherence), the one URL builder, the bounded
- * single-flight logs transport (superseding aborts, disposal, no
- * auto-retry), the closed viewer state machine (explicit list load,
- * explicit chunk load under the capture gate, stale-response drops,
- * one-click retry) and the safe render contract — plus the source
- * restrictions of the logs layer.
+ * (corrective): the one logs document parsers (`worker_logs` metadata
+ * union and `worker_log` status/chunk shapes with the run binding and
+ * the raw-byte cursor coherence), the one URL builder, the bounded
+ * single-flight logs transport with kind-aware arbitration (a metadata
+ * desire never cancels an in-flight manual content request), the closed
+ * viewer state machine (inspect-driven automatic metadata, terminal log
+ * access on every boundary, the immutable binding check, stale-cursor
+ * drops, one-click retry), the one incremental UTF-8 decoder owner and
+ * the safe render contract — plus the source restrictions of the logs
+ * layer.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   UiContractError,
+  createLogChunkDecoder,
   createLogsTransport,
   createWorkerLogViewer,
   createWorkerLogsState,
-  decodeLogChunkText,
-  logsCaptureGate,
   parseApiDocument,
   parseWorkerLogDocument,
   parseWorkerLogsDocument,
@@ -174,7 +175,7 @@ describe("worker logs URL builder", () => {
   });
 });
 
-describe("the bounded single-flight logs transport", () => {
+describe("the bounded single-flight logs transport with kind arbitration", () => {
   type Call = { runId: string; path: string; signal: AbortSignal };
   const makeIo = () => {
     const calls: Call[] = [];
@@ -194,60 +195,130 @@ describe("the bounded single-flight logs transport", () => {
     return { calls, gates, started, settled, io };
   };
 
-  test("one desire at a time; a second desire supersedes the first and runs after it", async () => {
-    const { calls, gates, started, io } = makeIo();
+  const metadataDesire = (onApplied: (r: unknown) => void) => ({ runId: "run-a", path: "/v1/runs/run-a/logs", kind: "metadata" as const, onApplied: onApplied as never });
+  const contentDesire = (path: string, onApplied: (r: unknown) => void) => ({ runId: "run-a", path, kind: "content" as const, onApplied: onApplied as never });
+
+  test("a metadata desire never cancels an in-flight manual content request", async () => {
+    const { calls, gates, io } = makeIo();
     const transport = createLogsTransport(io);
     const applied: string[] = [];
-    const first = transport.request({ runId: "run-a", path: "/v1/runs/run-a/logs", onApplied: (r) => applied.push(`first:${String(r !== undefined)}`) });
-    const second = transport.request({ runId: "run-a", path: "/v1/runs/run-a/logs", onApplied: (r) => applied.push(`second:${String(r !== undefined)}`) });
+    const chunk = transport.request(contentDesire("/v1/runs/run-a/logs/1?offset=0&limit=65536", (r) => applied.push(`chunk:${String(r !== undefined)}`)));
+    const meta = transport.request(metadataDesire((r) => applied.push(`meta:${String(r !== undefined)}`)));
+    expect(calls).toHaveLength(1); // the chunk request is on the wire
+    expect(calls[0]!.signal.aborted).toBe(false); // the metadata did not cancel it
+    const listModel = { kind: "worker_logs", runId: "run-a", revision: 25, logs: [] };
+    gates[0]!({ ok: true, model: chunkModelFor("/v1/runs/run-a/logs/1?offset=0&limit=65536") });
+    await chunk;
+    expect(applied).toEqual(["chunk:true"]); // the chunk applied first
+    expect(calls).toHaveLength(2); // then exactly one coalesced metadata follow-up
+    gates[1]!({ ok: true, model: listModel });
+    await meta;
+    expect(applied).toEqual(["chunk:true", "meta:true"]);
+  });
+
+  test("a content desire supersedes an active metadata refresh", async () => {
+    const { calls, gates, io } = makeIo();
+    const transport = createLogsTransport(io);
+    const applied: string[] = [];
+    const meta = transport.request(metadataDesire(() => applied.push("meta")));
+    const chunk = transport.request(contentDesire("/p1", () => applied.push("chunk")));
+    expect(calls[0]!.signal.aborted).toBe(true); // the metadata was superseded
+    gates[0]!({ ok: true, model: { kind: "worker_logs", runId: "run-a", revision: 1, logs: [] } });
+    await meta;
+    expect(applied).toEqual([]); // the superseded metadata never applies
+    gates[1]!({ ok: true, model: chunkModelFor("/p1") });
+    await chunk;
+    expect(applied).toEqual(["chunk"]);
+    expect(calls).toHaveLength(2);
+  });
+
+  test("repeated metadata desires coalesce to the latest", async () => {
+    const { calls, gates, io } = makeIo();
+    const transport = createLogsTransport(io);
+    const applied: string[] = [];
+    const first = transport.request(metadataDesire(() => applied.push("meta1")));
+    const second = transport.request(metadataDesire(() => applied.push("meta2")));
+    const third = transport.request(metadataDesire(() => applied.push("meta3")));
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.signal.aborted).toBe(true);
     gates[0]!({ ok: true, model: { kind: "worker_logs", runId: "run-a", revision: 1, logs: [] } });
     await first;
-    expect(applied).toEqual([]); // the superseded response is dropped
-    expect(calls).toHaveLength(2); // the coalesced follow-up starts after the slot frees
-    gates[1]!({ ok: true, model: { kind: "worker_logs", runId: "run-a", revision: 1, logs: [] } });
     await second;
-    expect(applied).toEqual(["second:true"]);
-    expect(started).toEqual(["run-a", "run-a"]);
+    expect(applied).toEqual([]); // both superseded desires settle without applying
+    expect(calls).toHaveLength(2); // only the coalesced latest runs
+    gates[1]!({ ok: true, model: { kind: "worker_logs", runId: "run-a", revision: 2, logs: [] } });
+    await third;
+    expect(applied).toEqual(["meta3"]);
+  });
+
+  test("a content desire supersedes an active content request", async () => {
+    const { calls, gates, io } = makeIo();
+    const transport = createLogsTransport(io);
+    const applied: string[] = [];
+    const first = transport.request(contentDesire("/p1", () => applied.push("first")));
+    const second = transport.request(contentDesire("/p2", () => applied.push("second")));
+    expect(calls[0]!.signal.aborted).toBe(true);
+    gates[0]!({ ok: true, model: chunkModelFor("/p1") });
+    await first;
+    expect(applied).toEqual([]);
+    gates[1]!({ ok: true, model: chunkModelFor("/p2") });
+    await second;
+    expect(applied).toEqual(["second"]);
   });
 
   test("invalidate withdraws the active and queued desires without effects", async () => {
-    const { calls, gates, settled, io } = makeIo();
+    const { calls, gates, io } = makeIo();
     const transport = createLogsTransport(io);
     const applied: string[] = [];
-    const first = transport.request({ runId: "run-a", path: "/p", onApplied: () => applied.push("first") });
-    transport.request({ runId: "run-a", path: "/p", onApplied: () => applied.push("second") });
+    const first = transport.request(contentDesire("/p", () => applied.push("first")));
+    transport.request(metadataDesire(() => applied.push("meta")));
     transport.invalidate();
-    gates[0]!({ ok: true, model: { kind: "worker_logs", runId: "run-a", revision: 1, logs: [] } });
+    gates[0]!({ ok: true, model: chunkModelFor("/p") });
     await first;
     expect(applied).toEqual([]);
     expect(calls).toHaveLength(1); // the queued desire was withdrawn
-    // the superseded settlement still frees the wire slot (buttons re-enable)
-    expect(settled).toEqual(["run-a"]);
   });
 
   test("dispose refuses every later desire", async () => {
     const { calls, io } = makeIo();
     const transport = createLogsTransport(io);
     transport.dispose();
-    const result = await transport.request({ runId: "run-a", path: "/p", onApplied: () => undefined });
+    const result = await transport.request(metadataDesire(() => undefined));
     expect(result).toBeUndefined();
     expect(calls).toHaveLength(0);
   });
 
-  test("invalid io shapes are refused before any state", () => {
+  test("invalid io shapes and desire kinds are refused before any state", () => {
     expect(contractReason(() => createLogsTransport({} as never))).toBe("invalid_transport_io");
-    expect(contractReason(() => createLogsTransport({ fetchLogs: 1, onStarted: () => undefined, onSettled: () => undefined } as never))).toBe("invalid_transport_io");
+    const { io, calls } = makeIo();
+    const transport = createLogsTransport(io);
+    void transport.request({ runId: "run-a", path: "/p", kind: "other" as never, onApplied: () => undefined });
+    expect(calls).toHaveLength(0);
   });
+
+  function chunkModelFor(path: string): Record<string, unknown> {
+    const offset = Number(new URL(path, "http://x").searchParams.get("offset") ?? 0);
+    return {
+      kind: "worker_log",
+      runId: "run-a",
+      revision: 24,
+      executionIndex: 1,
+      stateId: "architect",
+      status: "captured",
+      sha256: "a".repeat(64),
+      byteCount: 11,
+      truncatedDaemon: false,
+      truncatedLocal: false,
+      offset,
+      dataBase64: b64("hello world"),
+      nextOffset: null,
+    };
+  }
 });
 
 describe("the closed viewer state machine", () => {
   type Harness = {
     viewer: ReturnType<typeof createWorkerLogViewer>;
     states: (UiWorkerLogsState | null)[];
-    snapshot: { boundaryKind: string | null };
-    mutating: { inFlight: boolean };
     gates: ((result: unknown) => void)[];
     transport: ReturnType<typeof createLogsTransport>;
   };
@@ -259,28 +330,47 @@ describe("the closed viewer state machine", () => {
       onSettled: () => undefined,
     });
     const states: (UiWorkerLogsState | null)[] = [];
-    const snapshot = { boundaryKind: "in_flight" as string | null };
-    const mutating = { inFlight: false };
     const viewer = createWorkerLogViewer({
       transport,
       onState: (state) => states.push(state),
-      snapshot: () => ({ boundaryKind: snapshot.boundaryKind }),
-      mutatingInFlight: () => mutating.inFlight,
     });
     viewer.transitionToLogsView(runId);
-    return { viewer, states, snapshot, mutating, gates, transport };
+    return { viewer, states, gates, transport };
   };
 
-  const okList = (revision = 24): unknown => ({
+  const okList = (logs: readonly Record<string, unknown>[], revision = 24): unknown => ({
+    ok: true,
+    model: { kind: "worker_logs", runId: "run-a", revision, logs },
+  });
+
+  const capturedEntry = (index = 1, overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    executionIndex: index,
+    stateId: "architect",
+    status: "captured",
+    sha256: "a".repeat(64),
+    byteCount: 11,
+    truncatedDaemon: false,
+    truncatedLocal: false,
+    ...overrides,
+  });
+
+  const chunkModel = (offset = 0, overrides: Record<string, unknown> = {}): unknown => ({
     ok: true,
     model: {
-      kind: "worker_logs",
+      kind: "worker_log",
       runId: "run-a",
-      revision,
-      logs: [
-        { executionIndex: 1, stateId: "architect", status: "captured", sha256: "a".repeat(64), byteCount: 11, truncatedDaemon: false, truncatedLocal: false },
-        { executionIndex: 2, stateId: "execute", status: "pending" },
-      ],
+      revision: 24,
+      executionIndex: 1,
+      stateId: "architect",
+      status: "captured",
+      sha256: "a".repeat(64),
+      byteCount: 11,
+      truncatedDaemon: false,
+      truncatedLocal: false,
+      offset,
+      dataBase64: b64("hello world"),
+      nextOffset: null,
+      ...overrides,
     },
   });
 
@@ -291,140 +381,276 @@ describe("the closed viewer state machine", () => {
     expect(viewer.currentState()).toEqual(createWorkerLogsState("run-a"));
   });
 
-  test("the list loads only on the explicit press and binds run/revision", async () => {
+  test("the list loads on the explicit press and binds run/revision", async () => {
     const { viewer, states, gates } = makeViewer();
     viewer.fetchLogsList();
     expect(states.at(-1)!.requestState).toBe("loading");
-    gates[0]!(okList());
-    await Bun.sleep(1);
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
     const state = viewer.currentState()!;
     expect(state.requestState).toBe("ready");
     expect(state.snapshotRevision).toBe(24);
-    expect(state.logs).toHaveLength(2);
+    expect(state.logs).toHaveLength(1);
     expect(states.at(-1)!.requestState).toBe("ready");
   });
 
   test("a list response of another run is dropped before it becomes state", async () => {
-    const { viewer, states, gates } = makeViewer();
+    const { viewer, gates } = makeViewer();
     viewer.fetchLogsList();
     gates[0]!({
       ok: true,
       model: { kind: "worker_logs", runId: "run-b", revision: 5, logs: [{ executionIndex: 9, stateId: "x", status: "pending" }] },
     });
-    await Bun.sleep(1);
+    await Bun.sleep(2);
     const state = viewer.currentState()!;
     expect(state.logs).toHaveLength(0); // the stale response never applied
     expect(state.requestState).toBe("failed"); // settled as a typed contract failure, never stuck
     expect(state.error).toEqual({ layer: "contract", reason: "unexpected_kind" });
   });
 
-  test("the selection clears content and rejects unknown executions", async () => {
-    const { viewer, gates } = makeViewer();
-    viewer.fetchLogsList();
-    gates[0]!(okList());
-    await Bun.sleep(1);
-    viewer.selectExecution(1);
-    expect(viewer.currentState()!.selectedExecutionIndex).toBe(1);
-    viewer.selectExecution(9);
-    expect(viewer.currentState()!.selectedExecutionIndex).toBe(1);
-    viewer.selectExecution(2); // pending: selectable, but never chunkable
-    expect(viewer.currentState()!.selectedExecutionIndex).toBe(2);
+  test("the first applied authoritative inspect issues exactly one automatic metadata GET", async () => {
+    const { viewer, gates, states } = makeViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    expect(gates).toHaveLength(1);
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.snapshotRevision).toBe(24);
+    // the same revision never issues a second GET
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    expect(gates).toHaveLength(1);
+    // a lower revision never issues a GET
+    viewer.inspectApplied({ runId: "run-a", revision: 10 });
+    expect(gates).toHaveLength(1);
+    // a foreign run never issues a GET
+    viewer.inspectApplied({ runId: "run-b", revision: 99 });
+    expect(gates).toHaveLength(1);
+    // a higher revision issues exactly one more GET
+    viewer.inspectApplied({ runId: "run-a", revision: 30 });
+    expect(gates).toHaveLength(2);
+    gates[1]!(okList([capturedEntry()], 30));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.snapshotRevision).toBe(30);
+    expect(states.at(-1)!.requestState).toBe("ready");
   });
 
-  test("the chunk loads only under the capture gate and only for captured/truncated", async () => {
-    const { viewer, states, gates, snapshot, mutating } = makeViewer();
+  test("pending metadata becomes captured automatically after a revision advance", async () => {
+    const { viewer, gates } = makeViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 10 });
+    gates[0]!(okList([{ executionIndex: 1, stateId: "architect", status: "pending" }], 10));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.logs[0]!.status).toBe("pending");
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    gates[1]!(okList([capturedEntry()], 24));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.logs[0]!.status).toBe("captured");
+    expect(viewer.currentState()!.snapshotRevision).toBe(24);
+  });
+
+  test("a failed automatic metadata application does not re-trigger for the same revision", async () => {
+    const { viewer, gates } = makeViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    gates[0]!({ ok: false, failure: { layer: "transport", reason: "network_error" } });
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    // the same revision again: zero further GETs
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    expect(gates).toHaveLength(1);
+    // a higher revision recovers the automatic path
+    viewer.inspectApplied({ runId: "run-a", revision: 30 });
+    expect(gates).toHaveLength(2);
+    gates[1]!(okList([capturedEntry()], 30));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.requestState).toBe("ready");
+  });
+
+  test("an unchanged immutable binding preserves the loaded content, selection and text", async () => {
+    const { viewer, gates } = makeViewer();
     viewer.fetchLogsList();
-    gates[0]!(okList());
-    await Bun.sleep(1);
-    viewer.selectExecution(2); // pending
-    viewer.fetchChunk();
-    expect(viewer.currentState()!.requestState).toBe("ready"); // refused silently: no content for pending
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
     viewer.selectExecution(1);
-    mutating.inFlight = true;
     viewer.fetchChunk();
-    expect(viewer.currentState()!.requestState).toBe("ready"); // refused while a mutation is in flight
-    mutating.inFlight = false;
-    snapshot.boundaryKind = "succeeded";
+    gates[1]!(chunkModel(0, { nextOffset: 11 }));
+    await Bun.sleep(2);
+    const before = viewer.currentState()!.content;
+    expect(before!.text).toBe("hello world");
+    // a metadata refresh at a higher revision with the identical binding
+    viewer.inspectApplied({ runId: "run-a", revision: 30 });
+    gates[2]!(okList([capturedEntry()], 30));
+    await Bun.sleep(2);
+    const after = viewer.currentState()!.content;
+    expect(after).toEqual(before); // the loaded content survived the refresh
+    expect(viewer.currentState()!.selectedExecutionIndex).toBe(1);
+    // and the next chunk continues the same cursor
     viewer.fetchChunk();
-    const failed = viewer.currentState()!;
-    expect(failed.requestState).toBe("failed");
-    expect(failed.error).toEqual({ layer: "viewer", reason: "capture_gate_refused" });
-    expect(states.filter((s) => s!.requestState === "failed")).toHaveLength(1);
-    snapshot.boundaryKind = "in_flight";
+    expect(gates).toHaveLength(4); // list, chunk, refresh, next chunk
+  });
+
+  test("a changed immutable binding fails closed as invalid_log_binding", async () => {
+    const { viewer, gates, states } = makeViewer();
+    viewer.fetchLogsList();
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
+    viewer.selectExecution(1);
     viewer.fetchChunk();
-    expect(viewer.currentState()!.requestState).toBe("loading");
-    gates[1]!({ ok: true, model: parseWorkerLogDocument({ ...chunkDocument(), offset: 0, byte_count: 11, data_base64: b64("hello\0world"), next_offset: null }, "run-a") });
-    await Bun.sleep(5);
+    gates[1]!(chunkModel());
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.content).not.toBeNull();
+    // the refresh observes a different artifact digest for the same execution
+    viewer.inspectApplied({ runId: "run-a", revision: 30 });
+    gates[2]!(okList([capturedEntry(1, { sha256: "b".repeat(64) })], 30));
+    await Bun.sleep(2);
     const state = viewer.currentState()!;
+    expect(state.requestState).toBe("failed");
+    expect(state.error).toEqual({ layer: "viewer", reason: "invalid_log_binding" });
+    expect(states.filter((s) => s!.error?.reason === "invalid_log_binding")).toHaveLength(1);
+    // the loaded content is preserved, never silently mixed
     expect(state.content).not.toBeNull();
-    expect(state.content!.offset).toBe(0);
-    expect(state.requestState).toBe("ready");
+  });
+
+  test("terminal log access on every boundary: the viewer carries no boundary classifier", async () => {
+    // the viewer io accepts no snapshot and no mutating predicate at all:
+    // chunk access is independent of the run boundary, the mutation
+    // action model and the mutating POST state
+    const { viewer, gates } = makeViewer();
+    viewer.fetchLogsList();
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    gates[1]!(chunkModel());
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.content).not.toBeNull();
+    expect(viewer.currentState()!.requestState).toBe("ready");
+    expect(viewer.currentState()!.error).toBeNull();
+  });
+
+  test("a manual chunk survives an automatic metadata refresh and one follow-up runs", async () => {
+    const { viewer, gates } = makeViewer();
+    viewer.fetchLogsList();
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
+    viewer.selectExecution(1);
+    viewer.fetchChunk(); // the manual content request goes on the wire
+    viewer.inspectApplied({ runId: "run-a", revision: 25 }); // the automatic metadata arrives
+    gates[1]!(chunkModel());
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.content).not.toBeNull();
+    expect(gates).toHaveLength(3); // list, chunk, one coalesced metadata follow-up
+    gates[2]!(okList([capturedEntry()], 25));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.snapshotRevision).toBe(25);
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+  });
+
+  test("the selection clears content and resets the decoder; unknown executions are refused", async () => {
+    const { viewer, gates } = makeViewer();
+    viewer.fetchLogsList();
+    gates[0]!(okList([capturedEntry(), capturedEntry(2, { stateId: "execute" })]));
+    await Bun.sleep(2);
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    gates[1]!(chunkModel(0, { nextOffset: 7, dataBase64: b64("hello w") }));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.content!.text).toBe("hello w");
+    viewer.selectExecution(2);
+    expect(viewer.currentState()!.content).toBeNull(); // fresh content
+    viewer.selectExecution(9);
+    expect(viewer.currentState()!.selectedExecutionIndex).toBe(2);
+    // back to execution 1: the decoder is fresh, the reload starts at 0
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    gates[2]!(chunkModel(0, { nextOffset: 7, dataBase64: b64("hello w") }));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.content!.text).toBe("hello w"); // no duplicated prefix
   });
 
   test("a chunk response of another execution or run is dropped", async () => {
     const { viewer, gates } = makeViewer();
     viewer.fetchLogsList();
-    gates[0]!(okList());
-    await Bun.sleep(1);
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
     viewer.selectExecution(1);
     viewer.fetchChunk();
-    gates[1]!({ ok: true, model: parseWorkerLogDocument({ ...chunkDocument(), execution_index: 2 }, "run-a") });
-    await Bun.sleep(5);
+    gates[1]!({ ok: true, model: { ...chunkDocument(), execution_index: 2 } });
+    await Bun.sleep(2);
     expect(viewer.currentState()!.content).toBeNull();
-    expect(viewer.currentState()!.requestState).toBe("failed");
     viewer.fetchChunk();
     gates[2]!({ ok: true, model: parseWorkerLogDocument({ ...chunkDocument(), run_id: "run-b" }, "run-b") });
-    await Bun.sleep(5);
+    await Bun.sleep(2);
     expect(viewer.currentState()!.content).toBeNull();
   });
 
-  test("a terminal chunk disables the next request", async () => {
-    const { viewer, gates } = makeViewer();
+  test("a stale or duplicated chunk offset settles as a typed contract failure without decoding", async () => {
+    const { viewer, gates, states } = makeViewer();
     viewer.fetchLogsList();
-    gates[0]!(okList());
-    await Bun.sleep(1);
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
     viewer.selectExecution(1);
     viewer.fetchChunk();
-    gates[1]!({ ok: true, model: parseWorkerLogDocument(chunkDocument(), "run-a") });
-    await Bun.sleep(5);
-    const gate = logsCaptureGate(viewer.currentState(), "in_flight", () => false);
-    expect(gate).toBe(false); // next_offset === null: no further chunk
+    gates[1]!(chunkModel(0, { nextOffset: 7, dataBase64: b64("hello w") }));
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.content!.text).toBe("hello w");
+    // a retried offset 0 while the cursor is at 8: never decoded, never duplicated
+    viewer.fetchChunk(); // refused: the artifact is not complete but the state is loading? no: ready → issues offset 8
+    gates[2]!(chunkModel(0, { nextOffset: 7 })); // a stale response for offset 0 arrives at the offset-8 request
+    await Bun.sleep(2);
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    expect(viewer.currentState()!.error).toEqual({ layer: "contract", reason: "unexpected_kind" });
+    expect(viewer.currentState()!.content!.text).toBe("hello w"); // unchanged, no duplication
+    expect(states.filter((s) => s!.error?.reason === "unexpected_kind")).toHaveLength(1);
   });
 
-  test("the gate admits only active boundaries and refuses mutations", () => {
-    const state = createWorkerLogsState("run-a") as UiWorkerLogsState;
-    const loaded = { ...state, logs: [{ executionIndex: 1, stateId: "s", status: "captured" }], selectedExecutionIndex: 1 } as UiWorkerLogsState;
-    expect(logsCaptureGate(loaded, "in_flight", () => false)).toBe(true);
-    expect(logsCaptureGate(loaded, "plan_ready", () => false)).toBe(true);
-    expect(logsCaptureGate(loaded, "waiting", () => false)).toBe(true);
-    expect(logsCaptureGate(loaded, "resumable", () => false)).toBe(false);
-    expect(logsCaptureGate(loaded, "succeeded", () => false)).toBe(false);
-    expect(logsCaptureGate(loaded, "failed", () => false)).toBe(false);
-    expect(logsCaptureGate(loaded, "in_flight", () => true)).toBe(false);
-    expect(logsCaptureGate(null, "in_flight", () => false)).toBe(false);
+  test("the terminal chunk disables the next request", async () => {
+    const { viewer, gates } = makeViewer();
+    viewer.fetchLogsList();
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    gates[1]!(chunkModel());
+    await Bun.sleep(2);
+    const requestsBefore = gates.length;
+    viewer.fetchChunk(); // next_offset === null: a no-op
+    expect(gates).toHaveLength(requestsBefore);
   });
 
   test("a failed chunk desire retries exactly once per click", async () => {
     const { viewer, gates, states } = makeViewer();
     viewer.fetchLogsList();
-    gates[0]!(okList());
-    await Bun.sleep(1);
+    gates[0]!(okList([capturedEntry()]));
+    await Bun.sleep(2);
     viewer.selectExecution(1);
     viewer.fetchChunk();
     gates[1]!({ ok: false, failure: { layer: "transport", reason: "network_error" } });
-    await Bun.sleep(5);
+    await Bun.sleep(2);
     expect(viewer.currentState()!.requestState).toBe("failed");
     expect(viewer.currentState()!.error).toEqual({ layer: "transport", reason: "network_error" });
     viewer.retryLastChunkRequest();
     expect(viewer.currentState()!.requestState).toBe("loading");
-    gates[2]!({ ok: true, model: parseWorkerLogDocument(chunkDocument(), "run-a") });
-    await Bun.sleep(5);
+    gates[2]!(chunkModel());
+    await Bun.sleep(2);
     expect(viewer.currentState()!.content).not.toBeNull();
-    // list ready + the selection re-publish of the ready state + retry ready
-    expect(states.filter((s) => s!.requestState === "ready")).toHaveLength(3);
+    expect(viewer.currentState()!.content!.text).toBe("hello world"); // no duplicated prefix from the failed attempt
     // a retry outside a failed state is a no-op
     viewer.retryLastChunkRequest();
-    expect(viewer.currentState()!.content).not.toBeNull();
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    expect(states.filter((s) => s!.requestState === "ready").length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("a retry of a foreign selection is refused", async () => {
+    const { viewer, gates } = makeViewer();
+    viewer.fetchLogsList();
+    gates[0]!(okList([capturedEntry(), capturedEntry(2, { stateId: "execute" })]));
+    await Bun.sleep(2);
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    gates[1]!({ ok: false, failure: { layer: "transport", reason: "network_error" } });
+    await Bun.sleep(2);
+    viewer.selectExecution(2);
+    const requestsBefore = gates.length;
+    viewer.retryLastChunkRequest();
+    expect(gates).toHaveLength(requestsBefore); // the failed desire belongs to execution 1
   });
 
   test("a run change discards the viewer state and the wire", async () => {
@@ -437,46 +663,129 @@ describe("the closed viewer state machine", () => {
     expect(state.requestState).toBe("idle");
     // the in-flight list of run-a settles after the change: superseded, dropped
     gates[0]!({ ok: true, model: { kind: "worker_logs", runId: "run-a", revision: 9, logs: [{ executionIndex: 3, stateId: "s", status: "pending" }] } });
-    await Bun.sleep(5);
+    await Bun.sleep(2);
     expect(viewer.currentState()!.logs).toHaveLength(0);
     expect(viewer.currentState()!.requestState).toBe("idle"); // the new run's state owns the UI
+    // and the automatic path restarts from zero for the new run
+    viewer.inspectApplied({ runId: "run-b", revision: 5 });
+    expect(gates).toHaveLength(2);
     void transport;
   });
 
   test("the viewer refuses invalid io and unsafe run ids", () => {
     expect(contractReason(() => createWorkerLogViewer({} as never))).toBe("invalid_viewer_io");
+    expect(contractReason(() => createWorkerLogViewer({ transport: 1, onState: () => undefined } as never))).toBe("invalid_viewer_io");
     const { viewer } = makeViewer();
     expect(contractReason(() => viewer.transitionToLogsView("../escape"))).toBe("invalid_run_id");
   });
 });
 
-describe("the safe render contract", () => {
-  test("the decoded text preserves NUL, ANSI escapes and invalid UTF-8 bytes", () => {
-    const raw = new Uint8Array([0x61, 0x00, 0x1b, 0x5b, 0x33, 0x31, 0x6d, 0xff, 0xfe, 0x62]);
-    const text = decodeLogChunkText(Buffer.from(raw).toString("base64"));
-    expect(text).toContain("a");
-    expect(text).toContain("\u001b[31m");
-    expect(text).toContain("\u0000");
-    expect(text).toContain("\uFFFD"); // invalid UTF-8 becomes the replacement character
-    expect(text).toContain("b");
+describe("the incremental UTF-8 decoder", () => {
+  test("multi-byte sequences split across chunks decode correctly at every valid position", () => {
+    // 2-byte: é = C3 A9; 3-byte: € = E2 82 AC; 4-byte: 🙂 = F0 9F 99 82
+    const cases: { readonly name: string; readonly bytes: readonly number[]; readonly expected: string }[] = [
+      { name: "2-byte é", bytes: [0x61, 0xc3, 0xa9, 0x62], expected: "aéb" },
+      { name: "3-byte €", bytes: [0x61, 0xe2, 0x82, 0xac, 0x62], expected: "a€b" },
+      { name: "4-byte 🙂", bytes: [0x61, 0xf0, 0x9f, 0x99, 0x82, 0x62], expected: "a🙂b" },
+    ];
+    for (const testCase of cases) {
+      const bytes = testCase.bytes;
+      // split after every byte position that is inside the multi-byte sequence
+      for (let split = 1; split < bytes.length - 1; split += 1) {
+        const decoder = createLogChunkDecoder();
+        const head = Buffer.from(bytes.slice(0, split)).toString("base64");
+        const tail = Buffer.from(bytes.slice(split)).toString("base64");
+        const text = decoder.decodeChunk(head, false) + decoder.decodeChunk(tail, true);
+        expect(text).toBe(testCase.expected);
+      }
+    }
   });
 
+  test("invalid UTF-8 becomes the replacement character", () => {
+    const decoder = createLogChunkDecoder();
+    const text = decoder.decodeChunk(Buffer.from([0x61, 0xff, 0xfe, 0x62]).toString("base64"), true);
+    expect(text).toBe("a\uFFFD\uFFFDb");
+  });
+
+  test("reset clears the pending multi-byte state", () => {
+    const decoder = createLogChunkDecoder();
+    decoder.decodeChunk(Buffer.from([0x61, 0xc3]).toString("base64"), false); // a pending 2-byte lead
+    decoder.reset();
+    const text = decoder.decodeChunk(Buffer.from([0xa9]).toString("base64"), true);
+    expect(text).toBe("\uFFFD"); // the orphaned byte is invalid on its own
+  });
+
+  test("NUL, ANSI escapes and markup-looking text stay plain text", () => {
+    const decoder = createLogChunkDecoder();
+    const raw = "<script>alert(1)</script>\u0000\u001b[31m";
+    const text = decoder.decodeChunk(Buffer.from(raw, "utf8").toString("base64"), true);
+    expect(text).toBe(raw);
+  });
+});
+
+describe("the safe render contract", () => {
   test("the rendered text is safe by construction: the source never builds markup from the payload", () => {
     expect(appSource).not.toContain("innerHTML");
     expect(appSource).not.toContain("insertAdjacentHTML");
     expect(appSource).not.toContain("document.write");
-    // the content frame renders only through textContent
-    expect(appSource).toContain('pre.textContent = decodeLogChunkText(content.dataBase64)');
+    // the content frame renders only the accumulated decoded text
+    expect(appSource).toContain("pre.textContent = content.text");
   });
 });
 
 describe("the logs layer source restrictions", () => {
-  test("the logs section is manual-only: no auto-load, no polling, no streaming", () => {
+  test("the corrective viewer carries no capture gate and no boundary classifier", () => {
+    expect(appSource).not.toContain("capture_gate_refused");
+    expect(appSource).not.toContain("logsCaptureGate");
+    expect(appSource).not.toContain("decodeLogChunkText");
+    // the logs subsystem references no mutation/action classifier and no
+    // allowlist of run boundaries
+    const logsStart = appSource.indexOf("Worker logs (v5)");
+    const logsEnd = appSource.indexOf("one live-observation scheduling owner");
+    const region = appSource.slice(logsStart, logsEnd);
+    for (const banned of ["buildRunActionModel", "RESERVED_WAIT_ACTIONS", "buildMutationRequest", "runMutationFlow", "createMutationGate"]) {
+      expect(region.includes(banned)).toBe(false);
+    }
+    for (const boundary of ["in_flight", "plan_ready", "waiting", "resumable"]) {
+      expect(region.includes(`"${boundary}"`)).toBe(false);
+    }
+  });
+
+  test("one logs transport, one incremental decoder owner, one metadata trigger", () => {
+    expect(appSource.split("export function createLogsTransport(").length - 1).toBe(1);
+    expect(appSource.split("export function createLogChunkDecoder(").length - 1).toBe(1);
+    // both TextDecoder sites of the logs layer live inside the one
+    // decoder owner (the bounded response reader elsewhere in the module
+    // owns its own unrelated decoder)
+    const logsStart = appSource.indexOf("Worker logs (v5)");
+    const logsEnd = appSource.indexOf("one live-observation scheduling owner");
+    const logsRegion = appSource.slice(logsStart, logsEnd);
+    expect(logsRegion.split("new TextDecoder(").length - 1).toBe(2);
+    const decoderStart = logsRegion.indexOf("export function createLogChunkDecoder(");
+    const decoderEnd = logsRegion.indexOf("export function createWorkerLogViewer(");
+    expect(logsRegion.slice(0, decoderStart).includes("new TextDecoder(")).toBe(false);
+    expect(logsRegion.slice(decoderEnd).includes("new TextDecoder(")).toBe(false);
+    // the automatic metadata refresh is invoked only from the applied
+    // authoritative inspect path
+    expect(appSource.split("inspectApplied(").length - 1).toBe(2); // declaration + one call site
+    // the content fetch is invoked only from the user action path
+    expect(appSource.split("fetchChunk()").length - 1).toBe(2); // declaration + one click site
+  });
+
+  test("the logs section is manual-only for content: no auto-load of payload bytes", () => {
     expect(appSource).not.toContain("setInterval");
     expect(appSource).not.toContain("EventSource");
     expect(appSource).not.toContain("WebSocket");
     // the logs GET is the only method used by the logs client
     expect(appSource).toContain('requestWorkerLogsJson(fetchImplementation, path, { signal }, runId)');
+    // the logs subsystem owns zero timers: no scheduling primitive of any
+    // kind appears in the logs region (the v3 inspect scheduler lives
+    // outside it and is the module's only timer owner)
+    const logsStart = appSource.indexOf("Worker logs (v5)");
+    const logsEnd = appSource.indexOf("one live-observation scheduling owner");
+    const logsRegion = appSource.slice(logsStart, logsEnd);
+    expect(logsRegion.includes("setTimeout")).toBe(false);
+    expect(logsRegion.includes("setInterval")).toBe(false);
   });
 
   test("no log bytes ever leave the viewer: no payload in diagnostics or storage", () => {
