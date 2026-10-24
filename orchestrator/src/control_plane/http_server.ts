@@ -116,7 +116,9 @@ export type ControlPlaneHttpRequestFailureReason =
   | "method_not_allowed"
   | "unsupported_media_type"
   | "payload_too_large"
-  | "invalid_request";
+  | "invalid_request"
+  | "invalid_cursor"
+  | "stale_observation";
 
 /** The typed request-layer error; the HTTP status comes from the one status table. */
 export class ControlPlaneHttpRequestError extends Error {
@@ -163,6 +165,7 @@ interface ParsedRoute {
     | "events"
     | "logs_list"
     | "logs_execution"
+    | "project_changes"
     | "resume"
     | "resume_plan"
     | "continue_stage"
@@ -339,6 +342,16 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
     }
     return { kind: "logs_list", projectId: null, runId };
   }
+  if (matchesShape(["v1", "runs", "*", "changes"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the project changes route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    return { kind: "project_changes", projectId: null, runId };
+  }
   if (matchesShape(["v1", "runs", "*", "logs", "*"])) {
     if (shapeMethodMismatch("GET")) {
       return new ControlPlaneHttpRequestError("method_not_allowed", "the logs route accepts GET only");
@@ -403,6 +416,8 @@ export function statusForControlPlaneFailure(failure: { readonly layer: string; 
         return 415;
       case "payload_too_large":
         return 413;
+      case "stale_observation":
+        return 409;
       default:
         return 400;
     }
@@ -718,6 +733,80 @@ export function parseEventsQuery(
 }
 
 /**
+ * The project-changes query of one run's read-only workspace-changes
+ * page: an optional non-negative safe integer entry cursor (default 0),
+ * an optional positive safe integer limit (default 100, maximum 200) and
+ * an optional 64-hex observation identity. The raw query string is
+ * parsed strictly with the same grammar as the events query: no
+ * percent-encoding, no bare keys, no duplicates, no empty values, no
+ * sign, fraction or exponent, and no unknown fields.
+ */
+export function parseProjectChangesQuery(
+  search: string,
+): { readonly after: number | null; readonly limit: number | null; readonly observation: string | null } | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { after: null, limit: null, observation: null };
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the project changes query must not carry encoded components");
+  }
+  let after: number | null = null;
+  let limit: number | null = null;
+  let observation: string | null = null;
+  for (const part of search.split("&")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) {
+      return new ControlPlaneHttpRequestError("invalid_request", "every project changes query field must carry exactly one value");
+    }
+    const key = part.slice(0, separator);
+    const value = part.slice(separator + 1);
+    if (key === "after") {
+      if (after !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query fields must be unique");
+      }
+      if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query after must be a non-negative safe integer");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query after must be a non-negative safe integer");
+      }
+      after = parsed;
+      continue;
+    }
+    if (key === "limit") {
+      if (limit !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query fields must be unique");
+      }
+      if (!/^[1-9][0-9]*$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query limit must be a positive safe integer");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed > 200) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      continue;
+    }
+    if (key === "observation") {
+      if (observation !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query fields must be unique");
+      }
+      if (!/^[0-9a-f]{64}$/.test(value)) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the project changes query observation must be a 64-character lowercase hexadecimal digest");
+      }
+      observation = value;
+      continue;
+    }
+    return new ControlPlaneHttpRequestError("invalid_request", "the project changes query carries an unknown field");
+  }
+  return { after, limit, observation };
+}
+
+/**
  * The logs list query: the list route accepts no query at all — any
  * query string is a request failure.
  */
@@ -902,7 +991,9 @@ export function projectControlPlaneCommandResult(
     projection.kind === "logs" ||
     projection.kind === "logsExecution" ||
     projection.kind === "logsChunk" ||
-    projection.kind === "logsFailure"
+    projection.kind === "logsFailure" ||
+    projection.kind === "projectChanges" ||
+    projection.kind === "projectChangesFailure"
   ) {
     return { layer: "transport", reason: "internal_error" };
   }
@@ -944,6 +1035,17 @@ export interface WorkerLogsProjection {
   readonly run_id: string;
   readonly revision: number;
   readonly logs: readonly unknown[];
+}
+
+export interface ProjectChangesProjection {
+  readonly schema_version: 1;
+  readonly kind: "project_changes";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly observation: string;
+  readonly summary: Record<string, unknown>;
+  readonly changes: readonly unknown[];
+  readonly next_after: number | null;
 }
 
 export interface WorkerLogProjection {
@@ -1177,6 +1279,55 @@ export function projectControlPlaneEvents(
   };
 }
 
+/**
+ * The HTTP projection of one project-changes call. The closed mapping is
+ * an extension of the established events precedent: a transport failure
+ * stays 502; an `invalid_cursor` CLI failure is the request-layer 400
+ * envelope; a `stale_observation` CLI failure is the request-layer 409
+ * envelope (the read saw different trees — no partial page is ever
+ * returned); every other correctly received CLI failure — including
+ * `changes_not_ready` and the provenance-integrity refusals — is the
+ * established failed command result at HTTP 200 (a Pipeline V2 public
+ * reason is never reclassified into an HTTP status).
+ */
+export function projectControlPlaneChanges(
+  result: OrchestratorCallResult,
+): ProjectChangesProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "projectChangesFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    if (projection.reason === "stale_observation") {
+      return { layer: "request", reason: "stale_observation" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "projectChanges" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "project_changes",
+    run_id: projection.runId,
+    revision: projection.revision,
+    observation: projection.observation,
+    summary: projection.summary as Record<string, unknown>,
+    changes: projection.changes,
+    next_after: projection.nextAfter,
+  };
+}
+
 function projectionResponse(
   projection:
     | CommandOutcomeProjection
@@ -1185,6 +1336,7 @@ function projectionResponse(
     | RunsDiscoveryProjection
     | EventsProjection
     | WorkerLogsProjection
+    | ProjectChangesProjection
     | WorkerLogProjection
     | ControlPlaneHttpFailure,
 ): Response {
@@ -1290,6 +1442,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind !== "events" &&
       parsed.kind !== "logs_list" &&
       parsed.kind !== "logs_execution" &&
+      parsed.kind !== "project_changes" &&
       url.search !== ""
     ) {
       return respondUi(requestFailure("invalid_path"));
@@ -1321,7 +1474,8 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind === "runs" ||
       parsed.kind === "events" ||
       parsed.kind === "logs_list" ||
-      parsed.kind === "logs_execution"
+      parsed.kind === "logs_execution" ||
+      parsed.kind === "project_changes"
         ? { ...deps, discoveryQuery: url.search }
         : deps,
       parsed,
@@ -1415,6 +1569,22 @@ async function dispatchControlPlaneRoute(
       };
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneLogsExecution(result));
+    }
+    case "project_changes": {
+      const query = parseProjectChangesQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "project_changes",
+        runId,
+        projectPath: authority.project.projectRoot,
+        ...(query.after === null ? {} : { after: query.after }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+        ...(query.observation === null ? {} : { observation: query.observation }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneChanges(result));
     }
     case "resume": {
       parseEmptyBody(parseJsonBody(bodyText));

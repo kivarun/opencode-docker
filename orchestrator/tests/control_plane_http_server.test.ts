@@ -150,6 +150,7 @@ describe("control-plane HTTP: route parser", () => {
     expect(routeReason("/v1/runs/r1/revise-task", "POST")).toBe("ok:revise_task");
     expect(routeReason("/v1/runs/r1/respond", "POST")).toBe("ok:respond");
     expect(routeReason("/v1/runs/r1/events", "GET")).toBe("ok:events");
+    expect(routeReason("/v1/runs/r1/changes", "GET")).toBe("ok:project_changes");
   });
 
   test("method mismatches on known shapes are method_not_allowed", () => {
@@ -160,6 +161,7 @@ describe("control-plane HTTP: route parser", () => {
       ["/v1/runs/r1", "OPTIONS"],
       ["/v1/runs/r1/respond", "PUT"],
       ["/v1/runs/r1/events", "POST"],
+      ["/v1/runs/r1/changes", "POST"],
     ] as const) {
       expect(routeReason(path, method)).toBe("method_not_allowed");
     }
@@ -2164,5 +2166,239 @@ describe("control-plane HTTP: worker logs routes", () => {
     expect(response.body).toContain("data_base64");
     const listResponse = await get("/v1/runs/logs-run/logs");
     expect(listResponse.body).not.toContain(CANARY);
+  });
+});
+
+describe("control-plane HTTP: project changes route", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-changes-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const storeRoot = join(envRoot, "bindings");
+  const projectDir = join(envRoot, "project");
+  let registry: Awaited<ReturnType<typeof loadControlPlaneProjectRegistry>>;
+  const calls: unknown[] = [];
+  let nextResult: OrchestratorCallResult = {
+    ok: true,
+    projection: {
+      kind: "projectChanges",
+      schemaVersion: 1,
+      runId: "changes-run",
+      revision: 30,
+      observation: "a".repeat(64),
+      summary: {
+        total: 1, added: 1, deleted: 0, content_modified: 0, mode_modified: 0,
+        content_and_mode_modified: 0, symlink_target_modified: 0, type_changed: 0,
+        matches_baseline: 1, matches_result: 0, diverged: 0,
+      },
+      changes: [
+        { index: 1, path: "dogfood.txt", change: "added", source_relation: "matches_baseline", baseline: null, result: { kind: "regular_file", mode: 384, byte_count: 8, sha256: "b".repeat(64), multiple_links: false } },
+      ],
+      nextAfter: null,
+    },
+  };
+
+  beforeAll(async () => {
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    registry = await loadControlPlaneProjectRegistry(registryPath);
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "changes-run", projectId: "project-a" });
+    await store.claim({ runId: "gone-project-run", projectId: "project-removed" });
+  }, 20000);
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  const callHandler = async (path: string, method = "GET", headers: Record<string, string> = {}, body?: string): Promise<RawResponse> => {
+    const fakeClient = {
+      run: async (command: unknown): Promise<OrchestratorCallResult> => {
+        calls.push(command);
+        return nextResult;
+      },
+    } as unknown as OrchestratorSubprocessClient;
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: fakeClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+    };
+    const request = new Request(`http://127.0.0.1:4711${path}`, {
+      method,
+      headers: { host: "127.0.0.1:4711", ...headers },
+      ...(body === undefined ? {} : { body }),
+    });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    const headerEntries: Array<[string, string]> = [];
+    response.headers.forEach((value, key) => headerEntries.push([key, value]));
+    return { status: response.status, headers: Object.fromEntries(headerEntries), body: await response.text() };
+  };
+  const get = (path: string, headers: Record<string, string> = {}): Promise<RawResponse> => callHandler(path, "GET", headers);
+
+  test("a bound run serves the changes page with the exact snake_case schema and no run root", async () => {
+    calls.length = 0;
+    const response = await get("/v1/runs/changes-run/changes");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      "changes", "kind", "next_after", "observation", "revision", "run_id", "schema_version", "summary",
+    ]);
+    expect(body["kind"]).toBe("project_changes");
+    expect(body["schema_version"]).toBe(1);
+    expect(body["run_id"]).toBe("changes-run");
+    expect(body["next_after"]).toBeNull();
+    expect(response.body).not.toContain("run_root");
+    expect(response.headers["content-type"]).toBe("application/json");
+    expect(calls).toEqual([{ kind: "project_changes", runId: "changes-run", projectPath: projectDir }]);
+  });
+
+  test("the query scalars travel as typed command fields", async () => {
+    calls.length = 0;
+    await get("/v1/runs/changes-run/changes?after=4&limit=2&observation=" + "c".repeat(64));
+    expect(calls).toEqual([{ kind: "project_changes", runId: "changes-run", projectPath: projectDir, after: 4, limit: 2, observation: "c".repeat(64) }]);
+    calls.length = 0;
+    await get("/v1/runs/changes-run/changes?observation=" + "c".repeat(64) + "&after=4");
+    expect(calls).toEqual([{ kind: "project_changes", runId: "changes-run", projectPath: projectDir, after: 4, observation: "c".repeat(64) }]);
+    calls.length = 0;
+    await get("/v1/runs/changes-run/changes?after=0");
+    expect(calls).toEqual([{ kind: "project_changes", runId: "changes-run", projectPath: projectDir, after: 0 }]);
+  });
+
+  test("the query parser accepts only after, limit and observation with the exact grammar", async () => {
+    calls.length = 0;
+    for (const query of [
+      "?unknown=1",
+      "?after=1&after=2",
+      "?after",
+      "?after=",
+      "?after=-1",
+      "?after=1.5",
+      "?after=01",
+      "?after=1e3",
+      "?limit=0",
+      "?limit=201",
+      "?observation=ZZ",
+      "?observation=" + "a".repeat(63),
+      "?after=1%2F2",
+    ]) {
+      const response = await get(`/v1/runs/changes-run/changes${query}`);
+      expect(response.status).toBe(400);
+      expect(JSON.parse(response.body).reason).toBe("invalid_request");
+    }
+    expect(calls.length).toBe(0);
+  });
+
+  test("invalid_cursor is the request-layer 400 and stale_observation the request-layer 409", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "projectChangesFailure", exitCode: 1, runId: "changes-run", runRoot: "/secret/root", reason: "invalid_cursor" },
+    };
+    let response = await get("/v1/runs/changes-run/changes?after=999&observation=" + "c".repeat(64));
+    expect(response.status).toBe(400);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_cursor" });
+    expect(response.body).not.toContain("/secret/root");
+
+    nextResult = {
+      ok: true,
+      projection: { kind: "projectChangesFailure", exitCode: 1, runId: "changes-run", runRoot: "/secret/root", reason: "stale_observation" },
+    };
+    response = await get("/v1/runs/changes-run/changes?after=2&observation=" + "c".repeat(64));
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "stale_observation" });
+    expect(response.body).not.toContain("/secret/root");
+  });
+
+  test("every other changes failure follows the command-result precedent at HTTP 200", async () => {
+    for (const reason of ["changes_not_ready", "artifact_modified", "artifact_missing", "project_unstable", "workspace_unstable", "unsupported_project_entry", "run_not_found", "pipeline_mismatch", "internal_error"]) {
+      nextResult = {
+        ok: true,
+        projection: { kind: "projectChangesFailure", exitCode: 1, runId: "changes-run", runRoot: null, reason },
+      };
+      const response = await get("/v1/runs/changes-run/changes");
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        schema_version: 1,
+        kind: "command_result",
+        run_id: "changes-run",
+        outcome: "failed",
+        exit_code: 1,
+        reason,
+      });
+    }
+  });
+
+  test("an unbound CLI-created run fails closed before any subprocess", async () => {
+    calls.length = 0;
+    const response = await get("/v1/runs/unbound-run/changes");
+    expect(response.status).toBe(404);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_not_found" });
+    expect(calls).toEqual([]);
+  });
+
+  test("a removed registry project stays project_unavailable with the binding kept", async () => {
+    const response = await get("/v1/runs/gone-project-run/changes");
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "project_unavailable" });
+  });
+
+  test("the changes route accepts GET only and no body", async () => {
+    const post = await callHandler("/v1/runs/changes-run/changes", "POST", { "content-type": "application/json" }, "{}");
+    expect(post.status).toBe(405);
+    const withBody = await callHandler("/v1/runs/changes-run/changes", "GET", { "content-length": "5" }, "hello");
+    expect(withBody.status).toBe(400);
+  });
+
+  test("the loopback gates apply to the changes route unchanged", async () => {
+    const host = await get("/v1/runs/changes-run/changes", { host: "evil.example" });
+    expect(host.status).toBe(400);
+    expect(JSON.parse(host.body).reason).toBe("invalid_host");
+    const origin = await get("/v1/runs/changes-run/changes", { origin: "http://evil.example" });
+    expect(origin.status).toBe(400);
+    expect(JSON.parse(origin.body).reason).toBe("invalid_origin");
+    expect(calls.length).toBe(0);
+  });
+
+  test("the changes response never carries host paths, project paths or canaries", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "projectChanges",
+        schemaVersion: 1,
+        runId: "changes-run",
+        revision: 31,
+        observation: "d".repeat(64),
+        summary: { total: 1, added: 1, deleted: 0, content_modified: 0, mode_modified: 0, content_and_mode_modified: 0, symlink_target_modified: 0, type_changed: 0, matches_baseline: 1, matches_result: 0, diverged: 0 },
+        changes: [{ index: 1, path: `canary-${CANARY}.txt`, change: "added", source_relation: "matches_baseline", baseline: null, result: { kind: "regular_file", mode: 384, byte_count: 3, sha256: "e".repeat(64), multiple_links: false } }],
+        nextAfter: null,
+      },
+    };
+    const response = await get("/v1/runs/changes-run/changes");
+    expect(response.status).toBe(200);
+    expect(response.body).not.toContain(envRoot);
+    expect(response.body).not.toContain(projectDir);
+    expect(response.body).not.toContain("runRoot");
+    expect(response.body).not.toContain("projectRoot");
+    // the change path itself is data, not a host path: the projection is
+    // judged leak-free by the absence of every absolute path prefix
+    expect((response.body.match(/\//g) ?? []).length).toBe(0);
   });
 });

@@ -1329,6 +1329,9 @@ test("cumulative budget through the CLI: the unsafe request exits 1 without writ
     readTaskFile: (async () => {
       throw new Error("fake not configured");
     }) as unknown as CliIo["readTaskFile"],
+        projectChangesPipelineV2Run: (async () => {
+          throw new Error("fake not configured");
+        }) as unknown as CliIo["projectChangesPipelineV2Run"],
     writeStdout: (text: string) => {
       stdout.push(text);
     },

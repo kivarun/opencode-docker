@@ -419,6 +419,9 @@ function makeChain(stateRoot: string, resultBody: Record<string, unknown>, credF
     readTaskFile: (async () => {
       throw new Error("fake not configured");
     }) as unknown as CliIo["readTaskFile"],
+        projectChangesPipelineV2Run: (async () => {
+          throw new Error("fake not configured");
+        }) as unknown as CliIo["projectChangesPipelineV2Run"],
     writeStdout: () => {},
     writeError: () => {},
   };
@@ -642,6 +645,9 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
       readTaskFile: (async () => {
         throw new Error("fake not configured");
       }) as unknown as CliIo["readTaskFile"],
+          projectChangesPipelineV2Run: (async () => {
+            throw new Error("fake not configured");
+          }) as unknown as CliIo["projectChangesPipelineV2Run"],
       writeStdout: () => {},
       writeError: () => {},
     };

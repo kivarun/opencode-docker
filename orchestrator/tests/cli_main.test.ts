@@ -37,6 +37,10 @@ import {
 import {
   type PipelineV2LogsOutcome,
 } from "../src/pipeline_v2_logs.ts";
+import {
+  projectChangesPipelineV2Run,
+  type PipelineV2ProjectChangesOutcome,
+} from "../src/pipeline_v2_project_changes.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
@@ -124,6 +128,9 @@ function makeIo(): Recorder {
     logsPipelineV2Run: (async () => {
       throw new Error("fake logsPipelineV2Run not configured");
     }) as unknown as CliIo["logsPipelineV2Run"],
+    projectChangesPipelineV2Run: (async () => {
+      throw new Error("fake projectChangesPipelineV2Run not configured");
+    }) as unknown as CliIo["projectChangesPipelineV2Run"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake respondPipelineV2Wait not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -4045,4 +4052,110 @@ test("logs pending execution reports the status line and the failure line maps t
   expect(failureExit).toBe(1);
   expect(failureRec.err).toEqual(["orchestrator: logs failed (run run_x, reason artifact_modified)"]);
   expect(failureRec.out).toHaveLength(0);
+}, 15000);
+
+// --- project-changes dispatcher ------------------------------------------------
+
+function changesReport(overrides: Partial<Extract<PipelineV2ProjectChangesOutcome, { ok: true }>> = {}): PipelineV2ProjectChangesOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    runRoot: "/state/root/pipeline-runs/run_x",
+    revision: 12,
+    observation: "a".repeat(64),
+    summary: {
+      total: 2, added: 1, deleted: 0, content_modified: 1, mode_modified: 0,
+      content_and_mode_modified: 0, symlink_target_modified: 0, type_changed: 0,
+      matches_baseline: 1, matches_result: 1, diverged: 0,
+    },
+    changes: [
+      { index: 1, path: "dogfood.txt", change: "added", source_relation: "matches_baseline", baseline: null, result: { kind: "regular_file", mode: 448, byte_count: 8, sha256: "b".repeat(64), multiple_links: false } },
+      { index: 2, path: "README.md", change: "content_modified", source_relation: "matches_result", baseline: { kind: "regular_file", mode: 420, byte_count: 5, sha256: "c".repeat(64), multiple_links: false }, result: { kind: "regular_file", mode: 420, byte_count: 8, sha256: "b".repeat(64), multiple_links: false } },
+    ],
+    nextAfter: null,
+    ...overrides,
+  } as PipelineV2ProjectChangesOutcome;
+}
+
+test("project-changes dispatches exactly once with the parsed scalars and uses no runner", async () => {
+  const rec = makeIo();
+  const changesCalls: unknown[] = [];
+  rec.io.projectChangesPipelineV2Run = (async (options: unknown) => {
+    changesCalls.push(options);
+    return changesReport();
+  }) as unknown as CliIo["projectChangesPipelineV2Run"];
+  const exit = await runCli([
+    "project-changes", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/operator/project",
+    "--after", "2", "--limit", "9", "--observation", "a".repeat(64),
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(changesCalls).toHaveLength(1);
+  expect(changesCalls[0]).toEqual({
+    runId: "run_x",
+    stateRoot: "/state/root",
+    projectPath: "/operator/project",
+    after: 2,
+    limit: 9,
+    observation: "a".repeat(64),
+  });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: project-changes ok (run run_x, revision 12, changes 2, next-after none)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("project-changes reports the defaults, the next cursor and the failure line", async () => {
+  const rec = makeIo();
+  rec.io.projectChangesPipelineV2Run = (async () =>
+    changesReport({ nextAfter: 100 })) as unknown as CliIo["projectChangesPipelineV2Run"];
+  const exit = await runCli(["project-changes", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.err).toEqual(["orchestrator: project-changes ok (run run_x, revision 12, changes 2, next-after 100)"]);
+
+  const failureRec = makeIo();
+  failureRec.io.projectChangesPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    runRoot: null,
+    reason: "changes_not_ready",
+  })) as unknown as CliIo["projectChangesPipelineV2Run"];
+  const failureExit = await runCli(["project-changes", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p"], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: project-changes failed (run run_x, reason changes_not_ready)"]);
+  expect(failureRec.out).toHaveLength(0);
+}, 15000);
+
+test("project-changes JSON mode prints exactly one document and nothing else on stdout", async () => {
+  const rec = makeIo();
+  rec.io.projectChangesPipelineV2Run = (async () => changesReport()) as unknown as CliIo["projectChangesPipelineV2Run"];
+  const exit = await runCli(["project-changes", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p", "--json"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  expect(rec.out[0]?.endsWith("\n")).toBe(true);
+  const parsed = JSON.parse(rec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "changes", "exitCode", "nextAfter", "observation", "ok", "revision", "runId", "runRoot", "schemaVersion", "summary",
+  ]);
+  expect(parsed["schemaVersion"]).toBe(1);
+  expect("state" in parsed).toBe(false);
+  expect(rec.err).toHaveLength(0);
+}, 15000);
+
+test("project-changes resolver failure is exit 2 with the API never called", async () => {
+  const rec = makeIo();
+  rec.io.resolveStateRootProjection = () => {
+    throw new Error("no state root configured");
+  };
+  let called = 0;
+  rec.io.projectChangesPipelineV2Run = (async () => {
+    called += 1;
+    return changesReport();
+  }) as unknown as CliIo["projectChangesPipelineV2Run"];
+  const exit = await runCli(["project-changes", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p"], rec.io);
+  expect(exit).toBe(2);
+  expect(called).toBe(0);
+  expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
+  expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
 }, 15000);

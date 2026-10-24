@@ -313,10 +313,10 @@ orchestrator run \
   additionally verifies the initial workspace against the baseline; after
   a first activation the workspace is worker-mutable by contract and the
   manifest stays provenance, never a workspace invariant. **Run success
-  does not mean project delivery**: the manifest enables a future
-  read-only project change set (the next separate layer), the operator
-  project stays read-only, and no diff API, no Apply, and no read-write
-  authority over the operator project exist in this increment.
+  does not mean project delivery**: the durable baseline enables the
+  read-only project changes API (see "The read-only project changes API"
+  below), the operator project stays read-only, and no Apply and no
+  read-write authority over the operator project exist in this increment.
 - The pipeline's agent states select the profiles; the worker image, the
   OpenCode configuration, and the exact environment bindings belong to those
   profiles. The user never sets mounts, container paths, Session
@@ -671,6 +671,119 @@ consumes the same wire contract as the read-only lifecycle timeline
   stdout/stderr remain ephemeral and uncaptured, and durable log capture
   stays a separate future increment. The Browser UI timeline over the
   events feed is likewise a separate later increment.
+
+## The read-only project changes API (`orchestrator project-changes`, GET /v1/runs/:runId/changes)
+
+The durable schema-v10 project provenance is consumed by the versioned
+read-only project changes API: for one finalized pipeline v2 run it
+reports the **run workspace changes relative to the durable project
+baseline** — the observed current content of the final run workspace
+(`<run-root>/project`) compared against the provenance baseline and the
+observed current operator project. It is an observation, never an
+authorization: it does not claim the final workspace is a sealed
+worker-authored artifact (it is not sealed by an immutable artifact and
+remains technically reachable by a trusted host operator), and no
+`safe_to_apply` field exists — a future Apply increment must re-verify
+the operator project immediately before writing.
+
+- Single owner: `orchestrator/src/pipeline_v2_project_changes.ts` (public
+  facade) + `pipeline_v2_project_changes_internal.ts` (core). The whole
+  path is read-only: no run mutation lock, no Docker Helper/Launcher/
+  Session access, no temporary file, no write/chmod/repair on any path,
+  and a repeated read over unchanged trees is byte-identical. Reuse is
+  total: the shared read-only durable-run load chain, the shared
+  finalized-status predicate of the state module (running, plan-ready,
+  waiting, resumable and every terminal recovery window refuse
+  `changes_not_ready`; failed terminal runs are supported equally with
+  succeeded), the single provenance parser/digest/binding owner
+  (missing → `artifact_missing`; non-canonical/symlinked/wrong-mode/
+  conflicting → `artifact_modified`) and the provenance scanner's
+  read-only tree-observation IO seam — no second filesystem abstraction
+  and no second source scan of the copy traversal.
+- Tree observation: both trees are scanned read-only with root identity
+  fixation, leaf symlinks never dereferenced, bounded-chunk file reads
+  with kind/mode/identity/size/content-timestamp checks before and after
+  each read, every directory's entry set re-read after walking (a
+  replacement during the scan is the typed `workspace_unstable` /
+  `project_unstable` failure), FIFOs/sockets/devices typed
+  `unsupported_project_entry`, deterministic code-unit entry order, and
+  a missing/substituted/non-canonical operator root typed
+  `project_invalid`.
+- Change classification: the change paths are the union of the
+  workspace-baseline paths and the observed final workspace paths;
+  unchanged entries never appear and renames are never inferred (exactly
+  one `deleted` plus one `added`). The closed vocabulary is `added`,
+  `deleted`, `content_modified`, `mode_modified`,
+  `content_and_mode_modified`, `symlink_target_modified`,
+  `type_changed`. Regular files compare digest/byte_count (content)
+  and the final workspace mode against the workspace baseline mode
+  (mode); directories compare mode only (changed descendants alone
+  never change the directory); symlinks compare the verbatim target.
+  The copy normalization (source 0644 → workspace 0600, source 0755 →
+  workspace 0700, directory 0750 → 0700) is never a false change.
+- Intended result projection: the `baseline` node carries the provenance
+  source observation verbatim; the `result` node describes what a future
+  Apply would potentially produce. A `content_modified` result keeps the
+  original source mode; a mode-touched result projects the exact final
+  workspace mode; an added entry's result is the final workspace node; a
+  deleted entry's result is `null`. Hardlink metadata reuses the
+  schema-v10 semantics (`multiple_links` plus canonical 1-based
+  `hardlink_group` in sorted-path order; no host inodes); the API does
+  not promise a future Apply of hardlinks.
+- Source relation: every entry carries `matches_baseline` (the operator
+  object corresponds to the source observation), `matches_result` (it
+  already corresponds to the projected result, including absence for
+  `deleted`) or `diverged` (anything else, including an incompatible
+  ancestor) — computed against the full observed operator tree, read-only.
+- Observation identity: each full comparison carries an ephemeral
+  SHA-256 digest over the `pipeline-v2-project-changes-observation`
+  domain binding the API schema version, the run id, the durable
+  provenance binding, the terminal revision, the full observed final
+  workspace, the full observed current operator project and the full
+  ordered change set with its relations. It is never written to state,
+  never a durable revision and never permission to Apply; even an
+  unrelated operator change on an unchanged path moves it (the full
+  current-project observation is bound by design).
+- Pagination: `after` counts already viewed entries (default 0, first
+  page may omit the observation; `after > 0` requires the exact previous
+  observation, a mismatch is `stale_observation` with no partial page;
+  `after > total` is `invalid_cursor`; `after == total` is an empty page
+  with `next_after: null`). Default limit 100, maximum 200; the summary
+  counts cover the whole comparison, not the page.
+- CLI: `orchestrator project-changes --run-id SAFE_ID --config-root ABS
+  --project ABS [--after N] [--limit N] [--observation SHA256] [--json]`.
+  `--project` is the trusted operator surface (clean absolute path; the
+  caller never passes a run root or provenance path); the strict parser
+  rejects duplicates, unknowns and positionals with exit 2 and empty
+  stdout. Success prints exactly one JSON document
+  `{ok, exitCode: 0, schemaVersion: 1, runId, runRoot, revision,
+  observation, summary, changes, nextAfter}` — the `runRoot` exists only
+  in the trusted CLI document; failures carry the established
+  `{ok: false, exitCode: 1, runId, runRoot: string|null, reason}`
+  envelope over the closed 14-reason vocabulary, classified by typed
+  causes only with no path/target/payload/credential in any failure
+  document.
+- HTTP: `GET /v1/runs/:runId/changes[?after=N&limit=N&observation=HEX]`
+  flows `runId → durable binding → frozen registry project → subprocess
+  client`; the HTTP caller can never pass a project path, config root or
+  artifact path. The success body is exactly
+  `{schema_version: 1, kind: "project_changes", run_id, revision,
+  observation, summary, changes, next_after}` (snake_case, no
+  `run_root`); `invalid_cursor` maps to the request-layer 400 envelope
+  and `stale_observation` to 409, every other correctly received failure
+  (including `changes_not_ready` and the provenance-integrity refusals)
+  follows the failed command result at HTTP 200, transport failures stay
+  502, `binding_not_found` is 404 and a removed project stays
+  `project_unavailable` (409). Host/Origin/GET-only/no-body gates are
+  unchanged.
+- Browser UI: not wired. `parseApiDocument` rejects
+  `kind: "project_changes"` and the UI knows nothing about the endpoint
+  or the change vocabulary — the Changes tab is a separate future
+  increment.
+- Still unwired: Apply, any write to the operator project, RW project
+  mounts, project-level locking, automatic application, content
+  diff/payload download, final-workspace durable sealing, and any state
+  schema change.
 
 ## The production continue-stage runner API (`orchestrator continue-stage`)
 

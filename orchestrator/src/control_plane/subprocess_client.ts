@@ -196,6 +196,32 @@ export type OrchestratorLogsProjection =
       readonly reason: string;
     };
 
+/**
+ * The projected result of one `project_changes` call: the exact
+ * schemaVersion-1 changes projection (the summary and the change entries
+ * pass through as opaque frozen JSON — the client never re-classifies a
+ * change; the raw `runRoot` is dropped before the HTTP layer), or the
+ * typed changes failure outcome of the CLI itself.
+ */
+export type OrchestratorProjectChangesProjection =
+  | {
+      readonly kind: "projectChanges";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly observation: string;
+      readonly summary: OrchestratorJsonObject;
+      readonly changes: readonly OrchestratorJsonValue[];
+      readonly nextAfter: number | null;
+    }
+  | {
+      readonly kind: "projectChangesFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly runRoot: string | null;
+      readonly reason: string;
+    };
+
 /** A transport failure: not a durable run outcome, no stderr or body contents. */
 export interface OrchestratorTransportFailure {
   readonly reason: OrchestratorTransportReason;
@@ -217,7 +243,8 @@ export type OrchestratorCallResult =
         | OrchestratorRunProjection
         | OrchestratorInspectProjection
         | OrchestratorEventsProjection
-        | OrchestratorLogsProjection;
+        | OrchestratorLogsProjection
+        | OrchestratorProjectChangesProjection;
     }
   | { readonly ok: false; readonly failure: OrchestratorTransportFailure };
 
@@ -356,6 +383,19 @@ const EVENTS_REPORT_KEYS = [
   "schemaVersion",
 ] as const;
 const EVENTS_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+const CHANGES_REPORT_KEYS = [
+  "changes",
+  "exitCode",
+  "nextAfter",
+  "observation",
+  "ok",
+  "revision",
+  "runId",
+  "runRoot",
+  "schemaVersion",
+  "summary",
+] as const;
+const CHANGES_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
 const LOGS_LIST_KEYS = [
   "exitCode",
   "logs",
@@ -597,6 +637,92 @@ function parseOutcomeDocument(
           runId,
           revision: parsed["revision"] as number,
           events: deepFreezeValue(parsed["events"] as OrchestratorJsonValue[]),
+          nextAfter: nextAfterValue as number | null,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "project_changes") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, CHANGES_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const runRootValue = parsed["runRoot"];
+        if (runRootValue !== null && typeof runRootValue !== "string") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes failure runRoot must be a string or null");
+        }
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "projectChangesFailure",
+            exitCode: 1,
+            runId,
+            runRoot: runRootValue as string | null,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, CHANGES_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "project-changes projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      expectStringField(parsed, "runRoot");
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes revision must be a positive safe integer");
+      }
+      const observation = parsed["observation"];
+      if (typeof observation !== "string" || !/^[0-9a-f]{64}$/.test(observation)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes observation must be a 64-character lowercase hexadecimal digest");
+      }
+      if (!isRecord(parsed["summary"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes summary must be an object");
+      }
+      if (!Array.isArray(parsed["changes"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes changes must be an array");
+      }
+      const nextAfterValue = parsed["nextAfter"];
+      if (
+        nextAfterValue !== null &&
+        (typeof nextAfterValue !== "number" || !Number.isSafeInteger(nextAfterValue) || nextAfterValue < 0)
+      ) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-changes nextAfter must be a non-negative safe integer or null");
+      }
+      // The raw run root never reaches the HTTP layer: the projection
+      // carries the run identity, the observation identity and the page
+      // only.
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "projectChanges",
+          schemaVersion: 1,
+          runId,
+          revision: parsed["revision"] as number,
+          observation,
+          summary: parsed["summary"] as OrchestratorJsonObject,
+          changes: deepFreezeValue(parsed["changes"] as OrchestratorJsonValue[]),
           nextAfter: nextAfterValue as number | null,
         }),
       };

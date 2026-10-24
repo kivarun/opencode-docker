@@ -47,6 +47,14 @@ export type OrchestratorCommand =
     }
   | { readonly kind: "inspect"; readonly runId: string }
   | {
+      readonly kind: "project_changes";
+      readonly runId: string;
+      readonly projectPath: string;
+      readonly after?: number;
+      readonly limit?: number;
+      readonly observation?: string;
+    }
+  | {
       readonly kind: "events";
       readonly runId: string;
       readonly after?: number;
@@ -161,6 +169,7 @@ interface CapturedCommand {
   readonly limit: number | null;
   readonly executionIndex: number | null;
   readonly offset: number | null;
+  readonly observation: string | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -195,6 +204,14 @@ function expectCleanPathField(record: Record<string, unknown>, key: string, what
   const value = record[key];
   if (!isCleanAbsolutePath(value)) {
     throw new OrchestratorSubprocessClientError("invalid_command", `${what} must be a clean absolute path`);
+  }
+  return value;
+}
+
+function expectObservationDigestField(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new OrchestratorSubprocessClientError("invalid_command", `${key} must be a 64-character lowercase hexadecimal digest`);
   }
   return value;
 }
@@ -270,6 +287,7 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
     executionIndex: null,
     offset: null,
     limit: null,
+    observation: null,
   };
   switch (kind) {
     case "run": {
@@ -316,6 +334,33 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
         throw new OrchestratorSubprocessClientError("invalid_command", "missing field runId on inspect command");
       }
       return { ...empty, kind, runId: expectSafeIdField(command, "runId", "runId") };
+    }
+    case "project_changes": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "projectPath" && key !== "after" && key !== "limit" && key !== "observation") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on project_changes command");
+        }
+      }
+      for (const key of ["runId", "projectPath"] as const) {
+        if (!Object.hasOwn(command, key)) {
+          throw new OrchestratorSubprocessClientError("invalid_command", `missing field ${key} on project_changes command`);
+        }
+      }
+      const afterField = optionalField(command, "after");
+      const after = afterField.present ? expectNonNegativeIntegerField({ after: afterField.value }, "after", "after") : null;
+      const limitField = optionalField(command, "limit");
+      const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
+      const observationField = optionalField(command, "observation");
+      const observation = observationField.present ? expectObservationDigestField({ observation: observationField.value }, "observation") : null;
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        projectPath: expectCleanPathField(command, "projectPath", "projectPath"),
+        after,
+        limit,
+        observation,
+      };
     }
     case "events": {
       for (const key of Object.keys(command)) {
@@ -485,7 +530,9 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
         ? "continue-stage"
         : captured.kind === "revise_task"
           ? "revise-task"
-          : captured.kind;
+          : captured.kind === "project_changes"
+            ? "project-changes"
+            : captured.kind;
   const argv: string[] = [cliKind];
   switch (captured.kind) {
     case "run": {
@@ -502,6 +549,19 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
     }
     case "inspect":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
+      break;
+    case "project_changes":
+      argv.push(
+        "--run-id",
+        captured.runId,
+        "--config-root",
+        routingConfig.configRoot,
+        "--project",
+        captured.projectPath,
+      );
+      if (captured.after !== null) argv.push("--after", String(captured.after));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
+      if (captured.observation !== null) argv.push("--observation", captured.observation);
       break;
     case "events":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);

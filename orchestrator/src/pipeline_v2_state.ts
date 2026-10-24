@@ -162,6 +162,26 @@ export const PIPELINE_V2_RUN_STATUSES = [
 ] as const;
 export type PipelineV2RunStatus = (typeof PIPELINE_V2_RUN_STATUSES)[number];
 
+/**
+ * The finalized run statuses: the run has reached its immutable terminal
+ * lifecycle and no further mutation command is accepted. The single shared
+ * owner of the finalized predicate; read-only projections classify against
+ * this vocabulary instead of copying a status ladder.
+ */
+export const PIPELINE_V2_FINALIZED_RUN_STATUSES = [
+  "success",
+  "failed",
+  "cleanup_failed",
+] as const;
+export type PipelineV2FinalizedRunStatus = (typeof PIPELINE_V2_FINALIZED_RUN_STATUSES)[number];
+
+export function isPipelineV2FinalizedRunStatus(value: unknown): value is PipelineV2FinalizedRunStatus {
+  return (
+    typeof value === "string" &&
+    (PIPELINE_V2_FINALIZED_RUN_STATUSES as readonly string[]).includes(value)
+  );
+}
+
 export const PIPELINE_V2_RUN_PHASES = ["running", "waiting", "publishing_outputs", "finished"] as const;
 export type PipelineV2RunPhase = (typeof PIPELINE_V2_RUN_PHASES)[number];
 

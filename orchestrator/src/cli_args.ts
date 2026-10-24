@@ -1,6 +1,7 @@
 import type { AgentSmokeOptions } from "./agent_smoke.ts";
 import type { RunInputBinding } from "./pipeline_v2_runtime.ts";
 import { expectSafeId } from "./pipeline_v2_state.ts";
+import { isCleanAbsolutePath } from "./clean_path.ts";
 import { DEFAULT_WORKER_IMAGE } from "./worker.ts";
 
 export const DEFAULT_PIPELINE_ROOT = "/opt/orchestrator/pipelines/default";
@@ -109,6 +110,17 @@ export interface ParsedPipelineEventsArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineProjectChangesArgs {
+  readonly kind: "project-changes";
+  readonly runId: string;
+  readonly configRoot: string;
+  readonly project: string;
+  readonly after: number;
+  readonly limit: number;
+  readonly observation: string | null;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
@@ -120,7 +132,8 @@ export type ParsedCommand =
   | ParsedPipelineResumePlanArgs
   | ParsedPipelineInspectArgs
   | ParsedPipelineEventsArgs
-  | ParsedPipelineLogsArgs;
+  | ParsedPipelineLogsArgs
+  | ParsedPipelineProjectChangesArgs;
 
 export function usage(): string {
   return [
@@ -157,6 +170,12 @@ export function usage(): string {
     "               public logs schema 1 with bounded base64 content chunks -",
     "               no worker, no Launcher credential, no mutation lock and",
     "               no durable change",
+    "  project-changes read-only versioned run workspace changes of one finalized",
+    "               durable run relative to its durable project provenance",
+    "               baseline and the observed current operator project: an",
+    "               observation with an ephemeral read snapshot identity -",
+    "               no worker, no Launcher credential, no mutation lock, no",
+    "               durable change and no write to the operator project",
     "  respond      production pipeline v2 wait response: record the user's answer to",
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
@@ -498,6 +517,39 @@ export function usage(): string {
   "  this read-only chain (no mutation lock, no Docker Helper involvement,",
   "  no Launcher credential and no durable change), and no log content",
   "  reaches headers, errors, state, events, inspect or discovery.",
+  "",
+  "project-changes flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID        the run id of the durable run to read; required",
+  "  --config-root PATH      non-empty absolute configuration root; required by the",
+  "                          shared command grammar but not used by project-changes",
+  "                          (no profile is loaded, no Launcher credential is read)",
+  "  --project PATH          clean absolute path of the current operator project;",
+  "                          required; observed read-only and never written by",
+  "                          this command",
+  "  [--after N]             exclusive entry cursor (default 0); a cursor beyond",
+  "                          the total change set is 'invalid_cursor'",
+  "  [--limit N]             maximum entries per page (default 100, maximum 200)",
+  "  [--observation SHA256]  the 64-hex observation identity of a previous page;",
+  "                           required with --after > 0; a recomputed digest that",
+  "                          differs is 'stale_observation' (no partial page)",
+  "  --json                  print exactly one JSON versioned changes document on",
+  "                          stdout; errors and diagnostics go to stderr; the exit",
+  "                          code is 1 only when the changes read itself could not",
+  "                          be performed, never because of the run's own state.",
+  "",
+  "  project-changes compares the observed current content of the final run",
+  "  workspace (<run-root>/project) against the durable schema-v10 project",
+  "  provenance baseline and the observed current operator project. The",
+  "  result is 'run workspace changes relative to the durable project",
+  "  baseline': an ordered change set (added / deleted / content_modified /",
+  "  mode_modified / content_and_mode_modified / symlink_target_modified /",
+  "  type_changed) with a source relation per entry (matches_baseline /",
+  "  matches_result / diverged). The observation digest is an ephemeral",
+  "  read snapshot identity, never durable state and never permission to",
+  "  apply anything: this command writes nothing anywhere, the operator",
+  "  project stays read-only, and run success does not mean project",
+  "  delivery. Only finalized terminal runs carry a comparable workspace;",
+  "  every other boundary refuses as 'changes_not_ready'.",
   "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
@@ -1068,8 +1120,167 @@ function parseLogsArgs(argv: string[]): ParsedPipelineLogsArgs {
   };
 }
 
+function parseProjectChangesArgs(argv: string[]): ParsedPipelineProjectChangesArgs {
+  let runId: string | null = null;
+  let configRoot: string | null = null;
+  let project: string | null = null;
+  let after: number | null = null;
+  let limit: number | null = null;
+  let observation: string | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      const { value, next } = parseValue(argv, i, "--project");
+      requireSingleton(project, "--project");
+      project = requireAbsolute(value, "--project");
+      if (!isCleanAbsolutePath(project)) {
+        throw new Error("--project must be a clean absolute path");
+      }
+      i = next;
+    } else if (arg === "--after" || arg.startsWith("--after=")) {
+      const { value, next } = parseValue(argv, i, "--after");
+      requireSingleton(after, "--after");
+      after = parseNonNegativeDecimalSafeInteger(value, "--after");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > 200) {
+        throw new Error("--limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--observation" || arg.startsWith("--observation=")) {
+      const { value, next } = parseValue(argv, i, "--observation");
+      requireSingleton(observation, "--observation");
+      if (!/^[0-9a-f]{64}$/.test(value)) {
+        throw new Error("--observation must be a 64-character lowercase hexadecimal digest");
+      }
+      observation = value;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      throw new Error(
+        "project-changes does not accept --launcher-id; it performs no Launcher authentication",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "project-changes does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error("project-changes does not accept --input; the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error("project-changes does not accept --workspace; no worker is launched by project-changes");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("project-changes does not accept --image; no worker is launched by project-changes");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error("project-changes does not accept --profile; no profile is loaded by project-changes");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("project-changes does not accept --task; there is no task input on a changes read");
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      throw new Error(
+        "project-changes does not accept --stage-id; stage selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      throw new Error(
+        "project-changes does not accept --initial-budget; budget selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      throw new Error(
+        "project-changes does not accept --wait-index; wait selection belongs to the response and intervention commands",
+      );
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "project-changes does not accept --action; it changes nothing and records no response",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "project-changes does not accept --additional-iterations; grants belong to 'continue-stage'",
+      );
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      throw new Error("project-changes does not accept --task-id; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      throw new Error("project-changes does not accept --task-file; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error("project-changes does not accept --task-body; task revisions belong to 'revise-task'");
+    } else if (arg === "--execution-index" || arg.startsWith("--execution-index=")) {
+      throw new Error("project-changes does not accept --execution-index; the log cursor belongs to 'logs'");
+    } else if (arg === "--offset" || arg.startsWith("--offset=")) {
+      throw new Error("project-changes does not accept --offset; the log cursor belongs to 'logs'");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "project-changes does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "project-changes does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for project-changes");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for project-changes");
+  }
+  if (project === null) {
+    throw new Error("--project ABS is required for project-changes");
+  }
+  return {
+    kind: "project-changes",
+    runId,
+    configRoot,
+    project,
+    after: after ?? 0,
+    limit: limit ?? 100,
+    observation,
+    json,
+  };
+}
+
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs" | "project-changes",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -1098,6 +1309,9 @@ export function parseCommand(
   }
   if (kind === "logs") {
     return parseLogsArgs(argv);
+  }
+  if (kind === "project-changes") {
+    return parseProjectChangesArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;
