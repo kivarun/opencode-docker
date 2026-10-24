@@ -48,6 +48,8 @@ import type { PipelineV2WorkerLogState } from "../src/pipeline_v2_state.ts";
 import { parseWorkerLogArtifact } from "../src/pipeline_v2_worker_log.ts";
 import { publishPipelineV2WorkerLog } from "../src/pipeline_v2_worker_log_store.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Production recovery of the loader-valid post-commit crash windows
  * through the existing `resumePipelineV2Run` entrypoint. Every window is
@@ -671,7 +673,7 @@ async function readDurableState(harness: Harness): Promise<PipelineV2RunState> {
 // --- prefix builders (real reducer, real data plane) ------------------------
 
 async function prefixCreateRun(harness: Harness): Promise<RunInputsSnapshot> {
-  await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot);
+  const preparedProjectBinding026 = (await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     harness.pipeline,
     bindingsFor(harness.dirs, harness.pipeline) as readonly RunInputBinding[],
@@ -687,6 +689,7 @@ async function prefixCreateRun(harness: Harness): Promise<RunInputsSnapshot> {
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding026,
   });
   return runInputs;
 }

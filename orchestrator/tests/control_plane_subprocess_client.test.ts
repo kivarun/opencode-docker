@@ -29,7 +29,6 @@ function clientConfig(overrides: Partial<OrchestratorSubprocessClientConfig> = {
   };
 }
 
-
 async function waitEchoReady(echoPath: string): Promise<void> {
   for (let i = 0; i < 100 && !existsSync(echoPath); i += 1) {
     await Bun.sleep(50);

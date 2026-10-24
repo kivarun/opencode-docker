@@ -1125,7 +1125,6 @@ describe("control-plane HTTP: production entrypoint", () => {
   );
 });
 
-
 describe("control-plane HTTP: listen address contract", () => {
   const envRoot = mkdtempSync(join(tmpdir(), `cp-http-listen-${CANARY}-`));
   const registryPath = join(envRoot, "registry.json");
@@ -1353,7 +1352,6 @@ describe("control-plane HTTP: listen address contract", () => {
     60000,
   );
 });
-
 
 describe("control-plane HTTP: discovery (projects and bound runs)", () => {
   const envRoot = mkdtempSync(join(tmpdir(), `cp-http-discovery-${CANARY}-`));

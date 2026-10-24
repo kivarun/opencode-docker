@@ -48,6 +48,8 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 type StageWaitPolicy = { readonly reason: string; readonly actions: readonly string[] };
 
 const FULL_POLICY: StageWaitPolicy = { reason: "stage_iteration_completed", actions: ["continue_stage", "revise_task"] };
@@ -445,7 +447,7 @@ async function prefixStageEntry(
   const pipeline = await loadPipelineV2(harness.bundle);
   const raw = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId, now: nextTick });
   const recording = new RecordingSink(raw);
-  await prepareRunProject(harness.projectSource, harness.runRoot);
+  const preparedProjectBinding018 = (await prepareRunProject(harness.projectSource, harness.runRoot)).binding;
   const runInputs = await snapshotRunInputs(pipeline, await bindingsFor(harness, "cycle"), harness.runRoot);
   await recording.dispatch({
     kind: "create_run",
@@ -457,6 +459,7 @@ async function prefixStageEntry(
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding018,
   });
   await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, proposal);
   const { acceptPipelineV2PlanningRunPlan } = await import("../src/pipeline_v2_planning_run_plan_controller.ts");

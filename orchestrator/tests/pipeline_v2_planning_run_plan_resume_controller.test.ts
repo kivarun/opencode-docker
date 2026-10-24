@@ -61,6 +61,8 @@ import {
   type PipelineV2PlanningRunPlanResumeOps,
 } from "../src/pipeline_v2_planning_run_plan_resume_controller_internal.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Tests for the production composition controller
  * `resumePipelineV2RunAfterPlanningRunPlanHandoff`: the completed
@@ -390,14 +392,14 @@ async function buildTwoCyclePrefix(): Promise<PrefixCoordinates> {
     clockCounter = 0;
     const sink1 = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
     const recording1 = recordingSink(sink1);
-    await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+    const preparedProjectBinding024 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
     const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
     await recording1.dispatch({
       kind: "create_run",
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    });
+   projectProvenance: preparedProjectBinding024 });
     let accepted: AcceptedStateOutput[] = [];
     accepted = await runPlanningActivation(pipeline1, runInputs, accepted, recording1, "architect", "architect", "plan", 1, P1_PROPOSAL, "planning-1");
     const accepted1 = await acceptPipelineV2PlanningRunPlan({ pipeline: pipeline1, runRoot: fixture.runRoot, sink: recording1 });
@@ -1680,13 +1682,14 @@ async function buildInitialReadyPrefix(): Promise<PrefixCoordinates> {
   clockCounter = 0;
   const sink1 = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
   const recording1 = recordingSink(sink1);
-  await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+  const preparedProjectBinding025 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
   const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
   await recording1.dispatch({
     kind: "create_run",
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(pipeline1),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+    projectProvenance: preparedProjectBinding025,
   });
   await runPlanningActivation(pipeline1, runInputs, [], recording1, "architect", "architect", "plan", 1, P1_PROPOSAL, "planning-1");
   return { fixture, runId: RUN_ID };

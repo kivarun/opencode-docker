@@ -57,6 +57,8 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 type StageWaitPolicy = { readonly reason: string; readonly actions: readonly string[] };
 
 function pipelineYaml(plannerWait: StageWaitPolicy, shape: "cycle" | "terminal" | "control" = "cycle"): string {
@@ -460,7 +462,7 @@ async function prefixStageEntry(
   const pipeline = await loadPipelineV2(harness.bundle);
   const raw = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId, now: nextTick });
   const recording = new RecordingSink(raw);
-  await prepareRunProject(harness.projectSource, harness.runRoot);
+  const preparedProjectBinding036 = (await prepareRunProject(harness.projectSource, harness.runRoot)).binding;
   const runInputs = await snapshotRunInputs(pipeline, await bindingsFor(harness, shape), harness.runRoot);
   await recording.dispatch({
     kind: "create_run",
@@ -472,6 +474,7 @@ async function prefixStageEntry(
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding036,
   });
   await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, proposal);
   const acceptedPlan = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot: harness.runRoot, sink: recording as never });
@@ -1381,7 +1384,7 @@ async function runnerPrefixStageEntry(harness: RunnerHarness, runId: string): Pr
   clockValue = 0;
   const pipeline = await loadPipelineV2(harness.bundle);
   const sink = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId, now: nextTick });
-  await prepareRunProject(harness.projectSource, harness.runRoot);
+  const preparedProjectBinding037 = (await prepareRunProject(harness.projectSource, harness.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     pipeline,
     [{ id: "task", path: join(harness.sources, "task.md") }] as readonly RunInputBinding[],
@@ -1397,6 +1400,7 @@ async function runnerPrefixStageEntry(harness: RunnerHarness, runId: string): Pr
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding037,
   });
   const activation: PreparedActivationData = await prepareActivationData(pipeline, runInputs, [], "architect", 1);
   await sink.dispatch({

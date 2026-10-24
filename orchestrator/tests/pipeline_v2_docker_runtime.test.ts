@@ -420,7 +420,6 @@ const CODER_RUN_BODY = {
   helper_socket: true,
 };
 
-
 /** The frozen capture a fixture worker operation leaves behind. */
 function expectCaptureCaptured(result: unknown): void {
   const capture = (result as { capture?: { status?: string } }).capture;
@@ -939,7 +938,6 @@ test("17. forged, cross-runtime and cross-activation tool handles are rejected b
     await dispose(setup_);
   }
 });
-
 
 test("18. a repeated runAgent is rejected before any CLI call", async () => {
   const setup_ = await setup();

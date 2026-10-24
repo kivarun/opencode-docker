@@ -41,6 +41,8 @@ import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { createHash } from "node:crypto";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Production runner resume tests for pipeline schema version 2:
  * `resumePipelineV2` over the real v2 loader, real profiles, the shared
@@ -442,7 +444,7 @@ async function buildPrefix(
   const runRoot = harness.runRoot(runId);
   await mkdir(join(harness.stateRoot, "pipeline-runs"), { mode: 0o700 });
   await mkdir(runRoot, { mode: 0o700 });
-  await prepareRunProject(harness.projectSource, runRoot);
+  const preparedProjectBinding034 = (await prepareRunProject(harness.projectSource, runRoot)).binding;
   const bindings = pipeline.inputs.map((input) => {
     if (input.id === "facts_seed") {
       return { id: input.id, path: harness.factsFile };
@@ -461,6 +463,7 @@ async function buildPrefix(
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding034,
   });
   return { pipeline, runId, runRoot, sink, runInputs, accepted: [] };
 }
@@ -1650,3 +1653,57 @@ test("22. the runner finalizes the durable publication with only the run status 
   const durable = parsePipelineV2RunState(await readFile(pipelineV2RunStatePath(harness.stateRoot, runId), "utf8"));
   expect(durable.status).toBe("success");
 }, 15000);
+
+// --- project provenance verification on the resume path (schema v10) -------
+
+test("23. a tampered provenance manifest refuses the resume with zero effects (C7)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION);
+  const pipeline = await loadPipelineV2(harness.bundle);
+  const runId = "resume-tamper";
+  await buildPrefix(harness, pipeline, runId);
+  const manifestPath = join(harness.runRoot(runId), "project-provenance.json");
+  const original = await readFile(manifestPath, "utf8");
+  const tampered = original.replace('"regular_file"', '"regular_filf"');
+  await rm(manifestPath);
+  await writeFile(manifestPath, tampered, { mode: 0o600 });
+  const captured = await runResume(harness, runId, { workerOutputs: { coder: { report: '{"ok":true}' } } });
+  const outcome = captured.outcome;
+  expect(outcome?.ok).toBe(false);
+  expect(outcome?.exitCode).toBe(1);
+  expect(outcome && "reason" in outcome ? outcome.reason : "").toBe("artifact_modified");
+  // zero sessions, zero durable writes, the tampered artifact untouched
+  expect(createCount(captured)).toBe(0);
+  expect(await readFile(manifestPath, "utf8")).toBe(tampered);
+});
+
+test("24. a missing provenance manifest refuses the resume as a missing artifact (C7)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION);
+  const pipeline = await loadPipelineV2(harness.bundle);
+  const runId = "resume-missing";
+  await buildPrefix(harness, pipeline, runId);
+  await rm(join(harness.runRoot(runId), "project-provenance.json"));
+  const captured = await runResume(harness, runId, { workerOutputs: { coder: { report: '{"ok":true}' } } });
+  const outcome = captured.outcome;
+  expect(outcome?.ok).toBe(false);
+  expect(outcome && "reason" in outcome ? outcome.reason : "").toBe("artifact_missing");
+  expect(createCount(captured)).toBe(0);
+});
+
+test("25. a worker-mutated workspace does not refuse the resume once an activation exists (C6)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION);
+  const pipeline = await loadPipelineV2(harness.bundle);
+  const runId = "resume-mutated";
+  const prefix = await buildPrefix(harness, pipeline, runId);
+  await prefixAgentStep(prefix, "coder", 1, { report: '{"ok":true}' });
+  // The worker mutated the run workspace after the first activation.
+  await writeFile(join(harness.runRoot(runId), "project", "worker-added.txt"), "worker output\n", { mode: 0o600 });
+  const captured = await runResume(harness, runId, {
+    workerOutputs: { check: { report: JSON.stringify({ f1: false }) } },
+  });
+  const outcome = captured.outcome;
+  expect(outcome?.ok).toBe(true);
+  expect(outcome?.state?.status).toBe("success");
+  // the manifest artifact stays byte-identical to the initial baseline
+  const manifest = JSON.parse(await readFile(join(harness.runRoot(runId), "project-provenance.json"), "utf8")) as { entries: { path: string }[] };
+  expect(manifest.entries.map((entry) => entry.path)).toEqual(["seed.md"]);
+});

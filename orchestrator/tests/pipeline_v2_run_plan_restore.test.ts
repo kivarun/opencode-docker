@@ -57,6 +57,8 @@ import {
   type PipelineV2RunPlanRestoreOps,
 } from "../src/pipeline_v2_run_plan_restore_internal.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "restore-run";
 const PROTECTED_DIGEST = "a".repeat(64);
 const CANARY_BODY = "CANARY_secret_body_value";
@@ -349,6 +351,7 @@ async function setupRevisionOne(options: RevisionOneOptions = {}): Promise<Fixtu
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
     inputs: inputs.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   await playPlanningExecution(harness.recording);
   const taskA1 = taskA1Prepared();
@@ -433,6 +436,7 @@ async function setupRevisionTwo(options: RevisionTwoOptions = {}): Promise<Revis
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
     inputs: BASE_INPUTS.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   await playPlanningExecution(harness.recording);
   const taskA1 = taskA1Prepared();
@@ -838,7 +842,7 @@ async function forgeFreshState(
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline),
       inputs: BASE_INPUTS.map((input) => ({ ...input })),
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     for (let index = 0; index < planningExecutions; index += 1) {
       await playPlanningExecution(recording);
     }
@@ -1606,7 +1610,7 @@ test("11. the bridge: the durable ledger and manifests restore the compiled plan
   const harness = await setupHarness(RESTORE_PIPELINE);
   try {
     // real run: project copy, protected input snapshot, create_run
-    await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot);
+    const preparedProjectBinding031 = (await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot)).binding;
     const runInputs = await snapshotRunInputs(harness.pipeline, [{ id: "task", path: join(harness.dirs.sources, "task.md") }], harness.dirs.runRoot);
     const protectedInput = runInputs.inputs[0];
     if (protectedInput === undefined) {
@@ -1622,7 +1626,7 @@ test("11. the bridge: the durable ledger and manifests restore the compiled plan
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding031 });
 
     // real planning execution and real plan r1 acceptance
     const accepted: AcceptedStateOutput[] = [];

@@ -16,6 +16,8 @@ import {
   validatePipelineV2RunState,
 } from "../src/pipeline_v2_state.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const CONFIG_SCHEMA = {
   type: "object",
   required: ["stage"],
@@ -239,7 +241,6 @@ states:
       result: failed
 
 `;
-
 
 const GATE_MODEL_YAML = `schema_version: 1
 facts:
@@ -656,7 +657,7 @@ test("create_run accepts the built identity and the state survives the loader ro
     }));
     const state = reducePipelineV2RunCommand(
       null,
-      { kind: "create_run", runId: "digest-run", pipeline: identity, inputs },
+      { kind: "create_run", runId: "digest-run", pipeline: identity, inputs, projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       new Date(0),
     );
     expect(state.revision).toBe(1);

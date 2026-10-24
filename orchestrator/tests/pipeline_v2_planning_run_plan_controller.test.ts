@@ -42,6 +42,8 @@ import { verifyPipelineV2RunPlanCandidateForAcceptance } from "../src/pipeline_v
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
 import { PipelineV2RunPlanControllerError } from "../src/pipeline_v2_run_plan_controller_internal.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "planning-run";
 
 const hex = (char: string): string => char.repeat(64);
@@ -344,7 +346,7 @@ async function setupPlanningPrefix(
   resetClock();
   const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: RUN_ID, now: nextTick });
   const recording = new RecordingSink(sink);
-  await prepareRunProject(dirs.projectSource, dirs.runRoot);
+  const preparedProjectBinding019 = (await prepareRunProject(dirs.projectSource, dirs.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     pipeline,
     [{ id: "task", path: join(dirs.sources, "task.txt") }],
@@ -360,6 +362,7 @@ async function setupPlanningPrefix(
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding019,
   });
   const records = await playPlanningExecution(recording, pipeline, runInputs, {
     stateId: "architect",

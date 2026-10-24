@@ -161,7 +161,7 @@ const ghostRun = `wl-ghost-${suffix}`;
 // boundary is `in_flight`; the read-only viewer serves both executions.
 const MAIN_CAPTURE_PAYLOAD = new TextEncoder().encode("captured-output\0with\x1b[31mcontrol\x1b[0m-bytes");
 const MAIN_COMMANDS = [
-  { kind: "create_run", inputs: [], outputs: [] },
+  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const } },
   { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
   { kind: "agent_data_prepared" },
   { kind: "agent_execution_session_created", sessionId: `sess-${suffix}-1` },
@@ -186,7 +186,7 @@ const MAIN_COMMANDS = [
 // the truncated tail loads through the same explicit flow.
 const FAILED_PAYLOAD = new TextEncoder().encode("truncated-tail");
 const FAILED_COMMANDS = [
-  { kind: "create_run", inputs: [], outputs: [] },
+  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const } },
   { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
   { kind: "agent_data_prepared" },
   { kind: "agent_execution_session_created", sessionId: `sess-${suffix}-2` },
@@ -210,7 +210,6 @@ const FAILED_COMMANDS = [
   { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "completed", tool: "completed" }, workerLog: { status: "unavailable" } },
   { kind: "run_failed", reason: "worker_failed" },
 ] as const;
-
 
 async function waitFor(check: () => boolean, timeoutMs = 8000): Promise<void> {
   const deadline = Date.now() + timeoutMs;

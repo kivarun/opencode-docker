@@ -60,6 +60,8 @@ import {
   type ApplyPipelineV2ReviseTaskResumeOptions,
 } from "../src/pipeline_v2_revise_task_resume_controller.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Tests for the unwired production-neutral composition of the full
  * `revise_task` handoff: the restart-aware revise-task intervention facade
@@ -303,7 +305,7 @@ async function reviseResumeReady(options: { advance?: "r0" | "r4" } = {}): Promi
 
     // create_run with the coordinator's own project copy + input snapshot order
     const pipeline = await loadPipelineV2(bundleRoot);
-    await prepareRunProject(projectSource, runRoot);
+    const preparedProjectBinding027 = (await prepareRunProject(projectSource, runRoot)).binding;
     const runInputs = await snapshotRunInputs(
       pipeline,
       [{ id: "task", path: taskSource }] as readonly RunInputBinding[],
@@ -321,7 +323,7 @@ async function reviseResumeReady(options: { advance?: "r0" | "r4" } = {}): Promi
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding027 });
     const protectedInput = runInputs.inputs[0];
     if (protectedInput === undefined) {
       throw new Error("the prefix fixture lost its protected run input");

@@ -103,7 +103,7 @@ test("no run-root files are written and no state schema changes exist", () => {
   expect(operation).not.toContain("rename");
   // the durable state module keeps its schema version and command union untouched
   expect(src("pipeline_v2_state.ts")).toContain(
-    "export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 9",
+    "export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 10",
   );
 });
 

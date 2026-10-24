@@ -77,6 +77,8 @@ import {
   type PipelineV2RunPlanConstructionOps,
 } from "../src/pipeline_v2_run_plan_construction_internal.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "construct-run";
 const PROTECTED_DIGEST = "a".repeat(64);
 const CANARY_BODY = "CANARY_secret_body_value";
@@ -459,6 +461,7 @@ async function setupRevisionOne(): Promise<RevisionOneFixture> {
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
     inputs: BASE_INPUTS.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   await playPlanningExecution(harness.recording);
   const taskA1 = taskA1Prepared();
@@ -501,6 +504,7 @@ async function setupReviseBoundary(): Promise<ReviseBoundaryFixture> {
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
     inputs: BASE_INPUTS.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   await playPlanningExecution(harness.recording);
   const taskA1 = taskA1Prepared();
@@ -593,7 +597,7 @@ async function setupRuntimeProposal(): Promise<RuntimeProposalFixture> {
   resetClock();
   const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: RUN_ID, now: nextTick });
   const recording = new RecordingSink(sink);
-  await prepareRunProject(dirs.projectSource, dirs.runRoot);
+  const preparedProjectBinding028 = (await prepareRunProject(dirs.projectSource, dirs.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     pipeline,
     [{ id: "task", path: join(dirs.sources, "task.txt") }],
@@ -613,6 +617,7 @@ async function setupRuntimeProposal(): Promise<RuntimeProposalFixture> {
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding028,
   });
   const accepted: AcceptedStateOutput[] = [];
   const prep = await prepareActivationData(pipeline, runInputs, accepted, "architect", 1);
@@ -649,6 +654,7 @@ async function setupReplanning(): Promise<ReplanningFixture> {
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
     inputs: BASE_INPUTS.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   await playPlanningExecution(harness.recording);
   const taskA1 = taskA1Prepared();
@@ -1032,7 +1038,7 @@ test("5. an unreferenced new task entry is a construction conflict after the sin
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
       inputs: BASE_INPUTS.map((input) => ({ ...input })),
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await playPlanningExecution(harness.recording);
     const proposal = preparePipelineV2RunPlanProposal({
       schema_version: 1,
@@ -1074,7 +1080,7 @@ test("6. a pointer absent from both the ledger and new_tasks is a construction c
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
       inputs: BASE_INPUTS.map((input) => ({ ...input })),
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await playPlanningExecution(harness.recording);
     const proposal = preparePipelineV2RunPlanProposal({
       schema_version: 1,
@@ -1112,7 +1118,7 @@ test("7. duplicate pointers, unknown/cross-stage dependencies, cycles and empty 
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
       inputs: BASE_INPUTS.map((input) => ({ ...input })),
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await playPlanningExecution(harness.recording);
     const state = harness.recording.snapshot as PipelineV2RunState;
 
@@ -1591,7 +1597,7 @@ test("11b. a Proxy or cloned proposal is rejected through the existing provenanc
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
       inputs: BASE_INPUTS.map((input) => ({ ...input })),
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await playPlanningExecution(harness.recording);
     const state = harness.recording.snapshot as PipelineV2RunState;
     const { ops, calls } = recordingOps();
@@ -1710,7 +1716,7 @@ test("11d. malformed options and ops are typed invalid_options at the capture bo
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
       inputs: BASE_INPUTS.map((input) => ({ ...input })),
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await playPlanningExecution(harness.recording);
     const state = harness.recording.snapshot as PipelineV2RunState;
     const proposal = preparePipelineV2RunPlanProposal({
@@ -1814,7 +1820,7 @@ test("12. the state validation, run-root binding and root-task derivation bounda
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
       inputs: BASE_INPUTS.map((input) => ({ ...input })),
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await playPlanningExecution(harness.recording);
     const proposal = preparePipelineV2RunPlanProposal({
       schema_version: 1,
@@ -1848,7 +1854,7 @@ test("12. the state validation, run-root binding and root-task derivation bounda
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
         inputs: BASE_INPUTS.map((input) => ({ ...input })),
-      });
+     projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
       const causeNoExecution = await constructPipelineV2RunPlanCandidateFromProposal({
         runRoot: dirs.runRoot,
         state: freshRecording.snapshot,
@@ -1886,7 +1892,7 @@ test("12. the state validation, run-root binding and root-task derivation bounda
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
         inputs: [{ id: "brief", type: "file", protected: true, digest: PROTECTED_DIGEST }],
-      });
+     projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
       await playPlanningExecution(noTaskRecording);
       const causeNoRootTask = await constructPipelineV2RunPlanCandidateFromProposal({
         runRoot: dirs.runRoot,
@@ -1913,7 +1919,7 @@ test("12. the state validation, run-root binding and root-task derivation bounda
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(harness.pipeline),
         inputs: [{ id: "task", type: "file", protected: false, digest: PROTECTED_DIGEST }],
-      });
+     projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
       await playPlanningExecution(unprotectedRecording);
       const causeUnprotected = await constructPipelineV2RunPlanCandidateFromProposal({
         runRoot: dirs.runRoot,
@@ -2181,7 +2187,7 @@ async function setupAnchoredRuntime(): Promise<AnchoredFixture> {
   resetClock();
   const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: RUN_ID, now: nextTick });
   const recording = new RecordingSink(sink);
-  await prepareRunProject(dirs.projectSource, dirs.runRoot);
+  const preparedProjectBinding029 = (await prepareRunProject(dirs.projectSource, dirs.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     pipeline,
     [{ id: "task", path: join(dirs.sources, "task.txt") }],
@@ -2201,6 +2207,7 @@ async function setupAnchoredRuntime(): Promise<AnchoredFixture> {
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding029,
   });
   const accepted: AcceptedStateOutput[] = [];
   const prep = await prepareActivationData(pipeline, runInputs, accepted, "architect", 1);
@@ -2435,7 +2442,7 @@ test("16b. the pointer-only completed boundary recognizes the accepted plan inst
     resetClock();
     const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: RUN_ID, now: nextTick });
     const recording = new RecordingSink(sink);
-    await prepareRunProject(dirs.projectSource, dirs.runRoot);
+    const preparedProjectBinding030 = (await prepareRunProject(dirs.projectSource, dirs.runRoot)).binding;
     const runInputs = await snapshotRunInputs(
       pipeline,
       [{ id: "task", path: join(dirs.sources, "task.txt") }],
@@ -2451,7 +2458,7 @@ test("16b. the pointer-only completed boundary recognizes the accepted plan inst
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding030 });
     // The first planning execution: the real plan r1 acceptance.
     const prep = await prepareActivationData(pipeline, runInputs, [], "architect", 1);
     await recording.dispatch({

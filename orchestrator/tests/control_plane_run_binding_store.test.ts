@@ -1398,7 +1398,6 @@ describe("control plane run binding store: real composition smoke", () => {
   );
 });
 
-
 describe("control plane run binding store: authoritative discovery list", () => {
   test("44. an empty store without the namespace enumerates to an empty frozen list", async () => {
     const root = await makeRoot();

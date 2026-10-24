@@ -1913,7 +1913,6 @@ test("27. the provenance gate runs before the id check, getter reads and Proxy t
   });
 });
 
-
 test("28. mutation isolation: results and trusted snapshot are untouched by resolution", async () => {
   await withOrchestratedBundle(async (dirs) => {
     const pipeline = await loadPipelineV2(dirs.bundle);

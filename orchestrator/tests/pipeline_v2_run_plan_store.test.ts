@@ -585,7 +585,6 @@ test("18. a symlinked store-owned directory component fails closed as invalid la
   }
 }, 15000);
 
-
 test("19. a regular file in place of any store-owned directory component fails closed", async () => {
   const fixture = await setup();
   try {

@@ -25,6 +25,16 @@ import {
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
 import { verifyPipelineV2WorkerLogBindings } from "./pipeline_v2_worker_log_store.ts";
 import {
+  loadPipelineV2ProjectProvenance,
+  verifyPipelineV2InitialProjectWorkspace,
+  PipelineV2ProjectProvenanceStoreError,
+} from "./pipeline_v2_project_provenance_store.ts";
+import {
+  requireProvenanceBindingMatch,
+  PipelineV2ProjectProvenanceError,
+  type PreparedPipelineV2ProjectProvenance,
+} from "./pipeline_v2_project_provenance.ts";
+import {
   mintRestoredRunInputsSnapshot,
   verifyRestoredAcceptedHistory,
   type AcceptedStateOutput,
@@ -948,6 +958,49 @@ async function restoreContextCore(
       throw restoreError("artifact_missing", "the recorded worker log artifact is missing");
     }
     throw restoreError("artifact_modified", "the worker log artifact does not match its durable binding");
+  }
+  // 11. The project provenance manifest verification (schema v10): the
+  //     stored artifact must exist, be canonical and match its durable
+  //     binding (digest, entry count, copy policy version) — a provenance
+  //     integrity violation is a typed refusal, never a repair. Before the
+  //     first worker activation (no durable execution exists yet) the
+  //     initial workspace baseline is additionally verified against the
+  //     manifest; after a first activation the workspace is worker-mutable
+  //     by contract and the manifest stays provenance, not a workspace
+  //     invariant.
+  const storedManifest = await loadPipelineV2ProjectProvenance(runRootCanonical).catch(
+    (cause: unknown): PreparedPipelineV2ProjectProvenance => {
+      if (cause instanceof PipelineV2ProjectProvenanceStoreError) {
+        if (cause.reason === "conflict") {
+          throw restoreError("artifact_modified", "the project provenance manifest does not match its durable binding");
+        }
+        if (cause.reason === "invalid_layout") {
+          throw restoreError("run_layout_invalid", "the run provenance layout is invalid");
+        }
+      }
+      if (cause instanceof PipelineV2ProjectProvenanceError) {
+        throw restoreError("artifact_modified", "the project provenance manifest is not a valid provenance document");
+      }
+      throw cause;
+    },
+  );
+  if (storedManifest === null) {
+    throw restoreError("artifact_missing", "the project provenance manifest does not exist");
+  }
+  try {
+    requireProvenanceBindingMatch(storedManifest, validated.project_provenance);
+  } catch {
+    throw restoreError("artifact_modified", "the project provenance manifest does not match its durable binding");
+  }
+  if (validated.executions.length === 0) {
+    try {
+      await verifyPipelineV2InitialProjectWorkspace(projectRootCanonical, storedManifest);
+    } catch (cause) {
+      if (cause instanceof PipelineV2ProjectProvenanceError) {
+        throw restoreError("artifact_modified", "the initial run workspace does not match its provenance baseline");
+      }
+      throw cause;
+    }
   }
   return { validated, runInputs, acceptedOutputs };
 }

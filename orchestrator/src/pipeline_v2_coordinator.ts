@@ -156,6 +156,7 @@ import {
   type RunOutputSnapshotEntry,
 } from "./pipeline_v2_runtime.ts";
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
+import type { PipelineV2ProjectProvenanceBinding } from "./pipeline_v2_project_provenance.ts";
 import {
   classifyPipelineV2ResumeRecovery,
   type PipelineV2ExecutableRecovery,
@@ -1080,9 +1081,15 @@ export async function coordinatePipelineV2Run(
   // copy keeps the state document absent; the signal reason wins over the
   // classified failure (the priority below the session-cleanup failure,
   // which cannot exist before any Session).
+  let projectProvenance: PipelineV2ProjectProvenanceBinding;
   try {
     checkSignal();
-    await prepareRunProject(params.projectSourcePath, runRoot);
+    const preparedProject = await prepareRunProject(params.projectSourcePath, runRoot);
+    projectProvenance = preparedProject.binding;
+    // Checkpoint after the successful preparation: the published project
+    // copy and its provenance manifest stay in the run root; the signal
+    // outcome precedes `create_run`, so no state document exists yet.
+    checkSignal();
   } catch (cause) {
     const signal = capturedCurrentSignal();
     if (signal !== null) {
@@ -1140,6 +1147,7 @@ export async function coordinatePipelineV2Run(
       runId,
       pipeline: pipelineV2RunPipelineIdentity(pipeline),
       inputs: runInputStates,
+      projectProvenance,
     });
   } catch (cause) {
     if (cause instanceof PipelineV2RunStateDurabilityError) {

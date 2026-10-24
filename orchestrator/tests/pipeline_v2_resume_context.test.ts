@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { pipelineV2ProjectProvenanceBinding, preparePipelineV2ProjectProvenance } from "../src/pipeline_v2_project_provenance.ts";
+import { publishPipelineV2ProjectProvenance } from "../src/pipeline_v2_project_provenance_store.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -29,6 +31,9 @@ import {
   restorePipelineV2RuntimeContext,
   type PipelineV2RuntimeContextRestoreFailureReason,
 } from "../src/pipeline_v2_resume_context.ts";
+
+const EMPTY_PROJECT_MANIFEST = preparePipelineV2ProjectProvenance([]);
+const EMPTY_PROJECT_BINDING = pipelineV2ProjectProvenanceBinding(EMPTY_PROJECT_MANIFEST);
 
 const RUN_ID = "run-1";
 const REASON = "stage_iteration_limit_exhausted";
@@ -235,6 +240,7 @@ async function setupBase(): Promise<Base> {
 
   const runRoot = join(root, "runs", RUN_ID);
   await mkdir(join(runRoot, "project"), { mode: 0o700, recursive: true });
+  await publishPipelineV2ProjectProvenance(runRoot, EMPTY_PROJECT_MANIFEST);
   const runInputs = await snapshotRunInputs(pipeline, [
     { id: "task", path: join(sources, "task.md") },
     { id: "facts_seed", path: join(sources, "facts.json") },
@@ -253,6 +259,7 @@ async function setupBase(): Promise<Base> {
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: EMPTY_PROJECT_BINDING,
   });
   return { root, pipeline, runRoot, runInputs, clock, drive, sources };
 }
@@ -1993,6 +2000,7 @@ async function setupStageBase(pipelineYaml: string = STAGE_PIPELINE): Promise<St
 
   const runRoot = join(root, "runs", RUN_ID);
   await mkdir(join(runRoot, "project"), { mode: 0o700, recursive: true });
+  await publishPipelineV2ProjectProvenance(runRoot, EMPTY_PROJECT_MANIFEST);
   const runInputs = await snapshotRunInputs(pipeline, [
     { id: "task", path: join(sources, "task.md") },
     { id: "facts", path: join(sources, "facts.json") },
@@ -2010,6 +2018,7 @@ async function setupStageBase(pipelineYaml: string = STAGE_PIPELINE): Promise<St
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: EMPTY_PROJECT_BINDING,
   });
   return { root, pipeline, runRoot, runInputs, clock, drive };
 }
@@ -3034,4 +3043,126 @@ test("P10. the planning restore shares the single core: no second mechanism, no 
   expect(code).not.toContain("loadPipelineV2PlanRevision");
   expect(code).not.toContain("new WeakMap");
   expect(code).not.toContain("new WeakSet");
+});
+
+// --- PP. the project provenance manifest verification (state schema v10) -----
+
+test("PP1. a missing provenance manifest is an artifact_missing refusal with zero writes", async () => {
+  const base = await setupBase();
+  try {
+    await rm(join(base.runRoot, "project-provenance.json"));
+    const before = await fingerprint(base.root);
+    let failure: unknown;
+    try {
+      await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    expectRestoreError(failure, "artifact_missing");
+    expect((failure as Error).message).toContain("project provenance manifest does not exist");
+    expect(await fingerprint(base.root)).toBe(before);
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("PP2. a noncanonical or digest-mismatching manifest is an artifact_modified refusal", async () => {
+  const base = await setupBase();
+  try {
+    const path = join(base.runRoot, "project-provenance.json");
+    // a tampered (noncanonical) document: one trailing byte breaks the
+    // canonical-byte verification without changing the parsed document
+    const original = await readFile(path, "utf8");
+    await rm(path);
+    await writeFile(path, `${original} `, { mode: 0o600 });
+    let before = await fingerprint(base.root);
+    let failure: unknown;
+    try {
+      await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    expectRestoreError(failure, "artifact_modified");
+    expect(await fingerprint(base.root)).toBe(before);
+    // a valid manifest that does not match the durable binding
+    const foreign = preparePipelineV2ProjectProvenance([
+      { path: "f.txt", kind: "regular_file", source_mode: 0o644, workspace_mode: 0o600, byte_count: 1, sha256: "a".repeat(64), multiple_links: false },
+    ]);
+    await rm(path);
+    await writeFile(path, foreign.canonical_json, { mode: 0o600 });
+    before = await fingerprint(base.root);
+    failure = undefined;
+    try {
+      await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    expectRestoreError(failure, "artifact_modified");
+    expect((failure as Error).message).toContain("does not match its durable binding");
+    expect(await fingerprint(base.root)).toBe(before);
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("PP3. a symlinked or wrong-mode manifest artifact is refused without repair", async () => {
+  for (const mode of ["symlink", "wrong-mode"] as const) {
+    const base = await setupBase();
+    try {
+      const path = join(base.runRoot, "project-provenance.json");
+      const bytes = await readFile(path);
+      await rm(path);
+      if (mode === "symlink") {
+        await symlink(join(base.root, "elsewhere"), path);
+      } else {
+        await writeFile(path, bytes, { mode: 0o644 });
+      }
+      const before = await fingerprint(base.root);
+      let failure: unknown;
+      try {
+        await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+      } catch (cause) {
+        failure = cause;
+      }
+      expectRestoreError(failure, "artifact_modified");
+      expect(await fingerprint(base.root)).toBe(before);
+    } finally {
+      await dispose(base);
+    }
+  }
+});
+
+test("PP4. before the first activation a diverging initial workspace is an artifact_modified refusal", async () => {
+  const base = await setupBase();
+  try {
+    await writeFile(join(base.runRoot, "project", "worker-added.txt"), "added\n", { mode: 0o600 });
+    const before = await fingerprint(base.root);
+    let failure: unknown;
+    try {
+      await restorePipelineV2RuntimeContext(base.pipeline, base.drive.state, base.runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    expectRestoreError(failure, "artifact_modified");
+    expect((failure as Error).message).toContain("initial run workspace does not match its provenance baseline");
+    expect(await fingerprint(base.root)).toBe(before);
+  } finally {
+    await dispose(base);
+  }
+});
+
+test("PP5. after the first activation the workspace is worker-mutable and restores without verification", async () => {
+  const base = await setupBase();
+  try {
+    await runAgentActivation(base, base.drive, "coder", JSON.stringify({ f1: true, f2: false }));
+    const firstState = base.drive.state as PipelineV2RunState;
+    expect(firstState.executions.length).toBe(1);
+    await writeFile(join(base.runRoot, "project", "worker-added.txt"), "added\n", { mode: 0o600 });
+    await rm(join(base.runRoot, "project", "docs"), { recursive: true, force: true });
+    const context = await restorePipelineV2RuntimeContext(base.pipeline, firstState, base.runRoot);
+    expect(context.state.executions.length).toBe(1);
+    expect(context.next_execution_index).toBe(2);
+  } finally {
+    await dispose(base);
+  }
 });

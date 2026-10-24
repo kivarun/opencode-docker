@@ -18,6 +18,8 @@ import { buildStates, successCommands, tick, V2_IDENTITY, V2_INPUTS } from "./pi
 import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 import type { PipelineStateIo } from "../src/pipeline_state_store.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Tests for `PipelineV2RunStateSink.open`: the single way to continue an
  * already durable pipeline v2 run after a process restart. The open loads
@@ -295,7 +297,7 @@ describe("pipeline v2 run state sink: open", () => {
         runId: RUN_ID,
         pipeline: V2_IDENTITY,
         inputs: V2_INPUTS,
-      } satisfies PipelineV2RunCommand)).rejects.toThrow(PipelineV2RunStateStoreError);
+     projectProvenance: V2_PROJECT_PROVENANCE_BINDING } satisfies PipelineV2RunCommand)).rejects.toThrow(PipelineV2RunStateStoreError);
       expect(fresh.snapshot).toBeNull();
       // and open still works over the untouched state
       const reopened = await PipelineV2RunStateSink.open({

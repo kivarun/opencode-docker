@@ -65,6 +65,8 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const CANARY_SECRET = "CANARY-SECRET-dhsec9f1";
 
 interface Recorder {
@@ -1536,6 +1538,7 @@ test("respond end-to-end with the real production module: a reserved interventio
       max_transitions: 20,
     },
     inputs: [],
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   const runRoot = join(stateRoot, "pipeline-runs", "rid-reserved");
   chmodSync(runRoot, 0o700);
@@ -1787,7 +1790,7 @@ test("revise-task end-to-end with the real production runner: the honest waiting
     // the honest waiting prefix through the production facades only
     const pipeline = await loadPipelineV2(bundle);
     const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
-    await prepareRunProject(projectSource, runRoot);
+    const preparedProjectBinding000 = (await prepareRunProject(projectSource, runRoot)).binding;
     const runInputs: RunInputsSnapshot = await snapshotRunInputs(
       pipeline,
       [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
@@ -1803,7 +1806,7 @@ test("revise-task end-to-end with the real production runner: the honest waiting
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding000 });
     const accepted: AcceptedStateOutput[] = [];
     const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {
       const activation: PreparedActivationData = await prepareActivationData(
@@ -2091,7 +2094,7 @@ test("continue-stage end-to-end with the real production runner: the honest wait
     // the honest waiting prefix through the production facades only
     const pipeline = await loadPipelineV2(bundle);
     const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
-    await prepareRunProject(projectSource, runRoot);
+    const preparedProjectBinding001 = (await prepareRunProject(projectSource, runRoot)).binding;
     const runInputs: RunInputsSnapshot = await snapshotRunInputs(
       pipeline,
       [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
@@ -2107,7 +2110,7 @@ test("continue-stage end-to-end with the real production runner: the honest wait
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding001 });
     const accepted: AcceptedStateOutput[] = [];
     const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {
       const activation: PreparedActivationData = await prepareActivationData(
@@ -2804,7 +2807,7 @@ test("resume-plan end-to-end with the real production runner: the two-cycle plan
     // durable input
     const pipeline = await loadPipelineV2(bundle);
     const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
-    await prepareRunProject(projectSource, runRoot);
+    const preparedProjectBinding002 = (await prepareRunProject(projectSource, runRoot)).binding;
     const runInputs: RunInputsSnapshot = await snapshotRunInputs(
       pipeline,
       [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
@@ -2820,7 +2823,7 @@ test("resume-plan end-to-end with the real production runner: the two-cycle plan
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding002 });
     let accepted: AcceptedStateOutput[] = [];
     accepted = await cliPlanningActivation(pipeline, runInputs, accepted, sink, "architect", "architect", "plan", 1, P1_PROPOSAL);
     const acceptedPlan1 = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot, sink });
@@ -3076,7 +3079,7 @@ test("resume-plan end-to-end with the real production runner: the initial plan-r
     // no generation, no wait, no committed transition)
     const pipeline = await loadPipelineV2(bundle);
     const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
-    await prepareRunProject(projectSource, runRoot);
+    const preparedProjectBinding003 = (await prepareRunProject(projectSource, runRoot)).binding;
     const runInputs: RunInputsSnapshot = await snapshotRunInputs(
       pipeline,
       [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
@@ -3092,7 +3095,7 @@ test("resume-plan end-to-end with the real production runner: the initial plan-r
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding003 });
     await cliPlanningActivation(pipeline, runInputs, [], sink, "architect", "architect", "plan", 1, P1_PROPOSAL);
     const prefixState = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
     expect(prefixState.executions).toHaveLength(1);
@@ -3276,7 +3279,7 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
     };
     const pipeline = await loadPipelineV2(bundle);
     const sink = new PipelineV2RunStateSink({ stateRoot, runId, now: nextTick });
-    await prepareRunProject(projectSource, runRoot);
+    const preparedProjectBinding004 = (await prepareRunProject(projectSource, runRoot)).binding;
     const runInputs: RunInputsSnapshot = await snapshotRunInputs(
       pipeline,
       [{ id: "task", path: join(sources, "task.md") }] as readonly RunInputBinding[],
@@ -3292,7 +3295,7 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
         protected: entry.protected,
         digest: entry.digest,
       })),
-    });
+   projectProvenance: preparedProjectBinding004 });
     const activation: PreparedActivationData = await prepareActivationData(pipeline, runInputs, [], "architect", 1);
     await sink.dispatch({
       kind: "start_agent_execution",

@@ -9,7 +9,7 @@ import {
   realProjectCopyIo,
   type ProjectCopyIo,
 } from "../src/pipeline_v2_project_copy_internal.ts";
-import { prepareRunProject, type PreparedRunProject } from "../src/pipeline_v2_runtime.ts";
+import { prepareRunProject, type PreparedRunProjectWithProvenance } from "../src/pipeline_v2_runtime.ts";
 import { PipelineV2RuntimeError } from "../src/pipeline_v2_runtime_error.ts";
 
 interface Fixture {
@@ -360,7 +360,7 @@ test("10. a repeated call fails closed and never overwrites the published projec
     } catch (cause) {
       failure = cause;
     }
-    expectFailClosed(failure, "already exists");
+    expectFailClosed(failure, "already carries a project provenance manifest");
     expect(await treeDigest(prepared.project_root)).toBe(before);
   } finally {
     await dispose(fixture);
@@ -420,9 +420,11 @@ test("12. the traversal is deterministic and code-unit sorted across runs", asyn
 test("13. the returned object is deep-frozen and carries no source path", async () => {
   const fixture = await setup();
   try {
-    const prepared: PreparedRunProject = await prepareRunProject(fixture.source, fixture.runRoot);
+    const prepared: PreparedRunProjectWithProvenance = await prepareRunProject(fixture.source, fixture.runRoot);
     expect(Object.isFrozen(prepared)).toBe(true);
-    expect(Object.keys(prepared).sort()).toEqual(["project_root", "run_root"]);
+    expect(Object.keys(prepared).sort()).toEqual(["binding", "manifest", "project_root", "run_root"]);
+    expect(prepared.manifest.manifest.entries.length).toBe(prepared.binding.entry_count);
+    expect(prepared.binding.copy_policy_version).toBe(1);
     expect(JSON.stringify(prepared)).not.toContain(fixture.source);
   } finally {
     await dispose(fixture);
@@ -509,7 +511,7 @@ test("16. run root ownership: the coordinator-owned roots are not created or rem
     const runRootInfoAfter = await lstat(fixture.runRoot);
     expect(runRootInfoAfter.dev).toBe(runRootInfoBefore.dev);
     expect(runRootInfoAfter.ino).toBe(runRootInfoBefore.ino);
-    expect((await readdir(fixture.runRoot)).sort()).toEqual(["project"]);
+    expect((await readdir(fixture.runRoot)).sort()).toEqual(["project", "project-provenance.json"]);
   } finally {
     await dispose(fixture);
   }
@@ -833,7 +835,7 @@ test("22. a fault-injected internal core cannot affect a parallel public prepare
     );
     expect((injectedFailure as PipelineV2RuntimeError).reason).toBe("run_input_invalid");
     // The public copy stands exactly as published; nothing else remains.
-    expect((await readdir(fixture.runRoot)).sort()).toEqual(["project"]);
+    expect((await readdir(fixture.runRoot)).sort()).toEqual(["project", "project-provenance.json"]);
     expect((await readdir(prepared.project_root)).sort()).toEqual(["public.md"]);
   } finally {
     await dispose(fixture);
@@ -1097,7 +1099,7 @@ test("27. no mutable IO seam on the runtime module; the real IO is fixed and imm
   const internal = await import("../src/pipeline_v2_project_copy_internal.ts");
   // the internal module exports exactly the per-call core, the fixed real
   // IO and the IO type — no installer, no mutable module state
-  expect(Object.keys(internal).sort()).toEqual(["prepareProjectCopy", "realProjectCopyIo"]);
+  expect(Object.keys(internal).sort()).toEqual(["discardStagedProjectCopy", "prepareProjectCopy", "publishStagedProjectCopy", "realProjectCopyIo", "stageProjectCopy"]);
   expect(Object.isFrozen(internal.realProjectCopyIo)).toBe(true);
   expect(Object.keys(internal.realProjectCopyIo).sort()).toEqual([
     "destinationWrite",
@@ -1156,3 +1158,400 @@ async function treeDigest(root: string): Promise<string> {
   }
   return hash.digest("hex");
 }
+
+// --- provenance capture of the single copy traversal (state schema v10) ---
+
+import {
+  createHash,
+} from "node:crypto";
+import {
+  pipelineV2ProjectProvenanceBinding,
+} from "../src/pipeline_v2_project_provenance.ts";
+import {
+  loadPipelineV2ProjectProvenance,
+  verifyPipelineV2InitialProjectWorkspace,
+} from "../src/pipeline_v2_project_provenance_store.ts";
+
+const digestOf = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
+
+test("28. the manifest records the source mode and the normalized workspace mode", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "plain.txt"), "plain\n", { mode: 0o644 });
+    await writeFile(join(fixture.source, "script.sh"), "#!/bin/sh\n", { mode: 0o755 });
+    await mkdir(join(fixture.source, "dir"), { mode: 0o750 });
+    const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+    const byPath = new Map(prepared.manifest.manifest.entries.map((entry) => [entry.path, entry]));
+    const plain = byPath.get("plain.txt") as { kind: string; source_mode: number; workspace_mode: number };
+    const script = byPath.get("script.sh") as { kind: string; source_mode: number; workspace_mode: number };
+    const dir = byPath.get("dir") as { kind: string; source_mode: number; workspace_mode: number };
+    expect(plain.source_mode).toBe(0o644);
+    expect(plain.workspace_mode).toBe(0o600);
+    expect(script.source_mode).toBe(0o755);
+    expect(script.workspace_mode).toBe(0o700);
+    expect(dir.source_mode).toBe(0o750);
+    expect(dir.workspace_mode).toBe(0o700);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("29. the manifest records the exact copied bytes and byte count", async () => {
+  const fixture = await setup();
+  try {
+    const body = "the exact copied bytes\n";
+    await writeFile(join(fixture.source, "f.txt"), body, { mode: 0o644 });
+    const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+    const entry = prepared.manifest.manifest.entries[0] as { kind: string; byte_count: number; sha256: string };
+    expect(entry.byte_count).toBe(body.length);
+    expect(entry.sha256).toBe(digestOf(body));
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("30. a source hardlink pair is split and durably recorded as one canonical group", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "h1.txt"), "linked\n", { mode: 0o644 });
+    await (await import("node:fs/promises")).link(join(fixture.source, "h1.txt"), join(fixture.source, "h2.txt"));
+    const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+    const entries = prepared.manifest.manifest.entries as unknown as { path: string; multiple_links: boolean; hardlink_group?: number }[];
+    const h1 = entries.find((entry) => entry.path === "h1.txt");
+    const h2 = entries.find((entry) => entry.path === "h2.txt");
+    expect(h1?.multiple_links).toBe(true);
+    expect(h2?.multiple_links).toBe(true);
+    expect(h1?.hardlink_group).toBe(h2?.hardlink_group);
+    expect(typeof h1?.hardlink_group).toBe("number");
+    // the workspace copies are independent regular files
+    const ino1 = (await lstat(join(fixture.runRoot, "project", "h1.txt"))).ino;
+    const ino2 = (await lstat(join(fixture.runRoot, "project", "h2.txt"))).ino;
+    expect(ino1).not.toBe(ino2);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("31. a symlink entry carries the verbatim target and the identical-targets confirmation", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "real.txt"), "x\n", { mode: 0o644 });
+    await symlink("real.txt", join(fixture.source, "link"));
+    await symlink(join(fixture.source, "real.txt"), join(fixture.source, "abs"));
+    const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+    const entries = prepared.manifest.manifest.entries as { path: string; kind: string; target?: string; targets_identical?: boolean }[];
+    const link = entries.find((entry) => entry.path === "link");
+    const abs = entries.find((entry) => entry.path === "abs");
+    expect(link?.target).toBe("real.txt");
+    expect(link?.targets_identical).toBe(true);
+    expect(abs?.target).toBe(join(fixture.source, "real.txt"));
+    expect(abs?.targets_identical).toBe(true);
+    expect(await readlink(join(fixture.runRoot, "project", "link"))).toBe("real.txt");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("32. the manifest entries are in deterministic code-unit order and the workspace verifies", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "b.txt"), "b\n", { mode: 0o644 });
+    await mkdir(join(fixture.source, "a"), { mode: 0o700 });
+    await writeFile(join(fixture.source, "a", "c.txt"), "c\n", { mode: 0o644 });
+    const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+    expect(prepared.manifest.manifest.entries.map((entry) => entry.path)).toEqual(["a", "a/c.txt", "b.txt"]);
+    await verifyPipelineV2InitialProjectWorkspace(prepared.project_root, prepared.manifest);
+    const loaded = await loadPipelineV2ProjectProvenance(fixture.runRoot);
+    expect(loaded?.sha256).toBe(prepared.manifest.sha256);
+    expect(prepared.binding).toEqual(pipelineV2ProjectProvenanceBinding(prepared.manifest));
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("33. an empty project produces a zero-entry manifest and verifies", async () => {
+  const fixture = await setup();
+  try {
+    const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+    expect(prepared.manifest.manifest.entries).toEqual([]);
+    expect(prepared.binding.entry_count).toBe(0);
+    await verifyPipelineV2InitialProjectWorkspace(prepared.project_root, prepared.manifest);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("34. two histories with identical final and current trees produce different manifests (the audit indistinguishability is broken)", async () => {
+  // History A: baseline {f.txt}; the agent created h.txt in the workspace.
+  const a = await setup();
+  // History B: baseline {f.txt, h.txt}; the agent changed nothing; the operator
+  // deleted h.txt from the registered project after the snapshot.
+  const b = await setup();
+  try {
+    await writeFile(join(a.source, "f.txt"), "X\n", { mode: 0o644 });
+    const preparedA = await prepareRunProject(a.source, a.runRoot);
+    await writeFile(join(a.runRoot, "project", "h.txt"), "Q\n", { mode: 0o600 });
+
+    await writeFile(join(b.source, "f.txt"), "X\n", { mode: 0o644 });
+    await writeFile(join(b.source, "h.txt"), "Q\n", { mode: 0o600 });
+    const preparedB = await prepareRunProject(b.source, b.runRoot);
+    await rm(join(b.source, "h.txt"));
+
+    // Identical observables: the final run workspace trees and the current
+    // operator project trees are byte-identical across the two histories.
+    const finalA = await readFile(join(a.runRoot, "project", "h.txt"), "utf8");
+    const finalB = await readFile(join(b.runRoot, "project", "h.txt"), "utf8");
+    expect(finalA).toBe(finalB);
+    const hasOperatorH = await lstat(join(b.source, "h.txt")).then(() => true, () => false);
+    expect(hasOperatorH).toBe(false);
+    expect(await lstat(join(a.source, "h.txt")).then(() => true, () => false)).toBe(false);
+
+    // But the durable manifests differ exactly where the truth differs:
+    // A's baseline has no h.txt (the agent added it); B's baseline has it.
+    const pathsA = preparedA.manifest.manifest.entries.map((entry) => entry.path);
+    const pathsB = preparedB.manifest.manifest.entries.map((entry) => entry.path);
+    expect(pathsA).toEqual(["f.txt"]);
+    expect(pathsB).toEqual(["f.txt", "h.txt"]);
+    expect(preparedA.manifest.sha256).not.toBe(preparedB.manifest.sha256);
+  } finally {
+    await dispose(a);
+    await dispose(b);
+  }
+});
+
+test("35. a source object modified while it is being read fails the preparation closed", async () => {
+  const fixture = await setup();
+  try {
+    // A file large enough to span several write-loop iterations, mutated by
+    // a concurrent writer through the destination-write seam while the copy
+    // is still reading it.
+    const body = Buffer.alloc(4 * 128 * 1024, 0x61);
+    await writeFile(join(fixture.source, "big.txt"), body, { mode: 0o644 });
+    let writes = 0;
+    const wrappedIo: ProjectCopyIo = {
+      ...realProjectCopyIo,
+      destinationWrite: async (handle, chunk, offset, length, position) => {
+        writes += 1;
+        if (writes === 2) {
+          // The writer appends to the source while the copy holds the read
+          // open; the post-read coherence re-stat must detect it.
+          const handle2 = await (await import("node:fs/promises")).open(join(fixture.source, "big.txt"), "a");
+          await handle2.write(Buffer.from("APPENDED-DURING-READ"));
+          await handle2.close();
+        }
+        return realProjectCopyIo.destinationWrite(handle, chunk, offset, length, position);
+      },
+    };
+    let failure: unknown;
+    try {
+      await (await import("../src/pipeline_v2_project_copy_internal.ts")).prepareProjectCopy(wrappedIo, fixture.source, fixture.runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    expectFailClosed(failure, "was modified while it was being read");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("36. a source object whose permission mode changes while it is being read fails closed", async () => {
+  const fixture = await setup();
+  try {
+    const body = Buffer.alloc(2 * 128 * 1024, 0x62);
+    await writeFile(join(fixture.source, "touched.txt"), body, { mode: 0o644 });
+    let writes = 0;
+    const wrappedIo: ProjectCopyIo = {
+      ...realProjectCopyIo,
+      destinationWrite: async (handle, chunk, offset, length, position) => {
+        writes += 1;
+        if (writes === 1) {
+          // A metadata-only touch during the read changes the ctime; the
+          // post-read coherence re-stat must reject the copy.
+          await chmod(join(fixture.source, "touched.txt"), 0o666);
+        }
+        return realProjectCopyIo.destinationWrite(handle, chunk, offset, length, position);
+      },
+    };
+    let failure: unknown;
+    try {
+      await (await import("../src/pipeline_v2_project_copy_internal.ts")).prepareProjectCopy(wrappedIo, fixture.source, fixture.runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    expectFailClosed(failure, "was modified while it was being read");
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("37. C5: a copy whose published bytes diverge from its capture fails closed before any binding", async () => {
+  // The public wrapper composes exactly these steps with the fixed real
+  // IO; the corrupted-write fault is injected at the internal composition
+  // boundary, which runs the same verification gate the wrapper runs
+  // before it returns.
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "f.txt"), "ORIGINAL\n", { mode: 0o644 });
+    const corruptedWrite: ProjectCopyIo = {
+      ...realProjectCopyIo,
+      destinationWrite: async (handle, chunk, offset, length, position) => {
+        if (position === 0 && chunk.byteLength > 0) {
+          const corrupted = Buffer.from(chunk);
+          corrupted[0] = corrupted[0] === 0x58 ? 0x59 : 0x58;
+          return realProjectCopyIo.destinationWrite(handle, corrupted, offset, length, position);
+        }
+        return realProjectCopyIo.destinationWrite(handle, chunk, offset, length, position);
+      },
+    };
+    const { stageProjectCopy, publishStagedProjectCopy, discardStagedProjectCopy } =
+      await import("../src/pipeline_v2_project_copy_internal.ts");
+    const { preparePipelineV2ProjectProvenance, PipelineV2ProjectProvenanceError } =
+      await import("../src/pipeline_v2_project_provenance.ts");
+    const {
+      publishPipelineV2ProjectProvenance,
+      verifyPipelineV2InitialProjectWorkspace,
+    } = await import("../src/pipeline_v2_project_provenance_store.ts");
+    const staged = await stageProjectCopy(corruptedWrite, fixture.source, fixture.runRoot);
+    try {
+      // The capture digest describes the bytes read from the source; the
+      // corrupted write published different bytes into the workspace.
+      const prepared = preparePipelineV2ProjectProvenance(staged.entries);
+      expect(prepared.manifest.entries[0]).toMatchObject({ byte_count: 9 });
+      await publishPipelineV2ProjectProvenance(fixture.runRoot, prepared);
+      await publishStagedProjectCopy(corruptedWrite, staged);
+      let failure: unknown;
+      try {
+        await verifyPipelineV2InitialProjectWorkspace(join(fixture.runRoot, "project"), prepared);
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(PipelineV2ProjectProvenanceError);
+      expect((failure as { reason?: string }).reason).toBe("workspace_mismatch");
+      expect((failure as Error).message).toContain("content digest");
+      // The published project and the manifest stay for diagnostics; the
+      // wrapper's gate would have refused the preparation before any
+      // state document could exist.
+    } finally {
+      await discardStagedProjectCopy(realProjectCopyIo, {
+        run_root: staged.run_root,
+        staging_path: staged.staging_path,
+        staging_identity: staged.staging_identity,
+        entries: [],
+      });
+    }
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("38. C1: a manifest-publication failure leaves nothing published and a fresh retry binds the new copy", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "f.txt"), "one\n", { mode: 0o644 });
+    const { stageProjectCopy, discardStagedProjectCopy } = await import("../src/pipeline_v2_project_copy_internal.ts");
+    const {
+      preparePipelineV2ProjectProvenance,
+    } = await import("../src/pipeline_v2_project_provenance.ts");
+    const {
+      publishProjectProvenanceWithIo,
+    } = await import("../src/pipeline_v2_project_provenance_store_internal.ts");
+    const { realImmutableDocumentIo } = await import("../src/pipeline_v2_immutable_document_store_internal.ts");
+    const staged = await stageProjectCopy(realProjectCopyIo, fixture.source, fixture.runRoot);
+    const prepared = preparePipelineV2ProjectProvenance(staged.entries);
+    const failingOpen = {
+      ...realImmutableDocumentIo,
+      openTempExclusive: async () => {
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      },
+    } as unknown as typeof realImmutableDocumentIo;
+    let failure: unknown;
+    try {
+      await publishProjectProvenanceWithIo(failingOpen, fixture.runRoot, prepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(Object);
+    expect((failure as { outcome?: string }).outcome).toBe("not_published");
+    await discardStagedProjectCopy(realProjectCopyIo, staged);
+    // Nothing was published: no manifest, no workspace, no staging leftover.
+    expect((await readdir(fixture.runRoot)).sort()).toEqual([]);
+    // A fresh preparation binds the new copy: manifest and workspace agree.
+    const retry = await prepareRunProject(fixture.source, fixture.runRoot);
+    expect(retry.binding.entry_count).toBe(1);
+    const loaded = await loadPipelineV2ProjectProvenance(fixture.runRoot);
+    expect(loaded?.sha256).toBe(retry.manifest.sha256);
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("39. C2/C3: a visible manifest with an absent workspace refuses the retry and never re-derives provenance from the source", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "f.txt"), "before\n", { mode: 0o644 });
+    const { stageProjectCopy, discardStagedProjectCopy } = await import("../src/pipeline_v2_project_copy_internal.ts");
+    const {
+      preparePipelineV2ProjectProvenance,
+    } = await import("../src/pipeline_v2_project_provenance.ts");
+    const {
+      publishPipelineV2ProjectProvenance,
+    } = await import("../src/pipeline_v2_project_provenance_store.ts");
+    // The crash window between the manifest publication and the workspace
+    // rename: the manifest is durable, the workspace was never published.
+    const staged = await stageProjectCopy(realProjectCopyIo, fixture.source, fixture.runRoot);
+    const prepared = preparePipelineV2ProjectProvenance(staged.entries);
+    await publishPipelineV2ProjectProvenance(fixture.runRoot, prepared);
+    await discardStagedProjectCopy(realProjectCopyIo, staged);
+    const manifestBytes = await readFile(join(fixture.runRoot, "project-provenance.json"), "utf8");
+    // The source changes while the run is interrupted.
+    await writeFile(join(fixture.source, "added-after-crash.txt"), "later\n", { mode: 0o644 });
+    let failure: unknown;
+    try {
+      await prepareRunProject(fixture.source, fixture.runRoot);
+    } catch (cause) {
+      failure = cause;
+    }
+    expectFailClosed(failure, "already carries a project provenance manifest");
+    // The manifest is byte-identical; the workspace was never materialized
+    // from the changed source; nothing was rebound.
+    expect(await readFile(join(fixture.runRoot, "project-provenance.json"), "utf8")).toBe(manifestBytes);
+    expect(await lstatOrNull(join(fixture.runRoot, "project"))).toBeNull();
+  } finally {
+    await dispose(fixture);
+  }
+});
+
+test("40. C6: worker-style workspace changes leave the manifest byte-identical", async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(join(fixture.source, "f.txt"), "base\n", { mode: 0o644 });
+    await mkdir(join(fixture.source, "d"), { mode: 0o700 });
+    const prepared = await prepareRunProject(fixture.source, fixture.runRoot);
+    const manifestPath = join(fixture.runRoot, "project-provenance.json");
+    const before = await lstat(manifestPath);
+    const beforeBytes = await readFile(manifestPath, "utf8");
+    // The worker (or anyone with the workspace authority) adds, modifies,
+    // deletes, re-modes and re-types entries.
+    await writeFile(join(fixture.runRoot, "project", "worker-added.txt"), "added\n", { mode: 0o600 });
+    await writeFile(join(fixture.runRoot, "project", "f.txt"), "modified by worker\n", { mode: 0o600 });
+    await rm(join(fixture.runRoot, "project", "d"), { recursive: true });
+    await chmod(join(fixture.runRoot, "project", "f.txt"), 0o700);
+    await symlink("elsewhere", join(fixture.runRoot, "project", "worker-link"));
+    const after = await lstat(manifestPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(await readFile(manifestPath, "utf8")).toBe(beforeBytes);
+    expect(await readFile(manifestPath, "utf8")).toBe(prepared.manifest.canonical_json);
+    // The initial-workspace verifier is deliberately no longer meaningful:
+    // the workspace is worker-mutable after the first activation.
+    let failure: unknown;
+    try {
+      await verifyPipelineV2InitialProjectWorkspace(prepared.project_root, prepared.manifest);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect((failure as { reason?: string }).reason).toBe("workspace_mismatch");
+  } finally {
+    await dispose(fixture);
+  }
+});

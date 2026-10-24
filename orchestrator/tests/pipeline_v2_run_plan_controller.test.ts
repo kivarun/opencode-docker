@@ -53,6 +53,8 @@ import {
 } from "../src/pipeline_v2_run_plan_controller_internal.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "run-1";
 const hex = (char: string): string => char.repeat(64);
 const PROTECTED_DIGEST = hex("b");
@@ -385,7 +387,7 @@ async function playPlanning(
   pipeline: ResolvedPipelineV2,
 ): Promise<PipelineV2RunState> {
   const identity = pipelineV2RunPipelineIdentity(pipeline);
-  await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: identity, inputs: BASE_INPUTS });
+  await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: identity, inputs: BASE_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
   await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
   for (const command of agentPhases("planning")) {
     await sink.dispatch(command);

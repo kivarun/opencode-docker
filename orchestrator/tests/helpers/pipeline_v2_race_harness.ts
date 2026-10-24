@@ -21,6 +21,8 @@ import { prepareRunProject, snapshotRunInputs } from "../../src/pipeline_v2_runt
 import { enterPipelineV2Wait } from "../../src/pipeline_v2_wait_controller.ts";
 import { pipelineV2RunPipelineIdentity } from "../../src/pipeline_v2_digest.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 export const STAGE_LOOP_YAML_PLAN_READY = `schema_version: 2
 entry_state: architect
 max_transitions: 40
@@ -402,12 +404,12 @@ export async function prefixCustomWait(
   const pipeline = await loadPipelineV2(harness.bundlePlanReady);
   const runRoot = join(harness.stateRoot, "pipeline-runs", runId);
   await mkdir(runRoot, { recursive: true, mode: 0o700 });
-  await prepareRunProject(harness.projectSource, runRoot);
+  const preparedProjectBinding005 = (await prepareRunProject(harness.projectSource, runRoot)).binding;
   const runInputs = await snapshotRunInputs(pipeline, [{ id: "task", path: harness.taskFile }], runRoot);
   const sink = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId });
   await sink.dispatch({ kind: "create_run", runId, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: runInputs.inputs.map((input) => ({
     id: input.id, type: input.type, protected: input.protected, digest: input.digest,
-  })) });
+  })), projectProvenance: preparedProjectBinding005 });
   await enterPipelineV2Wait({
     runRoot,
     sink,
@@ -415,7 +417,6 @@ export async function prefixCustomWait(
     actions: [{ id: "approve", to: "architect" }],
   });
 }
-
 
 export function summarize(result: ChildResult): Record<string, unknown> {
   const outcome = result.outcome as Record<string, unknown>;

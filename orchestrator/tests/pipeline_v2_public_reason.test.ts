@@ -27,6 +27,8 @@ import {
 import { V2_IDENTITY, V2_INPUTS, tick } from "./pipeline_v2_state_fixtures.ts";
 import type { PipelineV2ResumeRefusalReason } from "../src/pipeline_v2_coordinator.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * The shared machine-readable contract of every pipeline v2 command outcome:
  * `exitCode !== 0` implies an own `reason` property drawn from the one
@@ -243,7 +245,7 @@ async function writeActiveRun(root: string, runId: string, bundleRoot: string): 
   const identity = { ...V2_IDENTITY, bundle_root: bundleRoot };
   const state: PipelineV2RunState = reducePipelineV2RunCommand(
     null,
-    { kind: "create_run", runId, pipeline: identity, inputs: V2_INPUTS },
+    { kind: "create_run", runId, pipeline: identity, inputs: V2_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
     tick(1),
   );
   await writeFile(join(runRoot, "state.json"), JSON.stringify(state), { mode: 0o600 });

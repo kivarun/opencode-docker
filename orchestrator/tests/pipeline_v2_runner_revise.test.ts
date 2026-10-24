@@ -64,6 +64,8 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { hex, startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const PIPELINE = `
 schema_version: 2
 entry_state: architect
@@ -242,7 +244,7 @@ async function drivePrefix(
   const sink = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId, now: nextTick });
   const recording: Array<Record<string, unknown>> = [];
   const rec = commandSink(sink, recording);
-  await prepareRunProject(harness.projectSource, runRoot);
+  const preparedProjectBinding035 = (await prepareRunProject(harness.projectSource, runRoot)).binding;
   const runInputs: RunInputsSnapshot = await snapshotRunInputs(
     pipeline,
     [{ id: "task", path: join(harness.sources, "task.md") }] as readonly RunInputBinding[],
@@ -258,6 +260,7 @@ async function drivePrefix(
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding035,
   });
   const accepted: AcceptedStateOutput[] = [];
   const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {

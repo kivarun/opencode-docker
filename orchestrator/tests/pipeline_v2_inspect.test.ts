@@ -49,6 +49,8 @@ import type { PipelineV2WorkerLogState } from "../src/pipeline_v2_state.ts";
 import { parseWorkerLogArtifact } from "../src/pipeline_v2_worker_log.ts";
 import { publishPipelineV2WorkerLog } from "../src/pipeline_v2_worker_log_store.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * The versioned read-only `orchestrator inspect` command. Every state of
  * the proof matrix is materialized with the real production substrate
@@ -704,7 +706,7 @@ function expectFailure(
 // --- prefix builders (real reducer, real data plane) ------------------------
 
 async function prefixCreateRun(harness: Harness): Promise<RunInputsSnapshot> {
-  await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot);
+  const preparedProjectBinding017 = (await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     harness.pipeline,
     bindingsFor(harness.dirs, harness.pipeline) as readonly RunInputBinding[],
@@ -720,6 +722,7 @@ async function prefixCreateRun(harness: Harness): Promise<RunInputsSnapshot> {
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding017,
   } as never);
   return runInputs;
 }

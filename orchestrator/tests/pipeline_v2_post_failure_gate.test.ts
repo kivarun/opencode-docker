@@ -22,6 +22,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "run-1";
 const hex = (c: string): string => c.repeat(64);
 const PIPELINE_IDENTITY = {
@@ -95,7 +97,7 @@ const STAGE_PHASES: readonly PipelineV2RunCommand[] = [
 /** Planning settled, plan accepted, transition, generation 1 + iteration 1, stage agent failed (ordinary). */
 function failedStageState(): PipelineV2RunState {
   return build([
-    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
     { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
     ...PLANNING_PHASES,
     { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -111,7 +113,7 @@ function failedStageState(): PipelineV2RunState {
 /** Planning agent failed (ordinary) with no plan accepted. */
 function failedPlanningState(): PipelineV2RunState {
   return build([
-    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
     { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
     { kind: "agent_data_prepared" },
     { kind: "agent_execution_session_created", sessionId: "sess-1" },
@@ -124,7 +126,7 @@ function failedPlanningState(): PipelineV2RunState {
 /** Control decision failed. */
 function failedDecisionState(): PipelineV2RunState {
   return build([
-    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
     { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
     ...PLANNING_PHASES,
     { kind: "transition_committed", step: { from: "architect", outcome: "completed", to: "gate", transition_index: 0 }, executionIndex: 1 },
@@ -136,7 +138,7 @@ function failedDecisionState(): PipelineV2RunState {
 /** Stage agent failed with an unconfirmed (failed) session cleanup. */
 function cleanupFailedState(): PipelineV2RunState {
   return build([
-    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+    { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
     { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
     { kind: "agent_data_prepared" },
     { kind: "agent_execution_session_created", sessionId: "sess-1" },
@@ -247,7 +249,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     // create_run keeps its own already-exists rejection
     let createMessage: string | undefined;
     try {
-      reducePipelineV2RunCommand(failed, { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] }, nextTick());
+      reducePipelineV2RunCommand(failed, { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING }, nextTick());
     } catch (cause) {
       createMessage = (cause as Error).message;
     }
@@ -409,7 +411,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     // the honest contract order: the settled planning execution, then the
     // generation and iteration openings at the same boundary
     const settled = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       ...PLANNING_PHASES,
       { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -421,7 +423,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     // boundary, without a generation (the generation probe) and with one
     // (the iteration probe)
     const inFlightWithoutGeneration = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       ...PLANNING_PHASES,
       { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -436,7 +438,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     }
     expect(generationMessage).toContain("opening a stage generation requires the run's last execution 2 to be settled, got the in-flight phase \"evaluating\"");
     const inFlightWithGeneration = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       ...PLANNING_PHASES,
       { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -455,7 +457,7 @@ describe("pipeline v2 post-failure successor gate", () => {
 
   test("13. the successful stage-boundary flow (settled planning -> generation -> iteration -> transition) is not broken", () => {
     const state = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       ...PLANNING_PHASES,
       { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -489,7 +491,7 @@ describe("pipeline v2 post-failure successor gate", () => {
 
   test("15/16. the loader rejects a plan revision whose planning origin execution failed", () => {
     const clean = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       ...PLANNING_PHASES,
       { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -534,7 +536,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     // the forged document turns the settled control execution into a
     // failed one, which the successor gate can never produce
     const controlSettled = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       ...PLANNING_PHASES,
       { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -563,7 +565,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     // boundary, the iteration at the control's start boundary, forged to a
     // failed control execution
     const iterationAtControl = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       ...PLANNING_PHASES,
       { kind: "plan_revision_accepted", planRevision: 1, planSha256: hex("a"), originExecution: 1 },
@@ -748,7 +750,7 @@ describe("pipeline v2 post-failure successor gate", () => {
   test("27. plain create_run works and reads the discriminator exactly once", () => {
     let kindReads = 0;
     const plain = new Proxy(
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] } as PipelineV2RunCommand,
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING } as PipelineV2RunCommand,
       {
         get(target, property, receiver) {
           if (property === "kind") {
@@ -777,7 +779,7 @@ describe("pipeline v2 post-failure successor gate", () => {
     expect(noStateMessage).toBe("command agent_data_prepared rejected: no pipeline v2 run state exists yet");
     // waiting diagnostic
     const waiting = build([
-      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [] },
+      { kind: "create_run", runId: RUN_ID, pipeline: PIPELINE_IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       {
         kind: "run_waiting",
         stateId: "architect",

@@ -64,6 +64,8 @@ import { preparePipelineV2WaitRequest } from "../src/pipeline_v2_wait_manifest.t
 import { publishPipelineV2WaitRequest } from "../src/pipeline_v2_wait_store.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Tests for the unwired production-neutral composition of the full
  * `continue_stage` handoff: the restart-aware intervention facade followed
@@ -284,7 +286,7 @@ class PrefixWorker {
 }
 
 async function prefixCreateRun(harness: Harness): Promise<RunInputsSnapshot> {
-  await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot);
+  const preparedProjectBinding006 = (await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     harness.pipeline,
     [{ id: "task", path: join(harness.dirs.sources, "task.md") }] as readonly RunInputBinding[],
@@ -300,6 +302,7 @@ async function prefixCreateRun(harness: Harness): Promise<RunInputsSnapshot> {
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding006,
   });
   return runInputs;
 }

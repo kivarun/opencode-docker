@@ -79,6 +79,8 @@ import {
   type PipelineV2ContinueStageInterventionOps,
 } from "../src/pipeline_v2_continue_stage_intervention_controller_internal.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "intervention-run";
 const hex = (char: string): string => char.repeat(64);
 const PROTECTED_DIGEST = hex("b");
@@ -295,7 +297,7 @@ async function driveToWaitBoundary(): Promise<Omit<Fixture, "intent" | "reopened
     const runRoot = join(stateRoot, "pipeline-runs", RUN_ID);
     const statePath = join(runRoot, "state.json");
     const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
-    await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS });
+    await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of agentPhases("planning")) {
       await sink.dispatch(command);
@@ -1657,7 +1659,6 @@ test("44. a forged final open state with a forged input digest is refused with t
   }
 }, 15000);
 
-
 /**
  * Bounded concurrent runner for the independent matrix cases: every case
  * builds its own temp fixture, so the heavy matrix loops do not inflate
@@ -1766,7 +1767,6 @@ test("45. the acceptance matrix: every schema-owned mutation is refused before t
   });
 }, 90000);
 
-
 test("46. the restore matrix: every schema-owned mutation is refused before the open", async () => {
   await runBounded(mutationList(), 5, async ([label, mutate]) => {
     const ctx = await driveToSecondWait();
@@ -1794,7 +1794,6 @@ test("46. the restore matrix: every schema-owned mutation is refused before the 
   });
 }, 90000);
 
-
 test("47. the open matrix: every schema-owned mutation of the final state is refused with the verified state", async () => {
   await runBounded(mutationList(), 5, async ([label, mutate]) => {
     const ctx = await driveToSecondWait();
@@ -1821,7 +1820,6 @@ test("47. the open matrix: every schema-owned mutation of the final state is ref
     }
   });
 }, 90000);
-
 
 // --- capture, provenance and caller policy ----------------------------------
 

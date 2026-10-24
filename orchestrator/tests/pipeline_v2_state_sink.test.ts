@@ -18,6 +18,8 @@ import { buildStates, successCommands, tick, V2_IDENTITY, V2_INPUTS } from "./pi
 import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 import type { PipelineStateIo } from "../src/pipeline_state_store.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "run-1";
 
 let clock = 0;
@@ -150,7 +152,7 @@ describe("pipeline v2 run state sink", () => {
         runId: "other-run",
         pipeline: V2_IDENTITY,
         inputs: V2_INPUTS,
-      };
+     projectProvenance: V2_PROJECT_PROVENANCE_BINDING };
       await expect(sink.dispatch(command)).rejects.toThrow(
         'create_run names run "other-run", but this sink owns run "run-1"',
       );

@@ -9,6 +9,8 @@ import {
 import { compiledExecutionRoleFor } from "../src/pipeline_v2_orchestration.ts";
 import type { ResolvedPipelineV2 } from "../src/pipeline_v2.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /** Shared v2 run-state fixtures for the store and sink tests. */
 
 /**
@@ -65,7 +67,7 @@ export function tick(index: number): Date {
  */
 export function successCommands(runId = "run-1"): PipelineV2RunCommand[] {
   return [
-    { kind: "create_run", runId, pipeline: V2_IDENTITY, inputs: V2_INPUTS },
+    { kind: "create_run", runId, pipeline: V2_IDENTITY, inputs: V2_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
     {
       kind: "start_agent_execution",
       stateId: "implement",

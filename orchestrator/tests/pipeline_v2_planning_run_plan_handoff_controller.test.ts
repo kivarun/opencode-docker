@@ -52,6 +52,9 @@ import {
   productionPlanningRunPlanHandoffOps,
   type PipelineV2PlanningRunPlanHandoffOps,
 } from "../src/pipeline_v2_planning_run_plan_handoff_controller_internal.ts";
+
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "handoff-run";
 const STAGE_ID = "stage-1";
 const INITIAL_BUDGET = 2;
@@ -245,14 +248,14 @@ async function buildPrefix(): Promise<Prefix> {
     clockCounter = 0;
     const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
     const recording = recordingSink(sink, Infinity);
-    await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+    const preparedProjectBinding020 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
     const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
     await recording.dispatch({
       kind: "create_run",
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    });
+   projectProvenance: preparedProjectBinding020 });
     const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
     await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of [
@@ -1517,14 +1520,14 @@ async function buildCycledPrefix(cycles: number): Promise<Prefix> {
     clockCounter = 0;
     const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
     const recording = recordingSink(sink, Infinity);
-    await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+    const preparedProjectBinding021 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
     const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
     await recording.dispatch({
       kind: "create_run",
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    });
+   projectProvenance: preparedProjectBinding021 });
     const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
     await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of [
@@ -1913,14 +1916,14 @@ async function buildTwoStagePrefix(stageCount: 2 | 3 | 4): Promise<Omit<Prefix, 
     clockCounter = 0;
     const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
     const recording = recordingSink(sink, Infinity);
-    await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+    const preparedProjectBinding022 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
     const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
     await recording.dispatch({
       kind: "create_run",
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    });
+   projectProvenance: preparedProjectBinding022 });
     const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
     await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of [
@@ -3131,13 +3134,14 @@ async function buildInitialPrefix(): Promise<Prefix> {
   clockCounter = 0;
   const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
   const recording = recordingSink(sink, Infinity);
-  await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+  const preparedProjectBinding023 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
   const runInputs = await snapshotRunInputs(pipeline1, [{ id: "task", path: join(fixture.root, "userdata", "task.txt") }], fixture.runRoot);
   await recording.dispatch({
     kind: "create_run",
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(pipeline1),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+    projectProvenance: preparedProjectBinding023,
   });
   const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
   await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });

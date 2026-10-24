@@ -53,6 +53,8 @@ import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 import type { PipelineStateIo } from "../src/pipeline_state_store.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Tests for the production-neutral resume entrypoint
  * `resumePipelineV2Run`: continuation of an already durable pipeline v2
@@ -588,7 +590,7 @@ class PrefixWorker {
 
 /** Dispatches `create_run` after preparing the run-owned project copy and the input snapshot. */
 async function prefixCreateRun(harness: ResumeHarness): Promise<RunInputsSnapshot> {
-  await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot);
+  const preparedProjectBinding007 = (await prepareRunProject(harness.dirs.projectSource, harness.dirs.runRoot)).binding;
   const runInputs = await snapshotRunInputs(
     harness.pipeline,
     bindingsFor(harness.dirs, harness.pipeline) as readonly RunInputBinding[],
@@ -604,6 +606,7 @@ async function prefixCreateRun(harness: ResumeHarness): Promise<RunInputsSnapsho
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding007,
   });
   return runInputs;
 }
@@ -1121,13 +1124,14 @@ test("5. uninterrupted run and pause/resume produce equivalent durable states", 
   resetClock();
   const freshB = new PipelineV2RunStateSink({ stateRoot: stateRootB, runId: "resume-run", io: countingIo().io, now: nextTick });
   const prefixRec = new RecordingSink(freshB);
-  await prepareRunProject(dirs.projectSource, runRootB);
+  const preparedProjectBinding008 = (await prepareRunProject(dirs.projectSource, runRootB)).binding;
   const runInputs = await snapshotRunInputs(pipeline, bindingsFor(dirs, pipeline) as readonly RunInputBinding[], runRootB);
   await prefixRec.dispatch({
     kind: "create_run",
     runId: "resume-run",
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+    projectProvenance: preparedProjectBinding008,
   });
   const acceptedB: AcceptedStateOutput[] = [];
   await prefixAgentStep(
@@ -1750,7 +1754,7 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
     now: nextTick,
   });
   const poisonedRecording = new RecordingSink(poisonedFresh);
-  await prepareRunProject(poisoned.dirs.projectSource, poisoned.dirs.runRoot);
+  const preparedProjectBinding009 = (await prepareRunProject(poisoned.dirs.projectSource, poisoned.dirs.runRoot)).binding;
   const poisonedInputs = await snapshotRunInputs(
     poisoned.pipeline,
     bindingsFor(poisoned.dirs, poisoned.pipeline) as readonly RunInputBinding[],
@@ -1766,6 +1770,7 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding009,
   });
   const poisonError = await poisonedRecording
     .dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" })
@@ -1968,7 +1973,7 @@ test("the reducer's state schema stays v6 and resume never dispatches create_run
   expect(allCommands.filter((command) => command.kind === "create_run")).toHaveLength(1);
   expect(allCommands.filter((command) => String(command.kind).startsWith("wait_"))).toHaveLength(0);
   const durable = await readDurableState(harness);
-  expect(durable.schema_version).toBe(9);
+  expect(durable.schema_version).toBe(10);
 });
 
 test("a malformed durable state document refuses the reopen without side effects", async () => {

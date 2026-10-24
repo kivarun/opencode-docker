@@ -1610,7 +1610,6 @@ test("25. the whole accepted history is validated before the latest record is se
   });
 });
 
-
 test("26. data-plane failures carry typed runtime reasons assigned by operation semantics", async () => {
   await withRuntime(async (dirs, sources) => {
     const pipeline = await loadPipelineV2(dirs.bundle);

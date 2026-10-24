@@ -1,6 +1,6 @@
 import { isAbsolute, join } from "node:path";
 import { constants, type Stats } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -234,6 +234,131 @@ export interface PreparedRunProject {
 }
 
 /**
+ * One copy-time provenance capture record of the single project copy
+ * traversal. The record describes exactly the object this traversal read
+ * and copied: its source permission mode (the scanned `lstat`), the
+ * normalized workspace permission mode, and — for regular files — the
+ * byte count and the SHA-256 of the exact copied bytes plus the source
+ * hardlink characteristic. `dev`/`ino` are used only as ephemeral
+ * copy-time identity to derive the canonical per-manifest hardlink groups
+ * and are never serialized into the durable manifest. The records are
+ * consumed by the provenance manifest builder; this module never
+ * publishes or stores them itself.
+ */
+export interface ProjectCopyCaptureEntry {
+  readonly path: string;
+  readonly kind: "directory" | "regular_file" | "symlink";
+  readonly source_mode?: number;
+  readonly workspace_mode?: number;
+  readonly byte_count?: number;
+  readonly sha256?: string;
+  readonly multiple_links?: boolean;
+  readonly target?: string;
+  /**
+   * Copy-time confirmation that the created workspace symlink's target
+   * text equals the source link target byte for byte (symlink records
+   * only).
+   */
+  readonly targets_identical?: true;
+  /**
+   * Ephemeral copy-time identity of the source object, used only to
+   * derive the canonical hardlink groups and stripped from every record
+   * before the capture leaves this module. Never serialized.
+   */
+  source_identity_dev?: number;
+  source_identity_ino?: number;
+}
+
+/**
+ * One staged, fully copied but not yet published project tree: the
+ * staging directory with its ownership identity and the capture records
+ * of the single traversal that filled it. The staging tree is owned by
+ * the holder of this object until it is published or discarded.
+ */
+export interface StagedProjectCopy {
+  readonly run_root: string;
+  readonly staging_path: string;
+  readonly staging_identity: { readonly dev: number; readonly ino: number };
+  readonly entries: readonly ProjectCopyCaptureEntry[];
+}
+
+interface ValidatedProjectCopyInputs {
+  readonly runRootCanonical: string;
+  readonly projectPath: string;
+  readonly sourceCanonical: string;
+}
+
+/**
+ * The shared validation prefix of every project-copy entry point: the
+ * run root must be an existing absolute canonical real non-symlink
+ * directory, `<runRoot>/project` must be absent, the source must be an
+ * absolute real non-symlink directory, and source and run root must not
+ * overlap in either direction.
+ */
+async function validateProjectCopyInputs(
+  projectSourcePath: string,
+  runRoot: string,
+): Promise<ValidatedProjectCopyInputs> {
+  if (typeof projectSourcePath !== "string" || projectSourcePath === "") {
+    throw new PipelineError("project source path must be a non-empty string");
+  }
+  if (!isAbsolute(projectSourcePath)) {
+    throw new PipelineError(
+      "project source path must be an absolute path, got a relative path",
+    );
+  }
+  if (!isAbsolute(runRoot)) {
+    throw new PipelineError("run root must be an absolute path");
+  }
+  const runRootCanonical = await requireCanonicalRunRoot(runRoot, "run root");
+  if (runRootCanonical !== runRoot) {
+    throw new PipelineError(
+      `run root ${runRoot} is not canonical; pass the canonical path ${runRootCanonical}`,
+    );
+  }
+
+  const projectPath = join(runRootCanonical, PROJECT_ROOT_NAME);
+  const existingProject = await projectCopyLstatOrNull(
+    projectPath,
+    "run project root could not be inspected",
+  );
+  if (existingProject !== null) {
+    throw new PipelineError(
+      `run project root already exists at the fixed run-root location and is ${describeEntry(existingProject)}`,
+    );
+  }
+
+  const sourceInfo = await projectCopyLstatOrNull(
+    projectSourcePath,
+    "project source could not be inspected",
+  );
+  if (sourceInfo === null) {
+    throw new PipelineError("project source does not exist");
+  }
+  if (sourceInfo.isSymbolicLink() || !sourceInfo.isDirectory()) {
+    throw new PipelineError(
+      `project source exists but is ${describeEntry(sourceInfo)}; pass a real non-symlink directory`,
+    );
+  }
+  let sourceCanonical: string;
+  try {
+    sourceCanonical = await realpath(projectSourcePath);
+  } catch (cause) {
+    throw projectCopyFailure("project source cannot be canonicalized", cause);
+  }
+  if (
+    sourceCanonical === runRootCanonical ||
+    isInsideRoot(runRootCanonical, sourceCanonical) ||
+    isInsideRoot(sourceCanonical, runRootCanonical)
+  ) {
+    throw new PipelineError(
+      "project source and the canonical run root must not overlap in either direction",
+    );
+  }
+  return { runRootCanonical, projectPath, sourceCanonical };
+}
+
+/**
  * Prepare the run-owned shared project directory `<runRoot>/project` as
  * an orchestrator-owned copy of the user's project source directory.
  *
@@ -312,68 +437,69 @@ export async function prepareProjectCopy(
   runRoot: string,
 ): Promise<PreparedRunProject> {
   return await withCopyReason(async () => {
-    if (typeof projectSourcePath !== "string" || projectSourcePath === "") {
-      throw new PipelineError("project source path must be a non-empty string");
-    }
-    if (!isAbsolute(projectSourcePath)) {
-      throw new PipelineError(
-        "project source path must be an absolute path, got a relative path",
-      );
-    }
-    if (!isAbsolute(runRoot)) {
-      throw new PipelineError("run root must be an absolute path");
-    }
-    const runRootCanonical = await requireCanonicalRunRoot(runRoot, "run root");
-    if (runRootCanonical !== runRoot) {
-      throw new PipelineError(
-        `run root ${runRoot} is not canonical; pass the canonical path ${runRootCanonical}`,
-      );
-    }
-
-    const projectPath = join(runRootCanonical, PROJECT_ROOT_NAME);
-    const existingProject = await projectCopyLstatOrNull(
-      projectPath,
-      "run project root could not be inspected",
-    );
-    if (existingProject !== null) {
-      throw new PipelineError(
-        `run project root already exists at the fixed run-root location and is ${describeEntry(existingProject)}`,
-      );
-    }
-
-    const sourceInfo = await projectCopyLstatOrNull(
-      projectSourcePath,
-      "project source could not be inspected",
-    );
-    if (sourceInfo === null) {
-      throw new PipelineError("project source does not exist");
-    }
-    if (sourceInfo.isSymbolicLink() || !sourceInfo.isDirectory()) {
-      throw new PipelineError(
-        `project source exists but is ${describeEntry(sourceInfo)}; pass a real non-symlink directory`,
-      );
-    }
-    let sourceCanonical: string;
+    const staged = await stageProjectCopy(io, projectSourcePath, runRoot);
     try {
-      sourceCanonical = await realpath(projectSourcePath);
+      await publishStagedProjectCopy(io, staged);
     } catch (cause) {
-      throw projectCopyFailure("project source cannot be canonicalized", cause);
+      await discardStagedProjectCopy(io, staged);
+      throw cause;
     }
-    if (
-      sourceCanonical === runRootCanonical ||
-      isInsideRoot(runRootCanonical, sourceCanonical) ||
-      isInsideRoot(sourceCanonical, runRootCanonical)
-    ) {
-      throw new PipelineError(
-        "project source and the canonical run root must not overlap in either direction",
-      );
-    }
+    const projectPath = join(staged.run_root, PROJECT_ROOT_NAME);
+    return Object.freeze({ run_root: staged.run_root, project_root: projectPath });
+  });
+}
 
-    let staging: ProjectStagingDirectory | null = null;
+/**
+ * Stage the run-owned project copy without publishing it: validation
+ * prefix, exclusive staging directory, and the single copy traversal that
+ * both fills the staging tree and records the provenance capture of
+ * exactly the objects and bytes it copied. Every failure after the
+ * staging identity was fixed cleans exactly the own staging tree; the
+ * source and every existing object stay untouched. The provenance capture
+ * is a by-product of this traversal — there is no second source scan.
+ */
+export async function stageProjectCopy(
+  io: ProjectCopyIo,
+  projectSourcePath: string,
+  runRoot: string,
+): Promise<StagedProjectCopy> {
+  return await withCopyReason(async () => {
+    const { runRootCanonical, sourceCanonical } = await validateProjectCopyInputs(
+      projectSourcePath,
+      runRoot,
+    );
+    const staging = await createProjectStagingDirectory(io, runRootCanonical);
+    const capture: ProjectCopyCaptureEntry[] = [];
     try {
-      staging = await createProjectStagingDirectory(io, runRootCanonical);
-      await copyProjectTree(io, sourceCanonical, staging.path);
-      // Fresh absence re-check immediately before the atomic publication.
+      await copyProjectTree(io, sourceCanonical, staging.path, capture);
+    } catch (cause) {
+      await removeProjectStagingTree(io, staging.path, staging, runRootCanonical);
+      throw cause;
+    }
+    finalizeCaptureHardlinkGroups(capture);
+    return Object.freeze({
+      run_root: runRootCanonical,
+      staging_path: staging.path,
+      staging_identity: Object.freeze({ dev: staging.dev, ino: staging.ino }),
+      entries: Object.freeze(capture.map((entry) => Object.freeze({ ...entry }))),
+    });
+  });
+}
+
+/**
+ * Publish one staged project copy: a fresh absence re-check of
+ * `<runRoot>/project` immediately before the atomic rename, then exactly
+ * one `rename()`. On a rename failure the staging tree is removed with
+ * its ownership proof and the sanitized failure is surfaced; the staging
+ * tree of a successful publication no longer exists.
+ */
+export async function publishStagedProjectCopy(
+  io: ProjectCopyIo,
+  staged: StagedProjectCopy,
+): Promise<void> {
+  return await withCopyReason(async () => {
+    const projectPath = join(staged.run_root, PROJECT_ROOT_NAME);
+    try {
       const beforeRename = await projectCopyLstatOrNull(
         projectPath,
         "run project root could not be inspected",
@@ -384,18 +510,39 @@ export async function prepareProjectCopy(
         );
       }
       try {
-        await rename(staging.path, projectPath);
+        await rename(staged.staging_path, projectPath);
       } catch (cause) {
         throw projectCopyFailure("run project copy could not be published", cause);
       }
     } catch (cause) {
-      if (staging !== null) {
-        await removeProjectStagingTree(io, staging.path, staging, runRootCanonical);
-      }
+      await removeProjectStagingTree(
+        io,
+        staged.staging_path,
+        staged.staging_identity,
+        staged.run_root,
+      );
       throw cause;
     }
-    return Object.freeze({ run_root: runRootCanonical, project_root: projectPath });
   });
+}
+
+/**
+ * Ownership-checked removal of one staged project copy that will not be
+ * published (the caller's recovery path after a failure between staging
+ * and publication). Best effort: a cleanup failure never replaces the
+ * caller's original failure and a vanished or substituted tree is left
+ * alone.
+ */
+export async function discardStagedProjectCopy(
+  io: ProjectCopyIo,
+  staged: StagedProjectCopy,
+): Promise<void> {
+  await removeProjectStagingTree(
+    io,
+    staged.staging_path,
+    staged.staging_identity,
+    staged.run_root,
+  );
 }
 
 /**
@@ -533,12 +680,15 @@ async function removeProjectStagingTree(
  * directories, regular files and symlinks (target text verbatim, never
  * resolved), including hidden entries and empty directories, in
  * deterministic code-unit sorted order. Any other object kind fails
- * closed.
+ * closed. The same traversal records the provenance capture of exactly
+ * the objects it reads and the bytes it copies — one traversal, one
+ * capture, no second source scan.
  */
 async function copyProjectTree(
   io: ProjectCopyIo,
   sourceCanonical: string,
   destinationRoot: string,
+  capture: ProjectCopyCaptureEntry[],
 ): Promise<void> {
   const copyDirectory = async (sourceDir: string, relativeDir: string): Promise<void> => {
     let dirents;
@@ -586,6 +736,29 @@ async function copyProjectTree(
             cause,
           );
         }
+        // Copy-time confirmation that the created workspace symlink's
+        // target text equals the source link target byte for byte.
+        let workspaceTarget: string;
+        try {
+          workspaceTarget = await readlink(childDestination);
+        } catch (cause) {
+          throw projectEntryFailure(
+            "project source symlink entry could not be confirmed in the workspace",
+            childRelative,
+            cause,
+          );
+        }
+        if (workspaceTarget !== target) {
+          throw new PipelineError(
+            `project source symlink entry ${JSON.stringify(childRelative)} was not copied with its verbatim target`,
+          );
+        }
+        capture.push({
+          path: childRelative,
+          kind: "symlink",
+          target,
+          targets_identical: true,
+        });
       } else if (info.isDirectory()) {
         try {
           await mkdir(childDestination, { mode: 0o700 });
@@ -597,9 +770,17 @@ async function copyProjectTree(
             cause,
           );
         }
+        capture.push({
+          path: childRelative,
+          kind: "directory",
+          source_mode: info.mode & 0o777,
+          workspace_mode: 0o700,
+        });
         await copyDirectory(childSource, childRelative);
       } else if (info.isFile()) {
-        await copyProjectRegularFile(io, childSource, childDestination, childRelative, info);
+        capture.push(
+          await copyProjectRegularFile(io, childSource, childDestination, childRelative, info),
+        );
       } else {
         throw new PipelineError(
           `project source entry ${JSON.stringify(childRelative)} is a FIFO, socket, device or another unsupported object`,
@@ -611,18 +792,74 @@ async function copyProjectTree(
 }
 
 /**
+ * The canonical per-manifest hardlink groups: entries whose source objects
+ * shared one copy-time inode identity are assigned one group index (1-based)
+ * in deterministic sorted-entry order. The grouping is computed after the
+ * traversal over the sorted capture, so identical copies always produce
+ * identical group numbers. After the assignment the ephemeral source
+ * identity fields are stripped from every record: they never leave this
+ * module and are never serialized.
+ */
+function finalizeCaptureHardlinkGroups(capture: ProjectCopyCaptureEntry[]): void {
+  const sorted = [...capture]
+    .filter((entry) => entry.kind === "regular_file" && entry.multiple_links === true)
+    .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  const groups = new Map<string, number>();
+  const result = new Map<string, number>();
+  let nextGroup = 1;
+  for (const entry of sorted) {
+    const key = `${entry.source_identity_dev}:${entry.source_identity_ino}`;
+    let group = groups.get(key);
+    if (group === undefined) {
+      group = nextGroup;
+      nextGroup += 1;
+      groups.set(key, group);
+    }
+    result.set(entry.path, group);
+  }
+  for (const entry of capture) {
+    const group = result.get(entry.path);
+    const mutable = entry as {
+      hardlink_group?: number;
+      source_identity_dev?: number;
+      source_identity_ino?: number;
+    };
+    if (group !== undefined) {
+      mutable.hardlink_group = group;
+    }
+    delete mutable.source_identity_dev;
+    delete mutable.source_identity_ino;
+  }
+}
+
+/**
  * Stream one regular file into the exclusive destination: the source is
  * opened `O_NOFOLLOW|O_NONBLOCK` (a FIFO substituted between scan and open
  * cannot block the run), the open object must still be the scanned regular
- * file (same kind, same dev/ino), and the destination is created
- * `O_CREAT|O_EXCL|O_NOFOLLOW` with the contract mode. Every block is fully
- * written with an internal write-all loop: partial writes advance the
- * buffer offset and the file position, a zero-progress or impossible
- * `bytesWritten` fails the operation, and only fully written blocks
- * advance the read position. Every expected filesystem failure is a
- * sanitized run-level input failure; close errors never replace an
- * already failing copy, and a close error after an otherwise successful
- * copy becomes the typed failure itself.
+ * file (same kind, same dev/ino, same permission mode and same content
+ * timestamps — a source object touched between the scan and the open is
+ * rejected), and the destination is created `O_CREAT|O_EXCL|O_NOFOLLOW`
+ * with the contract mode. Every block is fully written with an internal
+ * write-all loop: partial writes advance the buffer offset and the file
+ * position, a zero-progress or impossible `bytesWritten` fails the
+ * operation, and only fully written blocks advance the read position. The
+ * SHA-256 of the exact copied bytes and the total byte count are captured
+ * incrementally from the same read loop that fills the destination. After
+ * the read the open object is re-statted: a source object whose size,
+ * timestamps, mode or identity changed while it was being read fails the
+ * operation closed — the copy must be a coherent read of one stable
+ * object, and the provenance capture must describe exactly the bytes that
+ * were copied. This is a best-effort coherence proof at millisecond
+ * timestamp granularity, not a guarantee against an adversarial
+ * same-millisecond same-size rewrite; a coherent copy is still never a
+ * whole-tree atomic snapshot without project-level cooperation. Every
+ * expected filesystem failure is a sanitized run-level input failure;
+ * close errors never replace an already failing copy, and a close error
+ * after an otherwise successful copy becomes the typed failure itself.
+ * The returned capture record carries the source permission mode, the
+ * normalized workspace permission mode, the byte count, the content
+ * digest, the source hardlink characteristic and the ephemeral source
+ * identity for the hardlink grouping.
  */
 async function copyProjectRegularFile(
   io: ProjectCopyIo,
@@ -630,7 +867,8 @@ async function copyProjectRegularFile(
   destinationPath: string,
   childRelative: string,
   scannedInfo: Stats,
-): Promise<void> {
+): Promise<ProjectCopyCaptureEntry> {
+  const sourceMode = scannedInfo.mode & 0o777;
   const mode = (scannedInfo.mode & 0o111) !== 0 ? 0o700 : 0o600;
   let source: FileHandle;
   try {
@@ -646,6 +884,7 @@ async function copyProjectRegularFile(
     );
   }
   let sourceCloseFailure: unknown = undefined;
+  let captureEntry: ProjectCopyCaptureEntry | undefined = undefined;
   try {
     const opened = await source.stat();
     if (opened.isSymbolicLink() || !opened.isFile()) {
@@ -656,6 +895,25 @@ async function copyProjectRegularFile(
     if (opened.dev !== scannedInfo.dev || opened.ino !== scannedInfo.ino) {
       throw new PipelineError(
         `project source entry ${JSON.stringify(childRelative)} was replaced between scan and open`,
+      );
+    }
+    if ((opened.mode & 0o777) !== sourceMode) {
+      throw new PipelineError(
+        `project source entry ${JSON.stringify(childRelative)} changed permission mode between scan and open`,
+      );
+    }
+    if (opened.nlink !== scannedInfo.nlink) {
+      throw new PipelineError(
+        `project source entry ${JSON.stringify(childRelative)} changed its hardlink count between scan and open`,
+      );
+    }
+    if (
+      opened.size !== scannedInfo.size ||
+      opened.mtimeMs !== scannedInfo.mtimeMs ||
+      opened.ctimeMs !== scannedInfo.ctimeMs
+    ) {
+      throw new PipelineError(
+        `project source entry ${JSON.stringify(childRelative)} was modified between scan and open`,
       );
     }
     let destination: FileHandle;
@@ -672,6 +930,8 @@ async function copyProjectRegularFile(
         cause,
       );
     }
+    const hasher = createHash("sha256");
+    let byteCount = 0;
     let destinationCompleted = false;
     try {
       try {
@@ -683,6 +943,8 @@ async function copyProjectRegularFile(
           if (bytesRead === 0) {
             break;
           }
+          hasher.update(chunk.subarray(0, bytesRead));
+          byteCount += bytesRead;
           let written = 0;
           while (written < bytesRead) {
             const remaining = bytesRead - written;
@@ -736,6 +998,42 @@ async function copyProjectRegularFile(
         cause,
       );
     }
+    // Copy-time coherence proof: the source object must be unchanged from
+    // its opened identity through the whole read (identity, size,
+    // permission mode, hardlink count and content timestamps). A source
+    // object that was written while it was being read cannot be proven
+    // coherent and fails the whole preparation closed.
+    const after = await source.stat();
+    if (
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      after.isFile() !== true ||
+      (after.mode & 0o777) !== sourceMode ||
+      after.nlink !== opened.nlink ||
+      after.size !== opened.size ||
+      after.mtimeMs !== opened.mtimeMs ||
+      after.ctimeMs !== opened.ctimeMs
+    ) {
+      throw new PipelineError(
+        `project source entry ${JSON.stringify(childRelative)} was modified while it was being read`,
+      );
+    }
+    if (after.size !== byteCount) {
+      throw new PipelineError(
+        `project source entry ${JSON.stringify(childRelative)} was not read completely`,
+      );
+    }
+    captureEntry = {
+      path: childRelative,
+      kind: "regular_file",
+      source_mode: sourceMode,
+      workspace_mode: mode,
+      byte_count: byteCount,
+      sha256: hasher.digest("hex"),
+      multiple_links: opened.nlink > 1,
+      source_identity_dev: opened.dev,
+      source_identity_ino: opened.ino,
+    };
   } catch (cause) {
     if (cause instanceof PipelineError) {
       throw cause;
@@ -763,4 +1061,11 @@ async function copyProjectRegularFile(
       sourceCloseFailure,
     );
   }
+  if (captureEntry === undefined) {
+    throw projectEntryFailure(
+      "project source file entry could not be copied",
+      childRelative,
+    );
+  }
+  return captureEntry;
 }

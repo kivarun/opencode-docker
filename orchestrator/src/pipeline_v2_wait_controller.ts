@@ -7,6 +7,7 @@ import {
   type PipelineV2RunCommand,
   type PipelineV2RunState,
   type PipelineV2WaitRecord,
+  PIPELINE_V2_RUN_STATE_SCHEMA_VERSION,
 } from "./pipeline_v2_state.ts";
 import {
   PipelineV2RunStateDurabilityError,
@@ -315,7 +316,7 @@ function captureBoundary(
     throw controllerError("invalid_state", operation, "no durable pipeline v2 run state exists yet", null);
   }
   if (
-    snapshot["schema_version"] !== 9 ||
+    snapshot["schema_version"] !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION ||
     !isRecord(snapshot["pipeline"]) ||
     (snapshot["pipeline"] as Record<string, unknown>)["schema_version"] !== 2
   ) {

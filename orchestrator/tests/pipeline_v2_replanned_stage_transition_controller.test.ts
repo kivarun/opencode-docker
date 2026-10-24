@@ -48,6 +48,8 @@ import { preparePipelineV2WaitRequest } from "../src/pipeline_v2_wait_manifest.t
 import { publishPipelineV2WaitRequest } from "../src/pipeline_v2_wait_store.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "run-1";
 const hex = (char: string): string => char.repeat(64);
 const PROTECTED_DIGEST = hex("b");
@@ -242,7 +244,7 @@ async function transitionReady(options: TransitionReadyOptions = {}): Promise<Re
   return await withPipeline(async (pipeline) => {
     const fixture = await setupRun();
     const sink = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
-    await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS });
+    await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     const decisionShift = options.withDecisionExecution === true ? 1 : 0;
     if (options.withDecisionExecution === true) {
       // A historical decision execution with a correct selected result:

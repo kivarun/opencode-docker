@@ -58,6 +58,8 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const PIPELINE = `
 schema_version: 2
 entry_state: architect
@@ -384,7 +386,7 @@ async function driveTwoCyclePrefix(harness: Harness, runId: string = RUN_ID): Pr
   const pipeline = await loadPipelineV2(harness.bundle);
   const sink = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId, now: nextTick });
   const rec = commandSink(sink, []);
-  await prepareRunProject(harness.projectSource, runRoot);
+  const preparedProjectBinding033 = (await prepareRunProject(harness.projectSource, runRoot)).binding;
   const runInputs: RunInputsSnapshot = await snapshotRunInputs(
     pipeline,
     [{ id: "task", path: join(harness.sources, "task.md") }] as readonly RunInputBinding[],
@@ -400,6 +402,7 @@ async function driveTwoCyclePrefix(harness: Harness, runId: string = RUN_ID): Pr
       protected: entry.protected,
       digest: entry.digest,
     })),
+    projectProvenance: preparedProjectBinding033,
   } as never);
   let accepted: AcceptedStateOutput[] = [];
   accepted = await runPlanningActivation(pipeline, runInputs, accepted, rec as never, "architect", "architect", "plan", 1, P1_PROPOSAL);

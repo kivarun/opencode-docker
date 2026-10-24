@@ -37,6 +37,8 @@ import {
 import { E2E_YAML } from "./pipeline_v2_events_fixture.ts";
 import { faultIo } from "./state_io_test_helpers.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const ROOTS: string[] = [];
 afterEach(async () => {
   for (const root of ROOTS.splice(0)) {
@@ -147,7 +149,7 @@ describe("events projection owner", () => {
     const covered = new Set<string>(state.commit_history.map((entry) => entry.kind));
     const decisionState = validatePipelineV2RunState(
       apply([
-        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [] },
+        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
         { kind: "start_decision_execution", stateId: "architect", inputDigest: "a".repeat(64), executionRole: "planning" },
         { kind: "decision_evaluated", result: { status: "selected", outcome: "s2", decision: "s2", rule_id: "r1", active_constraint_ids: [] } },
       ]),
@@ -157,7 +159,7 @@ describe("events projection owner", () => {
     }
     const decisionFailedState = validatePipelineV2RunState(
       apply([
-        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [] },
+        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
         { kind: "start_decision_execution", stateId: "architect", inputDigest: "a".repeat(64), executionRole: "planning" },
         { kind: "decision_failed", reason: "decision_input_invalid" },
       ]),
@@ -167,7 +169,7 @@ describe("events projection owner", () => {
     }
     const failedState = validatePipelineV2RunState(
       apply([
-        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [] },
+        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
         { kind: "start_agent_execution", stateId: "architect", profile: "p", executionRole: "planning" },
         { kind: "agent_data_prepared" },
         { kind: "agent_failed", reason: "worker_failed", sessionCleanup: { execution: "not_required", tool: "not_required" }, workerLog: { status: "unavailable" }  },
@@ -179,7 +181,7 @@ describe("events projection owner", () => {
     }
     const cleanupState = validatePipelineV2RunState(
       apply([
-        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [] },
+        { kind: "create_run", runId: "r", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
         { kind: "start_agent_execution", stateId: "architect", profile: "p", executionRole: "planning" },
         { kind: "agent_data_prepared" },
         { kind: "agent_execution_session_created", sessionId: "s" },
@@ -284,7 +286,7 @@ async function seedRun(
 ): Promise<PipelineV2RunStateSink> {
   const pipeline = await loadPipelineV2(bundle);
   const sink = new PipelineV2RunStateSink({ stateRoot, runId });
-  await sink.dispatch({ kind: "create_run", runId, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: [] });
+  await sink.dispatch({ kind: "create_run", runId, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
   for (const command of commands) {
     await sink.dispatch(command as never);
   }
@@ -422,7 +424,7 @@ describe("events across crash windows and concurrent appends", () => {
     });
     let durabilityUnknown = false;
     try {
-      await sink.dispatch({ kind: "create_run", runId: "ev-dur", pipeline: identity, inputs: [] });
+      await sink.dispatch({ kind: "create_run", runId: "ev-dur", pipeline: identity, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     } catch {
       durabilityUnknown = true;
     }
@@ -441,7 +443,7 @@ describe("events across crash windows and concurrent appends", () => {
     const pipeline = await loadPipelineV2(dirs.bundle);
     const identity = pipelineV2RunPipelineIdentity(pipeline);
     const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId: "ev-conc" });
-    await sink.dispatch({ kind: "create_run", runId: "ev-conc", pipeline: identity, inputs: [] });
+    await sink.dispatch({ kind: "create_run", runId: "ev-conc", pipeline: identity, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     await sink.dispatch(ladderCommands()[0] as never);
     await sink.dispatch(ladderCommands()[1] as never);
     const page1 = await eventsPipelineV2Run({ runId: "ev-conc", stateRoot: dirs.stateRoot, limit: 3 });
@@ -505,7 +507,7 @@ describe("events leakage matrix", () => {
     const SESSION = "sess-CANARY-SESSION-ID";
     const DIGEST = "d".repeat(63) + "1";
     const commands: PipelineV2RunCommand[] = [
-      { kind: "create_run", runId: "canary-run", pipeline: { ...IDENTITY, bundle_root: HOST_PATH }, inputs: [] },
+      { kind: "create_run", runId: "canary-run", pipeline: { ...IDENTITY, bundle_root: HOST_PATH }, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "CANARY-PROFILE", executionRole: "planning" },
       { kind: "agent_data_prepared" },
       { kind: "agent_execution_session_created", sessionId: SESSION },

@@ -8,6 +8,7 @@
 // matrices and fixtures are unchanged and the default suite command stays
 // untouched.
 import { chmodSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +23,8 @@ import {
 import type { AuthFetcher, CliRunner, CliRunOptions, CliStdio } from "../src/docker_helper.ts";
 import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_runtime.ts";
 import { translateProjectionPath } from "../src/projection_fs.ts";
+import { prepareRunProject } from "../src/pipeline_v2_runtime.ts";
+import { PipelineV2RuntimeError } from "../src/pipeline_v2_runtime_error.ts";
 import type { PipelineV2ExecutionState, PipelineV2RunState } from "../src/pipeline_v2_state.ts";
 
 function asAgent(
@@ -1293,7 +1296,6 @@ test("25. a runner timeout keeps worker_timeout when no signal is forwarded", as
   expect(deleteIds(captured.transport)).toEqual(["dhs_fake_2", "dhs_fake_1"]);
 }, 15000);
 
-
 // --- fix 1: the protected preflight gate -------------------------------------
 
 function validOptions(
@@ -1757,3 +1759,75 @@ test("26. the projection suffix translation admits only clean relative paths", (
   expect(translateProjectionPath("/a", "/b", "/a/../x").ok).toBe(false);
   expect(translateProjectionPath("/a", "/b", "/z").ok).toBe(false);
 }, 15000);
+
+// --- project provenance binding (state schema v10) --------------------------
+
+test("37. the provenance manifest is durable before the first activation and stays byte-identical through terminal success", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runId = "11111111-2222-3333-4444-555555555555";
+  const manifestPath = join(runRootPath(harness, runId), "project-provenance.json");
+  const captured = await runScript(harness, {
+    fixedRunId: runId,
+    workerOutputs: { coder: { report: JSON.stringify({ f1: true, f2: false }) } },
+  });
+  const state = expectOk(captured);
+  // The manifest existed before any worker ran: the worker output only
+  // exists after the runner's fake activation completed, so a manifest
+  // content that matches the initial project proves the ordering.
+  const manifestBytes = await readFile(manifestPath, "utf8");
+  expect(manifestBytes.endsWith("\n")).toBe(false);
+  const manifest = JSON.parse(manifestBytes) as { schema_version: number; kind: string; copy_policy_version: number; entries: unknown[] };
+  expect(manifest.schema_version).toBe(1);
+  expect(manifest.kind).toBe("pipeline_v2_project_provenance");
+  expect(manifest.copy_policy_version).toBe(1);
+  // The durable binding matches the manifest exactly.
+  expect(state.project_provenance.digest).toBe(
+    createHash("sha256").update("pipeline-v2-project-provenance\0", "utf8").update(manifestBytes, "utf8").digest("hex"),
+  );
+  expect(state.project_provenance.entry_count).toBe(manifest.entries.length);
+  expect(state.project_provenance.copy_policy_version).toBe(1);
+  // The manifest is bound inside create_run: revision 1 already carries it.
+  const revision1 = JSON.parse(await readFile(statePath(harness, runId), "utf8")) as { project_provenance: unknown };
+  expect(revision1.project_provenance).toEqual(state.project_provenance);
+  // No absolute host paths and no source paths in the manifest or the state.
+  expect(manifestBytes).not.toContain(harness.projectSource);
+  expect(manifestBytes).not.toContain(runRootPath(harness, runId));
+  expect(JSON.stringify(state)).not.toContain(harness.projectSource);
+});
+
+test("38. worker workspace changes do not touch the provenance manifest (C6)", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runId = "66666666-7777-8888-9999-000000000000";
+  const manifestPath = join(runRootPath(harness, runId), "project-provenance.json");
+  const captured = await runScript(harness, {
+    fixedRunId: runId,
+    workerOutputs: { coder: { report: JSON.stringify({ f1: true, f2: false }) } },
+  });
+  expectOk(captured);
+  const manifestBytes = await readFile(manifestPath, "utf8");
+  // The fake worker wrote its result into the workspace; the manifest
+  // still describes only the initial baseline.
+  const manifest = JSON.parse(manifestBytes) as { entries: { path: string }[] };
+  expect(manifest.entries.map((entry) => entry.path).sort()).toEqual(["seed.md"]);
+  expect(await readFile(manifestPath, "utf8")).toBe(manifestBytes);
+});
+
+test("39. a pre-placed provenance artifact makes the fresh preparation fail closed", async () => {
+  const harness = await setup(PIPELINE_AGENT_DECISION, ["coder"]);
+  const runRoot = join(harness.stateRoot, "pipeline-runs", "preplaced-run");
+  await mkdir(runRoot, { mode: 0o700, recursive: true });
+  const preplaced = '{"copy_policy_version":1,"entries":[],"kind":"pipeline_v2_project_provenance","schema_version":1}';
+  await writeFile(join(runRoot, "project-provenance.json"), preplaced, { mode: 0o600 });
+  let failure: unknown;
+  try {
+    await prepareRunProject(harness.projectSource, runRoot);
+  } catch (cause) {
+    failure = cause;
+  }
+  expect(failure).toBeInstanceOf(PipelineV2RuntimeError);
+  expect((failure as PipelineV2RuntimeError).reason).toBe("run_input_invalid");
+  expect((failure as Error).message).toContain("already carries a project provenance manifest");
+  // The pre-placed artifact is untouched and no project was created.
+  expect(await readFile(join(runRoot, "project-provenance.json"), "utf8")).toBe(preplaced);
+  expect(await lstatOrNull(join(runRoot, "project"))).toBeNull();
+});

@@ -200,7 +200,7 @@ orchestrator run \
   activations. The source directory is never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 9), and the published run outputs stay at the fixed
+  (state schema version 10), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
@@ -272,6 +272,51 @@ orchestrator run \
   without changing its public projection (schemaVersion 1, no worker-log
   fields, no log endpoint); public logs API and Browser UI log routes
   remain unwired.
+- Schema v10 adds the durable project snapshot provenance: every fresh run
+  owns ONE immutable provenance manifest at the fixed run-root location
+  `<state-root>/pipeline-runs/<run-id>/project-provenance.json`, produced
+  by the single owner of the project copy during the same traversal that
+  copies it (no second source scan ever exists). The manifest describes
+  both halves of the copy contract — the **source observation** (what was
+  read from the operator project: permission modes, hardlink
+  characteristics, verbatim symlink targets) and the **workspace
+  baseline** (what was materialized into the initial run workspace:
+  normalized modes, the exact copied byte digests). Copy policy version 1
+  is the unchanged copy contract, now durably recorded: directories 0700,
+  regular files 0600 (0700 with any execute bit), symlinks verbatim,
+  uid/gid/timestamps/xattrs/ACLs not preserved, and hardlinks split into
+  independent regular files — the split is no longer silent, every
+  regular-file entry records `multiple_links` plus a canonical
+  per-manifest `hardlink_group`, and a future Apply increment must resolve
+  that explicitly. The manifest digest lives over the dedicated
+  `pipeline-v2-project-provenance` domain and binds the whole document
+  (order, modes, kinds, targets, file digests); the durable state stores
+  only the minimal immutable binding `{digest, entry_count,
+  copy_policy_version}` in the revision-1 `create_run` snapshot — no run
+  (and therefore no worker activation) can exist without it, there is no
+  migration for older runs, and the commit-history vocabulary is
+  unchanged. Publication reuses the immutable-document substrate BEFORE
+  the staged workspace is renamed into `project`, so the window "project
+  published, manifest invisible" is unreachable; the mirrored window
+  (manifest durable, workspace absent) fails closed on any retry — the
+  source is never re-read to rebuild provenance, and a changed source can
+  never rebind the run id to another baseline. The preparation verifies
+  the published workspace against the manifest's workspace baseline before
+  it returns, so no `create_run` can exist for a run whose published
+  workspace diverges from its provenance baseline. A source object written
+  or touched while it is being read fails the whole preparation closed
+  (copy-time coherence proof at millisecond timestamp granularity; a
+  coherent copy is still never a whole-tree atomic snapshot without
+  project-level cooperation). The restore verifier refuses any run whose
+  stored manifest is missing, tampered, symlinked, wrong-mode or foreign
+  to its durable binding, and — only before the first worker activation —
+  additionally verifies the initial workspace against the baseline; after
+  a first activation the workspace is worker-mutable by contract and the
+  manifest stays provenance, never a workspace invariant. **Run success
+  does not mean project delivery**: the manifest enables a future
+  read-only project change set (the next separate layer), the operator
+  project stays read-only, and no diff API, no Apply, and no read-write
+  authority over the operator project exist in this increment.
 - The pipeline's agent states select the profiles; the worker image, the
   OpenCode configuration, and the exact environment bindings belong to those
   profiles. The user never sets mounts, container paths, Session

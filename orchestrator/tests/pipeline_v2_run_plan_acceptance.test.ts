@@ -42,6 +42,8 @@ import {
 } from "../src/pipeline_v2_run_plan_acceptance.ts";
 import * as acceptanceModule from "../src/pipeline_v2_run_plan_acceptance.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const hex = (char: string): string => char.repeat(64);
 const PROTECTED_DIGEST = hex("b");
 const CANARY = "CANARY_secret_task_body";
@@ -693,7 +695,7 @@ function agentPhaseStates(identity: PipelineV2RunPipelineIdentity, runId: string
   for (let stop = 0; stop <= AGENT_PHASE_COMMANDS.length; stop++) {
     states.push(
       drive(identity, runId, [
-        { kind: "create_run", runId, pipeline: identity, inputs: [{ id: "task", type: "file", protected: true, digest: hex("b") }] },
+        { kind: "create_run", runId, pipeline: identity, inputs: [{ id: "task", type: "file", protected: true, digest: hex("b") }], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
         { kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" },
         ...AGENT_PHASE_COMMANDS.slice(0, stop),
       ]),
@@ -766,7 +768,7 @@ function createState(
   commands: readonly PipelineV2RunCommand[],
 ): PipelineV2RunState {
   return drive(identity, runId, [
-    { kind: "create_run", runId, pipeline: identity, inputs: BASE_INPUTS },
+    { kind: "create_run", runId, pipeline: identity, inputs: BASE_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
     ...commands,
   ]);
 }

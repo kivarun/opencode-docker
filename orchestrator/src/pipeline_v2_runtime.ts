@@ -21,10 +21,26 @@ import {
   requireRealDirectory,
 } from "./fs_checks.ts";
 import {
+  discardStagedProjectCopy,
   prepareProjectCopy,
+  publishStagedProjectCopy,
   realProjectCopyIo,
+  stageProjectCopy,
 } from "./pipeline_v2_project_copy_internal.ts";
 import type { PreparedRunProject } from "./pipeline_v2_project_copy_internal.ts";
+import {
+  pipelineV2ProjectProvenanceBinding,
+  preparePipelineV2ProjectProvenance,
+  PipelineV2ProjectProvenanceError,
+  type PipelineV2ProjectProvenanceBinding,
+  type PreparedPipelineV2ProjectProvenance,
+} from "./pipeline_v2_project_provenance.ts";
+import {
+  loadPipelineV2ProjectProvenance,
+  publishPipelineV2ProjectProvenance,
+  verifyPipelineV2InitialProjectWorkspace,
+  PipelineV2ProjectProvenanceStoreError,
+} from "./pipeline_v2_project_provenance_store.ts";
 export type { PreparedRunProject };
 import {
   PipelineError,
@@ -1126,21 +1142,123 @@ function parseRunInputBindings(bindings: readonly unknown[]): RunInputBinding[] 
 }
 
 /**
- * Production wrapper of the run-owned project copy. The public signature is
- * unchanged; the wrapper always calls the internal per-call core
- * (`prepareProjectCopy` in `pipeline_v2_project_copy_internal.ts`) with the
- * single fixed, immutable `realProjectCopyIo` defined there. There is no
- * mutable module-global IO and no installer: the IO is a per-call
- * capability, so a fault-injected test call can never change the behavior
- * of any parallel production call. The full ownership, copy, staging,
- * publication and failure contract lives on the internal core; this
- * wrapper adds nothing and changes nothing.
+ * The result of one run-owned project preparation: the materialized
+ * initial workspace (`<runRoot>/project`) and the durable provenance
+ * manifest that describes it, bound to the run at `create_run` time.
+ */
+export interface PreparedRunProjectWithProvenance {
+  readonly run_root: string;
+  readonly project_root: string;
+  readonly manifest: PreparedPipelineV2ProjectProvenance;
+  readonly binding: PipelineV2ProjectProvenanceBinding;
+}
+
+/**
+ * Production wrapper of the run-owned project copy with its durable
+ * provenance manifest (state schema v10).
+ *
+ * The single owner of the source observation is the copy traversal itself:
+ * `stageProjectCopy` reads the source exactly once, materializes the
+ * staging tree and records the provenance capture of exactly the objects
+ * and bytes it copied. There is no second source scan — the manifest is
+ * built from the capture of the same traversal that produced the
+ * workspace, and the manifest digest binds the whole document.
+ *
+ * Publication order (crash-safe by construction): the provenance manifest
+ * is published through the immutable-document substrate BEFORE the staged
+ * workspace is renamed into `<runRoot>/project`. The window "project
+ * published, manifest invisible" is therefore unreachable; the mirrored
+ * window (manifest published, workspace absent) leaves nothing bound. A
+ * provenance artifact that is already present at a fresh preparation is a
+ * typed fail-closed refusal, as is an existing `<runRoot>/project`; the
+ * source is never re-read to rebuild provenance, and no mismatched
+ * project/manifest pair can ever be bound. A `durability_unknown`
+ * publication outcome fails the preparation closed: the run never binds a
+ * manifest whose crash survival is unconfirmed (the visible artifact
+ * stays in the run root for diagnostics). After the publication the
+ * initial workspace baseline is verified against the manifest before the
+ * preparation returns, so no state document is ever created — and no
+ * worker activation can ever start — for a run whose published workspace
+ * diverges from its provenance baseline.
+ *
+ * Every expected failure is a `PipelineV2RuntimeError` with reason
+ * `run_input_invalid` and a content-free diagnostic (the project and its
+ * provenance are run-level inputs); the copy core's own failures keep
+ * their sanitized messages byte for byte.
  */
 export async function prepareRunProject(
   projectSourcePath: string,
   runRoot: string,
-): Promise<PreparedRunProject> {
-  return prepareProjectCopy(realProjectCopyIo, projectSourcePath, runRoot);
+): Promise<PreparedRunProjectWithProvenance> {
+  const operation = async (): Promise<PreparedRunProjectWithProvenance> => {
+    if (typeof projectSourcePath !== "string" || projectSourcePath === "") {
+      throw new PipelineError("project source path must be a non-empty string");
+    }
+    if (!isAbsolute(projectSourcePath)) {
+      throw new PipelineError("project source path must be an absolute path, got a relative path");
+    }
+    if (!isAbsolute(runRoot)) {
+      throw new PipelineError("run root must be an absolute path");
+    }
+    const existingManifest = await loadPipelineV2ProjectProvenance(runRoot);
+    if (existingManifest !== null) {
+      throw new PipelineError(
+        "the run already carries a project provenance manifest at the fixed run-root location",
+      );
+    }
+    const staged = await stageProjectCopy(realProjectCopyIo, projectSourcePath, runRoot);
+    try {
+      const prepared = preparePipelineV2ProjectProvenance(staged.entries);
+      // A durability-unknown publication leaves the manifest visible but
+      // unconfirmed; the preparation fails closed either way and never
+      // binds it.
+      await publishPipelineV2ProjectProvenance(runRoot, prepared);
+      await publishStagedProjectCopy(realProjectCopyIo, staged);
+      // Initial workspace baseline verification (C5): before the
+      // preparation can return — and therefore before `create_run`, the
+      // first worker activation and every later command — the published
+      // workspace tree must match the manifest's workspace baseline
+      // exactly (entry set, kinds, workspace modes, byte counts, content
+      // digests, verbatim symlink targets). A copy whose published bytes
+      // diverge from the capture of the bytes that were read is refused
+      // fail-closed; the published project and the manifest stay in the
+      // run root for diagnostics and are never repaired or rewritten.
+      try {
+        await verifyPipelineV2InitialProjectWorkspace(join(staged.run_root, "project"), prepared);
+      } catch (cause) {
+        if (cause instanceof PipelineV2ProjectProvenanceError) {
+          throw new PipelineError(
+            "the published run workspace does not match its project provenance baseline",
+          );
+        }
+        throw cause;
+      }
+      return Object.freeze({
+        run_root: staged.run_root,
+        project_root: join(staged.run_root, "project"),
+        manifest: prepared,
+        binding: pipelineV2ProjectProvenanceBinding(prepared),
+      });
+    } catch (cause) {
+      await discardStagedProjectCopy(realProjectCopyIo, staged);
+      throw cause;
+    }
+  };
+  try {
+    return await operation();
+  } catch (cause) {
+    if (cause instanceof PipelineV2RuntimeError) {
+      throw cause;
+    }
+    if (
+      cause instanceof PipelineError ||
+      cause instanceof PipelineV2ProjectProvenanceError ||
+      cause instanceof PipelineV2ProjectProvenanceStoreError
+    ) {
+      throw new PipelineV2RuntimeError("run_input_invalid", cause.message);
+    }
+    throw cause;
+  }
 }
 
 /**

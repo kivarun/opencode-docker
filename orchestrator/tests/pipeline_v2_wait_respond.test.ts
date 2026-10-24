@@ -19,6 +19,8 @@ import { defaultPipelineStateIo, type PipelineStateIo } from "../src/pipeline_st
 import { countingIo, faultIo } from "./state_io_test_helpers.ts";
 import { createHash } from "node:crypto";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 /**
  * Production wait-response command tests: `respondPipelineV2Wait` over the
  * real durable run state, the real wait controller/manifest/store stack
@@ -80,7 +82,7 @@ async function buildHarness(io: PipelineStateIo = defaultPipelineStateIo): Promi
         max_transitions: 20,
       },
       inputs: [],
-    });
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
     break;
   }
   const runRoot = join(stateRoot, "pipeline-runs", RUN_ID);
@@ -356,6 +358,7 @@ test("8. active, publishing and final states refuse without mutations", async ()
       max_transitions: 20,
     },
     inputs: [],
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   const runRootA = join(stateRootA, "pipeline-runs", RUN_ID);
   chmodSync(runRootA, 0o700);
@@ -396,6 +399,7 @@ test("8. active, publishing and final states refuse without mutations", async ()
       max_transitions: 20,
     },
     inputs: [],
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
   });
   await sinkP.dispatch({ kind: "terminal_reached", terminalStateId: "s01", terminalResult: "success" });
   const runRootP = join(stateRootP, "pipeline-runs", RUN_ID);

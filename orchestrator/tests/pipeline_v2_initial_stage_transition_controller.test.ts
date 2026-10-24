@@ -44,6 +44,8 @@ import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_co
 import { preparePlanRevisionManifest, prepareTaskRevisionManifest } from "../src/pipeline_v2_run_plan_manifests.ts";
 import { loadPipelineV2 as loadPipelineV2Alias } from "../src/pipeline_v2.ts";
 
+const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+
 const RUN_ID = "initial-transition";
 const INITIAL_BUDGET = 2;
 const STAGE_WAIT = `      stage_wait:
@@ -549,13 +551,14 @@ async function acceptedBoundary(): Promise<{
   const pipeline = await loadPipelineV2(fixture.bundle);
   const inner = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
   const recording = recordingSink(inner);
-  await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+  const preparedProjectBinding010 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
   const runInputs = await snapshotRunInputs(pipeline, [{ id: "task", path: join(fixture.root, "userdata", "task.md") }], fixture.runRoot);
   await recording.dispatch({
     kind: "create_run",
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
+    projectProvenance: preparedProjectBinding010,
   });
   await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1);
   const taskDigest = runInputs.inputs[0]!.digest;
@@ -716,7 +719,7 @@ describe("openPipelineV2InitialStageTransition", () => {
       const pipeline = await loadPipelineV2Alias(fixture.bundle);
       const inner = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
       const recording = recordingSink(inner);
-      await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+      const preparedProjectBinding011 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
       const runInputs = await snapshotRunInputs(
         pipeline,
         [
@@ -730,7 +733,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-      });
+     projectProvenance: preparedProjectBinding011 });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, {}, "plan");
       await recording.dispatch({
         kind: "transition_committed",
@@ -996,14 +999,14 @@ describe("openPipelineV2InitialStageTransition", () => {
       const pipeline = await loadPipelineV2Alias(fixture.bundle);
       const inner = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
       const recording = recordingSink(inner);
-      await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+      const preparedProjectBinding012 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
       const runInputs = await snapshotRunInputs(pipeline, [{ id: "task", path: join(fixture.root, "userdata", "task.md") }], fixture.runRoot);
       await recording.dispatch({
         kind: "create_run",
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-      });
+     projectProvenance: preparedProjectBinding012 });
       await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
       for (const command of [
         { kind: "agent_data_prepared" },
@@ -1052,14 +1055,14 @@ describe("openPipelineV2InitialStageTransition", () => {
       const pipeline = await loadPipelineV2Alias(fixture.bundle);
       const inner = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
       const recording = recordingSink(inner);
-      await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+      const preparedProjectBinding013 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
       const runInputs = await snapshotRunInputs(pipeline, [{ id: "task", path: join(fixture.root, "userdata", "task.md") }], fixture.runRoot);
       await recording.dispatch({
         kind: "create_run",
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-      });
+     projectProvenance: preparedProjectBinding013 });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, {}, "plan");
       const commandsBefore = recording.commands.length;
       const taskDigest = runInputs.inputs[0]!.digest;
@@ -1092,14 +1095,14 @@ describe("openPipelineV2InitialStageTransition", () => {
       const pipeline = await loadPipelineV2Alias(fixture.bundle);
       const inner = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
       const recording = recordingSink(inner);
-      await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+      const preparedProjectBinding014 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
       const runInputs = await snapshotRunInputs(pipeline, [{ id: "task", path: join(fixture.root, "userdata", "task.md") }], fixture.runRoot);
       await recording.dispatch({
         kind: "create_run",
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-      });
+     projectProvenance: preparedProjectBinding014 });
       await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
       await recording.dispatch({ kind: "agent_data_prepared" });
       const taskDigest = runInputs.inputs[0]!.digest;
@@ -1204,14 +1207,14 @@ describe("openPipelineV2InitialStageTransition", () => {
     const inner = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
     const recording = recordingSink(inner);
     try {
-      await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+      const preparedProjectBinding015 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
       const runInputs = await snapshotRunInputs(pipeline, [{ id: "task", path: join(fixture.root, "userdata", "task.md") }], fixture.runRoot);
       await recording.dispatch({
         kind: "create_run",
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-      });
+     projectProvenance: preparedProjectBinding015 });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1);
       const taskDigest = runInputs.inputs[0]!.digest;
       const { accepted } = await acceptInitialPlan(pipeline, fixture, recording, taskDigest);
@@ -1255,7 +1258,7 @@ describe("openPipelineV2InitialStageTransition", () => {
       const pipeline = await loadPipelineV2Alias(fixture.bundle);
       const inner = new PipelineV2RunStateSink({ stateRoot: fixture.stateRoot, runId: RUN_ID, now: nextTick });
       const recording = recordingSink(inner);
-      await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot);
+      const preparedProjectBinding016 = (await prepareRunProject(join(fixture.root, "project-source"), fixture.runRoot)).binding;
       const runInputs = await snapshotRunInputs(
         pipeline,
         [
@@ -1269,7 +1272,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-      });
+     projectProvenance: preparedProjectBinding016 });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, PROPOSAL_TWO_STAGES, "plan");
       const taskDigest = runInputs.inputs[0]!.digest;
       const taskA = prepareTaskRevisionManifest({ schema_version: 1, kind: "task_revision", run_id: RUN_ID, task_id: "task-a", revision: 1, previous_sha256: null, origin: "planning_proposal", body: "Body A" });
