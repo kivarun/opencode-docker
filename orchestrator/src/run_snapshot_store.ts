@@ -200,6 +200,12 @@ export interface RunSnapshotStoreOptions<S> {
   parseSnapshot: (raw: string) => S;
   /** Document label used verbatim in every diagnostic message. */
   documentLabel: string;
+  /**
+   * Optional layout override for stores that keep one snapshot per identity
+   * below a different fixed directory (`<stateRoot>/<segment>/<id>/state.json`).
+   * The default layout stays `<stateRoot>/pipeline-runs/<run-id>/state.json`.
+   */
+  pathLayout?: (stateRoot: string, id: string) => string;
 }
 
 interface WriteOptions {
@@ -221,11 +227,14 @@ export class RunSnapshotStore<S extends { revision: number }> {
   ) {
     this.parseSnapshot = options.parseSnapshot;
     this.documentLabel = options.documentLabel;
+    this.pathLayout = options.pathLayout ?? runSnapshotStatePath;
     this.io = io;
   }
 
+  private readonly pathLayout: (stateRoot: string, id: string) => string;
+
   get path(): string {
-    return runSnapshotStatePath(this.stateRoot, this.runId);
+    return this.pathLayout(this.stateRoot, this.runId);
   }
 
   private get runDir(): string {

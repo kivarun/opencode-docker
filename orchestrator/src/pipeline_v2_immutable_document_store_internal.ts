@@ -460,7 +460,7 @@ interface OwnedTempFile {
  * never removed; every failure is swallowed and never masks the original
  * outcome.
  */
-async function removeOwnedTempFile(
+export async function removeOwnedTempFile(
   io: ImmutableDocumentIo,
   tempPath: string,
   identity: OwnedTempFile,

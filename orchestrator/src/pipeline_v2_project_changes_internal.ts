@@ -780,10 +780,14 @@ function serializeObservation(
   });
 }
 
-/** The full comparison of one finalized run: scan, classify, observe.
- * The optional file-stream capability defaults to the real streaming
- * owner; tests inject per-call seams. */
-export async function compareProjectChangesWithIo(
+/**
+ * The full observation of one finalized run: provenance load + binding
+ * match, both read-only tree scans, classification and the ephemeral
+ * observation digest. Returns the raw observed trees (and the durable
+ * baseline) in addition to the public projection so a planner can build
+ * its own projected-state model without a second tree scan.
+ */
+export async function observeProjectChangesTreesWithIo(
   io: ProjectWorkspaceVerifyIo,
   runRoot: string,
   projectPath: string,
@@ -793,6 +797,9 @@ export async function compareProjectChangesWithIo(
   observation: string;
   summary: PipelineV2ProjectChangesSummary;
   changes: readonly PipelineV2ProjectChangeEntry[];
+  workspace: Map<string, ObservedEntry>;
+  operator: Map<string, ObservedEntry>;
+  baseline: PreparedPipelineV2ProjectProvenance;
 }> {
   // 1. The durable provenance baseline through the single verified load.
   const stored = await loadPipelineV2ProjectProvenance(runRoot).catch(
@@ -858,5 +865,23 @@ export async function compareProjectChangesWithIo(
     .update(OBSERVATION_DIGEST_DOMAIN)
     .update(canonicalJson(observationDocument), "utf8")
     .digest("hex");
-  return { observation, summary, changes };
+  return { observation, summary, changes, workspace, operator, baseline: stored };
+}
+
+/** The full comparison of one finalized run: scan, classify, observe.
+ * The optional file-stream capability defaults to the real streaming
+ * owner; tests inject per-call seams. */
+export async function compareProjectChangesWithIo(
+  io: ProjectWorkspaceVerifyIo,
+  runRoot: string,
+  projectPath: string,
+  state: PipelineV2RunState,
+  fileStreamIo: ProjectFileStreamIo = realProjectFileStreamIo,
+): Promise<{
+  observation: string;
+  summary: PipelineV2ProjectChangesSummary;
+  changes: readonly PipelineV2ProjectChangeEntry[];
+}> {
+  const full = await observeProjectChangesTreesWithIo(io, runRoot, projectPath, state, fileStreamIo);
+  return { observation: full.observation, summary: full.summary, changes: full.changes };
 }

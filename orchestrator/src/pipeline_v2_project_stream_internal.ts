@@ -103,7 +103,14 @@ export interface ObserveRegularFileStreamOptions {
   /** The expected content contract; a mismatch is an unstable failure. */
   readonly expected?: { readonly byteCount: number; readonly sha256: string };
   /** The bounded raw-byte window copied from the same stream. */
-  readonly capture?: { readonly offset: number; readonly limit: number };
+  readonly capture?: { readonly offset: number; limit: number };
+  /**
+   * Optional streaming sink receiving every read chunk exactly once, in
+   * order, before the digest is updated. A sink failure is an `io` failure
+   * of the observation; the caller owns any artifact the sink writes into
+   * (a failed observation never confirms the sink's bytes).
+   */
+  readonly sink?: (chunk: Uint8Array) => Promise<void>;
 }
 
 function identityFieldsOf(info: Stats): string {
@@ -152,6 +159,7 @@ export async function observeRegularFileStream(
     const hasher = createHash("sha256");
     const chunk = Buffer.allocUnsafe(PROJECT_FILE_STREAM_CHUNK_BYTES);
     const capture = options.capture;
+    const sink = options.sink;
     const captured = capture === undefined ? undefined : Buffer.alloc(capture.limit);
     let capturedLength = 0;
     let byteCount = 0;
@@ -165,7 +173,15 @@ export async function observeRegularFileStream(
       if (bytesRead < 0) {
         throw new ProjectFileStreamError("io", "the observed file could not be read");
       }
-      hasher.update(chunk.subarray(0, bytesRead));
+      const window = chunk.subarray(0, bytesRead);
+      if (sink !== undefined) {
+        try {
+          await sink(window);
+        } catch (cause) {
+          throw asStreamError(cause, "the streaming sink rejected a chunk of the observed file");
+        }
+      }
+      hasher.update(window);
       if (captured !== undefined && capture !== undefined) {
         const windowStart = capture.offset;
         const windowEnd = capture.offset + capture.limit;

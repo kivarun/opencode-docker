@@ -943,6 +943,160 @@ observation are the only content authority inside a run.
   operator project, RW project mounts, final-workspace durable sealing,
   and any state schema change.
 
+## The durable project apply preparation package (foundation, no public surface)
+
+The first Apply layer turns one reviewed, finalized pipeline v2 run plus
+one exact Project Changes observation into a fully self-contained
+prepared operation package — an immutable canonical plan, sealed payload
+blobs for every future regular-file publication and a crash-safe
+revisioned operation journal — **without writing a single byte into the
+registered project**. A prepared package does NOT mean applied: the
+registered project stays read-only, the next increment owns the per-path
+filesystem writer, the project lock and recovery on top of this package,
+and there is deliberately no HTTP route, no CLI command, no Browser UI
+surface, no control-plane command, no deployment flag and no schema v11
+in this layer.
+
+- Authority: `orchestrator/src/pipeline_v2_project_apply.ts` (public
+  facade) takes only trusted internal parameters — `applyStoreRoot`, the
+  caller-owned `applyId` safe id, `runId`, `projectId`, the canonical
+  `projectRoot` for the current read-only observation, the requested
+  `observation` digest and the deployment `stateRoot`. The stored package
+  binds the project through an opaque root-binding digest over the
+  canonical root and its `dev`/`ino` (`pipeline-v2-project-apply-root-binding\0`);
+  the canonical path is never persisted, and recovery must re-resolve the
+  root through `run binding → frozen registry project → canonical project
+  root` and re-verify the binding before any future use. A stored path
+  string is never authority.
+- Layout: `<applyStoreRoot>/operations/<applyId>/` — a 0700 tree with the
+  immutable canonical `plan.json` (0600), a 0700 `payloads/` directory of
+  immutable blobs `${payload_index}.payload` (0600) and the revisioned
+  `state.json` (0600) through the shared `RunSnapshotStore` substrate.
+  The single streaming immutable-blob publication owner
+  (`pipeline_v2_immutable_blob_internal.ts`) reuses — never duplicates —
+  the immutable-document substrate protocol: exclusive owned temp 0600
+  with identity fixation, per-chunk write-all at a running file position,
+  file fsync, exclusive `link()` publication, ownership-checked temp
+  unlink, parent fsync, `EEXIST` adoption only on exact digest/byte-count
+  match, `durability_unknown` with a frozen candidate, and the read side
+  (real non-symlink regular file mode 0600, one bounded-chunk pass whose
+  digest must equal the expectation).
+- The immutable plan (`pipeline_v2_apply_plan_internal.ts`, one
+  schema/digest owner, digest over the closed domain
+  `pipeline-v2-project-apply-plan\0` plus the canonical JSON, no
+  self-reference) carries schema version, kind, apply/run/project ids,
+  the root-binding digest, observation, terminal revision, the
+  provenance binding, the policy version, ordered steps, payload
+  bindings and the total payload byte count — and never an absolute
+  project path, run root, apply-store root, operation/session ids,
+  credentials, file contents, `dev`/`ino`, timestamps or diagnostics.
+- The low-level step model decouples execution progress from the change
+  list: every step carries a dense 1..N `step_index` (the journal
+  progress cursor), its `change_index` reference (never a cursor), a safe
+  relative path, one closed kind of `remove_leaf | remove_directory |
+  create_directory | publish_regular_file | publish_symlink | set_mode`,
+  the exact `expected_before`/`desired_after` node states and the payload
+  binding. One path carries several steps only for an explicit type
+  substitution (exactly one removal then one creation — crash positions
+  are unambiguous), a rename stays exactly one deletion plus one addition
+  and case-only changes get no rename semantics.
+- The deterministic apply-all planner
+  (`pipeline_v2_apply_planner_internal.ts`) consumes exactly the
+  production observation (`observeProjectChangesTreesWithIo` — no second
+  scanner): load durable run → terminal status only → provenance load +
+  binding verification → full observation recompute → exact observation
+  match → every affected path must match its baseline or result node
+  (`diverged_project` otherwise) → `matches_result` becomes a durable
+  no-op → plan-level projected-state simulation (a `file→directory`
+  substitution with added children is judged against each path's own
+  current object; the final projected tree on every affected path must
+  equal the reviewed result) → directory containment (every operator
+  descendant of a removed or replaced directory must be covered by the
+  plan's own removals; any operator-only descendant is a
+  `diverged_project` conflict — no blind recursive delete, every removal
+  is an explicit per-path step) → hardlink policy (a reviewed result or
+  touched baseline with a hardlink group is `unsupported_metadata`;
+  hardlink recreation is out of v1 scope) → deterministic ordering
+  (removals deepest-first, directory creations shallowest-first,
+  regular-file publications, symlink publications, mode-only steps last;
+  identical verified input yields the byte-identical canonical plan).
+- The single metadata probe owner
+  (`pipeline_v2_apply_metadata_probe_internal.ts`) is a read-only libc
+  FFI probe (`llistxattr`/`lgetxattr` over the proven `dlopen` +
+  `__errno_location` + `memcpy` discipline) that runs before the plan
+  over every touched object, every existing ancestor directory and every
+  desired-after workspace object, fail-closed: setuid/setgid/sticky,
+  ownership the orchestrator could not reproduce, more than one hard
+  link on a touched regular file, any listed xattr and present POSIX
+  ACLs are `unsupported_metadata`; FIFO/socket/device is
+  `unsupported_project_entry`; an unreachable object is
+  `project_unstable`/`workspace_unstable`. Timestamps, sparse layout and
+  reflink/compression layout are deliberately NOT part of the logical
+  project contract (documented physical properties, not silently lost
+  claims).
+- Payload sealing: for every `publish_regular_file` the core opens the
+  result file through the single streaming observation owner with a new
+  `sink` capability — `O_NOFOLLOW`, fstat before, one sequential
+  128 KiB-chunk pass computing the content digest while streaming every
+  chunk exactly once into the owned immutable payload temp, fstat after
+  with the full identity check, digest/byte-count match against the
+  plan's content contract, fsync, immutable publication, parent fsync
+  and read-back verification at package completeness. No whole-file
+  buffer, no slice-then-rehash, no bytes from the browser/API, no
+  publication before the source is fully verified, no payload without a
+  plan binding; symlink targets are stored canonical in the plan (no
+  payload) and a mode-only step creates no payload. After the prepared
+  marker the run workspace can change or disappear — the loader restores
+  every desired regular-file byte from the sealed payloads alone.
+- The journal (`pipeline_v2_apply_state_internal.ts`) is revisioned and
+  crash-safe with the v1 statuses exactly `preparing | prepared | failed`
+  (a future writer extends the vocabulary with its own version bump),
+  binding apply id, run id, project id, observation, terminal revision,
+  root binding, plan digest (plus step/payload/byte-count projections
+  present exactly when the digest is), sealed payload count, status and a
+  closed content-free failure reason. `prepared` is written only after
+  plan and every payload were published, re-read and verified, the
+  package completeness was confirmed and the directory fsyncs completed
+  (or a `durability_unknown` was adopted).
+- Idempotency: the apply id is the caller-owned identity — the first
+  call creates it, an exact retry continues `preparing` or returns the
+  byte-identical prepared package (no journal growth), a retry with a
+  different run/project/observation/root binding is a typed
+  `identity_conflict` refused before the other run is even looked up,
+  concurrent identical calls converge through store create/adoption, and
+  foreign bytes under the operation path are never overwritten
+  (exact-artifact adoption only after digest/shape verification;
+  the substrate's own publication-temp orphans are tolerated by the
+  loader, foreign-named artifacts are `artifact_modified`). The crash
+  matrix P0–P17 is proven by permanent fault-injection tests: zero
+  project writes in every window, retries execute only the missing
+  durable suffix, owned temps are cleaned or safely adopted, published
+  artifacts keep inode/mode/bytes across adoption, and a failed package
+  never looks prepared.
+- The read-only loader verifies operation layout/modes, exact state
+  schema, canonical plan bytes, plan digest and identity binding, dense
+  indexes, valid change references, the closed step vocabulary, step
+  order coherence, safe relative paths, payload existence/type/mode,
+  exact byte counts/digests, the absence of extra payload artifacts and
+  prepared completeness — `artifact_missing`/`artifact_modified` with
+  content-free diagnostics, never repairs, never needs the run
+  workspace, never uses a stored path as authority and never starts a
+  worker/helper/session.
+- Failure vocabulary (closed, typed causes only, no message parsing):
+  `invalid_options | run_not_found | run_not_terminal | run_state_invalid
+  | pipeline_mismatch | artifact_missing | artifact_modified |
+  stale_observation | diverged_project | unsupported_metadata |
+  unsupported_project_entry | identity_conflict | preparation_busy |
+  project_unstable | workspace_unstable | state_persist_failed |
+  internal_error` (`preparation_busy` is reserved for the writer layer's
+  project-lock conflicts).
+- Payloads are secret-bearing and unredacted; payload bytes never enter
+  plan, journal, diagnostics or filenames, and the store tree is 0700/0600
+  throughout.
+- Still unwired: the per-path filesystem writer, temp/rename inside the
+  registered project, the project lock, HTTP/UI/CLI/routing surfaces,
+  the deployment RW mount, schema v11, selective apply and rollback.
+
 ## The production continue-stage runner API (`orchestrator continue-stage`)
 
 `orchestrator/src/pipeline_v2_runner.ts` adds the dedicated `continue_stage`
