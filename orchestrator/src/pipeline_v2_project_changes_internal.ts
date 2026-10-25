@@ -33,6 +33,12 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { canonicalJson } from "./canonical_json.ts";
+import {
+  observeRegularFileStream,
+  ProjectFileStreamError,
+  realProjectFileStreamIo,
+  type ProjectFileStreamIo,
+} from "./pipeline_v2_project_stream_internal.ts";
 import { deepFreezeValue } from "./pipeline_v2_freeze_internal.ts";
 import {
   PipelineV2ProjectProvenanceError,
@@ -219,12 +225,16 @@ function metadataChanged(before: { mode: number; size: number; nlink: number; mt
 /**
  * One read-only tree observation. The scan fixes the root identity,
  * checks every entry's kind/mode/identity/size/content timestamps before
- * and after each file read, re-reads every directory's entry set after
- * walking it and never dereferences a leaf symlink. There is no write,
- * chmod, repair or temporary file on any path.
+ * and after each file read (the regular-file reads are one streaming
+ * observation pass each, via the shared streaming owner), re-reads every
+ * directory's entry set after walking it and never dereferences a leaf
+ * symlink. There is no write, chmod, repair or temporary file on any
+ * path, and no whole file is ever held in memory: the scan reads each
+ * file once from offset 0 to EOF through a fixed 128 KiB chunk.
  */
 async function scanTreeWithIo(
   io: ProjectWorkspaceVerifyIo,
+  fileStreamIo: ProjectFileStreamIo,
   root: string,
   labels: ScanFailureLabels,
 ): Promise<Map<string, ObservedEntry>> {
@@ -324,26 +334,26 @@ async function scanTreeWithIo(
         mtimeMs: before.mtimeMs,
         ctimeMs: before.ctimeMs,
       };
-      const bytes = await io.readWholeFile(childPath).catch((cause: unknown) => {
-        throw new ProjectTreeScanError(labels.io, "a regular file could not be read");
+      const observed = await observeRegularFileStream(fileStreamIo, childPath).catch((cause: unknown) => {
+        if (cause instanceof ProjectFileStreamError) {
+          if (cause.reason === "unstable") {
+            throw new ProjectTreeScanError(labels.unstable, "a regular file was replaced or changed during the scan");
+          }
+          throw new ProjectTreeScanError(labels.io, "a regular file could not be read");
+        }
+        throw cause;
       });
-      const after = await io.lstatOrNull(childPath).catch((cause: unknown) => {
-        throw new ProjectTreeScanError(labels.io, "an entry could not be inspected");
-      });
-      if (after === null || after.isSymbolicLink() || !after.isFile()) {
-        throw new ProjectTreeScanError(labels.unstable, "a regular file was replaced during the scan");
-      }
       if (
-        after.dev !== before.dev ||
-        after.ino !== before.ino ||
+        observed.identity.dev !== before.dev ||
+        observed.identity.ino !== before.ino ||
         metadataChanged(beforeMetadata, {
-          mode: after.mode & 0o777,
-          size: after.size,
-          nlink: after.nlink,
-          mtimeMs: after.mtimeMs,
-          ctimeMs: after.ctimeMs,
+          mode: observed.mode,
+          size: observed.stat.size,
+          nlink: observed.stat.nlink,
+          mtimeMs: observed.stat.mtimeMs,
+          ctimeMs: observed.stat.ctimeMs,
         }) ||
-        bytes.byteLength !== beforeMetadata.size
+        observed.byteCount !== beforeMetadata.size
       ) {
         throw new ProjectTreeScanError(labels.unstable, "a regular file changed during the scan");
       }
@@ -351,8 +361,8 @@ async function scanTreeWithIo(
         path: childRelative,
         kind: "regular_file",
         mode: beforeMetadata.mode,
-        byteCount: bytes.byteLength,
-        sha256: createHash("sha256").update(bytes).digest("hex"),
+        byteCount: observed.byteCount,
+        sha256: observed.sha256,
         target: "",
         nlink: beforeMetadata.nlink,
         dev: before.dev,
@@ -770,12 +780,15 @@ function serializeObservation(
   });
 }
 
-/** The full comparison of one finalized run: scan, classify, observe. */
+/** The full comparison of one finalized run: scan, classify, observe.
+ * The optional file-stream capability defaults to the real streaming
+ * owner; tests inject per-call seams. */
 export async function compareProjectChangesWithIo(
   io: ProjectWorkspaceVerifyIo,
   runRoot: string,
   projectPath: string,
   state: PipelineV2RunState,
+  fileStreamIo: ProjectFileStreamIo = realProjectFileStreamIo,
 ): Promise<{
   observation: string;
   summary: PipelineV2ProjectChangesSummary;
@@ -811,13 +824,13 @@ export async function compareProjectChangesWithIo(
   // 2. The two read-only tree observations.
   let workspace: Map<string, ObservedEntry>;
   try {
-    workspace = await scanTreeWithIo(io, join(runRoot, "project"), WORKSPACE_SCAN_LABELS);
+    workspace = await scanTreeWithIo(io, fileStreamIo, join(runRoot, "project"), WORKSPACE_SCAN_LABELS);
   } catch (cause) {
     throw new PipelineV2ProjectChangesError(scanFailure(cause), cause instanceof Error ? cause.message : "the final run workspace could not be observed");
   }
   let operator: Map<string, ObservedEntry>;
   try {
-    operator = await scanTreeWithIo(io, projectPath, PROJECT_SCAN_LABELS);
+    operator = await scanTreeWithIo(io, fileStreamIo, projectPath, PROJECT_SCAN_LABELS);
   } catch (cause) {
     throw new PipelineV2ProjectChangesError(scanFailure(cause), cause instanceof Error ? cause.message : "the operator project could not be observed");
   }

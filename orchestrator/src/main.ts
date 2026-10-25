@@ -109,6 +109,10 @@ import {
   projectChangesPipelineV2Run,
   type PipelineV2ProjectChangesOutcome,
 } from "./pipeline_v2_project_changes.ts";
+import {
+  projectChangeContentPipelineV2Run,
+  type PipelineV2ProjectChangeContentOutcome,
+} from "./pipeline_v2_project_change_content.ts";
 
 /**
  * The per-call seam of the dispatcher. The production default builds one
@@ -139,6 +143,7 @@ export interface CliIo {
   eventsPipelineV2Run: typeof eventsPipelineV2Run;
   logsPipelineV2Run: typeof logsPipelineV2Run;
   projectChangesPipelineV2Run: typeof projectChangesPipelineV2Run;
+  projectChangeContentPipelineV2Run: typeof projectChangeContentPipelineV2Run;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
   /**
@@ -175,6 +180,7 @@ function productionCliIo(): CliIo {
     eventsPipelineV2Run,
     logsPipelineV2Run,
     projectChangesPipelineV2Run,
+    projectChangeContentPipelineV2Run,
     runSmoke,
     runAgentSmoke,
     readTaskFile: (path: string) => readFile(path, "utf8"),
@@ -207,7 +213,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "logs", "project-changes"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "logs", "project-changes", "project-change-content"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -224,7 +230,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "inspect" &&
     command !== "events" &&
     command !== "logs" &&
-    command !== "project-changes"
+    command !== "project-changes" &&
+    command !== "project-change-content"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -290,6 +297,16 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // SubprocessCliRunner command dependencies and no mutating command
     // deps object are built for it.
     return await runPipelineV2LogsCommand(parsed, io);
+  }
+  if (parsed.kind === "project-change-content") {
+    // The read-only pipeline v2 project-change-content command: like
+    // inspect, events, logs and project-changes, it resolves only the
+    // state-root projection (no helper configuration, no Launcher
+    // credential, no auth, no subprocess, no signal registration, no
+    // mutation lock, no durable change) and invokes the content
+    // production API exactly once. No SubprocessCliRunner command
+    // dependencies and no mutating command deps object are built for it.
+    return await runPipelineV2ProjectChangeContentCommand(parsed, io);
   }
   if (parsed.kind === "project-changes") {
     // The read-only pipeline v2 project-changes command: like inspect and
@@ -802,6 +819,56 @@ async function runPipelineV2LogsCommand(
   } else {
     io.writeError(
       `orchestrator: logs failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+/**
+ * The read-only pipeline v2 project-change-content command: like inspect,
+ * events, logs and project-changes, it resolves only the state-root
+ * projection (no helper configuration, no Launcher credential, no auth,
+ * no subprocess, no signal registration, no mutation lock, no durable
+ * change) and invokes the content production API exactly once. The
+ * caller-provided `--project` path is a trusted operator surface; the
+ * observed path is derived exclusively from the verified change entry.
+ */
+async function runPipelineV2ProjectChangeContentCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "project-change-content" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2ProjectChangeContentOutcome = await io.projectChangeContentPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    projectPath: parsed.project,
+    changeIndex: parsed.changeIndex,
+    side: parsed.side,
+    observation: parsed.observation,
+    ...(parsed.offset === 0 ? {} : { offset: parsed.offset }),
+    ...(parsed.limit === 65536 ? {} : { limit: parsed.limit }),
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: project-change-content ok (run ${outcome.runId}, revision ${outcome.revision}, change ${outcome.changeIndex}, side ${outcome.side}, status ${outcome.status})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: project-change-content failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

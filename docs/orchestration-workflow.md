@@ -803,15 +803,145 @@ the operator project immediately before writing.
   counts and one row per change through `createElement`/`textContent` only
   (modes in octal, byte counts, full SHA-256 as text, hardlink indicators,
   verbatim symlink targets). The browser receives NO file content: no
-  `data_base64`, no content endpoint, no `/diff`, no `/apply`, no POST
-  inside the changes owner, no File System Access API, no clipboard, no
-  download route; digests and metadata are not a content preview. A changes
-  failure never POSTs, never calls inspect/events/logs and never affects
-  the mutation gate or polling eligibility.
+  `data_base64`, no content-endpoint fetch (the CLI/HTTP content route of
+  the next section is not consumed by the UI), no `/diff`, no `/apply`, no
+  POST inside the changes owner, no File System Access API, no clipboard,
+  no download route; digests and metadata are not a content preview. A
+  changes failure never POSTs, never calls inspect/events/logs and never
+  affects the mutation gate or polling eligibility.
 - Still unwired: Apply, any write to the operator project, RW project
-  mounts, project-level locking, automatic application, bounded
-  content/diff viewing (the declared next layer), final-workspace durable
-  sealing, and any state schema change.
+  mounts, project-level locking, automatic application, bounded text
+  preview and unified diff rendering over the content API (the declared
+  next layer; the raw-byte transport itself is wired — see the next
+  section), final-workspace durable sealing, and any state schema change.
+
+## The read-only project change content API (`orchestrator project-change-content`, GET /v1/runs/:runId/changes/:changeIndex/content)
+
+The versioned read-only Project Change Content API serves one bounded
+raw-byte slice of one side of one verified Project Changes entry for one
+finalized pipeline v2 run. Authority is never a path: the request names
+run id, change index, side, observation, offset and limit; the observed
+path is derived exclusively from the freshly recomputed verified change
+entry (full observation recompute → exact observation match → index
+resolve → side resolution → derived trusted path → one verified
+stream). The caller never passes a filesystem path, run root, artifact
+path, expected digest, byte count or symlink target; index plus
+observation are the only content authority inside a run.
+
+- Single owner: `orchestrator/src/pipeline_v2_project_change_content.ts`
+  (public facade) + `pipeline_v2_project_change_content_internal.ts`
+  (the pure side-availability resolver and the single-pass verified
+  reader) + `pipeline_v2_project_stream_internal.ts` (the ONE streaming
+  regular-file observation owner). The whole path is read-only: no
+  mutation lock, no project lock, no reducer/store, no Docker
+  Helper/Launcher/Session, no temporary file, no repair, and content,
+  mode and kind fingerprints are byte-identical across reads. Reuse is
+  total: the shared read-only durable-run load chain, the single Project
+  Changes comparison owner (the full observation is recomputed on every
+  content request) and the provenance scanner's read-only IO seam.
+- Four success statuses (`available` / `implicit_empty` /
+  `metadata_only` / `unavailable`), deliberately distinct:
+  - `available` — the side is a regular file whose bytes were proven to
+    belong to the expected digest by one sequential verified pass; a
+    bounded raw-byte slice is returned in `dataBase64`.
+  - `implicit_empty` — the baseline of an added path or the result of a
+    deleted path: a full logical empty diff side with `byte_count: 0`,
+    never an error and never a fabricated digest.
+  - `metadata_only` — the side is a directory or a symlink; file
+    content does not exist by definition and the metadata already lives
+    in the change node; a symlink is never dereferenced (`O_NOFOLLOW`
+    open ⇒ `ELOOP`).
+  - `unavailable` — the baseline regular-file bytes can no longer be
+    proven; the ONLY reason is `source_no_longer_matches_baseline`
+    (directory/symlink and logical emptiness are separate statuses, not
+    unavailable reasons).
+- Baseline availability is conditional by construction: baseline bytes
+  of a modified/deleted/type-changed path are served only while the
+  current operator project still matches the baseline observation
+  (`matches_baseline`; digest re-verified at read time); under
+  `matches_result` or `diverged` the status is `unavailable` and
+  third-party bytes are never served. A mode-only regular-file change
+  serves BOTH sides from the verified result workspace bytes because
+  the classifier proves digest equality (independent of the operator
+  relation); a violated equality contract fails closed. The result side
+  of every content change is always served from the run workspace.
+- Streaming verification (the closed A→B→A hole): one `O_NOFOLLOW`
+  open, fstat before, one sequential 128 KiB-chunk pass from offset 0
+  to EOF hashing the actual stream while an optional bounded slice
+  (≤ the requested limit) is copied from that same stream, fstat after
+  with the full identity comparison (dev/ino/kind/mode/size/nlink/
+  mtime/ctime), and the full digest/byte-count check against the
+  expected node — the result, including captured bytes, leaves the
+  owner only after every check passed. A slice can therefore never be
+  paired with a digest of different bytes, and there is no second read:
+  the older slice-then-rehash scheme (vulnerable to a same-size A→B→A
+  rewrite between the reads) is closed by construction. The residual
+  trusted-writer window is the same millisecond-granularity class the
+  provenance scanner documents (a same-millisecond same-size in-place
+  write between the scan read and the stream open defeats the ctime
+  check); the stream digest still binds the served slice to the bytes
+  actually read.
+- Memory bound: the same streaming owner now observes every regular
+  file of the Project Changes scan itself — the scanner holds one fixed
+  128 KiB chunk plus metadata, never a whole file, and never concatenates
+  chunks. The content read adds only the requested slice buffer. The
+  Project Changes observation digest and every wire document stay
+  byte-identical for unchanged trees.
+- Cursor contract (raw bytes): `offset` default 0; `offset >
+  byte_count` → `invalid_cursor`; `offset == byte_count` → empty data +
+  `next_offset: null`; `next_offset = offset + returned byte count`
+  only when a tail exists. `implicit_empty`/`metadata_only`/
+  `unavailable` serve offset 0 only. Default limit 65 536, maximum
+  262 144 raw bytes (both verified against the 4 MB subprocess stdout
+  limit and the 1 MiB UI document bound with ≥11×/3× headroom). Per
+  request the cost is honest O(tree + file): every content request
+  recomputes the FULL observation (both trees) and streams the
+  requested file once.
+- TOCTOU classification: a tree change between the metadata page and
+  the content request is `stale_observation` before any byte; an
+  instability during the recompute scan or during the target stream is
+  `workspace_unstable` (run workspace) / `project_unstable` (operator
+  project) with zero bytes and no partial response; the provenance
+  manifest keeps `artifact_missing`/`artifact_modified` (never used for
+  mutable-tree races).
+- Content boundary: the bytes are secret-bearing and served verbatim by
+  design (no redaction); only `dataBase64` carries bytes, and bytes
+  never appear in diagnostics, errors, headers or URLs; paths never
+  enter content documents; the same-origin loopback Host/Origin
+  boundary is unchanged; HTTP responses carry `Cache-Control: no-store`.
+- CLI: `orchestrator project-change-content --run-id SAFE_ID
+  --config-root ABS --project ABS --change-index N --side baseline|result
+  --observation SHA256 [--offset N] [--limit N] [--json]` — both flag
+  forms, strict parser (duplicates/unknowns/positionals exit 2 with
+  empty stdout; canonical decimals; observation 64-hex exact; every
+  auth/helper/internal/state-root flag rejected; `--project` the trusted
+  operator surface through the existing canonical directory validation).
+  Success prints exactly one JSON document
+  `{ok, exitCode: 0, schemaVersion: 1, runId, runRoot, revision,
+  observation, changeIndex, side, status, ...variant}` — `runRoot`
+  exists only in the trusted CLI document; failures carry the
+  established Project Changes failure envelope (no new failure
+  vocabulary).
+- HTTP: `GET /v1/runs/:runId/changes/:changeIndex/content?side=...&observation=HEX[&offset=N&limit=N]`
+  flows the same authority chain (`runId → durable binding → frozen
+  registry project → subprocess client`). Strict query grammar (no
+  percent-encoding, bare keys, duplicates, empty values, sign, fraction
+  or exponent); `invalid_cursor` maps to the request-layer 400,
+  `stale_observation` to 409, `binding_not_found` to 404, a removed
+  project stays `project_unavailable` (409), every other correctly
+  received content failure is the failed command result at 200,
+  transport failures stay 502, and all success statuses are 200 with
+  `no-store`, GET-only, body forbidden, no Range semantics and no
+  content disposition.
+- Zero-write semantics: no run mutation lock, no project lock, no
+  reducer/store sink, no Docker Helper, no Launcher, no sessions, no
+  worker, no temp files, no repair. atime is explicitly OUTSIDE the
+  zero-write guarantee — reads may move it under the kernel's read
+  policy (relatime), fingerprints exclude it and nothing restores it.
+- Still unwired: Browser UI preview/diff (the raw-byte transport is the
+  wire contract a future viewer builds on), Apply, writes to the
+  operator project, RW project mounts, final-workspace durable sealing,
+  and any state schema change.
 
 ## The production continue-stage runner API (`orchestrator continue-stage`)
 

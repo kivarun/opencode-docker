@@ -1242,7 +1242,13 @@ describe("project changes ownership and UI boundary", () => {
       "pipeline_v2_project_provenance_store_internal.ts",
     ]);
     expect(facadeUsers.sort()).toEqual(["main.ts", "pipeline_v2_project_changes.ts"]);
-    expect(coreUsers.sort()).toEqual(["pipeline_v2_project_changes.ts", "pipeline_v2_project_changes_internal.ts"]);
+    expect(coreUsers.sort()).toEqual([
+      // The content core reuses the one comparison owner; there is no
+      // second scanner.
+      "pipeline_v2_project_change_content_internal.ts",
+      "pipeline_v2_project_changes.ts",
+      "pipeline_v2_project_changes_internal.ts",
+    ]);
   });
 
   test("the facade runs the real read-only scanner IO and no test seam is exported", async () => {

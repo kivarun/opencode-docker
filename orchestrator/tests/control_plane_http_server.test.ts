@@ -2402,3 +2402,269 @@ describe("control-plane HTTP: project changes route", () => {
     expect((response.body.match(/\//g) ?? []).length).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// control-plane HTTP: project change content route
+// ---------------------------------------------------------------------------
+describe("control-plane HTTP: project change content route", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-content-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const storeRoot = join(envRoot, "bindings");
+  const projectDir = join(envRoot, "project");
+  let registry: Awaited<ReturnType<typeof loadControlPlaneProjectRegistry>>;
+  const calls: unknown[] = [];
+  let nextResult: OrchestratorCallResult = {
+    ok: true,
+    projection: {
+      kind: "projectChangeContent",
+      schemaVersion: 1,
+      runId: "content-run",
+      revision: 30,
+      observation: "a".repeat(64),
+      changeIndex: 1,
+      side: "result",
+      status: "available",
+      byteCount: 5,
+      sha256: "b".repeat(64),
+      offset: 0,
+      dataBase64: "aGVsbG8=",
+      nextOffset: null,
+    },
+  };
+
+  beforeAll(async () => {
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    registry = await loadControlPlaneProjectRegistry(registryPath);
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "content-run", projectId: "project-a" });
+    await store.claim({ runId: "content-gone-run", projectId: "project-removed" });
+  }, 20000);
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  const callHandler = async (path: string, method = "GET", headers: Record<string, string> = {}, body?: string): Promise<RawResponse> => {
+    const fakeClient = {
+      run: async (command: unknown): Promise<OrchestratorCallResult> => {
+        calls.push(command);
+        return nextResult;
+      },
+    } as unknown as OrchestratorSubprocessClient;
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: fakeClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+    };
+    const request = new Request(`http://127.0.0.1:4711${path}`, {
+      method,
+      headers: { host: "127.0.0.1:4711", ...headers },
+      ...(body === undefined ? {} : { body }),
+    });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    const headerEntries: Array<[string, string]> = [];
+    response.headers.forEach((value, key) => headerEntries.push([key, value]));
+    return { status: response.status, headers: Object.fromEntries(headerEntries), body: await response.text() };
+  };
+  const get = (path: string, headers: Record<string, string> = {}): Promise<RawResponse> => callHandler(path, "GET", headers);
+  const contentRouteReason = (path: string, method: string): string => {
+    const parsed = parseControlPlaneRoute(path, method);
+    return parsed instanceof ControlPlaneHttpRequestError ? parsed.reason : `ok:${(parsed as { kind: string }).kind}`;
+  };
+
+  test("the route grammar accepts the content path for GET only and validates the change index segment", () => {
+    expect(contentRouteReason("/v1/runs/content-run/changes/3/content", "GET")).toBe("ok:project_change_content");
+    expect(contentRouteReason("/v1/runs/content-run/changes/3/content", "POST")).toBe("method_not_allowed");
+    expect(contentRouteReason("/v1/runs/content-run/changes/0/content", "GET")).toBe("invalid_path");
+    expect(contentRouteReason("/v1/runs/content-run/changes/01/content", "GET")).toBe("invalid_path");
+    expect(contentRouteReason("/v1/runs/content-run/changes/x/content", "GET")).toBe("invalid_path");
+    expect(contentRouteReason("/v1/runs/content-run/changes/3", "GET")).toBe("unknown_route");
+    expect(contentRouteReason("/v1/runs/content-run/changes/3/content/extra", "GET")).toBe("unknown_route");
+    expect(contentRouteReason("/v1/runs/missing%20run/changes/3/content", "GET")).toBe("invalid_path");
+  });
+
+  test("the available status serves the exact snake_case schema with no-store and no run root", async () => {
+    calls.length = 0;
+    const response = await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`);
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      "byte_count", "change_index", "data_base64", "kind", "next_offset", "observation", "offset", "revision", "run_id", "schema_version", "sha256", "side", "status",
+    ]);
+    expect(body["kind"]).toBe("project_change_content");
+    expect(body["status"]).toBe("available");
+    expect(body["data_base64"]).toBe("aGVsbG8=");
+    expect(body["next_offset"]).toBeNull();
+    expect(response.body).not.toContain("run_root");
+    expect(response.body).not.toContain(projectDir);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(calls).toEqual([{
+      kind: "project_change_content", runId: "content-run", projectPath: projectDir,
+      changeIndex: 1, side: "result", observation: "a".repeat(64),
+    }]);
+  });
+
+  test("the implicit_empty, metadata_only and unavailable statuses project their exact shapes", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "projectChangeContent", schemaVersion: 1, runId: "content-run", revision: 30,
+        observation: "a".repeat(64), changeIndex: 1, side: "baseline", status: "implicit_empty",
+        byteCount: 0, offset: 0, dataBase64: "", nextOffset: null,
+      },
+    } as unknown as OrchestratorCallResult;
+    const empty = await get(`/v1/runs/content-run/changes/1/content?side=baseline&observation=${"a".repeat(64)}`);
+    expect(empty.status).toBe(200);
+    const emptyBody = JSON.parse(empty.body) as Record<string, unknown>;
+    expect(Object.keys(emptyBody).sort()).toEqual([
+      "byte_count", "change_index", "data_base64", "kind", "next_offset", "observation", "offset", "revision", "run_id", "schema_version", "side", "status",
+    ]);
+    expect(emptyBody["byte_count"]).toBe(0);
+
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "projectChangeContent", schemaVersion: 1, runId: "content-run", revision: 30,
+        observation: "a".repeat(64), changeIndex: 2, side: "result", status: "metadata_only",
+        node: { kind: "symlink", target: "elsewhere.txt" },
+      },
+    } as unknown as OrchestratorCallResult;
+    const meta = await get(`/v1/runs/content-run/changes/2/content?side=result&observation=${"a".repeat(64)}`);
+    const metaBody = JSON.parse(meta.body) as Record<string, unknown>;
+    expect(Object.keys(metaBody).sort()).toEqual([
+      "change_index", "kind", "node", "observation", "revision", "run_id", "schema_version", "side", "status",
+    ]);
+    expect(metaBody["node"]).toEqual({ kind: "symlink", target: "elsewhere.txt" });
+
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "projectChangeContent", schemaVersion: 1, runId: "content-run", revision: 30,
+        observation: "a".repeat(64), changeIndex: 3, side: "baseline", status: "unavailable",
+        reason: "source_no_longer_matches_baseline",
+        node: { kind: "regular_file", mode: 420, byte_count: 9, sha256: "c".repeat(64), multiple_links: false },
+      },
+    } as unknown as OrchestratorCallResult;
+    const un = await get(`/v1/runs/content-run/changes/3/content?side=baseline&observation=${"a".repeat(64)}`);
+    const unBody = JSON.parse(un.body) as Record<string, unknown>;
+    expect(Object.keys(unBody).sort()).toEqual([
+      "change_index", "kind", "node", "observation", "reason", "revision", "run_id", "schema_version", "side", "status",
+    ]);
+    expect(unBody["reason"]).toBe("source_no_longer_matches_baseline");
+  });
+
+  test("the query grammar is strict and every scalar travels as a typed command field", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "projectChangeContent", schemaVersion: 1, runId: "content-run", revision: 30,
+        observation: "a".repeat(64), changeIndex: 1, side: "result", status: "available",
+        byteCount: 5, sha256: "b".repeat(64), offset: 0, dataBase64: "aGVsbG8=", nextOffset: null,
+      },
+    } as unknown as OrchestratorCallResult;
+    calls.length = 0;
+    await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}&offset=8&limit=4096`);
+    expect(calls).toEqual([{
+      kind: "project_change_content", runId: "content-run", projectPath: projectDir,
+      changeIndex: 1, side: "result", observation: "a".repeat(64), offset: 8, limit: 4096,
+    }]);
+    const bad = [
+      "",
+      `side=result`,
+      `observation=${"a".repeat(64)}`,
+      `observation=${"a".repeat(64)}&side=middle`,
+      `observation=${"a".repeat(64)}&side=BASELINE`,
+      `side=result&observation=ZZ`,
+      `side=result&observation=${"a".repeat(63)}`,
+      `side=result&observation=${"a".repeat(64)}&offset=-1`,
+      `side=result&observation=${"a".repeat(64)}&offset=01`,
+      `side=result&observation=${"a".repeat(64)}&limit=0`,
+      `side=result&observation=${"a".repeat(64)}&limit=262145`,
+      `side=result&observation=${"a".repeat(64)}&after=1`,
+      `side=result&observation=${"a".repeat(64)}&side=result`,
+      `side=result&observation=${"a".repeat(64)}%`,
+      `side=result&observation=${"a".repeat(64)}&unknown=1`,
+      `side&observation=${"a".repeat(64)}`,
+      `side=extra`,
+    ];
+    for (const query of bad) {
+      const response = await get(`/v1/runs/content-run/changes/1/content${query === "" ? "" : `?${query}`}`);
+      expect(response.status).toBe(400);
+    }
+    calls.length = 0;
+  });
+
+  test("the typed content failures map to 400/409/200 and transport failures to 502", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "projectChangeContentFailure", exitCode: 1, runId: "content-run", runRoot: null, reason: "invalid_cursor" },
+    } as unknown as OrchestratorCallResult;
+    expect((await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`)).status).toBe(400);
+    nextResult = {
+      ok: true,
+      projection: { kind: "projectChangeContentFailure", exitCode: 1, runId: "content-run", runRoot: null, reason: "stale_observation" },
+    } as unknown as OrchestratorCallResult;
+    expect((await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`)).status).toBe(409);
+    nextResult = {
+      ok: true,
+      projection: { kind: "projectChangeContentFailure", exitCode: 1, runId: "content-run", runRoot: null, reason: "changes_not_ready" },
+    } as unknown as OrchestratorCallResult;
+    const notReady = await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`);
+    expect(notReady.status).toBe(200);
+    expect((JSON.parse(notReady.body) as Record<string, unknown>)["kind"]).toBe("command_result");
+    nextResult = { ok: false, failure: { reason: "spawn_failed", expectedRunId: "content-run" } } as unknown as OrchestratorCallResult;
+    expect((await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`)).status).toBe(502);
+    nextResult = {
+      ok: true,
+      projection: { kind: "projectChanges", schemaVersion: 1 },
+    } as unknown as OrchestratorCallResult;
+    expect((await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`)).status).toBe(502);
+    // Unbound runs and removed projects keep the established authority failures.
+    expect((await get(`/v1/runs/unbound-run/changes/1/content?side=result&observation=${"a".repeat(64)}`)).status).toBe(404);
+    expect((await get(`/v1/runs/content-gone-run/changes/1/content?side=result&observation=${"a".repeat(64)}`)).status).toBe(409);
+  });
+
+  test("the content route rejects bodies and preserves the Host/Origin gates", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "projectChangeContent", schemaVersion: 1, runId: "content-run", revision: 30,
+        observation: "a".repeat(64), changeIndex: 1, side: "result", status: "available",
+        byteCount: 5, sha256: "b".repeat(64), offset: 0, dataBase64: "aGVsbG8=", nextOffset: null,
+      },
+    } as unknown as OrchestratorCallResult;
+    const withBody = await callHandler(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`, "GET", { "content-length": "2" }, "{}");
+    expect(withBody.status).toBe(400);
+    expect((await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`, { origin: "http://evil.example" })).status).toBe(400);
+    expect((await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`, { host: "evil:1" })).status).toBe(400);
+  });
+
+  test("the content response carries no leakage canary", async () => {
+    const response = await get(`/v1/runs/content-run/changes/1/content?side=result&observation=${"a".repeat(64)}`);
+    expectNoLeak(response.body, [envRoot]);
+    expect(response.body).not.toContain(CANARY);
+    calls.length = 0;
+  });
+});

@@ -49,6 +49,115 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
     })}\n`,
     exitCode: 0,
   },
+  content_available: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "result", status: "available",
+      byteCount: 5, sha256: "b".repeat(64), offset: 0, dataBase64: Buffer.from("Hello", "utf8").toString("base64"), nextOffset: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_implicit_empty: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "baseline", status: "implicit_empty",
+      byteCount: 0, offset: 0, dataBase64: "", nextOffset: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_metadata_only: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 3, side: "result", status: "metadata_only",
+      node: { kind: "symlink", target: "elsewhere.txt" },
+    })}\n`,
+    exitCode: 0,
+  },
+  content_unavailable: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 4, side: "baseline", status: "unavailable",
+      reason: "source_no_longer_matches_baseline",
+      node: { kind: "regular_file", mode: 420, byte_count: 9, sha256: "c".repeat(64), multiple_links: false },
+    })}\n`,
+    exitCode: 0,
+  },
+  content_failure: {
+    stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run", reason: "stale_observation" })}\n`,
+    exitCode: 1,
+  },
+  content_bad_status: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "result", status: "complete",
+    })}\n`,
+    exitCode: 0,
+  },
+  content_extra_field: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "result", status: "available",
+      byteCount: 5, sha256: "b".repeat(64), offset: 0, dataBase64: "aGVsbG8=", nextOffset: null, extra: 1,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_missing_field: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "result", status: "available",
+      byteCount: 5, offset: 0, dataBase64: "aGVsbG8=", nextOffset: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_bad_side: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "middle", status: "available",
+      byteCount: 5, sha256: "b".repeat(64), offset: 0, dataBase64: "aGVsbG8=", nextOffset: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_bad_observation: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "zz", changeIndex: 2, side: "result", status: "available",
+      byteCount: 5, sha256: "b".repeat(64), offset: 0, dataBase64: "aGVsbG8=", nextOffset: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_v2: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 2, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "result", status: "available",
+      byteCount: 5, sha256: "b".repeat(64), offset: 0, dataBase64: "aGVsbG8=", nextOffset: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_implicit_wrong_cursor: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 2, side: "baseline", status: "implicit_empty",
+      byteCount: 1, offset: 0, dataBase64: "", nextOffset: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  content_bad_reason: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 4, side: "baseline", status: "unavailable",
+      reason: "something_else",
+      node: { kind: "regular_file", mode: 420, byte_count: 9, sha256: "c".repeat(64), multiple_links: false },
+    })}\n`,
+    exitCode: 0,
+  },
+  content_node_not_object: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",
+      revision: 9, observation: "a".repeat(64), changeIndex: 3, side: "result", status: "metadata_only",
+      node: "x",
+    })}\n`,
+    exitCode: 0,
+  },
   inspect_report_v2: {
     stdout: `${JSON.stringify({
       ok: true,

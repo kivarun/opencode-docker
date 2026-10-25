@@ -41,6 +41,7 @@ import {
   projectChangesPipelineV2Run,
   type PipelineV2ProjectChangesOutcome,
 } from "../src/pipeline_v2_project_changes.ts";
+import type { PipelineV2ProjectChangeContentOutcome } from "../src/pipeline_v2_project_change_content.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
@@ -122,6 +123,9 @@ function makeIo(): Recorder {
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],
+    projectChangeContentPipelineV2Run: (async () => {
+      throw new Error("fake projectChangeContentPipelineV2Run not configured");
+    }) as unknown as CliIo["projectChangeContentPipelineV2Run"],
     eventsPipelineV2Run: (async () => {
       throw new Error("fake eventsPipelineV2Run not configured");
     }) as unknown as CliIo["eventsPipelineV2Run"],
@@ -4052,6 +4056,102 @@ test("logs pending execution reports the status line and the failure line maps t
   expect(failureExit).toBe(1);
   expect(failureRec.err).toEqual(["orchestrator: logs failed (run run_x, reason artifact_modified)"]);
   expect(failureRec.out).toHaveLength(0);
+}, 15000);
+
+// --- project-change-content dispatcher -----------------------------------------
+
+function contentReport(overrides: Record<string, unknown> = {}): PipelineV2ProjectChangeContentOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    runRoot: "/state/root/pipeline-runs/run_x",
+    revision: 12,
+    observation: "a".repeat(64),
+    changeIndex: 2,
+    side: "result",
+    status: "available",
+    byteCount: 8,
+    sha256: "b".repeat(64),
+    offset: 0,
+    dataBase64: Buffer.from("DOGFOOD\n").toString("base64"),
+    nextOffset: null,
+    ...overrides,
+  } as unknown as PipelineV2ProjectChangeContentOutcome;
+}
+
+test("project-change-content dispatches exactly once with the parsed scalars and uses no runner", async () => {
+  const rec = makeIo();
+  const contentCalls: unknown[] = [];
+  rec.io.projectChangeContentPipelineV2Run = (async (options: unknown) => {
+    contentCalls.push(options);
+    return contentReport();
+  }) as unknown as CliIo["projectChangeContentPipelineV2Run"];
+  const exit = await runCli([
+    "project-change-content", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/operator/project",
+    "--change-index", "2", "--side", "result", "--observation", "a".repeat(64),
+    "--offset", "8", "--limit", "4096",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(contentCalls).toHaveLength(1);
+  expect(contentCalls[0]).toEqual({
+    runId: "run_x",
+    stateRoot: "/state/root",
+    projectPath: "/operator/project",
+    changeIndex: 2,
+    side: "result",
+    observation: "a".repeat(64),
+    offset: 8,
+    limit: 4096,
+  });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: project-change-content ok (run run_x, revision 12, change 2, side result, status available)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("project-change-content reports the defaults and every failure line", async () => {
+  const rec = makeIo();
+  rec.io.projectChangeContentPipelineV2Run = (async () =>
+    contentReport({ changeIndex: 1, side: "baseline", status: "implicit_empty", byteCount: 0, offset: 0, dataBase64: "", sha256: undefined, nextOffset: null })) as unknown as CliIo["projectChangeContentPipelineV2Run"];
+  const exit = await runCli(["project-change-content", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p", "--change-index", "1", "--side", "baseline", "--observation", "a".repeat(64)], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.err).toEqual(["orchestrator: project-change-content ok (run run_x, revision 12, change 1, side baseline, status implicit_empty)"]);
+
+  const failureRec = makeIo();
+  failureRec.io.projectChangeContentPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    runRoot: null,
+    reason: "stale_observation",
+  })) as unknown as CliIo["projectChangeContentPipelineV2Run"];
+  const failureExit = await runCli(["project-change-content", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p", "--change-index", "1", "--side", "result", "--observation", "a".repeat(64)], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: project-change-content failed (run run_x, reason stale_observation)"]);
+  expect(failureRec.out).toHaveLength(0);
+}, 15000);
+
+test("project-change-content JSON mode prints exactly one document and nothing else on stdout", async () => {
+  const rec = makeIo();
+  rec.io.projectChangeContentPipelineV2Run = (async () => contentReport()) as unknown as CliIo["projectChangeContentPipelineV2Run"];
+  const exit = await runCli(["project-change-content", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p", "--change-index", "2", "--side", "result", "--observation", "a".repeat(64), "--json"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  const parsed = JSON.parse(rec.out[0] as string) as Record<string, unknown>;
+  expect(parsed["status"]).toBe("available");
+  expect(parsed["dataBase64"]).toBe(Buffer.from("DOGFOOD\n").toString("base64"));
+  expect(rec.err).toHaveLength(0);
+}, 15000);
+
+test("project-change-content rejects unknown commands before any API call", async () => {
+  const rec = makeIo();
+  rec.io.projectChangeContentPipelineV2Run = (async () => {
+    throw new Error("must not be called");
+  }) as unknown as CliIo["projectChangeContentPipelineV2Run"];
+  const exit = await runCli(["project-change-content", "--run-id", "run_x", "--config-root", "/cfg", "--project", "/p", "--change-index", "1", "--side", "result", "--observation", "a".repeat(64), "--bogus"], rec.io);
+  expect(exit).toBe(2);
+  expect(rec.out).toHaveLength(0);
 }, 15000);
 
 // --- project-changes dispatcher ------------------------------------------------

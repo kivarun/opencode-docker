@@ -222,6 +222,40 @@ export type OrchestratorProjectChangesProjection =
       readonly reason: string;
     };
 
+/**
+ * The projected result of one `project_change_content` call: the exact
+ * schemaVersion-1 content projection in one of the four closed success
+ * statuses (the node passes through as opaque frozen JSON — the client
+ * never re-classifies a node; only `dataBase64` carries bytes and the
+ * raw `runRoot` is dropped before the HTTP layer), or the typed content
+ * failure outcome of the CLI itself.
+ */
+export type OrchestratorProjectChangeContentProjection =
+  | {
+      readonly kind: "projectChangeContent";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly observation: string;
+      readonly changeIndex: number;
+      readonly side: string;
+      readonly status: string;
+      readonly byteCount?: number;
+      readonly sha256?: string;
+      readonly offset?: number;
+      readonly dataBase64?: string;
+      readonly nextOffset?: number | null;
+      readonly reason?: string;
+      readonly node?: OrchestratorJsonObject;
+    }
+  | {
+      readonly kind: "projectChangeContentFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly runRoot: string | null;
+      readonly reason: string;
+    };
+
 /** A transport failure: not a durable run outcome, no stderr or body contents. */
 export interface OrchestratorTransportFailure {
   readonly reason: OrchestratorTransportReason;
@@ -244,7 +278,8 @@ export type OrchestratorCallResult =
         | OrchestratorInspectProjection
         | OrchestratorEventsProjection
         | OrchestratorLogsProjection
-        | OrchestratorProjectChangesProjection;
+        | OrchestratorProjectChangesProjection
+        | OrchestratorProjectChangeContentProjection;
     }
   | { readonly ok: false; readonly failure: OrchestratorTransportFailure };
 
@@ -396,6 +431,23 @@ const CHANGES_REPORT_KEYS = [
   "summary",
 ] as const;
 const CHANGES_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+const CONTENT_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+const CONTENT_COMMON_SUCCESS_KEYS = [
+  "changeIndex",
+  "exitCode",
+  "observation",
+  "ok",
+  "revision",
+  "runId",
+  "runRoot",
+  "schemaVersion",
+  "side",
+  "status",
+] as const;
+const CONTENT_AVAILABLE_KEYS = [...CONTENT_COMMON_SUCCESS_KEYS, "byteCount", "dataBase64", "nextOffset", "offset", "sha256"] as const;
+const CONTENT_IMPLICIT_EMPTY_KEYS = [...CONTENT_COMMON_SUCCESS_KEYS, "byteCount", "dataBase64", "nextOffset", "offset"] as const;
+const CONTENT_METADATA_ONLY_KEYS = [...CONTENT_COMMON_SUCCESS_KEYS, "node"] as const;
+const CONTENT_UNAVAILABLE_KEYS = [...CONTENT_COMMON_SUCCESS_KEYS, "node", "reason"] as const;
 const LOGS_LIST_KEYS = [
   "exitCode",
   "logs",
@@ -724,6 +776,187 @@ function parseOutcomeDocument(
           summary: parsed["summary"] as OrchestratorJsonObject,
           changes: deepFreezeValue(parsed["changes"] as OrchestratorJsonValue[]),
           nextAfter: nextAfterValue as number | null,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "project_change_content") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, CONTENT_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const runRootValue = parsed["runRoot"];
+        if (runRootValue !== null && typeof runRootValue !== "string") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content failure runRoot must be a string or null");
+        }
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "projectChangeContentFailure",
+            exitCode: 1,
+            runId,
+            runRoot: runRootValue as string | null,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      const status = parsed["status"];
+      if (
+        typeof status !== "string" ||
+        !(status === "available" || status === "implicit_empty" || status === "metadata_only" || status === "unavailable")
+      ) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content status must be one of the four closed statuses");
+      }
+      const keys =
+        status === "available"
+          ? CONTENT_AVAILABLE_KEYS
+          : status === "implicit_empty"
+            ? CONTENT_IMPLICIT_EMPTY_KEYS
+            : status === "metadata_only"
+              ? CONTENT_METADATA_ONLY_KEYS
+              : CONTENT_UNAVAILABLE_KEYS;
+      expectExactKeys(parsed, keys);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content outcome has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "project-change-content projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      const contentRunRoot = expectStringField(parsed, "runRoot");
+      void contentRunRoot;
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content revision must be a positive safe integer");
+      }
+      const observation = parsed["observation"];
+      if (typeof observation !== "string" || !/^[0-9a-f]{64}$/.test(observation)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content observation must be a 64-character lowercase hexadecimal digest");
+      }
+      if (!isPositiveSafeInteger(parsed["changeIndex"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content changeIndex must be a positive safe integer");
+      }
+      const side = parsed["side"];
+      if (side !== "baseline" && side !== "result") {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content side must be 'baseline' or 'result'");
+      }
+      // The raw run root never reaches the HTTP layer; only `dataBase64`
+      // carries bytes.
+      if (status === "available") {
+        const sha256 = expectStringField(parsed, "sha256");
+        if (!isLowercaseSha256(sha256)) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content sha256 must be a lowercase SHA-256 digest");
+        }
+        const byteCount = parsed["byteCount"];
+        const offset = parsed["offset"];
+        const nextOffsetValue = parsed["nextOffset"];
+        if (typeof byteCount !== "number" || !Number.isSafeInteger(byteCount) || byteCount < 0) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content byteCount must be a non-negative safe integer");
+        }
+        if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content offset must be a non-negative safe integer");
+        }
+        if (
+          nextOffsetValue !== null &&
+          (typeof nextOffsetValue !== "number" || !Number.isSafeInteger(nextOffsetValue) || nextOffsetValue < 0)
+        ) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content nextOffset must be a non-negative safe integer or null");
+        }
+        const dataBase64 = expectStringField(parsed, "dataBase64");
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "projectChangeContent",
+            schemaVersion: 1,
+            runId,
+            revision: parsed["revision"] as number,
+            observation,
+            changeIndex: parsed["changeIndex"] as number,
+            side,
+            status,
+            byteCount,
+            sha256,
+            offset,
+            dataBase64,
+            nextOffset: nextOffsetValue as number | null,
+          }),
+        };
+      }
+      if (status === "implicit_empty") {
+        if (parsed["byteCount"] !== 0 || parsed["offset"] !== 0 || parsed["dataBase64"] !== "" || parsed["nextOffset"] !== null) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content implicit_empty cursor fields have an unexpected shape");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "projectChangeContent",
+            schemaVersion: 1,
+            runId,
+            revision: parsed["revision"] as number,
+            observation,
+            changeIndex: parsed["changeIndex"] as number,
+            side,
+            status,
+            byteCount: 0,
+            offset: 0,
+            dataBase64: "",
+            nextOffset: null,
+          }),
+        };
+      }
+      if (!isRecord(parsed["node"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content node must be an object");
+      }
+      if (status === "metadata_only") {
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "projectChangeContent",
+            schemaVersion: 1,
+            runId,
+            revision: parsed["revision"] as number,
+            observation,
+            changeIndex: parsed["changeIndex"] as number,
+            side,
+            status,
+            node: parsed["node"] as OrchestratorJsonObject,
+          }),
+        };
+      }
+      if (parsed["reason"] !== "source_no_longer_matches_baseline") {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-change-content unavailable reason has an unexpected value");
+      }
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "projectChangeContent",
+          schemaVersion: 1,
+          runId,
+          revision: parsed["revision"] as number,
+          observation,
+          changeIndex: parsed["changeIndex"] as number,
+          side,
+          status,
+          reason: parsed["reason"] as string,
+          node: parsed["node"] as OrchestratorJsonObject,
         }),
       };
     } catch (cause) {

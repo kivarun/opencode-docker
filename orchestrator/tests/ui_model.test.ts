@@ -75,6 +75,9 @@ describe("ui model: document classification", () => {
     // the dedicated events client; an events document never satisfies
     // an inspect, discovery or mutation request
     expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "events", run_id: "r", revision: 1, events: [], next_after: null }))).toBe("unknown_kind");
+    // the content document stays owned by a future dedicated viewer: the
+    // general API client keeps rejecting it fail-closed
+    expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "project_change_content", run_id: "r", revision: 1, observation: "a".repeat(64), change_index: 1, side: "result", status: "available", byte_count: 1, sha256: "b".repeat(64), offset: 0, data_base64: "aGk=", next_offset: null }))).toBe("unknown_kind");
   });
 
   test("the general client keeps rejecting the events kind; the events client owns the endpoint", async () => {

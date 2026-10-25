@@ -55,6 +55,16 @@ export type OrchestratorCommand =
       readonly observation?: string;
     }
   | {
+      readonly kind: "project_change_content";
+      readonly runId: string;
+      readonly projectPath: string;
+      readonly changeIndex: number;
+      readonly side: string;
+      readonly observation: string;
+      readonly offset?: number;
+      readonly limit?: number;
+    }
+  | {
       readonly kind: "events";
       readonly runId: string;
       readonly after?: number;
@@ -170,6 +180,8 @@ interface CapturedCommand {
   readonly executionIndex: number | null;
   readonly offset: number | null;
   readonly observation: string | null;
+  readonly changeIndex: number;
+  readonly side: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -288,6 +300,8 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
     offset: null,
     limit: null,
     observation: null,
+    changeIndex: 0,
+    side: "",
   };
   switch (kind) {
     case "run": {
@@ -360,6 +374,41 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
         after,
         limit,
         observation,
+      };
+    }
+    case "project_change_content": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "projectPath" && key !== "changeIndex" && key !== "side" && key !== "observation" && key !== "offset" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on project_change_content command");
+        }
+      }
+      for (const key of ["runId", "projectPath", "changeIndex", "side", "observation"] as const) {
+        if (!Object.hasOwn(command, key)) {
+          throw new OrchestratorSubprocessClientError("invalid_command", `missing field ${key} on project_change_content command`);
+        }
+      }
+      const offsetField = optionalField(command, "offset");
+      const offset = offsetField.present ? expectNonNegativeIntegerField({ offset: offsetField.value }, "offset", "offset") : null;
+      const limitField = optionalField(command, "limit");
+      const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
+      if (limit !== null && limit > 262144) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "limit must be a positive safe integer up to 262144");
+      }
+      const sideValue = command["side"];
+      if (sideValue !== "baseline" && sideValue !== "result") {
+        throw new OrchestratorSubprocessClientError("invalid_command", "side must be 'baseline' or 'result'");
+      }
+      const side = sideValue as string;
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        projectPath: expectCleanPathField(command, "projectPath", "projectPath"),
+        changeIndex: expectPositiveIntegerField(command, "changeIndex", "changeIndex"),
+        side,
+        observation: expectObservationDigestField(command, "observation"),
+        offset,
+        limit,
       };
     }
     case "events": {
@@ -532,7 +581,9 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
           ? "revise-task"
           : captured.kind === "project_changes"
             ? "project-changes"
-            : captured.kind;
+            : captured.kind === "project_change_content"
+              ? "project-change-content"
+              : captured.kind;
   const argv: string[] = [cliKind];
   switch (captured.kind) {
     case "run": {
@@ -562,6 +613,24 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
       if (captured.after !== null) argv.push("--after", String(captured.after));
       if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       if (captured.observation !== null) argv.push("--observation", captured.observation);
+      break;
+    case "project_change_content":
+      argv.push(
+        "--run-id",
+        captured.runId,
+        "--config-root",
+        routingConfig.configRoot,
+        "--project",
+        captured.projectPath,
+        "--change-index",
+        String(captured.changeIndex),
+        "--side",
+        captured.side,
+        "--observation",
+        captured.observation as string,
+      );
+      if (captured.offset !== null) argv.push("--offset", String(captured.offset));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       break;
     case "events":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);

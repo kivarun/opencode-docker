@@ -121,6 +121,19 @@ export interface ParsedPipelineProjectChangesArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineProjectChangeContentArgs {
+  readonly kind: "project-change-content";
+  readonly runId: string;
+  readonly configRoot: string;
+  readonly project: string;
+  readonly changeIndex: number;
+  readonly side: "baseline" | "result";
+  readonly observation: string;
+  readonly offset: number;
+  readonly limit: number;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
   | ParsedAgentSmokeArgs
@@ -133,7 +146,8 @@ export type ParsedCommand =
   | ParsedPipelineInspectArgs
   | ParsedPipelineEventsArgs
   | ParsedPipelineLogsArgs
-  | ParsedPipelineProjectChangesArgs;
+  | ParsedPipelineProjectChangesArgs
+  | ParsedPipelineProjectChangeContentArgs;
 
 export function usage(): string {
   return [
@@ -176,6 +190,11 @@ export function usage(): string {
     "               observation with an ephemeral read snapshot identity -",
     "               no worker, no Launcher credential, no mutation lock, no",
     "               durable change and no write to the operator project",
+    "  project-change-content read-only bounded raw-byte content of one side",
+    "               of one verified change entry: bound to the recomputed",
+    "               observation identity, served through one single-pass",
+    "               verified stream - no worker, no Launcher credential, no",
+    "               mutation lock, no durable change and no write anywhere",
     "  respond      production pipeline v2 wait response: record the user's answer to",
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
@@ -550,6 +569,44 @@ export function usage(): string {
   "  project stays read-only, and run success does not mean project",
   "  delivery. Only finalized terminal runs carry a comparable workspace;",
   "  every other boundary refuses as 'changes_not_ready'.",
+  "",
+  "project-change-content flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID        the run id of the durable run to read; required",
+  "  --config-root PATH      non-empty absolute configuration root; required by the",
+  "                          shared command grammar but not used by",
+  "                          project-change-content (no profile is loaded, no",
+  "                          Launcher credential is read)",
+  "  --project PATH          clean absolute path of the current operator project;",
+  "                          required; observed read-only and never written by",
+  "                          this command",
+  "  --change-index N        the 1-based index of one verified change entry of",
+  "                          the recomputed observation; required",
+  "  --side baseline|result  which side of the change to read; required",
+  "  --observation SHA256    the 64-hex observation identity the content is",
+  "                          bound to; required; a recomputed digest that",
+  "                          differs is 'stale_observation' (no bytes)",
+  "  [--offset N]            raw-byte cursor (default 0); beyond the verified",
+  "                          byte count is 'invalid_cursor'",
+  "  [--limit N]             maximum raw bytes per response (default 65536,",
+  "                          maximum 262144); the cursor counts raw bytes",
+  "  --json                  print exactly one JSON versioned content document",
+  "                          on stdout; errors and diagnostics go to stderr.",
+  "",
+  "  The content of one side is available only when it is a regular file",
+  "  whose bytes are provable: the baseline side through the current",
+  "  operator project when it still matches the durable baseline, the",
+  "  result side through the run workspace. The four success statuses are",
+  "  'available' (bounded raw-byte slice, verified by one single-pass",
+  "  stream whose digest covers the same bytes the slice came from),",
+  "  'implicit_empty' (the logical empty side of an added baseline or a",
+  "  deleted result - never an error, never a fabricated digest),",
+  "  'metadata_only' (directory or symlink side; a symlink is never",
+  "  dereferenced) and 'unavailable' (the only reason is",
+  "  'source_no_longer_matches_baseline'). The content is secret-bearing",
+  "  and unredacted by design; the bytes travel only in 'dataBase64' and",
+  "  never in diagnostics, headers or URLs. This command writes nothing",
+  "  anywhere (atime may move under the kernel's read policy and is not",
+  "  part of any zero-write claim), and no Apply exists.",
   "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
@@ -1279,8 +1336,193 @@ function parseProjectChangesArgs(argv: string[]): ParsedPipelineProjectChangesAr
   };
 }
 
+function parseProjectChangeContentArgs(argv: string[]): ParsedPipelineProjectChangeContentArgs {
+  let runId: string | null = null;
+  let configRoot: string | null = null;
+  let project: string | null = null;
+  let changeIndex: number | null = null;
+  let side: string | null = null;
+  let observation: string | null = null;
+  let offset: number | null = null;
+  let limit: number | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      const { value, next } = parseValue(argv, i, "--project");
+      requireSingleton(project, "--project");
+      project = requireAbsolute(value, "--project");
+      if (!isCleanAbsolutePath(project)) {
+        throw new Error("--project must be a clean absolute path");
+      }
+      i = next;
+    } else if (arg === "--change-index" || arg.startsWith("--change-index=")) {
+      const { value, next } = parseValue(argv, i, "--change-index");
+      requireSingleton(changeIndex, "--change-index");
+      changeIndex = parsePositiveDecimalSafeInteger(value, "--change-index");
+      i = next;
+    } else if (arg === "--side" || arg.startsWith("--side=")) {
+      const { value, next } = parseValue(argv, i, "--side");
+      requireSingleton(side, "--side");
+      if (value !== "baseline" && value !== "result") {
+        throw new Error("--side must be 'baseline' or 'result'");
+      }
+      side = value;
+      i = next;
+    } else if (arg === "--observation" || arg.startsWith("--observation=")) {
+      const { value, next } = parseValue(argv, i, "--observation");
+      requireSingleton(observation, "--observation");
+      if (!/^[0-9a-f]{64}$/.test(value)) {
+        throw new Error("--observation must be a 64-character lowercase hexadecimal digest");
+      }
+      observation = value;
+      i = next;
+    } else if (arg === "--offset" || arg.startsWith("--offset=")) {
+      const { value, next } = parseValue(argv, i, "--offset");
+      requireSingleton(offset, "--offset");
+      offset = parseNonNegativeDecimalSafeInteger(value, "--offset");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > 262144) {
+        throw new Error("--limit must be a positive safe integer up to 262144");
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--after" || arg.startsWith("--after=")) {
+      throw new Error("project-change-content does not accept --after; the entry cursor belongs to 'project-changes'");
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      throw new Error(
+        "project-change-content does not accept --launcher-id; it performs no Launcher authentication",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "project-change-content does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error("project-change-content does not accept --input; the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error("project-change-content does not accept --workspace; no worker is launched by project-change-content");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("project-change-content does not accept --image; no worker is launched by project-change-content");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error("project-change-content does not accept --profile; no profile is loaded by project-change-content");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("project-change-content does not accept --task; there is no task input on a content read");
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      throw new Error(
+        "project-change-content does not accept --stage-id; stage selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      throw new Error(
+        "project-change-content does not accept --initial-budget; budget selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      throw new Error(
+        "project-change-content does not accept --wait-index; wait selection belongs to the response and intervention commands",
+      );
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "project-change-content does not accept --action; it changes nothing and records no response",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "project-change-content does not accept --additional-iterations; grants belong to 'continue-stage'",
+      );
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      throw new Error("project-change-content does not accept --task-id; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      throw new Error("project-change-content does not accept --task-file; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error("project-change-content does not accept --task-body; task revisions belong to 'revise-task'");
+    } else if (arg === "--execution-index" || arg.startsWith("--execution-index=")) {
+      throw new Error("project-change-content does not accept --execution-index; the log cursor belongs to 'logs'");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "project-change-content does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "project-change-content does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for project-change-content");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for project-change-content");
+  }
+  if (project === null) {
+    throw new Error("--project ABS is required for project-change-content");
+  }
+  if (changeIndex === null) {
+    throw new Error("--change-index N is required for project-change-content");
+  }
+  if (side === null) {
+    throw new Error("--side baseline|result is required for project-change-content");
+  }
+  if (observation === null) {
+    throw new Error("--observation SHA256 is required for project-change-content");
+  }
+  return {
+    kind: "project-change-content",
+    runId,
+    configRoot,
+    project,
+    changeIndex,
+    side: side as "baseline" | "result",
+    observation,
+    offset: offset ?? 0,
+    limit: limit ?? 65536,
+    json,
+  };
+}
+
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs" | "project-changes",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs" | "project-changes" | "project-change-content",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -1312,6 +1554,9 @@ export function parseCommand(
   }
   if (kind === "project-changes") {
     return parseProjectChangesArgs(argv);
+  }
+  if (kind === "project-change-content") {
+    return parseProjectChangeContentArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;

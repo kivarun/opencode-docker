@@ -166,6 +166,7 @@ interface ParsedRoute {
     | "logs_list"
     | "logs_execution"
     | "project_changes"
+    | "project_change_content"
     | "resume"
     | "resume_plan"
     | "continue_stage"
@@ -180,6 +181,8 @@ interface ParsedRoute {
   readonly runId: string | null;
   /** The execution index of the logs execution route (null elsewhere). */
   readonly executionIndex?: number;
+  /** The change index of the content route (null elsewhere). */
+  readonly changeIndex?: number;
 }
 
 /**
@@ -352,6 +355,24 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
     }
     return { kind: "project_changes", projectId: null, runId };
   }
+  if (matchesShape(["v1", "runs", "*", "changes", "*", "content"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the project change content route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    const changeSegment = rest[4];
+    if (changeSegment === undefined || !/^[1-9][0-9]*$/.test(changeSegment)) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the change index must be a positive decimal integer");
+    }
+    const changeIndex = Number(changeSegment);
+    if (!Number.isSafeInteger(changeIndex) || changeIndex < 1) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the change index must be a positive safe integer");
+    }
+    return { kind: "project_change_content", projectId: null, runId, changeIndex };
+  }
   if (matchesShape(["v1", "runs", "*", "logs", "*"])) {
     if (shapeMethodMismatch("GET")) {
       return new ControlPlaneHttpRequestError("method_not_allowed", "the logs route accepts GET only");
@@ -461,6 +482,13 @@ function jsonBody(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
+  });
+}
+
+function jsonBodyNoStore(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
 }
 
@@ -807,6 +835,97 @@ export function parseProjectChangesQuery(
 }
 
 /**
+ * The project-change-content query of one run's read-only content
+ * request: the required `side` (baseline|result) and the required 64-hex
+ * observation identity the content is bound to, plus an optional
+ * non-negative safe integer raw-byte offset (default 0) and an optional
+ * positive safe integer raw-byte limit (default 65536, maximum 262144).
+ * The raw query string is parsed strictly with the established grammar:
+ * no percent-encoding, no bare keys, no duplicates, no empty values, no
+ * sign, fraction or exponent, and no unknown fields.
+ */
+export function parseProjectChangeContentQuery(
+  search: string,
+): { readonly side: string; readonly observation: string; readonly offset: number | null; readonly limit: number | null } | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the project change content query must not carry encoded components");
+  }
+  let side: string | null = null;
+  let observation: string | null = null;
+  let offset: number | null = null;
+  let limit: number | null = null;
+  if (search !== "") {
+    for (const part of search.split("&")) {
+      const separator = part.indexOf("=");
+      if (separator <= 0) {
+        return new ControlPlaneHttpRequestError("invalid_request", "every project change content query field must carry exactly one value");
+      }
+      const key = part.slice(0, separator);
+      const value = part.slice(separator + 1);
+      if (key === "side") {
+        if (side !== null) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query fields must be unique");
+        }
+        if (value !== "baseline" && value !== "result") {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query side must be 'baseline' or 'result'");
+        }
+        side = value;
+        continue;
+      }
+      if (key === "observation") {
+        if (observation !== null) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query fields must be unique");
+        }
+        if (!/^[0-9a-f]{64}$/.test(value)) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query observation must be a 64-character lowercase hexadecimal digest");
+        }
+        observation = value;
+        continue;
+      }
+      if (key === "offset") {
+        if (offset !== null) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query fields must be unique");
+        }
+        if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query offset must be a non-negative safe integer");
+        }
+        const parsed = Number(value);
+        if (!Number.isSafeInteger(parsed)) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query offset must be a non-negative safe integer");
+        }
+        offset = parsed;
+        continue;
+      }
+      if (key === "limit") {
+        if (limit !== null) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query fields must be unique");
+        }
+        if (!/^[1-9][0-9]*$/.test(value)) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query limit must be a positive safe integer");
+        }
+        const parsed = Number(value);
+        if (!Number.isSafeInteger(parsed) || parsed > 262144) {
+          return new ControlPlaneHttpRequestError("invalid_request", "the project change content query limit must be a positive safe integer up to 262144");
+        }
+        limit = parsed;
+        continue;
+      }
+      return new ControlPlaneHttpRequestError("invalid_request", "the project change content query carries an unknown field");
+    }
+  }
+  if (side === null) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the project change content query requires a side");
+  }
+  if (observation === null) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the project change content query requires an observation");
+  }
+  return { side, observation, offset, limit };
+}
+
+/**
  * The logs list query: the list route accepts no query at all — any
  * query string is a request failure.
  */
@@ -993,7 +1112,9 @@ export function projectControlPlaneCommandResult(
     projection.kind === "logsChunk" ||
     projection.kind === "logsFailure" ||
     projection.kind === "projectChanges" ||
-    projection.kind === "projectChangesFailure"
+    projection.kind === "projectChangesFailure" ||
+    projection.kind === "projectChangeContent" ||
+    projection.kind === "projectChangeContentFailure"
   ) {
     return { layer: "transport", reason: "internal_error" };
   }
@@ -1046,6 +1167,24 @@ export interface ProjectChangesProjection {
   readonly summary: Record<string, unknown>;
   readonly changes: readonly unknown[];
   readonly next_after: number | null;
+}
+
+export interface ProjectChangeContentProjection {
+  readonly schema_version: 1;
+  readonly kind: "project_change_content";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly observation: string;
+  readonly change_index: number;
+  readonly side: string;
+  readonly status: string;
+  readonly byte_count?: number;
+  readonly sha256?: string;
+  readonly offset?: number;
+  readonly data_base64?: string;
+  readonly next_offset?: number | null;
+  readonly reason?: string;
+  readonly node?: Record<string, unknown>;
 }
 
 export interface WorkerLogProjection {
@@ -1328,6 +1467,74 @@ export function projectControlPlaneChanges(
   };
 }
 
+/**
+ * The one projection builder for the content route: built explicitly
+ * from the typed client projection — never a spread — so the run root
+ * and every host path stay out of the HTTP response. A failed content
+ * outcome maps `invalid_cursor` to the request-layer 400 and
+ * `stale_observation` to the request-layer 409; every other correctly
+ * received content failure is the established failed command result at
+ * HTTP 200.
+ */
+export function projectControlPlaneProjectChangeContent(
+  result: OrchestratorCallResult,
+): ProjectChangeContentProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "projectChangeContentFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    if (projection.reason === "stale_observation") {
+      return { layer: "request", reason: "stale_observation" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "projectChangeContent" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  const common = {
+    schema_version: 1 as const,
+    kind: "project_change_content" as const,
+    run_id: projection.runId,
+    revision: projection.revision,
+    observation: projection.observation,
+    change_index: projection.changeIndex,
+    side: projection.side,
+    status: projection.status,
+  };
+  if (projection.status === "available") {
+    return {
+      ...common,
+      byte_count: projection.byteCount as number,
+      sha256: projection.sha256 as string,
+      offset: projection.offset as number,
+      data_base64: projection.dataBase64 as string,
+      next_offset: projection.nextOffset as number | null,
+    };
+  }
+  if (projection.status === "implicit_empty") {
+    return { ...common, byte_count: 0, offset: 0, data_base64: "", next_offset: null };
+  }
+  if (projection.status === "metadata_only") {
+    return { ...common, node: projection.node as Record<string, unknown> };
+  }
+  return {
+    ...common,
+    reason: "source_no_longer_matches_baseline",
+    node: projection.node as Record<string, unknown>,
+  };
+}
+
 function projectionResponse(
   projection:
     | CommandOutcomeProjection
@@ -1337,11 +1544,17 @@ function projectionResponse(
     | EventsProjection
     | WorkerLogsProjection
     | ProjectChangesProjection
+    | ProjectChangeContentProjection
     | WorkerLogProjection
     | ControlPlaneHttpFailure,
 ): Response {
   if ("layer" in projection && "reason" in projection && !("kind" in projection)) {
     return failureResponse(projection as ControlPlaneHttpFailure);
+  }
+  if ((projection as { kind?: string }).kind === "project_change_content") {
+    // The content response never caches: the observation identity is an
+    // ephemeral read snapshot and the bytes are secret-bearing.
+    return jsonBodyNoStore(projection, 200);
   }
   return jsonBody(projection, 200);
 }
@@ -1443,6 +1656,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind !== "logs_list" &&
       parsed.kind !== "logs_execution" &&
       parsed.kind !== "project_changes" &&
+      parsed.kind !== "project_change_content" &&
       url.search !== ""
     ) {
       return respondUi(requestFailure("invalid_path"));
@@ -1475,7 +1689,8 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind === "events" ||
       parsed.kind === "logs_list" ||
       parsed.kind === "logs_execution" ||
-      parsed.kind === "project_changes"
+      parsed.kind === "project_changes" ||
+      parsed.kind === "project_change_content"
         ? { ...deps, discoveryQuery: url.search }
         : deps,
       parsed,
@@ -1585,6 +1800,24 @@ async function dispatchControlPlaneRoute(
       };
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneChanges(result));
+    }
+    case "project_change_content": {
+      const query = parseProjectChangeContentQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "project_change_content",
+        runId,
+        projectPath: authority.project.projectRoot,
+        changeIndex: route.changeIndex as number,
+        side: query.side,
+        observation: query.observation,
+        ...(query.offset === null ? {} : { offset: query.offset }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneProjectChangeContent(result));
     }
     case "resume": {
       parseEmptyBody(parseJsonBody(bodyText));
