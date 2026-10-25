@@ -1893,6 +1893,761 @@ export function createWorkerLogViewer(io) {
   });
 }
 
+/* ------------------------------------------------------------------ */
+/* Project changes (v6): the read-only panel of the run workspace      */
+/* changes relative to the durable project baseline.                   */
+/* ------------------------------------------------------------------ */
+
+const PROJECT_CHANGE_KINDS = Object.freeze([
+  "added",
+  "deleted",
+  "content_modified",
+  "mode_modified",
+  "content_and_mode_modified",
+  "symlink_target_modified",
+  "type_changed",
+]);
+const PROJECT_SOURCE_RELATIONS = Object.freeze(["matches_baseline", "matches_result", "diverged"]);
+const PROJECT_CHANGE_KIND_SUMMARY_KEYS = Object.freeze([
+  "added",
+  "deleted",
+  "content_modified",
+  "mode_modified",
+  "content_and_mode_modified",
+  "symlink_target_modified",
+  "type_changed",
+]);
+const PROJECT_RELATION_SUMMARY_KEYS = Object.freeze(["matches_baseline", "matches_result", "diverged"]);
+const PROJECT_CHANGES_SUMMARY_KEYS = Object.freeze([
+  "total",
+  ...PROJECT_CHANGE_KIND_SUMMARY_KEYS,
+  ...PROJECT_RELATION_SUMMARY_KEYS,
+]);
+const PROJECT_CHANGES_REQUEST_LIMIT = 100;
+
+const HEX64_PATTERN = /^[0-9a-f]{64}$/;
+
+/** One relative project path: non-empty, never absolute, no NUL and no
+ * empty, dot or dot-dot component. The text is verbatim data and is
+ * only ever rendered through `textContent`. */
+function isRelativeProjectPath(value) {
+  if (typeof value !== "string" || value === "" || value.includes("\0") || value.startsWith("/")) {
+    return false;
+  }
+  for (const component of value.split("/")) {
+    if (component === "" || component === "." || component === "..") {
+      return false;
+    }
+  }
+  return true;
+}
+
+function expectChangesNode(value) {
+  if (!isRecord(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const kind = value["kind"];
+  if (kind === "regular_file") {
+    const own = Object.keys(value);
+    const hasGroup = Object.hasOwn(value, "hardlink_group");
+    if (own.length !== (hasGroup ? 6 : 5)) {
+      throw new UiContractError("invalid_shape");
+    }
+    expectShape(value, hasGroup ? ["kind", "mode", "byte_count", "sha256", "multiple_links", "hardlink_group"] : ["kind", "mode", "byte_count", "sha256", "multiple_links"]);
+    const mode = value["mode"];
+    if (typeof mode !== "number" || !Number.isSafeInteger(mode) || mode < 0 || mode > 0o777) {
+      throw new UiContractError("invalid_shape");
+    }
+    const byteCount = value["byte_count"];
+    if (typeof byteCount !== "number" || !Number.isSafeInteger(byteCount) || byteCount < 0) {
+      throw new UiContractError("invalid_shape");
+    }
+    const sha256 = value["sha256"];
+    if (typeof sha256 !== "string" || !HEX64_PATTERN.test(sha256)) {
+      throw new UiContractError("invalid_shape");
+    }
+    const multipleLinks = value["multiple_links"];
+    if (typeof multipleLinks !== "boolean") {
+      throw new UiContractError("invalid_shape");
+    }
+    if (hasGroup !== multipleLinks) {
+      throw new UiContractError("invalid_shape");
+    }
+    const node = Object.freeze({
+      kind: "regular_file",
+      mode,
+      byte_count: byteCount,
+      sha256,
+      multiple_links: multipleLinks,
+    });
+    return hasGroup
+      ? Object.freeze({ ...node, hardlink_group: value["hardlink_group"] })
+      : node;
+  }
+  if (kind === "directory") {
+    expectShape(value, ["kind", "mode"]);
+    const mode = value["mode"];
+    if (typeof mode !== "number" || !Number.isSafeInteger(mode) || mode < 0 || mode > 0o777) {
+      throw new UiContractError("invalid_shape");
+    }
+    return Object.freeze({ kind: "directory", mode });
+  }
+  if (kind === "symlink") {
+    expectShape(value, ["kind", "target"]);
+    const target = value["target"];
+    if (typeof target !== "string") {
+      throw new UiContractError("invalid_shape");
+    }
+    return Object.freeze({ kind: "symlink", target });
+  }
+  throw new UiContractError("invalid_shape");
+}
+
+/** The one variant coherence check of a change entry: the baseline and
+ * result projections must agree with the change kind. */
+function expectEntryCoherence(change, baseline, result) {
+  if (change === "added") {
+    if (baseline !== null || result === null) {
+      throw new UiContractError("invalid_shape");
+    }
+    return;
+  }
+  if (change === "deleted") {
+    if (baseline === null || result !== null) {
+      throw new UiContractError("invalid_shape");
+    }
+    return;
+  }
+  if (baseline === null || result === null) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (change === "content_modified" || change === "content_and_mode_modified") {
+    if (baseline.kind !== "regular_file" || result.kind !== "regular_file") {
+      throw new UiContractError("invalid_shape");
+    }
+    return;
+  }
+  if (change === "mode_modified") {
+    if (baseline.kind !== result.kind || (baseline.kind !== "regular_file" && baseline.kind !== "directory")) {
+      throw new UiContractError("invalid_shape");
+    }
+    return;
+  }
+  if (change === "symlink_target_modified") {
+    if (baseline.kind !== "symlink" || result.kind !== "symlink") {
+      throw new UiContractError("invalid_shape");
+    }
+    return;
+  }
+  // type_changed: the two sides must be different kinds
+  if (baseline.kind === result.kind) {
+    throw new UiContractError("invalid_shape");
+  }
+}
+
+/**
+ * The dedicated parser of one project-changes document (HTTP schema
+ * version 1): exact own keys at every level, the closed change-kind and
+ * source-relation vocabularies, the node union with exact hardlink
+ * metadata, the per-entry variant coherence, strictly increasing
+ * indexes, unique paths and the internally coherent summary counts.
+ * Unknown versions, kinds and shapes are never guessed. The general
+ * `parseApiDocument` keeps rejecting this kind fail-closed — this
+ * parser is bound to the changes endpoint only.
+ */
+export function parseProjectChangesDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "project_changes") {
+    throw new UiContractError("unknown_kind");
+  }
+  expectShape(document, ["schema_version", "kind", "run_id", "revision", "observation", "summary", "changes", "next_after"]);
+  const runId = expectString(document, "run_id");
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (typeof expectedRunId === "string" && runId !== expectedRunId) {
+    throw new UiContractError("unexpected_run");
+  }
+  const observation = document["observation"];
+  if (typeof observation !== "string" || !HEX64_PATTERN.test(observation)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const summaryRecord = expectRecord(document, "summary");
+  expectShape(summaryRecord, PROJECT_CHANGES_SUMMARY_KEYS);
+  const summary = {};
+  for (const key of PROJECT_CHANGES_SUMMARY_KEYS) {
+    const value = summaryRecord[key];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new UiContractError("invalid_shape");
+    }
+    summary[key] = value;
+  }
+  let kindSum = 0;
+  for (const key of PROJECT_CHANGE_KIND_SUMMARY_KEYS) {
+    kindSum += summary[key];
+  }
+  if (kindSum !== summary["total"]) {
+    throw new UiContractError("invalid_shape");
+  }
+  let relationSum = 0;
+  for (const key of PROJECT_RELATION_SUMMARY_KEYS) {
+    relationSum += summary[key];
+  }
+  if (relationSum !== summary["total"]) {
+    throw new UiContractError("invalid_shape");
+  }
+  const rawChanges = expectArray(document, "changes");
+  if (rawChanges.length > summary["total"]) {
+    throw new UiContractError("invalid_shape");
+  }
+  const seenPaths = new Set();
+  let previousIndex = 0;
+  const changes = rawChanges.map((entry) => {
+    if (!isRecord(entry)) {
+      throw new UiContractError("invalid_shape");
+    }
+    expectShape(entry, ["index", "path", "change", "source_relation", "baseline", "result"]);
+    const index = entry["index"];
+    if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 1 || index <= previousIndex) {
+      throw new UiContractError("invalid_shape");
+    }
+    previousIndex = index;
+    const path = entry["path"];
+    if (!isRelativeProjectPath(path) || seenPaths.has(path)) {
+      throw new UiContractError("invalid_shape");
+    }
+    seenPaths.add(path);
+    const change = expectOneOf(entry, "change", PROJECT_CHANGE_KINDS);
+    const sourceRelation = expectOneOf(entry, "source_relation", PROJECT_SOURCE_RELATIONS);
+    const baselineValue = entry["baseline"];
+    const resultValue = entry["result"];
+    const baseline = baselineValue === null ? null : expectChangesNode(baselineValue);
+    const result = resultValue === null ? null : expectChangesNode(resultValue);
+    expectEntryCoherence(change, baseline, result);
+    return Object.freeze({ index, path, change, source_relation: sourceRelation, baseline, result });
+  });
+  const nextAfter = document["next_after"];
+  if (nextAfter !== null && (typeof nextAfter !== "number" || !Number.isSafeInteger(nextAfter) || nextAfter < 0)) {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({
+    kind: "project_changes",
+    runId,
+    revision: expectPositiveInteger(document, "revision"),
+    observation,
+    summary: Object.freeze(summary),
+    changes: Object.freeze(changes),
+    nextAfter,
+  });
+}
+
+/** The empty project-changes state of one run selection. */
+export function createProjectChangesState(runId) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  return Object.freeze({
+    runId,
+    inspectRevision: null,
+    observation: null,
+    summary: null,
+    changes: Object.freeze([]),
+    nextAfter: null,
+    requestState: "idle",
+    presentationState: "unavailable",
+    error: null,
+  });
+}
+
+function projectChangesPresentation(summary) {
+  if (summary === null) {
+    return "unavailable";
+  }
+  if (summary["total"] === 0) {
+    return "no_changes";
+  }
+  if (summary["diverged"] > 0) {
+    return "diverged";
+  }
+  if (summary["matches_baseline"] === summary["total"]) {
+    return "pending";
+  }
+  if (summary["matches_result"] === summary["total"]) {
+    return "already_present";
+  }
+  return "mixed";
+}
+
+function isProjectChangesState(state) {
+  return (
+    isRecord(state) &&
+    isSafeId(state["runId"]) &&
+    Array.isArray(state["changes"]) &&
+    (state["observation"] === null || (typeof state["observation"] === "string" && HEX64_PATTERN.test(state["observation"])))
+  );
+}
+
+/**
+ * The one pure page-merge owner of the changes viewer. An initial page
+ * (requestedAfter 0) replaces the previous snapshot only after the
+ * whole page validated; a continuation extends the accepted snapshot
+ * append-only under the exact observation, revision and cursor
+ * contract. Every violation is a typed UI contract failure and never
+ * mutates the input state or applies a partial page.
+ */
+export function applyProjectChangesPage(state, model, requestedAfter) {
+  if (!isProjectChangesState(state)) {
+    throw new UiContractError("invalid_state");
+  }
+  if (model === null || typeof model !== "object" || model.kind !== "project_changes" || model.runId !== state.runId) {
+    throw new UiContractError("unexpected_run");
+  }
+  if (typeof requestedAfter !== "number" || !Number.isSafeInteger(requestedAfter) || requestedAfter < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  const merged = requestedAfter === 0 ? model.changes : [...state.changes, ...model.changes];
+  if (requestedAfter === 0) {
+    if (model.changes.length > 0 && model.changes[0].index !== 1) {
+      throw new UiContractError("invalid_shape");
+    }
+  } else {
+    if (requestedAfter !== state.changes.length) {
+      throw new UiContractError("invalid_cursor");
+    }
+    if (state.nextAfter === null) {
+      throw new UiContractError("invalid_cursor");
+    }
+    if (model.observation !== state.observation) {
+      throw new UiContractError("observation_mismatch");
+    }
+    if (model.revision !== state.inspectRevision) {
+      throw new UiContractError("invalid_shape");
+    }
+    let previousLast = state.changes.length === 0 ? 0 : state.changes[state.changes.length - 1].index;
+    for (const entry of model.changes) {
+      if (entry.index !== previousLast + 1) {
+        throw new UiContractError("invalid_shape");
+      }
+      previousLast = entry.index;
+    }
+    const knownPaths = new Set(state.changes.map((entry) => entry.path));
+    for (const entry of model.changes) {
+      if (knownPaths.has(entry.path)) {
+        throw new UiContractError("invalid_shape");
+      }
+    }
+    const summary = model.summary;
+    const previous = state.summary;
+    for (const key of PROJECT_CHANGES_SUMMARY_KEYS) {
+      if (summary[key] !== previous[key]) {
+        throw new UiContractError("invalid_shape");
+      }
+    }
+  }
+  if (merged.length > model.summary["total"]) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (model.nextAfter !== null && model.nextAfter !== merged.length) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (model.nextAfter === null && merged.length !== model.summary["total"]) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (requestedAfter > 0 && model.nextAfter !== null && state.nextAfter !== null && model.nextAfter < state.nextAfter) {
+    throw new UiContractError("invalid_cursor");
+  }
+  return Object.freeze({
+    runId: state.runId,
+    inspectRevision: model.revision,
+    observation: model.observation,
+    summary: model.summary,
+    changes: Object.freeze(merged),
+    nextAfter: model.nextAfter,
+    requestState: "ready",
+    presentationState: projectChangesPresentation(model.summary),
+    error: null,
+  });
+}
+
+/** The one URL builder of every project-changes request. Only the run
+ * id, the page cursor/limit and the observation identity travel in the
+ * URL: never a project path, a change path, a symlink target, a file
+ * digest, node metadata, a project id or a run root. */
+export function projectChangesRequestPath(request) {
+  if (!isRecord(request)) {
+    throw new UiContractError("invalid_request");
+  }
+  const runId = request["runId"];
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  const after = request["after"];
+  if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  const limit = request["limit"];
+  if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    throw new UiContractError("invalid_request");
+  }
+  const observation = request["observation"];
+  if (after === 0) {
+    if (observation !== undefined && observation !== null) {
+      throw new UiContractError("invalid_request");
+    }
+    return `/v1/runs/${runId}/changes?after=0&limit=${limit}`;
+  }
+  if (typeof observation !== "string" || !HEX64_PATTERN.test(observation)) {
+    throw new UiContractError("invalid_request");
+  }
+  return `/v1/runs/${runId}/changes?after=${after}&limit=${limit}&observation=${observation}`;
+}
+
+/**
+ * The one document classifier of the changes endpoint: a well-formed
+ * `project_changes` document of the selected run, or one of the
+ * endpoint's documented failure envelopes (`error`, or the failed
+ * `command_result` of a rejected changes read). A succeeded command
+ * result is unsuitable and fails closed; every other kind fails closed.
+ */
+function parseProjectChangesEndpointDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "project_changes") {
+    return parseProjectChangesDocument(document, expectedRunId);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/**
+ * The changes endpoint client: it reuses the one bounded JSON response
+ * primitive and classifies the document by kind, never by message
+ * text. The raw Response is never retained and no body, path or target
+ * is ever echoed into a diagnostic.
+ */
+export async function requestProjectChangesJson(fetchImpl, path, init, expectedRunId) {
+  return requestJsonDocument(fetchImpl, path, init, (document) => parseProjectChangesEndpointDocument(document, expectedRunId));
+}
+
+/**
+ * The single-flight transport of the changes viewer: at most one
+ * unsettled changes GET exists at any instant. An initial/reload
+ * desire supersedes the active request and coalesces as the one
+ * follow-up; a continuation desire while a request is on the wire is
+ * declined without a second fetch. There is no timer, no polling and
+ * no retry loop of any kind.
+ */
+export function createProjectChangesTransport(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["fetchChanges"] !== "function" ||
+    typeof io["onStarted"] !== "function" ||
+    typeof io["onSettled"] !== "function"
+  ) {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const fetchChanges = io["fetchChanges"];
+  const onStarted = io["onStarted"];
+  const onSettled = io["onSettled"];
+  let active = null;
+  let desired = null;
+  let disposed = false;
+
+  const startRequest = (request) => {
+    if (active !== null) {
+      throw new UiContractError("transport_slot_busy");
+    }
+    active = request;
+    const controller = new AbortController();
+    request.controller = controller;
+    onStarted(request.runId);
+    void (async () => {
+      let result;
+      try {
+        result = await fetchChanges(request.runId, request.path, controller.signal);
+      } catch {
+        result = undefined;
+      } finally {
+        settleActive(request, result);
+      }
+    })();
+  };
+
+  const settleActive = (request, result) => {
+    try {
+      if (request.superseded) {
+        if (desired === null) {
+          onSettled(request.runId);
+        }
+      } else {
+        request.onApplied(result);
+        onSettled(request.runId);
+      }
+    } finally {
+      active = null;
+      const followUp = desired;
+      desired = null;
+      request.resolve(result);
+      if (followUp !== null && !disposed) {
+        startRequest(followUp);
+      }
+    }
+  };
+
+  return Object.freeze({
+    request(desire) {
+      const runId = isRecord(desire) && isSafeId(desire["runId"]) ? desire["runId"] : null;
+      const path = isRecord(desire) && typeof desire["path"] === "string" ? desire["path"] : null;
+      const kind = isRecord(desire) && (desire["kind"] === "initial" || desire["kind"] === "continuation") ? desire["kind"] : null;
+      const after = isRecord(desire) && typeof desire["after"] === "number" && Number.isSafeInteger(desire["after"]) && desire["after"] >= 0 ? desire["after"] : null;
+      const onApplied = isRecord(desire) && typeof desire["onApplied"] === "function" ? desire["onApplied"] : null;
+      let resolveResult = null;
+      const settled = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      if (disposed || runId === null || path === null || kind === null || after === null || onApplied === null) {
+        resolveResult(undefined);
+        return settled;
+      }
+      const request = { runId, path, kind, after, onApplied, superseded: false, controller: null, resolve: resolveResult };
+      if (active === null) {
+        startRequest(request);
+      } else if (kind === "continuation") {
+        // a continuation never displaces or queues behind another
+        // request: the viewer refuses it anyway and no stale page is
+        // ever fetched
+        resolveResult(undefined);
+        return settled;
+      } else {
+        active.superseded = true;
+        active.controller.abort();
+        const replaced = desired;
+        desired = request;
+        if (replaced !== null) {
+          replaced.resolve(undefined);
+        }
+      }
+      return settled;
+    },
+    invalidate() {
+      if (active !== null) {
+        active.superseded = true;
+        active.controller.abort();
+      }
+      const withdrawn = desired;
+      desired = null;
+      if (withdrawn !== null) {
+        withdrawn.resolve(undefined);
+      }
+    },
+    dispose() {
+      disposed = true;
+      this.invalidate();
+    },
+  });
+}
+
+/**
+ * The closed state machine of the Project changes panel over
+ * run workspace changes relative to the durable project baseline:
+ * a read-only view. It owns no fetch and no URL: every desire is
+ * handed to the single-flight transport. The automatic path is exactly
+ * one initial
+ * GET after an applied authoritative terminal inspect of the selected
+ * run (succeeded or failed) whose revision was not yet requested; every
+ * other boundary, an inspect failure and a re-inspect of the same
+ * revision issue nothing. An explicit Reload re-requests after=0
+ * without an observation and keeps the previous snapshot visible until
+ * a fully valid page replaces it; a stale_observation continuation
+ * keeps the loaded snapshot and offers only the explicit Reload. The
+ * panel never POSTs, never calls inspect, never starts a worker and
+ * never changes the operator project.
+ */
+export function createProjectChangesViewer(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["transport"] !== "object" ||
+    typeof io["onState"] !== "function"
+  ) {
+    throw new UiContractError("invalid_viewer_io");
+  }
+  const transport = io["transport"];
+  const onState = io["onState"];
+  let state = null;
+  // The last inspect revision an automatic initial GET was issued for;
+  // a repeated inspect of the same terminal revision never re-requests.
+  let requestedRevision = 0;
+
+  const publish = () => {
+    onState(state);
+  };
+
+  const failureOf = (result) => {
+    if (result !== undefined && result !== null && typeof result === "object" && result.ok === false) {
+      return result.failure;
+    }
+    const model = result !== undefined && result !== null && typeof result === "object" ? result.model : null;
+    if (model !== null && typeof model === "object" && model.kind === "error") {
+      return Object.freeze({ layer: model.layer, reason: model.reason });
+    }
+    if (model !== null && typeof model === "object" && model.kind === "command_result") {
+      return Object.freeze({ layer: "orchestrator", reason: model.reason ?? "failed" });
+    }
+    return Object.freeze({ layer: "contract", reason: "unexpected_kind" });
+  };
+
+  const applyFailure = (failure) => {
+    if (state === null) {
+      return;
+    }
+    const stale = failure !== null && typeof failure === "object" && failure.reason === "stale_observation";
+    state = Object.freeze({
+      ...state,
+      requestState: stale ? "stale" : "error",
+      error: failure,
+    });
+    publish();
+  };
+
+  const applyPage = (result, requestedRunId, requestedAfter) => {
+    if (state === null || state.runId !== requestedRunId || result === undefined) {
+      return;
+    }
+    if (!result.ok) {
+      applyFailure(failureOf(result));
+      return;
+    }
+    const model = result.model;
+    if (model.kind !== "project_changes") {
+      applyFailure(failureOf(result));
+      return;
+    }
+    try {
+      state = applyProjectChangesPage(state, model, requestedAfter);
+    } catch (error) {
+      state = Object.freeze({
+        ...state,
+        requestState: "error",
+        error: Object.freeze({ layer: "contract", reason: error instanceof UiContractError ? error.reason : "invalid_shape" }),
+      });
+    }
+    publish();
+  };
+
+  const requestInitial = () => {
+    if (state === null) {
+      return;
+    }
+    const requestedRunId = state.runId;
+    const hasSnapshot = state.observation !== null;
+    state = Object.freeze({ ...state, requestState: hasSnapshot ? "reloading" : "loading_initial", error: null });
+    publish();
+    transport.request({
+      runId: requestedRunId,
+      kind: "initial",
+      after: 0,
+      path: projectChangesRequestPath({ runId: requestedRunId, after: 0, limit: PROJECT_CHANGES_REQUEST_LIMIT }),
+      onApplied: (result) => {
+        applyPage(result, requestedRunId, 0);
+      },
+    });
+  };
+
+  return Object.freeze({
+    /** Selection change: discards the state and invalidates the wire. */
+    transitionToRun(runId) {
+      if (!isSafeId(runId)) {
+        throw new UiContractError("invalid_run_id");
+      }
+      transport.invalidate();
+      state = createProjectChangesState(runId);
+      requestedRevision = 0;
+      publish();
+    },
+    dropView() {
+      transport.invalidate();
+      state = null;
+      requestedRevision = 0;
+    },
+    /**
+     * The automatic path driven by the applied authoritative inspect:
+     * exactly one initial GET for a terminal (succeeded or failed)
+     * inspect revision that was not yet requested. A nonterminal
+     * boundary, an inspect failure and a re-inspect of the same
+     * revision issue nothing; a changed terminal revision issues one
+     * new initial request that keeps the previous snapshot visible
+     * until a fully valid page replaces it.
+     */
+    inspectApplied(model) {
+      if (state === null || !isRecord(model) || model.runId !== state.runId) {
+        return;
+      }
+      if (model.status !== "succeeded" && model.status !== "failed") {
+        return;
+      }
+      const revision = model.revision;
+      if (!Number.isSafeInteger(revision) || revision <= requestedRevision) {
+        return;
+      }
+      requestedRevision = revision;
+      requestInitial();
+    },
+    /** The explicit Reload: one after=0 request without an observation;
+     * the previous snapshot stays visible with the reloading state. */
+    reload() {
+      if (state === null || state.requestState === "loading_initial" || state.requestState === "reloading") {
+        return;
+      }
+      requestInitial();
+    },
+    /**
+     * The explicit Load more: one continuation GET carrying the exact
+     * current observation. Refused while another request is in flight;
+     * unavailable without a continuation cursor.
+     */
+    loadMore() {
+      if (state === null || state.requestState !== "ready" || state.nextAfter === null) {
+        return;
+      }
+      const requestedRunId = state.runId;
+      const requestedAfter = state.nextAfter;
+      state = Object.freeze({ ...state, requestState: "loading_more", error: null });
+      publish();
+      transport.request({
+        runId: requestedRunId,
+        kind: "continuation",
+        after: requestedAfter,
+        path: projectChangesRequestPath({ runId: requestedRunId, after: requestedAfter, limit: PROJECT_CHANGES_REQUEST_LIMIT, observation: state.observation }),
+        onApplied: (result) => {
+          applyPage(result, requestedRunId, requestedAfter);
+        },
+      });
+    },
+    /** The read-only projection for the DOM adapter. */
+    currentState() {
+      return state;
+    },
+  });
+}
+
 /* Live observation (v3): bounded read-only polling of one selected    */
 /* run; the corrective worker-logs viewer sits before this region and  */
 /* carries no scheduler, timer or mutation capability of its own.      */
@@ -2881,6 +3636,13 @@ function showRunModel(model, options = {}) {
   // later inspects: one per strictly greater revision)
   workerLogViewer.inspectApplied(model);
   renderWorkerLogs(workerLogViewer === null ? null : workerLogViewer.currentState());
+  // the applied authoritative inspect drives the automatic one-shot
+  // project-changes load (exactly one initial GET per terminal revision)
+  ensureProjectChangesFor(model.runId);
+  if (projectChangesViewer !== null) {
+    projectChangesViewer.inspectApplied(model);
+    renderProjectChanges(projectChangesViewer.currentState());
+  }
   return changed;
 }
 
@@ -3468,6 +4230,138 @@ function ensureWorkerLogsFor(runId) {
   resetWorkerLogsDom();
 }
 
+/* ------------------------------------------------------------------ */
+/* Project changes (v6): the thin DOM adapter of the changes viewer.   */
+/* ------------------------------------------------------------------ */
+
+let projectChangesViewer = null;
+
+const changesTransport = createProjectChangesTransport({
+  fetchChanges: (runId, path, signal) => requestProjectChangesJson(fetchImplementation, path, { signal }, runId),
+  onStarted: () => {
+    for (const id of ["changes-reload", "changes-load-more"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["changes-reload", "changes-load-more"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+/** The section of the selected run: created once per selection; a run
+ * change discards the previous viewer and invalidates its in-flight
+ * changes GET. The automatic one-shot initial load follows the applied
+ * authoritative terminal inspects (the viewer's `inspectApplied`);
+ * Reload and Load more stay explicit user actions. */
+function ensureProjectChangesFor(runId) {
+  const current = projectChangesViewer === null ? null : projectChangesViewer.currentState();
+  if (current !== null && current.runId === runId) {
+    document.getElementById("project-changes-section").hidden = false;
+    return;
+  }
+  if (projectChangesViewer === null) {
+    projectChangesViewer = createProjectChangesViewer({
+      transport: changesTransport,
+      onState: (state) => renderProjectChanges(state),
+    });
+  }
+  projectChangesViewer.transitionToRun(runId);
+  document.getElementById("project-changes-section").hidden = false;
+  resetProjectChangesDom();
+}
+
+function resetProjectChangesDom() {
+  document.getElementById("changes-body").replaceChildren();
+  document.getElementById("changes-table").hidden = true;
+  document.getElementById("changes-empty").textContent = "";
+  document.getElementById("changes-status").textContent = "";
+  document.getElementById("changes-meta").textContent = "";
+  document.getElementById("changes-summary").textContent = "";
+  document.getElementById("changes-reload").hidden = true;
+  document.getElementById("changes-load-more").hidden = true;
+}
+
+/** The read-only metadata text of one baseline/result node; every
+ * value renders through `textContent` and the symlink target stays
+ * verbatim plain text. */
+function changesNodeText(node) {
+  if (node === null) {
+    return "";
+  }
+  if (node.kind === "directory") {
+    return `directory · mode ${octalMode(node.mode)}`;
+  }
+  if (node.kind === "symlink") {
+    return `symlink → ${node.target}`;
+  }
+  const group = node.hardlink_group === undefined ? "" : ` · hardlink group ${node.hardlink_group}`;
+  return `file · mode ${octalMode(node.mode)} · ${node.byte_count} B · sha256 ${node.sha256}${group}`;
+}
+
+function octalMode(mode) {
+  return `0${mode.toString(8).padStart(3, "0")}`;
+}
+
+const PROJECT_PRESENTATION_LABELS = {
+  unavailable: "unavailable",
+  no_changes: "no changes",
+  pending: "pending",
+  already_present: "already present",
+  mixed: "mixed",
+  diverged: "diverged",
+};
+
+function renderProjectChanges(state) {
+  if (state === null) {
+    return;
+  }
+  const meta = document.getElementById("changes-meta");
+  const summary = document.getElementById("changes-summary");
+  const status = document.getElementById("changes-status");
+  const empty = document.getElementById("changes-empty");
+  const reload = document.getElementById("changes-reload");
+  const loadMore = document.getElementById("changes-load-more");
+  const table = document.getElementById("changes-table");
+  const body = document.getElementById("changes-body");
+  body.replaceChildren();
+  for (const entry of state.changes) {
+    const row = document.createElement("tr");
+    row.appendChild(element("td", entry.path));
+    row.appendChild(element("td", entry.change));
+    row.appendChild(element("td", entry.source_relation));
+    row.appendChild(element("td", changesNodeText(entry.baseline)));
+    row.appendChild(element("td", changesNodeText(entry.result)));
+    body.appendChild(row);
+  }
+  table.hidden = state.changes.length === 0;
+  const presentation = PROJECT_PRESENTATION_LABELS[state.presentationState] ?? state.presentationState;
+  const loadedTotal = state.summary === null ? "" : ` · loaded ${state.changes.length} of ${state.summary.total}`;
+  meta.textContent = state.inspectRevision === null ? "" : `snapshot revision ${state.inspectRevision} · ${presentation}${loadedTotal}`;
+  summary.textContent = state.summary === null
+    ? ""
+    : `total ${state.summary.total} · added ${state.summary.added} · deleted ${state.summary.deleted} · content ${state.summary.content_modified} · mode ${state.summary.mode_modified} · content+mode ${state.summary.content_and_mode_modified} · symlink target ${state.summary.symlink_target_modified} · type ${state.summary.type_changed} · baseline ${state.summary.matches_baseline} · already present ${state.summary.matches_result} · diverged ${state.summary.diverged}`;
+  let statusText = "";
+  if (state.requestState === "loading_initial" || state.requestState === "loading_more" || state.requestState === "reloading") {
+    statusText = "Loading…";
+  } else if (state.requestState === "stale") {
+    statusText = "Stale. The run workspace or registered project changed after this view was created. Reload the changes.";
+  } else if (state.requestState === "error" && state.error !== null) {
+    statusText = `failed (${state.error.layer}: ${state.error.reason})`;
+  }
+  status.textContent = statusText;
+  empty.textContent = state.requestState === "ready" && state.summary !== null && state.summary.total === 0
+    ? "The run workspace carries no changes relative to its durable baseline."
+    : "";
+  // the explicit actions: Reload stays available except after a
+  // contract-invalid document (fail closed, no automatic retry);
+  // Load more exists only for a ready snapshot with a continuation
+  const contractFailed = state.requestState === "error" && state.error !== null && state.error.layer === "contract";
+  reload.hidden = contractFailed;
+  loadMore.hidden = !(state.requestState === "ready" && state.nextAfter !== null);
+}
+
 function resetWorkerLogsDom() {
   document.getElementById("logs-body").replaceChildren();
   document.getElementById("logs-content").textContent = "";
@@ -3681,6 +4575,18 @@ function boot() {
     clearMessages();
     if (workerLogViewer !== null) {
       workerLogViewer.retryLastChunkRequest();
+    }
+  });
+  document.getElementById("changes-reload").addEventListener("click", () => {
+    clearMessages();
+    if (projectChangesViewer !== null) {
+      projectChangesViewer.reload();
+    }
+  });
+  document.getElementById("changes-load-more").addEventListener("click", () => {
+    clearMessages();
+    if (projectChangesViewer !== null) {
+      projectChangesViewer.loadMore();
     }
   });
   clearMessages();

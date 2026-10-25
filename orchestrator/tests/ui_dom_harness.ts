@@ -164,6 +164,18 @@ export interface UiHarness {
   logsEmpty(): string;
   /** The hidden/disabled state of one logs action button. */
   logsButtonState(id: string): { hidden: boolean; disabled: boolean };
+  /** The `Path|Change|Source relation|Baseline|Result` rows of the changes table. */
+  changesRows(): string[];
+  /** The project-changes aria-live status line. */
+  changesStatus(): string;
+  /** The changes meta line (snapshot revision, presentation, loaded/total). */
+  changesMeta(): string;
+  /** The changes summary counts line. */
+  changesSummary(): string;
+  /** The changes empty-hint line. */
+  changesEmpty(): string;
+  /** The hidden/disabled state of one changes action button. */
+  changesButtonState(id: string): { hidden: boolean; disabled: boolean };
   readonly clock: UiHarnessClock | null;
   /** Clicks the Inspect button of the run row at `index` in the runs table. */
   clickRunInspect(index: number): void;
@@ -218,6 +230,15 @@ const UI_ELEMENT_IDS = [
   "logs-status",
   "logs-next-chunk",
   "logs-retry",
+  "project-changes-section",
+  "changes-meta",
+  "changes-status",
+  "changes-summary",
+  "changes-table",
+  "changes-body",
+  "changes-empty",
+  "changes-reload",
+  "changes-load-more",
 ] as const;
 
 export interface UiHarnessOptions {
@@ -367,6 +388,22 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
     logsHint: () => harness.element("logs-hint").textContent,
     logsEmpty: () => harness.element("logs-empty").textContent,
     logsButtonState: (id) => {
+      const button = harness.element(id);
+      return { hidden: button.hidden, disabled: button.disabled };
+    },
+    /** The `Path|Change|Source relation|Baseline|Result` rows of the changes table. */
+    changesRows: () =>
+      harness.element("changes-body").children.map((row) => row.children.map((cell) => cell.textContent).join("|")),
+    /** The project-changes aria-live status line. */
+    changesStatus: () => harness.element("changes-status").textContent,
+    /** The changes meta line (snapshot revision, presentation, loaded/total). */
+    changesMeta: () => harness.element("changes-meta").textContent,
+    /** The changes summary counts line. */
+    changesSummary: () => harness.element("changes-summary").textContent,
+    /** The changes empty-hint line. */
+    changesEmpty: () => harness.element("changes-empty").textContent,
+    /** The hidden/disabled state of one changes action button. */
+    changesButtonState: (id) => {
       const button = harness.element(id);
       return { hidden: button.hidden, disabled: button.disabled };
     },

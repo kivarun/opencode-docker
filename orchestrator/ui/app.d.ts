@@ -600,3 +600,184 @@ export declare interface UiLogChunkDecoder {
 }
 
 export declare function createLogChunkDecoder(): UiLogChunkDecoder;
+
+/* ------------------------------------------------------------------ */
+/* Project changes (v6): the read-only panel of the run workspace      */
+/* changes relative to the durable project baseline.                   */
+/* ------------------------------------------------------------------ */
+
+export interface UiProjectChangesFileNode {
+  readonly kind: "regular_file";
+  readonly mode: number;
+  readonly byte_count: number;
+  readonly sha256: string;
+  readonly multiple_links: boolean;
+  readonly hardlink_group?: number;
+}
+
+export interface UiProjectChangesDirectoryNode {
+  readonly kind: "directory";
+  readonly mode: number;
+}
+
+export interface UiProjectChangesSymlinkNode {
+  readonly kind: "symlink";
+  readonly target: string;
+}
+
+export type UiProjectChangesNode = UiProjectChangesFileNode | UiProjectChangesDirectoryNode | UiProjectChangesSymlinkNode;
+
+export type UiProjectChangeKind =
+  | "added"
+  | "deleted"
+  | "content_modified"
+  | "mode_modified"
+  | "content_and_mode_modified"
+  | "symlink_target_modified"
+  | "type_changed";
+
+export type UiProjectSourceRelation = "matches_baseline" | "matches_result" | "diverged";
+
+export interface UiProjectChangeEntry {
+  readonly index: number;
+  readonly path: string;
+  readonly change: UiProjectChangeKind;
+  readonly source_relation: UiProjectSourceRelation;
+  readonly baseline: UiProjectChangesNode | null;
+  readonly result: UiProjectChangesNode | null;
+}
+
+export interface UiProjectChangesSummary {
+  readonly total: number;
+  readonly added: number;
+  readonly deleted: number;
+  readonly content_modified: number;
+  readonly mode_modified: number;
+  readonly content_and_mode_modified: number;
+  readonly symlink_target_modified: number;
+  readonly type_changed: number;
+  readonly matches_baseline: number;
+  readonly matches_result: number;
+  readonly diverged: number;
+}
+
+export interface UiProjectChangesModel {
+  readonly kind: "project_changes";
+  readonly runId: string;
+  readonly revision: number;
+  readonly observation: string;
+  readonly summary: UiProjectChangesSummary;
+  readonly changes: readonly UiProjectChangeEntry[];
+  readonly nextAfter: number | null;
+}
+
+export declare function parseProjectChangesDocument(document: unknown, expectedRunId?: string): UiProjectChangesModel;
+
+export type UiProjectChangesRequestState =
+  | "idle"
+  | "loading_initial"
+  | "loading_more"
+  | "reloading"
+  | "ready"
+  | "stale"
+  | "error";
+
+export type UiProjectChangesPresentation =
+  | "unavailable"
+  | "no_changes"
+  | "pending"
+  | "already_present"
+  | "mixed"
+  | "diverged";
+
+export interface UiProjectChangesState {
+  readonly runId: string;
+  readonly inspectRevision: number | null;
+  readonly observation: string | null;
+  readonly summary: UiProjectChangesSummary | null;
+  readonly changes: readonly UiProjectChangeEntry[];
+  readonly nextAfter: number | null;
+  readonly requestState: UiProjectChangesRequestState;
+  readonly presentationState: UiProjectChangesPresentation;
+  readonly error: UiApiFailure | null;
+}
+
+export declare function createProjectChangesState(runId: string): UiProjectChangesState;
+
+export declare function applyProjectChangesPage(
+  state: UiProjectChangesState,
+  model: UiProjectChangesModel,
+  requestedAfter: number,
+): UiProjectChangesState;
+
+export interface UiProjectChangesRequestPathOptions {
+  readonly runId: string;
+  readonly after: number;
+  readonly limit: number;
+  readonly observation?: string | null;
+}
+
+export declare function projectChangesRequestPath(request: UiProjectChangesRequestPathOptions): string;
+
+export type UiProjectChangesResult =
+  | { readonly ok: true; readonly lost: false; readonly model: UiProjectChangesModel | UiErrorModel | UiCommandResultModel }
+  | { readonly ok: false; readonly lost: boolean; readonly failure: UiApiFailure };
+
+export declare function requestProjectChangesJson(
+  fetchImpl: (path: string, init?: RequestInit) => Promise<Response>,
+  path: string,
+  init?: RequestInit,
+  expectedRunId?: string,
+): Promise<UiProjectChangesResult>;
+
+export interface UiProjectChangesTransportIo {
+  /** The only changes GET site; receives the request's abort signal. */
+  readonly fetchChanges: (runId: string, path: string, signal: AbortSignal) => Promise<UiProjectChangesResult | undefined>;
+  /** Fires exactly once per fetch start, before the request goes out. */
+  readonly onStarted: (runId: string) => void;
+  /** Fires when a superseded request settles with no desired follow-up. */
+  readonly onSettled: (runId: string) => void;
+}
+
+export interface UiProjectChangesDesire {
+  readonly runId: string;
+  readonly kind: "initial" | "continuation";
+  readonly after: number;
+  readonly path: string;
+  /** Called only when the request settled and was never superseded. */
+  readonly onApplied: (result: UiProjectChangesResult | undefined) => void;
+}
+
+export interface UiProjectChangesTransport {
+  request(desire: UiProjectChangesDesire): Promise<UiProjectChangesResult | undefined>;
+  invalidate(): void;
+  dispose(): void;
+}
+
+export declare function createProjectChangesTransport(io: UiProjectChangesTransportIo): UiProjectChangesTransport;
+
+export interface UiProjectChangesViewerIo {
+  readonly transport: UiProjectChangesTransport;
+  readonly onState: (state: UiProjectChangesState | null) => void;
+}
+
+export interface UiProjectChangesViewer {
+  /** Selection change: discards state and invalidates the wire. */
+  transitionToRun(runId: string): void;
+  /** Leaves the changes view without a run binding. */
+  dropView(): void;
+  /**
+   * The automatic one-shot initial load driven by the applied
+   * authoritative terminal inspect: exactly one GET per not-yet-
+   * requested terminal revision; every other boundary issues nothing.
+   */
+  inspectApplied(model: unknown): void;
+  /** The explicit Reload: one after=0 request without an observation. */
+  reload(): void;
+  /** The explicit Load more: one continuation GET with the observation. */
+  loadMore(): void;
+  /** The read-only projection for the DOM adapter. */
+  currentState(): UiProjectChangesState | null;
+}
+
+export declare function createProjectChangesViewer(io: UiProjectChangesViewerIo): UiProjectChangesViewer;

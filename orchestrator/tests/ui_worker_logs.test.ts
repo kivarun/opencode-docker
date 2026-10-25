@@ -766,8 +766,10 @@ describe("the logs layer source restrictions", () => {
     expect(logsRegion.slice(0, decoderStart).includes("new TextDecoder(")).toBe(false);
     expect(logsRegion.slice(decoderEnd).includes("new TextDecoder(")).toBe(false);
     // the automatic metadata refresh is invoked only from the applied
-    // authoritative inspect path
-    expect(appSource.split("inspectApplied(").length - 1).toBe(2); // declaration + one call site
+    // authoritative inspect path (the v6 project-changes viewer adds its
+    // own inspectApplied declaration and its own call site beside the
+    // logs ones)
+    expect(appSource.split("inspectApplied(").length - 1).toBe(4); // two declarations + two call sites
     // the content fetch is invoked only from the user action path
     expect(appSource.split("fetchChunk()").length - 1).toBe(2); // declaration + one click site
   });

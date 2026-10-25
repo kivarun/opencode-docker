@@ -776,14 +776,42 @@ the operator project immediately before writing.
   502, `binding_not_found` is 404 and a removed project stays
   `project_unavailable` (409). Host/Origin/GET-only/no-body gates are
   unchanged.
-- Browser UI: not wired. `parseApiDocument` rejects
-  `kind: "project_changes"` and the UI knows nothing about the endpoint
-  or the change vocabulary — the Changes tab is a separate future
-  increment.
+- Browser UI (v6, production-wired): the run detail carries a standalone
+  read-only `Project changes` section over the same endpoint. The dedicated
+  changes parser (`parseProjectChangesDocument`) accepts only
+  `schema_version: 1` + `kind: "project_changes"` with exact own keys at
+  every level, the closed 7-kind change vocabulary and 3-relation source
+  vocabulary, the exact node union (including the hardlink metadata of the
+  actual API), the per-entry variant coherence, strictly increasing indexes,
+  unique relative paths and coherent summary counts; the general
+  `parseApiDocument` keeps rejecting the changes kind for every other
+  endpoint. The automatic path is exactly ONE
+  `GET /v1/runs/<id>/changes?after=0&limit=100` per applied authoritative
+  terminal inspect (`succeeded`/`failed`) whose revision was not yet
+  requested; running/plan-ready/waiting/resumable boundaries, inspect
+  failures and re-inspects of the same revision issue nothing. Explicit
+  actions only: `Reload changes` (after=0 without an observation; the old
+  snapshot stays visible as `reloading`) and `Load more`
+  (`after=<nextAfter>&limit=100&observation=<current>`). A
+  `stale_observation` continuation keeps the loaded snapshot, shows
+  "Stale. The run workspace or registered project changed after this view
+  was created. Reload the changes." (never attributing the change to the
+  worker) and offers only the explicit Reload. The panel renders the
+  snapshot revision, the presentation status (`unavailable`/`no_changes`/
+  `pending`/`already_present`/`mixed`/`diverged` — `already_present` is
+  deliberately not named `applied`), the loaded/total count, the summary
+  counts and one row per change through `createElement`/`textContent` only
+  (modes in octal, byte counts, full SHA-256 as text, hardlink indicators,
+  verbatim symlink targets). The browser receives NO file content: no
+  `data_base64`, no content endpoint, no `/diff`, no `/apply`, no POST
+  inside the changes owner, no File System Access API, no clipboard, no
+  download route; digests and metadata are not a content preview. A changes
+  failure never POSTs, never calls inspect/events/logs and never affects
+  the mutation gate or polling eligibility.
 - Still unwired: Apply, any write to the operator project, RW project
-  mounts, project-level locking, automatic application, content
-  diff/payload download, final-workspace durable sealing, and any state
-  schema change.
+  mounts, project-level locking, automatic application, bounded
+  content/diff viewing (the declared next layer), final-workspace durable
+  sealing, and any state schema change.
 
 ## The production continue-stage runner API (`orchestrator continue-stage`)
 

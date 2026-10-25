@@ -1172,15 +1172,26 @@ describe("project changes ownership and UI boundary", () => {
     expect(() => ui.parseApiDocument({ schema_version: 1, kind: "changes", run_id: "chg" })).toThrow();
   });
 
-  test("the browser UI knows nothing about the changes endpoint or vocabulary", async () => {
+  test("the browser UI v6 panel stays read-only with no content or POST capability", async () => {
     const appSource = await readFile(join(import.meta.dir, "..", "ui", "app.js"), "utf8");
-    expect(appSource).not.toContain("/changes");
-    expect(appSource).not.toContain("project_changes");
-    expect(appSource).not.toContain("matches_baseline");
+    // the dedicated v6 owner exists beside the general fail-closed client
+    expect(appSource).toContain("parseProjectChangesDocument");
+    expect(appSource).toContain("projectChangesRequestPath");
+    expect(appSource).toContain("createProjectChangesViewer");
+    // the general client still rejects the document kind
+    const ui = await import("../ui/app.js");
+    expect(() =>
+      ui.parseApiDocument({ schema_version: 1, kind: "project_changes", run_id: "chg", revision: 1, observation: "a".repeat(64), summary: {}, changes: [], next_after: null }),
+    ).toThrow();
+    // no content, download, apply or write capability anywhere in the
+    // browser module
+    for (const banned of ["/diff", "/apply", "showSaveFilePicker", "showOpenFilePicker", "navigator.clipboard", "download", "innerHTML"]) {
+      expect(appSource.includes(banned)).toBe(false);
+    }
     const html = await readFile(join(import.meta.dir, "..", "ui", "index.html"), "utf8");
-    expect(html).not.toContain("changes");
-    const css = await readFile(join(import.meta.dir, "..", "ui", "style.css"), "utf8");
-    expect(css).not.toContain("changes");
+    expect(html).toContain("project-changes-section");
+    expect(html).toContain("Run workspace changes relative to the durable project baseline");
+    expect(html).toContain("The registered project is not modified.");
   });
 
   test("the failure vocabulary is closed and the public reasons never carry content", async () => {

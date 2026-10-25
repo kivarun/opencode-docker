@@ -540,6 +540,13 @@ describe("ui model: export surface and source restrictions", () => {
         "createLogsTransport",
         "createWorkerLogViewer",
         "createLogChunkDecoder",
+        "parseProjectChangesDocument",
+        "createProjectChangesState",
+        "applyProjectChangesPage",
+        "projectChangesRequestPath",
+        "requestProjectChangesJson",
+        "createProjectChangesTransport",
+        "createProjectChangesViewer",
       ].sort(),
     );
   });

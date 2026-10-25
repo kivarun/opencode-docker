@@ -56,6 +56,25 @@
       </thead>
       <tbody id="outputs-body"></tbody>
     </table>
+    <div id="project-changes-section" hidden>
+      <h3 id="project-changes-heading">Project changes</h3>
+      <p class="logs-note">Read-only view of the run workspace changes relative to the durable project baseline. The registered project is not modified.</p>
+      <p id="changes-meta" class="logs-meta"></p>
+      <p id="changes-status" class="events-live" aria-live="polite"></p>
+      <p id="changes-summary" class="logs-meta"></p>
+      <table id="changes-table" hidden>
+        <caption>Run workspace changes relative to the durable project baseline</caption>
+        <thead>
+          <tr><th scope="col">Path</th><th scope="col">Change</th><th scope="col">Source relation</th><th scope="col">Baseline</th><th scope="col">Result</th></tr>
+        </thead>
+        <tbody id="changes-body"></tbody>
+      </table>
+      <p id="changes-empty" class="logs-meta"></p>
+      <div class="events-actions">
+        <button type="button" id="changes-reload" hidden>Reload changes</button>
+        <button type="button" id="changes-load-more" hidden>Load more</button>
+      </div>
+    </div>
     <div id="worker-logs-section" hidden>
       <h3 id="worker-logs-heading">Worker logs</h3>
       <p class="logs-note">Read-only view of the durable worker-log records. The payload is secret-bearing, unredacted agent output. The metadata list follows the applied inspect revisions automatically; a bounded chunk of a captured or truncated execution loads on the explicit Load log press at any run boundary.</p>
