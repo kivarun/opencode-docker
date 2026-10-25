@@ -781,3 +781,162 @@ export interface UiProjectChangesViewer {
 }
 
 export declare function createProjectChangesViewer(io: UiProjectChangesViewerIo): UiProjectChangesViewer;
+
+/* ------------------------------------------------------------------ */
+/* Project change content (v7): bounded read-only content preview and  */
+/* client-side bounded diff over the Project Change Content API.       */
+/* ------------------------------------------------------------------ */
+
+/** The raw-byte request chunk of one content GET (the API default). */
+export declare const CONTENT_PREVIEW_CHUNK_LIMIT: 65536;
+/** The maximum raw bytes the viewer retains per side. */
+export declare const CONTENT_PREVIEW_MAX_BYTES: 262144;
+/** The maximum bytes of one side rendered through the bounded hex view. */
+export declare const CONTENT_HEX_DISPLAY_BYTES: 4096;
+/** The bounded line-diff limits. */
+export declare const DIFF_MAX_LINES_PER_SIDE: 2000;
+export declare const DIFF_MAX_WORK_CELLS: 250000;
+
+export interface UiProjectChangeContentBinding {
+  readonly runId: string;
+  readonly observation: string;
+  readonly changeIndex: number;
+  readonly side: string;
+}
+
+export interface UiProjectChangeContentModelCommon {
+  readonly kind: "project_change_content";
+  readonly runId: string;
+  readonly revision: number;
+  readonly observation: string;
+  readonly changeIndex: number;
+  readonly side: string;
+}
+
+export type UiProjectChangeContentModel =
+  | (UiProjectChangeContentModelCommon & {
+      readonly status: "available";
+      readonly byteCount: number;
+      readonly sha256: string;
+      readonly offset: number;
+      readonly data: Uint8Array;
+      readonly nextOffset: number | null;
+    })
+  | (UiProjectChangeContentModelCommon & {
+      readonly status: "implicit_empty";
+      readonly byteCount: 0;
+      readonly offset: 0;
+      readonly data: Uint8Array;
+      readonly nextOffset: null;
+    })
+  | (UiProjectChangeContentModelCommon & {
+      readonly status: "metadata_only";
+      readonly node: Record<string, unknown>;
+    })
+  | (UiProjectChangeContentModelCommon & {
+      readonly status: "unavailable";
+      readonly reason: string;
+      readonly node: Record<string, unknown>;
+    });
+
+export declare function parseProjectChangeContentDocument(document: unknown, expected: UiProjectChangeContentBinding | null): UiProjectChangeContentModel;
+
+export type UiProjectChangeContentResult =
+  | { readonly ok: true; readonly lost: false; readonly model: UiProjectChangeContentModel }
+  | { readonly ok: false; readonly lost: boolean; readonly failure: { readonly layer: string; readonly reason: string } };
+
+export declare function requestProjectChangeContentJson(fetchImpl: (path: string, init?: RequestInit) => Promise<Response>, path: string, init: RequestInit | undefined, expected: UiProjectChangeContentBinding | null): Promise<UiProjectChangeContentResult>;
+
+export interface UiProjectChangeContentPathRequest {
+  readonly runId: string;
+  readonly changeIndex: number;
+  readonly side: string;
+  readonly observation: string;
+  readonly offset?: number;
+  readonly limit?: number;
+}
+
+export declare function projectChangeContentRequestPath(request: UiProjectChangeContentPathRequest): string;
+
+export interface UiProjectChangeContentTransportIo {
+  readonly fetchContent: (runId: string, path: string, signal: AbortSignal, expected: UiProjectChangeContentBinding) => Promise<UiProjectChangeContentResult | undefined>;
+  readonly onStarted: (runId: string) => void;
+  readonly onSettled: (runId: string) => void;
+}
+
+export interface UiProjectChangeContentDesire {
+  readonly runId: string;
+  readonly kind: "initial" | "continuation";
+  readonly side: string;
+  readonly expected: UiProjectChangeContentBinding;
+  readonly path: string;
+  readonly onApplied: (result: UiProjectChangeContentResult | undefined) => void;
+}
+
+export interface UiProjectChangeContentTransport {
+  request(desire: UiProjectChangeContentDesire): Promise<UiProjectChangeContentResult | undefined>;
+  invalidate(): void;
+  dispose(): void;
+}
+
+export declare function createProjectChangeContentTransport(io: UiProjectChangeContentTransportIo): UiProjectChangeContentTransport;
+
+export interface UiProjectChangeContentViewerIo {
+  readonly transport: UiProjectChangeContentTransport;
+  readonly onState: (state: UiProjectChangeContentState | null) => void;
+}
+
+export interface UiProjectChangeContentSideState {
+  readonly phase: "unrequested" | "loading" | "available" | "implicit_empty" | "metadata_only" | "unavailable" | "error";
+  readonly byteCount: number | null;
+  readonly sha256: string | null;
+  readonly loadedBytes: number;
+  readonly nextOffset: number | null;
+  readonly capped: boolean;
+  readonly data: Uint8Array | null;
+  readonly error: { readonly layer: string; readonly reason: string } | null;
+}
+
+export interface UiProjectChangeContentState {
+  readonly runId: string;
+  readonly observation: string | null;
+  readonly changesCount: number;
+  readonly changeIndex: number | null;
+  readonly changePath: string | null;
+  readonly changeKind: string | null;
+  readonly generation: number;
+  readonly requestState: "idle" | "loading" | "ready" | "stale" | "error";
+  readonly stale: boolean;
+  readonly error: { readonly layer: string; readonly reason: string } | null;
+  readonly baseline: UiProjectChangeContentSideState;
+  readonly result: UiProjectChangeContentSideState;
+}
+
+export interface UiProjectChangeContentViewer {
+  review(entry: unknown): void;
+  loadMoreSide(side: string): void;
+  retrySide(side: string): void;
+  closeReview(): void;
+  invalidateMetadata(): void;
+  transitionToRun(runId: string): void;
+  metadataApplied(changesState: unknown): void;
+  currentState(): UiProjectChangeContentState | null;
+}
+
+export declare function createProjectChangeContentViewer(io: UiProjectChangeContentViewerIo): UiProjectChangeContentViewer;
+
+export declare function decodePreviewText(bytes: Uint8Array, options: { readonly incompleteTail?: boolean } | null): { readonly kind: "text"; readonly text: string } | { readonly kind: "binary" };
+
+export interface UiHexPreviewRow {
+  readonly offset: string;
+  readonly hex: string;
+  readonly ascii: string;
+}
+
+export declare function hexPreviewRows(bytes: Uint8Array, maxBytes?: number): readonly UiHexPreviewRow[];
+
+export type UiBoundedLineDiff =
+  | { readonly kind: "diff"; readonly identical: boolean; readonly rows: readonly { readonly type: "context" | "add" | "delete"; readonly text: string; readonly noEol: boolean }[] }
+  | { readonly kind: "refusal"; readonly reason: "not_text" | "too_many_lines" | "work_budget" };
+
+export declare function computeBoundedLineDiff(leftBytes: Uint8Array, rightBytes: Uint8Array): UiBoundedLineDiff;

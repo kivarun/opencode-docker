@@ -2648,6 +2648,1130 @@ export function createProjectChangesViewer(io) {
   });
 }
 
+/* ------------------------------------------------------------------ */
+/* Project change content (v7): bounded read-only content preview and  */
+/* client-side bounded diff over the Project Change Content API.       */
+/* ------------------------------------------------------------------ */
+
+/** The raw-byte request chunk of one content GET (the API default). */
+export const CONTENT_PREVIEW_CHUNK_LIMIT = 65536;
+/** The maximum raw bytes the viewer retains per side (the bounded
+ * preview cap; beyond it the side stays a truncated preview). */
+export const CONTENT_PREVIEW_MAX_BYTES = 262144;
+/** The maximum bytes of one side rendered through the bounded hex
+ * view (the DOM stays small; the retained bytes may be larger). */
+export const CONTENT_HEX_DISPLAY_BYTES = 4096;
+/** The bounded line-diff limits: lines per side and LCS work cells. */
+export const DIFF_MAX_LINES_PER_SIDE = 2000;
+export const DIFF_MAX_WORK_CELLS = 250000;
+
+const CONTENT_STATUS_KEYS = ["available", "implicit_empty", "metadata_only", "unavailable"];
+const CONTENT_SIDE_KEYS = ["baseline", "result"];
+/** The closed unavailable-reason vocabulary of the production content
+ * API; the UI parser owns this pinned copy (one element). */
+const CONTENT_UNAVAILABLE_REASONS = ["source_no_longer_matches_baseline"];
+const CONTENT_COMMON_KEYS = ["schema_version", "kind", "run_id", "revision", "observation", "change_index", "side", "status"];
+const CONTENT_STATUS_KEYS_MAP = {
+  available: [...CONTENT_COMMON_KEYS, "byte_count", "sha256", "offset", "data_base64", "next_offset"],
+  implicit_empty: [...CONTENT_COMMON_KEYS, "byte_count", "offset", "data_base64", "next_offset"],
+  metadata_only: [...CONTENT_COMMON_KEYS, "node"],
+  unavailable: [...CONTENT_COMMON_KEYS, "reason", "node"],
+};
+
+function isLowercaseSha256(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function isSafeIndex(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveSafeIndex(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+/** The exact snake_case node union of the changes metadata, validated
+ * for the content binding check. */
+function expectChangeNode(node) {
+  if (!isRecord(node)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (node["kind"] === "directory") {
+    expectShape(node, ["kind", "mode"]);
+  } else if (node["kind"] === "symlink") {
+    expectShape(node, ["kind", "target"]);
+    if (typeof node["target"] !== "string") {
+      throw new UiContractError("invalid_shape");
+    }
+  } else if (node["kind"] === "regular_file") {
+    expectShape(node, node["multiple_links"] === true ? ["kind", "mode", "byte_count", "sha256", "multiple_links", "hardlink_group"] : ["kind", "mode", "byte_count", "sha256", "multiple_links"]);
+    if (
+      !isSafeIndex(node["mode"]) ||
+      !isSafeIndex(node["byte_count"]) ||
+      !isLowercaseSha256(node["sha256"]) ||
+      (node["multiple_links"] !== false && node["multiple_links"] !== true) ||
+      (node["multiple_links"] === true && !isPositiveSafeIndex(node["hardlink_group"]))
+    ) {
+      throw new UiContractError("invalid_shape");
+    }
+  } else {
+    throw new UiContractError("invalid_shape");
+  }
+  return node;
+}
+
+function expectContentBinding(expected) {
+  if (!isRecord(expected)) {
+    throw new UiContractError("invalid_request");
+  }
+  const runId = expected["runId"];
+  const observation = expected["observation"];
+  const changeIndex = expected["changeIndex"];
+  const side = expected["side"];
+  if (
+    !isSafeId(runId) ||
+    typeof observation !== "string" || !HEX64_PATTERN.test(observation) ||
+    !isPositiveSafeIndex(changeIndex) ||
+    typeof side !== "string" || !CONTENT_SIDE_KEYS.includes(side)
+  ) {
+    throw new UiContractError("invalid_request");
+  }
+  return { runId, observation, changeIndex, side };
+}
+
+/** The decoded bytes of one canonical base64 string; a malformed,
+ * non-canonical or length-mismatching value is a contract failure.
+ * The decoded bytes are the only carrier of content in the model. */
+function expectBase64Bytes(value) {
+  if (typeof value !== "string") {
+    throw new UiContractError("invalid_shape");
+  }
+  const length = base64ByteLength(value);
+  if (length < 0) {
+    throw new UiContractError("invalid_shape");
+  }
+  let decoded;
+  try {
+    decoded = atob(value);
+  } catch {
+    throw new UiContractError("invalid_shape");
+  }
+  if (decoded.length !== length) {
+    throw new UiContractError("invalid_shape");
+  }
+  // a fresh private array; typed arrays cannot be frozen in the
+  // runtime, the model object freezing covers the reference
+  return Uint8Array.from(decoded, (char) => char.charCodeAt(0));
+}
+
+/**
+ * The dedicated parser of one project-change-content document (HTTP
+ * schema version 1): exact own keys per status variant, the closed
+ * status/side/reason vocabularies, canonical safe integers, lowercase
+ * SHA-256 digests, base64/byte-count/offset/next-offset coherence and
+ * the exact binding to the requested run id, observation, change index
+ * and side. Only the `available` status carries content bytes, and
+ * they live exclusively in the frozen `data` byte array — never in a
+ * diagnostic, never in a URL. The general `parseApiDocument` keeps
+ * rejecting this kind fail-closed.
+ */
+export function parseProjectChangeContentDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "project_change_content") {
+    throw new UiContractError("unknown_kind");
+  }
+  const binding = expected === null ? null : expectContentBinding(expected);
+  const status = document["status"];
+  if (typeof status !== "string" || !CONTENT_STATUS_KEYS.includes(status)) {
+    throw new UiContractError("invalid_shape");
+  }
+  expectShape(document, CONTENT_STATUS_KEYS_MAP[status]);
+  const runId = expectString(document, "run_id");
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (binding !== null && runId !== binding.runId) {
+    throw new UiContractError("unexpected_run");
+  }
+  const revision = document["revision"];
+  if (!isPositiveSafeIndex(revision)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const observation = expectString(document, "observation");
+  if (!HEX64_PATTERN.test(observation)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (binding !== null && observation !== binding.observation) {
+    throw new UiContractError("observation_mismatch");
+  }
+  const changeIndex = document["change_index"];
+  if (!isPositiveSafeIndex(changeIndex)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (binding !== null && changeIndex !== binding.changeIndex) {
+    throw new UiContractError("invalid_shape");
+  }
+  const side = document["side"];
+  if (typeof side !== "string" || !CONTENT_SIDE_KEYS.includes(side)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (binding !== null && side !== binding.side) {
+    throw new UiContractError("invalid_shape");
+  }
+  const base = {
+    kind: "project_change_content",
+    runId,
+    revision,
+    observation,
+    changeIndex,
+    side,
+    status,
+  };
+  if (status === "implicit_empty") {
+    if (document["byte_count"] !== 0 || document["offset"] !== 0 || document["data_base64"] !== "" || document["next_offset"] !== null) {
+      throw new UiContractError("invalid_shape");
+    }
+    return deepFreezeModel({ ...base, status, byteCount: 0, offset: 0, data: new Uint8Array(0), nextOffset: null });
+  }
+  if (status === "metadata_only") {
+    const node = expectChangeNode(document["node"]);
+    if (node["kind"] === "regular_file") {
+      throw new UiContractError("invalid_shape");
+    }
+    return deepFreezeModel({ ...base, status, node });
+  }
+  if (status === "unavailable") {
+    const reason = document["reason"];
+    if (typeof reason !== "string" || !CONTENT_UNAVAILABLE_REASONS.includes(reason)) {
+      throw new UiContractError("invalid_shape");
+    }
+    const node = expectChangeNode(document["node"]);
+    if (node["kind"] !== "regular_file") {
+      throw new UiContractError("invalid_shape");
+    }
+    return deepFreezeModel({ ...base, status, reason, node });
+  }
+  const byteCount = document["byte_count"];
+  const sha256 = document["sha256"];
+  const offset = document["offset"];
+  const nextOffset = document["next_offset"];
+  if (!isSafeIndex(byteCount) || !isLowercaseSha256(sha256) || !isSafeIndex(offset)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (nextOffset !== null && !isSafeIndex(nextOffset)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const data = expectBase64Bytes(document["data_base64"]);
+  if (offset > byteCount || offset + data.length > byteCount) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (nextOffset === null) {
+    // the terminal chunk: either the empty page at the exact end or the
+    // final slice reaching the end
+    if (data.length === 0 ? offset !== byteCount : offset + data.length !== byteCount) {
+      throw new UiContractError("invalid_shape");
+    }
+  } else {
+    if (nextOffset !== offset + data.length || nextOffset >= byteCount) {
+      throw new UiContractError("invalid_shape");
+    }
+    if (data.length === 0) {
+      throw new UiContractError("invalid_shape");
+    }
+  }
+  return deepFreezeModel({ ...base, status, byteCount, sha256, offset, data, nextOffset });
+}
+
+function deepFreezeModel(model) {
+  return Object.freeze(model);
+}
+
+/**
+ * The one document classifier of the content endpoint: a well-formed
+ * `project_change_content` document bound to the expected request, or
+ * one of the endpoint's documented failure envelopes (`error`, or the
+ * failed `command_result` of a rejected content read). A succeeded
+ * command result is unsuitable and fails closed.
+ */
+function parseProjectChangeContentEndpointDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "project_change_content") {
+    return parseProjectChangeContentDocument(document, expected);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/**
+ * The content endpoint client: it reuses the one bounded JSON response
+ * primitive and classifies the document by kind, never by message
+ * text. Content bytes never appear in a diagnostic.
+ */
+export async function requestProjectChangeContentJson(fetchImpl, path, init, expected) {
+  return requestJsonDocument(fetchImpl, path, init, (document) => parseProjectChangeContentEndpointDocument(document, expected));
+}
+
+/**
+ * The one URL builder of every content request. Only the run id, the
+ * change index, the fixed side, the observation identity and the
+ * raw-byte cursor travel in the URL: never a project path, a change
+ * path, a digest, node metadata, a project id or a run root.
+ */
+export function projectChangeContentRequestPath(request) {
+  if (!isRecord(request)) {
+    throw new UiContractError("invalid_request");
+  }
+  const runId = request["runId"];
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  const changeIndex = request["changeIndex"];
+  if (!isPositiveSafeIndex(changeIndex)) {
+    throw new UiContractError("invalid_cursor");
+  }
+  const side = request["side"];
+  if (typeof side !== "string" || !CONTENT_SIDE_KEYS.includes(side)) {
+    throw new UiContractError("invalid_request");
+  }
+  const observation = request["observation"];
+  if (typeof observation !== "string" || !HEX64_PATTERN.test(observation)) {
+    throw new UiContractError("invalid_request");
+  }
+  const offset = request["offset"];
+  if (offset !== undefined && (offset === null || !isSafeIndex(offset))) {
+    throw new UiContractError("invalid_cursor");
+  }
+  const limit = request["limit"];
+  if (limit !== undefined && (limit === null || !isPositiveSafeIndex(limit) || limit > 262144)) {
+    throw new UiContractError("invalid_request");
+  }
+  let path = `/v1/runs/${runId}/changes/${changeIndex}/content?side=${side}&observation=${observation}`;
+  if (offset !== undefined && offset !== 0) {
+    path += `&offset=${offset}`;
+  }
+  if (limit !== undefined && limit !== CONTENT_PREVIEW_CHUNK_LIMIT) {
+    path += `&limit=${limit}`;
+  }
+  return path;
+}
+
+/**
+ * The single-flight transport of the content viewer: at most one
+ * unsettled content GET exists at any instant. A new explicit Review
+ * supersedes the active request and coalesces as the one follow-up; a
+ * chunk continuation while a request is on the wire is declined
+ * without a second GET. invalidate/dispose withdraw the active and
+ * queued desires. There is no timer, no polling and no retry loop.
+ */
+export function createProjectChangeContentTransport(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["fetchContent"] !== "function" ||
+    typeof io["onStarted"] !== "function" ||
+    typeof io["onSettled"] !== "function"
+  ) {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const fetchContent = io["fetchContent"];
+  const onStarted = io["onStarted"];
+  const onSettled = io["onSettled"];
+  let active = null;
+  let desired = null;
+  let disposed = false;
+
+  const startRequest = (request) => {
+    if (active !== null) {
+      throw new UiContractError("transport_slot_busy");
+    }
+    active = request;
+    const controller = new AbortController();
+    request.controller = controller;
+    onStarted(request.runId);
+    void (async () => {
+      let result;
+      try {
+        result = await fetchContent(request.runId, request.path, controller.signal, request.expected);
+      } catch {
+        result = undefined;
+      } finally {
+        settleActive(request, result);
+      }
+    })();
+  };
+
+  const settleActive = (request, result) => {
+    try {
+      if (request.superseded) {
+        if (desired === null) {
+          onSettled(request.runId);
+        }
+      } else {
+        request.onApplied(result);
+        onSettled(request.runId);
+      }
+    } finally {
+      active = null;
+      const followUp = desired;
+      desired = null;
+      request.resolve(result);
+      if (followUp !== null && !disposed) {
+        startRequest(followUp);
+      }
+    }
+  };
+
+  return Object.freeze({
+    request(desire) {
+      const runId = isRecord(desire) && isSafeId(desire["runId"]) ? desire["runId"] : null;
+      const path = isRecord(desire) && typeof desire["path"] === "string" ? desire["path"] : null;
+      const kind = isRecord(desire) && (desire["kind"] === "initial" || desire["kind"] === "continuation") ? desire["kind"] : null;
+      const side = isRecord(desire) && typeof desire["side"] === "string" && CONTENT_SIDE_KEYS.includes(desire["side"]) ? desire["side"] : null;
+      const expected = isRecord(desire) && isRecord(desire["expected"]) ? desire["expected"] : null;
+      const onApplied = isRecord(desire) && typeof desire["onApplied"] === "function" ? desire["onApplied"] : null;
+      let resolveResult = null;
+      const settled = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      if (disposed || runId === null || path === null || kind === null || side === null || expected === null || onApplied === null) {
+        resolveResult(undefined);
+        return settled;
+      }
+      const request = { runId, path, kind, side, expected, onApplied, superseded: false, controller: null, resolve: resolveResult };
+      if (active === null) {
+        startRequest(request);
+      } else if (kind === "continuation") {
+        // a chunk continuation never displaces or queues behind another
+        // request: the viewer declines it and no stale bytes are fetched
+        resolveResult(undefined);
+        return settled;
+      } else {
+        active.superseded = true;
+        active.controller.abort();
+        const replaced = desired;
+        desired = request;
+        if (replaced !== null) {
+          replaced.resolve(undefined);
+        }
+      }
+      return settled;
+    },
+    invalidate() {
+      if (active !== null) {
+        active.superseded = true;
+        active.controller.abort();
+      }
+      const withdrawn = desired;
+      desired = null;
+      if (withdrawn !== null) {
+        withdrawn.resolve(undefined);
+      }
+    },
+    dispose() {
+      disposed = true;
+      this.invalidate();
+    },
+  });
+}
+
+/* The bounded UTF-8 scanner: the one strict validator of raw preview
+ * bytes. It returns the offset of the first invalid byte (-1 when the
+ * bytes are valid), whether a trailing incomplete multi-byte sequence
+ * exists, and the offset where that trailing sequence starts (-1 when
+ * there is none). Overlong forms, surrogates and out-of-range code
+ * points are invalid; a truncated sequence is invalid unless it sits
+ * exactly at the end of an unfinished preview. */
+function scanUtf8(bytes) {
+  const length = bytes.length;
+  let index = 0;
+  while (index < length) {
+    const lead = bytes[index];
+    let continuationCount = 0;
+    let minimum = 0;
+    let maximum = 0x10ffff;
+    if (lead < 0x80) {
+      index += 1;
+      continue;
+    }
+    if (lead >= 0xc2 && lead <= 0xdf) {
+      continuationCount = 1;
+    } else if (lead === 0xe0) {
+      continuationCount = 2;
+      minimum = 0xa0;
+    } else if ((lead >= 0xe1 && lead <= 0xec) || lead === 0xee || lead === 0xef) {
+      continuationCount = 2;
+      minimum = 0x80;
+    } else if (lead === 0xed) {
+      continuationCount = 2;
+      minimum = 0x80;
+      maximum = 0x9f;
+    } else if (lead === 0xf0) {
+      continuationCount = 3;
+      minimum = 0x90;
+    } else if ((lead >= 0xf1 && lead <= 0xf3)) {
+      continuationCount = 3;
+      minimum = 0x80;
+    } else if (lead === 0xf4) {
+      continuationCount = 3;
+      minimum = 0x80;
+      maximum = 0x8f;
+    } else {
+      return { invalidAt: index, incompleteTailAt: -1 };
+    }
+    if (index + continuationCount >= length && index + continuationCount === length) {
+      // a truncated sequence sits exactly at the end: report it as the
+      // trailing incomplete tail, not as an invalid byte
+      return { invalidAt: -1, incompleteTailAt: index };
+    }
+    for (let k = 1; k <= continuationCount; k += 1) {
+      const byte = bytes[index + k];
+      const lower = k === 1 ? minimum : 0x80;
+      const upper = k === 1 ? maximum : 0xbf;
+      if (byte === undefined || byte < lower || byte > upper) {
+        return { invalidAt: index, incompleteTailAt: -1 };
+      }
+    }
+    index += continuationCount + 1;
+  }
+  return { invalidAt: -1, incompleteTailAt: -1 };
+}
+
+/**
+ * The text/binary classification of one bounded preview. Raw bytes are
+ * the source of truth: any NUL byte or an invalid UTF-8 sequence makes
+ * the side binary; an incomplete trailing sequence is tolerated only
+ * while the preview is unfinished (`incompleteTail`) and is excluded
+ * from the rendered text. ANSI escapes and markup-looking text stay
+ * plain text — the render path is `textContent` only.
+ */
+export function decodePreviewText(bytes, options) {
+  const incompleteTail = isRecord(options) && options["incompleteTail"] === true;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] === 0) {
+      return Object.freeze({ kind: "binary" });
+    }
+  }
+  const scan = scanUtf8(bytes);
+  if (scan.invalidAt !== -1) {
+    return Object.freeze({ kind: "binary" });
+  }
+  let textBytes = bytes;
+  if (scan.incompleteTailAt !== -1) {
+    if (!incompleteTail) {
+      return Object.freeze({ kind: "binary" });
+    }
+    textBytes = bytes.subarray(0, scan.incompleteTailAt);
+  }
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(textBytes);
+  return Object.freeze({ kind: "text", text });
+}
+
+/** The bounded hex rows of one preview: fixed raw-byte offsets, hex
+ * pairs and a safe ASCII column; every non-printable byte renders as a
+ * dot and nothing is ever interpreted or executed. */
+export function hexPreviewRows(bytes, maxBytes) {
+  const displayLimit = isSafeIndex(maxBytes) ? maxBytes : CONTENT_HEX_DISPLAY_BYTES;
+  const shown = bytes.length > displayLimit ? bytes.subarray(0, displayLimit) : bytes;
+  const rows = [];
+  for (let offset = 0; offset < shown.length; offset += 16) {
+    const slice = shown.subarray(offset, Math.min(offset + 16, shown.length));
+    let hex = "";
+    let ascii = "";
+    for (let index = 0; index < 16; index += 1) {
+      if (index < slice.length) {
+        const byte = slice[index];
+        hex += byte.toString(16).padStart(2, "0") + (index === 7 ? "  " : " ");
+        ascii += byte >= 0x20 && byte <= 0x7e ? String.fromCharCode(byte) : ".";
+      } else {
+        hex += index === 7 ? "   " : "   ";
+        ascii += " ";
+      }
+    }
+    rows.push(Object.freeze({
+      offset: offset.toString(16).padStart(8, "0"),
+      hex: hex.trimEnd(),
+      ascii: ascii.trimEnd(),
+    }));
+  }
+  return Object.freeze(rows);
+}
+
+function splitDiffLines(bytes) {
+  const lines = [];
+  let start = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] === 0x0a) {
+      lines.push(Object.freeze({ text: new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(start, index)), noEol: false }));
+      start = index + 1;
+    }
+  }
+  if (start < bytes.length) {
+    lines.push(Object.freeze({ text: new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(start, bytes.length)), noEol: true }));
+  }
+  return lines;
+}
+
+/** The diff comparison key of one line: the missing final newline is a
+ * real difference, so the no-EOL flag participates in the key. */
+function diffLineKey(line) {
+  return `${line.text}\u0000${line.noEol ? "n" : "y"}`;
+}
+
+/**
+ * The one deterministic bounded line-diff owner. Both inputs are
+ * complete raw byte arrays; a non-UTF-8 or NUL-bearing side refuses
+ * with `not_text`, more than 2000 lines per side with
+ * `too_many_lines` and an LCS work table above 250000 cells with
+ * `work_budget` — never a hang and never a partial misleading diff.
+ * Identical inputs short-circuit. The output rows are plain text and
+ * render through `textContent` only.
+ */
+export function computeBoundedLineDiff(leftBytes, rightBytes) {
+  if (!(leftBytes instanceof Uint8Array) || !(rightBytes instanceof Uint8Array)) {
+    throw new UiContractError("invalid_shape");
+  }
+  for (const bytes of [leftBytes, rightBytes]) {
+    for (let index = 0; index < bytes.length; index += 1) {
+      if (bytes[index] === 0) {
+        return Object.freeze({ kind: "refusal", reason: "not_text" });
+      }
+    }
+    if (scanUtf8(bytes).invalidAt !== -1) {
+      return Object.freeze({ kind: "refusal", reason: "not_text" });
+    }
+  }
+  if (leftBytes.length === rightBytes.length) {
+    let identical = true;
+    for (let index = 0; index < leftBytes.length; index += 1) {
+      if (leftBytes[index] !== rightBytes[index]) {
+        identical = false;
+        break;
+      }
+    }
+    if (identical) {
+      return Object.freeze({ kind: "diff", identical: true, rows: Object.freeze([]) });
+    }
+  }
+  const left = splitDiffLines(leftBytes);
+  const right = splitDiffLines(rightBytes);
+  if (left.length > DIFF_MAX_LINES_PER_SIDE || right.length > DIFF_MAX_LINES_PER_SIDE) {
+    return Object.freeze({ kind: "refusal", reason: "too_many_lines" });
+  }
+  const rowsCount = left.length;
+  const columnsCount = right.length;
+  if (rowsCount * columnsCount > DIFF_MAX_WORK_CELLS) {
+    return Object.freeze({ kind: "refusal", reason: "work_budget" });
+  }
+  // the bounded LCS table; the work budget bounds its size
+  const table = new Uint32Array((rowsCount + 1) * (columnsCount + 1));
+  const width = columnsCount + 1;
+  for (let i = rowsCount - 1; i >= 0; i -= 1) {
+    for (let j = columnsCount - 1; j >= 0; j -= 1) {
+      table[i * width + j] = diffLineKey(left[i]) === diffLineKey(right[j])
+        ? table[(i + 1) * width + j + 1] + 1
+        : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
+    }
+  }
+  const rows = [];
+  let i = 0;
+  let j = 0;
+  while (i < rowsCount && j < columnsCount) {
+    if (diffLineKey(left[i]) === diffLineKey(right[j])) {
+      rows.push(Object.freeze({ type: "context", text: left[i].text, noEol: left[i].noEol }));
+      i += 1;
+      j += 1;
+    } else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) {
+      rows.push(Object.freeze({ type: "delete", text: left[i].text, noEol: left[i].noEol }));
+      i += 1;
+    } else {
+      rows.push(Object.freeze({ type: "add", text: right[j].text, noEol: right[j].noEol }));
+      j += 1;
+    }
+  }
+  while (i < rowsCount) {
+    rows.push(Object.freeze({ type: "delete", text: left[i].text, noEol: left[i].noEol }));
+    i += 1;
+  }
+  while (j < columnsCount) {
+    rows.push(Object.freeze({ type: "add", text: right[j].text, noEol: right[j].noEol }));
+    j += 1;
+  }
+  return Object.freeze({ kind: "diff", identical: false, rows: Object.freeze(rows) });
+}
+
+/** The structural equality of two change nodes: kind plus every
+ * metadata field the node kind carries. */
+function sameChangeNode(left, right) {
+  if (left === right) {
+    return true;
+  }
+  if (left === null || right === null || left.kind !== right.kind) {
+    return false;
+  }
+  if (left.kind === "directory") {
+    return left.mode === right.mode;
+  }
+  if (left.kind === "symlink") {
+    return left.target === right.target;
+  }
+  return left.mode === right.mode && left.byte_count === right.byte_count && left.sha256 === right.sha256;
+}
+
+/**
+ * The closed state machine of the inline content review panel. It owns
+ * no fetch and no URL: every desire is handed to the single-flight
+ * content transport. An explicit Review is the only path that starts a
+ * content GET — up to two sequential requests (baseline, then result)
+ * for one selected change entry of the current observation; chunk
+ * continuations and retries stay explicit user actions. The viewer
+ * verifies every response against the selected change entry's metadata
+ * (digest, byte count, node kind, status coherence) and fails closed
+ * with zero rendered bytes on any mismatch. A stale observation
+ * discards the loaded bytes of BOTH sides and offers only the explicit
+ * Project Changes reload. The panel never POSTs, never touches
+ * inspect/events/logs/mutations and never starts a worker.
+ */
+export function createProjectChangeContentViewer(io) {
+  if (
+    !isRecord(io) ||
+    typeof io["transport"] !== "object" ||
+    typeof io["onState"] !== "function"
+  ) {
+    throw new UiContractError("invalid_viewer_io");
+  }
+  const transport = io["transport"];
+  const onState = io["onState"];
+  let state = null;
+
+  const publish = () => {
+    onState(state);
+  };
+
+  const unrequestedSide = () => Object.freeze({
+    phase: "unrequested",
+    byteCount: null,
+    sha256: null,
+    loadedBytes: 0,
+    nextOffset: null,
+    capped: false,
+    data: null,
+    error: null,
+  });
+
+  const failureOf = (result) => {
+    if (result !== undefined && result !== null && typeof result === "object" && result.ok === false) {
+      return result.failure;
+    }
+    const model = result !== undefined && result !== null && typeof result === "object" ? result.model : null;
+    if (model !== null && typeof model === "object" && model.kind === "error") {
+      return Object.freeze({ layer: model.layer, reason: model.reason });
+    }
+    if (model !== null && typeof model === "object" && model.kind === "command_result") {
+      return Object.freeze({ layer: "orchestrator", reason: model.reason ?? "failed" });
+    }
+    return Object.freeze({ layer: "contract", reason: "unexpected_kind" });
+  };
+
+  const bothSides = () => ({ baseline: state.baseline, result: state.result });
+
+  const markStale = () => {
+    transport.invalidate();
+    state = Object.freeze({
+      ...state,
+      baseline: unrequestedSide(),
+      result: unrequestedSide(),
+      requestState: "stale",
+      stale: true,
+      error: null,
+    });
+    publish();
+  };
+
+  /** The coherence of one content response against the selected
+   * change entry's metadata; any mismatch is a contract failure with
+   * zero rendered bytes. */
+  const verifyAgainstEntry = (model, side) => {
+    const node = state.entry[side];
+    if (model.runId !== state.runId || model.observation !== state.observation || model.changeIndex !== state.changeIndex || model.side !== side) {
+      throw new UiContractError("invalid_shape");
+    }
+    if (model.status === "available") {
+      if (node === null || node.kind !== "regular_file" || node.byte_count !== model.byteCount || node.sha256 !== model.sha256) {
+        throw new UiContractError("invalid_shape");
+      }
+      return;
+    }
+    if (model.status === "implicit_empty") {
+      if (node !== null) {
+        throw new UiContractError("invalid_shape");
+      }
+      return;
+    }
+    if (model.status === "metadata_only") {
+      if (node === null || node.kind === "regular_file" || !sameChangeNode(node, model.node)) {
+        throw new UiContractError("invalid_shape");
+      }
+      return;
+    }
+    // unavailable: only the baseline side of a regular-file node whose
+    // metadata still matches the verified entry
+    if (side !== "baseline" || node === null || node.kind !== "regular_file" || !sameChangeNode(node, model.node)) {
+      throw new UiContractError("invalid_shape");
+    }
+  };
+
+  const applySideModel = (model, side) => {
+    const retained = model.status === "available" ? model.data : null;
+    // the loading phase preserves the accumulated prefix bytes; a
+    // continuation appends when the slice continues exactly at the end
+    const previous = offsetLoadsAccumulate(state[side], model) ? state[side].data : null;
+    const merged = retained === null
+      ? null
+      : previous === null || previous.length === 0
+        ? retained
+        : concatBytes(previous, retained);
+    const loadedBytes = merged === null ? 0 : merged.length;
+    const capped = model.status === "available" && model.byteCount > CONTENT_PREVIEW_MAX_BYTES && loadedBytes >= CONTENT_PREVIEW_MAX_BYTES;
+    state = Object.freeze({
+      ...state,
+      requestState: "ready",
+      [side]: Object.freeze({
+        phase: model.status,
+        byteCount: model.status === "available" || model.status === "implicit_empty" ? model.byteCount : null,
+        sha256: model.status === "available" ? model.sha256 : null,
+        loadedBytes,
+        nextOffset: model.status === "available" ? model.nextOffset : null,
+        capped,
+        data: merged,
+        error: null,
+      }),
+    });
+    publish();
+  };
+
+  /** A continuation appends to the retained bytes only when the new
+   * slice continues exactly where the retained prefix ended. */
+  function offsetLoadsAccumulate(sideState, model) {
+    return model.offset === sideState.loadedBytes && sideState.loadedBytes > 0;
+  }
+
+  function concatBytes(left, right) {
+    const merged = new Uint8Array(left.length + right.length);
+    merged.set(left, 0);
+    merged.set(right, left.length);
+    return merged;
+  }
+
+  const applySideFailure = (failure, side) => {
+    state = Object.freeze({
+      ...state,
+      requestState: "ready",
+      [side]: Object.freeze({
+        ...state[side],
+        phase: "error",
+        data: null,
+        error: failure,
+      }),
+    });
+    publish();
+  };
+
+  const settleSide = (result, side, kind, requestedRunId, requestedObservation, requestedChangeIndex, generation) => {
+    if (state === null || generation !== state.generation) {
+      return;
+    }
+    if (state.runId !== requestedRunId || state.observation !== requestedObservation || state.changeIndex !== requestedChangeIndex) {
+      return;
+    }
+    if (result === undefined) {
+      // superseded: a new review or an invalidation already reset the
+      // state; a declined continuation is restored below
+      return;
+    }
+    if (!result.ok) {
+      const failure = failureOf(result);
+      if (failure.reason === "stale_observation") {
+        markStale();
+        return;
+      }
+      applySideFailure(failure, side);
+      return;
+    }
+    const model = result.model;
+    if (model.kind !== "project_change_content") {
+      const failure = failureOf(result);
+      if (failure.reason === "stale_observation") {
+        markStale();
+        return;
+      }
+      applySideFailure(failure, side);
+      return;
+    }
+    try {
+      verifyAgainstEntry(model, side);
+    } catch (error) {
+      applySideFailure(Object.freeze({ layer: "contract", reason: error instanceof UiContractError ? error.reason : "invalid_shape" }), side);
+      return;
+    }
+    applySideModel(model, side);
+  };
+
+  const restoreDeclinedSide = (side, generation, previousPhase) => {
+    if (state === null || generation !== state.generation) {
+      return;
+    }
+    const sideState = state[side];
+    if (sideState.phase !== "loading") {
+      return;
+    }
+    state = Object.freeze({
+      ...state,
+      requestState: "ready",
+      [side]: Object.freeze({ ...sideState, phase: previousPhase }),
+    });
+    publish();
+  };
+
+  const requestSide = (side, kind, generation) => {
+    if (state === null || generation !== state.generation) {
+      return;
+    }
+    const sideState = state[side];
+    if (sideState.phase === "loading" || sideState.capped) {
+      return;
+    }
+    if (sideState.phase !== "unrequested" && sideState.phase !== "error" && !(sideState.phase === "available" && sideState.nextOffset !== null)) {
+      return;
+    }
+    const requestedRunId = state.runId;
+    const requestedObservation = state.observation;
+    const requestedChangeIndex = state.changeIndex;
+    const offset = sideState.phase === "available" && sideState.nextOffset !== null ? sideState.nextOffset : 0;
+    const remaining = Math.max(0, CONTENT_PREVIEW_MAX_BYTES - offset);
+    if (remaining === 0) {
+      return;
+    }
+    const limit = Math.min(CONTENT_PREVIEW_CHUNK_LIMIT, remaining);
+    const previousPhase = sideState.phase;
+    const expected = { runId: requestedRunId, observation: requestedObservation, changeIndex: requestedChangeIndex, side };
+    state = Object.freeze({
+      ...state,
+      requestState: "loading",
+      [side]: Object.freeze({ ...state[side], phase: "loading" }),
+    });
+    publish();
+    const settled = transport.request({
+      runId: requestedRunId,
+      kind,
+      side,
+      expected,
+      path: projectChangeContentRequestPath({ runId: requestedRunId, changeIndex: requestedChangeIndex, side, observation: requestedObservation, offset, limit }),
+      onApplied: (result) => {
+        settleSide(result, side, kind, requestedRunId, requestedObservation, requestedChangeIndex, generation);
+        if (generation === (state === null ? -1 : state.generation) && kind === "initial" && side === "baseline") {
+          const follow = state === null ? null : state.result;
+          if (state !== null && state.requestState !== "stale" && follow !== null && follow.phase === "unrequested") {
+            requestSide("result", "initial", generation);
+          }
+        }
+      },
+    });
+    // a declined continuation (the slot was busy) never calls
+    // onApplied: restore the side instead of leaving it loading
+    void settled.then((result) => {
+      if (result === undefined && kind === "continuation") {
+        restoreDeclinedSide(side, generation, previousPhase);
+      }
+    });
+  };
+
+  return Object.freeze({
+    /** One explicit Review of one selected change entry: resets both
+     * sides, then requests baseline and result sequentially (up to two
+     * GETs for one user action). */
+    review(entry) {
+      if (
+        state === null ||
+        !isRecord(entry) ||
+        !isPositiveSafeIndex(entry["index"]) ||
+        typeof entry["path"] !== "string" ||
+        typeof entry["change"] !== "string" ||
+        state.observation === null
+      ) {
+        throw new UiContractError("invalid_request");
+      }
+      const index = entry["index"];
+      if (index > state.changesCount) {
+        throw new UiContractError("invalid_request");
+      }
+      const baseline = entry["baseline"] === null ? null : expectChangeNode(entry["baseline"]);
+      const result = entry["result"] === null ? null : expectChangeNode(entry["result"]);
+      transport.invalidate();
+      state = Object.freeze({
+        runId: state.runId,
+        observation: state.observation,
+        changesCount: state.changesCount,
+        changeIndex: index,
+        changePath: entry["path"],
+        changeKind: entry["change"],
+        entry: Object.freeze({ baseline, result }),
+        generation: (state.generation ?? 0) + 1,
+        requestState: "loading",
+        stale: false,
+        error: null,
+        baseline: unrequestedSide(),
+        result: unrequestedSide(),
+      });
+      publish();
+      requestSide("baseline", "initial", state.generation);
+    },
+    /** The explicit chunk continuation of one side; declined while the
+     * transport is busy and refused once the preview cap is reached. */
+    loadMoreSide(side) {
+      if (typeof side !== "string" || !CONTENT_SIDE_KEYS.includes(side)) {
+        throw new UiContractError("invalid_request");
+      }
+      if (state === null) {
+        return;
+      }
+      const sideState = state[side];
+      if (sideState.phase !== "available" || sideState.nextOffset === null || sideState.capped) {
+        return;
+      }
+      requestSide(side, "continuation", state.generation);
+    },
+    /** The explicit retry of one failed side; only a transport failure
+     * is recoverable, and only by this click. */
+    retrySide(side) {
+      if (typeof side !== "string" || !CONTENT_SIDE_KEYS.includes(side)) {
+        throw new UiContractError("invalid_request");
+      }
+      if (state === null) {
+        return;
+      }
+      const sideState = state[side];
+      if (sideState.phase !== "error" || sideState.error === null || sideState.error.layer !== "transport") {
+        return;
+      }
+      requestSide(side, "continuation", state.generation);
+    },
+    /** Closes the review: the selection and the loaded secret-bearing
+     * bytes are discarded and the transport is invalidated; a late
+     * response can never apply. */
+    closeReview() {
+      if (state === null) {
+        return;
+      }
+      transport.invalidate();
+      state = Object.freeze({
+        ...state,
+        generation: state.generation + 1,
+        changeIndex: null,
+        changePath: null,
+        changeKind: null,
+        entry: null,
+        requestState: "idle",
+        stale: false,
+        error: null,
+        baseline: unrequestedSide(),
+        result: unrequestedSide(),
+      });
+      publish();
+    },
+    /** The metadata-driven invalidation: a changed run, a changed
+     * observation or a disposed view discards the loaded secret-bearing
+     * bytes and withdraws the wire; nothing is re-fetched. */
+    invalidateMetadata() {
+      if (state === null) {
+        return;
+      }
+      transport.invalidate();
+      state = Object.freeze({
+        ...state,
+        generation: state.generation + 1,
+        changeIndex: null,
+        changePath: null,
+        changeKind: null,
+        entry: null,
+        requestState: "idle",
+        stale: false,
+        error: null,
+        baseline: unrequestedSide(),
+        result: unrequestedSide(),
+      });
+      publish();
+    },
+    transitionToRun(runId) {
+      if (!isSafeId(runId)) {
+        throw new UiContractError("invalid_run_id");
+      }
+      transport.invalidate();
+      state = Object.freeze({
+        runId,
+        observation: null,
+        changesCount: 0,
+        changeIndex: null,
+        changePath: null,
+        changeKind: null,
+        entry: null,
+        generation: state === null ? 1 : state.generation + 1,
+        requestState: "idle",
+        stale: false,
+        error: null,
+        baseline: unrequestedSide(),
+        result: unrequestedSide(),
+      });
+      publish();
+    },
+    /** The changes metadata was applied: the viewer records the run
+     * binding, the observation and the change count it may later review
+     * against. No content GET is ever issued here. */
+    metadataApplied(changesState) {
+      if (
+        state === null ||
+        !isRecord(changesState) ||
+        changesState.runId !== state.runId ||
+        typeof changesState.observation !== "string" ||
+        !HEX64_PATTERN.test(changesState.observation)
+      ) {
+        return;
+      }
+      const changed = state.observation !== changesState.observation;
+      state = Object.freeze({
+        ...state,
+        observation: changesState.observation,
+        changesCount: Array.isArray(changesState.changes) ? changesState.changes.length : state.changesCount,
+      });
+      if (changed) {
+        this.invalidateMetadata();
+        return;
+      }
+      publish();
+    },
+    currentState() {
+      return state;
+    },
+  });
+}
+
 /* Live observation (v3): bounded read-only polling of one selected    */
 /* run; the corrective worker-logs viewer sits before this region and  */
 /* carries no scheduler, timer or mutation capability of its own.      */
@@ -4250,6 +5374,32 @@ const changesTransport = createProjectChangesTransport({
   },
 });
 
+/** The content review transport and viewer (v7): the single-flight
+ * wire of the bounded read-only content preview. No GET exists before
+ * an explicit Review; the viewer owns no timers and never mutates. */
+const contentTransport = createProjectChangeContentTransport({
+  fetchContent: (runId, path, signal, expected) => requestProjectChangeContentJson(fetchImplementation, path, { signal }, expected),
+  onStarted: () => {
+    for (const id of ["content-review-load-baseline", "content-review-load-result", "content-review-retry", "content-review-reload-changes", "content-review-close"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["content-review-load-baseline", "content-review-load-result", "content-review-retry", "content-review-reload-changes", "content-review-close"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+const contentViewer = createProjectChangeContentViewer({
+  transport: contentTransport,
+  onState: (state) => renderContentReview(state),
+});
+
+/** The side a content Retry click re-requests; set by the render
+ * adapter from the viewer state, never persisted anywhere. */
+let contentRetrySide = null;
+
 /** The section of the selected run: created once per selection; a run
  * change discards the previous viewer and invalidates its in-flight
  * changes GET. The automatic one-shot initial load follows the applied
@@ -4268,6 +5418,7 @@ function ensureProjectChangesFor(runId) {
     });
   }
   projectChangesViewer.transitionToRun(runId);
+  contentViewer.transitionToRun(runId);
   document.getElementById("project-changes-section").hidden = false;
   resetProjectChangesDom();
 }
@@ -4281,6 +5432,7 @@ function resetProjectChangesDom() {
   document.getElementById("changes-summary").textContent = "";
   document.getElementById("changes-reload").hidden = true;
   document.getElementById("changes-load-more").hidden = true;
+  document.getElementById("content-review-panel").hidden = true;
 }
 
 /** The read-only metadata text of one baseline/result node; every
@@ -4317,6 +5469,12 @@ function renderProjectChanges(state) {
   if (state === null) {
     return;
   }
+  // the content review is bound to the loaded metadata: a changed run
+  // or observation discards its loaded bytes and withdraws the wire
+  // (the viewer itself never re-fetches anything)
+  if (state.observation !== null) {
+    contentViewer.metadataApplied(state);
+  }
   const meta = document.getElementById("changes-meta");
   const summary = document.getElementById("changes-summary");
   const status = document.getElementById("changes-status");
@@ -4333,6 +5491,16 @@ function renderProjectChanges(state) {
     row.appendChild(element("td", entry.source_relation));
     row.appendChild(element("td", changesNodeText(entry.baseline)));
     row.appendChild(element("td", changesNodeText(entry.result)));
+    const actions = document.createElement("td");
+    const reviewButton = document.createElement("button");
+    reviewButton.type = "button";
+    reviewButton.textContent = "Review content";
+    reviewButton.addEventListener("click", () => {
+      clearMessages();
+      contentViewer.review(entry);
+    });
+    actions.appendChild(reviewButton);
+    row.appendChild(actions);
     body.appendChild(row);
   }
   table.hidden = state.changes.length === 0;
@@ -4360,6 +5528,144 @@ function renderProjectChanges(state) {
   const contractFailed = state.requestState === "error" && state.error !== null && state.error.layer === "contract";
   reload.hidden = contractFailed;
   loadMore.hidden = !(state.requestState === "ready" && state.nextAfter !== null);
+}
+
+const CONTENT_SIDE_PHASE_TEXT = {
+  unrequested: "not requested",
+  loading: "Loading…",
+  implicit_empty: "empty side — no content existed on this side",
+  metadata_only: "metadata only — this side has no file content",
+  unavailable: "baseline bytes can no longer be proven (the registered project no longer matches the baseline)",
+};
+
+/** The read-only status line and bounded view of one side. */
+function contentSideStatus(sideState) {
+  if (sideState.phase === "available") {
+    const total = sideState.byteCount === null ? "?" : String(sideState.byteCount);
+    const preview = sideState.capped || sideState.nextOffset !== null ? "truncated preview" : "full preview";
+    return `available · ${sideState.loadedBytes} of ${total} B retained · sha256 ${sideState.sha256.slice(0, 12)}… · ${preview}`;
+  }
+  if (sideState.phase === "error") {
+    return `failed (${sideState.error.layer}: ${sideState.error.reason})`;
+  }
+  return CONTENT_SIDE_PHASE_TEXT[sideState.phase] ?? sideState.phase;
+}
+
+/** The bounded presentation of one retained side: decoded text through
+ * `textContent`, or the bounded hex view. */
+function renderContentSide(statusId, viewId, sideState) {
+  const status = document.getElementById(statusId);
+  const view = document.getElementById(viewId);
+  status.textContent = contentSideStatus(sideState);
+  if (sideState.phase !== "available" || sideState.data === null) {
+    view.hidden = true;
+    view.textContent = "";
+    return;
+  }
+  const decoded = decodePreviewText(sideState.data, { incompleteTail: sideState.nextOffset !== null });
+  if (decoded.kind === "text") {
+    view.hidden = false;
+    view.textContent = decoded.text;
+    return;
+  }
+  view.hidden = false;
+  const rows = hexPreviewRows(sideState.data, CONTENT_HEX_DISPLAY_BYTES);
+  const lines = rows.map((row) => `${row.offset}  ${row.hex}  |${row.ascii}|`);
+  if (sideState.data.length > CONTENT_HEX_DISPLAY_BYTES) {
+    lines.push(`(hex preview limited to the first ${CONTENT_HEX_DISPLAY_BYTES} bytes of ${sideState.data.length} retained)`);
+  }
+  view.textContent = lines.join("\n");
+}
+
+const DIFF_REFUSAL_TEXT = {
+  not_text: "diff unavailable: at least one side is not UTF-8 text (binary content)",
+  too_many_lines: "diff unavailable: the change exceeds the bounded line limit",
+  work_budget: "diff unavailable: the change exceeds the bounded diff work budget",
+};
+
+/** The thin DOM adapter of the content review viewer: every value
+ * renders through `createElement`/`textContent`, the diff rows are
+ * plain text, and the panel owns no fetch and no mutation. */
+function renderContentReview(state) {
+  if (state === null) {
+    return;
+  }
+  const panel = document.getElementById("content-review-panel");
+  const meta = document.getElementById("content-review-meta");
+  const status = document.getElementById("content-review-status");
+  const diffStatus = document.getElementById("content-diff-status");
+  const diffView = document.getElementById("content-diff-view");
+  const loadBaseline = document.getElementById("content-review-load-baseline");
+  const loadResult = document.getElementById("content-review-load-result");
+  const retry = document.getElementById("content-review-retry");
+  const reloadChanges = document.getElementById("content-review-reload-changes");
+  panel.hidden = state.changeIndex === null;
+  meta.textContent = state.changeIndex === null
+    ? ""
+    : `change ${state.changeIndex} · ${state.changePath} · ${state.changeKind} · observation ${state.observation.slice(0, 12)}…`;
+  let statusText = "";
+  if (state.requestState === "loading") {
+    statusText = "Loading…";
+  } else if (state.requestState === "stale") {
+    statusText = "Stale. The run workspace or registered project changed after this review was created. Reload the Project Changes.";
+  }
+  status.textContent = statusText;
+  renderContentSide("content-baseline-status", "content-baseline-view", state.baseline);
+  renderContentSide("content-result-status", "content-result-view", state.result);
+  // the bounded diff: only two fully loaded, uncapped UTF-8 sides
+  const diffable = (side) => side.phase === "available" && side.nextOffset === null && !side.capped && side.data !== null;
+  const emptyable = (side) => side.phase === "implicit_empty";
+  const leftOk = diffable(state.baseline) || emptyable(state.baseline);
+  const rightOk = diffable(state.result) || emptyable(state.result);
+  let diffText = "";
+  let diffRows = null;
+  if (state.changeIndex === null || state.requestState === "stale") {
+    diffStatus.textContent = "";
+  } else if (!leftOk || !rightOk) {
+    diffStatus.textContent = "diff unavailable: both sides must be loaded text or an explicit empty side";
+  } else {
+    const left = state.baseline.phase === "implicit_empty" ? new Uint8Array(0) : state.baseline.data;
+    const right = state.result.phase === "implicit_empty" ? new Uint8Array(0) : state.result.data;
+    const leftDecoded = decodePreviewText(left, { incompleteTail: false });
+    const rightDecoded = decodePreviewText(right, { incompleteTail: false });
+    if (leftDecoded.kind !== "text" || rightDecoded.kind !== "text") {
+      diffStatus.textContent = DIFF_REFUSAL_TEXT.not_text;
+    } else {
+      const diff = computeBoundedLineDiff(left, right);
+      if (diff.kind === "refusal") {
+        diffStatus.textContent = DIFF_REFUSAL_TEXT[diff.reason] ?? "diff unavailable";
+      } else if (diff.identical) {
+        diffStatus.textContent = state.changeKind === "mode_modified"
+          ? "Content identical; metadata changed."
+          : "No textual differences.";
+      } else {
+        diffStatus.textContent = "";
+        diffRows = diff.rows;
+      }
+    }
+  }
+  diffView.hidden = diffRows === null;
+  if (diffRows !== null) {
+    const lines = diffRows.map((row) => {
+      const prefix = row.type === "add" ? "+ " : row.type === "delete" ? "- " : "  ";
+      const line = prefix + row.text;
+      return row.noEol ? `${line}\n\\ No newline at end of file` : line;
+    });
+    diffView.textContent = lines.join("\n");
+  } else {
+    diffView.textContent = "";
+  }
+  const busy = state.requestState === "loading";
+  loadBaseline.hidden = !(state.baseline.phase === "available" && state.baseline.nextOffset !== null && !state.baseline.capped);
+  loadResult.hidden = !(state.result.phase === "available" && state.result.nextOffset !== null && !state.result.capped);
+  const retryableSide = state.baseline.phase === "error" && state.baseline.error !== null && state.baseline.error.layer === "transport"
+    ? "baseline"
+    : state.result.phase === "error" && state.result.error !== null && state.result.error.layer === "transport"
+      ? "result"
+      : null;
+  retry.hidden = retryableSide === null;
+  contentRetrySide = retryableSide;
+  reloadChanges.hidden = !state.stale;
 }
 
 function resetWorkerLogsDom() {
@@ -4587,6 +5893,30 @@ function boot() {
     clearMessages();
     if (projectChangesViewer !== null) {
       projectChangesViewer.loadMore();
+    }
+  });
+  document.getElementById("content-review-close").addEventListener("click", () => {
+    clearMessages();
+    contentViewer.closeReview();
+  });
+  document.getElementById("content-review-load-baseline").addEventListener("click", () => {
+    clearMessages();
+    contentViewer.loadMoreSide("baseline");
+  });
+  document.getElementById("content-review-load-result").addEventListener("click", () => {
+    clearMessages();
+    contentViewer.loadMoreSide("result");
+  });
+  document.getElementById("content-review-retry").addEventListener("click", () => {
+    clearMessages();
+    if (contentRetrySide !== null) {
+      contentViewer.retrySide(contentRetrySide);
+    }
+  });
+  document.getElementById("content-review-reload-changes").addEventListener("click", () => {
+    clearMessages();
+    if (projectChangesViewer !== null) {
+      projectChangesViewer.reload();
     }
   });
   clearMessages();

@@ -741,7 +741,8 @@ describe("the logs layer source restrictions", () => {
     // the logs subsystem references no mutation/action classifier and no
     // allowlist of run boundaries
     const logsStart = appSource.indexOf("Worker logs (v5)");
-    const logsEnd = appSource.indexOf("one live-observation scheduling owner");
+    // the logs owner ends where the v7 content preview region begins
+    const logsEnd = appSource.indexOf("Project change content (v7)");
     const region = appSource.slice(logsStart, logsEnd);
     for (const banned of ["buildRunActionModel", "RESERVED_WAIT_ACTIONS", "buildMutationRequest", "runMutationFlow", "createMutationGate"]) {
       expect(region.includes(banned)).toBe(false);
@@ -758,7 +759,8 @@ describe("the logs layer source restrictions", () => {
     // decoder owner (the bounded response reader elsewhere in the module
     // owns its own unrelated decoder)
     const logsStart = appSource.indexOf("Worker logs (v5)");
-    const logsEnd = appSource.indexOf("one live-observation scheduling owner");
+    // the logs owner ends where the v7 content preview region begins
+    const logsEnd = appSource.indexOf("Project change content (v7)");
     const logsRegion = appSource.slice(logsStart, logsEnd);
     expect(logsRegion.split("new TextDecoder(").length - 1).toBe(2);
     const decoderStart = logsRegion.indexOf("export function createLogChunkDecoder(");
@@ -784,7 +786,8 @@ describe("the logs layer source restrictions", () => {
     // kind appears in the logs region (the v3 inspect scheduler lives
     // outside it and is the module's only timer owner)
     const logsStart = appSource.indexOf("Worker logs (v5)");
-    const logsEnd = appSource.indexOf("one live-observation scheduling owner");
+    // the logs owner ends where the v7 content preview region begins
+    const logsEnd = appSource.indexOf("Project change content (v7)");
     const logsRegion = appSource.slice(logsStart, logsEnd);
     expect(logsRegion.includes("setTimeout")).toBe(false);
     expect(logsRegion.includes("setInterval")).toBe(false);

@@ -239,6 +239,20 @@ const UI_ELEMENT_IDS = [
   "changes-empty",
   "changes-reload",
   "changes-load-more",
+  "content-review-panel",
+  "content-review-meta",
+  "content-review-status",
+  "content-baseline-status",
+  "content-baseline-view",
+  "content-result-status",
+  "content-result-view",
+  "content-diff-status",
+  "content-diff-view",
+  "content-review-load-baseline",
+  "content-review-load-result",
+  "content-review-retry",
+  "content-review-reload-changes",
+  "content-review-close",
 ] as const;
 
 export interface UiHarnessOptions {

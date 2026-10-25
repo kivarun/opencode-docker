@@ -65,7 +65,7 @@
       <table id="changes-table" hidden>
         <caption>Run workspace changes relative to the durable project baseline</caption>
         <thead>
-          <tr><th scope="col">Path</th><th scope="col">Change</th><th scope="col">Source relation</th><th scope="col">Baseline</th><th scope="col">Result</th></tr>
+          <tr><th scope="col">Path</th><th scope="col">Change</th><th scope="col">Source relation</th><th scope="col">Baseline</th><th scope="col">Result</th><th scope="col">Actions</th></tr>
         </thead>
         <tbody id="changes-body"></tbody>
       </table>
@@ -73,6 +73,28 @@
       <div class="events-actions">
         <button type="button" id="changes-reload" hidden>Reload changes</button>
         <button type="button" id="changes-load-more" hidden>Load more</button>
+      </div>
+      <div id="content-review-panel" hidden>
+        <h4 id="content-review-heading">Content review</h4>
+        <p class="logs-note">Read-only bounded preview of one change. Content may contain secrets and is not redacted. The registered project is not modified.</p>
+        <p id="content-review-meta" class="logs-meta"></p>
+        <p id="content-review-status" class="events-live" aria-live="polite"></p>
+        <h5>Baseline</h5>
+        <p id="content-baseline-status" class="logs-meta"></p>
+        <pre id="content-baseline-view" class="content-view" hidden></pre>
+        <h5>Result</h5>
+        <p id="content-result-status" class="logs-meta"></p>
+        <pre id="content-result-view" class="content-view" hidden></pre>
+        <h5 id="content-diff-heading">Diff</h5>
+        <p id="content-diff-status" class="logs-meta"></p>
+        <pre id="content-diff-view" class="content-view" hidden></pre>
+        <div class="events-actions">
+          <button type="button" id="content-review-load-baseline" hidden>Load more baseline</button>
+          <button type="button" id="content-review-load-result" hidden>Load more result</button>
+          <button type="button" id="content-review-retry" hidden>Retry</button>
+          <button type="button" id="content-review-reload-changes" hidden>Reload Project Changes</button>
+          <button type="button" id="content-review-close">Close</button>
+        </div>
       </div>
     </div>
     <div id="worker-logs-section" hidden>

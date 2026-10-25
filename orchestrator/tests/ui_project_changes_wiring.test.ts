@@ -218,8 +218,8 @@ describe("ui project changes wiring: the automatic request matrix", () => {
       expect(harness.changesMeta()).toContain("pending");
       expect(harness.changesMeta()).toContain("loaded 2 of 2");
       expect(harness.changesRows()).toEqual([
-        "dogfood.txt|added|matches_baseline||file · mode 0644 · 8 B · sha256 " + "c".repeat(64),
-        "README.md|content_modified|matches_baseline|file · mode 0644 · 20 B · sha256 " + "d".repeat(64) + "|file · mode 0644 · 34 B · sha256 " + "e".repeat(64),
+        "dogfood.txt|added|matches_baseline||file · mode 0644 · 8 B · sha256 " + "c".repeat(64) + "|",
+        "README.md|content_modified|matches_baseline|file · mode 0644 · 20 B · sha256 " + "d".repeat(64) + "|file · mode 0644 · 34 B · sha256 " + "e".repeat(64) + "|",
       ]);
       expect(harness.changesSummary()).toContain("total 2");
       expect(harness.changesStatus()).toBe("");
@@ -637,9 +637,9 @@ describe("ui project changes wiring: isolation and safe render", () => {
       await wait();
       await harness.clickRunInspect(0);
       await wait();
-      expect(harness.changesRows()[0]).toBe("<img src=x onerror=alert(1)>|added|matches_baseline||symlink → <script>alert(2)</script>");
+      expect(harness.changesRows()[0]).toBe("<img src=x onerror=alert(1)>|added|matches_baseline||symlink → <script>alert(2)</script>|");
       // no markup node was ever created: the row cell count stays exact
-      expect(harness.element("changes-body").children[0]?.children.length).toBe(5);
+      expect(harness.element("changes-body").children[0]?.children.length).toBe(6);
     } finally {
       harness.dispose();
     }

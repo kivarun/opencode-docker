@@ -14,7 +14,7 @@
  *
  * usage: bun control_plane_project_changes_daemon.ts <socket-path> [dev-entry-delay-ms]
  */
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const socketPath = process.argv[2] ?? "";
@@ -118,6 +118,20 @@ async function executeWorker(operation: OperationRecord, workspace: string, moun
       operation.state = "failed";
       operation.log += "WORKER-FAILED injected failure\n";
       return;
+    }
+    if (mode === "CONTENT") {
+      // the browser UI v7 content-review scenario: one modified text
+      // file, one deleted file, one binary file, one retargeted
+      // symlink, one directory mode change and one large file
+      writeFileSync(join(projectRoot, "text.txt"), "TEXT-CHANGED\n", { mode: 0o644 });
+      rmSync(join(projectRoot, "old.txt"), { force: true });
+      writeFileSync(join(projectRoot, "bin.dat"), Buffer.from([66, 73, 78, 0, 255, 0, 10]), { mode: 0o644 });
+      rmSync(join(projectRoot, "link"), { force: true });
+      symlinkSync("target2", join(projectRoot, "link"));
+      chmodSync(join(projectRoot, "moded.txt"), 0o700);
+      mkdirSync(join(projectRoot, "newdir"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(projectRoot, "big.txt"), `${"M".repeat(99)}\n`.repeat(1024), { mode: 0o644 });
+      writeFileSync(join(projectRoot, "blob.bin"), Buffer.from([1, 2, 0, 255, 3, 0, 10]), { mode: 0o644 });
     }
   } else if (stateId === "review_entry") {
     mkdirSync(projectRoot, { recursive: true });

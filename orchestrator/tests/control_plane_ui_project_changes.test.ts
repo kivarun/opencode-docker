@@ -327,9 +327,9 @@ describe("control-plane UI project changes: the read-only panel over the real st
         expect(harness.changesMeta()).toContain("loaded 3 of 3");
         const rows = harness.changesRows();
         expect(rows.length).toBe(3);
-        expect(rows[0]).toMatch(/^README\.md\|content_modified\|matches_baseline\|file \u00b7 mode 0644 \u00b7 7 B \u00b7 sha256 [0-9a-f]{64}\|file \u00b7 mode 0644 \u00b7 15 B \u00b7 sha256 [0-9a-f]{64}$/);
-        expect(rows[1]).toMatch(/^dev-notes\.txt\|added\|matches_baseline\|\|file \u00b7 mode 0644 \u00b7 10 B \u00b7 sha256 [0-9a-f]{64}$/);
-        expect(rows[2]).toMatch(/^report-copy\.txt\|added\|matches_baseline\|\|file \u00b7 mode 0644 \u00b7 12 B \u00b7 sha256 [0-9a-f]{64}$/);
+        expect(rows[0]).toMatch(/^README\.md\|content_modified\|matches_baseline\|file \u00b7 mode 0644 \u00b7 7 B \u00b7 sha256 [0-9a-f]{64}\|file \u00b7 mode 0644 \u00b7 15 B \u00b7 sha256 [0-9a-f]{64}\|$/);
+        expect(rows[1]).toMatch(/^dev-notes\.txt\|added\|matches_baseline\|\|file \u00b7 mode 0644 \u00b7 10 B \u00b7 sha256 [0-9a-f]{64}\|$/);
+        expect(rows[2]).toMatch(/^report-copy\.txt\|added\|matches_baseline\|\|file \u00b7 mode 0644 \u00b7 12 B \u00b7 sha256 [0-9a-f]{64}\|$/);
         expect(harness.changesSummary()).toContain("total 3");
         expect(harness.changesSummary()).toContain("added 2");
         expect(harness.changesSummary()).toContain("content 1");

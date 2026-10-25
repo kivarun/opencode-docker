@@ -572,9 +572,10 @@ describe("ui v3: source restrictions of the live observation", () => {
     // module wiring, one abort-controller site, one fetch start
     expect(appSource.split("export function createInspectTransport(").length - 1).toBe(1);
     expect(appSource.split("createInspectTransport({").length - 1).toBe(1);
-    // four abort-controller sites: the inspect, events, logs and
-    // project-changes transports each own their request's abort controller
-    expect(appSource.split("new AbortController(").length - 1).toBe(4);
+    // five abort-controller sites: the inspect, events, logs,
+    // project-changes and project-change-content transports each own
+    // their request's abort controller
+    expect(appSource.split("new AbortController(").length - 1).toBe(5);
     expect(appSource.split("await fetchInspect(").length - 1).toBe(1);
     expect(appSource.split("fetchInspect:").length - 1).toBe(1);
     // the inspect GET path is constructed only for the transport and the

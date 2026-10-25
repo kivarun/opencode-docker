@@ -237,3 +237,15 @@ button:disabled {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.content-view {
+  max-height: 24rem;
+  overflow: auto;
+  white-space: pre;
+  font-family: monospace;
+  font-size: 0.8rem;
+  background: var(--surface-muted, #f6f6f6);
+  border: 1px solid var(--border, #ccc);
+  border-radius: 4px;
+  padding: 0.5rem;
+}
