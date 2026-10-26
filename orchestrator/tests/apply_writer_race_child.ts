@@ -10,7 +10,7 @@ import { applyPreparedPipelineV2Project } from "../src/pipeline_v2_project_apply
 import { defaultPipelineStateIo, type PipelineStateIo, type StateFileHandle } from "../src/run_snapshot_store.ts";
 import { isApplyCrashFault } from "../src/pipeline_v2_apply_crash_internal.ts";
 
-const [, , mode, applyStoreRoot, applyId, projectRoot] = process.argv as [string, string, string, string, string, string];
+const [, , mode, applyStoreRoot, applyId, projectRoot, projectIdArg] = process.argv as [string, string, string, string, string, string, string?];
 
 function readStdinLine(): Promise<string> {
   return new Promise((resolve) => {
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
     process.stdout.write("RELEASED\n");
     return;
   }
-  const options = { applyStoreRoot, applyId, projectId: "proj1", projectRoot };
+  const options = { applyStoreRoot, applyId, projectId: projectIdArg ?? "proj1", projectRoot };
   if (mode === "execute-gated") {
     const { applyPreparedProjectCore } = await import("../src/pipeline_v2_project_apply_writer_internal.ts");
     const { realApplyFdOps } = await import("../src/pipeline_v2_apply_fd_internal.ts");
