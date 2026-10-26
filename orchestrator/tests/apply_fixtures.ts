@@ -13,6 +13,9 @@ import { realImmutableDocumentIo, type ImmutableDocumentIo } from "../src/pipeli
 import { defaultPipelineStateIo, type PipelineStateIo } from "../src/pipeline_state_store.ts";
 import { realProjectFileStreamIo, type ProjectFileStreamIo } from "../src/pipeline_v2_project_stream_internal.ts";
 import { realMetadataProbeIo, type MetadataProbeIo } from "../src/pipeline_v2_apply_metadata_probe_internal.ts";
+import { dlopen, FFIType } from "bun:ffi";
+import { realApplyFdOps, type ApplyFdOps } from "../src/pipeline_v2_apply_fd_internal.ts";
+import { applyCrashFault } from "../src/pipeline_v2_apply_crash_internal.ts";
 
 /**
  * Shared fixtures for the durable Project Apply preparation suites: a
@@ -428,10 +431,13 @@ export function faultDocIo(): FaultDocIo {
 export interface FaultStreamIo {
   readonly io: ProjectFileStreamIo;
   failOnceOpen: (nth?: number) => void;
+  /** Fault the `nth` read call of any opened stream as a crash. */
+  failReadCrashOnce: (nth?: number) => void;
 }
 
 export function faultStreamIo(): FaultStreamIo {
   let armedNth: number | null = null;
+  let armedReadNth: number | null = null;
   let opens = 0;
   const io: ProjectFileStreamIo = {
     openNoFollow: async (path: string) => {
@@ -440,10 +446,35 @@ export function faultStreamIo(): FaultStreamIo {
         armedNth = null;
         throw Object.assign(new Error("injected stream open failure"), { code: "EACCES" });
       }
-      return await realProjectFileStreamIo.openNoFollow(path);
+      const handle = await realProjectFileStreamIo.openNoFollow(path);
+      if (armedReadNth === null) {
+        return handle;
+      }
+      const readTarget = armedReadNth;
+      let reads = 0;
+      return {
+        fstat: () => handle.fstat(),
+        read: async (chunk, offset, length, position) => {
+          reads += 1;
+          if (reads >= readTarget) {
+            armedReadNth = null;
+            throw applyCrashFault("injected stream read crash");
+          }
+          return await handle.read(chunk, offset, length, position);
+        },
+        close: () => handle.close(),
+      };
     },
   };
-  return { io, failOnceOpen: (nth = 1) => { armedNth = nth; } };
+  return {
+    io,
+    failOnceOpen: (nth = 1) => {
+      armedNth = nth;
+    },
+    failReadCrashOnce: (nth = 1) => {
+      armedReadNth = nth;
+    },
+  };
 }
 
 export interface FaultStateIo {
@@ -570,5 +601,121 @@ export function faultProbeIo(): FaultProbeIo {
   };
 }
 
-export { realImmutableDocumentIo, defaultPipelineStateIo, realProjectFileStreamIo, realMetadataProbeIo as realProbe };
+export interface FaultFdOps {
+  readonly ops: ApplyFdOps;
+  /** Fault the `nth` occurrence (1-based) of one operation as a crash. */
+  failCrashOnce: (op: FdFaultOp, nth?: number, match?: (args: unknown[]) => boolean) => void;
+  /** Fault the `nth` occurrence of one operation as a graceful errno. */
+  failErrnoOnce: (op: FdFaultOp, nth?: number) => void;
+  /** Overrides one operation entirely (deterministic seams). */
+  override: (op: FdFaultOp, fn: ((...args: unknown[]) => unknown) | null) => void;
+  /** The recorded operation sequence of the wrapped adapter. */
+  readonly log: string[];
+  readonly counts: ReadonlyMap<string, number>;
+}
+
+export type FdFaultOp =
+  | "openat"
+  | "mkdirat"
+  | "unlinkat"
+  | "symlinkat"
+  | "renameat2"
+  | "renameat"
+  | "readlinkat"
+  | "flistxattr"
+  | "fstatvfs"
+  | "faccessat"
+  | "getdents64"
+  | "fstat"
+  | "readFd"
+  | "writeFd"
+  | "fchmod"
+  | "fsyncFd"
+  | "closeFd";
+
+/** One-shot crash/errno fault injection over the real fd adapter. */
+export function faultFdOps(): FaultFdOps {
+  const crashArmed = new Map<string, { nth: number; match?: (args: unknown[]) => boolean }>();
+  const errnoArmed = new Map<string, number>();
+  const overrides = new Map<string, (...args: unknown[]) => unknown>();
+  const log: string[] = [];
+  const counts = new Map<string, number>();
+  const maybeFault = (op: string, args: unknown[]): boolean => {
+    log.push(op);
+    counts.set(op, (counts.get(op) ?? 0) + 1);
+    const crashSpec = crashArmed.get(op);
+    if (crashSpec !== undefined && (counts.get(op) ?? 0) >= crashSpec.nth && (crashSpec.match === undefined || crashSpec.match(args) === true)) {
+      crashArmed.delete(op);
+      throw applyCrashFault(`injected crash fault at ${op}`);
+    }
+    if (errnoArmed.has(op) && (counts.get(op) ?? 0) >= (errnoArmed.get(op) ?? 0)) {
+      errnoArmed.delete(op);
+      const cause = new Error(`injected errno fault at ${op}`);
+      (cause as unknown as { code: string }).code = "APPLY_INJECTED_ERRNO";
+      throw cause;
+    }
+    return false;
+  };
+  const wrap = <A extends unknown[], R>(op: FdFaultOp, real: (...args: A) => R) => (...args: A): R => {
+    maybeFault(op, args);
+    const override = overrides.get(op);
+    if (override !== undefined) {
+      return override(...args) as R;
+    }
+    return real(...args);
+  };
+  const ops_: ApplyFdOps = {
+    openat: wrap("openat", (dirfd, name, flags, mode) => realApplyFdOps.openat(dirfd, name, flags, mode)),
+    mkdirat: wrap("mkdirat", (dirfd, name, mode) => realApplyFdOps.mkdirat(dirfd, name, mode)),
+    unlinkat: wrap("unlinkat", (dirfd, name, flags) => realApplyFdOps.unlinkat(dirfd, name, flags)),
+    symlinkat: wrap("symlinkat", (target, dirfd, name) => realApplyFdOps.symlinkat(target, dirfd, name)),
+    renameat2: wrap("renameat2", (a, b, c, d, e) => realApplyFdOps.renameat2(a, b, c, d, e)),
+    renameat: wrap("renameat", (a, b, c, d) => realApplyFdOps.renameat(a, b, c, d)),
+    readlinkat: wrap("readlinkat", (a, b, c, d) => realApplyFdOps.readlinkat(a, b, c, d)),
+    flistxattr: wrap("flistxattr", (a, b, c) => realApplyFdOps.flistxattr(a, b, c)),
+    fstatvfs: wrap("fstatvfs", (a, b) => realApplyFdOps.fstatvfs(a, b)),
+    faccessat: wrap("faccessat", (a, b, c, d) => realApplyFdOps.faccessat(a, b, c, d)),
+    getdents64: wrap("getdents64", (a, b, c) => realApplyFdOps.getdents64(a, b, c)),
+    fstat: wrap("fstat", (fd) => realApplyFdOps.fstat(fd)),
+    readFd: wrap("readFd", (a, b, c, d, e) => realApplyFdOps.readFd(a, b, c, d, e)),
+    writeFd: wrap("writeFd", (a, b, c, d, e) => realApplyFdOps.writeFd(a, b, c, d, e)),
+    fchmod: wrap("fchmod", (a, b) => realApplyFdOps.fchmod(a, b)),
+    fsyncFd: wrap("fsyncFd", (fd) => realApplyFdOps.fsyncFd(fd)),
+    closeFd: wrap("closeFd", (fd) => realApplyFdOps.closeFd(fd)),
+    errno: () => realApplyFdOps.errno(),
+  };
+  return {
+    ops: ops_,
+    failCrashOnce: (op, nth = 1, match) => {
+      crashArmed.set(op, { nth, match });
+    },
+    failErrnoOnce: (op, nth = 1) => {
+      errnoArmed.set(op, nth);
+    },
+    override: (op, fn) => {
+      if (fn === null) {
+        overrides.delete(op);
+      } else {
+        overrides.set(op, fn);
+      }
+    },
+    log,
+    counts,
+  };
+}
+
+/** Sets the calling thread's libc errno (test determinism for faulted syscalls). */
+export function setLibcErrno(value: number): void {
+  const lib = dlopen("libc.so.6", {
+    __errno_location: { args: [], returns: FFIType.ptr },
+    memcpy: { args: [FFIType.ptr, FFIType.ptr, FFIType.u64], returns: FFIType.ptr },
+  });
+  const symbols = lib.symbols as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const location = symbols["__errno_location"]!();
+  const buffer = new Uint8Array(8);
+  new DataView(buffer.buffer).setInt32(0, value, true);
+  symbols["memcpy"]!(location, buffer, 4);
+}
+
+export { applyCrashFault, realApplyFdOps, realImmutableDocumentIo, defaultPipelineStateIo, realProjectFileStreamIo, realMetadataProbeIo as realProbe };
 export { chmod, cp, mkdir, rm, symlink, writeFile };

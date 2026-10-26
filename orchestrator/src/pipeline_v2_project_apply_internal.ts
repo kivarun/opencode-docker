@@ -106,6 +106,7 @@ export const PIPELINE_V2_PROJECT_APPLY_FAILURE_REASONS = [
   "unsupported_project_entry",
   "identity_conflict",
   "preparation_busy",
+  "apply_not_prepared",
   "project_unstable",
   "workspace_unstable",
   "state_persist_failed",
@@ -181,6 +182,11 @@ export interface PipelineV2ProjectApplyOperationProjection {
   readonly plan_digest: string | null;
   readonly sealed_payload_count: number;
   readonly failure_reason: string | null;
+  /** The durable execution progress (schema v2); null before the writer ran. */
+  readonly execution: {
+    readonly completed_step_count: number;
+    readonly active_step: { readonly step_index: number } | null;
+  } | null;
 }
 
 function applyFailure(reason: PipelineV2ProjectApplyFailureReason, message: string): PipelineV2ProjectApplyError {
@@ -277,8 +283,10 @@ async function computeProjectRootBinding(
   return rootBindingDigest(projectRoot, info.dev, info.ino);
 }
 
-function identityOf(state: PipelineV2ApplyOperationState): {
-  applyId: string;
+/** The journal statuses a preparation retry may still operate on. */
+const EXECUTABLE_FOR_PREPARATION = new Set(["preparing", "failed", "prepared"]);
+
+function identityOf(state: PipelineV2ApplyOperationState): {  applyId: string;
   runId: string;
   projectId: string;
   observation: string;
@@ -311,7 +319,7 @@ function identityMatches(
   );
 }
 
-interface OperationStore {
+export interface OperationStore {
   load(): Promise<PipelineV2ApplyOperationState | null>;
   create(snapshot: PipelineV2ApplyOperationState): Promise<void>;
   commit(snapshot: PipelineV2ApplyOperationState, expectedRevision: number): Promise<void>;
@@ -459,6 +467,12 @@ async function preparePipelineV2ProjectApplyWithComponents(
   if (existing !== null && !identityMatches(existing, applyId, runId, projectId, observation, rootBinding)) {
     throw applyFailure("identity_conflict", "the operation identity does not match the stored operation");
   }
+  if (existing !== null && !EXECUTABLE_FOR_PREPARATION.has(existing.status)) {
+    // The filesystem writer owns every post-preparation status; a
+    // preparation retry over an executing or finished operation is a
+    // typed refusal, never a reinterpretation of the journal.
+    throw applyFailure("apply_not_prepared", "the operation has already left the preparation phase");
+  }
 
   // 3. The durable run through the shared read-only load chain.
   const read = await loadDurablePipelineV2Run({ runId, stateRoot });
@@ -511,7 +525,7 @@ async function preparePipelineV2ProjectApplyWithComponents(
   let current = existing;
   if (current === null) {
     const initial: PipelineV2ApplyOperationState = validateApplyOperationState({
-      schema_version: 1,
+      schema_version: 2,
       kind: "pipeline_v2_project_apply_operation",
       revision: 1,
       apply_id: applyId,
@@ -527,6 +541,7 @@ async function preparePipelineV2ProjectApplyWithComponents(
       sealed_payload_count: 0,
       status: "preparing",
       failure_reason: null,
+      execution: null,
     });
     try {
       await store.create(initial);
@@ -849,7 +864,7 @@ async function loadPreparedPackageWithComponents(
  * created, repaired or removed; the run workspace is never needed.
  */
 async function verifyPreparedPackageContentsWithComponents(
-  components: PipelineV2ProjectApplyComponents,
+  components: { readonly docIo: ImmutableDocumentIo },
   applyStoreRoot: string,
   applyId: string,
   state: PipelineV2ApplyOperationState,
@@ -1012,6 +1027,13 @@ async function inspectOperationWithComponents(
     plan_digest: state.plan_digest,
     sealed_payload_count: state.sealed_payload_count,
     failure_reason: state.failure_reason,
+    execution:
+      state.execution === null
+        ? null
+        : deepFreezeValue({
+            completed_step_count: state.execution.completed_step_count,
+            active_step: state.execution.active_step === null ? null : deepFreezeValue({ step_index: state.execution.active_step.step_index }),
+          }),
   });
 }
 
@@ -1020,4 +1042,57 @@ export {
   loadPreparedPackageWithComponents as loadPreparedPackageCore,
   inspectOperationWithComponents as inspectOperationCore,
   applyStoreStatePath,
+};
+
+/** The statuses whose stored result the execution facade returns verbatim. */
+const EXECUTION_TERMINAL_STATUSES = new Set(["applied", "conflict", "failed"]);
+
+export interface LoadedApplyOperationForExecution {
+  readonly state: PipelineV2ApplyOperationState;
+  /** The verified package; null exactly for the terminal-result statuses. */
+  readonly pkg: PreparedPipelineV2ProjectApplyPackage | null;
+}
+
+/**
+ * Loads one operation for the filesystem writer: the journal state of any
+ * status, plus the fully verified package exactly when the operation is
+ * still executable (`prepared`/`applying`). Terminal-result statuses
+ * return without touching payload artifacts; every executable status gets
+ * the full package verification (plan, payloads, layout, modes).
+ */
+async function loadApplyOperationForExecutionCore(
+  components: { readonly docIo: ImmutableDocumentIo; readonly stateIo: PipelineStateIo },
+  applyStoreRoot: string,
+  applyId: string,
+): Promise<LoadedApplyOperationForExecution> {
+  const { docIo, stateIo } = components;
+  await requireCanonicalStoreRoot(docIo, applyStoreRoot);
+  if (!isPipelineV2SafeId(applyId)) {
+    throw applyFailure("invalid_options", "the apply id must be a safe id");
+  }
+  const store = openOperationStore(applyStoreRoot, applyId, stateIo);
+  await requireStoredStateShape(docIo, applyStoreStatePath(applyStoreRoot, applyId));
+  const state = await store.load().catch((cause: unknown) => {
+    if (cause instanceof Error && cause.name === "PipelineV2ApplyStateError") {
+      throw applyFailure("artifact_modified", "the stored operation state is not a valid operation state");
+    }
+    throw applyFailure("state_persist_failed", "the stored operation state could not be read");
+  });
+  if (state === null) {
+    throw applyFailure("artifact_missing", "the operation does not exist");
+  }
+  if (EXECUTION_TERMINAL_STATUSES.has(state.status)) {
+    return { state, pkg: null };
+  }
+  if (state.status !== "prepared" && state.status !== "applying" && state.status !== "recovery_required") {
+    throw applyFailure("apply_not_prepared", "the operation is not in an executable state");
+  }
+  return { state, pkg: await verifyPreparedPackageContentsWithComponents(components, applyStoreRoot, applyId, state) };
+}
+
+export {
+  loadApplyOperationForExecutionCore as loadApplyOperationForExecution,
+  commitOperationState as commitApplyOperationState,
+  openOperationStore as openApplyOperationStore,
+  rootBindingDigest as computeApplyRootBindingDigest,
 };

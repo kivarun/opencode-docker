@@ -561,6 +561,7 @@ describe("apply zero-write and ownership", () => {
       "unsupported_project_entry",
       "identity_conflict",
       "preparation_busy",
+      "apply_not_prepared",
       "project_unstable",
       "workspace_unstable",
       "state_persist_failed",

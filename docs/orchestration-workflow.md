@@ -6962,3 +6962,71 @@ cycles within the transition budget) through the graph engine, one child
 Session per activation, per-activation result identity, and run state schema
 version 2. Generalization to content-based branching, arbitrary JSON
 Schemas, retries, and resume has not started.
+
+## Project Apply filesystem writer
+
+The prepared apply package (see "Durable Project Apply preparation") is
+executed by a dedicated filesystem writer layer. It turns a reviewed,
+finalized run into changes of the registered operator project — and only
+that: the run workspace, durable run state, sessions and endpoints are
+never touched by the writer.
+
+- **Authority and ownership.** The entry point is
+  `applyPreparedPipelineV2Project({applyStoreRoot, applyId, projectId,
+  projectRoot})` over the public apply facade. The whole execution runs
+  against the verified plan and the sealed payloads alone; the run
+  workspace is never read. The canonical project root is re-resolved and
+  re-verified against the opaque root-binding digest of the prepared
+  package before any effect.
+- **Serialization.** One kernel advisory lock (`flock(LOCK_EX)` on the
+  project root's directory descriptor) serializes all applying callers
+  per project across processes. The lock leaves zero artifacts, is
+  released by the kernel when the owner dies, and its descriptor doubles
+  as the writer's root directory fd: every mutation is fd-relative
+  (`openat`/`mkdirat`/`unlinkat`/`symlinkat`/`renameat2` family), so no
+  absolute target path ever reaches a mutation primitive and a symlinked
+  ancestor can never redirect a write.
+- **Order of one attempt.** Load and verify the whole package (a tampered
+  plan or payload refuses before any effect), project the terminal
+  results of `applied`/`conflict` journals without touching anything,
+  re-verify the project identity under the lock, check the read-only
+  gates (`ST_RDONLY` plus `W_OK` on the root and every existing unplanned
+  ancestor), then run the recovery walk.
+- **Recovery walk.** At `prepared` the whole plan is verified against the
+  untouched project before the first mutation; a divergence is a clean
+  `project_conflict` with a byte-identical project. At `applying` (or the
+  soft-retryable `recovery_required`) the walk requires every completed
+  step to sit exactly at its recorded postcondition and every pending
+  path to sit at a plan-consistent state; a divergence with durable
+  progress is a `recovery_required` refusal that keeps the frontier
+  intent and leaves the operation retryable. A passing walk rolls
+  forward.
+- **Steps.** Steps run strictly sequentially from the recorded progress
+  with one durable journal commit after each verified mutation. Every
+  regular-file publication owns its temp through the journal: the intent
+  (`step_index`, temp name) is committed before the exclusive create, and
+  recovery either adopts a byte-complete temp, cleans and recreates an
+  incomplete one under a fresh committed intent, or refuses
+  (`recovery_required`) on a foreign object it will never remove.
+  Publication uses `RENAME_NOREPLACE` for absent targets (with a typed
+  `unsupported_filesystem` refusal when the filesystem cannot provide the
+  primitive) and a verified rename for replacements. Directories,
+  symlinks, removals and mode changes follow the same observe → mutate →
+  fsync → verify → commit discipline; metadata (ownership, special bits,
+  extended attributes, hard links) is re-gated before every mutation.
+- **Failure model.** The writer never rolls anything back and never
+  records `failed`. Unexpected errors leave the journal in `applying` for
+  a clean retry with the own temp cleaned; `conflict` and `applied` are
+  terminal; `recovery_required` is soft and heals when the operator
+  resolves the named obstruction (for example by removing the foreign
+  object at a temp name). Durability follows the shared journal substrate
+  (a confirmed-but-unconfirmed rename adopts the visible candidate).
+- **Guarantees in scope.** Zero writes before the full preflight; no
+  blind recursive removal (containment is proven against the real child
+  listing); no `exec`-bit creation; no roll-back; content-free results
+  and diagnostics. The documented limitation: a non-cooperative writer
+  racing the verify→rename window remains an operator-trust assumption,
+  as everywhere else in the apply layer.
+- **Out of scope (still unwired).** HTTP/UI/CLI routing surfaces for
+  apply, the deployment read-write mount, selective apply, rollback and
+  the future journal extension for them.
