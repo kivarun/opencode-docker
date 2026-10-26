@@ -35,6 +35,11 @@ import {
   type PipelineV2ProjectChangesSummary,
 } from "./pipeline_v2_project_changes_internal.ts";
 import { realProjectWorkspaceVerifyIo } from "./pipeline_v2_project_provenance_store_internal.ts";
+import {
+  acquirePipelineV2SharedProjectLock,
+  PipelineV2ApplyProjectLockError,
+  type PipelineV2ApplyProjectLock,
+} from "./pipeline_v2_apply_project_lock_internal.ts";
 
 export {
   PIPELINE_V2_PROJECT_CHANGE_KINDS,
@@ -108,7 +113,11 @@ function failure(
  * operator project, and returns the versioned projection or exactly one
  * typed failure. Every path is read-only: no run mutation lock, no Docker
  * Helper involvement, no durable change, no temporary file and no
- * filesystem write.
+ * filesystem write. The observation of the registered operator project
+ * runs under the cooperative shared project lock (`LOCK_SH` on the
+ * canonical root), so a mid-apply multi-step state is never observed;
+ * contention is the typed `project_busy` refusal with zero partial
+ * response.
  */
 export async function projectChangesPipelineV2Run(
   options: PipelineV2ProjectChangesOptions,
@@ -157,8 +166,32 @@ export async function projectChangesPipelineV2Run(
     return failure(verifiedRunId, runRoot, "changes_not_ready");
   }
 
-  // 4. The full comparison through the single internal owner.
+  // 4. The cooperative shared project lock: the whole two-tree
+  //    observation runs under LOCK_SH on the canonical operator project
+  //    root, so an applying writer's mid-step state is never observed as
+  //    a comparison. Contention is the typed busy refusal with zero
+  //    partial response; a root the lock cannot resolve falls through to
+  //    the comparison, which classifies it with the established
+  //    `project_invalid` refusal; a lock-infrastructure failure refuses
+  //    fail-closed instead of observing unexcluded.
+  let lock: PipelineV2ApplyProjectLock | undefined;
   try {
+    try {
+      const acquisition = acquirePipelineV2SharedProjectLock(projectPath);
+      if (acquisition.busy) {
+        return failure(verifiedRunId, runRoot, "project_busy");
+      }
+      lock = acquisition.lock;
+    } catch (cause) {
+      if (!(cause instanceof PipelineV2ApplyProjectLockError)) {
+        throw cause;
+      }
+      if (cause.reason !== "root_invalid") {
+        return failure(verifiedRunId, runRoot, "internal_error");
+      }
+      // root_invalid: the comparison below produces the established
+      // classification for exactly this project root.
+    }
     const comparison = await compareProjectChangesWithIo(
       realProjectWorkspaceVerifyIo,
       runRoot,
@@ -198,5 +231,7 @@ export async function projectChangesPipelineV2Run(
       return failure(verifiedRunId, runRoot, cause.reason);
     }
     return failure(verifiedRunId, runRoot, "internal_error");
+  } finally {
+    lock?.release();
   }
 }

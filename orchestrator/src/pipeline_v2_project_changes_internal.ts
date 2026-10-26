@@ -125,6 +125,7 @@ export const PIPELINE_V2_PROJECT_CHANGES_FAILURE_REASONS = [
   "artifact_modified",
   "changes_not_ready",
   "project_invalid",
+  "project_busy",
   "project_unstable",
   "workspace_unstable",
   "unsupported_project_entry",

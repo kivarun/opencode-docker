@@ -690,7 +690,11 @@ the operator project immediately before writing.
   facade) + `pipeline_v2_project_changes_internal.ts` (core). The whole
   path is read-only: no run mutation lock, no Docker Helper/Launcher/
   Session access, no temporary file, no write/chmod/repair on any path,
-  and a repeated read over unchanged trees is byte-identical. Reuse is
+  and a repeated read over unchanged trees is byte-identical. The
+  observation of the registered operator project runs under the
+  cooperative shared project lock (`LOCK_SH` on the canonical root):
+  contention with an applying writer is the typed `project_busy`
+  refusal with zero partial response. Reuse is
   total: the shared read-only durable-run load chain, the shared
   finalized-status predicate of the state module (running, plan-ready,
   waiting, resumable and every terminal recovery window refuse
@@ -760,9 +764,10 @@ the operator project immediately before writing.
   observation, summary, changes, nextAfter}` — the `runRoot` exists only
   in the trusted CLI document; failures carry the established
   `{ok: false, exitCode: 1, runId, runRoot: string|null, reason}`
-  envelope over the closed 14-reason vocabulary, classified by typed
-  causes only with no path/target/payload/credential in any failure
-  document.
+  envelope over the closed 15-reason vocabulary (`project_busy` is the
+  typed busy refusal of the cooperative registered-project lock),
+  classified by typed causes only with no path/target/payload/credential
+  in any failure document.
 - HTTP: `GET /v1/runs/:runId/changes[?after=N&limit=N&observation=HEX]`
   flows `runId → durable binding → frozen registry project → subprocess
   client`; the HTTP caller can never pass a project path, config root or
@@ -833,9 +838,12 @@ observation are the only content authority inside a run.
   (the pure side-availability resolver and the single-pass verified
   reader) + `pipeline_v2_project_stream_internal.ts` (the ONE streaming
   regular-file observation owner). The whole path is read-only: no
-  mutation lock, no project lock, no reducer/store, no Docker
-  Helper/Launcher/Session, no temporary file, no repair, and content,
-  mode and kind fingerprints are byte-identical across reads. Reuse is
+  mutation lock, no reducer/store, no Docker Helper/Launcher/Session,
+  no temporary file, no repair; the operator-side read runs under the
+  cooperative shared project lock (`LOCK_SH` on the canonical root — an
+  applying writer is the typed `project_busy` refusal with zero bytes),
+  and content, mode and kind fingerprints are byte-identical across
+  reads. Reuse is
   total: the shared read-only durable-run load chain, the single Project
   Changes comparison owner (the full observation is recomputed on every
   content request) and the provenance scanner's read-only IO seam.
@@ -933,9 +941,11 @@ observation are the only content authority inside a run.
   transport failures stay 502, and all success statuses are 200 with
   `no-store`, GET-only, body forbidden, no Range semantics and no
   content disposition.
-- Zero-write semantics: no run mutation lock, no project lock, no
-  reducer/store sink, no Docker Helper, no Launcher, no sessions, no
-  worker, no temp files, no repair. atime is explicitly OUTSIDE the
+- Zero-write semantics: no run mutation lock, no reducer/store sink, no
+  Docker Helper, no Launcher, no sessions, no worker, no temp files, no
+  repair; the operator-side read runs under the cooperative shared
+  project lock (contention is the typed `project_busy` refusal with zero
+  bytes). atime is explicitly OUTSIDE the
   zero-write guarantee — reads may move it under the kernel's read
   policy (relatime), fingerprints exclude it and nothing restores it.
 - Still unwired: Browser UI preview/diff (the raw-byte transport is the
@@ -1093,9 +1103,11 @@ in this layer.
 - Payloads are secret-bearing and unredacted; payload bytes never enter
   plan, journal, diagnostics or filenames, and the store tree is 0700/0600
   throughout.
-- Still unwired: the per-path filesystem writer, temp/rename inside the
-  registered project, the project lock, HTTP/UI/CLI/routing surfaces,
-  the deployment RW mount, schema v11, selective apply and rollback.
+- Still unwired: the per-path filesystem writer and temp/rename inside
+  the registered project (the lock itself is live: the preparation and
+  every orchestrator-owned reader take the shared mode of the single
+  cooperative project lock), HTTP/UI/CLI/routing surfaces, the
+  deployment RW mount, schema v11, selective apply and rollback.
 
 ## The production continue-stage runner API (`orchestrator continue-stage`)
 
@@ -6089,7 +6101,13 @@ stay out of scope.
 The v2 data plane also implements the run-owned project copy:
 `prepareRunProject(projectSourcePath, runRoot)` publishes an
 orchestrator-owned `<runRoot>/project` copy from the caller's source
-directory with one atomic rename (see the data-plane section above). The
+directory with one atomic rename (see the data-plane section above).
+When the source is the registered operator project, the whole
+fixation→copy→provenance→publication→verification boundary runs under
+the cooperative shared project lock (`LOCK_SH` on the canonical root;
+contention with an applying writer is the typed `project_busy`
+refusal, and the staged copy proves its scanned source identity against
+the locked root's `dev`/`ino`). The
 production-neutral coordinator `coordinatePipelineV2Run` assembles the
 whole v2 substrate — graph execution, the data plane, the decision
 evaluator, durable state v4, the state sink and the two-session runtime —
@@ -6985,7 +7003,21 @@ never touched by the writer.
   as the writer's root directory fd: every mutation is fd-relative
   (`openat`/`mkdirat`/`unlinkat`/`symlinkat`/`renameat2` family), so no
   absolute target path ever reaches a mutation primitive and a symlinked
-  ancestor can never redirect a write.
+  ancestor can never redirect a write. The lock is cooperative in both
+  directions: every orchestrator-owned reader of the registered project —
+  the fresh-run project copy (`prepareRunProject`, from source fixation
+  through the full copy traversal, provenance publication, workspace
+  verification and workspace publication), the Project Changes
+  observation, the Project Change Content operator-side read and the
+  Apply preparation — takes the shared mode (`LOCK_SH`, `LOCK_NB`) of
+  the same single lock owner on the canonical root, so a mid-apply
+  multi-step state is never observed, copied, served or planned through
+  the cooperative contract. Readers prove the tree they scan against the
+  locked root's `dev`/`ino`; the shared mode is never upgraded to
+  exclusive (Apply preparation releases the shared lock first, the writer
+  then takes the exclusive lock and re-runs its full preflight). The
+  non-cooperative boundary is unchanged: IDEs, git or any host writer
+  that does not take the lock are not excluded.
 - **Order of one attempt.** Load and verify the whole package (a tampered
   plan or payload refuses before any effect), project the terminal
   results of `applied`/`conflict` journals without touching anything,

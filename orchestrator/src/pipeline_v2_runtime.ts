@@ -29,6 +29,12 @@ import {
 } from "./pipeline_v2_project_copy_internal.ts";
 import type { PreparedRunProject } from "./pipeline_v2_project_copy_internal.ts";
 import {
+  acquirePipelineV2SharedProjectLock,
+  PipelineV2ApplyProjectLockError,
+  PipelineV2ProjectLockBusyError,
+  type PipelineV2ApplyProjectLock,
+} from "./pipeline_v2_apply_project_lock_internal.ts";
+import {
   pipelineV2ProjectProvenanceBinding,
   preparePipelineV2ProjectProvenance,
   PipelineV2ProjectProvenanceError,
@@ -1206,42 +1212,71 @@ export async function prepareRunProject(
         "the run already carries a project provenance manifest at the fixed run-root location",
       );
     }
-    const staged = await stageProjectCopy(realProjectCopyIo, projectSourcePath, runRoot);
+    // The cooperative shared project lock: from here (the source-root
+    // fixation happens inside the staging call) through the full copy
+    // traversal, the provenance publication, the workspace verification
+    // and the workspace publication, the registered project is held SH,
+    // so an applying writer's mid-step multi-path state is never copied
+    // into a fresh run. Contention is the typed busy refusal, never a
+    // data-plane classification. A source the shared lock cannot resolve
+    // as a real directory falls through: the copy below fails with the
+    // established run-level input classification for exactly that source.
+    let lock: PipelineV2ApplyProjectLock | undefined;
     try {
-      const prepared = preparePipelineV2ProjectProvenance(staged.entries);
-      // A durability-unknown publication leaves the manifest visible but
-      // unconfirmed; the preparation fails closed either way and never
-      // binds it.
-      await publishPipelineV2ProjectProvenance(runRoot, prepared);
-      await publishStagedProjectCopy(realProjectCopyIo, staged);
-      // Initial workspace baseline verification (C5): before the
-      // preparation can return — and therefore before `create_run`, the
-      // first worker activation and every later command — the published
-      // workspace tree must match the manifest's workspace baseline
-      // exactly (entry set, kinds, workspace modes, byte counts, content
-      // digests, verbatim symlink targets). A copy whose published bytes
-      // diverge from the capture of the bytes that were read is refused
-      // fail-closed; the published project and the manifest stay in the
-      // run root for diagnostics and are never repaired or rewritten.
-      try {
-        await verifyPipelineV2InitialProjectWorkspace(join(staged.run_root, "project"), prepared);
-      } catch (cause) {
-        if (cause instanceof PipelineV2ProjectProvenanceError) {
-          throw new PipelineError(
-            "the published run workspace does not match its project provenance baseline",
-          );
-        }
+      const acquisition = acquirePipelineV2SharedProjectLock(projectSourcePath);
+      if (acquisition.busy) {
+        throw new PipelineV2ProjectLockBusyError(
+          "the registered project is busy with a filesystem apply",
+        );
+      }
+      lock = acquisition.lock;
+    } catch (cause) {
+      if (cause instanceof PipelineV2ApplyProjectLockError && cause.reason === "root_invalid") {
+        lock = undefined;
+      } else {
         throw cause;
       }
-      return Object.freeze({
-        run_root: staged.run_root,
-        project_root: join(staged.run_root, "project"),
-        manifest: prepared,
-        binding: pipelineV2ProjectProvenanceBinding(prepared),
-      });
-    } catch (cause) {
-      await discardStagedProjectCopy(realProjectCopyIo, staged);
-      throw cause;
+    }
+    try {
+      const staged = await stageProjectCopy(realProjectCopyIo, projectSourcePath, runRoot, lock);
+      try {
+        const prepared = preparePipelineV2ProjectProvenance(staged.entries);
+        // A durability-unknown publication leaves the manifest visible but
+        // unconfirmed; the preparation fails closed either way and never
+        // binds it.
+        await publishPipelineV2ProjectProvenance(runRoot, prepared);
+        await publishStagedProjectCopy(realProjectCopyIo, staged);
+        // Initial workspace baseline verification (C5): before the
+        // preparation can return — and therefore before `create_run`, the
+        // first worker activation and every later command — the published
+        // workspace tree must match the manifest's workspace baseline
+        // exactly (entry set, kinds, workspace modes, byte counts, content
+        // digests, verbatim symlink targets). A copy whose published bytes
+        // diverge from the capture of the bytes that were read is refused
+        // fail-closed; the published project and the manifest stay in the
+        // run root for diagnostics and are never repaired or rewritten.
+        try {
+          await verifyPipelineV2InitialProjectWorkspace(join(staged.run_root, "project"), prepared);
+        } catch (cause) {
+          if (cause instanceof PipelineV2ProjectProvenanceError) {
+            throw new PipelineError(
+              "the published run workspace does not match its project provenance baseline",
+            );
+          }
+          throw cause;
+        }
+        return Object.freeze({
+          run_root: staged.run_root,
+          project_root: join(staged.run_root, "project"),
+          manifest: prepared,
+          binding: pipelineV2ProjectProvenanceBinding(prepared),
+        });
+      } catch (cause) {
+        await discardStagedProjectCopy(realProjectCopyIo, staged);
+        throw cause;
+      }
+    } finally {
+      lock?.release();
     }
   };
   try {

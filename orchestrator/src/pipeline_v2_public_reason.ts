@@ -65,6 +65,7 @@ export const PIPELINE_V2_PUBLIC_REASONS = [
     "run_already_exists",
     "run_not_found",
     "run_busy",
+    "project_busy",
     "invalid_options",
     "invalid_result",
     "run_cleanup_failed",

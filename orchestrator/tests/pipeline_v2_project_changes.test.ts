@@ -1204,6 +1204,7 @@ describe("project changes ownership and UI boundary", () => {
       "artifact_modified",
       "changes_not_ready",
       "project_invalid",
+      "project_busy",
       "project_unstable",
       "workspace_unstable",
       "unsupported_project_entry",

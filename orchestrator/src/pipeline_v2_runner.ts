@@ -116,6 +116,10 @@
  */
 import { lstat, mkdir } from "node:fs/promises";
 import { isCleanAbsolutePath } from "./clean_path.ts";
+import {
+  acquirePipelineV2SharedProjectLock,
+  PipelineV2ApplyProjectLockError,
+} from "./pipeline_v2_apply_project_lock_internal.ts";
 import { describeError, type AuthFetcher, type CliRunner } from "./docker_helper.ts";
 import {
   RunCauseGate,
@@ -325,13 +329,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Shape-only validation of the runner contract. It reads no secret value:
  * environment maps, profile bodies and binding paths are inspected only by
  * name/kind, never by value. Returns the caller-supplied run id captured
- * exactly once (undefined when the caller did not pass one); every other
+ * exactly once (undefined when the caller did not pass one) and the
+ * validated project source path captured exactly once (the cooperative
+ * project-lock gate and the coordinator parameters consume only the
+ * captured value, so the option field is never read again); every other
  * option field keeps its established one-time read order.
  */
 function validateRunnerContract(
   options: PipelineV2RunOptions,
   deps: PipelineV2RunnerDeps,
-): string | undefined {
+): { runId: string | undefined; projectSourcePath: string } {
   if (!isRecord(options)) {
     throw new Error("pipeline v2 runner options must be an object");
   }
@@ -395,7 +402,7 @@ function validateRunnerContract(
   if (deps.randomId !== undefined && typeof deps.randomId !== "function") {
     throw new Error("pipeline v2 runner deps.randomId must be a function");
   }
-  return capturedRunId;
+  return { runId: capturedRunId, projectSourcePath: options.projectSourcePath as string };
 }
 
 function deepFreeze<T>(value: T): T {
@@ -667,8 +674,11 @@ export async function runPipelineV2(
   let gate: RunCauseGate;
   let workerSignalsOfThisRun: WorkerSignalHub = new WorkerSignalHub();
   let callerRunId: string | undefined;
+  let callerProjectSourcePath: string;
   try {
-    callerRunId = validateRunnerContract(options, deps);
+    const contract = validateRunnerContract(options, deps);
+    callerRunId = contract.runId;
+    callerProjectSourcePath = contract.projectSourcePath;
     // The signal seam is read exactly once, here, inside the protected
     // preflight; the captured value alone is checked and handed to the
     // gate, so the original getter or property is never read again.
@@ -750,6 +760,45 @@ export async function runPipelineV2(
       return signalOutcomeBeforeRunRoot();
     }
     return preflightFailure(cause);
+  }
+  if (recordedSignal() !== null) {
+    return signalOutcomeBeforeRunRoot();
+  }
+
+  // --- cooperative project lock gate --------------------------------------
+  //
+  // The registered operator project is read by this fresh run under the
+  // cooperative shared project lock; before any resource is claimed (the
+  // run id, the exclusive run-leaf creation, the sink, the runtime), the
+  // gate reports the typed busy refusal of an applying writer and touches
+  // nothing. The gate is a fast-fail only: it releases the lock
+  // immediately, and the real exclusion is the shared acquisition inside
+  // `prepareRunProject`, which proves the scanned tree against the locked
+  // root identity. A root the lock cannot resolve is not a gate failure —
+  // the copy below classifies it with the established run-level input
+  // refusal.
+  try {
+    const gateAcquisition = acquirePipelineV2SharedProjectLock(callerProjectSourcePath);
+    if (gateAcquisition.busy) {
+      return deepFreeze({
+        ok: false,
+        exitCode: 1,
+        runId: "",
+        runRoot: null,
+        state: null,
+        reason: "project_busy",
+      });
+    }
+    gateAcquisition.lock.release();
+  } catch (cause) {
+    if (!(cause instanceof PipelineV2ApplyProjectLockError)) {
+      throw cause;
+    }
+    // A root the shared lock cannot resolve is not a gate failure: the
+    // copy below classifies it with the established run-level input
+    // refusal. A lock-infrastructure failure is re-encountered by the
+    // copy, which fails closed and is classified as `internal_error` by
+    // the coordinator — never a rejected runner promise.
   }
   if (recordedSignal() !== null) {
     return signalOutcomeBeforeRunRoot();
@@ -925,7 +974,7 @@ export async function runPipelineV2(
         pipeline,
         runId,
         runRoot: runRoot.localRunRoot,
-        projectSourcePath: options.projectSourcePath,
+        projectSourcePath: callerProjectSourcePath,
         inputBindings: options.inputBindings,
         sink,
         runtime,

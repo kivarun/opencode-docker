@@ -156,6 +156,7 @@ import {
   type RunOutputSnapshotEntry,
 } from "./pipeline_v2_runtime.ts";
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
+import { PipelineV2ProjectLockBusyError } from "./pipeline_v2_apply_project_lock_internal.ts";
 import type { PipelineV2ProjectProvenanceBinding } from "./pipeline_v2_project_provenance.ts";
 import {
   classifyPipelineV2ResumeRecovery,
@@ -1101,6 +1102,13 @@ export async function coordinatePipelineV2Run(
     }
     if (cause instanceof PipelineV2RuntimeError && cause.reason === "run_input_invalid") {
       return deepFreeze({ ok: false as const, reason: "run_input_invalid" as const, state: null });
+    }
+    if (cause instanceof PipelineV2ProjectLockBusyError) {
+      // The typed busy refusal of the cooperative project lock: never a
+      // data-plane failure reason and never a durable state document —
+      // rethrown unchanged so the runner boundary maps the closed public
+      // reason.
+      throw cause;
     }
     return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
   }

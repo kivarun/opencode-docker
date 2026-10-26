@@ -15,6 +15,7 @@ import {
   type FileHandle,
 } from "node:fs/promises";
 import { PipelineError } from "./pipeline.ts";
+import type { PipelineV2ApplyProjectLock } from "./pipeline_v2_apply_project_lock_internal.ts";
 import {
   describeEntry,
   isErrnoException,
@@ -286,6 +287,7 @@ interface ValidatedProjectCopyInputs {
   readonly runRootCanonical: string;
   readonly projectPath: string;
   readonly sourceCanonical: string;
+  readonly sourceIdentity: { readonly dev: number; readonly ino: number };
 }
 
 /**
@@ -293,11 +295,17 @@ interface ValidatedProjectCopyInputs {
  * run root must be an existing absolute canonical real non-symlink
  * directory, `<runRoot>/project` must be absent, the source must be an
  * absolute real non-symlink directory, and source and run root must not
- * overlap in either direction.
+ * overlap in either direction. When the caller holds the cooperative
+ * shared project lock, the scanned source identity is proven here —
+ * immediately after the source fixation and before the copy traversal —
+ * to be exactly the directory the lock was taken on, so a directory
+ * replaced between lock acquisition and fixation can never be scanned
+ * under the wrong lock.
  */
 async function validateProjectCopyInputs(
   projectSourcePath: string,
   runRoot: string,
+  lock?: PipelineV2ApplyProjectLock,
 ): Promise<ValidatedProjectCopyInputs> {
   if (typeof projectSourcePath !== "string" || projectSourcePath === "") {
     throw new PipelineError("project source path must be a non-empty string");
@@ -355,7 +363,15 @@ async function validateProjectCopyInputs(
       "project source and the canonical run root must not overlap in either direction",
     );
   }
-  return { runRootCanonical, projectPath, sourceCanonical };
+  const sourceIdentity = Object.freeze({ dev: sourceInfo.dev, ino: sourceInfo.ino });
+  if (lock !== undefined) {
+    if (lock.identity.dev !== sourceIdentity.dev || lock.identity.ino !== sourceIdentity.ino) {
+      throw new PipelineError(
+        "the held project lock does not cover the scanned project source directory",
+      );
+    }
+  }
+  return { runRootCanonical, projectPath, sourceCanonical, sourceIdentity };
 }
 
 /**
@@ -429,15 +445,21 @@ async function validateProjectCopyInputs(
  * Every expected failure of this operation is a run-level input failure:
  * a `PipelineV2RuntimeError` with reason `run_input_invalid` and a
  * content-free diagnostic. No new failure reason is introduced and the
- * state schema stays v4.
+ * state schema stays v4. This is a convenience wrapper, not the
+ * production boundary: the production fresh-run path is
+ * `prepareRunProject`, which owns the cooperative shared project lock for
+ * the whole fixation→copy→provenance→publication→verification boundary.
+ * A caller that already holds the shared lock passes it here so the
+ * staged copy is proven to belong to the locked directory.
  */
 export async function prepareProjectCopy(
   io: ProjectCopyIo,
   projectSourcePath: string,
   runRoot: string,
+  lock?: PipelineV2ApplyProjectLock,
 ): Promise<PreparedRunProject> {
   return await withCopyReason(async () => {
-    const staged = await stageProjectCopy(io, projectSourcePath, runRoot);
+    const staged = await stageProjectCopy(io, projectSourcePath, runRoot, lock);
     try {
       await publishStagedProjectCopy(io, staged);
     } catch (cause) {
@@ -462,11 +484,13 @@ export async function stageProjectCopy(
   io: ProjectCopyIo,
   projectSourcePath: string,
   runRoot: string,
+  lock?: PipelineV2ApplyProjectLock,
 ): Promise<StagedProjectCopy> {
   return await withCopyReason(async () => {
     const { runRootCanonical, sourceCanonical } = await validateProjectCopyInputs(
       projectSourcePath,
       runRoot,
+      lock,
     );
     const staging = await createProjectStagingDirectory(io, runRootCanonical);
     const capture: ProjectCopyCaptureEntry[] = [];

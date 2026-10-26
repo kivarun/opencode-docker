@@ -26,6 +26,11 @@ import { isPipelineV2FinalizedRunStatus } from "./pipeline_v2_state.ts";
 import { isCleanAbsolutePath } from "./clean_path.ts";
 import { realProjectWorkspaceVerifyIo } from "./pipeline_v2_project_provenance_store_internal.ts";
 import { realProjectFileStreamIo } from "./pipeline_v2_project_stream_internal.ts";
+import {
+  acquirePipelineV2SharedProjectLock,
+  PipelineV2ApplyProjectLockError,
+  type PipelineV2ApplyProjectLock,
+} from "./pipeline_v2_apply_project_lock_internal.ts";
 import { PipelineV2ProjectChangesError, type PipelineV2ProjectChangeNode, type PipelineV2ProjectChangesFailureReason } from "./pipeline_v2_project_changes.ts";
 import {
   PIPELINE_V2_PROJECT_CHANGE_CONTENT_SIDES,
@@ -97,7 +102,10 @@ function failure(
  * Reads one bounded raw-byte slice of one side of one verified Project
  * Changes entry, or returns exactly one typed failure. Every path is
  * read-only: no mutation lock, no Docker Helper involvement, no durable
- * change, no temporary file and no filesystem write.
+ * change, no temporary file and no filesystem write. The operator-side
+ * read runs under the cooperative shared project lock (`LOCK_SH` on the
+ * canonical root), so no payload byte is ever served from a mid-apply
+ * state; contention is the typed `project_busy` refusal with zero bytes.
  */
 export async function projectChangeContentPipelineV2Run(
   options: PipelineV2ProjectChangeContentOptions,
@@ -154,8 +162,32 @@ export async function projectChangeContentPipelineV2Run(
     return failure(verifiedRunId, runRoot, "changes_not_ready");
   }
 
-  // 4. The content read through the single internal owner.
+  // 4. The content read through the single internal owner, under the
+  //    cooperative shared project lock: the full observation recompute
+  //    and the single-pass read of the operator-side file run with LOCK_SH
+  //    held on the canonical operator project root, so no payload byte is
+  //    ever served from a mid-apply state. Contention is the typed busy
+  //    refusal with zero bytes; a root the lock cannot resolve falls
+  //    through to the established content classification; a
+  //    lock-infrastructure failure refuses fail-closed.
+  let lock: PipelineV2ApplyProjectLock | undefined;
   try {
+    try {
+      const acquisition = acquirePipelineV2SharedProjectLock(projectPath);
+      if (acquisition.busy) {
+        return failure(verifiedRunId, runRoot, "project_busy");
+      }
+      lock = acquisition.lock;
+    } catch (cause) {
+      if (!(cause instanceof PipelineV2ApplyProjectLockError)) {
+        throw cause;
+      }
+      if (cause.reason !== "root_invalid") {
+        return failure(verifiedRunId, runRoot, "internal_error");
+      }
+      // root_invalid: the content read below classifies exactly this
+      // project root through its own observation recompute.
+    }
     const result = await readProjectChangeContentWithIo(
       realProjectWorkspaceVerifyIo,
       realProjectFileStreamIo,
@@ -176,6 +208,8 @@ export async function projectChangeContentPipelineV2Run(
       return failure(verifiedRunId, runRoot, cause.reason);
     }
     return failure(verifiedRunId, runRoot, "internal_error");
+  } finally {
+    lock?.release();
   }
 }
 

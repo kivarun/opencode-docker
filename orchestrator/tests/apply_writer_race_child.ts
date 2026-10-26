@@ -1,10 +1,11 @@
 /**
  * Child helper for the apply-writer race matrix. Runs one execution of a
- * prepared operation (or holds the project lock) in a separate OS
- * process, with stdin-gated pausing for mid-execution observation.
+ * prepared operation (or holds the project lock in the exclusive or the
+ * shared mode) in a separate OS process, with stdin-gated pausing for
+ * mid-execution observation.
  *
  * usage: bun apply_writer_race_child.ts <mode> <applyStoreRoot> <applyId> <projectRoot>
- *   modes: execute | execute-gated | hold
+ *   modes: execute | execute-gated | hold | hold-shared
  */
 import { applyPreparedPipelineV2Project } from "../src/pipeline_v2_project_apply.ts";
 import { defaultPipelineStateIo, type PipelineStateIo, type StateFileHandle } from "../src/run_snapshot_store.ts";
@@ -65,9 +66,11 @@ function gatedStateIo(): PipelineStateIo {
 }
 
 async function main(): Promise<void> {
-  if (mode === "hold") {
-    const { acquirePipelineV2ApplyProjectLock } = await import("../src/pipeline_v2_apply_project_lock_internal.ts");
-    const acquisition = acquirePipelineV2ApplyProjectLock(projectRoot);
+  if (mode === "hold" || mode === "hold-shared") {
+    const lockModule = await import("../src/pipeline_v2_apply_project_lock_internal.ts");
+    const acquisition = mode === "hold"
+      ? lockModule.acquirePipelineV2ApplyProjectLock(projectRoot)
+      : lockModule.acquirePipelineV2SharedProjectLock(projectRoot);
     if (acquisition.busy) {
       process.stdout.write("BUSY\n");
       return;
