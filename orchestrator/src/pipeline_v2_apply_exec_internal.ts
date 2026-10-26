@@ -97,12 +97,21 @@ export interface ApplyExecutorOptions {
   /** Steps grouped by path (plan order), as computed by the walk. */
   readonly stepsByPath: ReadonlyMap<string, readonly number[]>;
   /** The committed temp intent restored from the journal, if any. */
-  readonly initialActiveStep: { readonly step_index: number; readonly temp_name: string } | null;
+  readonly initialActiveStep: ActiveIntent;
   /** Durable temp-intent commit (orchestration-owned state transition). */
   readonly commitTempIntent: (stepIndex: number, tempName: string) => Promise<void>;
+  /** Durable temp-identity commit: fixes the created object's dev/ino before any byte is written. */
+  readonly commitTempIdentity: (stepIndex: number, tempName: string, dev: number, ino: number) => Promise<void>;
   /** Durable progress commit (orchestration-owned state transition). */
   readonly commitProgress: (stepIndex: number) => Promise<void>;
 }
+
+/** The durable temp intent: the name plus, once fixed, the object identity. */
+type ActiveIntent = {
+  readonly step_index: number;
+  readonly temp_name: string;
+  readonly temp_identity: { readonly dev: number; readonly ino: number } | null;
+} | null;
 
 const CHUNK_BYTES = 128 * 1024;
 
@@ -184,6 +193,7 @@ export async function executeApplySteps(options: ApplyExecutorOptions): Promise<
             payloadsRoot,
             activeIntent,
             options.commitTempIntent,
+            options.commitTempIdentity,
             options.commitProgress,
           );
           break;
@@ -196,6 +206,7 @@ export async function executeApplySteps(options: ApplyExecutorOptions): Promise<
             stepIndex,
             activeIntent,
             options.commitTempIntent,
+            options.commitTempIdentity,
             options.commitProgress,
           );
           break;
@@ -380,8 +391,6 @@ async function verifyCreatedDirectory(
   await commitProgress(stepIndex);
 }
 
-type ActiveIntent = { readonly step_index: number; readonly temp_name: string } | null;
-
 async function executePublishRegularFile(
   fdOps: ApplyFdOps,
   fileStreamIo: ProjectFileStreamIo,
@@ -393,6 +402,7 @@ async function executePublishRegularFile(
   payloadsRoot: string,
   activeIntent: ActiveIntent,
   commitTempIntent: (stepIndex: number, tempName: string) => Promise<void>,
+  commitTempIdentity: (stepIndex: number, tempName: string, dev: number, ino: number) => Promise<void>,
   commitProgress: (stepIndex: number) => Promise<void>,
 ): Promise<ActiveIntent> {
   const desired = step.desired_after;
@@ -409,15 +419,26 @@ async function executePublishRegularFile(
   let resumedComplete = false;
   let createTemp = true;
   if (prior !== null) {
-    const state = inspectOwnedTemp(fdOps, parentFd, prior.temp_name, contract, desired.mode);
+    const state = inspectOwnedTemp(fdOps, parentFd, prior.temp_name, prior.temp_identity, contract, desired.mode);
     if (state === "foreign") {
+      // The name alone never proves ownership: an object the journal
+      // identity does not vouch for is never removed and never rewritten.
       throw applyForeignTemp("a committed apply temp name carries a foreign object");
     }
     if (state === "incomplete") {
+      // The durable identity matched, so the object is provably ours; its
+      // content is not the payload, so it is cleaned and recreated under
+      // a fresh committed intent.
       await cleanOwnedTemp(fdOps, parentFd, prior.temp_name);
       tempName = freshTempName();
       await commitTempIntent(stepIndex, tempName);
+    } else if (state === "absent" && prior.temp_identity !== null) {
+      // Our durably owned temp vanished; recreate under a fresh intent.
+      tempName = freshTempName();
+      await commitTempIntent(stepIndex, tempName);
     } else {
+      // Either the complete owned temp (adopt and publish) or an intent
+      // whose object was never created: recreate at the committed name.
       tempName = prior.temp_name;
       resumedComplete = state === "complete";
       createTemp = !resumedComplete;
@@ -446,6 +467,11 @@ async function executePublishRegularFile(
     const stat = fdOps.fstat(tempFd);
     if (!stat.isFile() || (createTemp && (stat.mode & 0o7777) !== 0o600)) {
       throw new Error("the apply temp file does not have its required creation shape");
+    }
+    if (createTemp) {
+      // Fix the created object's identity durably BEFORE any byte is
+      // written, so every later ownership decision rests on the journal.
+      await commitTempIdentity(stepIndex, tempName, stat.dev, stat.ino);
     }
     if (!resumedComplete) {
       await streamPayloadIntoTemp(fdOps, fileStreamIo, `${payloadsRoot}/${payload.artifact}`, tempFd, contract);
@@ -484,6 +510,7 @@ async function executePublishSymlink(
   stepIndex: number,
   activeIntent: ActiveIntent,
   commitTempIntent: (stepIndex: number, tempName: string) => Promise<void>,
+  commitTempIdentity: (stepIndex: number, tempName: string, dev: number, ino: number) => Promise<void>,
   commitProgress: (stepIndex: number) => Promise<void>,
 ): Promise<ActiveIntent> {
   const desired = step.desired_after;
@@ -494,12 +521,26 @@ async function executePublishSymlink(
   let tempName: string;
   let createTemp = true;
   if (prior !== null) {
-    const state = inspectOwnedSymlinkTemp(fdOps, parentFd, prior.temp_name, desired.target);
+    const state = inspectOwnedSymlinkTemp(fdOps, parentFd, prior.temp_name, prior.temp_identity, desired.target);
     if (state === "foreign") {
+      // The name alone never proves ownership; a foreign object is never
+      // removed and never rewritten.
       throw applyForeignTemp("a committed apply temp name carries a foreign object");
     }
-    tempName = prior.temp_name;
-    createTemp = state === "absent";
+    if (state === "mismatch") {
+      // The durable identity matched, so the object is provably ours, but
+      // its target is not the planned one; clean and recreate under a
+      // fresh committed intent.
+      await cleanOwnedTemp(fdOps, parentFd, prior.temp_name);
+      tempName = freshTempName();
+      await commitTempIntent(stepIndex, tempName);
+    } else if (state === "absent" && prior.temp_identity !== null) {
+      tempName = freshTempName();
+      await commitTempIntent(stepIndex, tempName);
+    } else {
+      tempName = prior.temp_name;
+      createTemp = state === "absent";
+    }
   } else {
     tempName = freshTempName();
     await commitTempIntent(stepIndex, tempName);
@@ -512,6 +553,24 @@ async function executePublishSymlink(
         throw applyForeignTemp("a committed apply temp name is already occupied");
       }
       throw unexpectedSyscall("create the apply temp symlink", errno);
+    }
+    // Fix the created symlink's identity durably before publication.
+    const identityFd = fdOps.openat(parentFd, encodeFdName(tempName), FD_OPEN_PATH | FD_OPEN_NOFOLLOW | FD_OPEN_CLOEXEC, 0);
+    if (identityFd < 0) {
+      throw unexpectedSyscall("inspect the created apply temp symlink", fdOps.errno());
+    }
+    try {
+      const identityStat = fdOps.fstat(identityFd);
+      if ((identityStat.mode & 0o170000) !== 0o120000) {
+        throw new Error("the apply temp symlink does not have its required creation shape");
+      }
+      await commitTempIdentity(stepIndex, tempName, identityStat.dev, identityStat.ino);
+    } finally {
+      try {
+        fdOps.closeFd(identityFd);
+      } catch {
+        // best effort
+      }
     }
   }
   try {
@@ -532,6 +591,7 @@ function inspectOwnedTemp(
   fdOps: ApplyFdOps,
   parentFd: number,
   tempName: string,
+  identity: { readonly dev: number; readonly ino: number } | null,
   contract: { readonly sha256: string; readonly byteCount: number },
   desiredMode: number,
 ): ApplyTempState {
@@ -542,9 +602,16 @@ function inspectOwnedTemp(
   try {
     const stat = fdOps.fstat(fd);
     const mode = stat.mode & 0o7777;
-    // A temp the writer owns is either still being written (0600) or
-    // already carries its desired mode (the crash came after the fchmod).
-    if (!stat.isFile() || (mode !== 0o600 && mode !== desiredMode)) {
+    // An object whose identity the journal does not vouch for (no
+    // identity committed yet, or a different dev/ino) is foreign no
+    // matter what its content looks like; it is never removed.
+    if (
+      !stat.isFile() ||
+      identity === null ||
+      stat.dev !== identity.dev ||
+      stat.ino !== identity.ino ||
+      (mode !== 0o600 && mode !== desiredMode)
+    ) {
       return "foreign";
     }
     const content = hashFdContent(fdOps, fd);
@@ -565,8 +632,9 @@ function inspectOwnedSymlinkTemp(
   fdOps: ApplyFdOps,
   parentFd: number,
   tempName: string,
+  identity: { readonly dev: number; readonly ino: number } | null,
   expectedTarget: string,
-): Exclude<ApplyTempState, "incomplete"> {
+): Exclude<ApplyTempState, "incomplete"> | "mismatch" {
   const fd = fdOps.openat(parentFd, encodeFdName(tempName), FD_OPEN_RDONLY | FD_OPEN_NOFOLLOW | FD_OPEN_CLOEXEC, 0);
   if (fd >= 0) {
     // A regular file (or directory) at a temp symlink name is foreign.
@@ -584,14 +652,15 @@ function inspectOwnedSymlinkTemp(
   if (errno !== FD_ELOOP) {
     return "foreign";
   }
-  // ELOOP: the object is a symlink; verify its kind and target.
+  // ELOOP: the object is a symlink; verify its kind, identity and target.
   const pathFd = fdOps.openat(parentFd, encodeFdName(tempName), FD_OPEN_PATH | FD_OPEN_NOFOLLOW | FD_OPEN_CLOEXEC, 0);
   if (pathFd < 0) {
     return "foreign";
   }
+  let stat: ReturnType<ApplyFdOps["fstat"]>;
   try {
-    const stat = fdOps.fstat(pathFd);
-    if ((stat.mode & 0o170000) !== 0o120000) {
+    stat = fdOps.fstat(pathFd);
+    if ((stat.mode & 0o170000) !== 0o120000 || identity === null || stat.dev !== identity.dev || stat.ino !== identity.ino) {
       return "foreign";
     }
   } catch {
@@ -603,12 +672,13 @@ function inspectOwnedSymlinkTemp(
       // best effort
     }
   }
+  void stat;
   const linkBuffer = Buffer.alloc(4096);
   const length = Number(fdOps.readlinkat(parentFd, encodeFdName(tempName), linkBuffer, linkBuffer.byteLength));
   if (length < 0) {
     return "foreign";
   }
-  return linkBuffer.toString("utf8", 0, length) === expectedTarget ? "complete" : "foreign";
+  return linkBuffer.toString("utf8", 0, length) === expectedTarget ? "complete" : "mismatch";
 }
 
 async function cleanOwnedTemp(fdOps: ApplyFdOps, parentFd: number, tempName: string): Promise<void> {

@@ -1,4 +1,5 @@
-import { isAbsolute } from "node:path";
+import {
+ isAbsolute } from "node:path";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { canonicalJson } from "./canonical_json.ts";
@@ -51,6 +52,7 @@ import {
   parseApplyOperationState,
   validateApplyOperationState,
   type PipelineV2ApplyOperationState,
+  PIPELINE_V2_APPLY_STATE_SCHEMA_VERSION,
 } from "./pipeline_v2_apply_state_internal.ts";
 import {
   planProjectApplySteps,
@@ -525,7 +527,7 @@ async function preparePipelineV2ProjectApplyWithComponents(
   let current = existing;
   if (current === null) {
     const initial: PipelineV2ApplyOperationState = validateApplyOperationState({
-      schema_version: 2,
+      schema_version: PIPELINE_V2_APPLY_STATE_SCHEMA_VERSION,
       kind: "pipeline_v2_project_apply_operation",
       revision: 1,
       apply_id: applyId,

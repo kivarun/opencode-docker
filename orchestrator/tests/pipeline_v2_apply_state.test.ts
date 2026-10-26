@@ -44,7 +44,7 @@ function baseState(): Record<string, unknown> {
 }
 
 describe("apply operation state schema v2", () => {
-  test("the v2 status vocabulary is exactly the seven lifecycle statuses", () => {
+  test("the status vocabulary is exactly the seven lifecycle statuses", () => {
     expect([...PIPELINE_V2_APPLY_OPERATION_STATUSES]).toEqual([
       "preparing",
       "prepared",
@@ -109,19 +109,19 @@ describe("apply operation state schema v2", () => {
     expect(applying.execution).toEqual({ completed_step_count: 1, active_step: null });
     const withIntent = validateApplyOperationState({
       ...applying,
-      execution: { completed_step_count: 1, active_step: { step_index: 2, temp_name: `.apply-tmp-${"ab".repeat(16)}` } },
+      execution: { completed_step_count: 1, active_step: { step_index: 2, temp_name: `.apply-tmp-${"ab".repeat(16)}`, temp_identity: null } },
     });
-    expect(withIntent.execution?.active_step).toEqual({ step_index: 2, temp_name: `.apply-tmp-${"ab".repeat(16)}` });
+    expect(withIntent.execution?.active_step).toEqual({ step_index: 2, temp_name: `.apply-tmp-${"ab".repeat(16)}`, temp_identity: null });
     expect(parseApplyOperationState(JSON.stringify(withIntent))).toEqual(withIntent);
-    const offFrontier = { ...applying, execution: { completed_step_count: 1, active_step: { step_index: 3, temp_name: `.apply-tmp-${"ab".repeat(16)}` } } };
+    const offFrontier = { ...applying, execution: { completed_step_count: 1, active_step: { step_index: 3, temp_name: `.apply-tmp-${"ab".repeat(16)}`, temp_identity: null } } };
     expect(() => validateApplyOperationState(offFrontier)).toThrow(/frontier step/);
-    const badName = { ...applying, execution: { completed_step_count: 1, active_step: { step_index: 2, temp_name: "hostile" } } };
+    const badName = { ...applying, execution: { completed_step_count: 1, active_step: { step_index: 2, temp_name: "hostile", temp_identity: null } } };
     expect(() => validateApplyOperationState(badName)).toThrow(/temp grammar/);
     const zeroWithIntent = validateApplyOperationState({
       ...applying,
-      execution: { completed_step_count: 0, active_step: { step_index: 1, temp_name: `.apply-tmp-${"ab".repeat(16)}` } },
+      execution: { completed_step_count: 0, active_step: { step_index: 1, temp_name: `.apply-tmp-${"ab".repeat(16)}`, temp_identity: null } },
     });
-    expect(zeroWithIntent.execution?.active_step).toEqual({ step_index: 1, temp_name: `.apply-tmp-${"ab".repeat(16)}` });
+    expect(zeroWithIntent.execution?.active_step).toEqual({ step_index: 1, temp_name: `.apply-tmp-${"ab".repeat(16)}`, temp_identity: null });
   });
 
   test("an applied state is terminal with full progress and no active step", () => {
@@ -137,7 +137,7 @@ describe("apply operation state schema v2", () => {
     expect(applied.status).toBe("applied");
     const partial = { ...applied, execution: { completed_step_count: 1, active_step: null } };
     expect(() => validateApplyOperationState(partial)).toThrow(/frontier step|exceeds|completed/);
-    const withActive = { ...applied, execution: { completed_step_count: 2, active_step: { step_index: 3, temp_name: `.apply-tmp-${"ab".repeat(16)}` } } };
+    const withActive = { ...applied, execution: { completed_step_count: 2, active_step: { step_index: 3, temp_name: `.apply-tmp-${"ab".repeat(16)}`, temp_identity: null } } };
     expect(() => validateApplyOperationState(withActive)).toThrow(/active temp intent/);
   });
 
@@ -163,7 +163,7 @@ describe("apply operation state schema v2", () => {
       plan_total_payload_byte_count: 4,
       status: "recovery_required",
       failure_reason: "recovery_required",
-      execution: { completed_step_count: 1, active_step: { step_index: 2, temp_name: `.apply-tmp-${"ab".repeat(16)}` } },
+      execution: { completed_step_count: 1, active_step: { step_index: 2, temp_name: `.apply-tmp-${"ab".repeat(16)}`, temp_identity: null } },
     });
     expect(recovery.status).toBe("recovery_required");
     const recoveryWithoutReason = { ...recovery, failure_reason: null };
@@ -212,7 +212,20 @@ describe("apply operation state schema v2", () => {
         "apply operation state schema version 1 is not supported (no migration from v1 preparation journals)",
       );
     }
-    expect(() => validateApplyOperationState({ ...baseState(), schema_version: 3 })).toThrow(/schema version is not supported/);
+    expect(() => validateApplyOperationState({ ...baseState(), schema_version: 4 })).toThrow(/schema version is not supported/);
+  });
+
+  test("schema version 2 is rejected with the typed legacy message and never migrated", () => {
+    try {
+      validateApplyOperationState({ ...baseState(), schema_version: 2 });
+      throw new Error("expected a rejection");
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(PipelineV2ApplyStateError);
+      expect((cause as Error).message).toBe(
+        "apply operation state schema version 2 is not supported (no migration from v2 temp-intent journals)",
+      );
+    }
+    expect(() => validateApplyOperationState({ ...baseState(), schema_version: 4 })).toThrow(/schema version is not supported/);
   });
 
   test("the plan projection fields are present exactly when the digest is", () => {

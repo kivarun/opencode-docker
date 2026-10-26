@@ -7003,17 +7003,26 @@ never touched by the writer.
   forward.
 - **Steps.** Steps run strictly sequentially from the recorded progress
   with one durable journal commit after each verified mutation. Every
-  regular-file publication owns its temp through the journal: the intent
-  (`step_index`, temp name) is committed before the exclusive create, and
-  recovery either adopts a byte-complete temp, cleans and recreates an
-  incomplete one under a fresh committed intent, or refuses
-  (`recovery_required`) on a foreign object it will never remove.
-  Publication uses `RENAME_NOREPLACE` for absent targets (with a typed
+  temp-owning publication (regular file or symlink) owns its temp through
+  the journal: the intent (`step_index`, temp name, identity `null`) is
+  committed before the exclusive create, and the object's identity
+  (`dev`/`ino`, read back through `fstat` on the owned descriptor) is
+  committed in its own durable step before any byte is written. The name
+  alone never proves ownership. Recovery either adopts a byte-complete
+  temp whose durable identity matches, cleans and recreates an incomplete
+  one under a fresh committed intent (only with the exact durable
+  identity), or refuses (`recovery_required`) on an object that carries
+  no durable identity or a foreign one — that object is never removed and
+  never rewritten; an intent whose object was never created is recreated
+  at the committed name with an exclusive create. Publication uses
+  `RENAME_NOREPLACE` for absent targets (with a typed
   `unsupported_filesystem` refusal when the filesystem cannot provide the
   primitive) and a verified rename for replacements. Directories,
   symlinks, removals and mode changes follow the same observe → mutate →
   fsync → verify → commit discipline; metadata (ownership, special bits,
   extended attributes, hard links) is re-gated before every mutation.
+  The operation journal is schema v3; older journals are rejected with a
+  typed legacy message and never migrated.
 - **Failure model.** The writer never rolls anything back and never
   records `failed`. Unexpected errors leave the journal in `applying` for
   a clean retry with the own temp cleaned; `conflict` and `applied` are

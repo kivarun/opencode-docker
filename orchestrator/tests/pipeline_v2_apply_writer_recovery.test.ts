@@ -8,7 +8,8 @@
  * run-workspace or endpoint dependencies.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFile, rm, writeFile, mkdir, symlink } from "node:fs/promises";
+import { lstat, readFile, rm, writeFile, mkdir, symlink } from "node:fs/promises";
+import { spawn } from "bun";
 import { join } from "node:path";
 import {
   applyPreparedPipelineV2Project,
@@ -267,32 +268,8 @@ describe("apply writer recovery: temp ownership windows", () => {
     expect(finalState["status"]).toBe("applied");
   });
 
-  test("W6/W7: an incomplete committed temp is cleaned and recreated under a fresh intent", async () => {
+  test("W6/W7: a crash mid-write leaves a durably owned partial temp that the retry cleans and recreates", async () => {
     const fixture = await prepared("w6", BASIC_SPEC, BASIC_WORKER);
-    const fops = faultFdOps();
-    fops.failCrashOnce("openat", 1, tempFaultMatch);
-    let crashed = false;
-    try {
-      await attempt(fixture, { fdOps: fops.ops });
-    } catch (cause) {
-      crashed = isApplyCrashFault(cause);
-    }
-    expect(crashed).toBe(true);
-    const state = await readJournal(fixture);
-    const intent = (state["execution"] as Record<string, unknown>)["active_step"] as Record<string, unknown>;
-    const tempName = String(intent["temp_name"]);
-    // Simulate the crash states: an empty temp (W6) and a partial temp (W7).
-    for (const partial of [Buffer.alloc(0), Buffer.from("NEW".slice(0, 1))]) {
-      await writeFile(join(fixture.operatorProject, tempName), partial as Buffer, { mode: 0o600 });
-      const retry = await attempt(fixture);
-      expect(retry.ok).toBe(true);
-      const finalState = await readJournal(fixture);
-      expect(finalState["status"]).toBe("applied");
-    }
-  });
-
-  test("a stream read crash mid-copy leaves a partial temp that the retry cleans", async () => {
-    const fixture = await prepared("w7-live", BASIC_SPEC, BASIC_WORKER);
     const stream = faultStreamIo();
     stream.failReadCrashOnce(2);
     let crashed = false;
@@ -302,6 +279,12 @@ describe("apply writer recovery: temp ownership windows", () => {
       crashed = isApplyCrashFault(cause);
     }
     expect(crashed).toBe(true);
+    const state = await readJournal(fixture);
+    const active = state["execution"] as Record<string, unknown>;
+    expect(active["active_step"]).not.toBe(null);
+    // The identity was committed before the first payload byte, so the
+    // partial temp is durably owned.
+    expect(((active["active_step"] as Record<string, unknown>)["temp_identity"] as Record<string, unknown> | null)).not.toBe(null);
     const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
     expect(listing.some((name) => name.startsWith(".apply-tmp-"))).toBe(true);
     const retry = await attempt(fixture);
@@ -311,8 +294,29 @@ describe("apply writer recovery: temp ownership windows", () => {
     expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
   });
 
-  test("W8/W9: a complete committed temp is adopted and published by the retry", async () => {
+  test("W8/W9: a complete durably owned temp left by a crash is adopted and published by the retry", async () => {
     const fixture = await prepared("w8", BASIC_SPEC, BASIC_WORKER);
+    const fops = faultFdOps();
+    fops.failCrashOnce("renameat", 1);
+    let crashed = false;
+    try {
+      await attempt(fixture, { fdOps: fops.ops });
+    } catch (cause) {
+      crashed = isApplyCrashFault(cause);
+    }
+    expect(crashed).toBe(true);
+    const state = await readJournal(fixture);
+    const active = (state["execution"] as Record<string, unknown>)["active_step"] as Record<string, unknown>;
+    expect(active["temp_identity"]).not.toBe(null);
+    const retry = await attempt(fixture);
+    expect(retry.ok).toBe(true);
+    expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
+    const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    expect(listing.some((name) => name.startsWith(".apply-tmp-"))).toBe(false);
+  });
+
+  test("W5b: an intent whose object was never created is recreated at the committed name", async () => {
+    const fixture = await prepared("w5b", BASIC_SPEC, BASIC_WORKER);
     const fops = faultFdOps();
     fops.failCrashOnce("openat", 1, tempFaultMatch);
     let crashed = false;
@@ -323,14 +327,11 @@ describe("apply writer recovery: temp ownership windows", () => {
     }
     expect(crashed).toBe(true);
     const state = await readJournal(fixture);
-    const tempName = String(((state["execution"] as Record<string, unknown>)["active_step"] as Record<string, unknown>)["temp_name"]);
-    const payload = await readFile(join(fixture.applyStoreRoot, "operations", "applyone", "payloads", "1.payload"));
-    await writeFile(join(fixture.operatorProject, tempName), payload, { mode: 0o600 });
+    const active = (state["execution"] as Record<string, unknown>)["active_step"] as Record<string, unknown>;
+    expect(active["temp_identity"]).toBe(null);
     const retry = await attempt(fixture);
     expect(retry.ok).toBe(true);
-    expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
-    const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
-    expect(listing.some((name) => name.startsWith(".apply-tmp-"))).toBe(false);
+    expect((await readJournal(fixture))["status"]).toBe("applied");
   });
 });
 
@@ -636,5 +637,262 @@ describe("apply writer recovery: state machine edges", () => {
     if (healed.ok) expect(healed.outcome).toBe("applied");
     expect((await readJournal(fixture))["status"]).toBe("applied");
     expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
+  });
+});
+
+describe("apply writer temp ownership: foreign-object proofs A-F", () => {
+  test("A: an intent without identity plus a foreign object created by another process is never removed", async () => {
+    const fixture = await prepared("own-a", BASIC_SPEC, BASIC_WORKER);
+    const fops = faultFdOps();
+    fops.failCrashOnce("openat", 1, tempFaultMatch);
+    try {
+      await attempt(fixture, { fdOps: fops.ops });
+    } catch (cause) {
+      expect(isApplyCrashFault(cause)).toBe(true);
+    }
+    const state = await readJournal(fixture);
+    const active = (state["execution"] as Record<string, unknown>)["active_step"] as Record<string, unknown>;
+    const tempName = String(active["temp_name"]);
+    expect(active["temp_identity"]).toBe(null);
+    // A foreign OS process places an object at the expected temp name.
+    const child = spawn({
+      cmd: [
+        process.execPath,
+        "-e",
+        `const fs=require("node:fs");fs.writeFileSync(process.argv[1],"FOREIGN-PARTIAL",{mode:0o600});`,
+        join(fixture.operatorProject, tempName),
+      ],
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    expect(await child.exited).toBe(0);
+    const before = await lstat(join(fixture.operatorProject, tempName));
+    const refused = await attempt(fixture);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.reason).toBe("recovery_required");
+    const after = await lstat(join(fixture.operatorProject, tempName));
+    expect(after.ino).toBe(before.ino);
+    expect(after.dev).toBe(before.dev);
+    expect((await readFile(join(fixture.operatorProject, tempName), "utf8"))).toBe("FOREIGN-PARTIAL");
+    // Healing: once the operator removes the foreign object the retry
+    // recreates at the committed name and applies.
+    await rm(join(fixture.operatorProject, tempName));
+    const healed = await attempt(fixture);
+    expect(healed.ok).toBe(true);
+    if (healed.ok) expect(healed.outcome).toBe("applied");
+    expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
+  });
+
+  test("B: a crash between the exclusive create and the identity commit never deletes the created object", async () => {
+    const fixture = await prepared("own-b", BASIC_SPEC, BASIC_WORKER);
+    const fops = faultFdOps();
+    const inner = defaultPipelineStateIo;
+    let armed = false;
+    let fired = false;
+    const realFstat = fops.ops.fstat;
+    const counting = {
+      ...fops.ops,
+      fstat: ((fd: number) => {
+        if (armed) {
+          armed = false;
+          fired = true;
+          throw Object.assign(new Error("injected crash after create"), { applyCrashFault: true });
+        }
+        return realFstat(fd);
+      }) as typeof fops.ops.fstat,
+    };
+    const failing: PipelineStateIo = {
+      ...inner,
+      openExclusive: async (path: string, mode: number) => {
+        const handle = await inner.openExclusive(path, mode);
+        return {
+          chmod: (m: number) => handle.chmod(m),
+          writeAll: async (bytes: Uint8Array) => {
+            const document = JSON.parse(Buffer.from(bytes).toString("utf8")) as Record<string, unknown>;
+            const execution = document["execution"] as Record<string, unknown> | null;
+            const active = execution?.["active_step"] as Record<string, unknown> | null;
+            if (active !== null && active["temp_identity"] === null) {
+              armed = true;
+            }
+            await handle.writeAll(bytes);
+          },
+          sync: () => handle.sync(),
+          close: () => handle.close(),
+        };
+      },
+    } as PipelineStateIo;
+    let crashed = false;
+    try {
+      await attempt(fixture, { fdOps: counting as typeof fops.ops, stateIo: failing });
+    } catch (cause) {
+      crashed = isApplyCrashFault(cause);
+    }
+    expect(crashed).toBe(true);
+    expect(fired).toBe(true);
+    const state = await readJournal(fixture);
+    const active = (state["execution"] as Record<string, unknown>)["active_step"] as Record<string, unknown>;
+    expect(active["temp_identity"]).toBe(null);
+    const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    const tempName = listing.find((name) => name.startsWith(".apply-tmp-"));
+    expect(tempName).toBeDefined();
+    const before = await lstat(join(fixture.operatorProject, tempName!));
+    const refused = await attempt(fixture);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.reason).toBe("recovery_required");
+    const after = await lstat(join(fixture.operatorProject, tempName!));
+    expect(after.ino).toBe(before.ino);
+    expect(after.dev).toBe(before.dev);
+    // Healing: the operator removes the unproven object; the retry recreates.
+    await rm(join(fixture.operatorProject, tempName!));
+    const healed = await attempt(fixture);
+    expect(healed.ok).toBe(true);
+    if (healed.ok) expect(healed.outcome).toBe("applied");
+  });
+
+  test("C: a foreign inode at a durably owned temp name is never removed or adopted", async () => {
+    const fixture = await prepared("own-c", BASIC_SPEC, BASIC_WORKER);
+    const fops = faultFdOps();
+    fops.failCrashOnce("renameat", 1);
+    try {
+      await attempt(fixture, { fdOps: fops.ops });
+    } catch (cause) {
+      expect(isApplyCrashFault(cause)).toBe(true);
+    }
+    const state = await readJournal(fixture);
+    const active = (state["execution"] as Record<string, unknown>)["active_step"] as Record<string, unknown>;
+    const identity = active["temp_identity"] as Record<string, number>;
+    expect(identity).not.toBe(null);
+    const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    const tempName = listing.find((name) => name.startsWith(".apply-tmp-"));
+    expect(tempName).toBe(String(active["temp_name"]));
+    // A trusted-host adversary replaces the object with a different inode
+    // carrying the exact payload bytes.
+    const payload = await readFile(join(fixture.applyStoreRoot, "operations", "applyone", "payloads", "1.payload"));
+    await rm(join(fixture.operatorProject, tempName!));
+    await writeFile(join(fixture.operatorProject, tempName!), payload, { mode: 0o600 });
+    const replacement = await lstat(join(fixture.operatorProject, tempName!));
+    expect(replacement.ino).not.toBe(identity.ino);
+    const refused = await attempt(fixture);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.reason).toBe("recovery_required");
+    const after = await lstat(join(fixture.operatorProject, tempName!));
+    expect(after.ino).toBe(replacement.ino);
+    expect(after.dev).toBe(replacement.dev);
+  });
+
+  test("D: a same-inode content mutation of a durably owned temp is cleaned and recreated", async () => {
+    const fixture = await prepared("own-d", BASIC_SPEC, BASIC_WORKER);
+    const stream = faultStreamIo();
+    stream.failReadCrashOnce(2);
+    try {
+      await attempt(fixture, { stream: stream.io });
+    } catch (cause) {
+      expect(isApplyCrashFault(cause)).toBe(true);
+    }
+    const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    const tempName = listing.find((name) => name.startsWith(".apply-tmp-"));
+    const before = await lstat(join(fixture.operatorProject, tempName!));
+    // The same inode is mutated further (a trusted-host writer).
+    await writeFile(join(fixture.operatorProject, tempName!), Buffer.from("MUTATED-BEYOND-THE-CRASH"), { flag: "r+" });
+    const afterMutation = await lstat(join(fixture.operatorProject, tempName!));
+    expect(afterMutation.ino).toBe(before.ino);
+    const result = await attempt(fixture);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.outcome).toBe("applied");
+    expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
+    const finalListing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    expect(finalListing.some((name) => name.startsWith(".apply-tmp-"))).toBe(false);
+  });
+
+  test("E: a complete durably owned temp is adopted exactly once and published", async () => {
+    const fixture = await prepared("own-e", BASIC_SPEC, BASIC_WORKER);
+    const fops = faultFdOps();
+    fops.failCrashOnce("renameat", 1);
+    try {
+      await attempt(fixture, { fdOps: fops.ops });
+    } catch (cause) {
+      expect(isApplyCrashFault(cause)).toBe(true);
+    }
+    const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    const tempName = listing.find((name) => name.startsWith(".apply-tmp-"));
+    const before = await lstat(join(fixture.operatorProject, tempName!));
+    const result = await attempt(fixture);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.outcome).toBe("applied");
+    const afterListing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    expect(afterListing.some((name) => name.startsWith(".apply-tmp-"))).toBe(false);
+    expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
+    void before;
+  });
+
+  test("F: a published target whose progress commit lags is adopted by the recovery walk", async () => {
+    const fixture = await prepared("own-f", BASIC_SPEC, BASIC_WORKER);
+    const refusing = crashAtProgressCommit(2);
+    const refused = await attempt(fixture, { stateIo: refusing });
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.reason).toBe("state_persist_failed");
+    expect((await readFile(join(fixture.operatorProject, "chg.txt"))).toString()).toBe("NEW");
+    expect((await (await import("node:fs/promises")).stat(join(fixture.operatorProject, "gone.txt")).catch(() => null))).toBe(null);
+    const retry = await attempt(fixture);
+    expect(retry.ok).toBe(true);
+    expect((await readJournal(fixture))["status"]).toBe("applied");
+  });
+
+  test("a symlink temp created without a durable identity is never removed (recovery_required)", async () => {
+    const fixture = await prepared("own-symlink-b", [
+      { path: "target.txt", kind: "file", content: "TARGET" },
+    ], async (ws) => {
+      await symlink("target.txt", join(ws, "fresh-link"));
+    });
+    const fops = faultFdOps();
+    const inner = defaultPipelineStateIo;
+    let armed = false;
+    const realFstat = fops.ops.fstat;
+    const counting = {
+      ...fops.ops,
+      fstat: ((fd: number) => {
+        if (armed) {
+          armed = false;
+          throw Object.assign(new Error("injected crash after symlink create"), { applyCrashFault: true });
+        }
+        return realFstat(fd);
+      }) as typeof fops.ops.fstat,
+    };
+    const failing: PipelineStateIo = {
+      ...inner,
+      openExclusive: async (path: string, mode: number) => {
+        const handle = await inner.openExclusive(path, mode);
+        return {
+          chmod: (m: number) => handle.chmod(m),
+          writeAll: async (bytes: Uint8Array) => {
+            const document = JSON.parse(Buffer.from(bytes).toString("utf8")) as Record<string, unknown>;
+            const execution = document["execution"] as Record<string, unknown> | null;
+            const active = execution?.["active_step"] as Record<string, unknown> | null;
+            if (active !== null && active["temp_identity"] === null) {
+              armed = true;
+            }
+            await handle.writeAll(bytes);
+          },
+          sync: () => handle.sync(),
+          close: () => handle.close(),
+        };
+      },
+    } as PipelineStateIo;
+    let crashed = false;
+    try {
+      await attempt(fixture, { fdOps: counting as typeof fops.ops, stateIo: failing });
+    } catch (cause) {
+      crashed = isApplyCrashFault(cause);
+    }
+    expect(crashed).toBe(true);
+    const refused = await attempt(fixture);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.reason).toBe("recovery_required");
+    expect(await (await import("node:fs/promises")).readlink(join(fixture.operatorProject, ".apply-tmp-0")).catch(() => null)).toBe(null);
+    const listing = await (await import("node:fs/promises")).readdir(fixture.operatorProject);
+    const tempName = listing.find((name) => name.startsWith(".apply-tmp-"));
+    expect(tempName).toBeDefined();
+    expect(await (await import("node:fs/promises")).readlink(join(fixture.operatorProject, tempName!))).toBe("target.txt");
   });
 });

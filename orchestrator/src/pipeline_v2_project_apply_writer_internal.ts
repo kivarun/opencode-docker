@@ -512,11 +512,35 @@ async function runLockedExecution(
             validateApplyOperationState({
               ...current,
               revision: before + 1,
-              execution: executionOf(completed, deepFreezeValue({ step_index: stepIndex, temp_name: tempName })),
+              execution: executionOf(
+                completed,
+                deepFreezeValue({ step_index: stepIndex, temp_name: tempName, temp_identity: null }),
+              ),
             }),
             (reloaded) =>
               reloaded.execution?.active_step?.step_index === stepIndex &&
               reloaded.execution.active_step.temp_name === tempName &&
+              reloaded.execution.active_step.temp_identity === null &&
+              reloaded.revision >= before + 1,
+          );
+        },
+        commitTempIdentity: async (stepIndex, tempName, dev, ino) => {
+          const before = current.revision;
+          await commitState(
+            validateApplyOperationState({
+              ...current,
+              revision: before + 1,
+              execution: executionOf(
+                completed,
+                deepFreezeValue({ step_index: stepIndex, temp_name: tempName, temp_identity: deepFreezeValue({ dev, ino }) }),
+              ),
+            }),
+            (reloaded) =>
+              reloaded.execution?.active_step?.step_index === stepIndex &&
+              reloaded.execution.active_step.temp_name === tempName &&
+              reloaded.execution.active_step.temp_identity !== null &&
+              reloaded.execution.active_step.temp_identity.dev === dev &&
+              reloaded.execution.active_step.temp_identity.ino === ino &&
               reloaded.revision >= before + 1,
           );
         },
