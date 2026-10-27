@@ -239,7 +239,9 @@ describe("control-plane HTTP: browser UI routes", () => {
   test("u9. the existing JSON routes are unchanged and carry no UI headers", async () => {
     const projects = JSON.parse((await get("/v1/projects")).body) as Record<string, unknown>;
     expect(projects["kind"]).toBe("projects");
-    expect(projects["schema_version"]).toBe(1);
+    // the projects discovery moved honestly to schema version 2 with
+    // the effective Project Apply capability field
+    expect(projects["schema_version"]).toBe(2);
     const runs = JSON.parse((await get("/v1/runs")).body) as Record<string, unknown>;
     expect(runs["kind"]).toBe("runs");
     expect(runs["runs"]).toEqual([{ run_id: "run-a", project_id: "project-a", project_available: true }]);

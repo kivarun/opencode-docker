@@ -17,6 +17,8 @@ export interface UiProjectsModel {
   readonly projects: readonly {
     readonly id: string;
     readonly inputRootIds: readonly string[];
+    /** The effective Project Apply capability of the bound project. */
+    readonly projectApply: boolean;
   }[];
 }
 
@@ -940,3 +942,125 @@ export type UiBoundedLineDiff =
   | { readonly kind: "refusal"; readonly reason: "not_text" | "too_many_lines" | "work_budget" };
 
 export declare function computeBoundedLineDiff(leftBytes: Uint8Array, rightBytes: Uint8Array): UiBoundedLineDiff;
+
+/* --- Project apply (v8): explicit durable Project Apply. ------------- */
+
+export declare const PROJECT_APPLY_OPERATION_STATUSES: readonly string[];
+
+export declare const PROJECT_APPLY_UI_STATES: readonly string[];
+
+export interface UiProjectApplyOperationModel {
+  readonly kind: "project_apply_operation";
+  readonly runId: string;
+  readonly applyId: string;
+  readonly projectId: string;
+  readonly observation: string;
+  readonly revision: number;
+  readonly status: string;
+  readonly completedStepCount: number;
+  readonly totalStepCount: number;
+}
+
+export declare function parseProjectApplyOperationDocument(
+  document: unknown,
+  expected: { readonly runId: string; readonly applyId: string; readonly observation: string },
+): UiProjectApplyOperationModel;
+
+export declare function requestProjectApplyJson(
+  fetchImpl: ((path: string, init?: RequestInit) => Promise<Response>) | null,
+  path: string,
+  init: RequestInit | undefined,
+  expected: { readonly runId: string; readonly applyId: string; readonly observation: string },
+): Promise<UiEndpointResult>;
+
+export declare function projectApplyRequestPath(runId: string, applyId: string): string;
+
+export declare function projectApplyPostBody(observation: string): { readonly schema_version: 1; readonly observation: string };
+
+export declare const PROJECT_APPLY_INELIGIBILITY_REASONS: readonly string[];
+
+export interface UiProjectApplyEligibility {
+  readonly eligible: boolean;
+  readonly reason: string | null;
+}
+
+export declare function projectApplyEligibility(options: {
+  readonly terminalStatus: unknown;
+  readonly capability: unknown;
+  readonly changesState: unknown;
+  readonly applyState: unknown;
+  readonly mutationInFlight: unknown;
+}): UiProjectApplyEligibility;
+
+export declare const APPLY_RECORD_STORAGE_PREFIX: string;
+
+export interface UiApplyRecoveryRecord {
+  readonly runId: string;
+  readonly applyId: string;
+  readonly observation: string;
+}
+
+export declare function parseApplyRecoveryRecord(document: unknown): UiApplyRecoveryRecord;
+
+export interface UiApplyRecoveryStore {
+  load(runId: string): { readonly record: UiApplyRecoveryRecord | null; readonly error: string | null };
+  save(runId: string, observation: string): { readonly saved: boolean; readonly error: string | null };
+  remove(runId: string): boolean;
+}
+
+export declare function createApplyRecoveryStore(storage: unknown): UiApplyRecoveryStore;
+
+export interface UiProjectApplyTransport {
+  request(desire: {
+    readonly runId: string;
+    readonly applyId: string;
+    readonly observation: string;
+    readonly onSettled?: (settlement: { readonly fulfilled: boolean; readonly superseded: boolean; readonly result?: unknown; readonly error?: unknown }) => void;
+  }): void;
+  invalidate(): void;
+  dispose(): void;
+}
+
+export declare function createProjectApplyTransport(io: {
+  readonly fetchOperation: (
+    runId: string,
+    applyId: string,
+    observation: string,
+    signal: AbortSignal | undefined,
+  ) => Promise<unknown>;
+}): UiProjectApplyTransport;
+
+export interface UiProjectApplyState {
+  readonly runId: string;
+  readonly uiState: string;
+  readonly applyId: string | null;
+  readonly observation: string | null;
+  readonly revision: number | null;
+  readonly completedSteps: number | null;
+  readonly totalSteps: number | null;
+  readonly error: { readonly layer: string; readonly reason: string } | null;
+  readonly recordError: string | null;
+  readonly recoveryIssued: boolean;
+  readonly submitKind: string | null;
+}
+
+export interface UiProjectApplyViewer {
+  transitionToRun(runId: string): void;
+  dropView(): void;
+  changesSnapshotReady(changesState: unknown): void;
+  review(): void;
+  cancel(): void;
+  confirm(observation: string): void;
+  retry(): void;
+  continueRecovery(): void;
+  checkStatus(): void;
+  currentState(): UiProjectApplyState | null;
+}
+
+export declare function createProjectApplyViewer(io: {
+  readonly recoveryStore: UiApplyRecoveryStore;
+  readonly transport: UiProjectApplyTransport;
+  readonly submit: (identity: { readonly runId: string; readonly applyId: string; readonly observation: string }) => Promise<unknown>;
+  readonly onState: (state: UiProjectApplyState | null) => void;
+  readonly onApplied?: (identity: { readonly runId: string; readonly applyId: string; readonly observation: string }) => void;
+}): UiProjectApplyViewer;

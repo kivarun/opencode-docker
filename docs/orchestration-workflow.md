@@ -7122,9 +7122,10 @@ supplies.
   `GET` on the same path is read-only, never runs recovery and answers a
   404 without disclosure for a missing or foreign operation. Durable
   conflicts and `recovery_required` travel as typed command results —
-  they are operation states, never lost transport errors. The Browser UI
-  has no Apply surface: its general API client keeps rejecting the new
-  document kinds fail-closed.
+  they are operation states, never lost transport errors. The read-only
+  operator surface is the same-origin browser UI apply panel (below);
+  its general API client keeps rejecting the new document kinds
+  fail-closed.
 - **Guarantees preserved unchanged.** Apply never starts a worker, a
   Docker Helper call or a session; the full preflight precedes the first
   project mutation; progress is per-path crash-safe (not whole-tree
@@ -7135,3 +7136,85 @@ supplies.
   workers still see only the run workspace; the dogfood kit stays
   read-only. Operations are durable and retryable by apply id across
   service restarts.
+
+## Browser UI v8: explicit durable Project Apply
+
+The same-origin browser UI gains an explicit, operator-confirmed
+`Project apply` section over the existing versioned Apply endpoints. It
+is the read-only operator surface of the explicit Apply API; nothing in
+the panel modifies the registered project without the operator's
+explicit confirmation, and no automatic Apply exists anywhere.
+
+**Capability discovery.** The projects discovery document moved honestly
+to schema version 2: `{schema_version: 2, kind: "projects", projects[]
+{id, input_roots[] {id}, project_apply}}`. The service computes the one
+effective capability flag as
+`registry project_apply === true && the server-owned apply-store root is
+configured`; nothing else is disclosed — no project path, apply-store
+path, mount details or registry internals. The browser parser validates
+the document version per kind (`PROJECTS_SCHEMA_VERSION = 2` for
+projects, 1 for every other kind); a v1 projects document is
+`unknown_schema_version`, never silently accepted. With
+`project_apply: false` the Apply control is disabled with zero GET/POST,
+while read-only Changes/Content keep working.
+
+**Apply identity and the browser recovery record.** The apply id is the
+exact original Project Changes observation (64 lowercase hex, bound to
+the run). Before the first POST the browser synchronously stores the
+minimal record `{schema_version: 1, run_id, apply_id, observation}` in
+`localStorage` under one closed namespace owner
+(`orchestrator.apply.v1:<runId>`). Only safe metadata is stored — no
+paths, contents, payload bytes, digest nodes, credentials or
+diagnostics. A corrupted record is surfaced as a recovery-record error
+and never silently deleted; an unavailable storage or a failed
+byte/shape-equivalent read-back blocks the POST; selection changes,
+network errors, reloads and browser restarts preserve the record; a new
+operation is refused while a nonterminal/recovery record exists for the
+run; and a completed record is removed only after a confirmed
+`applied`/`already_applied` plus a fully loaded Project Changes reload
+without pending or diverged entries. The record is a recovery hint, not
+authoritative state: the authoritative status is always the GET API.
+
+**Recovery on load.** After selecting a run and loading its terminal
+Project Changes snapshot fully, an absent record issues zero operation
+GETs and a present record issues exactly one
+`GET /v1/runs/:runId/project-applies/:applyId` with the stored original
+observation — no polling, timers or backoff. A 404 is shown as a
+lost/missing durable operation with the record kept; durable
+`preparing`/`prepared`/`applying`/`recovery_required` statuses are
+displayed but never auto-continued — continuation is an explicit button
+POSTing the same apply id and observation; `applied` triggers exactly
+one internal explicit Project Changes reload; `conflict`/`failed` stay
+visible and are never masked as transport errors. Recovery always uses
+the stored original observation, even when the current Changes
+observation has already changed through partial Apply progress.
+
+**Eligibility and confirmation.** Apply is offered only when the run is
+terminal, the effective capability is on, the Changes state is ready and
+not stale, every page is loaded (`loaded === summary.total` and
+`nextAfter === null`), `total > 0`, `diverged === 0`, at least one
+change is `matches_baseline`, no recovery record is active and no other
+UI mutation is in flight — Apply is never offered from a partial first
+page. The first press renders an inline confirmation only (run id,
+snapshot revision, observation, total/pending/already-present counts
+plus the three fixed warnings: the registered project will be modified;
+the operation is per-path crash-recoverable but not whole-tree atomic;
+the cooperative lock does not protect against external IDE/git writers)
+with Cancel (zero effects) and Confirm (record write, then exactly one
+POST). No `confirm()`, rendering only through `createElement`/
+`textContent`.
+
+**Mutation ownership and errors.** The apply POST runs through the same
+UI mutation gate as every other run mutation: at most one unsettled
+mutation POST exists, a double click creates no second POST, a network
+failure is `network_unknown` (never "not applied"), Retry reuses the
+same apply id and observation, there is no automatic retry, timer or
+polling, and a late response of another run is dropped by run binding.
+The read-only operation GET has its own single-flight transport that
+never starts a POST. `stale_observation` clears the confirmation and the
+recovery record (the backend refuses preparation before any journal
+create) without touching the loaded Changes snapshot;
+`project_busy`/`preparation_busy` admit only an explicit Retry of the
+same operation; `identity_conflict` fails closed with no automatic new
+apply id; every error is a safe `layer: reason` presentation — never raw
+stderr, message, path or content.

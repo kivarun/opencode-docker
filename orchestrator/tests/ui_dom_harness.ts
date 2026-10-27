@@ -176,6 +176,18 @@ export interface UiHarness {
   changesEmpty(): string;
   /** The hidden/disabled state of one changes action button. */
   changesButtonState(id: string): { hidden: boolean; disabled: boolean };
+  /** The apply panel's aria-live status line. */
+  applyStatus(): string;
+  /** The apply panel's recovery-record line. */
+  applyRecord(): string;
+  /** The apply panel's operation meta line. */
+  applyMeta(): string;
+  /** The joined confirmation detail lines. */
+  applyConfirmation(): string;
+  /** Whether the confirmation panel is visible. */
+  applyConfirmationVisible(): boolean;
+  /** The hidden/disabled state of one apply action button. */
+  applyButtonState(id: string): { hidden: boolean; disabled: boolean };
   readonly clock: UiHarnessClock | null;
   /** Clicks the Inspect button of the run row at `index` in the runs table. */
   clickRunInspect(index: number): void;
@@ -253,12 +265,30 @@ const UI_ELEMENT_IDS = [
   "content-review-retry",
   "content-review-reload-changes",
   "content-review-close",
+  "project-apply-section",
+  "project-apply-status",
+  "project-apply-record",
+  "project-apply-meta",
+  "project-apply-confirmation",
+  "project-apply-confirmation-details",
+  "project-apply-confirm",
+  "project-apply-cancel",
+  "project-apply-review",
+  "project-apply-retry",
+  "project-apply-check",
+  "project-apply-continue",
 ] as const;
 
 export interface UiHarnessOptions {
   readonly fetchImpl: (path: string, init?: RequestInit) => Promise<Response>;
   /** When omitted the harness uses the real timers. */
   readonly clock?: UiHarnessClock;
+  /**
+   * The browser storage the module's closed recovery-record owner
+   * binds; when omitted a fresh in-memory store is installed (the
+   * harness never touches a real browser storage).
+   */
+  readonly storage?: Map<string, string> | null;
 }
 
 export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarness> {
@@ -301,6 +331,23 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
   const previousFetch = (globalThis as Record<string, unknown>)["fetch"];
   const previousSetTimeout = (globalThis as Record<string, unknown>)["setTimeout"];
   const previousClearTimeout = (globalThis as Record<string, unknown>)["clearTimeout"];
+  const previousLocalStorage = (globalThis as Record<string, unknown>)["localStorage"];
+  const storageMap = options.storage === undefined ? new Map<string, string>() : options.storage;
+  const storageShim =
+    storageMap === null
+      ? undefined
+      : {
+          getItem: (key: string): string | null => (storageMap.has(key) ? (storageMap.get(key) as string) : null),
+          setItem: (key: string, value: string): void => {
+            storageMap.set(key, value);
+          },
+          removeItem: (key: string): void => {
+            storageMap.delete(key);
+          },
+        };
+  (globalThis as Record<string, unknown>)["document"] = documentShim;
+  (globalThis as Record<string, unknown>)["fetch"] = options.fetchImpl;
+  (globalThis as Record<string, unknown>)["localStorage"] = storageShim;
   // Real timers scheduled through the module-level adapter must never
   // outlive the harness: without a clock the shims pass through to the
   // real timers but track every handle so dispose() can cancel all
@@ -335,6 +382,7 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
       (globalThis as Record<string, unknown>)["fetch"] = previousFetch;
       (globalThis as Record<string, unknown>)["setTimeout"] = previousSetTimeout;
       (globalThis as Record<string, unknown>)["clearTimeout"] = previousClearTimeout;
+      (globalThis as Record<string, unknown>)["localStorage"] = previousLocalStorage;
     }
   }
 
@@ -421,6 +469,16 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
       const button = harness.element(id);
       return { hidden: button.hidden, disabled: button.disabled };
     },
+    applyStatus: () => harness.element("project-apply-status").textContent,
+    applyRecord: () => harness.element("project-apply-record").textContent,
+    applyMeta: () => harness.element("project-apply-meta").textContent,
+    applyConfirmation: () =>
+      harness.element("project-apply-confirmation-details").children.map((node) => node.textContent).join("|"),
+    applyConfirmationVisible: () => !harness.element("project-apply-confirmation").hidden,
+    applyButtonState: (id) => {
+      const button = harness.element(id);
+      return { hidden: button.hidden, disabled: button.disabled };
+    },
     clock,
     dispose: () => {
       if (disposed) {
@@ -439,6 +497,7 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
       (globalThis as Record<string, unknown>)["fetch"] = previousFetch;
       (globalThis as Record<string, unknown>)["setTimeout"] = previousSetTimeout;
       (globalThis as Record<string, unknown>)["clearTimeout"] = previousClearTimeout;
+      (globalThis as Record<string, unknown>)["localStorage"] = previousLocalStorage;
     },
   };
 
@@ -482,8 +541,8 @@ export function runsPageDocument(runIds: readonly string[]): Record<string, unkn
 
 export function projectsDocument(): Record<string, unknown> {
   return {
-    schema_version: 1,
+    schema_version: 2,
     kind: "projects",
-    projects: [{ id: "project-a", input_roots: [{ id: "tasks" }] }],
+    projects: [{ id: "project-a", input_roots: [{ id: "tasks" }], project_apply: false }],
   };
 }

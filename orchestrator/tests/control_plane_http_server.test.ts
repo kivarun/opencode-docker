@@ -1450,13 +1450,13 @@ describe("control-plane HTTP: discovery (projects and bound runs)", () => {
     rmSync(envRoot, { recursive: true, force: true });
   });
 
-  test("d1. projects project declaration-order ids only, byte-identical on repeat", async () => {
+  test("d1. projects project declaration-order ids and the effective capability, byte-identical on repeat", async () => {
     const expected = {
-      schema_version: 1,
+      schema_version: 2,
       kind: "projects",
       projects: [
-        { id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }] },
-        { id: "project-b", input_roots: [{ id: "notes" }] },
+        { id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }], project_apply: false },
+        { id: "project-b", input_roots: [{ id: "notes" }], project_apply: false },
       ],
     };
     const first = await get("/v1/projects");
@@ -1639,7 +1639,7 @@ describe("control-plane HTTP: discovery (projects and bound runs)", () => {
         }),
       ],
     });
-    const projected = projectControlPlaneProjects(frozen as never);
+    const projected = projectControlPlaneProjects(frozen as never, { applyStoreConfigured: true });
     expect(projected.projects.map((project) => project.id)).toEqual(["project-a", "project-b"]);
     const entries = projectControlPlaneRuns(
       [

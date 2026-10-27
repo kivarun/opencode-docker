@@ -46,14 +46,21 @@
  *
  * Security posture: all inserted content travels through textContent
  * (no direct HTML injection, no dynamic code evaluation, no external
- * origins, no browser storage, no workers, no websockets); failures are
- * shown as `layer: reason` strings only. The fresh-run POST is never
+ * origins, no workers, no websockets); failures are
+ * shown as `layer: reason` strings only. The only browser storage is
+ * the one closed-namespace Project Apply recovery record
+ * (`orchestrator.apply.v1:*`, Browser UI v8) holding the run and apply
+ * ids and the observation — never paths, contents or secrets. The
+ * fresh-run POST is never
  * retried automatically: a lost response is recovered exclusively
  * through the safe GET inspect of the caller-owned run id, which is
  * created and displayed before the request is sent.
  */
 
 const SCHEMA_VERSION = 1;
+/** The projects discovery document version: 2 since the effective
+ * Project Apply capability flag became a required project field. */
+const PROJECTS_SCHEMA_VERSION = 2;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const RUNS_PAGE_LIMIT = 100;
 const MAX_DOCUMENT_BYTES = 1048576;
@@ -251,7 +258,7 @@ function parseProjectsDocument(document) {
     if (!isRecord(entry)) {
       throw new UiContractError("invalid_shape");
     }
-    expectShape(entry, ["id", "input_roots"]);
+    expectShape(entry, ["id", "input_roots", "project_apply"]);
     const inputRootIds = expectArray(entry, "input_roots").map((root) => {
       if (!isRecord(root)) {
         throw new UiContractError("invalid_shape");
@@ -259,7 +266,11 @@ function parseProjectsDocument(document) {
       expectShape(root, ["id"]);
       return expectString(root, "id");
     });
-    return Object.freeze({ id: expectString(entry, "id"), inputRootIds: Object.freeze(inputRootIds) });
+    return Object.freeze({
+      id: expectString(entry, "id"),
+      inputRootIds: Object.freeze(inputRootIds),
+      projectApply: expectBoolean(entry, "project_apply"),
+    });
   });
   return Object.freeze({ kind: "projects", projects: Object.freeze(modelProjects) });
 }
@@ -480,7 +491,12 @@ export function parseApiDocument(document) {
   if (!isRecord(document)) {
     throw new UiContractError("not_a_document");
   }
-  if (document["schema_version"] !== SCHEMA_VERSION) {
+  // The projects discovery moved honestly to schema version 2 when the
+  // effective Project Apply capability flag became a required field;
+  // every other kind stays at version 1. An old or foreign form fails
+  // closed — no silent unknown field in either version.
+  const expectedVersion = document["kind"] === "projects" ? PROJECTS_SCHEMA_VERSION : SCHEMA_VERSION;
+  if (document["schema_version"] !== expectedVersion) {
     throw new UiContractError("unknown_schema_version");
   }
   switch (document["kind"]) {
@@ -2649,6 +2665,948 @@ export function createProjectChangesViewer(io) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Project apply (v8): explicit durable application of the reviewed    */
+/* run workspace changes to the registered project.                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The UI mirror of the production operation status vocabulary (the
+ * backend owner is `PIPELINE_V2_APPLY_OPERATION_STATUSES`; the parity
+ * is pinned by tests). The durable statuses keep their exact names in
+ * the UI state — there is no UI-only pseudo-status that could be
+ * confused with a durable backend status.
+ */
+export const PROJECT_APPLY_OPERATION_STATUSES = Object.freeze([
+  "preparing",
+  "prepared",
+  "applying",
+  "applied",
+  "conflict",
+  "recovery_required",
+  "failed",
+]);
+
+const PROJECT_APPLY_OPERATION_KEYS = [
+  "schema_version",
+  "kind",
+  "run_id",
+  "apply_id",
+  "project_id",
+  "observation",
+  "revision",
+  "status",
+  "completed_step_count",
+  "total_step_count",
+];
+
+/**
+ * The one parser of the `project_apply_operation` document: exact own
+ * keys at every level, the production status vocabulary, positive-safe
+ * revision and step coherence, and the exact binding to the expected
+ * run id, apply id and observation — a response that does not name
+ * exactly the requested operation is never applied. No path, content,
+ * temp name or host identity is accepted or echoed.
+ */
+export function parseProjectApplyOperationDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "project_apply_operation") {
+    throw new UiContractError("unknown_kind");
+  }
+  expectShape(document, PROJECT_APPLY_OPERATION_KEYS);
+  if (!isRecord(expected) || !isSafeId(expected["runId"]) || !isSafeId(expected["applyId"])) {
+    throw new UiContractError("invalid_request");
+  }
+  const observation = expectString(document, "observation");
+  if (typeof expected["observation"] !== "string" || !HEX64_PATTERN.test(expected["observation"])) {
+    throw new UiContractError("invalid_request");
+  }
+  if (!HEX64_PATTERN.test(observation) || observation !== expected["observation"]) {
+    throw new UiContractError("observation_mismatch");
+  }
+  const runId = expectString(document, "run_id");
+  if (!isSafeId(runId) || runId !== expected["runId"]) {
+    throw new UiContractError("unexpected_run");
+  }
+  const applyId = expectString(document, "apply_id");
+  if (!isSafeId(applyId) || applyId !== expected["applyId"]) {
+    throw new UiContractError("apply_id_mismatch");
+  }
+  const projectId = expectString(document, "project_id");
+  if (!isSafeId(projectId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const revision = expectPositiveInteger(document, "revision");
+  const status = expectOneOf(document, "status", PROJECT_APPLY_OPERATION_STATUSES);
+  const completedStepCount = expectNonNegativeInteger(document, "completed_step_count");
+  const totalStepCount = expectNonNegativeInteger(document, "total_step_count");
+  if (completedStepCount > totalStepCount) {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({
+    kind: "project_apply_operation",
+    runId,
+    applyId,
+    projectId,
+    observation,
+    revision,
+    status,
+    completedStepCount,
+    totalStepCount,
+  });
+}
+
+/**
+ * The one document classifier of the Project Apply endpoints: a
+ * well-formed `project_apply_operation` document bound to the expected
+ * operation, or one of the endpoints' documented failure envelopes
+ * (`error`, or the failed `command_result` of a rejected apply). A
+ * succeeded command result is unsuitable and fails closed; every other
+ * kind fails closed.
+ */
+function parseProjectApplyEndpointDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "project_apply_operation") {
+    return parseProjectApplyOperationDocument(document, expected);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/**
+ * The Project Apply endpoint client: it reuses the one bounded JSON
+ * response primitive and classifies the document by kind, never by
+ * message text. The raw Response is never retained and no path,
+ * content or diagnostic is ever echoed.
+ */
+export async function requestProjectApplyJson(fetchImpl, path, init, expected) {
+  return requestJsonDocument(fetchImpl, path, init, (document) => parseProjectApplyEndpointDocument(document, expected));
+}
+
+/** The exact operation URL: only the run id and the apply id travel in
+ * the URL — never a project path, apply store root or observation. */
+export function projectApplyRequestPath(runId, applyId) {
+  if (!isSafeId(runId) || !isSafeId(applyId)) {
+    throw new UiContractError("invalid_request");
+  }
+  return `/v1/runs/${runId}/project-applies/${applyId}`;
+}
+
+/** The exact POST body of the explicit Apply API. */
+export function projectApplyPostBody(observation) {
+  if (typeof observation !== "string" || !HEX64_PATTERN.test(observation)) {
+    throw new UiContractError("invalid_request");
+  }
+  return Object.freeze({ schema_version: SCHEMA_VERSION, observation });
+}
+
+/**
+ * The closed eligibility vocabulary of the Review apply action. Every
+ * reason is a UI contract fact, never a backend status.
+ */
+export const PROJECT_APPLY_INELIGIBILITY_REASONS = Object.freeze([
+  "run_not_terminal",
+  "capability_disabled",
+  "changes_not_ready",
+  "changes_stale",
+  "changes_incomplete",
+  "no_changes",
+  "diverged_present",
+  "no_pending_changes",
+  "operation_active",
+  "mutation_in_flight",
+]);
+
+/**
+ * The one pure eligibility owner of the Review apply action. The apply
+ * is offered only when every condition holds at once: the selected run
+ * is terminal (succeeded or failed — the existing Changes contract),
+ * the effective capability is on, the Project Changes snapshot is
+ * ready, not stale and fully loaded (loaded === total and no
+ * continuation), there is at least one change, none of them diverged,
+ * at least one still pending (relation `matches_baseline` — an
+ * all-already-present plan needs no apply), no operation is active for
+ * the run and no other UI mutation POST is in flight. A partial page
+ * out of a longer history never enables the apply.
+ */
+export function projectApplyEligibility(options) {
+  if (!isRecord(options)) {
+    throw new UiContractError("invalid_request");
+  }
+  const terminal = options["terminalStatus"];
+  if (terminal !== "succeeded" && terminal !== "failed") {
+    return ineligible("run_not_terminal");
+  }
+  if (options["capability"] !== true) {
+    return ineligible("capability_disabled");
+  }
+  const changes = options["changesState"];
+  if (isRecord(changes) && changes["requestState"] === "stale") {
+    return ineligible("changes_stale");
+  }
+  if (
+    !isRecord(changes) ||
+    changes["requestState"] !== "ready" ||
+    changes["summary"] === null ||
+    !isRecord(changes["summary"])
+  ) {
+    return ineligible("changes_not_ready");
+  }
+  if (changes["nextAfter"] !== null || changes["changes"].length !== changes["summary"]["total"]) {
+    return ineligible("changes_incomplete");
+  }
+  const summary = changes["summary"];
+  if (summary["total"] === 0) {
+    return ineligible("no_changes");
+  }
+  if (summary["diverged"] > 0) {
+    return ineligible("diverged_present");
+  }
+  if (summary["matches_baseline"] === 0) {
+    return ineligible("no_pending_changes");
+  }
+  const phase = options["applyState"];
+  if (typeof phase !== "string" || phase !== "idle") {
+    return ineligible("operation_active");
+  }
+  if (options["mutationInFlight"] === true) {
+    return ineligible("mutation_in_flight");
+  }
+  return Object.freeze({ eligible: true, reason: null });
+
+  function ineligible(reason) {
+    if (!(PROJECT_APPLY_INELIGIBILITY_REASONS.indexOf(reason) >= 0)) {
+      throw new UiContractError("invalid_request");
+    }
+    return Object.freeze({ eligible: false, reason });
+  }
+}
+
+/* --- The browser recovery record: the one closed storage owner. ----- */
+
+/** The single closed localStorage namespace of the recovery records. */
+export const APPLY_RECORD_STORAGE_PREFIX = "orchestrator.apply.v1:";
+
+const APPLY_RECORD_KEYS = ["schema_version", "run_id", "apply_id", "observation"];
+
+/**
+ * The parser of one stored recovery record: exact own keys, version 1,
+ * safe run and apply ids and a 64-hex observation binding. Nothing else is
+ * ever read from storage and no path, content or diagnostic is stored.
+ */
+export function parseApplyRecoveryRecord(document) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  expectShape(document, APPLY_RECORD_KEYS);
+  const runId = expectString(document, "run_id");
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const applyId = expectString(document, "apply_id");
+  if (!isSafeId(applyId) || !HEX64_PATTERN.test(applyId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const observation = expectString(document, "observation");
+  if (!HEX64_PATTERN.test(observation)) {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({ runId, applyId, observation });
+}
+
+/**
+ * The one closed browser storage owner of the Apply recovery records:
+ * one record per run id under one fixed namespace prefix. The record
+ * is a browser recovery hint only — the authoritative operation status
+ * is always the GET API. The store never deletes a corrupted record
+ * silently (the error is surfaced), never stores anything beyond the
+ * four safe metadata fields, and refuses to write a new record while
+ * one already exists for the run (a retry never writes; only a
+ * confirmed applied operation plus a confirming reload removes it).
+ *
+ * `storage` is the localStorage-like object (`getItem`/`setItem`/
+ * `removeItem`) or `null` when browser storage is unavailable — an
+ * unavailable store refuses every write so an apply never starts
+ * without its durable recovery hint.
+ */
+export function createApplyRecoveryStore(storage) {
+  if (storage !== null && (!isRecord(storage) || typeof storage["getItem"] !== "function" || typeof storage["setItem"] !== "function" || typeof storage["removeItem"] !== "function")) {
+    throw new UiContractError("invalid_storage");
+  }
+  const keyFor = (runId) => {
+    if (!isSafeId(runId)) {
+      throw new UiContractError("invalid_run_id");
+    }
+    return `${APPLY_RECORD_STORAGE_PREFIX}${runId}`;
+  };
+  const readRaw = (key) => {
+    try {
+      return { ok: true, value: storage.getItem(key) };
+    } catch {
+      return { ok: false, value: undefined };
+    }
+  };
+  return Object.freeze({
+    /** The record of one run or `null`; `error` is `corrupt_record` or
+     * `storage_unavailable` — a corrupted record is never deleted. */
+    load(runId) {
+      const key = keyFor(runId);
+      if (storage === null) {
+        return Object.freeze({ record: null, error: "storage_unavailable" });
+      }
+      const read = readRaw(key);
+      if (!read.ok) {
+        return Object.freeze({ record: null, error: "storage_unavailable" });
+      }
+      const raw = read.value;
+      if (raw === undefined || raw === null || raw === "") {
+        return Object.freeze({ record: null, error: null });
+      }
+      if (typeof raw !== "string") {
+        return Object.freeze({ record: null, error: "corrupt_record" });
+      }
+      let document;
+      try {
+        document = JSON.parse(raw);
+      } catch {
+        return Object.freeze({ record: null, error: "corrupt_record" });
+      }
+      try {
+        return Object.freeze({ record: parseApplyRecoveryRecord(document), error: null });
+      } catch {
+        return Object.freeze({ record: null, error: "corrupt_record" });
+      }
+    },
+    /**
+     * Writes the recovery hint for one run and reads it back for a
+     * byte- and shape-equivalent verification; every failure refuses
+     * the write so the caller never POSTs without a durable hint. A
+     * record that already exists for the run is never overwritten.
+     */
+    save(runId, observation) {
+      const key = keyFor(runId);
+      if (typeof observation !== "string" || !HEX64_PATTERN.test(observation)) {
+        throw new UiContractError("invalid_request");
+      }
+      if (storage === null) {
+        return Object.freeze({ saved: false, error: "storage_unavailable" });
+      }
+      const existing = readRaw(key);
+      if (existing.ok && existing.value !== null && existing.value !== undefined && existing.value !== "") {
+        return Object.freeze({ saved: false, error: "record_exists" });
+      }
+      const wire = JSON.stringify({ schema_version: SCHEMA_VERSION, run_id: runId, apply_id: observation, observation });
+      try {
+        storage.setItem(key, wire);
+      } catch {
+        return Object.freeze({ saved: false, error: "record_unwritable" });
+      }
+      const readBack = readRaw(key);
+      if (!readBack.ok || readBack.value !== wire) {
+        return Object.freeze({ saved: false, error: "record_unwritable" });
+      }
+      try {
+        const parsed = parseApplyRecoveryRecord(JSON.parse(String(readBack.value)));
+        if (parsed.runId !== runId || parsed.applyId !== observation || parsed.observation !== observation) {
+          return Object.freeze({ saved: false, error: "record_unwritable" });
+        }
+      } catch {
+        return Object.freeze({ saved: false, error: "record_unwritable" });
+      }
+      return Object.freeze({ saved: true, error: null });
+    },
+    /** Removes the record of one run; a storage failure keeps it. */
+    remove(runId) {
+      const key = keyFor(runId);
+      if (storage === null) {
+        return false;
+      }
+      try {
+        storage.removeItem(key);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+}
+
+/* --- The single-flight transport of the operation GETs. ------------- */
+
+/**
+ * The one single-flight transport of the read-only operation GETs: at
+ * most one unsettled GET exists at any instant. A new desire
+ * supersedes the active request and coalesces as the one follow-up;
+ * `invalidate()` supersedes the active result and withdraws the
+ * pending desire; `dispose()` withdraws everything. The transport
+ * never starts a POST and owns no timer, no polling and no retry
+ * loop of any kind.
+ */
+export function createProjectApplyTransport(io) {
+  if (!isRecord(io) || typeof io["fetchOperation"] !== "function") {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const fetchOperation = io["fetchOperation"];
+  let active = null;
+  let desired = null;
+  let disposed = false;
+  const settleActive = () => {
+    const finished = active;
+    active = null;
+    return finished;
+  };
+  const startNext = () => {
+    if (disposed || desired === null || active !== null) {
+      return;
+    }
+    const next = desired;
+    desired = null;
+    active = next;
+    fetchOperation(next.runId, next.applyId, next.observation, next.signal)
+      .then(
+        (result) => next.onSettled({ fulfilled: true, superseded: next.superseded, result }),
+        (error) => next.onSettled({ fulfilled: false, superseded: next.superseded, error }),
+      )
+      .then(() => {
+        const finished = settleActive();
+        if (finished !== next) {
+          return;
+        }
+        startNext();
+      });
+  };
+  return Object.freeze({
+    request(desire) {
+      if (
+        disposed ||
+        !isRecord(desire) ||
+        !isSafeId(desire["runId"]) ||
+        !isSafeId(desire["applyId"]) ||
+        typeof desire["observation"] !== "string" ||
+        !HEX64_PATTERN.test(desire["observation"])
+      ) {
+        return;
+      }
+      if (active !== null) {
+        active.superseded = true;
+        if (typeof active.abort === "function") {
+          try {
+            active.abort();
+          } catch {
+            // best effort: a fetch that ignores the abort delays the follow-up
+          }
+        }
+      }
+      desired = {
+        runId: desire["runId"],
+        applyId: desire["applyId"],
+        observation: typeof desire["observation"] === "string" ? desire["observation"] : "",
+        signal: undefined,
+        onSettled: typeof desire["onSettled"] === "function" ? desire["onSettled"] : () => undefined,
+        superseded: false,
+      };
+      startNext();
+    },
+    invalidate() {
+      if (active !== null) {
+        active.superseded = true;
+        if (typeof active.abort === "function") {
+          try {
+            active.abort();
+          } catch {
+            // best effort
+          }
+        }
+      }
+      desired = null;
+    },
+    dispose() {
+      disposed = true;
+      this.invalidate();
+    },
+  });
+}
+
+/* --- The apply state machine. --------------------------------------- */
+
+/**
+ * The closed UI state union of the apply panel. The durable operation
+ * statuses keep their exact production names (`preparing`, `prepared`,
+ * `applying`, `applied`, `conflict`, `recovery_required`, `failed`);
+ * the UI-own states are `idle`, `confirming`, `submitting`,
+ * `network_unknown` and `unavailable` — no pseudo-status that could be
+ * confused with a durable backend status.
+ */
+export const PROJECT_APPLY_UI_STATES = Object.freeze([
+  "idle",
+  "confirming",
+  "submitting",
+  "network_unknown",
+  "preparing",
+  "prepared",
+  "applying",
+  "applied",
+  "conflict",
+  "recovery_required",
+  "failed",
+  "unavailable",
+]);
+
+function createApplyState(runId) {
+  return Object.freeze({
+    runId,
+    uiState: "idle",
+    applyId: null,
+    observation: null,
+    revision: null,
+    completedSteps: null,
+    totalSteps: null,
+    error: null,
+    recordError: null,
+    recoveryIssued: false,
+    submitKind: null,
+  });
+}
+
+/**
+ * The one state machine of the explicit Project Apply panel. It owns
+ * no fetch and no gate: every POST desire is handed to the injected
+ * `submit` capability (the wiring acquires the one shared UI mutation
+ * gate before the wire) and every operation GET to the single-flight
+ * transport. The recovery record is written synchronously before the
+ * first POST and removed only after a confirmed applied operation plus
+ * a fully loaded confirming reload.
+ *
+ * Recovery on load: after the terminal Project Changes snapshot of the
+ * selected run is fully loaded, an existing recovery record triggers
+ * exactly one operation GET per load — never a POST, never a timer.
+ * A 404 shows the lost/missing durable operation and never erases the
+ * record automatically; a lost POST shows `network_unknown` and offers
+ * only the explicit same-identity retry and check.
+ */
+export function createProjectApplyViewer(io) {
+  if (
+    !isRecord(io) ||
+    !isRecord(io["recoveryStore"]) ||
+    typeof io["submit"] !== "function" ||
+    typeof io["onState"] !== "function" ||
+    typeof io["transport"]?.request !== "function"
+  ) {
+    throw new UiContractError("invalid_viewer_io");
+  }
+  const recoveryStore = io["recoveryStore"];
+  const submit = io["submit"];
+  const onState = io["onState"];
+  const transport = io["transport"];
+  let state = null;
+
+  const publish = () => {
+    onState(state);
+  };
+
+  const expectIdentity = (identity) => {
+    if (
+      !isRecord(identity) ||
+      !isSafeId(identity["runId"]) ||
+      typeof identity["observation"] !== "string" ||
+      !HEX64_PATTERN.test(identity["observation"])
+    ) {
+      throw new UiContractError("invalid_request");
+    }
+    return Object.freeze({ runId: identity["runId"], observation: identity["observation"] });
+  };
+
+  const startSubmit = async (kind, identity) => {
+    if (state === null) {
+      return;
+    }
+    state = Object.freeze({
+      ...state,
+      uiState: "submitting",
+      applyId: identity.applyId,
+      observation: identity.observation,
+      error: null,
+      submitKind: kind,
+    });
+    publish();
+    const result = await submit(identity);
+    applySubmitResult(identity, result, kind);
+  };
+
+  const applySubmitResult = (identity, result, kind) => {
+    if (state === null || state.runId !== identity.runId || state.observation !== identity.observation) {
+      // A selection change reset the panel while the POST was in
+      // flight: the response never applies to another run. The record
+      // stays on disk; a later selection recovers through the GET.
+      return;
+    }
+    if (result === undefined || result === null || typeof result !== "object") {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "unexpected_result" } });
+      publish();
+      return;
+    }
+    if (result.ok === false) {
+      if (result.lost === true) {
+        state = Object.freeze({ ...state, uiState: "network_unknown", error: null });
+        publish();
+        return;
+      }
+      const failure = result.failure ?? { layer: "contract", reason: "unexpected_result" };
+      applyOperationFailure(identity, failure, kind);
+      return;
+    }
+    const model = result.model;
+    if (model === null || typeof model !== "object") {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "unexpected_result" } });
+      publish();
+      return;
+    }
+    if (model.kind === "error" || model.kind === "command_result") {
+      const failure = model.kind === "error"
+        ? { layer: model.layer, reason: model.reason }
+        : { layer: "orchestrator", reason: model.reason ?? "failed" };
+      applyOperationFailure(identity, failure, kind);
+      return;
+    }
+    if (model.kind !== "project_apply_operation") {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "unexpected_kind" } });
+      publish();
+      return;
+    }
+    applyOperationModel(identity, model, kind);
+  };
+
+  const applyOperationFailure = (identity, failure, kind) => {
+    // `stale_observation` on a fresh or continued submit proves the
+    // reviewed plan no longer matches the world; the backend refused
+    // before any durable effect, so the recovery hint of an operation
+    // that was never created is cleared with an explicit note — the
+    // operator re-reviews the fresh observation instead of wedging on
+    // an unappliable identity. Every other failure keeps the record.
+    if (failure !== null && typeof failure === "object" && failure.reason === "stale_observation") {
+      recoveryStore.remove(identity.runId);
+      state = Object.freeze({
+        ...state,
+        uiState: "idle",
+        applyId: null,
+        observation: null,
+        revision: null,
+        completedSteps: null,
+        totalSteps: null,
+        error: failure,
+        submitKind: null,
+        recordError: null,
+      });
+      publish();
+      return;
+    }
+    state = Object.freeze({ ...state, uiState: "unavailable", error: failure, submitKind: null });
+    publish();
+  };
+
+  const applyOperationModel = (identity, model, kind) => {
+    if (model.runId !== identity.runId || model.applyId !== identity.applyId || model.observation !== identity.observation) {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "operation_mismatch" } });
+      publish();
+      return;
+    }
+    const applied = model.status === "applied";
+    state = Object.freeze({
+      ...state,
+      uiState: model.status,
+      applyId: model.applyId,
+      observation: model.observation,
+      revision: model.revision,
+      completedSteps: model.completedStepCount,
+      totalSteps: model.totalStepCount,
+      error: null,
+      submitKind: null,
+    });
+    publish();
+    if (applied && typeof io["onApplied"] === "function") {
+      // The one post-apply hook: the wiring runs the explicit Project
+      // Changes reload (after=0, no observation); the record removal
+      // waits for the confirming reload through `changesSnapshotReady`.
+      io["onApplied"](identity);
+    }
+  };
+
+  const applyOperationGet = (identity, result) => {
+    if (state === null || state.runId !== identity.runId) {
+      return;
+    }
+    if (result === undefined || result === null || typeof result !== "object") {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "unexpected_result" } });
+      publish();
+      return;
+    }
+    if (result.ok === false) {
+      const failure = result.failure ?? { layer: "contract", reason: "unexpected_result" };
+      state = Object.freeze({ ...state, uiState: "unavailable", error: failure });
+      publish();
+      return;
+    }
+    const model = result.model;
+    if (model === null || typeof model !== "object") {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "unexpected_result" } });
+      publish();
+      return;
+    }
+    if (model.kind === "error" || model.kind === "command_result") {
+      const failure = model.kind === "error"
+        ? { layer: model.layer, reason: model.reason }
+        : { layer: "orchestrator", reason: model.reason ?? "failed" };
+      state = Object.freeze({ ...state, uiState: "unavailable", error: failure });
+      publish();
+      return;
+    }
+    if (model.kind !== "project_apply_operation" || model.runId !== identity.runId || model.applyId !== identity.applyId) {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "operation_mismatch" } });
+      publish();
+      return;
+    }
+    const observationBinding = state.observation === null || state.observation === model.observation;
+    if (!observationBinding) {
+      state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "observation_mismatch" } });
+      publish();
+      return;
+    }
+    state = Object.freeze({
+      ...state,
+      uiState: model.status,
+      applyId: model.applyId,
+      observation: model.observation,
+      revision: model.revision,
+      completedSteps: model.completedStepCount,
+      totalSteps: model.totalStepCount,
+      error: null,
+    });
+    publish();
+    if (model.status === "applied" && typeof io["onApplied"] === "function") {
+      io["onApplied"](identity);
+    }
+  };
+
+  const issueRecoveryGet = () => {
+    if (state === null || state.recoveryIssued) {
+      return;
+    }
+    const loaded = recoveryStore.load(state.runId);
+    if (loaded.error === "storage_unavailable" || loaded.error === "corrupt_record") {
+      state = Object.freeze({ ...state, recordError: loaded.error, recoveryIssued: true });
+      publish();
+      return;
+    }
+    if (loaded.record === null) {
+      state = Object.freeze({ ...state, recoveryIssued: true });
+      publish();
+      return;
+    }
+    state = Object.freeze({
+      ...state,
+      recoveryIssued: true,
+      applyId: loaded.record.applyId,
+      observation: loaded.record.observation,
+    });
+    const requestedRunId = state.runId;
+    const requestedApplyId = state.applyId;
+    publish();
+    transport.request({
+      runId: requestedRunId,
+      applyId: requestedApplyId,
+      observation: state.observation,
+      onSettled: (settlement) => {
+        if (state === null || state.runId !== requestedRunId || settlement.superseded === true) {
+          return;
+        }
+        const raw = settlement.fulfilled ? settlement.result : {
+          ok: false,
+          lost: false,
+          failure: { layer: "transport", reason: "network_error" },
+        };
+        applyOperationGet({ runId: requestedRunId, applyId: requestedApplyId, observation: state.observation }, raw);
+      },
+    });
+  };
+
+  return Object.freeze({
+    /** Selection change: resets the panel, invalidates the wire and
+     * reloads the record presence — the record itself is never
+     * removed by a selection change. */
+    transitionToRun(runId) {
+      if (!isSafeId(runId)) {
+        throw new UiContractError("invalid_run_id");
+      }
+      transport.invalidate();
+      state = createApplyState(runId);
+      const loaded = recoveryStore.load(runId);
+      if (loaded.error !== null) {
+        state = Object.freeze({ ...state, recordError: loaded.error });
+      }
+      publish();
+    },
+    dropView() {
+      transport.invalidate();
+      state = null;
+    },
+    /**
+     * The hook fired by the wiring when a fully loaded, ready Project
+     * Changes snapshot of the selected run lands. It drives exactly
+     * one recovery GET per load (when a record exists) and the record
+     * removal after a confirmed applied operation plus a fully loaded
+     * reload without pending or diverged entries.
+     */
+    changesSnapshotReady(changesState) {
+      if (state === null || !isRecord(changesState) || changesState["runId"] !== state.runId) {
+        return;
+      }
+      if (state.uiState === "applied" && state.applyId !== null) {
+        const summary = changesState["summary"];
+        if (
+          isRecord(summary) &&
+          changesState["nextAfter"] === null &&
+          changesState["changes"].length === summary["total"] &&
+          summary["diverged"] === 0 &&
+          summary["matches_baseline"] === 0
+        ) {
+          const removed = recoveryStore.remove(state.runId);
+          state = Object.freeze({
+            ...state,
+            uiState: removed ? "idle" : "applied",
+            applyId: removed ? null : state.applyId,
+            observation: removed ? null : state.observation,
+            revision: removed ? null : state.revision,
+            completedSteps: removed ? null : state.completedSteps,
+            totalSteps: removed ? null : state.totalSteps,
+            error: null,
+            recordError: removed ? null : "record_unwritable",
+            recoveryIssued: true,
+          });
+          publish();
+        }
+        return;
+      }
+      issueRecoveryGet();
+    },
+    /** The first Review apply press: confirmation only, zero POST. A
+     * run with an existing recovery record never reaches confirming —
+     * its operation identity is already pinned. */
+    review() {
+      if (state === null || state.uiState !== "idle") {
+        return;
+      }
+      if (recoveryStore.load(state.runId).record !== null) {
+        return;
+      }
+      state = Object.freeze({ ...state, uiState: "confirming" });
+      publish();
+    },
+    /** Cancel: zero effects, back to idle. */
+    cancel() {
+      if (state === null || state.uiState !== "confirming") {
+        return;
+      }
+      state = Object.freeze({ ...state, uiState: "idle" });
+      publish();
+    },
+    /**
+     * The confirm press of a fresh apply: the recovery record is
+     * written synchronously first; a failed write never POSTs.
+     */
+    confirm(observation) {
+      if (state === null || state.uiState !== "confirming") {
+        return;
+      }
+      const identity = expectIdentity({ runId: state.runId, observation });
+      if (state.applyId !== null && state.applyId !== identity.observation) {
+        state = Object.freeze({ ...state, uiState: "unavailable", error: { layer: "contract", reason: "record_conflict" } });
+        publish();
+        return;
+      }
+      const saved = recoveryStore.save(state.runId, identity.observation);
+      if (!saved.saved) {
+        state = Object.freeze({
+          ...state,
+          uiState: "unavailable",
+          error: null,
+          recordError: saved.error,
+        });
+        publish();
+        return;
+      }
+      void startSubmit("fresh", { runId: identity.runId, applyId: identity.observation, observation: identity.observation });
+    },
+    /** The explicit retry of the same operation after a lost POST. */
+    retry() {
+      if (state === null || (state.uiState !== "network_unknown" && state.uiState !== "unavailable") || state.applyId === null) {
+        return;
+      }
+      void startSubmit("retry", { runId: state.runId, applyId: state.applyId, observation: state.observation });
+    },
+    /** The explicit continuation of a durable in-progress operation. */
+    continueRecovery() {
+      if (
+        state === null ||
+        (state.uiState !== "prepared" && state.uiState !== "applying" && state.uiState !== "recovery_required" && state.uiState !== "unavailable") ||
+        state.applyId === null
+      ) {
+        return;
+      }
+      void startSubmit("continue", { runId: state.runId, applyId: state.applyId, observation: state.observation });
+    },
+    /** The explicit status check of the known operation identity. */
+    checkStatus() {
+      if (state === null || state.applyId === null || state.uiState === "submitting") {
+        return;
+      }
+      const requestedRunId = state.runId;
+      const requestedApplyId = state.applyId;
+      transport.request({
+        runId: requestedRunId,
+        applyId: requestedApplyId,
+        observation: state.observation,
+        onSettled: (settlement) => {
+          if (state === null || state.runId !== requestedRunId || settlement.superseded === true) {
+            return;
+          }
+          const raw = settlement.fulfilled ? settlement.result : {
+            ok: false,
+            lost: false,
+            failure: { layer: "transport", reason: "network_error" },
+          };
+          applyOperationGet({ runId: requestedRunId, applyId: requestedApplyId, observation: state.observation }, raw);
+        },
+      });
+    },
+    /** The read-only projection for the DOM adapter. */
+    currentState() {
+      return state;
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Project change content (v7): bounded read-only content preview and  */
 /* client-side bounded diff over the Project Change Content API.       */
 /* ------------------------------------------------------------------ */
@@ -4767,6 +5725,10 @@ function showRunModel(model, options = {}) {
     projectChangesViewer.inspectApplied(model);
     renderProjectChanges(projectChangesViewer.currentState());
   }
+  // the apply panel follows the same selection lifecycle; the terminal
+  // status of the last applied inspect feeds the eligibility only
+  lastInspectedStatus = model.status;
+  ensureProjectApplyFor(model.runId);
   return changed;
 }
 
@@ -4774,6 +5736,12 @@ async function loadProjects() {
   const result = expectDiscoveryModel(await requestApiJson(fetchImplementation, "/v1/projects"), "projects");
   if (result.ok && result.model.kind === "projects") {
     renderProjects(result.model);
+    // the effective capability may arrive after a run selection; the
+    // apply panel re-evaluates against the loaded discovery
+    const applyState = applyViewer.currentState();
+    if (applyState !== null) {
+      renderProjectApply(applyState);
+    }
     setStatus("Projects loaded.");
     return;
   }
@@ -5054,6 +6022,7 @@ async function submitAction(action, readForm, describe) {
     if (mutationObserved) {
       applySchedulerEffect(scheduler.mutationCompleted());
     }
+    renderProjectApplyIfSelected();
   }
 }
 
@@ -5400,6 +6369,113 @@ const contentViewer = createProjectChangeContentViewer({
  * adapter from the viewer state, never persisted anywhere. */
 let contentRetrySide = null;
 
+/* ------------------------------------------------------------------ */
+/* Project apply (v8): the wiring of the explicit durable operation.   */
+/* ------------------------------------------------------------------ */
+
+/** The terminal status of the last applied authoritative inspect of
+ * the selected run; the apply eligibility never derives it from
+ * anything else. */
+let lastInspectedStatus = null;
+
+/** The production recovery store binds the one closed localStorage
+ * namespace; an unavailable browser storage refuses every write and
+ * therefore every apply. */
+const applyRecoveryStore = createApplyRecoveryStore(
+  typeof localStorage === "undefined" || localStorage === null ? null : localStorage,
+);
+
+const applyTransport = createProjectApplyTransport({
+  fetchOperation: (runId, applyId, observation, signal) =>
+    requestProjectApplyJson(fetchImplementation, projectApplyRequestPath(runId, applyId), { signal }, {
+      runId,
+      applyId,
+      observation,
+    }),
+  onStarted: () => {
+    document.getElementById("project-apply-check").disabled = true;
+  },
+  onSettled: () => {
+    document.getElementById("project-apply-check").disabled = false;
+  },
+});
+
+/**
+ * The one shared mutation gate admits the apply POST exactly like a
+ * run mutation: the same begin/end pair, the same control disabling
+ * and the same live-observation pause — an apply can never run
+ * parallel to a run mutation and vice versa.
+ */
+async function submitProjectApplyViaGate(identity) {
+  if (!mutationGate.begin()) {
+    return { ok: false, lost: false, failure: { layer: "transport", reason: "mutation_busy" } };
+  }
+  setMutationControlsDisabled(true);
+  let mutationObserved = false;
+  try {
+    inspectTransport.invalidate();
+    applySchedulerEffect(scheduler.mutationStarted());
+    mutationObserved = true;
+    return await requestProjectApplyJson(
+      fetchImplementation,
+      projectApplyRequestPath(identity.runId, identity.applyId),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(projectApplyPostBody(identity.observation)),
+      },
+      { runId: identity.runId, applyId: identity.applyId, observation: identity.observation },
+    );
+  } finally {
+    mutationGate.end();
+    setMutationControlsDisabled(false);
+    if (mutationObserved) {
+      applySchedulerEffect(scheduler.mutationCompleted());
+    }
+    renderProjectApplyIfSelected();
+  }
+}
+
+const applyViewer = createProjectApplyViewer({
+  recoveryStore: applyRecoveryStore,
+  transport: applyTransport,
+  submit: submitProjectApplyViaGate,
+  onState: (state) => renderProjectApply(state),
+  onApplied: (identity) => {
+    // The one explicit post-apply Project Changes reload (after=0,
+    // no observation): the same reload the Reload button runs — no
+    // second changes model, no content auto-fetch, no inspect POST.
+    if (selectedRunId === identity.runId && projectChangesViewer !== null) {
+      projectChangesViewer.reload();
+    }
+  },
+});
+
+/** The effective capability of the selected run's bound project, read
+ * only from the discovery projection: never a project path, apply store
+ * root or registry internal. */
+function applyCapabilityFor(runId) {
+  const authority = authorityFor(runId);
+  if (projectsState === null || authority.runEntry === null) {
+    return false;
+  }
+  const project = projectsState.projects.find((entry) => entry.id === authority.runEntry.projectId);
+  return project !== undefined && project.projectApply === true;
+}
+
+/** The section of the selected run: a run change resets the panel and
+ * invalidates the in-flight operation GET while the recovery record
+ * stays on disk (the authoritative state is the GET API). */
+function ensureProjectApplyFor(runId) {
+  const current = applyViewer.currentState();
+  if (current !== null && current.runId === runId) {
+    document.getElementById("project-apply-section").hidden = false;
+    return;
+  }
+  applyViewer.transitionToRun(runId);
+  document.getElementById("project-apply-section").hidden = false;
+}
+
 /** The section of the selected run: created once per selection; a run
  * change discards the previous viewer and invalidates its in-flight
  * changes GET. The automatic one-shot initial load follows the applied
@@ -5528,6 +6604,23 @@ function renderProjectChanges(state) {
   const contractFailed = state.requestState === "error" && state.error !== null && state.error.layer === "contract";
   reload.hidden = contractFailed;
   loadMore.hidden = !(state.requestState === "ready" && state.nextAfter !== null);
+  // the apply panel consumes every fully loaded, ready snapshot of the
+  // selected run: it drives the one recovery GET per load and the
+  // record removal after a confirmed applied operation
+  if (state.requestState === "ready" && state.summary !== null && state.nextAfter === null && state.changes.length === state.summary.total) {
+    applyViewer.changesSnapshotReady(state);
+  }
+  renderProjectApplyIfSelected();
+}
+
+/** The apply panel re-evaluates whenever its inputs change without an
+ * apply state change (a finished mutation releases the gate; a
+ * reloaded snapshot changes the eligibility inputs). */
+function renderProjectApplyIfSelected() {
+  const applyState = applyViewer.currentState();
+  if (applyState !== null) {
+    renderProjectApply(applyState);
+  }
 }
 
 const CONTENT_SIDE_PHASE_TEXT = {
@@ -5666,6 +6759,94 @@ function renderContentReview(state) {
   retry.hidden = retryableSide === null;
   contentRetrySide = retryableSide;
   reloadChanges.hidden = !state.stale;
+}
+
+/** The labels of the apply panel's closed UI states; the durable
+ * operation statuses render under their exact production names. */
+const PROJECT_APPLY_STATE_LABELS = {
+  idle: "",
+  confirming: "Confirmation required.",
+  submitting: "Applying…",
+  network_unknown: "Outcome unknown. The apply request may have been received; check the status.",
+  preparing: "Operation preparing.",
+  prepared: "Operation prepared but not started.",
+  applying: "Operation applying.",
+  applied: "Operation applied.",
+  conflict: "Operation stopped on a project conflict.",
+  recovery_required: "Operation needs recovery; continue explicitly.",
+  failed: "Operation failed.",
+  unavailable: "",
+};
+
+/** The thin DOM adapter of the apply panel: every value renders
+ * through `createElement`/`textContent`, the confirmation panel is an
+ * inline block (never `confirm()`), and the Review press never POSTs. */
+function renderProjectApply(state) {
+  if (state === null) {
+    return;
+  }
+  const section = document.getElementById("project-apply-section");
+  const statusLine = document.getElementById("project-apply-status");
+  const meta = document.getElementById("project-apply-meta");
+  const recordLine = document.getElementById("project-apply-record");
+  const confirmation = document.getElementById("project-apply-confirmation");
+  const confirmationDetails = document.getElementById("project-apply-confirmation-details");
+  const review = document.getElementById("project-apply-review");
+  const confirmButton = document.getElementById("project-apply-confirm");
+  const cancelButton = document.getElementById("project-apply-cancel");
+  const retry = document.getElementById("project-apply-retry");
+  const check = document.getElementById("project-apply-check");
+  const continueButton = document.getElementById("project-apply-continue");
+  section.hidden = false;
+  const changesState = projectChangesViewer === null ? null : projectChangesViewer.currentState();
+  const eligibility = projectApplyEligibility({
+    terminalStatus: lastInspectedStatus,
+    capability: applyCapabilityFor(state.runId),
+    changesState,
+    applyState: state.uiState,
+    mutationInFlight: mutationGate.isInFlight(),
+  });
+  const label = PROJECT_APPLY_STATE_LABELS[state.uiState] ?? state.uiState;
+  statusLine.textContent = state.error !== null
+    ? `${label} failed (${state.error.layer}: ${state.error.reason})`.trim()
+    : label;
+  meta.textContent = state.applyId === null
+    ? ""
+    : `operation ${state.applyId.slice(0, 12)}… · revision ${state.revision === null ? "?" : state.revision}` +
+      (state.totalSteps === null ? "" : ` · steps ${state.completedSteps}/${state.totalSteps}`);
+  recordLine.textContent = state.recordError !== null
+    ? `recovery record problem (${state.recordError}); the apply is blocked until it is resolved.`
+    : "";
+  // the confirmation panel: rendered from the current snapshot the
+  // operator reviewed; the Confirm press re-validates everything
+  confirmation.hidden = state.uiState !== "confirming";
+  if (state.uiState === "confirming" && changesState !== null && changesState.summary !== null) {
+    const summary = changesState.summary;
+    const rows = [
+      `Run: ${state.runId}`,
+      `Snapshot revision: ${changesState.inspectRevision}`,
+      `Observation: ${changesState.observation}`,
+      `Changes: ${summary.total} total · ${summary.matches_baseline} pending · ${summary.matches_result} already present`,
+      "Warning: the registered project will be modified.",
+      "Warning: the operation is per-path crash-recoverable but not whole-tree atomic.",
+      "Warning: the project is locked cooperatively; external IDE or git writers are not serialized.",
+    ];
+    confirmationDetails.replaceChildren();
+    for (const text of rows) {
+      confirmationDetails.appendChild(element("p", text));
+    }
+  } else {
+    confirmationDetails.replaceChildren();
+  }
+  review.hidden = !eligibility.eligible;
+  confirmButton.hidden = state.uiState !== "confirming";
+  cancelButton.hidden = state.uiState !== "confirming";
+  retry.hidden = !(state.applyId !== null && (state.uiState === "network_unknown" || state.uiState === "unavailable"));
+  check.hidden = !(state.applyId !== null && state.uiState !== "submitting" && state.uiState !== "confirming");
+  continueButton.hidden = !(
+    state.applyId !== null &&
+    (state.uiState === "prepared" || state.uiState === "applying" || state.uiState === "recovery_required")
+  );
 }
 
 function resetWorkerLogsDom() {
@@ -5918,6 +7099,50 @@ function boot() {
     if (projectChangesViewer !== null) {
       projectChangesViewer.reload();
     }
+  });
+  document.getElementById("project-apply-review").addEventListener("click", () => {
+    clearMessages();
+    applyViewer.review();
+  });
+  document.getElementById("project-apply-cancel").addEventListener("click", () => {
+    clearMessages();
+    applyViewer.cancel();
+  });
+  document.getElementById("project-apply-confirm").addEventListener("click", () => {
+    clearMessages();
+    const changesState = projectChangesViewer === null ? null : projectChangesViewer.currentState();
+    const observation = changesState === null ? null : changesState.observation;
+    if (typeof observation !== "string") {
+      showError("contract: invalid_request");
+      return;
+    }
+    // the confirm press re-validates every changes-derived eligibility
+    // condition against the snapshot being applied (the operation
+    // state is still the pre-operation confirming panel)
+    const eligibility = projectApplyEligibility({
+      terminalStatus: lastInspectedStatus,
+      capability: applyCapabilityFor(applyViewer.currentState()?.runId ?? null),
+      changesState,
+      applyState: "idle",
+      mutationInFlight: mutationGate.isInFlight(),
+    });
+    if (!eligibility.eligible) {
+      showError(`contract: ${eligibility.reason}`);
+      return;
+    }
+    applyViewer.confirm(observation);
+  });
+  document.getElementById("project-apply-retry").addEventListener("click", () => {
+    clearMessages();
+    applyViewer.retry();
+  });
+  document.getElementById("project-apply-check").addEventListener("click", () => {
+    clearMessages();
+    applyViewer.checkStatus();
+  });
+  document.getElementById("project-apply-continue").addEventListener("click", () => {
+    clearMessages();
+    applyViewer.continueRecovery();
   });
   clearMessages();
 }

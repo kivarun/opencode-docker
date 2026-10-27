@@ -97,6 +97,25 @@
         </div>
       </div>
     </div>
+    <div id="project-apply-section" hidden>
+      <h3 id="project-apply-heading">Project apply</h3>
+      <p class="logs-note">Explicit, never automatic application of the reviewed run workspace changes to the registered project. The operation is per-path crash-recoverable but not whole-tree atomic; the registered project is modified only after your explicit confirmation.</p>
+      <p id="project-apply-status" class="events-live" aria-live="polite"></p>
+      <p id="project-apply-record" class="logs-meta"></p>
+      <p id="project-apply-meta" class="logs-meta"></p>
+      <div id="project-apply-confirmation" hidden>
+        <h4 id="project-apply-confirmation-heading">Confirm apply</h4>
+        <div id="project-apply-confirmation-details"></div>
+        <button type="button" id="project-apply-confirm" class="mutation-control">Confirm apply</button>
+        <button type="button" id="project-apply-cancel">Cancel</button>
+      </div>
+      <div>
+        <button type="button" id="project-apply-review" class="mutation-control" hidden>Review apply</button>
+        <button type="button" id="project-apply-retry" class="mutation-control" hidden>Retry</button>
+        <button type="button" id="project-apply-check" hidden>Check status</button>
+        <button type="button" id="project-apply-continue" class="mutation-control" hidden>Continue recovery</button>
+      </div>
+    </div>
     <div id="worker-logs-section" hidden>
       <h3 id="worker-logs-heading">Worker logs</h3>
       <p class="logs-note">Read-only view of the durable worker-log records. The payload is secret-bearing, unredacted agent output. The metadata list follows the applied inspect revisions automatically; a bounded chunk of a captured or truncated execution loads on the explicit Load log press at any run boundary.</p>

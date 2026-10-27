@@ -117,39 +117,39 @@ describe("ui model: document classification", () => {
   });
 
   test("the model is frozen and repeated parses are structurally identical", () => {
-    const model = parseApiDocument({ schema_version: 1, kind: "projects", projects: [] });
+    const model = parseApiDocument({ schema_version: 2, kind: "projects", projects: [] });
     expect(Object.isFrozen(model)).toBe(true);
-    expect(model).toEqual(parseApiDocument({ projects: [], kind: "projects", schema_version: 1 }));
+    expect(model).toEqual(parseApiDocument({ projects: [], kind: "projects", schema_version: 2 }));
   });
 });
 
 describe("ui model: projects", () => {
   test("projects keep declaration order and input-root ids only", () => {
     const model = parseApiDocument({
-      schema_version: 1,
+      schema_version: 2,
       kind: "projects",
       projects: [
-        { id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }] },
-        { id: "project-b", input_roots: [] },
+        { id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }], project_apply: false },
+        { id: "project-b", input_roots: [], project_apply: false },
       ],
     });
     expect(model.kind).toBe("projects");
     expect((model as UiApiModel & { kind: "projects" }).projects).toEqual([
-      { id: "project-a", inputRootIds: ["tasks", "plans"] },
-      { id: "project-b", inputRootIds: [] },
+      { id: "project-a", inputRootIds: ["tasks", "plans"], projectApply: false },
+      { id: "project-b", inputRootIds: [], projectApply: false },
     ]);
   });
 
   test("projects reject unknown fields, inherited fields and hostile shapes", () => {
-    const inherited = Object.create({ schema_version: 1, kind: "projects", projects: [] });
+    const inherited = Object.create({ schema_version: 2, kind: "projects", projects: [] });
     expect(contractReason(() => parseApiDocument(inherited))).toBe("invalid_shape");
     for (const bad of [
-      { schema_version: 1, kind: "projects", projects: [], extra: 1 },
-      { schema_version: 1, kind: "projects" },
-      { schema_version: 1, kind: "projects", projects: [{ id: "p" }] },
-      { schema_version: 1, kind: "projects", projects: [{ id: "p", input_roots: [{ id: "t", root: "/secret" }] }] },
-      { schema_version: 1, kind: "projects", projects: [{ id: "", input_roots: [] }] },
-      { schema_version: 1, kind: "projects", projects: "all" },
+      { schema_version: 2, kind: "projects", projects: [], extra: 1 },
+      { schema_version: 2, kind: "projects" },
+      { schema_version: 2, kind: "projects", projects: [{ id: "p" }] },
+      { schema_version: 2, kind: "projects", projects: [{ id: "p", input_roots: [{ id: "t", root: "/secret" }] }] },
+      { schema_version: 2, kind: "projects", projects: [{ id: "", input_roots: [] }] },
+      { schema_version: 2, kind: "projects", projects: "all" },
     ]) {
       expect(contractReason(() => parseApiDocument(bad))).toBe("invalid_shape");
     }
@@ -483,9 +483,9 @@ describe("ui model: hostile content stays plain text", () => {
   test("hostile strings pass through the model verbatim for textContent rendering", () => {
     const hostile = '<img src=x onerror="alert(1)">';
     const model = parseApiDocument({
-      schema_version: 1,
+      schema_version: 2,
       kind: "projects",
-      projects: [{ id: hostile, input_roots: [{ id: hostile }] }],
+      projects: [{ id: hostile, input_roots: [{ id: hostile }], project_apply: false }],
     }) as UiApiModel & { kind: "projects" };
     expect(model.projects[0]?.id).toBe(hostile);
     expect(model.projects[0]?.inputRootIds[0]).toBe(hostile);
@@ -568,6 +568,19 @@ describe("ui model: export surface and source restrictions", () => {
         "decodePreviewText",
         "hexPreviewRows",
         "computeBoundedLineDiff",
+        "PROJECT_APPLY_OPERATION_STATUSES",
+        "PROJECT_APPLY_UI_STATES",
+        "parseProjectApplyOperationDocument",
+        "requestProjectApplyJson",
+        "projectApplyRequestPath",
+        "projectApplyPostBody",
+        "PROJECT_APPLY_INELIGIBILITY_REASONS",
+        "projectApplyEligibility",
+        "APPLY_RECORD_STORAGE_PREFIX",
+        "parseApplyRecoveryRecord",
+        "createApplyRecoveryStore",
+        "createProjectApplyTransport",
+        "createProjectApplyViewer",
       ].sort(),
     );
   });
@@ -584,7 +597,6 @@ describe("ui model: export surface and source restrictions", () => {
       "import(",
       "http://",
       "https://",
-      "localStorage",
       "sessionStorage",
       "document.cookie",
       "indexedDB",
@@ -615,9 +627,10 @@ describe("ui model: export surface and source restrictions", () => {
       expect(appSource.includes(banned)).toBe(false);
     }
     expect(appSource.split("await fetchImpl(").length - 1).toBe(1);
-    // exactly one mutating POST site (the shared postMutation owner);
-    // the GETs are the discovery and inspect reads
-    expect(appSource.split('method: "POST"').length - 1).toBe(1);
+    // exactly two mutating POST sites, both through the one shared UI
+    // mutation gate (the shared run-mutation owner and the apply
+    // owner); the GETs are the discovery and inspect reads
+    expect(appSource.split('method: "POST"').length - 1).toBe(2);
     expect(appSource.split('method: "GET"').length - 1).toBe(0);
     expect(appSource.split("buildMutationRequest(").length - 1).toBe(2);
     expect(appSource.split("buildRunActionModel(").length - 1).toBe(2);
@@ -627,6 +640,11 @@ describe("ui model: export surface and source restrictions", () => {
       expect(line.startsWith("import ")).toBe(false);
     }
     expect(appSource.includes("typeof document")).toBe(true);
+    // the one closed storage owner: exactly one runtime access site
+    // (`typeof localStorage`) plus the documented owner mentions — no
+    // sessionStorage, cookie, indexedDB or other storage API anywhere
+    expect(appSource.split("localStorage").length - 1).toBe(6);
+    expect(appSource.split("APPLY_RECORD_STORAGE_PREFIX").length - 1).toBe(2);
   });
 
   test("the shipped document and stylesheet carry no inline code or external references", () => {
@@ -668,9 +686,9 @@ type UiRunActionAuthorityFixture = Parameters<typeof buildRunActionModel>[1];
 
 const AUTHORITY_AVAILABLE = {
   projectsModel: parseApiDocument({
-    schema_version: 1,
+    schema_version: 2,
     kind: "projects",
-    projects: [{ id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }] }],
+    projects: [{ id: "project-a", input_roots: [{ id: "tasks" }, { id: "plans" }], project_apply: false }],
   }) as UiApiModel & { kind: "projects" },
   runEntry: { runId: "run-a", projectId: "project-a", projectAvailable: true },
 } as const;
@@ -744,9 +762,9 @@ describe("ui v2: boundary-to-control matrix", () => {
     expect(
       blocked({
         projectsModel: parseApiDocument({
-          schema_version: 1,
+          schema_version: 2,
           kind: "projects",
-          projects: [{ id: "other", input_roots: [{ id: "tasks" }] }],
+          projects: [{ id: "other", input_roots: [{ id: "tasks" }], project_apply: false }],
         }) as UiApiModel & { kind: "projects" },
         runEntry: AUTHORITY_AVAILABLE.runEntry,
       }),
@@ -754,9 +772,9 @@ describe("ui v2: boundary-to-control matrix", () => {
     expect(
       blocked({
         projectsModel: parseApiDocument({
-          schema_version: 1,
+          schema_version: 2,
           kind: "projects",
-          projects: [{ id: "project-a", input_roots: [] }],
+          projects: [{ id: "project-a", input_roots: [], project_apply: false }],
         }) as UiApiModel & { kind: "projects" },
         runEntry: AUTHORITY_AVAILABLE.runEntry,
       }),
@@ -900,7 +918,7 @@ describe("ui v2: endpoint-specific response acceptance", () => {
   });
 
   test("discovery accepts only its own kind or an error", () => {
-    const projects = { schema_version: 1, kind: "projects", projects: [] };
+    const projects = { schema_version: 2, kind: "projects", projects: [] };
     const runs = { schema_version: 1, kind: "runs", runs: [], next_after: null };
     expect(expectDiscoveryModel(asResult(projects), "projects").ok).toBe(true);
     expect(expectDiscoveryModel(asResult(runs), "projects").failure).toEqual({ layer: "contract", reason: "unexpected_kind" });

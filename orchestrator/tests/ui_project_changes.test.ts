@@ -434,8 +434,8 @@ describe("project changes model: source restrictions", () => {
 
   test("the changes owner carries no content, download, apply or write capability", () => {
     const start = appSource.indexOf("Project changes (v6)");
-    // the v6 changes owner ends where the v7 content preview region begins
-    const end = appSource.indexOf("Project change content (v7)");
+    // the v6 changes owner ends where the v8 apply panel region begins
+    const end = appSource.indexOf("Project apply (v8)");
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     const region = appSource.slice(start, end);

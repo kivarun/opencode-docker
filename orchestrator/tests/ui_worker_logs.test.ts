@@ -794,7 +794,9 @@ describe("the logs layer source restrictions", () => {
   });
 
   test("no log bytes ever leave the viewer: no payload in diagnostics or storage", () => {
-    expect(appSource).not.toContain("localStorage");
+    // the only storage capability in the module is the closed v8 apply
+    // recovery-record namespace owner; the logs layer stores nothing
+    expect(appSource.split("localStorage").length - 1).toBe(6);
     expect(appSource).not.toContain("sessionStorage");
     expect(appSource).not.toContain("history.pushState");
     // the failure diagnostics carry only layer/reason pairs

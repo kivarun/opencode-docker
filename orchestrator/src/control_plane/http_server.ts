@@ -1053,23 +1053,43 @@ export function parseLogsExecutionQuery(
   return { offset, limit };
 }
 
-/** The projects discovery projection: declaration-order ids only. */
+/**
+ * The projects discovery projection: declaration-order ids plus the one
+ * effective Project Apply capability flag. The flag is computed by the
+ * service from its own immutable configuration — the registry capability
+ * and the server-owned apply-store root — and never exposes the project
+ * path, the apply-store path, mount details or any other registry
+ * internals. Adding the required field changed the exact wire shape, so
+ * the document schema version moved honestly from 1 to 2 (the UI parser
+ * rejects version 1 fail closed; no silent unknown field in v1).
+ */
 export interface ProjectsDiscoveryProjection {
-  readonly schema_version: 1;
+  readonly schema_version: 2;
   readonly kind: "projects";
-  readonly projects: readonly { readonly id: string; readonly input_roots: readonly { readonly id: string }[] }[];
+  readonly projects: readonly {
+    readonly id: string;
+    readonly input_roots: readonly { readonly id: string }[];
+    readonly project_apply: boolean;
+  }[];
 }
 
-export function projectControlPlaneProjects(registry: ControlPlaneProjectRegistry): ProjectsDiscoveryProjection {
-  const projects: { id: string; input_roots: { id: string }[] }[] = [];
+export function projectControlPlaneProjects(
+  registry: ControlPlaneProjectRegistry,
+  options: { readonly applyStoreConfigured: boolean },
+): ProjectsDiscoveryProjection {
+  const projects: { id: string; input_roots: { id: string }[]; project_apply: boolean }[] = [];
   for (const project of registry.projects) {
     const inputRoots: { id: string }[] = [];
     for (const root of project.inputRoots) {
       inputRoots.push({ id: root.id });
     }
-    projects.push({ id: project.id, input_roots: inputRoots });
+    projects.push({
+      id: project.id,
+      input_roots: inputRoots,
+      project_apply: project.projectApply === true && options.applyStoreConfigured,
+    });
   }
-  return { schema_version: 1, kind: "projects", projects };
+  return { schema_version: 2, kind: "projects", projects };
 }
 
 /** One projected run of the runs discovery: ids only, never run status. */
@@ -1850,7 +1870,7 @@ async function dispatchControlPlaneRoute(
     if ((deps.discoveryQuery ?? "") !== "") {
       return requestFailure("invalid_request");
     }
-    return projectionResponse(projectControlPlaneProjects(deps.registry));
+    return projectionResponse(projectControlPlaneProjects(deps.registry, { applyStoreConfigured: deps.applyStoreRoot !== null }));
   }
   if (route.kind === "runs") {
     const query = parseRunsDiscoveryQuery(deps.discoveryQuery ?? "");

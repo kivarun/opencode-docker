@@ -464,8 +464,9 @@ describe("ui events model: source restrictions of the events layer", () => {
     // the single URL builder is the only events path site
     expect(appSource.split("/events?").length - 1).toBe(1);
     // the events fetch is a GET: no method override anywhere in the
-    // events wire owner and exactly one POST site in the whole module
-    expect(appSource.split('method: "POST"').length - 1).toBe(1);
+    // events wire owner and exactly two POST sites in the whole module
+    // (the shared run-mutation owner and the v8 apply owner)
+    expect(appSource.split('method: "POST"').length - 1).toBe(2);
     expect(appSource.split('method: "GET"').length - 1).toBe(0);
     // no event-path timer, polling loop or retry machinery
     expect(appSource.split("setTimeout(").length - 1).toBe(1);
@@ -483,7 +484,9 @@ describe("ui events model: source restrictions of the events layer", () => {
   test("s2. no timestamps, storage, raw state or host material anywhere", () => {
     expect(appSource.includes("new Date(")).toBe(false);
     expect(appSource.includes("Date.now(")).toBe(false);
-    expect(appSource.includes("localStorage")).toBe(false);
+    // the only storage capability is the closed v8 apply recovery
+    // record owner; the events layer stores nothing
+    expect(appSource.split("localStorage").length - 1).toBe(6);
     expect(appSource.includes("document.cookie")).toBe(false);
     for (const banned of ["stderr", "state.json", "runRoot", "run_root", "/opt/", "/home/"]) {
       expect(appSource.includes(banned)).toBe(false);
