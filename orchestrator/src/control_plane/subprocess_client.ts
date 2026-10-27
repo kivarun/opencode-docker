@@ -23,6 +23,8 @@ import { isCleanAbsolutePath } from "../clean_path.ts";
 import { deepFreezeValue } from "../pipeline_v2_freeze_internal.ts";
 import { isNonNegativeSafeInteger, isLowercaseSha256, isPipelineV2SafeId, isPositiveSafeInteger } from "../pipeline_v2_scalar.ts";
 import { isPipelineV2PublicReason, type PipelineV2PublicReason } from "../pipeline_v2_public_reason.ts";
+import { PIPELINE_V2_APPLY_OPERATION_STATUSES, type PipelineV2ApplyOperationStatus } from "../pipeline_v2_apply_state_internal.ts";
+import { PIPELINE_V2_PROJECT_APPLY_PUBLIC_REASONS, type PipelineV2ProjectApplyPublicReason } from "../pipeline_v2_project_apply.ts";
 import {
   OrchestratorSubprocessClientError,
   routeOrchestratorCommand,
@@ -279,7 +281,8 @@ export type OrchestratorCallResult =
         | OrchestratorEventsProjection
         | OrchestratorLogsProjection
         | OrchestratorProjectChangesProjection
-        | OrchestratorProjectChangeContentProjection;
+        | OrchestratorProjectChangeContentProjection
+        | OrchestratorProjectApplyProjection;
     }
   | { readonly ok: false; readonly failure: OrchestratorTransportFailure };
 
@@ -431,6 +434,49 @@ const CHANGES_REPORT_KEYS = [
   "summary",
 ] as const;
 const CHANGES_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+const APPLY_REPORT_KEYS = [
+  "applyId",
+  "completedStepCount",
+  "exitCode",
+  "observation",
+  "ok",
+  "projectId",
+  "revision",
+  "runId",
+  "schemaVersion",
+  "status",
+  "totalStepCount",
+] as const;
+const APPLY_FAILURE_KEYS = ["applyId", "exitCode", "ok", "reason", "runId"] as const;
+
+/**
+ * The projected result of one `project_apply` / `project_apply_inspect`
+ * call: the exact schemaVersion-1 operation projection of the CLI (the
+ * durable status travels verbatim from the single Apply state vocabulary
+ * owner; no path, plan, payload or temp identity is ever carried), or
+ * the typed failure outcome of the CLI itself with a reason from the
+ * single combined Apply reason owner.
+ */
+export type OrchestratorProjectApplyProjection =
+  | {
+      readonly kind: "projectApplyOperation";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly applyId: string;
+      readonly projectId: string;
+      readonly observation: string;
+      readonly revision: number;
+      readonly status: PipelineV2ApplyOperationStatus;
+      readonly completedStepCount: number;
+      readonly totalStepCount: number;
+    }
+  | {
+      readonly kind: "projectApplyFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly applyId: string;
+      readonly reason: PipelineV2ProjectApplyPublicReason;
+    };
 const CONTENT_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
 const CONTENT_COMMON_SUCCESS_KEYS = [
   "changeIndex",
@@ -957,6 +1003,88 @@ function parseOutcomeDocument(
           status,
           reason: parsed["reason"] as string,
           node: parsed["node"] as OrchestratorJsonObject,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "project_apply" || commandKind === "project_apply_inspect") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, APPLY_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const applyId = expectStringField(parsed, "applyId");
+        const reason = expectStringField(parsed, "reason");
+        if (!(PIPELINE_V2_PROJECT_APPLY_PUBLIC_REASONS as readonly string[]).includes(reason)) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply failure reason is not a known Apply reason");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "projectApplyFailure",
+            exitCode: 1,
+            runId,
+            applyId,
+            reason: reason as PipelineV2ProjectApplyPublicReason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, APPLY_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "project-apply projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      const applyId = expectStringField(parsed, "applyId");
+      const projectId = expectStringField(parsed, "projectId");
+      const observation = parsed["observation"];
+      if (typeof observation !== "string" || !/^[0-9a-f]{64}$/.test(observation)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply observation must be a 64-character lowercase hexadecimal digest");
+      }
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply revision must be a positive safe integer");
+      }
+      const status = parsed["status"];
+      if (typeof status !== "string" || !(PIPELINE_V2_APPLY_OPERATION_STATUSES as readonly string[]).includes(status)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply status is not a known Apply operation status");
+      }
+      const completedStepCount = parsed["completedStepCount"];
+      const totalStepCount = parsed["totalStepCount"];
+      if (!isNonNegativeSafeInteger(completedStepCount) || !isNonNegativeSafeInteger(totalStepCount)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply step counts must be non-negative safe integers");
+      }
+      if (completedStepCount > totalStepCount) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "project-apply completed step count must not exceed the total step count");
+      }
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "projectApplyOperation",
+          schemaVersion: 1,
+          runId,
+          applyId,
+          projectId,
+          observation,
+          revision: parsed["revision"] as number,
+          status: status as PipelineV2ApplyOperationStatus,
+          completedStepCount,
+          totalStepCount,
         }),
       };
     } catch (cause) {

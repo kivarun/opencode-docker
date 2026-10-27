@@ -10,6 +10,7 @@ import {
   type OrchestratorRunProjection,
   type OrchestratorSubprocessClientConfig,
 } from "../src/control_plane/subprocess_client.ts";
+import type { OrchestratorCommand } from "../src/control_plane/routing.ts";
 import { OrchestratorSubprocessClientError, type OrchestratorTransportReason } from "../src/control_plane/routing.ts";
 
 const CHILD = join(import.meta.dir, "control_plane_child.ts");
@@ -750,4 +751,90 @@ test("a logs projection with schemaVersion 2 is unsupported_contract", async () 
 test("a logs document carrying an extra unknown field is unexpected_output_shape", async () => {
   const client = makeClient();
   expectFailure(await client.run(logsScenario("logs-root-leak")), "unexpected_output_shape");
+}, 15000);
+
+function applyScenario(scenario: string): Extract<OrchestratorCommand, { kind: "project_apply" }> {
+  return {
+    kind: "project_apply",
+    runId: `sc-${scenario}`,
+    applyId: "apply-1",
+    projectId: "project-a",
+    projectPath: "/srv/projects/demo",
+    applyStoreRoot: "/srv/applies",
+    observation: "a".repeat(64),
+  };
+}
+
+function applyInspectScenario(scenario: string): Extract<OrchestratorCommand, { kind: "project_apply_inspect" }> {
+  return {
+    kind: "project_apply_inspect",
+    runId: `sc-${scenario}`,
+    applyId: "apply-1",
+    projectId: "project-a",
+    projectPath: "/srv/projects/demo",
+    applyStoreRoot: "/srv/applies",
+  };
+}
+
+test("projects the apply operation document and drops nothing that exists", async () => {
+  const client = makeClient();
+  const result = await client.run(applyScenario("apply_ok"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  expect(result.projection.kind).toBe("projectApplyOperation");
+  if (result.projection.kind !== "projectApplyOperation") throw new Error("unreachable");
+  expect(result.projection).toEqual({
+    kind: "projectApplyOperation",
+    schemaVersion: 1,
+    runId: "cp-child-run",
+    applyId: "cp-child-apply",
+    projectId: "cp-child-project",
+    observation: "a".repeat(64),
+    revision: 12,
+    status: "applied",
+    completedStepCount: 3,
+    totalStepCount: 3,
+  });
+  expect(JSON.stringify(result.projection)).not.toContain("/srv");
+}, 15000);
+
+test("both apply command kinds parse the same operation projection", async () => {
+  const client = makeClient();
+  const inspectResult = await client.run(applyInspectScenario("apply_ok"));
+  expect(inspectResult.ok).toBe(true);
+  if (!inspectResult.ok) throw new Error("unreachable");
+  expect(inspectResult.projection.kind).toBe("projectApplyOperation");
+  const recovering = await client.run(applyScenario("apply_recovering"));
+  expect(recovering.ok).toBe(true);
+  if (!recovering.ok) throw new Error("unreachable");
+  if (recovering.projection.kind !== "projectApplyOperation") throw new Error("unreachable");
+  expect(recovering.projection.status).toBe("applying");
+  expect(recovering.projection.completedStepCount).toBe(1);
+}, 15000);
+
+test("projects the apply failure with a reason from the combined Apply vocabulary", async () => {
+  const client = makeClient();
+  const result = await client.run(applyScenario("apply_conflict"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  expect(result.projection.kind).toBe("projectApplyFailure");
+  if (result.projection.kind !== "projectApplyFailure") throw new Error("unreachable");
+  expect(result.projection.reason).toBe("project_conflict");
+  expect(result.projection.runId).toBe("cp-child-run");
+  expect(result.projection.applyId).toBe("cp-child-apply");
+}, 15000);
+
+test("an apply status outside the durable state vocabulary is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(applyScenario("apply_bad_status")), "unexpected_output_shape");
+}, 15000);
+
+test("an apply failure reason outside the combined vocabulary is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(applyScenario("apply_bad_reason")), "unexpected_output_shape");
+}, 15000);
+
+test("an apply operation document with a missing field is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(applyInspectScenario("apply_missing_field")), "unexpected_output_shape");
 }, 15000);

@@ -78,6 +78,11 @@ describe("ui model: document classification", () => {
     // the content document stays owned by a future dedicated viewer: the
     // general API client keeps rejecting it fail-closed
     expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "project_change_content", run_id: "r", revision: 1, observation: "a".repeat(64), change_index: 1, side: "result", status: "available", byte_count: 1, sha256: "b".repeat(64), offset: 0, data_base64: "aGk=", next_offset: null }))).toBe("unknown_kind");
+    // the explicit Project Apply operation document stays CLI/API-only:
+    // the browser UI has no Apply surface and the general API client
+    // keeps rejecting the new kinds fail-closed
+    expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "project_apply_operation", run_id: "r", apply_id: "a", project_id: "p", observation: "a".repeat(64), revision: 1, status: "applied", completed_step_count: 1, total_step_count: 1 }))).toBe("unknown_kind");
+    expect(contractReason(() => parseApiDocument({ schema_version: 1, kind: "project_apply_failure", run_id: "r", apply_id: "a", reason: "project_conflict" }))).toBe("unknown_kind");
   });
 
   test("the general client keeps rejecting the events kind; the events client owns the endpoint", async () => {

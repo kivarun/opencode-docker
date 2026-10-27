@@ -118,7 +118,9 @@ export type ControlPlaneHttpRequestFailureReason =
   | "payload_too_large"
   | "invalid_request"
   | "invalid_cursor"
-  | "stale_observation";
+  | "stale_observation"
+  | "project_apply_disabled"
+  | "project_apply_not_found";
 
 /** The typed request-layer error; the HTTP status comes from the one status table. */
 export class ControlPlaneHttpRequestError extends Error {
@@ -167,6 +169,8 @@ interface ParsedRoute {
     | "logs_execution"
     | "project_changes"
     | "project_change_content"
+    | "project_apply_post"
+    | "project_apply_get"
     | "resume"
     | "resume_plan"
     | "continue_stage"
@@ -183,6 +187,8 @@ interface ParsedRoute {
   readonly executionIndex?: number;
   /** The change index of the content route (null elsewhere). */
   readonly changeIndex?: number;
+  /** The apply id of the explicit Project Apply routes (absent elsewhere). */
+  readonly applyId?: string;
 }
 
 /**
@@ -391,6 +397,23 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
     }
     return { kind: "logs_execution", projectId: null, runId, executionIndex };
   }
+  if (matchesShape(["v1", "runs", "*", "project-applies", "*"])) {
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    const applyId = safeId(rest[4]);
+    if (applyId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the apply id must be a safe identifier");
+    }
+    if (method === "POST") {
+      return { kind: "project_apply_post", projectId: null, runId, applyId };
+    }
+    if (method === "GET") {
+      return { kind: "project_apply_get", projectId: null, runId, applyId };
+    }
+    return new ControlPlaneHttpRequestError("method_not_allowed", "the project-apply routes accept POST and GET only");
+  }
   if (matchesShape(["v1", "runs", "*", "*"])) {
     const action = rest[3];
     if (action === undefined || !ACTION_NAMES.includes(action)) {
@@ -439,6 +462,10 @@ export function statusForControlPlaneFailure(failure: { readonly layer: string; 
         return 413;
       case "stale_observation":
         return 409;
+      case "project_apply_disabled":
+        return 409;
+      case "project_apply_not_found":
+        return 404;
       default:
         return 400;
     }
@@ -619,6 +646,28 @@ export function parseRespondBody(document: unknown): { readonly waitIndex: numbe
     waitIndex: expectPositiveIntegerField(document, "wait_index", "the respond request wait_index"),
     actionId: expectSafeIdField(document, "action_id", "the respond request action_id"),
   };
+}
+
+/**
+ * The exact POST body of the explicit Project Apply route: the reviewed
+ * observation identity is the only caller input besides the URL ids. No
+ * project id, project path, config root, apply-store root, run root,
+ * plan, step, payload, artifact path, temp name, dev/ino or worker
+ * authority is expressible.
+ */
+export function parseProjectApplyBody(document: unknown): { readonly observation: string } {
+  if (!isRecord(document)) {
+    throw new ControlPlaneHttpRequestError("invalid_request", "the project-apply request body must be an object");
+  }
+  expectExactKeys(document, ["schema_version", "observation"], "the project-apply request body");
+  if (document["schema_version"] !== 1) {
+    throw new ControlPlaneHttpRequestError("invalid_request", "the project-apply request body schema_version must be 1");
+  }
+  const observation = document["observation"];
+  if (typeof observation !== "string" || !/^[0-9a-f]{64}$/.test(observation)) {
+    throw new ControlPlaneHttpRequestError("invalid_request", "the project-apply request observation must be a 64-character lowercase hexadecimal digest");
+  }
+  return { observation };
 }
 
 export function parseReviseTaskBody(
@@ -1114,7 +1163,9 @@ export function projectControlPlaneCommandResult(
     projection.kind === "projectChanges" ||
     projection.kind === "projectChangesFailure" ||
     projection.kind === "projectChangeContent" ||
-    projection.kind === "projectChangeContentFailure"
+    projection.kind === "projectChangeContentFailure" ||
+    projection.kind === "projectApplyOperation" ||
+    projection.kind === "projectApplyFailure"
   ) {
     return { layer: "transport", reason: "internal_error" };
   }
@@ -1185,6 +1236,19 @@ export interface ProjectChangeContentProjection {
   readonly next_offset?: number | null;
   readonly reason?: string;
   readonly node?: Record<string, unknown>;
+}
+
+export interface ProjectApplyOperationProjection {
+  readonly schema_version: 1;
+  readonly kind: "project_apply_operation";
+  readonly run_id: string;
+  readonly apply_id: string;
+  readonly project_id: string;
+  readonly observation: string;
+  readonly revision: number;
+  readonly status: string;
+  readonly completed_step_count: number;
+  readonly total_step_count: number;
 }
 
 export interface WorkerLogProjection {
@@ -1545,18 +1609,78 @@ function projectionResponse(
     | WorkerLogsProjection
     | ProjectChangesProjection
     | ProjectChangeContentProjection
+    | ProjectApplyOperationProjection
     | WorkerLogProjection
     | ControlPlaneHttpFailure,
 ): Response {
   if ("layer" in projection && "reason" in projection && !("kind" in projection)) {
     return failureResponse(projection as ControlPlaneHttpFailure);
   }
-  if ((projection as { kind?: string }).kind === "project_change_content") {
+  if (
+    (projection as { kind?: string }).kind === "project_change_content" ||
+    (projection as { kind?: string }).kind === "project_apply_operation"
+  ) {
     // The content response never caches: the observation identity is an
-    // ephemeral read snapshot and the bytes are secret-bearing.
+    // ephemeral read snapshot and the bytes are secret-bearing. The
+    // apply operation document carries a durable status that changes
+    // with recovery, so it never caches either.
     return jsonBodyNoStore(projection, 200);
   }
   return jsonBody(projection, 200);
+}
+
+/**
+ * The one HTTP projection of the explicit Project Apply routes. Built
+ * explicitly from the typed client projection — never a spread — so no
+ * project/run/apply-store path, plan or payload content, change path,
+ * symlink target, temp identity or host diagnostic reaches a response.
+ * A transport failure stays 502; a `stale_observation` CLI failure is
+ * the request-layer 409 envelope; on the read-only GET route a missing
+ * or foreign operation is the request-layer 404 (`project_apply_not_found`)
+ * so a foreign applyId is never disclosed; every other correctly
+ * received CLI failure is the established failed command result at HTTP
+ * 200 (a durable conflict or `recovery_required` is an operation state,
+ * never a lost transport error).
+ */
+export function projectControlPlaneProjectApply(
+  result: OrchestratorCallResult,
+  mode: "post" | "get",
+): ProjectApplyOperationProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "projectApplyFailure") {
+    if (projection.reason === "stale_observation") {
+      return { layer: "request", reason: "stale_observation" };
+    }
+    if (mode === "get" && projection.reason === "artifact_missing") {
+      return { layer: "request", reason: "project_apply_not_found" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "projectApplyOperation" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "project_apply_operation",
+    run_id: projection.runId,
+    apply_id: projection.applyId,
+    project_id: projection.projectId,
+    observation: projection.observation,
+    revision: projection.revision,
+    status: projection.status,
+    completed_step_count: projection.completedStepCount,
+    total_step_count: projection.totalStepCount,
+  };
 }
 
 function launcherFields(project: ResolvedControlPlaneProject): { readonly launcherId?: string } {
@@ -1576,6 +1700,13 @@ export interface ControlPlaneHttpServiceDeps {
   readonly assets: ControlPlaneUiAssets;
   readonly port: number;
   readonly bodyLimitBytes: number;
+  /**
+   * The server-owned apply-store root of the explicit Project Apply
+   * capability (trusted startup configuration). `null` means the
+   * capability is unavailable; the HTTP caller can never supply or
+   * override it.
+   */
+  readonly applyStoreRoot: string | null;
   /** The raw query string of the current discovery request ("" otherwise). */
   readonly discoveryQuery?: string;
 }
@@ -1819,6 +1950,43 @@ async function dispatchControlPlaneRoute(
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneProjectChangeContent(result));
     }
+    case "project_apply_post": {
+      const applyId = route.applyId as string;
+      if (deps.applyStoreRoot === null) {
+        return requestFailure("project_apply_disabled");
+      }
+      if (authority.project.projectApply !== true) {
+        return requestFailure("project_apply_disabled");
+      }
+      const body = parseProjectApplyBody(parseJsonBody(bodyText));
+      const command: OrchestratorCommand = {
+        kind: "project_apply",
+        runId,
+        applyId,
+        projectId: authority.project.id,
+        projectPath: authority.project.projectRoot,
+        applyStoreRoot: deps.applyStoreRoot,
+        observation: body.observation,
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneProjectApply(result, "post"));
+    }
+    case "project_apply_get": {
+      const applyId = route.applyId as string;
+      if (deps.applyStoreRoot === null) {
+        return requestFailure("project_apply_disabled");
+      }
+      const command: OrchestratorCommand = {
+        kind: "project_apply_inspect",
+        runId,
+        applyId,
+        projectId: authority.project.id,
+        projectPath: authority.project.projectRoot,
+        applyStoreRoot: deps.applyStoreRoot,
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneProjectApply(result, "get"));
+    }
     case "resume": {
       parseEmptyBody(parseJsonBody(bodyText));
       const command: OrchestratorCommand = { kind: "resume", runId, ...launcherFields(authority.project) };
@@ -1900,6 +2068,13 @@ export interface ControlPlaneHttpServiceConfig {
   readonly port: number;
   readonly bodyLimitBytes: number;
   /**
+   * The server-owned apply-store root for the explicit Project Apply
+   * capability. Absent or null means the capability is unavailable; a
+   * present value must be a clean absolute path (the mode-0700 real
+   * directory requirement stays with the Apply facade).
+   */
+  readonly applyStoreRoot?: string | null;
+  /**
    * The exact bind address of the single `Bun.serve` socket. Absent means
    * the established loopback default (`127.0.0.1`); the only other
    * accepted value is `0.0.0.0`, which allows a container port
@@ -1950,6 +2125,11 @@ export async function startControlPlaneHttpService(config: ControlPlaneHttpServi
   const bodyLimitBytes = config.bodyLimitBytes;
   if (!isPositiveSafeInteger(bodyLimitBytes)) {
     throw new ControlPlaneHttpServiceError("invalid_service_config", "the body limit must be a positive safe integer");
+  }
+  const applyStoreRootConfig = config.applyStoreRoot;
+  let applyStoreRoot: string | null = null;
+  if (applyStoreRootConfig !== undefined && applyStoreRootConfig !== null) {
+    applyStoreRoot = requireCleanPath(applyStoreRootConfig, "the apply-store root");
   }
   const listenAddress = config.listenAddress === undefined ? "127.0.0.1" : config.listenAddress;
   if (listenAddress !== "127.0.0.1" && listenAddress !== "0.0.0.0") {
@@ -2026,6 +2206,7 @@ export async function startControlPlaneHttpService(config: ControlPlaneHttpServi
     assets,
     port: boundPort,
     bodyLimitBytes,
+    applyStoreRoot,
   };
   depsRef.current = deps;
   const service: RunningControlPlaneHttpService = {

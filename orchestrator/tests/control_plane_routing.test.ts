@@ -360,3 +360,108 @@ test("logs routes the execution scalars only and rejects hostile shapes", () => 
     expect(() => routeOrchestratorCommand(bad, ROUTING_CONFIG)).toThrow(OrchestratorSubprocessClientError);
   }
 });
+
+test("project_apply routes the exact argv with the observation between the ids and the paths", () => {
+  const routed = routeOrchestratorCommand(
+    {
+      kind: "project_apply",
+      runId: "cp-run-1",
+      applyId: "apply-1",
+      projectId: "project-a",
+      projectPath: "/srv/projects/demo",
+      applyStoreRoot: "/srv/applies",
+      observation: "a".repeat(64),
+    } as unknown as OrchestratorCommand,
+    ROUTING_CONFIG,
+  );
+  expect(routed.argv).toEqual([
+    "project-apply",
+    "--run-id", "cp-run-1",
+    "--apply-id", "apply-1",
+    "--project-id", "project-a",
+    "--observation", "a".repeat(64),
+    "--config-root", "/opt/orchestrator/config",
+    "--project", "/srv/projects/demo",
+    "--apply-store-root", "/srv/applies",
+    "--json",
+  ]);
+  expect(routed.expectedRunId).toBe("cp-run-1");
+});
+
+test("project_apply_inspect routes the exact read-only argv without an observation", () => {
+  const routed = routeOrchestratorCommand(
+    {
+      kind: "project_apply_inspect",
+      runId: "cp-run-1",
+      applyId: "apply-1",
+      projectId: "project-a",
+      projectPath: "/srv/projects/demo",
+      applyStoreRoot: "/srv/applies",
+    } as unknown as OrchestratorCommand,
+    ROUTING_CONFIG,
+  );
+  expect(routed.argv).toEqual([
+    "project-apply-inspect",
+    "--run-id", "cp-run-1",
+    "--apply-id", "apply-1",
+    "--project-id", "project-a",
+    "--config-root", "/opt/orchestrator/config",
+    "--project", "/srv/projects/demo",
+    "--apply-store-root", "/srv/applies",
+    "--json",
+  ]);
+});
+
+test("the apply commands reject hostile shapes fail-closed", () => {
+  const bad: readonly unknown[] = [
+    { kind: "project_apply", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", projectPath: "/p", applyStoreRoot: "/a" },
+    { kind: "project_apply", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", projectPath: "/p", applyStoreRoot: "/a", observation: "ZZ" },
+    { kind: "project_apply", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", projectPath: "/p", applyStoreRoot: "/a", observation: "a".repeat(64), ghost: 1 },
+    { kind: "project_apply_inspect", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", projectPath: "/p", applyStoreRoot: "/a", observation: "a".repeat(64) },
+    { kind: "project_apply_inspect", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", applyStoreRoot: "/a" },
+    { kind: "project_apply", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", projectPath: "relative", applyStoreRoot: "/a", observation: "a".repeat(64) },
+    { kind: "project_apply", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", projectPath: "/p", applyStoreRoot: "/a/../b", observation: "a".repeat(64) },
+    { kind: "project_apply", runId: "../escape", applyId: "apply-1", projectId: "project-a", projectPath: "/p", applyStoreRoot: "/a", observation: "a".repeat(64) },
+    { kind: "project_apply", runId: "cp-run-1", applyId: "apply-1", projectId: "project-a", projectPath: "/p", applyStoreRoot: "/a", observation: "a".repeat(64), ghost: 1 },
+  ];
+  for (const command of bad) {
+    expect(() => routeOrchestratorCommand(command as OrchestratorCommand, ROUTING_CONFIG)).toThrow(OrchestratorSubprocessClientError);
+  }
+});
+
+test("the apply command capture reads every field exactly once through a proxy", () => {
+  const reads: string[] = [];
+  const target = {
+    kind: "project_apply",
+    runId: "cp-run-1",
+    applyId: "apply-1",
+    projectId: "project-a",
+    projectPath: "/srv/projects/demo",
+    applyStoreRoot: "/srv/applies",
+    observation: "a".repeat(64),
+  };
+  const hostile = new Proxy(target, {
+    get(target, property) {
+      if (typeof property === "string") {
+        reads.push(property);
+        return (target as unknown as Record<string, unknown>)[property];
+      }
+      return undefined;
+    },
+    has() {
+      return true;
+    },
+    ownKeys() {
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  const routed = routeOrchestratorCommand(hostile as unknown as OrchestratorCommand, ROUTING_CONFIG);
+  expect(routed.argv[0]).toBe("project-apply");
+  for (const field of ["kind", "runId", "applyId", "projectId", "projectPath", "applyStoreRoot", "observation"]) {
+    expect(reads.filter((read) => read === field)).toHaveLength(1);
+  }
+  expect(reads.some((read) => read === "ghost" || read === "launcherId" || read === "pipelineRoot")).toBe(false);
+});

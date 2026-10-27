@@ -416,6 +416,12 @@ function makeChain(stateRoot: string, resultBody: Record<string, unknown>, credF
     projectChangeContentPipelineV2Run: (async () => {
       throw new Error("fake projectChangeContentPipelineV2Run not configured");
     }) as unknown as CliIo["projectChangeContentPipelineV2Run"],
+    projectApplyPipelineV2: (async () => {
+      throw new Error("fake projectApplyPipelineV2Run not configured");
+    }) as unknown as CliIo["projectApplyPipelineV2"],
+    projectApplyInspectPipelineV2: (async () => {
+      throw new Error("fake projectApplyInspectPipelineV2 not configured");
+    }) as unknown as CliIo["projectApplyInspectPipelineV2"],
     respondPipelineV2Wait: (async () => {
       throw new Error("fake not configured");
     }) as unknown as CliIo["respondPipelineV2Wait"],
@@ -645,6 +651,12 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
     projectChangeContentPipelineV2Run: (async () => {
       throw new Error("fake projectChangeContentPipelineV2Run not configured");
     }) as unknown as CliIo["projectChangeContentPipelineV2Run"],
+    projectApplyPipelineV2: (async () => {
+      throw new Error("fake projectApplyPipelineV2Run not configured");
+    }) as unknown as CliIo["projectApplyPipelineV2"],
+    projectApplyInspectPipelineV2: (async () => {
+      throw new Error("fake projectApplyInspectPipelineV2 not configured");
+    }) as unknown as CliIo["projectApplyInspectPipelineV2"],
     respondPipelineV2Wait: (async () => {
         throw new Error("fake not configured");
       }) as unknown as CliIo["respondPipelineV2Wait"],

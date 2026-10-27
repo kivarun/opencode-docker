@@ -98,6 +98,12 @@ export interface ResolvedControlPlaneProject {
   readonly pipelineRoot: string | null;
   readonly launcherId: string | null;
   readonly inputRoots: readonly ResolvedControlPlaneInputRoot[];
+  /**
+   * The one explicit per-project Project Apply capability. Absent in the
+   * document means `false` (default disabled); there is no other
+   * capability mechanism and no second feature-flag list.
+   */
+  readonly projectApply: boolean;
 }
 
 /** The loaded registry: schema version 1 with projects in declaration order. */
@@ -176,6 +182,7 @@ interface CapturedRegistryProject {
   readonly pipelineRoot: string | null;
   readonly launcherId: string | null;
   readonly inputRoots: readonly { id: string; root: string }[];
+  readonly projectApply: boolean;
 }
 
 /**
@@ -209,7 +216,7 @@ function validateRegistryDocument(document: unknown): readonly CapturedRegistryP
     }
     const projectKeys = Object.keys(entry);
     if (
-      projectKeys.length !== 6 ||
+      (projectKeys.length !== 6 && projectKeys.length !== 7) ||
       !Object.hasOwn(entry, "id") ||
       !Object.hasOwn(entry, "project_root") ||
       !Object.hasOwn(entry, "config_root") ||
@@ -217,7 +224,15 @@ function validateRegistryDocument(document: unknown): readonly CapturedRegistryP
       !Object.hasOwn(entry, "launcher_id") ||
       !Object.hasOwn(entry, "input_roots")
     ) {
-      throw new ControlPlaneProjectRegistryError("invalid_registry", "each registry project must have exactly id, project_root, config_root, pipeline_root, launcher_id and input_roots");
+      throw new ControlPlaneProjectRegistryError("invalid_registry", "each registry project must have exactly id, project_root, config_root, pipeline_root, launcher_id, input_roots and the optional project_apply");
+    }
+    const projectApplyValue = entry["project_apply"];
+    let projectApply = false;
+    if (Object.hasOwn(entry, "project_apply")) {
+      if (typeof projectApplyValue !== "boolean") {
+        throw new ControlPlaneProjectRegistryError("invalid_registry", "the registry project_apply must be a boolean when present");
+      }
+      projectApply = projectApplyValue;
     }
     const id = expectSafeId(entry, "id", "the registry project id");
     if (seenProjectIds.has(id)) {
@@ -267,7 +282,7 @@ function validateRegistryDocument(document: unknown): readonly CapturedRegistryP
       }
       inputRoots.push({ id: rootId, root: rootPath });
     }
-    captured.push({ id, projectRoot, configRoot, pipelineRoot, launcherId, inputRoots });
+    captured.push({ id, projectRoot, configRoot, pipelineRoot, launcherId, inputRoots, projectApply });
   }
   return captured;
 }
@@ -389,6 +404,7 @@ export async function loadControlPlaneProjectRegistry(registryPath: string): Pro
       pipelineRoot,
       launcherId: project.launcherId,
       inputRoots,
+      projectApply: project.projectApply,
     });
   }
   return deepFreezeValue({ schemaVersion: 1 as const, projects: resolvedProjects });

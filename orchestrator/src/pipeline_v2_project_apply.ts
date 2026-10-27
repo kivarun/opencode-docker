@@ -18,6 +18,7 @@ import {
   type PipelineV2ApplyExecutionReason,
   type PipelineV2ApplyExecutionResult,
 } from "./pipeline_v2_project_apply_writer_internal.ts";
+import type { PipelineV2ApplyOperationStatus } from "./pipeline_v2_apply_state_internal.ts";
 import { realApplyFdOps } from "./pipeline_v2_apply_fd_internal.ts";
 import { realImmutableDocumentIo } from "./pipeline_v2_immutable_document_store_internal.ts";
 import { defaultPipelineStateIo } from "./run_snapshot_store.ts";
@@ -67,6 +68,145 @@ export type {
   PipelineV2ApplyExecutionReason,
 };
 export type { PipelineV2ApplyPlan };
+
+/**
+ * The one public reason vocabulary of the explicit Project Apply API:
+ * derived once from the two existing typed owners (the preparation
+ * vocabulary and the execution vocabulary) — never a copied literal
+ * list. Every CLI, subprocess-client and HTTP layer validates against
+ * this single derived array.
+ */
+export const PIPELINE_V2_PROJECT_APPLY_PUBLIC_REASONS: readonly string[] = Object.freeze(
+  Array.from(new Set<string>([...PIPELINE_V2_PROJECT_APPLY_FAILURE_REASONS, ...PIPELINE_V2_APPLY_EXECUTION_REASONS])),
+);
+
+export type PipelineV2ProjectApplyPublicReason = PipelineV2ProjectApplyFailureReason | PipelineV2ApplyExecutionReason;
+
+/** The CLI-facing outcome of one explicit Project Apply command. */
+export type PipelineV2ProjectApplyCommandOutcome =
+  | {
+      readonly ok: true;
+      readonly exitCode: 0;
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly applyId: string;
+      readonly projectId: string;
+      readonly observation: string;
+      readonly revision: number;
+      readonly status: PipelineV2ApplyOperationStatus;
+      readonly completedStepCount: number;
+      readonly totalStepCount: number;
+    }
+  | {
+      readonly ok: false;
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly applyId: string;
+      readonly reason: PipelineV2ProjectApplyPublicReason;
+    };
+
+function applyCommandFailure(
+  runId: string,
+  applyId: string,
+  cause: unknown,
+): PipelineV2ProjectApplyCommandOutcome {
+  const reason: PipelineV2ProjectApplyPublicReason =
+    cause instanceof PipelineV2ProjectApplyError
+      ? cause.reason
+      : cause instanceof PipelineV2ApplyExecutionError
+        ? cause.reason
+        : "internal_error";
+  return { ok: false, exitCode: 1, runId, applyId, reason };
+}
+
+/**
+ * The one explicit Apply composition: terminal-run eligibility, exact
+ * observation verification and identity/root binding belong to the
+ * existing preparation core; the filesystem execution and recovery to
+ * the existing writer; the final document to the existing read-only
+ * inspection projection. No second planner, writer, verifier or state
+ * machine exists here.
+ */
+export async function applyPipelineV2ProjectOperation(options: PipelineV2ProjectApplyOptions): Promise<PipelineV2ProjectApplyCommandOutcome> {
+  try {
+    await preparePipelineV2ProjectApply(options);
+  } catch (cause) {
+    // The filesystem writer owns every post-preparation status: an
+    // operation that already left the preparation phase (applied,
+    // conflict, recovery_required, applying, failed) goes straight to
+    // the writer, which returns its stored typed result or continues
+    // the recovery. Every other preparation refusal is terminal.
+    if (!(cause instanceof PipelineV2ProjectApplyError && cause.reason === "apply_not_prepared")) {
+      return applyCommandFailure(options.runId, options.applyId, cause);
+    }
+  }
+  let execution: PipelineV2ApplyExecutionResult;
+  try {
+    execution = await applyPreparedPipelineV2Project({
+      applyStoreRoot: options.applyStoreRoot,
+      applyId: options.applyId,
+      projectId: options.projectId,
+      projectRoot: options.projectRoot,
+    });
+  } catch (cause) {
+    return applyCommandFailure(options.runId, options.applyId, cause);
+  }
+  if (!execution.ok) {
+    return { ok: false, exitCode: 1, runId: options.runId, applyId: options.applyId, reason: execution.reason };
+  }
+  try {
+    const projection = await inspectPipelineV2ProjectApplyOperation({ applyStoreRoot: options.applyStoreRoot, applyId: options.applyId });
+    return {
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 1,
+      runId: options.runId,
+      applyId: options.applyId,
+      projectId: options.projectId,
+      observation: projection.observation,
+      revision: projection.revision,
+      status: projection.status,
+      completedStepCount: projection.execution?.completed_step_count ?? 0,
+      totalStepCount: projection.plan_step_count ?? 0,
+    };
+  } catch (cause) {
+    return applyCommandFailure(options.runId, options.applyId, cause);
+  }
+}
+
+/**
+ * The one read-only operation inspection bound to one run/project: a
+ * foreign applyId is refused with the same reason as a missing one, so
+ * the existence of somebody else's operation is never disclosed.
+ */
+export async function inspectPipelineV2ProjectApplyOperationForRun(options: {
+  readonly applyStoreRoot: string;
+  readonly applyId: string;
+  readonly runId: string;
+  readonly projectId: string;
+}): Promise<PipelineV2ProjectApplyCommandOutcome> {
+  try {
+    const projection = await inspectPipelineV2ProjectApplyOperation({ applyStoreRoot: options.applyStoreRoot, applyId: options.applyId });
+    if (projection.run_id !== options.runId || projection.project_id !== options.projectId) {
+      return { ok: false, exitCode: 1, runId: options.runId, applyId: options.applyId, reason: "artifact_missing" };
+    }
+    return {
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 1,
+      runId: projection.run_id,
+      applyId: projection.apply_id,
+      projectId: projection.project_id,
+      observation: projection.observation,
+      revision: projection.revision,
+      status: projection.status,
+      completedStepCount: projection.execution?.completed_step_count ?? 0,
+      totalStepCount: projection.plan_step_count ?? 0,
+    };
+  } catch (cause) {
+    return applyCommandFailure(options.runId, options.applyId, cause);
+  }
+}
 
 const productionComponents = {
   docIo: realImmutableDocumentIo,

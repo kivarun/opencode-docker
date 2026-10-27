@@ -105,6 +105,23 @@ export type OrchestratorCommand =
       readonly runId: string;
       readonly waitIndex: number;
       readonly actionId: string;
+    }
+  | {
+      readonly kind: "project_apply";
+      readonly runId: string;
+      readonly applyId: string;
+      readonly projectId: string;
+      readonly projectPath: string;
+      readonly applyStoreRoot: string;
+      readonly observation: string;
+    }
+  | {
+      readonly kind: "project_apply_inspect";
+      readonly runId: string;
+      readonly applyId: string;
+      readonly projectId: string;
+      readonly projectPath: string;
+      readonly applyStoreRoot: string;
     };
 
 /** Server-side routing configuration: which config root and optional default pipeline root to route with. */
@@ -182,6 +199,9 @@ interface CapturedCommand {
   readonly observation: string | null;
   readonly changeIndex: number;
   readonly side: string;
+  readonly applyId: string;
+  readonly projectId: string;
+  readonly applyStoreRoot: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -302,6 +322,9 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
     observation: null,
     changeIndex: 0,
     side: "",
+    applyId: "",
+    projectId: "",
+    applyStoreRoot: "",
   };
   switch (kind) {
     case "run": {
@@ -549,6 +572,31 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
         actionId: expectSafeIdField(command, "actionId", "actionId"),
       };
     }
+    case "project_apply":
+    case "project_apply_inspect": {
+      const required = ["kind", "runId", "applyId", "projectId", "projectPath", "applyStoreRoot"] as const;
+      const allowed: readonly string[] = kind === "project_apply" ? [...required, "observation"] : [...required];
+      for (const key of Object.keys(command)) {
+        if (!allowed.includes(key)) {
+          throw new OrchestratorSubprocessClientError("invalid_command", `unknown field on ${kind} command`);
+        }
+      }
+      for (const key of required) {
+        if (!Object.hasOwn(command, key)) {
+          throw new OrchestratorSubprocessClientError("invalid_command", `missing field ${key} on ${kind} command`);
+        }
+      }
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        applyId: expectSafeIdField(command, "applyId", "applyId"),
+        projectId: expectSafeIdField(command, "projectId", "projectId"),
+        projectPath: expectCleanPathField(command, "projectPath", "projectPath"),
+        applyStoreRoot: expectCleanPathField(command, "applyStoreRoot", "applyStoreRoot"),
+        observation: kind === "project_apply" ? expectObservationDigestField(command, "observation") : null,
+      };
+    }
     default:
       throw new OrchestratorSubprocessClientError("invalid_command", "unknown command kind");
   }
@@ -583,7 +631,11 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
             ? "project-changes"
             : captured.kind === "project_change_content"
               ? "project-change-content"
-              : captured.kind;
+              : captured.kind === "project_apply"
+                ? "project-apply"
+                : captured.kind === "project_apply_inspect"
+                  ? "project-apply-inspect"
+                  : captured.kind;
   const argv: string[] = [cliKind];
   switch (captured.kind) {
     case "run": {
@@ -690,6 +742,31 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
       break;
     case "respond":
       argv.push("--run-id", captured.runId, "--wait-index", String(captured.waitIndex), "--action", captured.actionId);
+      break;
+    case "project_apply":
+    case "project_apply_inspect":
+      argv.push(
+        "--run-id",
+        captured.runId,
+        "--apply-id",
+        captured.applyId,
+        "--project-id",
+        captured.projectId,
+      );
+      if (captured.kind === "project_apply") {
+        if (captured.observation === null) {
+          throw new OrchestratorSubprocessClientError("invalid_command", "missing field observation on project_apply command");
+        }
+        argv.push("--observation", captured.observation);
+      }
+      argv.push(
+        "--config-root",
+        routingConfig.configRoot,
+        "--project",
+        captured.projectPath,
+        "--apply-store-root",
+        captured.applyStoreRoot,
+      );
       break;
     default:
       throw new OrchestratorSubprocessClientError("invalid_command", "unknown command kind");

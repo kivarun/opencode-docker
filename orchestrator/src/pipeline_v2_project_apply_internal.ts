@@ -187,6 +187,8 @@ export interface PipelineV2ProjectApplyOperationProjection {
   readonly revision: number;
   readonly observation: string;
   readonly plan_digest: string | null;
+  /** The plan's total step count once the plan was published (null before). */
+  readonly plan_step_count: number | null;
   readonly sealed_payload_count: number;
   readonly failure_reason: string | null;
   /** The durable execution progress (schema v2); null before the writer ran. */
@@ -1074,6 +1076,7 @@ async function inspectOperationWithComponents(
     revision: state.revision,
     observation: state.observation,
     plan_digest: state.plan_digest,
+    plan_step_count: state.plan_step_count,
     sealed_payload_count: state.sealed_payload_count,
     failure_reason: state.failure_reason,
     execution:

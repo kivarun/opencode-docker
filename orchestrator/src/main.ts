@@ -113,6 +113,11 @@ import {
   projectChangeContentPipelineV2Run,
   type PipelineV2ProjectChangeContentOutcome,
 } from "./pipeline_v2_project_change_content.ts";
+import {
+  applyPipelineV2ProjectOperation,
+  inspectPipelineV2ProjectApplyOperationForRun,
+  type PipelineV2ProjectApplyCommandOutcome,
+} from "./pipeline_v2_project_apply.ts";
 
 /**
  * The per-call seam of the dispatcher. The production default builds one
@@ -144,6 +149,8 @@ export interface CliIo {
   logsPipelineV2Run: typeof logsPipelineV2Run;
   projectChangesPipelineV2Run: typeof projectChangesPipelineV2Run;
   projectChangeContentPipelineV2Run: typeof projectChangeContentPipelineV2Run;
+  projectApplyPipelineV2: typeof applyPipelineV2ProjectOperation;
+  projectApplyInspectPipelineV2: typeof inspectPipelineV2ProjectApplyOperationForRun;
   runSmoke: typeof runSmoke;
   runAgentSmoke: typeof runAgentSmoke;
   /**
@@ -181,6 +188,8 @@ function productionCliIo(): CliIo {
     logsPipelineV2Run,
     projectChangesPipelineV2Run,
     projectChangeContentPipelineV2Run,
+    projectApplyPipelineV2: applyPipelineV2ProjectOperation,
+    projectApplyInspectPipelineV2: inspectPipelineV2ProjectApplyOperationForRun,
     runSmoke,
     runAgentSmoke,
     readTaskFile: (path: string) => readFile(path, "utf8"),
@@ -213,7 +222,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "logs", "project-changes", "project-change-content"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "logs", "project-changes", "project-change-content", "project-apply", "project-apply-inspect"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -231,7 +240,9 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "events" &&
     command !== "logs" &&
     command !== "project-changes" &&
-    command !== "project-change-content"
+    command !== "project-change-content" &&
+    command !== "project-apply" &&
+    command !== "project-apply-inspect"
   ) {
     const expected = COMMANDS.map((name) => `'orchestrator ${name}'`).join(", ");
     const suffix = command !== undefined ? `, got ${JSON.stringify(command)}` : "";
@@ -307,6 +318,24 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // production API exactly once. No SubprocessCliRunner command
     // dependencies and no mutating command deps object are built for it.
     return await runPipelineV2ProjectChangeContentCommand(parsed, io);
+  }
+  if (parsed.kind === "project-apply") {
+    // The explicit pipeline v2 Project Apply command: it resolves only
+    // the state-root projection (no helper configuration, no Launcher
+    // credential, no auth, no subprocess, no signal registration) and
+    // invokes the Apply production API exactly once. The Apply runs
+    // under the cooperative project lock inside the existing facade;
+    // no run mutation lock is taken (the operation is keyed by the
+    // caller-owned apply id and every write is idempotent), and no
+    // worker, Docker Helper call or session is ever started.
+    return await runPipelineV2ProjectApplyCommand(parsed, io);
+  }
+  if (parsed.kind === "project-apply-inspect") {
+    // The read-only pipeline v2 Project Apply operation inspection: like
+    // project-changes it resolves only the state-root projection and
+    // invokes the read-only inspection exactly once. It never runs
+    // recovery and never changes any durable status.
+    return await runPipelineV2ProjectApplyInspectCommand(parsed, io);
   }
   if (parsed.kind === "project-changes") {
     // The read-only pipeline v2 project-changes command: like inspect and
@@ -920,6 +949,81 @@ async function runPipelineV2ProjectChangesCommand(
     );
   }
   return outcome.exitCode;
+}
+
+/** The one human summary line of the explicit Project Apply commands. */
+function reportPipelineV2ProjectApplyOutcome(
+  command: "project-apply" | "project-apply-inspect",
+  outcome: PipelineV2ProjectApplyCommandOutcome,
+  io: CliIo,
+): number {
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: ${command} ok (run ${outcome.runId}, apply ${outcome.applyId}, status ${outcome.status}, steps ${outcome.completedStepCount}/${outcome.totalStepCount})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: ${command} failed (run ${outcome.runId}, apply ${outcome.applyId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+async function runPipelineV2ProjectApplyCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "project-apply" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2ProjectApplyCommandOutcome = await io.projectApplyPipelineV2({
+    applyStoreRoot: parsed.applyStoreRoot,
+    applyId: parsed.applyId,
+    runId: parsed.runId,
+    projectId: parsed.projectId,
+    projectRoot: parsed.project,
+    observation: parsed.observation,
+    stateRoot: stateRootProjection.localRoot,
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+  return reportPipelineV2ProjectApplyOutcome("project-apply", outcome, io);
+}
+
+async function runPipelineV2ProjectApplyInspectCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "project-apply-inspect" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2ProjectApplyCommandOutcome = await io.projectApplyInspectPipelineV2({
+    applyStoreRoot: parsed.applyStoreRoot,
+    applyId: parsed.applyId,
+    runId: parsed.runId,
+    projectId: parsed.projectId,
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+  return reportPipelineV2ProjectApplyOutcome("project-apply-inspect", outcome, io);
 }
 
 function reportPipelineV2Outcome(

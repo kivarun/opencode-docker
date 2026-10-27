@@ -54,14 +54,17 @@ export interface ParsedControlPlaneServerArgs {
   readonly bindingStoreRoot: string;
   readonly port: number;
   readonly listenAddress: ControlPlaneListenAddress;
+  readonly applyStoreRoot: string | null;
   readonly env: Readonly<Record<string, string>>;
 }
 
 function usage(): string {
   return [
-    "usage: bun server_main.ts --registry ABS --binding-store ABS --port N [--listen-address 127.0.0.1|0.0.0.0] [--env KEY=VALUE ...]",
+    "usage: bun server_main.ts --registry ABS --binding-store ABS --port N [--apply-store-root ABS] [--listen-address 127.0.0.1|0.0.0.0] [--env KEY=VALUE ...]",
     "  --registry       absolute path of the versioned project registry file",
     "  --binding-store  absolute path of the durable run binding store root",
+    "  --apply-store-root  optional absolute mode-0700 apply-store root; absent",
+    "                   means the explicit Project Apply capability is unavailable",
     "  --port           the listen port (1..65535)",
     "  --listen-address the exact bind address: 127.0.0.1 (default) or 0.0.0.0 (container port forwarding)",
     "  --env KEY=VALUE  the exact CLI child environment; repeatable, no ambient inheritance",
@@ -88,6 +91,7 @@ export function parseControlPlaneServerArgs(argv: readonly string[]): ParsedCont
   let bindingStoreRoot: string | null = null;
   let port: number | null = null;
   let listenAddress: ControlPlaneListenAddress | null = null;
+  let applyStoreRoot: string | null = null;
   const env: Record<string, string> = {};
   const seenEnvKeys: string[] = [];
   let index = 0;
@@ -140,6 +144,13 @@ export function parseControlPlaneServerArgs(argv: readonly string[]): ParsedCont
       port = parsedPort;
       continue;
     }
+    const applyStoreValue = takeValue("--apply-store-root");
+    if (applyStoreValue !== null) {
+      if (applyStoreRoot !== null) failUsage("--apply-store-root must not repeat");
+      if (!isCleanAbsolutePath(applyStoreValue)) failUsage("--apply-store-root must be a clean absolute path");
+      applyStoreRoot = applyStoreValue;
+      continue;
+    }
     const listenValue = takeValue("--listen-address");
     if (listenValue !== null) {
       if (listenAddress !== null) failUsage("--listen-address must not repeat");
@@ -167,7 +178,7 @@ export function parseControlPlaneServerArgs(argv: readonly string[]): ParsedCont
   if (registryPath === null) failUsage("--registry is required");
   if (bindingStoreRoot === null) failUsage("--binding-store is required");
   if (port === null) failUsage("--port is required");
-  return { registryPath, bindingStoreRoot, port, listenAddress: listenAddress ?? "127.0.0.1", env };
+  return { registryPath, bindingStoreRoot, port, listenAddress: listenAddress ?? "127.0.0.1", applyStoreRoot, env };
 }
 
 export function buildControlPlaneServerConfig(args: ParsedControlPlaneServerArgs): ControlPlaneHttpServiceConfig {
@@ -186,6 +197,7 @@ export function buildControlPlaneServerConfig(args: ParsedControlPlaneServerArgs
     port: args.port,
     bodyLimitBytes: BODY_LIMIT_BYTES,
     listenAddress: args.listenAddress,
+    ...(args.applyStoreRoot === null ? {} : { applyStoreRoot: args.applyStoreRoot }),
   };
 }
 

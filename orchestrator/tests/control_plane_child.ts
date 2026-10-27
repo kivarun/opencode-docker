@@ -86,6 +86,46 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
     stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run", reason: "stale_observation" })}\n`,
     exitCode: 1,
   },
+  apply_ok: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", applyId: "cp-child-apply",
+      projectId: "cp-child-project", observation: "a".repeat(64), revision: 12,
+      status: "applied", completedStepCount: 3, totalStepCount: 3,
+    })}\n`,
+    exitCode: 0,
+  },
+  apply_conflict: {
+    stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", applyId: "cp-child-apply", reason: "project_conflict" })}\n`,
+    exitCode: 1,
+  },
+  apply_recovering: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", applyId: "cp-child-apply",
+      projectId: "cp-child-project", observation: "a".repeat(64), revision: 14,
+      status: "applying", completedStepCount: 1, totalStepCount: 3,
+    })}\n`,
+    exitCode: 0,
+  },
+  apply_bad_status: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", applyId: "cp-child-apply",
+      projectId: "cp-child-project", observation: "a".repeat(64), revision: 12,
+      status: "already_applied", completedStepCount: 3, totalStepCount: 3,
+    })}\n`,
+    exitCode: 0,
+  },
+  apply_bad_reason: {
+    stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", applyId: "cp-child-apply", reason: "ghost_reason" })}\n`,
+    exitCode: 1,
+  },
+  apply_missing_field: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", applyId: "cp-child-apply",
+      projectId: "cp-child-project", observation: "a".repeat(64), revision: 12,
+      status: "applied", completedStepCount: 3,
+    })}\n`,
+    exitCode: 0,
+  },
   content_bad_status: {
     stdout: `${JSON.stringify({
       ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run", runRoot: "/tmp/cp-child-run",

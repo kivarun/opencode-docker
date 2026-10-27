@@ -7068,6 +7068,70 @@ never touched by the writer.
   and diagnostics. The documented limitation: a non-cooperative writer
   racing the verify→rename window remains an operator-trust assumption,
   as everywhere else in the apply layer.
-- **Out of scope (still unwired).** HTTP/UI/CLI routing surfaces for
-  apply, the deployment read-write mount, selective apply, rollback and
-  the future journal extension for them.
+- **Out of scope (still unwired).** The deployment read-write mount,
+  selective apply, rollback and the future journal extension for them;
+  the public surfaces exist since the explicit Apply API increment below
+  (CLI, control-plane routing/client, HTTP POST/GET — the Browser UI
+  stays unwired).
+
+## Explicit Project Apply API
+
+Apply is always explicit. Nothing in a run, in the orchestrator, in the
+CLI (outside the dedicated command) or in the browser UI applies a
+prepared package automatically, on a schedule, or as a side effect of any
+other operation. The operator reviews the Project Changes observation
+first; the reviewed observation identity is the only content the caller
+supplies.
+
+- **Capability, default disabled.** The frozen project registry carries
+  the one optional per-project `project_apply` boolean. Absent or false
+  means the capability is disabled; there is no second capability
+  mechanism and no second feature-flag list, and no users/RBAC/TLS layer
+  is introduced by it. The loopback HTTP service additionally requires
+  the trusted startup flag `--apply-store-root`; when it is absent the
+  capability is unavailable entirely and the HTTP caller can never supply
+  or override the root.
+- **Authority chain (nothing caller-supplied).** The HTTP caller names
+  exactly three values — the URL run id, the URL apply id and the POST
+  body observation. The project identity, the project path, the
+  configuration root, the apply-store root, the run root, plans, steps,
+  payloads, artifact paths, temp names and any worker authority are
+  structurally inexpressible: `runId → durable run binding → frozen
+  registry project → canonical registered project root → server-owned
+  apply-store root → existing preparation/writer facade`.
+- **Operation identity and idempotency.** The apply id is a
+  caller-generated safe identifier and the idempotency key. The first
+  POST creates the operation; an exact repeat of
+  `(runId, applyId, observation, bound project)` continues crash recovery
+  or returns `status: "applied"` again without a second package, repeated
+  filesystem steps or inode/mode/content churn. A repeat with a different
+  run, observation or project binding is the typed `identity_conflict`
+  with zero writes. There is no server-generated apply id after the
+  operation began: a lost HTTP response never makes an operation
+  unreachable — the caller retries the same POST.
+- **Trusted CLI.** `orchestrator project-apply` composes preparation,
+  writer execution/recovery and the read-only operation projection through
+  the existing facades; `orchestrator project-apply-inspect` is strictly
+  read-only and never runs recovery. An operation bound to a different
+  run or project is reported as absent (never disclosed). No project
+  path, run root, apply-store root, plan path, payload name, temp name,
+  device identity or diagnostic is ever serialized into a document.
+- **HTTP surface.** `POST /v1/runs/:runId/project-applies/:applyId`
+  answers the versioned `project_apply_operation` document (run/apply
+  ids, bound observation, durable status, completed/total step counts);
+  `GET` on the same path is read-only, never runs recovery and answers a
+  404 without disclosure for a missing or foreign operation. Durable
+  conflicts and `recovery_required` travel as typed command results —
+  they are operation states, never lost transport errors. The Browser UI
+  has no Apply surface: its general API client keeps rejecting the new
+  document kinds fail-closed.
+- **Guarantees preserved unchanged.** Apply never starts a worker, a
+  Docker Helper call or a session; the full preflight precedes the first
+  project mutation; progress is per-path crash-safe (not whole-tree
+  atomic); the cooperative project lock serializes orchestrator-owned
+  readers and writers but does not protect against editors or VCS tools
+  that ignore `flock`; the registered project requires the
+  operator-provided read-write authority of its deployment mount, while
+  workers still see only the run workspace; the dogfood kit stays
+  read-only. Operations are durable and retryable by apply id across
+  service restarts.

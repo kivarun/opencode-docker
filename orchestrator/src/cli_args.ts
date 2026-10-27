@@ -147,7 +147,9 @@ export type ParsedCommand =
   | ParsedPipelineEventsArgs
   | ParsedPipelineLogsArgs
   | ParsedPipelineProjectChangesArgs
-  | ParsedPipelineProjectChangeContentArgs;
+  | ParsedPipelineProjectChangeContentArgs
+  | ParsedPipelineProjectApplyArgs
+  | ParsedPipelineProjectApplyInspectArgs;
 
 export function usage(): string {
   return [
@@ -190,11 +192,19 @@ export function usage(): string {
     "               observation with an ephemeral read snapshot identity -",
     "               no worker, no Launcher credential, no mutation lock, no",
     "               durable change and no write to the operator project",
-    "  project-change-content read-only bounded raw-byte content of one side",
-    "               of one verified change entry: bound to the recomputed",
-    "               observation identity, served through one single-pass",
-    "               verified stream - no worker, no Launcher credential, no",
-    "               mutation lock, no durable change and no write anywhere",
+  "  project-change-content read-only bounded raw-byte content of one side",
+  "               of one verified change entry: bound to the recomputed",
+  "               observation identity, served through one single-pass",
+  "               verified stream - no worker, no Launcher credential, no",
+  "               mutation lock, no durable change and no write anywhere",
+  "  project-apply explicit Project Apply of one finalized run's reviewed",
+  "               result onto the registered operator project: caller-owned",
+  "               apply id, exact observation binding, durable per-path",
+  "               progress - never automatic, starts no worker and no",
+  "               Docker Helper call",
+  "  project-apply-inspect read-only projection of one durable Apply",
+  "               operation (status, revision, step counts): never runs",
+  "               recovery and never changes any status",
     "  respond      production pipeline v2 wait response: record the user's answer to",
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
@@ -607,6 +617,45 @@ export function usage(): string {
   "  never in diagnostics, headers or URLs. This command writes nothing",
   "  anywhere (atime may move under the kernel's read policy and is not",
   "  part of any zero-write claim), and no Apply exists.",
+  "",
+  "project-apply flags (production pipeline v2, explicit Project Apply):",
+  "  --run-id SAFE_ID        the terminal run whose reviewed result is applied",
+  "  --apply-id SAFE_ID      caller-owned idempotency identity of the operation;",
+  "                          the same identity continues crash recovery and",
+  "                          never creates a second package",
+  "  --project-id SAFE_ID    the registry project id the operation binds to",
+  "  --observation SHA256    the 64-hex Project Changes observation the",
+  "                          operation is bound to; a recomputed digest that",
+  "                          differs is 'stale_observation' (zero writes)",
+  "  --config-root PATH      non-empty absolute configuration root; required by",
+  "                          the shared command grammar but not used here",
+  "                          (no profile is loaded, no Launcher credential)",
+  "  --project PATH          clean absolute path of the registered operator",
+  "                          project; required; written only under the",
+  "                          cooperative project lock",
+  "  --apply-store-root PATH clean absolute mode-0700 directory owning the",
+  "                          durable operation packages; required",
+  "  --json                  print exactly one JSON versioned operation document",
+  "                          on stdout; errors and diagnostics go to stderr.",
+  "",
+  "  Apply is always explicit and never automatic: the operator reviews the",
+  "  Project Changes observation first. The operation is durable and",
+  "  retryable by apply id; progress is per-path crash-safe (not",
+  "  whole-tree atomic), and the cooperative project lock does not protect",
+  "  against editors or VCS tools that ignore flock. This command starts",
+  "  no worker, no Docker Helper call and no session.",
+  "",
+  "project-apply-inspect flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID --apply-id SAFE_ID --project-id SAFE_ID",
+  "                          the operation to project; an operation bound to a",
+  "                          different run or project is reported as absent",
+  "  --config-root PATH      required by the shared command grammar; unused",
+  "  --project PATH          clean absolute path of the registered operator",
+  "                          project; required; never written",
+  "  --apply-store-root PATH the operation store to read; required",
+  "  --json                  print exactly one JSON versioned operation document",
+  "                          on stdout. This command is strictly read-only: it",
+  "                          never runs recovery and never changes any status.",
   "",
     "run locations and runtime configuration:",
     "  The durable run state is written to",
@@ -1521,8 +1570,246 @@ function parseProjectChangeContentArgs(argv: string[]): ParsedPipelineProjectCha
   };
 }
 
+export interface ParsedPipelineProjectApplyArgs {
+  readonly kind: "project-apply";
+  readonly runId: string;
+  readonly applyId: string;
+  readonly projectId: string;
+  readonly observation: string;
+  readonly configRoot: string;
+  readonly project: string;
+  readonly applyStoreRoot: string;
+  readonly json: boolean;
+}
+
+export interface ParsedPipelineProjectApplyInspectArgs {
+  readonly kind: "project-apply-inspect";
+  readonly runId: string;
+  readonly applyId: string;
+  readonly projectId: string;
+  readonly configRoot: string;
+  readonly project: string;
+  readonly applyStoreRoot: string;
+  readonly json: boolean;
+}
+
+/** The shared flag battery of the two explicit Project Apply commands. */
+function parseProjectApplyShared(
+  argv: string[],
+  commandName: "project-apply" | "project-apply-inspect",
+): {
+  runId: string;
+  applyId: string;
+  projectId: string;
+  observation: string | null;
+  configRoot: string;
+  project: string;
+  applyStoreRoot: string;
+  json: boolean;
+} {
+  let runId: string | null = null;
+  let applyId: string | null = null;
+  let projectId: string | null = null;
+  let observation: string | null = null;
+  let configRoot: string | null = null;
+  let project: string | null = null;
+  let applyStoreRoot: string | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+  const expectSafeIdFlag = (value: string, flag: string): string => {
+    try {
+      expectSafeId(value, flag);
+    } catch (cause) {
+      throw new Error(`${flag} must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+    return value;
+  };
+  const foreign = (arg: string, why: string): never => {
+    throw new Error(`${commandName} does not accept ${arg.split("=")[0] ?? arg}; ${why}`);
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      runId = expectSafeIdFlag(value, "--run-id");
+      i = next;
+    } else if (arg === "--apply-id" || arg.startsWith("--apply-id=")) {
+      const { value, next } = parseValue(argv, i, "--apply-id");
+      requireSingleton(applyId, "--apply-id");
+      applyId = expectSafeIdFlag(value, "--apply-id");
+      i = next;
+    } else if (arg === "--project-id" || arg.startsWith("--project-id=")) {
+      const { value, next } = parseValue(argv, i, "--project-id");
+      requireSingleton(projectId, "--project-id");
+      projectId = expectSafeIdFlag(value, "--project-id");
+      i = next;
+    } else if (arg === "--observation" || arg.startsWith("--observation=")) {
+      if (commandName === "project-apply-inspect") {
+        foreign(arg, "the bound observation comes from the durable operation");
+      }
+      const { value, next } = parseValue(argv, i, "--observation");
+      requireSingleton(observation, "--observation");
+      if (!/^[0-9a-f]{64}$/.test(value)) {
+        throw new Error("--observation must be a 64-character lowercase hexadecimal digest");
+      }
+      observation = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      const { value, next } = parseValue(argv, i, "--project");
+      requireSingleton(project, "--project");
+      project = requireAbsolute(value, "--project");
+      if (!isCleanAbsolutePath(project)) {
+        throw new Error("--project must be a clean absolute path");
+      }
+      i = next;
+    } else if (arg === "--apply-store-root" || arg.startsWith("--apply-store-root=")) {
+      const { value, next } = parseValue(argv, i, "--apply-store-root");
+      requireSingleton(applyStoreRoot, "--apply-store-root");
+      applyStoreRoot = requireAbsolute(value, "--apply-store-root");
+      if (!isCleanAbsolutePath(applyStoreRoot)) {
+        throw new Error("--apply-store-root must be a clean absolute path");
+      }
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      foreign(arg, "it performs no Launcher authentication");
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      foreign(arg, "the pipeline comes only from the durable state");
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      foreign(arg, "the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      foreign(arg, "no worker is launched");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      foreign(arg, "no worker is launched");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      foreign(arg, "no profile is loaded");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      foreign(arg, "there is no task input");
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      foreign(arg, "stage selection is operator policy of 'resume-plan'");
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      foreign(arg, "budget selection is operator policy of 'resume-plan'");
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      foreign(arg, "wait selection belongs to the response and intervention commands");
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      foreign(arg, "it changes nothing and records no response");
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      foreign(arg, "grants belong to 'continue-stage'");
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      foreign(arg, "task revisions belong to 'revise-task'");
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      foreign(arg, "task revisions belong to 'revise-task'");
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      foreign(arg, "task revisions belong to 'revise-task'");
+    } else if (arg === "--execution-index" || arg.startsWith("--execution-index=")) {
+      foreign(arg, "the log cursor belongs to 'logs'");
+    } else if (arg === "--offset" || arg.startsWith("--offset=")) {
+      foreign(arg, "the content cursor belongs to 'project-change-content'");
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      foreign(arg, "the content cursor belongs to 'project-change-content'");
+    } else if (arg === "--change-index" || arg.startsWith("--change-index=")) {
+      foreign(arg, "the change index belongs to 'project-change-content'");
+    } else if (arg === "--side" || arg.startsWith("--side=")) {
+      foreign(arg, "the content side belongs to 'project-change-content'");
+    } else if (arg === "--after" || arg.startsWith("--after=")) {
+      foreign(arg, "the entry cursor belongs to 'project-changes'");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      foreign(arg, "set the ORCHESTRATOR_STATE_ROOT environment variable");
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      foreign(arg, "set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable");
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error(`--run-id SAFE_ID is required for ${commandName}`);
+  }
+  if (applyId === null) {
+    throw new Error(`--apply-id SAFE_ID is required for ${commandName}`);
+  }
+  if (projectId === null) {
+    throw new Error(`--project-id SAFE_ID is required for ${commandName}`);
+  }
+  if (configRoot === null) {
+    throw new Error(`--config-root ABS is required for ${commandName}`);
+  }
+  if (project === null) {
+    throw new Error(`--project ABS is required for ${commandName}`);
+  }
+  if (applyStoreRoot === null) {
+    throw new Error(`--apply-store-root ABS is required for ${commandName}`);
+  }
+  return {
+    runId,
+    applyId: applyId,
+    projectId: projectId,
+    observation,
+    configRoot,
+    project,
+    applyStoreRoot,
+    json,
+  };
+}
+
+function parseProjectApplyArgs(argv: string[]): ParsedPipelineProjectApplyArgs {
+  const shared = parseProjectApplyShared(argv, "project-apply");
+  if (shared.observation === null) {
+    throw new Error("--observation SHA256 is required for project-apply");
+  }
+  return {
+    kind: "project-apply",
+    runId: shared.runId,
+    applyId: shared.applyId,
+    projectId: shared.projectId,
+    observation: shared.observation,
+    configRoot: shared.configRoot,
+    project: shared.project,
+    applyStoreRoot: shared.applyStoreRoot,
+    json: shared.json,
+  };
+}
+
+function parseProjectApplyInspectArgs(argv: string[]): ParsedPipelineProjectApplyInspectArgs {
+  const shared = parseProjectApplyShared(argv, "project-apply-inspect");
+  return {
+    kind: "project-apply-inspect",
+    runId: shared.runId,
+    applyId: shared.applyId,
+    projectId: shared.projectId,
+    configRoot: shared.configRoot,
+    project: shared.project,
+    applyStoreRoot: shared.applyStoreRoot,
+    json: shared.json,
+  };
+}
+
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs" | "project-changes" | "project-change-content",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs" | "project-changes" | "project-change-content" | "project-apply" | "project-apply-inspect",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -1557,6 +1844,12 @@ export function parseCommand(
   }
   if (kind === "project-change-content") {
     return parseProjectChangeContentArgs(argv);
+  }
+  if (kind === "project-apply") {
+    return parseProjectApplyArgs(argv);
+  }
+  if (kind === "project-apply-inspect") {
+    return parseProjectApplyInspectArgs(argv);
   }
   let workspace: string | null = null;
   let workerImage: string | null = null;

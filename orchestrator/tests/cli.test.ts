@@ -1586,3 +1586,126 @@ test("the logs parser: the exact success shapes in both flag forms", () => {
     expect(text).toContain("no log content");
     expect(text).toContain("reaches headers, errors, state, events, inspect or discovery");
   });
+
+test("the project-apply parser: the exact success shape in both flag forms", () => {
+  const base = [
+    "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a",
+    "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/operator/project",
+    "--apply-store-root", "/applies",
+  ];
+  for (const form of [base, base.map((value) => (value.startsWith("--") && !base.includes(value, base.indexOf(value) + 1) ? value : value))]) {
+    void form;
+  }
+  const parsed = parseCommand("project-apply", base);
+  expect(parsed.kind).toBe("project-apply");
+  if (parsed.kind !== "project-apply") {
+    throw new Error("expected project-apply");
+  }
+  expect(parsed).toEqual({
+    kind: "project-apply",
+    runId: "run_x",
+    applyId: "apply_x",
+    projectId: "project_a",
+    observation: "a".repeat(64),
+    configRoot: "/cfg",
+    project: "/operator/project",
+    applyStoreRoot: "/applies",
+    json: false,
+  });
+  const equalsForm = parseCommand("project-apply", [
+    "--run-id=run_x", "--apply-id=apply_x", "--project-id=project_a",
+    `--observation=${"a".repeat(64)}`, "--config-root=/cfg", "--project=/operator/project",
+    "--apply-store-root=/applies",
+  ]);
+  expect(equalsForm.kind).toBe("project-apply");
+});
+
+test("the project-apply parser requires every identity scalar and the observation", () => {
+  const full = ["--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"];
+  for (const [flag, index] of [["--run-id", 0], ["--apply-id", 2], ["--project-id", 4], ["--observation", 6], ["--config-root", 8], ["--project", 10], ["--apply-store-root", 12]] as const) {
+    const argv = [...full.slice(0, index), ...full.slice(index + 2)];
+    expect(() => parseCommand("project-apply", argv), `missing ${flag}`).toThrow(new RegExp(flag.replace(/[-]/g, "[-]")));
+  }
+  expect(() => parseCommand("project-apply", full)).not.toThrow();
+});
+
+test("the project-apply parser rejects unsafe ids, a malformed observation and duplicates", () => {
+  const base = ["--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"];
+  expect(() => parseCommand("project-apply", ["--run-id", "bad id", ...base.slice(2)])).toThrow("--run-id must be a safe identifier");
+  expect(() => parseCommand("project-apply", ["--apply-id", "..x", ...base.slice(2)])).toThrow("--apply-id must be a safe identifier");
+  expect(() => parseCommand("project-apply", ["--project-id", "", ...base.slice(2)])).toThrow("--project-id requires a value");
+  expect(() => parseCommand("project-apply", [...base.slice(0, 6), "--observation", "A".repeat(64), ...base.slice(8)])).toThrow("64-character lowercase hexadecimal");
+  expect(() => parseCommand("project-apply", [...base.slice(0, 6), "--observation", "a".repeat(63), ...base.slice(8)])).toThrow("64-character lowercase hexadecimal");
+  expect(() => parseCommand("project-apply", [...base.slice(0, 2), "--run-id", "run_y", ...base.slice(2)])).toThrow("at most once");
+  expect(() => parseCommand("project-apply", [...base, "--apply-store-root", "/b"])).toThrow("at most once");
+  expect(() => parseCommand("project-apply", [...base.slice(0, 10), "--project", "relative/path", ...base.slice(12)])).toThrow("must be an absolute path");
+  expect(() => parseCommand("project-apply", [...base.slice(0, 12), "--apply-store-root", "/a/../b"])).toThrow("clean absolute path");
+});
+
+test("the project-apply parser rejects every foreign flag with its scoped message", () => {
+  const base = ["--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"];
+  const rejected: readonly [string, string][] = [
+    ["--launcher-id", "it performs no Launcher authentication"],
+    ["--pipeline-root", "the pipeline comes only from the durable state"],
+    ["--input", "the run-owned input snapshot already exists"],
+    ["--workspace", "no worker is launched"],
+    ["--image", "no worker is launched"],
+    ["--profile", "no profile is loaded"],
+    ["--task", "there is no task input"],
+    ["--stage-id", "stage selection is operator policy of 'resume-plan'"],
+    ["--initial-budget", "budget selection is operator policy of 'resume-plan'"],
+    ["--wait-index", "wait selection belongs to the response and intervention commands"],
+    ["--action", "it changes nothing and records no response"],
+    ["--additional-iterations", "grants belong to 'continue-stage'"],
+    ["--task-id", "task revisions belong to 'revise-task'"],
+    ["--task-file", "task revisions belong to 'revise-task'"],
+    ["--task-body", "task revisions belong to 'revise-task'"],
+    ["--execution-index", "the log cursor belongs to 'logs'"],
+    ["--offset", "the content cursor belongs to 'project-change-content'"],
+    ["--limit", "the content cursor belongs to 'project-change-content'"],
+    ["--change-index", "the change index belongs to 'project-change-content'"],
+    ["--side", "the content side belongs to 'project-change-content'"],
+    ["--after", "the entry cursor belongs to 'project-changes'"],
+    ["--state-root", "set the ORCHESTRATOR_STATE_ROOT environment variable"],
+    ["--daemon-state-root", "set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable"],
+    ["--json=value", "--json does not take a value"],
+  ];
+  for (const [flag, message] of rejected) {
+    expect(() => parseCommand("project-apply", [...base, flag, "x"]), `${flag} value form`).toThrow(message);
+    expect(() => parseCommand("project-apply", [...base, `${flag}=x`]), `${flag}= form`).toThrow(message);
+  }
+  expect(() => parseCommand("project-apply", [...base, "--ghost"])).toThrow("unknown argument: --ghost");
+  expect(() => parseCommand("project-apply", [...base, "stray"])).toThrow("unknown argument: stray");
+});
+
+test("the project-apply-inspect parser: exact shape, no observation accepted", () => {
+  const base = ["--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"];
+  const parsed = parseCommand("project-apply-inspect", base);
+  expect(parsed).toEqual({
+    kind: "project-apply-inspect",
+    runId: "run_x",
+    applyId: "apply_x",
+    projectId: "project_a",
+    configRoot: "/cfg",
+    project: "/p",
+    applyStoreRoot: "/a",
+    json: false,
+  });
+  expect(() => parseCommand("project-apply-inspect", [...base, "--observation", "a".repeat(64)])).toThrow(
+    "the bound observation comes from the durable operation",
+  );
+  expect(() => parseCommand("project-apply-inspect", ["--observation=" + "a".repeat(64)])).toThrow("the bound observation");
+});
+
+test("usage documents both explicit Project Apply commands", () => {
+  const text = usage();
+  expect(text).toContain("project-apply explicit Project Apply of one finalized run's reviewed");
+  expect(text).toContain("project-apply-inspect read-only projection of one durable Apply");
+  expect(text).toContain("project-apply flags (production pipeline v2, explicit Project Apply)");
+  expect(text).toContain("--apply-id SAFE_ID      caller-owned idempotency identity of the operation");
+  expect(text).toContain("never automatic, starts no worker and no");
+  expect(text).toContain("project-apply-inspect flags (production pipeline v2, read-only)");
+  expect(text).toContain("never runs recovery and never changes any status");
+  expect(text).toContain("the cooperative project lock does not protect");
+  expect(text).toContain("against editors or VCS tools that ignore flock");
+});

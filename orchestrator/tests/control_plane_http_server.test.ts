@@ -2668,3 +2668,311 @@ describe("control-plane HTTP: project change content route", () => {
     calls.length = 0;
   });
 });
+
+describe("control plane HTTP: the explicit Project Apply routes", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), "cp-http-apply-"));
+  const storeRoot = join(envRoot, "bindings");
+  const registryPath = join(envRoot, "registry.json");
+  let registry: Awaited<ReturnType<typeof loadControlPlaneProjectRegistry>>;
+  const calls: unknown[] = [];
+  let nextResult: OrchestratorCallResult = { ok: false, failure: { reason: "spawn_failed", expectedRunId: "" } };
+
+  const operationDocument = (overrides: Record<string, unknown> = {}): OrchestratorCallResult => ({
+    ok: true,
+    projection: {
+      kind: "projectApplyOperation",
+      schemaVersion: 1,
+      runId: "apply-run",
+      applyId: "apply-1",
+      projectId: "project-a",
+      observation: "a".repeat(64),
+      revision: 12,
+      status: "applied",
+      completedStepCount: 3,
+      totalStepCount: 3,
+      ...overrides,
+    },
+  });
+
+  const applyFailure = (reason: string): OrchestratorCallResult => ({
+    ok: true,
+    projection: { kind: "projectApplyFailure", exitCode: 1, runId: "apply-run", applyId: "apply-1", reason } as never,
+  });
+
+  const callHandler = async (
+    path: string,
+    method = "GET",
+    body?: string,
+    overrides: { applyStoreRoot?: string | null; origin?: string | null; extraHeaders?: Record<string, string> } = {},
+  ): Promise<{ status: number; body: string }> => {
+    calls.length = 0;
+    const fakeClient = {
+      run: async (command: unknown): Promise<OrchestratorCallResult> => {
+        calls.push(command);
+        return nextResult;
+      },
+    } as unknown as OrchestratorSubprocessClient;
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: fakeClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+      applyStoreRoot: overrides.applyStoreRoot === undefined ? "/srv/applies" : overrides.applyStoreRoot,
+    };
+    const headers: Record<string, string> = { host: "127.0.0.1:4711" };
+    if (overrides.origin !== null) headers["origin"] = overrides.origin ?? "http://127.0.0.1:4711";
+    if (body !== undefined) headers["content-type"] = "application/json";
+    for (const [name, value] of Object.entries(overrides.extraHeaders ?? {})) {
+      headers[name] = value;
+    }
+    const request = new Request(`http://127.0.0.1:4711${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    return { status: response.status, body: await response.text() };
+  };
+
+  beforeAll(async () => {
+    mkdirSync(join(envRoot, "projects", "a"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(envRoot, "projects", "b"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(envRoot, "projects", "gone"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: join(envRoot, "projects", "a"),
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+            project_apply: true,
+          },
+          {
+            id: "project-b",
+            project_root: join(envRoot, "projects", "b"),
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    registry = await loadControlPlaneProjectRegistry(registryPath);
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "apply-run", projectId: "project-a" });
+    await store.claim({ runId: "plain-run", projectId: "project-b" });
+    await store.claim({ runId: "gone-run", projectId: "project-removed" });
+  }, 20000);
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  test("POST applies through the bound authority and answers the exact operation document", async () => {
+    nextResult = operationDocument();
+    const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }));
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      schema_version: 1,
+      kind: "project_apply_operation",
+      run_id: "apply-run",
+      apply_id: "apply-1",
+      project_id: "project-a",
+      observation: "a".repeat(64),
+      revision: 12,
+      status: "applied",
+      completed_step_count: 3,
+      total_step_count: 3,
+    });
+    expect(calls).toEqual([{
+      kind: "project_apply",
+      runId: "apply-run",
+      applyId: "apply-1",
+      projectId: "project-a",
+      projectPath: join(envRoot, "projects", "a"),
+      applyStoreRoot: "/srv/applies",
+      observation: "a".repeat(64),
+    }]);
+  });
+
+  test("the POST operation response never caches and carries no host path", async () => {
+    nextResult = operationDocument();
+    const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }));
+    expect(response.body).not.toContain("/srv");
+    expect(response.body).not.toContain("applyStoreRoot");
+  });
+
+  test("POST identity and durable conflicts stay typed command results at 200", async () => {
+    for (const reason of ["identity_conflict", "project_conflict", "recovery_required", "preparation_busy", "project_busy"]) {
+      nextResult = applyFailure(reason);
+      const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }));
+      expect(response.status, reason).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        schema_version: 1,
+        kind: "command_result",
+        run_id: "apply-run",
+        outcome: "failed",
+        exit_code: 1,
+        reason,
+      });
+    }
+  });
+
+  test("POST stale_observation is the request-layer 409", async () => {
+    nextResult = applyFailure("stale_observation");
+    const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }));
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "stale_observation" });
+  });
+
+  test("a transport failure stays 502 on both apply routes", async () => {
+    nextResult = { ok: false, failure: { reason: "child_terminated", expectedRunId: "apply-run" } };
+    const post = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }));
+    expect(post.status).toBe(502);
+    const get = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "GET");
+    expect(get.status).toBe(502);
+  });
+
+  test("GET projects the operation read-only and never sends an observation", async () => {
+    nextResult = operationDocument({ status: "recovery_required", completedStepCount: 1, revision: 14 });
+    const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "GET");
+    expect(response.status).toBe(200);
+    const parsed = JSON.parse(response.body) as Record<string, unknown>;
+    expect(parsed["kind"]).toBe("project_apply_operation");
+    expect(parsed["status"]).toBe("recovery_required");
+    expect(parsed["completed_step_count"]).toBe(1);
+    expect(calls).toEqual([{
+      kind: "project_apply_inspect",
+      runId: "apply-run",
+      applyId: "apply-1",
+      projectId: "project-a",
+      projectPath: join(envRoot, "projects", "a"),
+      applyStoreRoot: "/srv/applies",
+    }]);
+  });
+
+  test("GET of a missing or foreign operation is the request-layer 404 without disclosure", async () => {
+    nextResult = applyFailure("artifact_missing");
+    const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "GET");
+    expect(response.status).toBe(404);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "project_apply_not_found" });
+  });
+
+  test("GET of a damaged operation stays a typed command result at 200", async () => {
+    nextResult = applyFailure("artifact_modified");
+    const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "GET");
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      schema_version: 1, kind: "command_result", run_id: "apply-run", outcome: "failed", exit_code: 1, reason: "artifact_modified",
+    });
+  });
+
+  test("POST without the per-project capability is the typed 409 refusal with zero client calls", async () => {
+    nextResult = operationDocument();
+    const response = await callHandler("/v1/runs/plain-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }));
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "project_apply_disabled" });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("GET works without the capability but not without the apply-store root", async () => {
+    nextResult = operationDocument();
+    const withoutCapability = await callHandler("/v1/runs/plain-run/project-applies/apply-1", "GET");
+    expect(withoutCapability.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    const disabled = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "GET", undefined, { applyStoreRoot: null });
+    expect(disabled.status).toBe(409);
+    expect(JSON.parse(disabled.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "project_apply_disabled" });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("POST with an absent apply-store root is refused before any client call", async () => {
+    nextResult = operationDocument();
+    const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }), { applyStoreRoot: null });
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "project_apply_disabled" });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("the POST body is exact: unknown fields, wrong version and malformed observations are 400", async () => {
+    nextResult = operationDocument();
+    for (const body of [
+      "",
+      "not json",
+      "{}",
+      "[]",
+      JSON.stringify({ schema_version: 1 }),
+      JSON.stringify({ observation: "a".repeat(64) }),
+      JSON.stringify({ schema_version: 2, observation: "a".repeat(64) }),
+      JSON.stringify({ schema_version: 1, observation: "a".repeat(64), extra: 1 }),
+      JSON.stringify({ schema_version: 1, observation: "A".repeat(64) }),
+      JSON.stringify({ schema_version: 1, observation: "a".repeat(63) }),
+    ]) {
+      const response = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", body);
+      expect(response.status, body.slice(0, 40)).toBe(400);
+      expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_request" });
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  test("the GET route refuses a query string and a body", async () => {
+    nextResult = operationDocument();
+    const query = await callHandler("/v1/runs/apply-run/project-applies/apply-1?x=1", "GET");
+    expect(query.status).toBe(400);
+    expect(calls).toHaveLength(0);
+    const withBody = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "GET", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }), { extraHeaders: { "content-length": "2" } });
+    expect(withBody.status).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("an unbound run is 404 and a removed project stays the 409 contract", async () => {
+    nextResult = operationDocument();
+    const unbound = await callHandler("/v1/runs/unknown-run/project-applies/apply-1", "GET");
+    expect(unbound.status).toBe(404);
+    expect(JSON.parse(unbound.body)["reason"]).toBe("binding_not_found");
+    const removed = await callHandler("/v1/runs/gone-run/project-applies/apply-1", "GET");
+    expect(removed.status).toBe(409);
+    expect(JSON.parse(removed.body)["reason"]).toBe("project_unavailable");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("an unsafe apply id is an invalid path before any effect", () => {
+    const traversal = parseControlPlaneRoute("/v1/runs/apply-run/project-applies/../escape", "GET");
+    expect(traversal instanceof ControlPlaneHttpRequestError).toBe(true);
+    expect((traversal as ControlPlaneHttpRequestError).reason).toBe("invalid_path");
+    const traversalPost = parseControlPlaneRoute("/v1/runs/apply-run/project-applies/apply-1", "DELETE");
+    expect(traversalPost instanceof ControlPlaneHttpRequestError).toBe(true);
+    expect((traversalPost as ControlPlaneHttpRequestError).reason).toBe("method_not_allowed");
+  });
+
+  test("an encoded apply id and a wrong method are refused before any effect", async () => {
+    nextResult = operationDocument();
+    const encoded = await callHandler("/v1/runs/apply-run/project-applies/BAD%20ID", "GET");
+    expect(encoded.status).toBe(400);
+    expect(calls).toHaveLength(0);
+    const wrongMethod = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "PUT");
+    expect(wrongMethod.status).toBe(405);
+    const unknownShape = await callHandler("/v1/runs/apply-run/project-applies", "GET");
+    expect(unknownShape.status).toBe(404);
+  });
+
+  test("the Host and Origin gates run before the apply routes", async () => {
+    nextResult = operationDocument();
+    const badOrigin = await callHandler("/v1/runs/apply-run/project-applies/apply-1", "POST", JSON.stringify({ schema_version: 1, observation: "a".repeat(64) }), { origin: "http://evil.example" });
+    expect(badOrigin.status).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("the status table pins the two new request reasons", () => {
+    expect(statusForControlPlaneFailure({ layer: "request", reason: "project_apply_disabled" })).toBe(409);
+    expect(statusForControlPlaneFailure({ layer: "request", reason: "project_apply_not_found" })).toBe(404);
+    expect(statusForControlPlaneFailure({ layer: "request", reason: "stale_observation" })).toBe(409);
+  });
+});

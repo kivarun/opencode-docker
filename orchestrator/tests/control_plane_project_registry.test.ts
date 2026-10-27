@@ -735,3 +735,75 @@ describe("control plane project registry: real composition smoke", () => {
     90000,
   );
 });
+
+describe("control plane project registry: the explicit Project Apply capability", () => {
+  const root = mkdtempSync(join(tmpdir(), "cp-reg-apply-"));
+  const realProject = join(root, "real-project");
+  const realConfig = join(root, "real-config");
+
+  function registryFile(name: string, project: Record<string, unknown>): string {
+    const path = join(root, `${name}.json`);
+    writeFileSync(path, JSON.stringify({
+      schema_version: 1,
+      projects: [{
+        id: "project-a",
+        project_root: realProject,
+        config_root: realConfig,
+        pipeline_root: null,
+        launcher_id: null,
+        input_roots: [],
+        ...project,
+      }],
+    }), { mode: 0o600 });
+    return path;
+  }
+
+  beforeAll(() => {
+    mkdirSync(realProject, { recursive: true });
+    mkdirSync(realConfig, { recursive: true });
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("absent project_apply defaults to disabled (projectApply false)", async () => {
+    const registry = await loadControlPlaneProjectRegistry(registryFile("absent", {}));
+    expect(registry.projects[0]?.projectApply).toBe(false);
+  });
+
+  test("explicit project_apply false loads as disabled", async () => {
+    const registry = await loadControlPlaneProjectRegistry(registryFile("false", { project_apply: false }));
+    expect(registry.projects[0]?.projectApply).toBe(false);
+  });
+
+  test("explicit project_apply true loads as enabled", async () => {
+    const registry = await loadControlPlaneProjectRegistry(registryFile("true", { project_apply: true }));
+    expect(registry.projects[0]?.projectApply).toBe(true);
+  });
+
+  test("a non-boolean project_apply is refused as invalid_registry", async () => {
+    await expectLoadError(registryFile("nonbool", { project_apply: "yes" }), "invalid_registry");
+  });
+
+  test("a non-boolean project_apply never echoes the hostile value", async () => {
+    try {
+      await loadControlPlaneProjectRegistry(registryFile("nonbool2", { project_apply: 17 }));
+      throw new Error("expected load failure");
+    } catch (cause) {
+      expectRegistryError(cause, "invalid_registry");
+      expect((cause as Error).message).not.toContain("17");
+    }
+  });
+
+  test("an unknown extra field beside project_apply stays refused", async () => {
+    await expectLoadError(registryFile("extra", { project_apply: true, extra: 1 }), "invalid_registry");
+  });
+
+  test("the frozen resolved project carries the capability as an own property", async () => {
+    const registry = await loadControlPlaneProjectRegistry(registryFile("frozen", { project_apply: true }));
+    const project = registry.projects[0];
+    expect(Object.isFrozen(project)).toBe(true);
+    expect(Object.keys(project as unknown as Record<string, unknown>)).toContain("projectApply");
+  });
+});

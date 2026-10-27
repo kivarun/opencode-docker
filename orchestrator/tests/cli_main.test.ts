@@ -42,6 +42,7 @@ import {
   type PipelineV2ProjectChangesOutcome,
 } from "../src/pipeline_v2_project_changes.ts";
 import type { PipelineV2ProjectChangeContentOutcome } from "../src/pipeline_v2_project_change_content.ts";
+import type { PipelineV2ProjectApplyCommandOutcome } from "../src/pipeline_v2_project_apply.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { enterPipelineV2Wait } from "../src/pipeline_v2_wait_controller.ts";
 import { loadPipelineV2 } from "../src/pipeline_v2.ts";
@@ -126,6 +127,12 @@ function makeIo(): Recorder {
     projectChangeContentPipelineV2Run: (async () => {
       throw new Error("fake projectChangeContentPipelineV2Run not configured");
     }) as unknown as CliIo["projectChangeContentPipelineV2Run"],
+    projectApplyPipelineV2: (async () => {
+      throw new Error("fake projectApplyPipelineV2Run not configured");
+    }) as unknown as CliIo["projectApplyPipelineV2"],
+    projectApplyInspectPipelineV2: (async () => {
+      throw new Error("fake projectApplyInspectPipelineV2 not configured");
+    }) as unknown as CliIo["projectApplyInspectPipelineV2"],
     eventsPipelineV2Run: (async () => {
       throw new Error("fake eventsPipelineV2Run not configured");
     }) as unknown as CliIo["eventsPipelineV2Run"],
@@ -4258,4 +4265,126 @@ test("project-changes resolver failure is exit 2 with the API never called", asy
   expect(called).toBe(0);
   expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
   expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
+}, 15000);
+
+// --- explicit Project Apply dispatcher ----------------------------------------
+
+function applyReport(overrides: Record<string, unknown> = {}): PipelineV2ProjectApplyCommandOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    runId: "run_x",
+    applyId: "apply_x",
+    projectId: "project_a",
+    observation: "a".repeat(64),
+    revision: 12,
+    status: "applied",
+    completedStepCount: 3,
+    totalStepCount: 3,
+    ...overrides,
+  } as unknown as PipelineV2ProjectApplyCommandOutcome;
+}
+
+test("project-apply dispatches exactly once with the parsed scalars and uses no runner", async () => {
+  const rec = makeIo();
+  const calls: unknown[] = [];
+  rec.io.projectApplyPipelineV2 = (async (options: unknown) => {
+    calls.push(options);
+    return applyReport();
+  }) as unknown as CliIo["projectApplyPipelineV2"];
+  const exit = await runCli([
+    "project-apply", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a",
+    "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/operator/project",
+    "--apply-store-root", "/applies",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual({
+    applyStoreRoot: "/applies",
+    applyId: "apply_x",
+    runId: "run_x",
+    projectId: "project_a",
+    projectRoot: "/operator/project",
+    observation: "a".repeat(64),
+    stateRoot: "/state/root",
+  });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: project-apply ok (run run_x, apply apply_x, status applied, steps 3/3)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("project-apply reports the failure line and in-progress statuses", async () => {
+  const rec = makeIo();
+  rec.io.projectApplyPipelineV2 = (async () => applyReport({ status: "applying", completedStepCount: 1, totalStepCount: 3 })) as unknown as CliIo["projectApplyPipelineV2"];
+  const exit = await runCli(["project-apply", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.err).toEqual(["orchestrator: project-apply ok (run run_x, apply apply_x, status applying, steps 1/3)"]);
+
+  const failureRec = makeIo();
+  failureRec.io.projectApplyPipelineV2 = (async () => ({ ok: false, exitCode: 1, runId: "run_x", applyId: "apply_x", reason: "project_conflict" })) as unknown as CliIo["projectApplyPipelineV2"];
+  const failureExit = await runCli(["project-apply", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: project-apply failed (run run_x, apply apply_x, reason project_conflict)"]);
+  expect(failureRec.out).toHaveLength(0);
+}, 15000);
+
+test("project-apply JSON mode prints exactly one document and nothing else on stdout", async () => {
+  const rec = makeIo();
+  rec.io.projectApplyPipelineV2 = (async () => applyReport()) as unknown as CliIo["projectApplyPipelineV2"];
+  const exit = await runCli(["project-apply", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a", "--json"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  const parsed = JSON.parse(rec.out[0] as string) as Record<string, unknown>;
+  expect(parsed["status"]).toBe("applied");
+  expect(parsed["totalStepCount"]).toBe(3);
+  expect(JSON.stringify(parsed)).not.toContain("/p");
+  expect(JSON.stringify(parsed)).not.toContain("/applies");
+  expect(rec.err).toHaveLength(0);
+}, 15000);
+
+test("project-apply rejects an unknown flag before any API call", async () => {
+  const rec = makeIo();
+  rec.io.projectApplyPipelineV2 = (async () => {
+    throw new Error("must not be called");
+  }) as unknown as CliIo["projectApplyPipelineV2"];
+  const exit = await runCli(["project-apply", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--observation", "a".repeat(64), "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a", "--bogus"], rec.io);
+  expect(exit).toBe(2);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("project-apply-inspect dispatches exactly once and never launches a runner", async () => {
+  const rec = makeIo();
+  const calls: unknown[] = [];
+  rec.io.projectApplyInspectPipelineV2 = (async (options: unknown) => {
+    calls.push(options);
+    return applyReport({ status: "recovery_required", completedStepCount: 1 });
+  }) as unknown as CliIo["projectApplyInspectPipelineV2"];
+  const exit = await runCli(["project-apply-inspect", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"], rec.io);
+  expect(exit).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual({
+    applyStoreRoot: "/a",
+    applyId: "apply_x",
+    runId: "run_x",
+    projectId: "project_a",
+  });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: project-apply-inspect ok (run run_x, apply apply_x, status recovery_required, steps 1/3)"]);
+}, 15000);
+
+test("project-apply-inspect reports the missing-operation failure and JSON mode", async () => {
+  const rec = makeIo();
+  rec.io.projectApplyInspectPipelineV2 = (async () => ({ ok: false, exitCode: 1, runId: "run_x", applyId: "apply_x", reason: "artifact_missing" })) as unknown as CliIo["projectApplyInspectPipelineV2"];
+  const exit = await runCli(["project-apply-inspect", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a"], rec.io);
+  expect(exit).toBe(1);
+  expect(rec.err).toEqual(["orchestrator: project-apply-inspect failed (run run_x, apply apply_x, reason artifact_missing)"]);
+
+  const jsonRec = makeIo();
+  jsonRec.io.projectApplyInspectPipelineV2 = (async () => applyReport()) as unknown as CliIo["projectApplyInspectPipelineV2"];
+  const jsonExit = await runCli(["project-apply-inspect", "--run-id", "run_x", "--apply-id", "apply_x", "--project-id", "project_a", "--config-root", "/cfg", "--project", "/p", "--apply-store-root", "/a", "--json"], jsonRec.io);
+  expect(jsonExit).toBe(0);
+  expect(jsonRec.out).toHaveLength(1);
+  const parsed = JSON.parse(jsonRec.out[0] as string) as Record<string, unknown>;
+  expect(parsed["kind"]).toBeUndefined();
+  expect(parsed["status"]).toBe("applied");
 }, 15000);
