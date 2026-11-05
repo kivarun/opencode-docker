@@ -1,4 +1,9 @@
-FROM ghcr.io/anomalyco/opencode:latest
+# Upstream OpenCode V1 channel: the `latest` tag is pinned by a tracked
+# manifest digest. The digest owns the exact build content and is updated
+# automatically by the opencode-updater workflow after the content is
+# proven to be OpenCode 1.x (`opencode --version`); a V2/unknown major
+# never passes the updater or the base build gate.
+FROM ghcr.io/anomalyco/opencode:latest@sha256:f4cfe16d91efbbfca01a51c44094fba4cf82e15c7fa17de5f11f9059699b1e6e
 
 ARG DOCKER_HELPER_VERSION=2.3.1
 ARG DOCKER_HELPER_SHA256=78798f5b85e78b210fb4b2cb57b3f4f9c18a6e49f5f3c39670170f147bb191e1

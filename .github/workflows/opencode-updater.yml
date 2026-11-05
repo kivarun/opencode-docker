@@ -1,0 +1,134 @@
+---
+name: opencode-updater
+
+# Automatic OpenCode V1 update channel.
+#
+# The `experiment/opencode-v2` evaluation showed that OpenCode V2 is not
+# compatible with our usage model yet, but the V1 line must keep
+# receiving updates. Upstream `ghcr.io/anomalyco/opencode:latest` is
+# mutable, and the existing diff-based image pipeline only rebuilds when
+# repository files change - so this workflow re-resolves the upstream
+# manifest digest, proves the content by running the image, and opens a
+# minimal PR that updates the tracked digest in Dockerfile_base.
+#
+# Fail-closed rules:
+#   - only a proven `1.x.y` from `opencode --version` is accepted; the
+#     version is never stored anywhere but read from the image itself;
+#   - V2 (or any other major), unrecognized output, a failed run or a
+#     digest mismatch stops the workflow before any commit or PR;
+#   - an unchanged digest exits without a diff, PR or image build;
+#   - this workflow never builds or pushes images: the merged PR flows
+#     through the regular image pipeline, which tags a new immutable
+#     git-SHA tag and refreshes `latest` only after every required image
+#     succeeded - old git-SHA tags are never overwritten.
+
+# yamllint disable-line rule:truthy
+on:
+  schedule:
+    # Daily at 04:23 UTC.
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe upstream digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+      new-digest: ${{ steps.gate.outputs.new_digest }}
+      opencode-version: ${{ steps.gate.outputs.opencode_version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Probe upstream OpenCode V1
+        id: gate
+        run: bash scripts/opencode-update-gate.sh run
+
+  pull-request:
+    name: open digest update pull request
+    needs: [probe]
+    if: needs.probe.outputs.decision == 'update'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      NEW_DIGEST: ${{ needs.probe.outputs.new-digest }}
+      OPENCODE_VERSION: ${{ needs.probe.outputs.opencode-version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Update tracked digest
+        run: |
+          set -euo pipefail
+          if ! [[ "$NEW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "the probed digest is not a sha256 digest" >&2
+            exit 1
+          fi
+          hex="${NEW_DIGEST#sha256:}"
+          from="^(FROM ghcr\.io/anomalyco/opencode:latest@sha256:)"
+          sed -i -E "s|${from}[0-9a-f]{64}\$|\1${hex}|" Dockerfile_base
+          if git diff --quiet -- Dockerfile_base; then
+            echo "the tracked digest was not updated" >&2
+            exit 1
+          fi
+          if [[ "$(git status --porcelain | wc -l)" -ne 1 ]]; then
+            echo "unexpected additional changes" >&2
+            exit 1
+          fi
+          git diff --check
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          branch="ci/opencode-v1-${NEW_DIGEST#sha256:}"
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Dockerfile_base
+          git commit \
+            -m "ci: pin opencode upstream digest to ${NEW_DIGEST#sha256:}" \
+            -m "Proven by running the image at that exact digest:" \
+            -m "opencode --version -> ${OPENCODE_VERSION}"
+          git push origin HEAD
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="ci/opencode-v1-${NEW_DIGEST#sha256:}"
+          count="$(gh pr list \
+            --head "$branch" --state open --json number --jq 'length')"
+          if [[ "$count" != "0" ]]; then
+            echo "a pull request is already open for $branch"
+            exit 0
+          fi
+          body="$(printf '%s\n' \
+            "Automatic OpenCode V1 update channel." \
+            "" \
+            "- resolved upstream digest: \`${NEW_DIGEST}\`" \
+            "  (ghcr.io/anomalyco/opencode:latest)" \
+            "- proven by running the image at that exact digest:" \
+            "  \`opencode --version\` -> \`${OPENCODE_VERSION}\`" \
+            "- the PR changes only the tracked digest in" \
+            "  \`Dockerfile_base\`; merging it rebuilds base and all" \
+            "  dependent images through the regular image pipeline" \
+            "  (new immutable git-SHA tags).")"
+          title="ci: update opencode upstream digest"
+          title="${title} (opencode ${OPENCODE_VERSION})"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "$title" \
+            --body "$body"

@@ -41,6 +41,12 @@
 #                    (dependent images only)
 #   SAVE_BASE_TO     path to save the base image to when publishing is
 #                    disabled (base image only)
+#
+# The base build carries a fail-closed OpenCode V1 gate: after the image
+# is built, `opencode --version` must report a proven 1.x.y before the
+# image is saved or pushed (scripts/opencode-update-gate.sh
+# check-version). A V2/unknown major stops the build, also when the
+# Dockerfile was edited by hand instead of through the updater.
 
 set -euo pipefail
 
@@ -297,6 +303,10 @@ elif [[ "$MODE" == "build" ]]; then
 
     if [[ "$IMAGE_NAME" == "$BASE_IMAGE_NAME" ]]; then
         docker build --pull --file "$dockerfile" --tag "$tag" .
+
+        # Fail-closed OpenCode V1 gate: the freshly built base must prove
+        # an actual OpenCode 1.x before it is saved, pushed or published.
+        bash scripts/opencode-update-gate.sh check-version "$tag"
 
         if [[ -n "$SAVE_BASE_TO" && "$PUBLISH" != "1" ]]; then
             mkdir -p "$(dirname "$SAVE_BASE_TO")"
