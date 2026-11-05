@@ -32,6 +32,7 @@ export const PIPELINE_V2_PUBLIC_REASONS = [
     "run_input_invalid",
     "run_input_modified",
     "activation_prepare_failed",
+    "stage_task_invalid",
     "worker_failed",
     "worker_timeout",
     "activation_output_invalid",

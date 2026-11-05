@@ -21,7 +21,9 @@ import {
   type PipelineV2RunCommand,
   type PipelineV2RunInputState,
   type PipelineV2RunPipelineIdentity,
+  type PipelineV2AgentExecutionState,
   type PipelineV2RunState,
+  type PipelineV2StageTaskBindingInput,
 } from "../src/pipeline_v2_state.ts";
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
@@ -301,7 +303,7 @@ describe("pipeline v2 run state schema v6", () => {
     const driver = createDriver();
     playSuccessRun(driver);
     const state = driver.current as PipelineV2RunState;
-    expect(state.schema_version).toBe(10);
+    expect(state.schema_version).toBe(11);
     expect(state.revision).toBe(23);
     expect(state.status).toBe("success");
     expect(state.phase).toBe("finished");
@@ -322,7 +324,7 @@ describe("pipeline v2 run state schema v6", () => {
       { index: 0, from: "check", outcome: "approved", to: "ship", execution_index: 2 },
       { index: 0, from: "ship", outcome: "completed", to: "done", execution_index: 3 },
     ]);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(10);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(11);
   });
 
   test("every accepted command grows the revision by exactly one and refreshes updated_at", () => {
@@ -1372,49 +1374,55 @@ describe("pipeline v2 run state schema v6", () => {
 
   test("parse rejects schema versions 1 through 9 without any migration", () => {
     expect(() => parsePipelineV2RunState('{"schema_version":1}')).toThrow(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v1 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":2}')).toThrow(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 10 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 11 is the supported contract; no v2 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 2 })).toThrow(
-      "not a pipeline v2 run state (schema version 10 is the supported contract; no v2 migration exists)",
+      "not a pipeline v2 run state (schema version 11 is the supported contract; no v2 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":3}')).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v3 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 3 })).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v3 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":4}')).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v4 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 4 })).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v4 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":5}')).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v5 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 5 })).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v5 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":6}')).toThrow(
-      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v6 migration exists)",
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v6 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":7}')).toThrow(
-      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v7 migration exists)",
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v7 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":8}')).toThrow(
-      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v8 migration exists)",
+      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v8 migration exists)",
     );
     expect(() => parsePipelineV2RunState('{"schema_version":9}')).toThrow(
-      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v9 migration exists)",
+      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v9 migration exists)",
     );
     expect(() => validatePipelineV2RunState({ schema_version: 9 })).toThrow(
-      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v9 migration exists)",
+      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v9 migration exists)",
     );
-    expect(() => parsePipelineV2RunState('{"schema_version":11}')).toThrow(
-      "pipeline v2 run state has schema_version 11, expected 10",
+    expect(() => parsePipelineV2RunState('{"schema_version":10}')).toThrow(
+      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v10 migration exists)",
+    );
+    expect(() => validatePipelineV2RunState({ schema_version: 10 })).toThrow(
+      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v10 migration exists)",
+    );
+    expect(() => parsePipelineV2RunState('{"schema_version":99}')).toThrow(
+      "pipeline v2 run state has schema_version 99, expected 11",
     );
   });
 
@@ -1449,7 +1457,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v3Document);
     expect(() => parsePipelineV2RunState(v3Document)).toThrow(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v3 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v3Document);
     await rm(root, { recursive: true, force: true });
@@ -1475,7 +1483,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v4Document);
     expect(() => parsePipelineV2RunState(v4Document)).toThrow(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v4 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v4Document);
     await rm(root, { recursive: true, force: true });
@@ -1508,7 +1516,7 @@ describe("pipeline v2 run state schema v6", () => {
     });
     await writeFile(path, v5Document);
     expect(() => parsePipelineV2RunState(v5Document)).toThrow(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v5 migration exists)",
     );
     expect(await readFile(path, "utf8")).toBe(v5Document);
     await rm(root, { recursive: true, force: true });
@@ -4243,13 +4251,13 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     playStageRun(driver);
     const raw = JSON.stringify(driver.current);
     const exact = {
-      1: "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v1 migration exists)",
-      2: "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 10 is the supported contract; no v2 migration exists)",
-      3: "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v3 migration exists)",
-      4: "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v4 migration exists)",
-      5: "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v5 migration exists)",
-      6: "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v6 migration exists)",
-      7: "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v7 migration exists)",
+      1: "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v1 migration exists)",
+      2: "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 11 is the supported contract; no v2 migration exists)",
+      3: "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v3 migration exists)",
+      4: "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v4 migration exists)",
+      5: "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v5 migration exists)",
+      6: "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v6 migration exists)",
+      7: "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v7 migration exists)",
     };
     for (const [version, message] of Object.entries(exact)) {
       const draft = JSON.parse(raw) as Record<string, unknown>;
@@ -5348,6 +5356,218 @@ describe("pipeline v2 run state schema v7: execution roles, stage lifecycle and 
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Schema v11: the immutable stage-task binding of one stage execution.
+  // ---------------------------------------------------------------------------
+
+  const STAGE_TASK_BINDING = {
+    taskId: "coder_task",
+    taskRevision: 1,
+    taskManifestSha256: hex("c"),
+    bodySha256: hex("b"),
+  };
+
+  /** The prefix up to an open generation with the bound task revision in the ledger. */
+  function stageTaskPrefix(driver: Driver): void {
+    lifecycleOpenPrefix(driver);
+    driver.apply(taskAccepted());
+  }
+
+  function stageTaskBinding(
+    overrides: Partial<{ taskId: string; taskRevision: number; taskManifestSha256: string; bodySha256: string }> = {},
+  ): PipelineV2StageTaskBindingInput {
+    return { ...STAGE_TASK_BINDING, ...overrides };
+  }
+
+  test("agent_data_prepared records the stage-task binding of a stage execution exactly once", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    stageTaskPrefix(driver);
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    driver.apply({ kind: "agent_data_prepared", stageTask: stageTaskBinding() });
+    const state = driver.current as PipelineV2RunState;
+    const execution = state.executions[state.executions.length - 1] as PipelineV2AgentExecutionState;
+    expect(execution.stage_task).toEqual({
+      task_id: "coder_task",
+      task_revision: 1,
+      task_manifest_sha256: hex("c"),
+      body_sha256: hex("b"),
+    });
+    requireLoadableSnapshot(state);
+    // The binding is written exactly once: a second data-preparation
+    // command is rejected by the phase ladder regardless of any payload.
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding() },
+      'data preparation requires execution phase "started"',
+    );
+  });
+
+  test("the stage-task binding is rejected outside the stage execution role", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    driver.apply(createRun(STAGE_IDENTITY, []));
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "architect",
+      profile: "coder",
+      executionRole: "planning",
+    });
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding() },
+      'the stage-task binding requires the "stage" execution role, got "planning"',
+    );
+    // Without the payload the same command stays valid for the planning
+    // execution (the binding exists only for stage-task activations).
+    driver.apply({ kind: "agent_data_prepared" });
+    const state = driver.current as PipelineV2RunState;
+    const execution = state.executions[state.executions.length - 1] as PipelineV2AgentExecutionState;
+    expect(execution.stage_task).toBeUndefined();
+  });
+
+  test("the stage-task binding payload is exact-field validated", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    stageTaskPrefix(driver);
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: { ...stageTaskBinding(), extra: true } as never },
+      "agent_data_prepared stageTask must carry exactly taskId, taskRevision, taskManifestSha256 and bodySha256",
+    );
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: { taskId: "coder_task", taskRevision: 1, taskManifestSha256: hex("c") } as never },
+      "agent_data_prepared stageTask must carry exactly taskId, taskRevision, taskManifestSha256 and bodySha256",
+    );
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding({ taskId: "../escape" }) },
+      "agent_data_prepared stageTask taskId",
+    );
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding({ taskRevision: 0 }) },
+      "agent_data_prepared stageTask taskRevision",
+    );
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding({ taskManifestSha256: "NOT-HEX" }) },
+      "agent_data_prepared stageTask taskManifestSha256",
+    );
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding({ bodySha256: "NOT-HEX" }) },
+      "agent_data_prepared stageTask bodySha256",
+    );
+  });
+
+  test("the stage-task binding is anchored to the task ledger at write time", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    stageTaskPrefix(driver);
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding({ taskId: "unknown_task" }) },
+      "which is not recorded exactly once in the task ledger with the bound manifest digest",
+    );
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding({ taskRevision: 2 }) },
+      "which is not recorded exactly once in the task ledger with the bound manifest digest",
+    );
+    driver.reject(
+      { kind: "agent_data_prepared", stageTask: stageTaskBinding({ taskManifestSha256: hex("9") }) },
+      "which is not recorded exactly once in the task ledger with the bound manifest digest",
+    );
+    // Without the payload the command stays valid (a stage state without
+    // the stage_task source prepares no binding).
+    driver.apply({ kind: "agent_data_prepared" });
+    const state = driver.current as PipelineV2RunState;
+    const execution = state.executions[state.executions.length - 1] as PipelineV2AgentExecutionState;
+    expect(execution.stage_task).toBeUndefined();
+  });
+
+  test("the loader validates the stage-task binding shape, role, phase and ledger anchor", () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    stageTaskPrefix(driver);
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    driver.apply({ kind: "agent_data_prepared", stageTask: stageTaskBinding() });
+    const state = driver.current as PipelineV2RunState;
+    const executionIndex = state.executions.length - 1;
+    expectInvalid(state, (draft) => {
+      draft.executions[executionIndex].execution_role = "planning";
+      delete draft.executions[executionIndex].iteration_index;
+    }, 'execution role but records a stage-task binding');
+    expectInvalid(state, (draft) => {
+      draft.executions[executionIndex].stage_task.extra = 1;
+    }, 'pipeline v2 run state executions[' + executionIndex + '].stage_task has unknown field "extra"');
+    expectInvalid(state, (draft) => {
+      delete draft.executions[executionIndex].stage_task.body_sha256;
+    }, 'pipeline v2 run state executions[' + executionIndex + '].stage_task is missing required field "body_sha256"');
+    expectInvalid(state, (draft) => {
+      draft.executions[executionIndex].stage_task.task_manifest_sha256 = hex("9");
+    }, "which is not recorded exactly once in the task ledger with the bound manifest digest");
+    expectInvalid(state, (draft) => {
+      draft.executions[executionIndex].stage_task.task_revision = 2;
+    }, "which is not recorded exactly once in the task ledger with the bound manifest digest");
+    // A started execution can never already carry the binding.
+    const startedDriver = createDriver(STAGE_IDENTITY, []);
+    stageTaskPrefix(startedDriver);
+    startedDriver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    const started = startedDriver.current as PipelineV2RunState;
+    expectInvalid(started, (draft) => {
+      draft.executions[draft.executions.length - 1].stage_task = {
+        task_id: "coder_task",
+        task_revision: 1,
+        task_manifest_sha256: hex("c"),
+        body_sha256: hex("b"),
+      };
+    }, 'has phase "started" but already records a stage-task binding');
+  });
+
+  test("a stored schema v10 document is rejected and left byte-for-byte identical", async () => {
+    const driver = createDriver(STAGE_IDENTITY, []);
+    stageTaskPrefix(driver);
+    driver.apply({
+      kind: "start_agent_execution",
+      stateId: "dev_entry",
+      profile: "coder",
+      executionRole: "stage",
+      iterationIndex: 1,
+    });
+    driver.apply({ kind: "agent_data_prepared", stageTask: stageTaskBinding() });
+    const current = JSON.stringify(driver.current);
+    const v10Document = current.replace('"schema_version":11', '"schema_version":10');
+    expect(v10Document).not.toBe(current);
+    const root = await mkdtemp(join(tmpdir(), "pipeline-v2-state-v10-"));
+    const path = join(root, "state.json");
+    await writeFile(path, v10Document);
+    expect(() => parsePipelineV2RunState(v10Document)).toThrow(
+      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v10 migration exists)",
+    );
+    expect(await readFile(path, "utf8")).toBe(v10Document);
+    await rm(root, { recursive: true, force: true });
+  });
+
   test("the runtime export surface is exactly the fixed constants, validators, reducers and shared queries", async () => {
     // Runtime (value) exports only: type-only exports never appear here.
     // The list pins the shared stage-iteration query surface — the exact
@@ -5468,9 +5688,9 @@ describe("schema v9 worker-log binding", () => {
   const UNAVAILABLE = { status: "unavailable" as const };
 
   test("the schema version is 9 and v8 is rejected typed, exact and without migration", () => {
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(10);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(11);
     expect(() => parsePipelineV2RunState('{"schema_version":8}')).toThrow(
-      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v8 migration exists)",
+      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v8 migration exists)",
     );
   });
 

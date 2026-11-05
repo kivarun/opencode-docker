@@ -78,6 +78,11 @@ import {
   PipelineV2RuntimeError,
   type PipelineV2RuntimeFailureReason,
 } from "./pipeline_v2_runtime_error.ts";
+import {
+  preparedStageTaskBodyBytes,
+  stageTaskBodyDigest,
+  type PreparedStageTaskContext,
+} from "./pipeline_v2_stage_task.ts";
 
 /**
  * Builds one typed failure for an explicit failure site inside this data
@@ -2357,10 +2362,22 @@ export async function prepareActivationExecutionDocument(
  * activation index — no timestamps, no run identity, no host paths, no
  * profile env values, no credentials, no helper endpoint, no model config,
  * and no input file contents ever appear in it.
+ *
+ * A stage activation that resolved the `stage_task` source additionally
+ * carries the deterministic, content-free orchestration context section:
+ * the accepted plan revision and digest, the stage identity (id, position,
+ * template), the bound task identity (id, revision, manifest digest), and
+ * the generation and iteration indexes. The task body itself is never
+ * duplicated into the document, and no filesystem path, profile, model or
+ * server configuration appears. String fields are rendered with
+ * `JSON.stringify` (the established safe rendering contract of the
+ * document), so hostile identifiers can never inject Markdown structure;
+ * revisions, indexes and digest hex render literally.
  */
 function buildExecutionDocument(
   agentState: Extract<ResolvedV2State, { type: "agent" }>,
   activationIndex: number,
+  stageTask?: PreparedStageTaskContext,
 ): string {
   const inputLines = agentState.inputs.map((port, position) =>
     describeInputPort(port, position + 1),
@@ -2374,6 +2391,25 @@ function buildExecutionDocument(
     `state_id: ${JSON.stringify(agentState.id)}`,
     `execution_index: ${activationIndex}`,
     "",
+  ];
+  if (stageTask !== undefined) {
+    parts.push(
+      "## Orchestration context",
+      "",
+      `plan_revision: ${stageTask.plan_revision}`,
+      `plan_sha256: ${stageTask.plan_sha256}`,
+      `stage_id: ${JSON.stringify(stageTask.stage_id)}`,
+      `stage_position: ${stageTask.stage_position}`,
+      `stage_template: ${JSON.stringify(stageTask.stage_template)}`,
+      `task_id: ${JSON.stringify(stageTask.task_id)}`,
+      `task_revision: ${stageTask.task_revision}`,
+      `task_sha256: ${stageTask.task_manifest_sha256}`,
+      `generation_index: ${stageTask.generation_index}`,
+      `iteration_index: ${stageTask.iteration_index}`,
+      "",
+    );
+  }
+  parts.push(
     "## Instruction",
     "",
     agentState.promptContent,
@@ -2387,7 +2423,7 @@ function buildExecutionDocument(
     "",
     "## Input ports (declaration order)",
     "",
-  ];
+  );
   if (inputLines.length === 0) {
     parts.push("This activation declares no input ports.", "");
   } else {
@@ -2441,6 +2477,7 @@ export async function prepareActivationData(
   acceptedOutputs: readonly unknown[],
   stateId: string,
   activationIndex: number,
+  stageTask?: PreparedStageTaskContext,
 ): Promise<PreparedActivationData> {
   requireResolvedPipelineV2Provenance(pipeline, "activation data preparation");
   const provenance = runInputSnapshotProvenance.get(runInputs);
@@ -2493,11 +2530,25 @@ export async function prepareActivationData(
   // scan and the exclusive leaf creation, before any port is materialized.
   interface ResolvedInputPortSource {
     readonly port: (typeof agentState.inputs)[number];
-    readonly sourcePath: string;
+    readonly sourcePath: string | null;
   }
   const resolveInputPortSources = (): ResolvedInputPortSource[] =>
     agentState.inputs.map((port) => {
       const what = `input port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)}`;
+      if ("stage_task" in port.source) {
+        // The stage-task source has no filesystem source path: the exact
+        // worker-visible bytes come from the trusted stage-task context
+        // resolved by the coordinator. A stage-task port without the
+        // context (or a context without a stage-task port) is an
+        // impossible shape of the trusted compiled pipeline and the
+        // coordinator's contract and stays a plain `PipelineError`.
+        if (stageTask === undefined) {
+          throw new PipelineError(
+            `${what} declares the stage_task source, but no stage-task context was resolved for the activation`,
+          );
+        }
+        return { port, sourcePath: null };
+      }
       if ("pipeline_input" in port.source) {
         let entry: RunInputSnapshotEntry | undefined;
         for (const candidate of runInputs.inputs) {
@@ -2576,6 +2627,14 @@ export async function prepareActivationData(
     // impossible trusted shape is never converted by the typed regions
     // below, while the still-observable failure order stays unchanged.
     const resolvedInputSources = resolveInputPortSources();
+    if (
+      stageTask !== undefined &&
+      !resolvedInputSources.some((entry) => "stage_task" in entry.port.source)
+    ) {
+      throw new PipelineError(
+        `a stage-task context was resolved for agent state ${JSON.stringify(agentState.id)}, but the state declares no stage_task input port`,
+      );
+    }
 
     const { dataRoot, inputsRoot, outputsRoot, preparedInputs, preparedOutputs, executionDocument } =
       await withRuntimeReason("activation_prepare_failed", async () => {
@@ -2590,6 +2649,37 @@ export async function prepareActivationData(
         for (const { port, sourcePath } of resolvedInputSources) {
           const what = `input port ${JSON.stringify(port.id)} of agent state ${JSON.stringify(agentState.id)}`;
           const target = join(inputsRoot, port.id);
+          if (sourcePath === null) {
+            if (stageTask === undefined) {
+              throw new PipelineError(
+                `${what} declares the stage_task source, but no stage-task context was resolved for the activation`,
+              );
+            }
+            // The stage-task source: the exact worker-visible body bytes
+            // are published through the existing exclusive-write
+            // substrate and verified byte-exactly against the context's
+            // digest before the activation is returned.
+            const bytes = preparedStageTaskBodyBytes(stageTask, pipeline);
+            if (bytes === null) {
+              throw new PipelineError(
+                `${what} declares the stage_task source, but the resolved stage-task context carries no provenance for this trusted pipeline`,
+              );
+            }
+            await writeRegularFileExclusive(target, bytes, what);
+            const written = await readRegularFileBytes(target, what);
+            if (stageTaskBodyDigest(written) !== stageTask.body_sha256) {
+              throw new PipelineError(
+                `${what} was published with bytes that do not carry the resolved stage-task body digest`,
+              );
+            }
+            preparedInputs.push({
+              id: port.id,
+              source: port.source,
+              type: port.type,
+              path: target,
+            });
+            continue;
+          }
           await copyTypedValue(sourcePath, port.type, target, what);
           preparedInputs.push({
             id: port.id,
@@ -2619,7 +2709,7 @@ export async function prepareActivationData(
         // modified.
         const executionDocument = await prepareActivationExecutionDocument(
           inputsRoot,
-          buildExecutionDocument(agentState, activationIndex),
+          buildExecutionDocument(agentState, activationIndex, stageTask),
         );
         return { dataRoot, inputsRoot, outputsRoot, preparedInputs, preparedOutputs, executionDocument };
       });
@@ -2850,6 +2940,87 @@ export async function acceptActivationOutputs(
 }
 
 /**
+ * Re-verify the immutable stage-task input artifacts of one prepared
+ * activation against the resolved stage-task context: every `stage_task`
+ * input port must still be a real non-symlink regular file at its fixed
+ * activation path inside the canonical run root whose exact bytes carry
+ * the context's `body_sha256` digest.
+ *
+ * The coordinator calls this twice around the worker run — immediately
+ * before the Execution Session is created (after the durable stage-task
+ * binding) and immediately before the activation outputs are accepted
+ * (after the worker ran with the inputs mounted read-only). The function
+ * creates, fixes and deletes nothing; a missing, substituted or
+ * digest-divergent artifact is a typed `stage_task_invalid` failure and
+ * is never repaired.
+ */
+export async function verifyStageTaskActivationInput(
+  pipeline: ResolvedPipelineV2,
+  activation: PreparedActivationData,
+  stageTask: PreparedStageTaskContext,
+): Promise<void> {
+  requireResolvedPipelineV2Provenance(pipeline, "stage task input verification");
+  const provenance = preparedActivationProvenance.get(activation);
+  if (provenance === undefined || provenance.pipeline !== pipeline) {
+    throw new PipelineError(UNTRUSTED_PREPARED_ACTIVATION_MESSAGE);
+  }
+  const state = findStateById(pipeline, activation.state_id);
+  if (state === undefined || state.type !== "agent") {
+    throw new PipelineError(
+      `prepared activation names state ${JSON.stringify(activation.state_id)} which is not a declared agent state of the trusted pipeline`,
+    );
+  }
+  const stageTaskPorts = state.inputs.filter((port) => "stage_task" in port.source);
+  if (stageTaskPorts.length === 0) {
+    throw new PipelineError(
+      `agent state ${JSON.stringify(activation.state_id)} declares no stage_task input port, but a stage-task context was resolved`,
+    );
+  }
+  for (const port of stageTaskPorts) {
+    const what = `stage task input ${JSON.stringify(port.id)} of agent state ${JSON.stringify(activation.state_id)} activation ${activation.activation_index}`;
+    const path = join(activation.inputs_root, port.id);
+    const info = await lstatOrNull(path);
+    if (info === null) {
+      throw new PipelineV2RuntimeError(
+        "stage_task_invalid",
+        `${what} is missing`,
+      );
+    }
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new PipelineV2RuntimeError(
+        "stage_task_invalid",
+        `${what} is not a regular non-symlink file, found ${describeEntry(info)}`,
+      );
+    }
+    let canonical: string;
+    try {
+      canonical = await realpath(path);
+    } catch (cause) {
+      throw new PipelineV2RuntimeError(
+        "stage_task_invalid",
+        `${what} cannot be canonicalized`,
+      );
+    }
+    if (
+      canonical !== path ||
+      !isInsideRoot(provenance.runRootCanonical, canonical)
+    ) {
+      throw new PipelineV2RuntimeError(
+        "stage_task_invalid",
+        `${what} does not resolve exactly to its fixed activation path inside the canonical run root`,
+      );
+    }
+    const bytes = await readRegularFileBytes(path, what);
+    if (stageTaskBodyDigest(bytes) !== stageTask.body_sha256) {
+      throw new PipelineV2RuntimeError(
+        "stage_task_invalid",
+        `${what} does not carry the digest of the resolved stage-task body bytes`,
+      );
+    }
+  }
+}
+
+/**
  * One published run output as recorded in the returned snapshot: an
  * optional output whose source was absent is listed as `present: false`
  * (with `required: false` — a missing required source fails the whole
@@ -2892,6 +3063,11 @@ function resolveRunOutputSource(
   acceptedByRef: ReadonlyMap<string, ResolvedAcceptedOutput>,
 ): ResolvedRunOutputSource {
   const what = `run output ${JSON.stringify(output.id)}`;
+  if ("stage_task" in output.source) {
+    throw new PipelineError(
+      `${what} declares the stage_task source; the stage_task source is valid only as an input port of a stage-role agent state`,
+    );
+  }
   if ("pipeline_input" in output.source) {
     let entry: RunInputSnapshotEntry | undefined;
     for (const candidate of runInputs.inputs) {
@@ -3798,6 +3974,11 @@ export async function prepareDecisionStateData(
   const portWhat = `input port ${JSON.stringify(port.id)} of decision state ${JSON.stringify(safeStateId)}`;
   let sourcePath: string;
   let sourceWhat: string;
+  if ("stage_task" in port.source) {
+    throw new PipelineError(
+      `${portWhat} declares the stage_task source; the stage_task source is valid only as an input port of a stage-role agent state`,
+    );
+  }
   if ("pipeline_input" in port.source) {
     let entry: RunInputSnapshotEntry | undefined;
     for (const candidate of runInputs.inputs) {

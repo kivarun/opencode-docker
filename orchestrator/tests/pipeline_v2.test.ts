@@ -509,7 +509,7 @@ test("6. port sources must have exactly one form", () => {
     doc(
       "          pipeline_input: task\n          state_output:\n            state: coder\n            output: implementation\n",
     ),
-    /must declare exactly one of "pipeline_input" or "state_output"/,
+    /must declare exactly one of "pipeline_input", "state_output" or "stage_task"/,
   );
   rejectParse(doc("          other: 1\n"), /input port 0 source has unknown field "other"/);
   rejectParse(

@@ -1,5 +1,5 @@
 /**
- * Durable run state for pipeline schema v2 (state schema version 10).
+ * Durable run state for pipeline schema v2 (state schema version 11).
  *
  * Pure substrate: a versioned state document, an exact-field loader, and a
  * pure command reducer. Nothing here touches the filesystem, docker-helper,
@@ -122,7 +122,7 @@ import {
   type PipelineV2ProjectProvenanceBinding,
 } from "./pipeline_v2_project_provenance.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 10;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 11;
 
 /** The closed execution-role vocabulary fixed on every execution at start. */
 export const PIPELINE_V2_EXECUTION_ROLES = ["planning", "control", "stage"] as const;
@@ -205,6 +205,7 @@ export const PIPELINE_V2_FAILURE_REASONS = [
   "run_input_invalid",
   "run_input_modified",
   "activation_prepare_failed",
+  "stage_task_invalid",
   "worker_failed",
   "worker_timeout",
   "activation_output_invalid",
@@ -256,6 +257,7 @@ export const PIPELINE_V2_AGENT_EXECUTION_FAILURE_REASONS = [
   "run_input_invalid",
   "run_input_modified",
   "activation_prepare_failed",
+  "stage_task_invalid",
   "worker_failed",
   "worker_timeout",
   "activation_output_invalid",
@@ -358,6 +360,39 @@ export type PipelineV2WorkerLogState =
     }
   | { status: "unavailable" };
 
+/**
+ * Content-free durable binding of one agent execution's stage task
+ * (schema v11). The binding is written atomically by the same
+ * `agent_data_prepared` command that durably marks the activation data
+ * prepared, after the trusted stage-task resolver resolved the exact task
+ * revision of the open generation's bound accepted plan and the exact
+ * worker-visible body bytes were published into the activation inputs.
+ * Task bodies never enter the state document: the binding records the
+ * task identity and the two digests that re-prove it after a restart —
+ * the task manifest digest (anchored in the task ledger and the accepted
+ * plan manifest pointer) and the digest of the exact worker-visible
+ * bytes. The field exists only on stage-role agent executions whose
+ * compiled state declares the `stage_task` input source.
+ */
+export interface PipelineV2StageTaskBindingState {
+  readonly task_id: string;
+  readonly task_revision: number;
+  readonly task_manifest_sha256: string;
+  readonly body_sha256: string;
+}
+
+/**
+ * The `agent_data_prepared` command payload form of the stage-task
+ * binding (camelCase command fields; the durable record stores the
+ * snake_case `PipelineV2StageTaskBindingState` projection).
+ */
+export interface PipelineV2StageTaskBindingInput {
+  readonly taskId: string;
+  readonly taskRevision: number;
+  readonly taskManifestSha256: string;
+  readonly bodySha256: string;
+}
+
 export interface PipelineV2AgentExecutionState {
   index: number;
   type: "agent";
@@ -381,6 +416,12 @@ export interface PipelineV2AgentExecutionState {
    * atomically by `agent_outputs_accepted`/`agent_failed`.
    */
   worker_log: PipelineV2WorkerLogState | null;
+  /**
+   * The immutable stage-task binding (schema v11): written once by
+   * `agent_data_prepared` for stage executions whose state declares the
+   * `stage_task` input source; never rewritten.
+   */
+  stage_task?: PipelineV2StageTaskBindingState;
   outputs?: PipelineV2AgentOutputState[];
   failure_reason?: PipelineV2FailureReason;
 }
@@ -695,7 +736,16 @@ export type PipelineV2RunCommand =
       /** The open iteration index; mandatory exactly for the stage role. */
       iterationIndex?: number;
     }
-  | { kind: "agent_data_prepared" }
+  | {
+      kind: "agent_data_prepared";
+      /**
+       * The immutable stage-task binding (schema v11), present exactly for
+       * stage executions whose compiled state declares the `stage_task`
+       * input source. The reducer anchors the binding to the task ledger
+       * before it writes the field.
+       */
+      stageTask?: PipelineV2StageTaskBindingInput;
+    }
   | { kind: "agent_execution_session_created"; sessionId: string }
   | { kind: "agent_tool_session_created"; sessionId: string }
   | { kind: "agent_running" }
@@ -1359,47 +1409,52 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 10 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 11 is the supported contract; no v2 migration exists)",
     );
   }
   if (version === 3) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v3 migration exists)",
     );
   }
   if (version === 4) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v4 migration exists)",
     );
   }
   if (version === 5) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v5 migration exists)",
     );
   }
   if (version === 6) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v6 migration exists)",
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v6 migration exists)",
     );
   }
   if (version === 7) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v7 migration exists)",
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v7 migration exists)",
     );
   }
   if (version === 8) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v8 migration exists)",
+      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v8 migration exists)",
     );
   }
   if (version === 9) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 10 is the supported contract; no v9 migration exists)",
+      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v9 migration exists)",
+    );
+  }
+  if (version === 10) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v10 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -1493,7 +1548,7 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
     value,
     what,
     ["index", "type", "state_id", "attempt", "profile", "phase", "execution_role", "worker_log"],
-    ["iteration_index", "execution_session_id", "tool_session_id", "session_cleanup", "outputs", "failure_reason"],
+    ["iteration_index", "execution_session_id", "tool_session_id", "session_cleanup", "stage_task", "outputs", "failure_reason"],
   );
   if (obj.type !== "agent") {
     throw new PipelineV2StateError(`${what}.type must be "agent", got ${JSON.stringify(obj.type)}`);
@@ -1599,6 +1654,42 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
     throw new PipelineV2StateError(
       `${what} has the ${JSON.stringify(execution.execution_role)} execution role but records an iteration index`,
     );
+  }
+
+  // The immutable stage-task binding (schema v11): written exactly once by
+  // `agent_data_prepared`, so it exists only from the "data_prepared"
+  // phase onward and only on stage-role executions. The content-free
+  // shape is validated here; the ledger anchor is re-checked at the
+  // document level below (every bound task revision must be an accepted
+  // task ledger record with the bound manifest digest).
+  if (obj.stage_task !== undefined) {
+    if (execution.execution_role !== "stage") {
+      throw new PipelineV2StateError(
+        `${what} has the ${JSON.stringify(execution.execution_role)} execution role but records a stage-task binding`,
+      );
+    }
+    if (phase === "started") {
+      throw new PipelineV2StateError(
+        `${what} has phase ${JSON.stringify(phase)} but already records a stage-task binding`,
+      );
+    }
+    const binding = expectExactObject(
+      obj.stage_task,
+      `${what}.stage_task`,
+      ["task_id", "task_revision", "task_manifest_sha256", "body_sha256"],
+    );
+    execution.stage_task = Object.freeze({
+      task_id: expectSafeId(binding.task_id, `${what}.stage_task.task_id`),
+      task_revision: expectSafePositiveInteger(
+        binding.task_revision,
+        `${what}.stage_task.task_revision`,
+      ),
+      task_manifest_sha256: expectSha256(
+        binding.task_manifest_sha256,
+        `${what}.stage_task.task_manifest_sha256`,
+      ),
+      body_sha256: expectSha256(binding.body_sha256, `${what}.stage_task.body_sha256`),
+    });
   }
 
   // Phase coherence of the two durable session slots: neither session
@@ -2536,6 +2627,28 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         }
       }
       lastPerTask.set(task.task_id, task);
+    }
+  }
+  // The stage-task bindings (schema v11) anchor to the task ledger: every
+  // agent execution that records a stage-task binding names an accepted
+  // task revision exactly once, with the bound manifest digest. This is
+  // the restart proof of the binding — a forged, stale or drift-diverged
+  // binding is rejected before any runtime restoration reads the state.
+  for (const execution of executions) {
+    if (execution.type !== "agent" || execution.stage_task === undefined) {
+      continue;
+    }
+    const binding = execution.stage_task;
+    const matches = taskRevisions.filter(
+      (record) =>
+        record.task_id === binding.task_id &&
+        record.revision === binding.task_revision &&
+        record.sha256 === binding.task_manifest_sha256,
+    );
+    if (matches.length !== 1) {
+      throw new PipelineV2StateError(
+        `execution ${execution.index} records a stage-task binding for task ${JSON.stringify(binding.task_id)} revision ${binding.task_revision}, which is not recorded exactly once in the task ledger with the bound manifest digest`,
+      );
     }
   }
   // One grant belongs to exactly one (generation, wait) pair: a repeated
@@ -4778,6 +4891,9 @@ function cloneExecution(execution: PipelineV2ExecutionState): PipelineV2Executio
     if (execution.worker_log !== null) {
       clone.worker_log = cloneWorkerLogBinding(execution.worker_log);
     }
+    if (execution.stage_task !== undefined) {
+      clone.stage_task = { ...execution.stage_task };
+    }
     return clone;
   }
   const clone: PipelineV2DecisionExecutionState = { ...execution };
@@ -5341,6 +5457,65 @@ export function reducePipelineV2RunCommand(
       const execution = requireUnfinishedAgent(current, "agent_data_prepared");
       if (execution.phase !== "started") {
         fail(current, `data preparation requires execution phase "started", got ${JSON.stringify(execution.phase)}`);
+      }
+      if (command.stageTask !== undefined) {
+        const binding = command.stageTask;
+        const bindingKeys = Object.keys(binding).sort();
+        if (
+          typeof binding !== "object" ||
+          binding === null ||
+          Array.isArray(binding) ||
+          bindingKeys.length !== 4 ||
+          bindingKeys[0] !== "bodySha256" ||
+          bindingKeys[1] !== "taskId" ||
+          bindingKeys[2] !== "taskManifestSha256" ||
+          bindingKeys[3] !== "taskRevision"
+        ) {
+          throw new PipelineV2StateError(
+            "agent_data_prepared stageTask must carry exactly taskId, taskRevision, taskManifestSha256 and bodySha256",
+          );
+        }
+        if (execution.execution_role !== "stage") {
+          fail(
+            current,
+            `the stage-task binding requires the "stage" execution role, got ${JSON.stringify(execution.execution_role)}`,
+          );
+        }
+        const taskId = expectSafeId(binding.taskId, "agent_data_prepared stageTask taskId");
+        const taskRevision = expectSafePositiveInteger(
+          binding.taskRevision,
+          "agent_data_prepared stageTask taskRevision",
+        );
+        const taskManifestSha256 = expectSha256(
+          binding.taskManifestSha256,
+          "agent_data_prepared stageTask taskManifestSha256",
+        );
+        const bodySha256 = expectSha256(binding.bodySha256, "agent_data_prepared stageTask bodySha256");
+        // The durable anchor: the bound task revision must already be an
+        // accepted task ledger record with exactly the bound manifest
+        // digest, so the binding can be re-proven from the durable state
+        // alone after a restart.
+        const ledgerMatches = current.task_revisions.filter(
+          (record) =>
+            record.task_id === taskId &&
+            record.revision === taskRevision &&
+            record.sha256 === taskManifestSha256,
+        );
+        if (ledgerMatches.length !== 1) {
+          fail(
+            current,
+            `the stage-task binding names task ${JSON.stringify(taskId)} revision ${taskRevision}, which is not recorded exactly once in the task ledger with the bound manifest digest`,
+          );
+        }
+        const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
+        last.phase = "data_prepared";
+        last.stage_task = Object.freeze({
+          task_id: taskId,
+          task_revision: taskRevision,
+          task_manifest_sha256: taskManifestSha256,
+          body_sha256: bodySha256,
+        });
+        break;
       }
       const last = next.executions[next.executions.length - 1] as PipelineV2AgentExecutionState;
       last.phase = "data_prepared";

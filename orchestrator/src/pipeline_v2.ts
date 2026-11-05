@@ -42,8 +42,11 @@ import {
  * paths are bound later by the CLI/API and are not part of the document);
  * run-level `outputs` are the data handed back to the user after
  * completion; every agent state declares local input and output ports. A
- * port source has exactly one form: `{pipeline_input: ID}` or
- * `{state_output: {state: ID, output: ID}}`.
+ * port source has exactly one form: `{pipeline_input: ID}`,
+ * `{state_output: {state: ID, output: ID}}` or — on stage-role agent
+ * states only — the parameterless `{stage_task: {}}` form whose
+ * worker-visible value is the exact UTF-8 body of the current accepted
+ * task revision of the state's stage.
  *
  * Runtime semantics fixed here for later increments (not implemented yet):
  * a `state_output` value is the last successfully accepted output of the
@@ -140,9 +143,23 @@ export interface PipelinePortSourceStateOutput {
   readonly state_output: { readonly state: string; readonly output: string };
 }
 
+/**
+ * The `stage_task` source form: the activation input is the exact UTF-8
+ * body of the current accepted task revision of the state's stage, resolved
+ * only from the trusted durable orchestration context (the open
+ * generation's bound accepted plan revision and its single task pointer).
+ * Valid only on stage-role agent states; the compiled check below rejects
+ * it everywhere else. The form carries no parameters — the task identity is
+ * never a caller or document field.
+ */
+export interface PipelinePortSourceStageTask {
+  readonly stage_task: Record<string, never>;
+}
+
 export type PipelinePortSource =
   | PipelinePortSourcePipelineInput
-  | PipelinePortSourceStateOutput;
+  | PipelinePortSourceStateOutput
+  | PipelinePortSourceStageTask;
 
 export interface PipelineV2InputSpec {
   id: string;
@@ -560,7 +577,7 @@ function parseSchemaField(
 function parsePortSource(raw: unknown, what: string): PipelinePortSource {
   const source = expectObject(raw, `${what} source`);
   const keys = Object.keys(source);
-  const allowed = new Set(["pipeline_input", "state_output"]);
+  const allowed = new Set(["pipeline_input", "state_output", "stage_task"]);
   for (const key of keys) {
     if (!allowed.has(key)) {
       throw new PipelineError(`${what} source has unknown field ${JSON.stringify(key)}`);
@@ -568,9 +585,10 @@ function parsePortSource(raw: unknown, what: string): PipelinePortSource {
   }
   const hasPipelineInput = keys.includes("pipeline_input");
   const hasStateOutput = keys.includes("state_output");
-  if (hasPipelineInput === hasStateOutput) {
+  const hasStageTask = keys.includes("stage_task");
+  if ((hasPipelineInput ? 1 : 0) + (hasStateOutput ? 1 : 0) + (hasStageTask ? 1 : 0) !== 1) {
     throw new PipelineError(
-      `${what} source must declare exactly one of "pipeline_input" or "state_output"`,
+      `${what} source must declare exactly one of "pipeline_input", "state_output" or "stage_task"`,
     );
   }
   if (hasPipelineInput) {
@@ -580,6 +598,20 @@ function parsePortSource(raw: unknown, what: string): PipelinePortSource {
         `${what} source pipeline_input id`,
       ),
     }) as PipelinePortSourcePipelineInput;
+  }
+  if (hasStageTask) {
+    const stageTask = source.stage_task;
+    if (typeof stageTask !== "object" || stageTask === null || Array.isArray(stageTask)) {
+      throw new PipelineError(`${what} source stage_task must be an empty object`);
+    }
+    if (Object.keys(stageTask).length !== 0) {
+      throw new PipelineError(
+        `${what} source stage_task must be exactly the empty object, got ${Object.keys(stageTask).length} field(s)`,
+      );
+    }
+    return Object.freeze({
+      stage_task: Object.freeze({}),
+    }) as PipelinePortSourceStageTask;
   }
   const stateOutput = expectObject(source.state_output, `${what} source state_output`);
   expectExactKeys(stateOutput, ["state", "output"], `${what} source state_output`);
@@ -1316,10 +1348,25 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
       new Map(state.outputs.map((port) => [port.id, port])),
     );
   }
+  // The compiled execution role of every declared agent/decision state,
+  // fixed by the trusted orchestration metadata. A bundle without the
+  // section declares no roles, so the `stage_task` source is invalid
+  // everywhere in it.
+  const executionRoleOfState = new Map<string, PipelineV2ExecutionRoleSpec>();
+  if (orchestration !== undefined) {
+    for (const role of orchestration.execution_roles) {
+      executionRoleOfState.set(role.state_id, role);
+    }
+  }
   const resolveSourceContract = (
     source: PipelinePortSource,
     what: string,
   ): { type: PortType; schema?: string } => {
+    if ("stage_task" in source) {
+      throw new PipelineError(
+        `${what} declares the stage_task source; the stage_task source is valid only as an input port of a stage-role agent state`,
+      );
+    }
     if ("pipeline_input" in source) {
       const declared = inputs.find((entry) => entry.id === source.pipeline_input);
       if (declared === undefined) {
@@ -1384,6 +1431,24 @@ export function compilePipelineV2Spec(parsed: unknown): PipelineV2Spec {
       profile: state.profile,
       prompt: state.prompt,
       inputs: state.inputs.map((port) => {
+        if ("stage_task" in port.source) {
+          const role = executionRoleOfState.get(state.id);
+          if (role === undefined) {
+            throw new PipelineError(
+              `agent state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)} declares the stage_task source, but no orchestration section declares an execution role for the state`,
+            );
+          }
+          if (role.role !== "stage") {
+            throw new PipelineError(
+              `agent state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)} declares the stage_task source, but its compiled execution role is ${JSON.stringify(role.role)}; the stage_task source is valid only on stage-role agent states`,
+            );
+          }
+          return {
+            id: port.id,
+            source: port.source,
+            type: "file" as PortType,
+          };
+        }
         const derived = resolveSourceContract(
           port.source,
           `agent state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)}`,
@@ -1716,6 +1781,11 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
     source: PipelinePortSource,
     what: string,
   ): { type: PortType; schema?: Readonly<Record<string, unknown>> } => {
+    if ("stage_task" in source) {
+      throw new PipelineError(
+        `${what} declares the stage_task source; the stage_task source is valid only as an input port of a stage-role agent state`,
+      );
+    }
     if ("pipeline_input" in source) {
       const declared = runInputById.get(source.pipeline_input);
       if (declared === undefined) {
@@ -1788,6 +1858,12 @@ export async function loadPipelineV2(bundleRoot: string): Promise<ResolvedPipeli
       promptContent: state.promptContent,
       inputs: Object.freeze(
         state.inputs.map((port) => {
+          if ("stage_task" in port.source) {
+            // The stage_task source carries no JSON schema; its derived
+            // "file" type was fixed by the trusted compile and the role
+            // gate already ran there.
+            return deepFreeze({ id: port.id, source: port.source, type: port.type });
+          }
           const derived = contractForSource(
             port.source,
             `agent state ${JSON.stringify(state.id)} input port ${JSON.stringify(port.id)}`,

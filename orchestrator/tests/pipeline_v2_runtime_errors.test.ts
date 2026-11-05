@@ -466,7 +466,7 @@ async function runCoder(
 }
 
 test("1. every runtime failure reason is a state schema v3 failure reason", () => {
-  expect(PIPELINE_V2_RUNTIME_FAILURE_REASONS.length).toBe(9);
+  expect(PIPELINE_V2_RUNTIME_FAILURE_REASONS.length).toBe(10);
   const stateReasons = new Set<string>(PIPELINE_V2_FAILURE_REASONS);
   for (const reason of PIPELINE_V2_RUNTIME_FAILURE_REASONS) {
     expect(stateReasons.has(reason)).toBe(true);

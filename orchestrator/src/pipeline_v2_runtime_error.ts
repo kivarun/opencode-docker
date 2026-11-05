@@ -43,6 +43,7 @@ export const PIPELINE_V2_RUNTIME_FAILURE_REASONS = [
   "run_input_invalid",
   "run_input_modified",
   "activation_prepare_failed",
+  "stage_task_invalid",
   "activation_output_invalid",
   "accepted_output_modified",
   "decision_input_invalid",

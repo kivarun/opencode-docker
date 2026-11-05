@@ -117,7 +117,7 @@ describe("pipeline v2 commit provenance: the 66-command lifecycle oracle", () =>
     expect(state.status).toBe("success");
     expect(state.revision).toBe(66);
     expect(state.schema_version).toBe(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(10);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(11);
     expect(state.commit_history).toHaveLength(66);
     state.commit_history.forEach((entry, index) => {
       expect(entry.revision).toBe(index + 1);

@@ -1973,7 +1973,7 @@ test("the reducer's state schema stays v6 and resume never dispatches create_run
   expect(allCommands.filter((command) => command.kind === "create_run")).toHaveLength(1);
   expect(allCommands.filter((command) => String(command.kind).startsWith("wait_"))).toHaveLength(0);
   const durable = await readDurableState(harness);
-  expect(durable.schema_version).toBe(10);
+  expect(durable.schema_version).toBe(11);
 });
 
 test("a malformed durable state document refuses the reopen without side effects", async () => {

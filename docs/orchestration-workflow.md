@@ -200,7 +200,7 @@ orchestrator run \
   activations. The source directory is never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 10), and the published run outputs stay at the fixed
+  (state schema version 11), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
@@ -317,6 +317,18 @@ orchestrator run \
   read-only project changes API (see "The read-only project changes API"
   below), the operator project stays read-only, and no Apply and no
   read-write authority over the operator project exist in this increment.
+- Schema v11 adds the durable stage activation context: an agent state
+  whose compiled execution role is `stage` may declare a third port source
+  form `{stage_task: {}}` (derived type `file`, no schema), and the stage
+  worker receives the exact bytes of the current accepted task revision
+  plus a deterministic content-free orchestration context in the execution
+  document. The resolver is the single owner in
+  `orchestrator/src/pipeline_v2_stage_task.ts`; every agent execution
+  carries the optional durable binding `{task_id, task_revision,
+  task_manifest_sha256, body_sha256}`, and the new typed failure reason
+  `stage_task_invalid` refuses missing/mismatched artifacts, multi-task
+  stages and worker-tampered inputs before any output acceptance. See
+  "The durable stage activation context" below.
 - The pipeline's agent states select the profiles; the worker image, the
   OpenCode configuration, and the exact environment bindings belong to those
   profiles. The user never sets mounts, container paths, Session
@@ -1831,7 +1843,9 @@ data handed back to the user after completion (`required: true` outputs
 fail the run if absent at the terminal; optional outputs may be absent —
 both are compile-declared); each agent state declares local input and
 output ports. Port sources have exactly one form
-(`{pipeline_input: ID}` or `{state_output: {state, output}}`); port types
+(`{pipeline_input: ID}`, `{state_output: {state, output}}`, or
+`{stage_task: {}}` — the stage-task form is valid only on an agent state
+whose compiled execution role is `stage` and carries no schema); port types
 are `file`, `directory`, or `json` (json ports require a bundle-relative
 JSON schema file loaded through the same realpath containment, parsed as a
 JSON object, and compiled as JSON Schema Draft 2020-12 at load time — a
@@ -2900,10 +2914,61 @@ Files such as `STATE.md` may be generated for compatibility or human
 inspection in the future, but an agent cannot advance the run by modifying
 them.
 
-### Pipeline v2 run state (state schema version 7, the production run state of pipeline v2)
+### The durable stage activation context (implemented, wired into the production runner)
 
-`orchestrator/src/pipeline_v2_state.ts` already defines the durable run state
-for pipeline schema v2 as a pure substrate (state schema version 7, with the
+After `revise-task` the next stage activation must consume the accepted task
+revision, not the original protected pipeline input. The durable stage
+activation context closes that gap with three pieces:
+
+1. **A third data-port source form.** `stage_task: {}` is valid only on an
+   agent state whose compiled execution role is `stage` (checked once at
+   trusted load) and derives type `file` with no schema. It is rejected on
+   planning/control states, run-output sources and decision ports.
+2. **A single resolver.** `resolvePipelineV2StageTaskContext` in
+   `orchestrator/src/pipeline_v2_stage_task.ts` validates the durable state,
+   resolves the open generation through `pipelineV2OpenStageIteration`,
+   restores the accepted run plan through the single public restoration
+   (plan digest, stage id, stage position and stage template must bind the
+   open generation exactly), requires exactly one task pointer in the
+   compiled stage (zero or multiple tasks fail closed — no scheduler), loads
+   the task manifest through the read-only store, verifies the manifest
+   digest against both the plan pointer and the durable task-ledger anchor,
+   and returns the deep-frozen content-free context `{plan_revision,
+   plan_sha256, stage_id, stage_position, stage_template, task_id,
+   task_revision, task_manifest_sha256, body_sha256, generation_index,
+   iteration_index}`. The body bytes stay in a module-private registry bound
+   to the pipeline provenance; `stageTaskBodyDigest` hashes the exact bytes
+   over the closed `pipeline-v2-stage-task-body` domain. Every resolver
+   failure is the typed `stage_task_invalid` reason — never the body, never
+   a path.
+3. **Activation materialization and verification.** `prepareActivationData`
+   gained an optional stage-task parameter; the declared port is
+   materialized from the resolver bytes through an exclusive regular-file
+   write with a read-back digest verification, and the execution document
+   gains a deterministic content-free `## Orchestration context` section
+   (plan revision/digest, stage id/position/template, task id/revision and
+   manifest digest, generation and iteration indexes — never the body).
+   `verifyStageTaskActivationInput` re-proves the published artifact before
+   any Session and again after the worker run; a modified, deleted or
+   substituted input artifact (including one the worker rewrote during the
+   run) fails the execution as `stage_task_invalid` before any output is
+   accepted.
+
+Durable state schema v11 records the binding `{task_id, task_revision,
+task_manifest_sha256, body_sha256}` on every stage execution through the
+`agent_data_prepared` payload; the reducer and loader enforce the role gate
+and the exact task-ledger anchor, stored v10 documents are rejected and
+never migrated, and task bodies never enter `state.json`, the execution
+documents or any public projection. The production coordinator resolves the
+context before activation preparation, so after `revise-task` the next
+stage worker sees the exact bytes of the accepted revision. Multiple tasks
+per stage still fail closed by design; automatic task-body rewriting and
+any scheduler remain later work.
+
+### Pipeline v2 run state (state schema version 11, the production run state of pipeline v2)
+
+`orchestrator/src/pipeline_v2_state.ts` defines the durable run state
+for pipeline schema v2 (state schema version 11, with the
 nested pipeline identity carrying `schema_version: 2`): logical run inputs
 (id, port type, protected flag, snapshot digest), a shared contiguous
 execution index covering both agent and decision executions (agent

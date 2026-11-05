@@ -149,12 +149,14 @@ import {
   prepareDecisionStateData,
   prepareRunProject,
   snapshotRunInputs,
+  verifyStageTaskActivationInput,
   type AcceptedStateOutput,
   type PreparedActivationData,
   type RunInputBinding,
   type RunInputsSnapshot,
   type RunOutputSnapshotEntry,
 } from "./pipeline_v2_runtime.ts";
+import { resolvePipelineV2StageTaskContext } from "./pipeline_v2_stage_task.ts";
 import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
 import { PipelineV2ProjectLockBusyError } from "./pipeline_v2_apply_project_lock_internal.ts";
 import type { PipelineV2ProjectProvenanceBinding } from "./pipeline_v2_project_provenance.ts";
@@ -698,6 +700,21 @@ function readWorkerCaptureSafely(outcome: unknown): WorkerLogCapture | null {
 }
 
 /**
+ * Whether one declared agent state of the trusted pipeline declares the
+ * `stage_task` input source (compile-time restricted to stage-role agent
+ * states). The coordinator resolves the durable stage-task context exactly
+ * for such states and never for any other execution.
+ */
+function stateDeclaresStageTask(pipeline: ResolvedPipelineV2, stateId: string): boolean {
+  for (const state of pipeline.states) {
+    if (state.id === stateId) {
+      return state.type === "agent" && state.inputs.some((port) => "stage_task" in port.source);
+    }
+  }
+  return false;
+}
+
+/**
  * Classifies one unexpected failure by typed errors and context only —
  * never by parsing messages. The typed data-plane reasons, the engine
  * reasons (all of which exist in state schema v5) and the store/durability
@@ -759,6 +776,7 @@ const AGENT_EXECUTION_REASONS: readonly PipelineV2FailureReason[] = [
   "run_input_invalid",
   "run_input_modified",
   "activation_prepare_failed",
+  "stage_task_invalid",
   "worker_failed",
   "worker_timeout",
   "activation_output_invalid",
@@ -2419,12 +2437,66 @@ async function continuePipelineV2Coordination(
       const executionIndex = requireLastExecutionIndex();
       assertExecutionIndexChain(executionIndex);
 
-      // 3. prepare the activation data through the existing data plane
-      //    (it re-verifies the protected inputs and the accepted outputs)
-      const activation = await prepareActivationData(pipeline, runInputs, accepted, view.id, executionIndex);
+      // 2b. resolve the durable stage-task context for states declaring the
+      //    `stage_task` source (compile-time restricted to stage-role agent
+      //    states). The resolution reads only the trusted durable snapshot
+      //    and the existing run-plan store chain; every failure is a typed
+      //    `stage_task_invalid` data-plane failure before any Session and
+      //    before any worker runs.
+      const stageTask = stateDeclaresStageTask(pipeline, view.id)
+        ? await resolvePipelineV2StageTaskContext({ pipeline, state: requireSnapshot(), runRoot })
+        : undefined;
 
-      // 4. agent_data_prepared
-      await dispatchState({ kind: "agent_data_prepared" });
+      // 3. prepare the activation data through the existing data plane
+      //    (it re-verifies the protected inputs and the accepted outputs,
+      //    and publishes the exact stage-task body bytes for stage-task
+      //    ports)
+      const activation = await prepareActivationData(
+        pipeline,
+        runInputs,
+        accepted,
+        view.id,
+        executionIndex,
+        stageTask,
+      );
+
+      // 4. agent_data_prepared — for a stage-task activation the immutable
+      //    stage-task binding joins the same atomic commit, after the
+      //    input artifact is published and before any Session exists
+      await dispatchState({
+        kind: "agent_data_prepared",
+        ...(stageTask !== undefined
+          ? {
+              stageTask: {
+                taskId: stageTask.task_id,
+                taskRevision: stageTask.task_revision,
+                taskManifestSha256: stageTask.task_manifest_sha256,
+                bodySha256: stageTask.body_sha256,
+              },
+            }
+          : {}),
+      });
+      if (stageTask !== undefined) {
+        // The durable binding must be exactly the resolved context, and
+        // the published input artifact must still carry the exact body
+        // bytes — both re-verified immediately before the first Session.
+        const bound = requireSnapshot().executions[executionIndex - 1];
+        if (
+          bound === undefined ||
+          bound.type !== "agent" ||
+          bound.stage_task === undefined ||
+          bound.stage_task.task_id !== stageTask.task_id ||
+          bound.stage_task.task_revision !== stageTask.task_revision ||
+          bound.stage_task.task_manifest_sha256 !== stageTask.task_manifest_sha256 ||
+          bound.stage_task.body_sha256 !== stageTask.body_sha256
+        ) {
+          throw new PipelineV2RuntimeError(
+            "stage_task_invalid",
+            `the durable stage-task binding of execution ${executionIndex} does not match the resolved stage-task context`,
+          );
+        }
+        await verifyStageTaskActivationInput(pipeline, activation, stageTask);
+      }
 
       // 5. runtime.createExecutionSession (captured once at coordination
       //    start). The session contract is captured exactly once, right
@@ -2503,7 +2575,7 @@ async function continuePipelineV2Coordination(
           "pipeline v2 agent session contract violated: runAgent must return a completed or a typed failed result",
         );
       }
-      // 10b. publish-then-bind: the frozen in-memory capture becomes at
+      // 11b. publish-then-bind: the frozen in-memory capture becomes at
       //      most one run-root artifact and the verified binding joins
       //      the SAME command that fixes the terminal worker result
       //      (below). Capture and publication problems never change the
@@ -2521,10 +2593,17 @@ async function continuePipelineV2Coordination(
         throw new CoordinationAbortedError();
       }
 
-      // 11. accept the activation outputs (the worker held them read-write)
+      // 11. re-verify the immutable stage-task input after the worker ran
+      //     (the inputs were mounted read-only; the verification is
+      //     defense-in-depth before any output is accepted)
+      if (stageTask !== undefined) {
+        await verifyStageTaskActivationInput(pipeline, activation, stageTask);
+      }
+
+      // 12. accept the activation outputs (the worker held them read-write)
       const records = await acceptActivationOutputs(pipeline, activation);
 
-      // 12. agent_outputs_accepted — the terminal worker result and the
+      // 13. agent_outputs_accepted — the terminal worker result and the
       //     worker-log binding are fixed by this one atomic commit
       await dispatchState({
         kind: "agent_outputs_accepted",
@@ -2532,7 +2611,7 @@ async function continuePipelineV2Coordination(
         workerLog,
       });
 
-      // 13./14. cleanup the Tool session, then the Execution session,
+      // 14./15. cleanup the Tool session, then the Execution session,
       // each exactly once; the first error never blocks the second.
       await runSessionCleanups();
 
@@ -2543,21 +2622,21 @@ async function continuePipelineV2Coordination(
         throw new CoordinationAbortedError();
       }
 
-      // 15. agent_cleanup_completed — both sessions were confirmed
+      // 16. agent_cleanup_completed — both sessions were confirmed
       //     cleaned
       await dispatchState({ kind: "agent_cleanup_completed" });
       tracking.unfinished = false;
 
-      // 15b. the plan-ready suspension seam: a fully successful planning
+      // 16b. the plan-ready suspension seam: a fully successful planning
       //      execution stops here — no transition is committed, no plan is
       //      accepted; the operator applies `resume-plan` next. Non-
       //      planning executions pass through untouched.
       await maybePlanReadySuspension(view.id);
 
-      // 16. the accepted records join the runner-owned history
+      // 17. the accepted records join the runner-owned history
       accepted.push(...records);
 
-      // 17. return void: the engine applies its own fixed completed outcome
+      // 18. return void: the engine applies its own fixed completed outcome
     },
 
     executeDecision: async (view: V2DecisionExecutionView): Promise<string> => {
