@@ -90,7 +90,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 
 | Order | Increment | Status |
 | ---: | --- | --- |
-| 1 | Durable stage activation context | Planned |
+| 1 | Durable stage activation context | Complete (b63c4cf; CI 42043441341) |
 | 2 | Durable profile/model epoch | Planned |
 | 3 | Hard read-only reviewer | Planned |
 | 4 | Separate development pipeline bundle | Planned |
@@ -121,6 +121,21 @@ inputs:
 
 The final spelling may change during implementation if an existing source
 vocabulary has a better fit, but the following semantics are fixed:
+
+> Implementation note (2026-11-05): the provisional spelling
+> `stage_task: {}` was kept; it is now a compiled source form of schema v2
+> (`PipelinePortSourceStageTask`), valid only on an agent state whose compiled
+> execution role is `stage`, with derived type `file`. The binding is durable:
+> run-state schema v11 carries an optional `stage_task` field on agent
+> executions (`task_id`, `task_revision`, `task_manifest_sha256`,
+> `body_sha256`), recorded by `agent_data_prepared`. The schema bump was chosen
+> because the worker-visible bytes digest had no durable anchor before this
+> increment — the existing activation input binding proved only accepted
+> outputs, not the stage-task input — so the durable-state rule below resolved
+> to "schema bump required". The resolver is the single owner in
+> `orchestrator/src/pipeline_v2_stage_task.ts`; failures carry the typed
+> `stage_task_invalid` reason. Delivered in b63c4cf (CI run 42043441341);
+> see the acceptance criteria below for the evidence mapping.
 
 - valid only on an agent state whose trusted execution role is `stage`;
 - the task is resolved only from the trusted accepted plan and current durable
@@ -166,6 +181,12 @@ The permanent red-before must reproduce the observed production behavior:
 4. the next stage activation still receives the original pipeline input;
 5. neither execution document contains stage/task/revision/iteration identity.
 
+> Reproduced (2026-11-05) on baseline `68f902b` with a temporary harness that
+> drove the real runner over a fake Docker Helper transport; both parts (the
+> stale pipeline input on both stage activations, and the compile rejection of
+> the new source form) were captured red before the implementation. The
+> harness was removed after the permanent suites went green.
+
 ### Acceptance criteria
 
 - before revision, the stage worker sees the exact bytes of
@@ -184,6 +205,21 @@ The permanent red-before must reproduce the observed production behavior:
 - existing pipeline-input and state-output source forms retain their behavior;
 - no new event kind, UI surface, Apply behavior or profile-binding behavior is
   introduced.
+
+Evidence (b63c4cf): the acceptance criteria are covered by the two permanent
+suites — `orchestrator/tests/pipeline_v2_stage_task.test.ts` (compile and
+resolver contract, binding mismatches, content-free diagnostics, WeakMap
+isolation) and `orchestrator/tests/pipeline_v2_stage_task_runtime.test.ts`
+(the real production runner and `revisePipelineV2Task` over a fake Docker
+Helper transport: both stage activations receive the exact revision bytes,
+the orchestration context appears in both execution documents without the
+body, the durable binding is written exactly once per stage execution and
+survives the restart boundary, multi-task and worker-tampered-input
+refusals fail before any output acceptance, and the pre-Session
+verification seam refuses deleted/modified/substituted artifacts). Local
+`bun test` reports the apply/project-lock family as not run/not passed in
+this environment (the libc-FFI metadata probe fails identically on the
+clean baseline commit); CI build 42043441341 is the delivery evidence.
 
 ## Increment 2: durable profile/model epoch
 
