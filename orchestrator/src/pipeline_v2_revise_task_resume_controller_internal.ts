@@ -137,6 +137,7 @@ const PIPELINE_V2_RESUME_REFUSAL_REASONS = [
   "accepted_output_modified",
   "artifact_missing",
   "artifact_modified",
+  "profile_epoch_mismatch",
   "internal_error",
 ] as const;
 

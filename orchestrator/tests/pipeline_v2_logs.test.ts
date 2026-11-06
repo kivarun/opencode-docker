@@ -38,6 +38,7 @@ import { publishPipelineV2WorkerLog, loadPipelineV2WorkerLog } from "../src/pipe
 import { workerLogPayloadDigest } from "../src/pipeline_v2_worker_log.ts";
 import type { WorkerLogCapture } from "../src/worker_operation.ts";
 
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
 const RUN_ID = "logs-run";
@@ -195,7 +196,7 @@ async function makeFixture(): Promise<Fixture> {
   };
 
   const commands: PipelineV2RunCommand[] = [
-    { kind: "create_run", runId: RUN_ID, pipeline: identity, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+    { kind: "create_run", runId: RUN_ID, pipeline: identity, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
     { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
     ...agentLadder(1),
     { kind: "agent_outputs_accepted", outputs: [{ id: "plan", digest: hex("d") }], workerLog: binding1 },

@@ -57,6 +57,8 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+import { V2_PREPARED_PROFILE_EPOCH } from "./helpers/profile_epoch_fixture.ts";
+import { loadAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
 type StageWaitPolicy = { readonly reason: string; readonly actions: readonly string[] };
@@ -474,7 +476,7 @@ async function prefixStageEntry(
       protected: entry.protected,
       digest: entry.digest,
     })),
-    projectProvenance: preparedProjectBinding036,
+    projectProvenance: preparedProjectBinding036, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, proposal);
   const acceptedPlan = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot: harness.runRoot, sink: recording as never });
@@ -982,6 +984,7 @@ test("12. a fresh planning run suspends plan-ready before any transition: no sta
       inputBindings: await bindingsFor(harness, "cycle"),
       sink: recording as never,
       runtime: freshRuntime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     CONTROL,
   );
@@ -1209,6 +1212,7 @@ import type { PipelineV2WorkerOperationRunner } from "../src/pipeline_v2_docker_
 import { preparePlanRevisionManifest, prepareTaskRevisionManifest } from "../src/pipeline_v2_run_plan_manifests.ts";
 import { preparePipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_candidate.ts";
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 interface RunnerHarness {
   root: string;
@@ -1299,13 +1303,16 @@ async function makeRunnerHarness(prefix: string, runId: string): Promise<RunnerH
   await writeFile(
     join(configRoot, "profiles", "coder.yaml"),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      "opencode_config: opencode/coder.json",
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+      "  path: opencode/coder.json",
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       "    from_env: CODER_SOURCE_VAR_1",
       "    required: true",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -1401,6 +1408,12 @@ async function runnerPrefixStageEntry(harness: RunnerHarness, runId: string): Pr
       digest: entry.digest,
     })),
     projectProvenance: preparedProjectBinding037,
+    profileEpoch: await loadAndPublishRunProfileEpoch({
+      runRoot: harness.runRoot,
+      pipeline,
+      configRoot: harness.configRoot,
+      baseEnv: { HOME: "/home/u", XDG_CONFIG_HOME: "/cfg", CODER_SOURCE_VAR_1: "coder-secret" },
+    }),
   });
   const activation: PreparedActivationData = await prepareActivationData(pipeline, runInputs, [], "architect", 1);
   await sink.dispatch({

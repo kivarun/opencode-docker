@@ -35,6 +35,7 @@ import { publishPipelineV2ProjectProvenance } from "../src/pipeline_v2_project_p
 import { preparePipelineV2ProjectProvenance } from "../src/pipeline_v2_project_provenance.ts";
 
 import { createHash } from "node:crypto";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const sha = (content: string): string => createHash("sha256").update(content).digest("hex");
 
@@ -147,13 +148,16 @@ async function makeHarness(prefix: string, projectSpec: readonly ProjectSpec[], 
   await writeFile(
     join(configRoot, "profiles", "coder.yaml"),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      "opencode_config: opencode/coder.json",
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+      "  path: opencode/coder.json",
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       "    from_env: CODER_SOURCE_VAR_1",
       "    required: true",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -206,7 +210,7 @@ async function buildFinalizedRun(
     runId,
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: inputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    projectProvenance: prepared.binding,
+    projectProvenance: prepared.binding, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   if (options.finalize !== false) {
     await sink.dispatch({ kind: "start_agent_execution", stateId: "work", profile: "coder", executionRole: "planning" });

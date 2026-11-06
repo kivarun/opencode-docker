@@ -259,7 +259,7 @@ async function setupBase(): Promise<Base> {
       protected: entry.protected,
       digest: entry.digest,
     })),
-    projectProvenance: EMPTY_PROJECT_BINDING,
+    projectProvenance: EMPTY_PROJECT_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   return { root, pipeline, runRoot, runInputs, clock, drive, sources };
 }
@@ -2018,7 +2018,7 @@ async function setupStageBase(pipelineYaml: string = STAGE_PIPELINE): Promise<St
       protected: entry.protected,
       digest: entry.digest,
     })),
-    projectProvenance: EMPTY_PROJECT_BINDING,
+    projectProvenance: EMPTY_PROJECT_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   return { root, pipeline, runRoot, runInputs, clock, drive };
 }
@@ -2485,6 +2485,7 @@ import {
   restorePipelineV2PlanningAcceptanceContext,
   type RestoredPipelineV2PlanningAcceptanceContext,
 } from "../src/pipeline_v2_resume_context.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const PLAN_BYTES = JSON.stringify({ f1: true, f2: false });
 

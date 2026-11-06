@@ -71,7 +71,9 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+import { loadAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const CANARY_SECRET = "CANARY-SECRET-dhsec9f1";
 
@@ -1556,7 +1558,7 @@ test("respond end-to-end with the real production module: a reserved interventio
       max_transitions: 20,
     },
     inputs: [],
-    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   const runRoot = join(stateRoot, "pipeline-runs", "rid-reserved");
   chmodSync(runRoot, 0o700);
@@ -1766,13 +1768,16 @@ test("revise-task end-to-end with the real production runner: the honest waiting
     writeFileSync(
       join(configRoot, "profiles", "coder.yaml"),
       [
-        "schema_version: 1",
-        "image: ghcr.io/example/worker:1",
-        "opencode_config: opencode/coder.json",
+        "schema_version: 2",
+        "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "opencode_config:",
+        "  path: opencode/coder.json",
+        "  secrets: env_only",
         "env:",
         "  MODEL_API_KEY:",
         "    from_env: CODER_SOURCE_VAR_1",
         "    required: true",
+        "    secret: true",
         "",
       ].join("\n"),
     );
@@ -1824,7 +1829,14 @@ test("revise-task end-to-end with the real production runner: the honest waiting
         protected: entry.protected,
         digest: entry.digest,
       })),
-   projectProvenance: preparedProjectBinding000 });
+   projectProvenance: preparedProjectBinding000,
+   profileEpoch: await loadAndPublishRunProfileEpoch({
+     runRoot,
+     pipeline,
+     configRoot,
+     baseEnv: { HOME: "/home/u", CANARY_SECRET_ENV: CANARY_SECRET, CODER_SOURCE_VAR_1: "tester-secret" },
+   }),
+  });
     const accepted: AcceptedStateOutput[] = [];
     const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {
       const activation: PreparedActivationData = await prepareActivationData(
@@ -2076,13 +2088,16 @@ test("continue-stage end-to-end with the real production runner: the honest wait
     writeFileSync(
       join(configRoot, "profiles", "coder.yaml"),
       [
-        "schema_version: 1",
-        "image: ghcr.io/example/worker:1",
-        "opencode_config: opencode/coder.json",
+        "schema_version: 2",
+        "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "opencode_config:",
+        "  path: opencode/coder.json",
+        "  secrets: env_only",
         "env:",
         "  MODEL_API_KEY:",
         "    from_env: CODER_SOURCE_VAR_1",
         "    required: true",
+        "    secret: true",
         "",
       ].join("\n"),
     );
@@ -2128,7 +2143,14 @@ test("continue-stage end-to-end with the real production runner: the honest wait
         protected: entry.protected,
         digest: entry.digest,
       })),
-   projectProvenance: preparedProjectBinding001 });
+   projectProvenance: preparedProjectBinding001,
+   profileEpoch: await loadAndPublishRunProfileEpoch({
+     runRoot,
+     pipeline,
+     configRoot,
+     baseEnv: { HOME: "/home/u", CANARY_SECRET_ENV: CANARY_SECRET, CODER_SOURCE_VAR_1: "tester-secret" },
+   }),
+  });
     const accepted: AcceptedStateOutput[] = [];
     const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {
       const activation: PreparedActivationData = await prepareActivationData(
@@ -2784,13 +2806,16 @@ test("resume-plan end-to-end with the real production runner: the two-cycle plan
       writeFileSync(
         join(configRoot, "profiles", `${profile}.yaml`),
         [
-          "schema_version: 1",
-          "image: ghcr.io/example/worker:1",
-          `opencode_config: opencode/${profile}.json`,
+          "schema_version: 2",
+          "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          "opencode_config:",
+          `  path: opencode/${profile}.json`,
+          "  secrets: env_only",
           "env:",
           "  MODEL_API_KEY:",
           `    from_env: ${profile.toUpperCase()}_SOURCE_VAR_1`,
           "    required: true",
+          "    secret: true",
           "",
         ].join("\n"),
       );
@@ -2841,7 +2866,14 @@ test("resume-plan end-to-end with the real production runner: the two-cycle plan
         protected: entry.protected,
         digest: entry.digest,
       })),
-   projectProvenance: preparedProjectBinding002 });
+   projectProvenance: preparedProjectBinding002,
+   profileEpoch: await loadAndPublishRunProfileEpoch({
+     runRoot,
+     pipeline,
+     configRoot,
+     baseEnv: { HOME: "/home/u", CANARY_SECRET_ENV: CANARY_SECRET, CODER_SOURCE_VAR_1: "coder-secret", ARCHITECT_SOURCE_VAR_1: "architect-secret" },
+   }),
+  });
     let accepted: AcceptedStateOutput[] = [];
     accepted = await cliPlanningActivation(pipeline, runInputs, accepted, sink, "architect", "architect", "plan", 1, P1_PROPOSAL);
     const acceptedPlan1 = await acceptPipelineV2PlanningRunPlan({ pipeline, runRoot, sink });
@@ -3057,13 +3089,16 @@ test("resume-plan end-to-end with the real production runner: the initial plan-r
       writeFileSync(
         join(configRoot, "profiles", `${profile}.yaml`),
         [
-          "schema_version: 1",
-          "image: ghcr.io/example/worker:1",
-          `opencode_config: opencode/${profile}.json`,
+          "schema_version: 2",
+          "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          "opencode_config:",
+          `  path: opencode/${profile}.json`,
+          "  secrets: env_only",
           "env:",
           "  MODEL_API_KEY:",
           `    from_env: ${profile.toUpperCase()}_SOURCE_VAR_1`,
           "    required: true",
+          "    secret: true",
           "",
         ].join("\n"),
       );
@@ -3113,7 +3148,14 @@ test("resume-plan end-to-end with the real production runner: the initial plan-r
         protected: entry.protected,
         digest: entry.digest,
       })),
-   projectProvenance: preparedProjectBinding003 });
+   projectProvenance: preparedProjectBinding003,
+   profileEpoch: await loadAndPublishRunProfileEpoch({
+     runRoot,
+     pipeline,
+     configRoot,
+     baseEnv: { HOME: "/home/u", CANARY_SECRET_ENV: CANARY_SECRET, CODER_SOURCE_VAR_1: "coder-secret", ARCHITECT_SOURCE_VAR_1: "architect-secret" },
+   }),
+  });
     await cliPlanningActivation(pipeline, runInputs, [], sink, "architect", "architect", "plan", 1, P1_PROPOSAL);
     const prefixState = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));
     expect(prefixState.executions).toHaveLength(1);
@@ -3264,13 +3306,16 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
     writeFileSync(
       join(configRoot, "profiles", "coder.yaml"),
       [
-        "schema_version: 1",
-        "image: ghcr.io/example/worker:1",
-        "opencode_config: opencode/coder.json",
+        "schema_version: 2",
+        "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "opencode_config:",
+        "  path: opencode/coder.json",
+        "  secrets: env_only",
         "env:",
         "  MODEL_API_KEY:",
         "    from_env: CODER_SOURCE_VAR_1",
         "    required: true",
+        "    secret: true",
         "",
       ].join("\n"),
     );
@@ -3313,7 +3358,14 @@ test("resume CLI reports the controlled stage-wait suspension: one JSON waiting 
         protected: entry.protected,
         digest: entry.digest,
       })),
-   projectProvenance: preparedProjectBinding004 });
+   projectProvenance: preparedProjectBinding004,
+   profileEpoch: await loadAndPublishRunProfileEpoch({
+     runRoot,
+     pipeline,
+     configRoot,
+     baseEnv: { HOME: "/home/u", CANARY_SECRET_ENV: CANARY_SECRET, CODER_SOURCE_VAR_1: "tester-secret" },
+   }),
+  });
     const activation: PreparedActivationData = await prepareActivationData(pipeline, runInputs, [], "architect", 1);
     await sink.dispatch({
       kind: "start_agent_execution",
@@ -3541,13 +3593,16 @@ test("run CLI reports the plan-ready suspension: one JSON plan-ready outcome (ex
     writeFileSync(
       join(configRoot, "profiles", "coder.yaml"),
       [
-        "schema_version: 1",
-        "image: ghcr.io/example/worker:1",
-        "opencode_config: opencode/coder.json",
+        "schema_version: 2",
+        "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "opencode_config:",
+        "  path: opencode/coder.json",
+        "  secrets: env_only",
         "env:",
         "  MODEL_API_KEY:",
         "    from_env: CODER_SOURCE_VAR_1",
         "    required: true",
+        "    secret: true",
         "",
       ].join("\n"),
     );

@@ -60,6 +60,7 @@ import {
   type ApplyPipelineV2ReviseTaskResumeOptions,
 } from "../src/pipeline_v2_revise_task_resume_controller.ts";
 
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
 /**
@@ -323,7 +324,7 @@ async function reviseResumeReady(options: { advance?: "r0" | "r4" } = {}): Promi
         protected: entry.protected,
         digest: entry.digest,
       })),
-   projectProvenance: preparedProjectBinding027 });
+   projectProvenance: preparedProjectBinding027, profileEpoch: V2_PROFILE_EPOCH_BINDING });
     const protectedInput = runInputs.inputs[0];
     if (protectedInput === undefined) {
       throw new Error("the prefix fixture lost its protected run input");

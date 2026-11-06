@@ -15,6 +15,7 @@ import { PipelineV2RunStateDurabilityError, PipelineV2RunStateStoreError } from 
 import { applyStageTransitionCommit } from "../src/pipeline_v2_stage_transition_apply_internal.ts";
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const RUN_ID = "kernel-transition";
 
@@ -64,7 +65,7 @@ async function seedSettledExecution(sink: PipelineV2RunStateSink, pipeline: Reso
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: [],
-    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   await sink.dispatch({ kind: "start_agent_execution", stateId: "planner", profile: "coder", executionRole: "planning" });
   for (const command of [

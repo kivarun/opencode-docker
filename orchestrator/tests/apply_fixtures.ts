@@ -16,6 +16,7 @@ import { realMetadataProbeIo, type MetadataProbeIo } from "../src/pipeline_v2_ap
 import { dlopen, FFIType } from "bun:ffi";
 import { realApplyFdOps, type ApplyFdOps } from "../src/pipeline_v2_apply_fd_internal.ts";
 import { applyCrashFault } from "../src/pipeline_v2_apply_crash_internal.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 /**
  * Shared fixtures for the durable Project Apply preparation suites: a
@@ -132,7 +133,7 @@ export async function buildFinalizedApplyRun(prefix: string, options: BuildApply
   const configRoot = join(root, "config");
   await mkdir(join(configRoot, "profiles"), { recursive: true });
   await mkdir(join(configRoot, "opencode"), { recursive: true });
-  await writeFile(join(configRoot, "profiles", "coder.yaml"), "schema_version: 1\nimage: ghcr.io/example/worker:1\nopencode_config: opencode/coder.json\nenv: {}\n");
+  await writeFile(join(configRoot, "profiles", "coder.yaml"), "schema_version: 2\nimage: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\nopencode_config:\n  path: opencode/coder.json\n  secrets: env_only\nenv: {}\n");
   await writeFile(join(configRoot, "opencode", "coder.json"), "{}");
   const projectSource = join(root, "project-source");
   await mkdir(projectSource);
@@ -153,7 +154,7 @@ export async function buildFinalizedApplyRun(prefix: string, options: BuildApply
     runId,
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: [],
-    projectProvenance: prepared.binding,
+    projectProvenance: prepared.binding, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   if (options.stopAfterCreate === true) {
     const state = parsePipelineV2RunState(await readFile(join(runRoot, "state.json"), "utf8"));

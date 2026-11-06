@@ -1,7 +1,10 @@
-schema_version: 1
-image: ghcr.io/example/worker:1
-opencode_config: opencode/coder.json
+schema_version: 2
+image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+opencode_config:
+  path: opencode/coder.json
+  secrets: env_only
 env:
   MODEL_API_KEY:
     from_env: CODER_SOURCE_VAR_1
     required: true
+    secret: true

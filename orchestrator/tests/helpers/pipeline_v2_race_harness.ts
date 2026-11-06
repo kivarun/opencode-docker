@@ -20,6 +20,7 @@ import { openPipelineV2ContinuedStage } from "../../src/pipeline_v2_continued_st
 import { prepareRunProject, snapshotRunInputs } from "../../src/pipeline_v2_runtime.ts";
 import { enterPipelineV2Wait } from "../../src/pipeline_v2_wait_controller.ts";
 import { pipelineV2RunPipelineIdentity } from "../../src/pipeline_v2_digest.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -129,13 +130,18 @@ export async function buildHarness(prefix: string): Promise<Harness> {
     await writeFile(
       join(configRoot, "profiles", `${name}.yaml`),
       [
-        "schema_version: 1",
-        "image: ghcr.io/example/worker:1",
-        `opencode_config: opencode/${name}.json`,
+        "schema_version: 2",
+        "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "opencode_config:",
+
+        `  path: opencode/${name}.json`,
+
+        "  secrets: env_only",
         "env:",
         "  MODEL_API_KEY:",
         `    from_env: ${name.toUpperCase()}_SOURCE_VAR_1`,
         "    required: true",
+        "    secret: true",
         "",
       ].join("\n"),
     );
@@ -409,7 +415,7 @@ export async function prefixCustomWait(
   const sink = new PipelineV2RunStateSink({ stateRoot: harness.stateRoot, runId });
   await sink.dispatch({ kind: "create_run", runId, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: runInputs.inputs.map((input) => ({
     id: input.id, type: input.type, protected: input.protected, digest: input.digest,
-  })), projectProvenance: preparedProjectBinding005 });
+  })), projectProvenance: preparedProjectBinding005, profileEpoch: V2_PROFILE_EPOCH_BINDING });
   await enterPipelineV2Wait({
     runRoot,
     sink,

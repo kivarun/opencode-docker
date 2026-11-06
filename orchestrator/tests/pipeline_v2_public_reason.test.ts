@@ -18,6 +18,7 @@ import {
   type PipelineV2PublicReason,
 } from "../src/pipeline_v2_public_reason.ts";
 import { PipelineV2RunStateStoreError } from "../src/pipeline_v2_state_store.ts";
+import { loadPipelineV2 } from "../src/pipeline_v2.ts";
 import {
   parsePipelineV2RunState,
   reducePipelineV2RunCommand,
@@ -27,7 +28,9 @@ import {
 import { V2_IDENTITY, V2_INPUTS, tick } from "./pipeline_v2_state_fixtures.ts";
 import type { PipelineV2ResumeRefusalReason } from "../src/pipeline_v2_coordinator.ts";
 
+import { loadAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 /**
  * The shared machine-readable contract of every pipeline v2 command outcome:
@@ -230,7 +233,7 @@ async function writeBundle(root: string): Promise<string> {
   await mkdir(join(configRoot, "opencode"), { recursive: true });
   await writeFile(
     join(configRoot, "profiles", "coder.yaml"),
-    "schema_version: 1\nimage: ghcr.io/example/worker:1\nopencode_config: opencode/coder.json\nenv: {}\n",
+    "schema_version: 2\nimage: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\nopencode_config:\n  path: opencode/coder.json\n  secrets: env_only\nenv: {}\n",
   );
   await writeFile(join(configRoot, "opencode", "coder.json"), "{}");
   const project = join(root, "project");
@@ -243,9 +246,22 @@ async function writeActiveRun(root: string, runId: string, bundleRoot: string): 
   const runRoot = join(stateRoot, "pipeline-runs", runId);
   await mkdir(runRoot, { recursive: true, mode: 0o700 });
   const identity = { ...V2_IDENTITY, bundle_root: bundleRoot };
+  let epochBinding: { digest: string; profile_count: number } = V2_PROFILE_EPOCH_BINDING;
+  try {
+    const pipeline = await loadPipelineV2(bundleRoot);
+    epochBinding = await loadAndPublishRunProfileEpoch({
+      runRoot,
+      pipeline,
+      configRoot: join(root, "config"),
+      baseEnv: {},
+    });
+  } catch {
+    // fixtures with a non-loadable bundle keep the shape-only binding; the
+    // flows under test refuse before the epoch verification
+  }
   const state: PipelineV2RunState = reducePipelineV2RunCommand(
     null,
-    { kind: "create_run", runId, pipeline: identity, inputs: V2_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+    { kind: "create_run", runId, pipeline: identity, inputs: V2_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: epochBinding },
     tick(1),
   );
   await writeFile(join(runRoot, "state.json"), JSON.stringify(state), { mode: 0o600 });

@@ -57,6 +57,7 @@ import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
  * Helper or real Sessions.
  */
 
+import { V2_PREPARED_PROFILE_EPOCH } from "./helpers/profile_epoch_fixture.ts";
 const LOOSE_SCHEMA = {};
 
 const PLAN_OUTPUT_SCHEMA = { type: "object" };
@@ -2605,6 +2606,7 @@ async function coordinate(
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime,
+    profileEpoch: V2_PREPARED_PROFILE_EPOCH,
   }, options.control ?? NEUTRAL_CONTROL);
 }
 
@@ -2683,6 +2685,7 @@ test("34. a project preparation failure reaches no command and no session", asyn
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime: fake.runtime,
+    profileEpoch: V2_PREPARED_PROFILE_EPOCH,
   }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
   if (!result.ok && !("waiting" in result) && !("planReady" in result)) {
@@ -2716,6 +2719,7 @@ test("35. a late run-input failure keeps the published project copy and an untou
     inputBindings: brokenBindings,
     sink: harness.recording,
     runtime: fake.runtime,
+    profileEpoch: V2_PREPARED_PROFILE_EPOCH,
   }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
   if (!result.ok && !("waiting" in result) && !("planReady" in result)) {
@@ -2860,6 +2864,7 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
       inputBindings: bindingsFor(harness.dirs, harness.pipeline),
       sink: guardedSink,
       runtime: guardedRuntime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     }, NEUTRAL_CONTROL);
     expect(result.ok).toBe(false);
     if (!result.ok && !("waiting" in result) && !("planReady" in result)) {
@@ -2891,6 +2896,7 @@ test("38. a forged pipeline is rejected by the provenance gate before any side e
     inputBindings: bindingsFor(harness.dirs, harness.pipeline),
     sink: harness.recording,
     runtime: fake.runtime,
+    profileEpoch: V2_PREPARED_PROFILE_EPOCH,
   }, NEUTRAL_CONTROL);
   expect(result.ok).toBe(false);
   if (!result.ok && !("waiting" in result) && !("planReady" in result)) {

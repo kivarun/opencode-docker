@@ -60,6 +60,7 @@ import {
   productionPlanningRunPlanResumeOps,
   type PipelineV2PlanningRunPlanResumeOps,
 } from "../src/pipeline_v2_planning_run_plan_resume_controller_internal.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -399,7 +400,7 @@ async function buildTwoCyclePrefix(): Promise<PrefixCoordinates> {
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-   projectProvenance: preparedProjectBinding024 });
+   projectProvenance: preparedProjectBinding024, profileEpoch: V2_PROFILE_EPOCH_BINDING });
     let accepted: AcceptedStateOutput[] = [];
     accepted = await runPlanningActivation(pipeline1, runInputs, accepted, recording1, "architect", "architect", "plan", 1, P1_PROPOSAL, "planning-1");
     const accepted1 = await acceptPipelineV2PlanningRunPlan({ pipeline: pipeline1, runRoot: fixture.runRoot, sink: recording1 });
@@ -1689,7 +1690,7 @@ async function buildInitialReadyPrefix(): Promise<PrefixCoordinates> {
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(pipeline1),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    projectProvenance: preparedProjectBinding025,
+    projectProvenance: preparedProjectBinding025, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   await runPlanningActivation(pipeline1, runInputs, [], recording1, "architect", "architect", "plan", 1, P1_PROPOSAL, "planning-1");
   return { fixture, runId: RUN_ID };

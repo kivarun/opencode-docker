@@ -266,16 +266,22 @@ async function writeProfile(configRoot: string, name: string, sourceVar: string)
   await writeFile(
     join(configRoot, "profiles", `${name}.yaml`),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      `opencode_config: opencode/${name}.json`,
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+
+      `  path: opencode/${name}.json`,
+
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       `    from_env: ${sourceVar}`,
       "    required: true",
+      "    secret: true",
       "  GH_TOKEN:",
       "    from_env: GH_TOKEN",
       "    required: false",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -734,7 +740,7 @@ test("1. happy path: agent -> decision -> success through the real sink, runtime
     image?: string;
     mounts?: Array<{ target?: string }>;
   };
-  expect(body.image).toBe("ghcr.io/example/worker:1");
+  expect(body.image).toBe("ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
   expect((body.mounts ?? []).map((mount) => mount.target)).toEqual([
     "/workspace",
     "/pipeline/inputs",

@@ -14,6 +14,7 @@ import {
 } from "../src/pipeline_v2_state.ts";
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 export const hex = (char: string): string => char.repeat(64);
 
@@ -74,7 +75,7 @@ export function transition(from: string, to: string, executionIndex: number, tra
  */
 export function lifecycleCommands(): PipelineV2RunCommand[] {
   return [
-    { kind: "create_run", runId: "run-history", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+    { kind: "create_run", runId: "run-history", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
     ...planningLadder("sess-1", "tool-1"),
     { kind: "task_revision_accepted", taskId: "task-a", revision: 1, taskSha256: hex("1") },
     { kind: "task_revision_accepted", taskId: "task-b", revision: 1, taskSha256: hex("2") },

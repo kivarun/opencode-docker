@@ -1,5 +1,5 @@
 /**
- * Durable run state for pipeline schema v2 (state schema version 11).
+ * Durable run state for pipeline schema v2 (state schema version 12).
  *
  * Pure substrate: a versioned state document, an exact-field loader, and a
  * pure command reducer. Nothing here touches the filesystem, docker-helper,
@@ -121,8 +121,13 @@ import {
   validatePipelineV2ProjectProvenanceBinding,
   type PipelineV2ProjectProvenanceBinding,
 } from "./pipeline_v2_project_provenance.ts";
+import {
+  PipelineV2ProfileEpochError,
+  validatePipelineV2ProfileEpochBinding,
+  type PipelineV2ProfileEpochBinding,
+} from "./pipeline_v2_profile_epoch.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 11;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 12;
 
 /** The closed execution-role vocabulary fixed on every execution at start. */
 export const PIPELINE_V2_EXECUTION_ROLES = ["planning", "control", "stage"] as const;
@@ -683,6 +688,16 @@ export interface PipelineV2RunState {
    * location outside the worker-mounted project tree.
    */
   project_provenance: PipelineV2ProjectProvenanceBinding;
+  /**
+   * The immutable binding of the run's profile epoch manifest (schema
+   * v12): the content-free digest of the run-wide execution-profile epoch
+   * and the bound profile count. Bound atomically by `create_run` — no
+   * activation can exist in a run without it — and never rewritten. The
+   * manifest artifact itself lives at the fixed run-root location
+   * `<runRoot>/profile-epoch.json` and carries no secret value, no host
+   * path and no config path.
+   */
+  profile_epoch: PipelineV2ProfileEpochBinding;
   cursor: PipelineV2RunCursorState;
   executions: PipelineV2ExecutionState[];
   transitions: PipelineV2CommittedTransitionState[];
@@ -726,6 +741,8 @@ export type PipelineV2RunCommand =
       inputs: readonly PipelineV2RunInputState[];
       /** The immutable binding of the run's project provenance manifest (schema v10). */
       projectProvenance: PipelineV2ProjectProvenanceBinding;
+      /** The immutable binding of the run's profile epoch manifest (schema v12). */
+      profileEpoch: PipelineV2ProfileEpochBinding;
     }
   | {
       kind: "start_agent_execution";
@@ -1409,52 +1426,57 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 11 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 12 is the supported contract; no v2 migration exists)",
     );
   }
   if (version === 3) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v3 migration exists)",
     );
   }
   if (version === 4) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v4 migration exists)",
     );
   }
   if (version === 5) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v5 migration exists)",
     );
   }
   if (version === 6) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v6 migration exists)",
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v6 migration exists)",
     );
   }
   if (version === 7) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v7 migration exists)",
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v7 migration exists)",
     );
   }
   if (version === 8) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v8 migration exists)",
+      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v8 migration exists)",
     );
   }
   if (version === 9) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v9 migration exists)",
+      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v9 migration exists)",
     );
   }
   if (version === 10) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 11 is the supported contract; no v10 migration exists)",
+      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v10 migration exists)",
+    );
+  }
+  if (version === 11) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 11, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v11 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -1513,6 +1535,25 @@ function expectStateProvenanceBinding(
     return validatePipelineV2ProjectProvenanceBinding(value, what);
   } catch (cause) {
     if (cause instanceof PipelineV2ProjectProvenanceError) {
+      throw new PipelineV2StateError(cause.message);
+    }
+    throw cause;
+  }
+}
+
+/**
+ * Translates the profile-epoch substrate's typed errors into the state
+ * error class: the failure is a `PipelineV2StateError`; the epoch
+ * substrate's content-free diagnostics pass through byte for byte.
+ */
+function expectStateProfileEpochBinding(
+  value: unknown,
+  what: string,
+): PipelineV2ProfileEpochBinding {
+  try {
+    return validatePipelineV2ProfileEpochBinding(value, what);
+  } catch (cause) {
+    if (cause instanceof PipelineV2ProfileEpochError) {
       throw new PipelineV2StateError(cause.message);
     }
     throw cause;
@@ -2444,6 +2485,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
       "pipeline",
       "inputs",
       "project_provenance",
+      "profile_epoch",
       "cursor",
       "executions",
       "transitions",
@@ -2488,6 +2530,10 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
   const projectProvenance = expectStateProvenanceBinding(
     obj.project_provenance,
     "pipeline v2 run state project_provenance",
+  );
+  const profileEpoch = expectStateProfileEpochBinding(
+    obj.profile_epoch,
+    "pipeline v2 run state profile_epoch",
   );
   const cursor = validateCursorState(obj.cursor, "pipeline v2 run state cursor");
   if (!Array.isArray(obj.executions)) {
@@ -3876,6 +3922,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
     pipeline,
     inputs,
     project_provenance: projectProvenance,
+    profile_epoch: profileEpoch,
     cursor,
     executions,
     transitions,
@@ -5026,6 +5073,7 @@ function cloneState(state: PipelineV2RunState): PipelineV2RunState {
     pipeline: { ...state.pipeline },
     inputs: state.inputs.map(cloneRunInput),
     project_provenance: { ...state.project_provenance },
+    profile_epoch: { ...state.profile_epoch },
     cursor: { ...state.cursor },
     executions: state.executions.map(cloneExecution),
     transitions: state.transitions.map(cloneTransition),
@@ -5337,6 +5385,10 @@ export function reducePipelineV2RunCommand(
       command.projectProvenance,
       "create_run project_provenance",
     );
+    const profileEpoch = expectStateProfileEpochBinding(
+      command.profileEpoch,
+      "create_run profile_epoch",
+    );
     if (!isPipelineV2SafeId(command.runId)) {
       throw new PipelineV2StateError("create_run requires a safe non-empty run id");
     }
@@ -5352,6 +5404,7 @@ export function reducePipelineV2RunCommand(
       pipeline,
       inputs,
       project_provenance: projectProvenance,
+      profile_epoch: profileEpoch,
       cursor: { current_state: pipeline.entry_state, transition_count: 0 },
       executions: [],
       transitions: [],

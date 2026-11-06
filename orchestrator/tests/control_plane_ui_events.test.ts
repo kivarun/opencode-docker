@@ -154,7 +154,7 @@ function hex64(seed: string): string {
 }
 
 const COVERAGE_B_COMMANDS = [
-  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const } },
+  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const }, profileEpoch: { digest: "d".repeat(64), profile_count: 1 } },
   { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
   { kind: "agent_data_prepared" },
   { kind: "agent_execution_session_created", sessionId: "sess-b-1" },
@@ -176,7 +176,7 @@ const COVERAGE_B_COMMANDS = [
 ] as const;
 
 const COVERAGE_C_COMMANDS = [
-  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const } },
+  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const }, profileEpoch: { digest: "d".repeat(64), profile_count: 1 } },
   { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
   { kind: "agent_data_prepared" },
   { kind: "agent_execution_session_created", sessionId: "sess-c-1" },
@@ -187,7 +187,7 @@ const COVERAGE_C_COMMANDS = [
 ] as const;
 
 const COVERAGE_D_COMMANDS = [
-  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const } },
+  { kind: "create_run", inputs: [], outputs: [], projectProvenance: { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const }, profileEpoch: { digest: "d".repeat(64), profile_count: 1 } },
   { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
   { kind: "agent_data_prepared" },
   { kind: "agent_execution_session_created", sessionId: "sess-d-1" },

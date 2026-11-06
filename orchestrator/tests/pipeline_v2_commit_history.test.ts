@@ -40,6 +40,7 @@ import {
 } from "./pipeline_v2_commit_history_fixture.ts";
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const ORACLE_KINDS: readonly string[] = [
   "create_run",
@@ -117,7 +118,7 @@ describe("pipeline v2 commit provenance: the 66-command lifecycle oracle", () =>
     expect(state.status).toBe("success");
     expect(state.revision).toBe(66);
     expect(state.schema_version).toBe(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(11);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(12);
     expect(state.commit_history).toHaveLength(66);
     state.commit_history.forEach((entry, index) => {
       expect(entry.revision).toBe(index + 1);
@@ -202,7 +203,7 @@ describe("pipeline v2 commit provenance: the 66-command lifecycle oracle", () =>
 describe("pipeline v2 commit provenance: the ambiguity clusters resolve durably", () => {
   function planningPrefix(): PipelineV2RunCommand[] {
     return [
-      { kind: "create_run", runId: "run-r1", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+      { kind: "create_run", runId: "run-r1", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
       ...planningLadder("sess-1", "tool-1"),
     ];
   }
@@ -313,7 +314,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
       runId: "run-decision",
       pipeline: { ...IDENTITY, entry_state: "check" },
       inputs: [],
-   projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+   projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
     { kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" },
     {
       kind: "decision_evaluated",
@@ -325,7 +326,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
     { kind: "run_succeeded" },
   ];
   const agentFailedFlow = (): PipelineV2RunCommand[] => [
-    { kind: "create_run", runId: "run-failed", pipeline: { ...IDENTITY, entry_state: "architect" }, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+    { kind: "create_run", runId: "run-failed", pipeline: { ...IDENTITY, entry_state: "architect" }, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
     { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
     { kind: "agent_data_prepared" },
     {
@@ -336,7 +337,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
     { kind: "run_failed", reason: "worker_failed" },
   ];
   const cleanupFailedFlow = (): PipelineV2RunCommand[] => [
-    { kind: "create_run", runId: "run-cleanup", pipeline: { ...IDENTITY, entry_state: "architect" }, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+    { kind: "create_run", runId: "run-cleanup", pipeline: { ...IDENTITY, entry_state: "architect" }, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
     { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
     { kind: "agent_data_prepared" },
     { kind: "agent_execution_session_created", sessionId: "sess-x" },
@@ -353,7 +354,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
     {
       kind: "create_run",
       commands: [],
-      command: { kind: "create_run", runId: "run-x", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+      command: { kind: "create_run", runId: "run-x", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
       entry: { kind: "create_run" },
     },
     { kind: "start_agent_execution", command: undefined, entry: { kind: "start_agent_execution", execution_index: 1, state_id: "architect" } },
@@ -384,7 +385,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
     {
       kind: "decision_failed",
       commands: [
-        { kind: "create_run", runId: "run-decision-failed", pipeline: { ...IDENTITY, entry_state: "check" }, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+        { kind: "create_run", runId: "run-decision-failed", pipeline: { ...IDENTITY, entry_state: "check" }, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
         { kind: "start_decision_execution", stateId: "check", inputDigest: hex("e"), executionRole: "control" },
       ],
       command: { kind: "decision_failed", reason: "internal_error" },
@@ -469,7 +470,7 @@ describe("pipeline v2 commit provenance: the full command-kind ownership matrix"
 
   test("a rejected command leaves the history untouched", () => {
     const rejected: Array<[string, PipelineV2RunCommand[]]> = [
-      ["create_run twice", [...lifecycleCommands().slice(0, 5), { kind: "create_run", runId: "other", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING }]],
+      ["create_run twice", [...lifecycleCommands().slice(0, 5), { kind: "create_run", runId: "other", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING }]],
       ["start off the waiting boundary", [...lifecycleCommands().slice(0, 23), { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" }]],
       ["ladder out of order", [...lifecycleCommands().slice(0, 2), { kind: "agent_running" }]],
       ["unknown decision state", [...lifecycleCommands().slice(0, 1), { kind: "start_decision_execution", stateId: "elsewhere", inputDigest: hex("e"), executionRole: "control" }]],
@@ -728,7 +729,7 @@ describe("pipeline v2 commit provenance: the crash and durability matrix", () =>
     try {
       const stateRoot = join(root, "state-root");
       const sink = new PipelineV2RunStateSink({ stateRoot, runId: "run-crash", now: () => TICKS[0]!, io: faultIo({ failCommit: 2, failStep: "rename" }) });
-      await sink.dispatch({ kind: "create_run", runId: "run-crash", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
+      await sink.dispatch({ kind: "create_run", runId: "run-crash", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       let rejected = false;
       try {
         await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
@@ -761,7 +762,7 @@ describe("pipeline v2 commit provenance: the crash and durability matrix", () =>
     try {
       const stateRoot = join(root, "state-root");
       const sink = new PipelineV2RunStateSink({ stateRoot, runId: "run-durable", now: () => TICKS[0]!, io: faultIo({ failCommit: 2, failStep: "dirsync" }) });
-      await sink.dispatch({ kind: "create_run", runId: "run-durable", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
+      await sink.dispatch({ kind: "create_run", runId: "run-durable", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       let durabilityUnknown = false;
       try {
         await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
@@ -796,7 +797,7 @@ describe("pipeline v2 commit provenance: the crash and durability matrix", () =>
     try {
       const stateRoot = join(root, "state-root");
       const sink = new PipelineV2RunStateSink({ stateRoot, runId: "run-readonly", now: () => TICKS[0]! });
-      await sink.dispatch({ kind: "create_run", runId: "run-readonly", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
+      await sink.dispatch({ kind: "create_run", runId: "run-readonly", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       const raw = await readFile(join(stateRoot, "pipeline-runs", "run-readonly", "state.json"), "utf8");
       const parsed = parsePipelineV2RunState(raw);
       expect(JSON.stringify(parsed)).toBe(JSON.stringify(JSON.parse(raw)));
@@ -839,7 +840,7 @@ describe("pipeline v2 commit provenance: state size and leakage", () => {
         runId: "run-canary",
         pipeline: { ...IDENTITY, bundle_root: canaryPath },
         inputs: [],
-     projectProvenance: V2_PROJECT_PROVENANCE_BINDING },
+     projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING },
       { kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" },
       { kind: "agent_data_prepared" },
       { kind: "agent_execution_session_created", sessionId: `sess-${canary}` },

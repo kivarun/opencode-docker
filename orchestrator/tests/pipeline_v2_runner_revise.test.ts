@@ -63,6 +63,9 @@ import {
   type RunInputsSnapshot,
 } from "../src/pipeline_v2_runtime.ts";
 import { hex, startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
+import { loadAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
+const EPOCH_BASE_ENV: Readonly<Record<string, string>> = { HOME: "/home/u", CODER_SOURCE_VAR_1: "tester-secret" };
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -172,13 +175,16 @@ async function makeHarness(prefix: string, runId: string = RUN_ID): Promise<Harn
   await writeFile(
     join(configRoot, "profiles", "coder.yaml"),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      "opencode_config: opencode/coder.json",
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+      "  path: opencode/coder.json",
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       "    from_env: CODER_SOURCE_VAR_1",
       "    required: true",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -261,6 +267,12 @@ async function drivePrefix(
       digest: entry.digest,
     })),
     projectProvenance: preparedProjectBinding035,
+    profileEpoch: await loadAndPublishRunProfileEpoch({
+      runRoot,
+      pipeline,
+      configRoot: harness.configRoot,
+      baseEnv: EPOCH_BASE_ENV,
+    }),
   });
   const accepted: AcceptedStateOutput[] = [];
   const runAgentStep = async (stateId: string, executionIndex: number, commit: boolean): Promise<void> => {
@@ -1057,6 +1069,7 @@ test("the runner export surface gains exactly one key for the revise-task entryp
     "resumePipelineV2PlanningRunPlan",
     "revisePipelineV2Task",
     "runPipelineV2",
+    "uniqueProfileNames",
   ]);
   expect(typeof namespace["revisePipelineV2Task"]).toBe("function");
 }, 15000);

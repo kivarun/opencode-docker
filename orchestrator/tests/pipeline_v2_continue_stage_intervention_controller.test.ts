@@ -297,7 +297,7 @@ async function driveToWaitBoundary(): Promise<Omit<Fixture, "intent" | "reopened
     const runRoot = join(stateRoot, "pipeline-runs", RUN_ID);
     const statePath = join(runRoot, "state.json");
     const sink = new PipelineV2RunStateSink({ stateRoot, runId: RUN_ID, now: nextTick });
-    await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING });
+    await sink.dispatch({ kind: "create_run", runId: RUN_ID, pipeline: pipelineV2RunPipelineIdentity(pipeline), inputs: BASE_INPUTS, projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING });
     await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of agentPhases("planning")) {
       await sink.dispatch(command);
@@ -2162,6 +2162,7 @@ test("26. caller mutation after the pending acceptance cannot change the interve
 // --- durability windows -----------------------------------------------------
 
 import { PipelineV2ContinueStageGrantControllerError } from "../src/pipeline_v2_continue_stage_grant_controller.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 import { PipelineV2WaitControllerError } from "../src/pipeline_v2_wait_controller.ts";
 import { PipelineV2StageIterationControllerError } from "../src/pipeline_v2_stage_iteration_controller.ts";
 

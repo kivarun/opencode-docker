@@ -131,6 +131,11 @@ import { WorkerSignalHub } from "./worker_signals.ts";
 import type { PipelineV2WorkerOperationRunner } from "./pipeline_v2_docker_runtime.ts";
 import type { HelperConfig } from "./launcher.ts";
 import { loadProfile, type ResolvedProfile } from "./profile.ts";
+import {
+  preparePipelineV2ProfileEpoch,
+  type PreparedPipelineV2ProfileEpoch,
+} from "./pipeline_v2_profile_epoch.ts";
+import { verifyPipelineV2ProfileEpochForExistingRun } from "./pipeline_v2_profile_epoch_store.ts";
 import { isPositiveSafeInteger } from "./pipeline_v2_scalar.ts";
 import {
   expectSafeId,
@@ -420,8 +425,12 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** The unique agent-state profile names of the pipeline, in declaration order. */
-function uniqueProfileNames(pipeline: ResolvedPipelineV2): string[] {
+/**
+ * The unique agent-state profile names of the pipeline, in declaration
+ * order. Exported so the profile-epoch construction of tests and the
+ * store helper share this one deterministic order function.
+ */
+export function uniqueProfileNames(pipeline: ResolvedPipelineV2): string[] {
   const names: string[] = [];
   const seen = new Set<string>();
   for (const state of pipeline.states) {
@@ -733,12 +742,22 @@ export async function runPipelineV2(
   // root is created wins over that operation's error.
 
   let pipeline: ResolvedPipelineV2;
+  let profileEpoch: PreparedPipelineV2ProfileEpoch;
   const profiles = new Map<string, ResolvedProfile>();
   try {
     pipeline = await loadPipelineV2(options.pipelineRoot);
     for (const profileName of uniqueProfileNames(pipeline)) {
       profiles.set(profileName, await loadProfile(options.configRoot, profileName, deps.baseEnv));
     }
+    profileEpoch = preparePipelineV2ProfileEpoch(
+      uniqueProfileNames(pipeline).map((name) => {
+        const profile = profiles.get(name);
+        if (profile === undefined) {
+          throw new Error(`pipeline v2 runner: profile ${JSON.stringify(name)} was not loaded`);
+        }
+        return profile.identity;
+      }),
+    );
   } catch (cause) {
     if (recordedSignal() !== null) {
       return signalOutcomeBeforeRunRoot();
@@ -978,6 +997,7 @@ export async function runPipelineV2(
         inputBindings: options.inputBindings,
         sink,
         runtime,
+        profileEpoch,
       },
       control,
     );
@@ -1935,7 +1955,8 @@ async function runExistingPipelineV2(
   // `state.pipeline.bundle_root`; the profiles are loaded again from the
   // explicitly passed configuration root, once per unique agent-state
   // profile name in declaration order (trusted operator configuration;
-  // durable profile epochs are not implemented).
+  // the durable run-wide profile epoch is verified right after this
+  // load, from exactly this snapshot).
 
   let pipeline: ResolvedPipelineV2;
   const profiles = new Map<string, ResolvedProfile>();
@@ -1949,6 +1970,38 @@ async function runExistingPipelineV2(
       return postRunRootSignalOutcome(sink.snapshot);
     }
     return postRunRootFailure(cause, sink.snapshot, publicReasonFor(cause, "invalid_options"));
+  }
+  if (recordedSignal() !== null) {
+    return postRunRootSignalOutcome(sink.snapshot);
+  }
+
+  // --- durable run-wide profile epoch verification -------------------------
+  //
+  // The single verification entry of every mutating existing-run flow. It
+  // proves the stored `<runRoot>/profile-epoch.json` artifact against the
+  // durable binding and recomputes the epoch manifest from exactly the
+  // freshly loaded profile snapshot the runtime factory receives below.
+  // A mismatch, a missing artifact or a damaged artifact refuses the run
+  // with its typed reason before Launcher auth, before the runtime
+  // adapter, before any Session, helper call or worker, and before any
+  // durable write. Secret rotation never changes the epoch.
+  try {
+    await verifyPipelineV2ProfileEpochForExistingRun({
+      runRoot: runRoot.localRunRoot,
+      binding: sink.snapshot!.profile_epoch,
+      profileEntries: uniqueProfileNames(pipeline).map((name) => {
+        const profile = profiles.get(name);
+        if (profile === undefined) {
+          throw new Error(`pipeline v2 runner: profile ${JSON.stringify(name)} was not loaded`);
+        }
+        return profile.identity;
+      }),
+    });
+  } catch (cause) {
+    if (recordedSignal() !== null) {
+      return postRunRootSignalOutcome(sink.snapshot);
+    }
+    return postRunRootFailure(cause, sink.snapshot, publicReasonFor(cause, "internal_error"));
   }
   if (recordedSignal() !== null) {
     return postRunRootSignalOutcome(sink.snapshot);

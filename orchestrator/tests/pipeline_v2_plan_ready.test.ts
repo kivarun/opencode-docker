@@ -47,6 +47,9 @@ import {
   type RunInputsSnapshot,
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
+import { V2_PREPARED_PROFILE_EPOCH } from "./helpers/profile_epoch_fixture.ts";
+import { prepareAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -261,13 +264,16 @@ async function makeHarness(
   await writeFile(
     join(configRoot, "profiles", "coder.yaml"),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      "opencode_config: opencode/coder.json",
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+      "  path: opencode/coder.json",
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       "    from_env: CODER_SOURCE_VAR_1",
       "    required: true",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -460,6 +466,15 @@ async function prefixStageEntry(
       digest: entry.digest,
     })),
     projectProvenance: preparedProjectBinding018,
+    profileEpoch: (await (async () => {
+      const prepared = await prepareAndPublishRunProfileEpoch({
+        runRoot: harness.runRoot,
+        pipeline,
+        configRoot: harness.configRoot,
+        baseEnv: { HOME: "/home/u", XDG_CONFIG_HOME: "/cfg", CODER_SOURCE_VAR_1: "coder-secret" },
+      });
+      return { digest: prepared.sha256, profile_count: prepared.manifest.profiles.length };
+    })()),
   });
   await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, proposal);
   const { acceptPipelineV2PlanningRunPlan } = await import("../src/pipeline_v2_planning_run_plan_controller.ts");
@@ -615,6 +630,7 @@ test("1/2/3/13/16/22. the fresh planning run suspends plan-ready: exact commands
       inputBindings: await bindingsFor(harness, "cycle"),
       sink: recording as never,
       runtime: fake.runtime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     CONTROL,
   );
@@ -695,6 +711,7 @@ test("12. a signal accepted before the plan-ready checkpoint wins with the previ
           return pair as never;
         }) as never,
       }) as unknown as PipelineV2AgentRuntime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     control,
   );
@@ -739,6 +756,7 @@ test("9. a failed planning execution stays an ordinary worker failure with no pl
       inputBindings: await bindingsFor(harness, "cycle"),
       sink: recording as never,
       runtime: fake.runtime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     CONTROL,
   );
@@ -788,6 +806,7 @@ test("10/11. planning->control and planning->terminal flows keep committing thei
       inputBindings: await bindingsFor(harness, "control"),
       sink: recording as never,
       runtime: fake.runtime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     CONTROL,
   );
@@ -858,6 +877,7 @@ test("14. a verification failure inside the plan-ready seam propagates through t
       inputBindings: await bindingsFor(harness, "cycle"),
       sink: recording as never,
       runtime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     CONTROL,
   );
@@ -901,6 +921,7 @@ test("15. a forged pipeline is rejected by the provenance gate before any effect
       inputBindings: await bindingsFor(harness, "cycle"),
       sink: recording as never,
       runtime: fake.runtime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     CONTROL,
   );

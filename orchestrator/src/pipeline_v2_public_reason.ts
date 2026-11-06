@@ -60,6 +60,7 @@ export const PIPELINE_V2_PUBLIC_REASONS = [
     "invalid_state",
     "pipeline_mismatch",
     "run_layout_invalid",
+    "profile_epoch_mismatch",
   ] as const,
   // the minimal general categories of the runner boundary
   ...[

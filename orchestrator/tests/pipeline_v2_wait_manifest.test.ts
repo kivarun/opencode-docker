@@ -17,6 +17,7 @@ import {
 } from "../src/pipeline_v2_state.ts";
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const hex = (char: string): string => char.repeat(64);
 
@@ -554,7 +555,7 @@ describe("pipeline v2 wait manifests in durable state v6 (pure round-trip proof)
     const requestRaw = JSON.stringify({ ...REQUEST, transition_count: 0 });
     const prepared = parsePipelineV2WaitRequest(requestRaw);
 
-    let state = reduce(null, { kind: "create_run", runId: "run-1", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING }, 0);
+    let state = reduce(null, { kind: "create_run", runId: "run-1", pipeline: IDENTITY, inputs: [], projectProvenance: V2_PROJECT_PROVENANCE_BINDING, profileEpoch: V2_PROFILE_EPOCH_BINDING }, 0);
     state = reduce(state, {
       kind: "run_waiting",
       stateId: prepared.manifest.state_id,

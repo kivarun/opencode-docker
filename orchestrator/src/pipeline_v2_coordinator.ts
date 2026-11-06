@@ -161,6 +161,13 @@ import { PipelineV2RuntimeError } from "./pipeline_v2_runtime_error.ts";
 import { PipelineV2ProjectLockBusyError } from "./pipeline_v2_apply_project_lock_internal.ts";
 import type { PipelineV2ProjectProvenanceBinding } from "./pipeline_v2_project_provenance.ts";
 import {
+  pipelineV2ProfileEpochDigest,
+  validateProfileEpochManifest,
+  type PipelineV2ProfileEpochBinding,
+  type PreparedPipelineV2ProfileEpoch,
+} from "./pipeline_v2_profile_epoch.ts";
+import { PipelineV2ProfileEpochStoreError, publishPipelineV2ProfileEpoch } from "./pipeline_v2_profile_epoch_store.ts";
+import {
   classifyPipelineV2ResumeRecovery,
   type PipelineV2ExecutableRecovery,
 } from "./pipeline_v2_recovery.ts";
@@ -306,6 +313,14 @@ export interface PipelineV2CoordinatorParams {
   readonly inputBindings: readonly RunInputBinding[];
   readonly sink: PipelineV2CoordinatorStateSink;
   readonly runtime: PipelineV2AgentRuntime;
+  /**
+   * The prepared run-wide profile epoch manifest (schema v12), built by
+   * the runner from exactly the loaded profile snapshot the runtime
+   * factory snapshots. The coordinator publishes it as the immutable
+   * `<runRoot>/profile-epoch.json` artifact before `create_run` and binds
+   * its digest atomically in the same command.
+   */
+  readonly profileEpoch: PreparedPipelineV2ProfileEpoch;
 }
 
 /**
@@ -350,6 +365,7 @@ export type PipelineV2ResumeRefusalReason =
   | "accepted_output_modified"
   | "artifact_missing"
   | "artifact_modified"
+  | "profile_epoch_mismatch"
   | "internal_error";
 
 /**
@@ -1091,6 +1107,48 @@ export async function coordinatePipelineV2Run(
     return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
   }
 
+  // Phase 0: the run-wide profile epoch manifest is published as the
+  // immutable `<runRoot>/profile-epoch.json` artifact before any other
+  // run artifact and before `create_run`. The manifest was built by the
+  // runner from exactly the loaded profile snapshot the runtime factory
+  // snapshots; the coordinator re-validates it structurally, recomputes
+  // its digest and refuses any divergence before any durable write. A
+  // publication failure fails the run closed before `create_run` — no
+  // binding, no state document — and the signal semantics match the
+  // neighboring phases.
+  const profileEpochBinding: PipelineV2ProfileEpochBinding = (() => {
+    validateProfileEpochManifest(params.profileEpoch.manifest);
+    const recomputed = pipelineV2ProfileEpochDigest(params.profileEpoch.manifest);
+    if (recomputed !== params.profileEpoch.sha256) {
+      throw new Error("pipeline v2 coordinator: the prepared profile epoch manifest does not match its own digest");
+    }
+    return Object.freeze({
+      digest: params.profileEpoch.sha256,
+      profile_count: params.profileEpoch.manifest.profiles.length,
+    });
+  })();
+  try {
+    checkSignal();
+    await publishPipelineV2ProfileEpoch(runRoot, params.profileEpoch);
+    // Checkpoint after the successful publication: the epoch artifact
+    // stays in the run root; the signal outcome precedes `create_run`, so
+    // no state document exists yet.
+    checkSignal();
+  } catch (cause) {
+    const signal = capturedCurrentSignal();
+    if (signal !== null) {
+      return deepFreeze({
+        ok: false as const,
+        reason: signalFailureReason(signal),
+        state: null,
+      });
+    }
+    if (cause instanceof PipelineV2ProfileEpochStoreError) {
+      return deepFreeze({ ok: false as const, reason: "state_persist_failed" as const, state: null });
+    }
+    return deepFreeze({ ok: false as const, reason: "internal_error" as const, state: null });
+  }
+
   // Phase 0a: the run-owned project copy is prepared by the coordinator
   // from the caller's project source. The source is never modified; the
   // copy is published atomically as `<runRoot>/project`. A preparation
@@ -1174,6 +1232,7 @@ export async function coordinatePipelineV2Run(
       pipeline: pipelineV2RunPipelineIdentity(pipeline),
       inputs: runInputStates,
       projectProvenance,
+      profileEpoch: profileEpochBinding,
     });
   } catch (cause) {
     if (cause instanceof PipelineV2RunStateDurabilityError) {

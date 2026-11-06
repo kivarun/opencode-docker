@@ -62,6 +62,7 @@ import type { PipelineV2AgentRuntime } from "../src/pipeline_v2_coordinator.ts";
 // Compile battery.
 // ---------------------------------------------------------------------------
 
+import { V2_PREPARED_PROFILE_EPOCH } from "./helpers/profile_epoch_fixture.ts";
 function pipelineYaml(taskPort: string): string {
   return `
 schema_version: 2
@@ -526,6 +527,7 @@ async function stageTaskBoundary(
       inputBindings: [{ id: "task", path: join(harness.sources, "task.md") }] as RunInputBinding[],
       sink: fresh as never,
       runtime: fake.runtime,
+      profileEpoch: V2_PREPARED_PROFILE_EPOCH,
     },
     CONTROL,
   );

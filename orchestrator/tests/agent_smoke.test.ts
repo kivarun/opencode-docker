@@ -55,8 +55,8 @@ const LAUNCHER_SECRET = "dhc_launcher_secret_value";
 const ADMIN_SECRET = "dha_admin_secret_value";
 const STATE_PATH = "/host/orchestrator-state";
 
-const PROFILE_IMAGE = "gitreg.example/opencode-docker/base:latest";
-const ALT_IMAGE = "alt-image.example/agent:2";
+const PROFILE_IMAGE = "gitreg.example/opencode-docker/base@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+const ALT_IMAGE = "alt-image.example/agent@sha256:0f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 const OPENCODE_CONFIG = '{"$schema":"https://opencode.ai/config.json","model":"test/model"}';
 
 const BASE_ENV = {
@@ -223,22 +223,28 @@ const PROMPT_BODY = [
 const BUNDLE_PROMPT = PROMPT_BODY;
 
 const PROFILE_BODY = [
-  "schema_version: 1",
+  "schema_version: 2",
   `image: ${PROFILE_IMAGE}`,
-  "opencode_config: opencode/default.json",
+  "opencode_config:",
+  "  path: opencode/default.json",
+  "  secrets: env_only",
   "env:",
   "  LLM_SERVER:",
   "    from_env: LLM_SERVER",
   "    required: true",
+  "    secret: false",
   "  LLM_KEY:",
   "    from_env: LLM_KEY",
   "    required: true",
+  "    secret: true",
   "  OPENCODE_ENABLE_EXA:",
   "    from_env: OPENCODE_ENABLE_EXA",
   "    required: false",
+  "    secret: false",
   "  OPENCODE_EXPERIMENTAL_LSP_TOOL:",
   "    from_env: OPENCODE_EXPERIMENTAL_LSP_TOOL",
   "    required: false",
+  "    secret: false",
   "",
 ].join("\n");
 
@@ -1883,13 +1889,16 @@ test("38. profile with control destination: fails before any session is created"
     await writeFile(
       dirs.profileFile,
       [
-        "schema_version: 1",
+        "schema_version: 2",
         `image: ${PROFILE_IMAGE}`,
-        "opencode_config: opencode/default.json",
+        "opencode_config:",
+        "  path: opencode/default.json",
+        "  secrets: env_only",
         "env:",
         "  OPENCODE_CONFIG_CONTENT:",
         "    from_env: LLM_SERVER",
         "    required: false",
+        "    secret: false",
         "",
       ].join("\n"),
     );

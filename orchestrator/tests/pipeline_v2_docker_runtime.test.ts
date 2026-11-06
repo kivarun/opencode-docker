@@ -161,17 +161,29 @@ async function makeProfiles(): Promise<Map<string, ResolvedProfile>> {
   const profiles = new Map<string, ResolvedProfile>();
   profiles.set("coder", {
     profileName: "coder",
-    image: "ghcr.io/example/coder:1",
-    opencodeConfigPath: "/cfg/coder.json",
+    image: "ghcr.io/example/coder@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
     opencodeConfigContent: JSON.stringify({ model: "coder-model" }),
     env: { MODEL_API_KEY: "sk-coder-secret", SHARED_SETTING: "shared-value-1" },
+    identity: {
+      id: "coder",
+      image_ref: "ghcr.io/example/coder@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      config_policy: "env_only",
+      config_sha256: "c".repeat(64),
+      env_bindings: [],
+    },
   });
   profiles.set("architect", {
     profileName: "architect",
-    image: "ghcr.io/example/architect:1",
-    opencodeConfigPath: "/cfg/architect.json",
+    image: "ghcr.io/example/architect@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
     opencodeConfigContent: JSON.stringify({ model: "architect-model" }),
     env: { MODEL_API_KEY: "sk-architect-secret", ARCH_ONLY: "arch-only-value" },
+    identity: {
+      id: "architect",
+      image_ref: "ghcr.io/example/architect@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      config_policy: "env_only",
+      config_sha256: "c".repeat(64),
+      env_bindings: [],
+    },
   });
   return profiles;
 }
@@ -402,7 +414,7 @@ function pullCall(calls: RecordedCall[]): RecordedCall {
 }
 
 const CODER_RUN_BODY = {
-  image: "ghcr.io/example/coder:1",
+  image: "ghcr.io/example/coder@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   entrypoint: "opencode",
   workdir: "/workspace",
   command: ["run", "--format", "json", "--auto", INSTRUCTION],
@@ -457,7 +469,7 @@ test("2. profile snapshots are immune to mutations of the source map and profile
     // factory snapshot was taken
     setup_.profiles.delete("architect");
     const coderProfile = setup_.profiles.get("coder")!;
-    coderProfile.image = "ghcr.io/evil/image:9";
+    coderProfile.image = "ghcr.io/evil/image@sha256:0f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
     coderProfile.opencodeConfigContent = "EVIL-CONFIG";
     coderProfile.env.MODEL_API_KEY = "EVIL-SECRET";
     coderProfile.env.SHARED_SETTING = "EVIL-SHARED";
@@ -715,7 +727,7 @@ test("7. the pull uses the exact argv and the Execution bearer only", async () =
   try {
     const driven = await driveCoderActivation(setup_);
     const pull = pullCall(driven.calls);
-    expect(pull.args).toEqual(["pull", "--endpoint", SOCKET, "ghcr.io/example/coder:1"]);
+    expect(pull.args).toEqual(["pull", "--endpoint", SOCKET, "ghcr.io/example/coder@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]);
     expect(pull.env).toEqual({ DOCKER_HELPER_SESSION_TOKEN: "dhc_1" });
     expect(pull.stdio).toBe("inherit");
     expect(pull.opts).toBeUndefined();
@@ -1107,11 +1119,11 @@ test("25. different agent states use their own image, env and config", async () 
       environment: Record<string, unknown>;
       mounts: Array<Record<string, unknown>>;
     };
-    expect(coderBody.image).toBe("ghcr.io/example/coder:1");
+    expect(coderBody.image).toBe("ghcr.io/example/coder@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
     expect(coderBody.environment["OPENCODE_CONFIG_CONTENT"]).toBe(JSON.stringify({ model: "coder-model" }));
     expect(coderBody.environment["MODEL_API_KEY"]).toBe("sk-coder-secret");
     expect(coderBody.environment["SHARED_SETTING"]).toBe("shared-value-1");
-    expect(architectBody.image).toBe("ghcr.io/example/architect:1");
+    expect(architectBody.image).toBe("ghcr.io/example/architect@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
     expect(architectBody.environment["OPENCODE_CONFIG_CONTENT"]).toBe(JSON.stringify({ model: "architect-model" }));
     expect(architectBody.environment["MODEL_API_KEY"]).toBe("sk-architect-secret");
     expect(architectBody.environment["ARCH_ONLY"]).toBe("arch-only-value");
@@ -1662,10 +1674,16 @@ test("42. mutations of the profile map and the projection object after the facto
     setup_.profiles.delete("coder");
     setup_.profiles.set("coder", {
       profileName: "coder",
-      image: "ghcr.io/evil/image:9",
-      opencodeConfigPath: "/cfg/evil.json",
+      image: "ghcr.io/evil/image@sha256:0f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
       opencodeConfigContent: "EVIL",
       env: { MODEL_API_KEY: "EVIL" },
+      identity: {
+        id: "coder",
+        image_ref: "ghcr.io/evil/image@sha256:0f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        config_policy: "env_only",
+        config_sha256: "c".repeat(64),
+        env_bindings: [],
+      },
     });
     await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
     const call = fake.calls[0]!;

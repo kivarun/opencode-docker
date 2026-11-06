@@ -41,6 +41,7 @@ import { PipelineV2RunPlanConstructionError } from "../src/pipeline_v2_run_plan_
 import { verifyPipelineV2RunPlanCandidateForAcceptance } from "../src/pipeline_v2_run_plan_acceptance.ts";
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
 import { PipelineV2RunPlanControllerError } from "../src/pipeline_v2_run_plan_controller_internal.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -362,7 +363,7 @@ async function setupPlanningPrefix(
       protected: entry.protected,
       digest: entry.digest,
     })),
-    projectProvenance: preparedProjectBinding019,
+    projectProvenance: preparedProjectBinding019, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   const records = await playPlanningExecution(recording, pipeline, runInputs, {
     stateId: "architect",

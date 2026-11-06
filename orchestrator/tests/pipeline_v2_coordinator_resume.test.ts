@@ -52,6 +52,8 @@ import { compiledPipelineV2RunPlanStageFor } from "../src/pipeline_v2_run_plan_c
 import { countingIo, faultIo, type IoCounts } from "./state_io_test_helpers.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 import type { PipelineStateIo } from "../src/pipeline_state_store.ts";
+import { V2_PREPARED_PROFILE_EPOCH, V2_PREPARED_PROFILE_EPOCH_BINDING } from "./helpers/profile_epoch_fixture.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -606,7 +608,7 @@ async function prefixCreateRun(harness: ResumeHarness): Promise<RunInputsSnapsho
       protected: entry.protected,
       digest: entry.digest,
     })),
-    projectProvenance: preparedProjectBinding007,
+    projectProvenance: preparedProjectBinding007, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   return runInputs;
 }
@@ -1113,6 +1115,7 @@ test("5. uninterrupted run and pause/resume produce equivalent durable states", 
     inputBindings: bindingsFor(dirs, pipeline) as readonly RunInputBinding[],
     sink: new RecordingSink(freshA),
     runtime: fakeA.runtime,
+    profileEpoch: V2_PREPARED_PROFILE_EPOCH,
   }, NEUTRAL_CONTROL);
   if (!resultA.ok || "waiting" in resultA || "planReady" in resultA) {
     throw new Error("variant A failed");
@@ -1131,7 +1134,7 @@ test("5. uninterrupted run and pause/resume produce equivalent durable states", 
     runId: "resume-run",
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    projectProvenance: preparedProjectBinding008,
+    projectProvenance: preparedProjectBinding008, profileEpoch: V2_PREPARED_PROFILE_EPOCH_BINDING,
   });
   const acceptedB: AcceptedStateOutput[] = [];
   await prefixAgentStep(
@@ -1770,7 +1773,7 @@ test("17. in-flight, unbound, publishing, final, missing, mismatched and poisone
       protected: entry.protected,
       digest: entry.digest,
     })),
-    projectProvenance: preparedProjectBinding009,
+    projectProvenance: preparedProjectBinding009, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   const poisonError = await poisonedRecording
     .dispatch({ kind: "start_agent_execution", stateId: "coder", profile: "coder", executionRole: "planning" })
@@ -1973,7 +1976,7 @@ test("the reducer's state schema stays v6 and resume never dispatches create_run
   expect(allCommands.filter((command) => command.kind === "create_run")).toHaveLength(1);
   expect(allCommands.filter((command) => String(command.kind).startsWith("wait_"))).toHaveLength(0);
   const durable = await readDurableState(harness);
-  expect(durable.schema_version).toBe(11);
+  expect(durable.schema_version).toBe(12);
 });
 
 test("a malformed durable state document refuses the reopen without side effects", async () => {

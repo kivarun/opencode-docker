@@ -57,6 +57,13 @@ import {
   type RunInputsSnapshot,
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
+import { loadAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
+const EPOCH_BASE_ENV: Readonly<Record<string, string>> = {
+  HOME: "/home/u",
+  CODER_SOURCE_VAR_1: "coder-secret",
+  ARCHITECT_SOURCE_VAR_1: "architect-secret",
+};
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -241,13 +248,16 @@ async function makeHarness(prefix: string, runId: string = RUN_ID): Promise<Harn
     await writeFile(
       join(configRoot, "profiles", `${profile}.yaml`),
       [
-        "schema_version: 1",
-        "image: ghcr.io/example/worker:1",
-        `opencode_config: opencode/${profile}.json`,
+        "schema_version: 2",
+        "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "opencode_config:",
+        `  path: opencode/${profile}.json`,
+        "  secrets: env_only",
         "env:",
         `  MODEL_API_KEY:`,
         `    from_env: ${profile.toUpperCase()}_SOURCE_VAR_1`,
         "    required: true",
+        "    secret: false",
         "",
       ].join("\n"),
     );
@@ -403,6 +413,12 @@ async function driveTwoCyclePrefix(harness: Harness, runId: string = RUN_ID): Pr
       digest: entry.digest,
     })),
     projectProvenance: preparedProjectBinding033,
+    profileEpoch: await loadAndPublishRunProfileEpoch({
+      runRoot,
+      pipeline,
+      configRoot: harness.configRoot,
+      baseEnv: EPOCH_BASE_ENV,
+    }),
   } as never);
   let accepted: AcceptedStateOutput[] = [];
   accepted = await runPlanningActivation(pipeline, runInputs, accepted, rec as never, "architect", "architect", "plan", 1, P1_PROPOSAL);
@@ -1179,6 +1195,7 @@ test("the runner export surface gains exactly one new function key", async () =>
     "resumePipelineV2PlanningRunPlan",
     "revisePipelineV2Task",
     "runPipelineV2",
+    "uniqueProfileNames",
   ]);
   expect(typeof namespace["resumePipelineV2PlanningRunPlan"]).toBe("function");
 }, 15000);

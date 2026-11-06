@@ -40,6 +40,8 @@ import { pipelineV2RunStatePath } from "../src/pipeline_v2_state_store.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
 import { createHash } from "node:crypto";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
+import { loadAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -358,13 +360,16 @@ async function writeProfile(configRoot: string, name: string, sourceVar: string)
   await writeFile(
     join(configRoot, "profiles", `${name}.yaml`),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      `opencode_config: opencode/${name}.json`,
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+      `  path: opencode/${name}.json`,
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       `    from_env: ${sourceVar}`,
       "    required: true",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -439,6 +444,7 @@ async function buildPrefix(
   harness: Harness,
   pipeline: ResolvedPipelineV2,
   runId: string,
+  epochEnv: Readonly<Record<string, string | undefined>> = DEFAULT_BASE_ENV,
 ): Promise<PrefixRunner> {
   clockValue = 0;
   const runRoot = harness.runRoot(runId);
@@ -464,6 +470,12 @@ async function buildPrefix(
       digest: entry.digest,
     })),
     projectProvenance: preparedProjectBinding034,
+    profileEpoch: await loadAndPublishRunProfileEpoch({
+      runRoot,
+      pipeline,
+      configRoot: harness.configRoot,
+      baseEnv: epochEnv,
+    }),
   });
   return { pipeline, runId, runRoot, sink, runInputs, accepted: [] };
 }

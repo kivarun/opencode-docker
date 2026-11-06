@@ -66,6 +66,8 @@ import {
 } from "../src/pipeline_v2_runtime.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+import { V2_PREPARED_PROFILE_EPOCH } from "./helpers/profile_epoch_fixture.ts";
+import { prepareAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
 type PlanReadyPolicy = { readonly stage_position: number; readonly initial_budget: number };
 
 const INITIAL_BUDGET = 2;
@@ -298,13 +300,16 @@ async function makeAutoHarness(
   await writeFile(
     join(configRoot, "profiles", "coder.yaml"),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      "opencode_config: opencode/coder.json",
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+      "  path: opencode/coder.json",
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       "    from_env: CODER_SOURCE_VAR_1",
       "    required: true",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -581,6 +586,12 @@ async function freshPlanReady(
       inputBindings: await bindingsFor(harness),
       sink: recording as never,
       runtime: fake.runtime,
+      profileEpoch: await prepareAndPublishRunProfileEpoch({
+        runRoot: harness.runRoot,
+        pipeline,
+        configRoot: harness.configRoot,
+        baseEnv: { HOME: "/home/u", XDG_CONFIG_HOME: "/cfg", CODER_SOURCE_VAR_1: "coder-secret" },
+      }),
     },
     CONTROL,
   );

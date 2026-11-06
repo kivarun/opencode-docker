@@ -2441,23 +2441,29 @@ configuration root:
   opencode/<configuration files>
 ```
 
-The minimal schema (schema_version 1) is:
+The minimal schema (schema_version 2 — the only supported version; schema v1
+is rejected without migration) is:
 
 ```yaml
-schema_version: 1
-image: ghcr.io/kivarun/opencode-docker/base:latest
-opencode_config: opencode/default.jsonc
+schema_version: 2
+image: ghcr.io/kivarun/opencode-docker/base@sha256:<64 lowercase hex>
+opencode_config:
+  path: opencode/default.jsonc
+  secrets: env_only
 
 env:
   LLM_SERVER:
     from_env: LLM_SERVER
     required: true
+    secret: false
   LLM_KEY:
     from_env: LLM_KEY
     required: true
+    secret: true
   OPENCODE_ENABLE_EXA:
     from_env: OPENCODE_ENABLE_EXA
     required: false
+    secret: false
 ```
 
 Only `.yaml` profile files are supported; JSON and `.yml` are not accepted as
@@ -2469,7 +2475,21 @@ Implemented rules:
 - the profile file and the referenced OpenCode configuration must be regular
   files that resolve inside the configuration root; traversal and symlink
   escape are rejected;
-- unknown and missing fields are rejected; `schema_version` must be 1;
+- unknown and missing fields are rejected; `schema_version` must be 2;
+- `opencode_config` is an exact two-key mapping: `path` (the bundle-relative
+  configuration file) and `secrets`, which accepts only the single value
+  `env_only` — the trusted-operator assertion that the configuration carries
+  no literal credentials. A false assertion is explicitly out of contract;
+  the orchestrator does not semantically parse the configuration to detect
+  credentials;
+- `image` must be a digest-pinned reference ending in
+  `@sha256:<64 lowercase hex>` (a tag may be kept before the digest); a
+  tag-only image, an image ID without a repository, whitespace/control
+  characters and a malformed digest are rejected. The string is stored as
+  identity without rewriting;
+- every env binding is an exact three-key mapping `from_env`, `required`,
+  `secret`; `secret: true` bindings never contribute a value digest to the
+  profile epoch (below);
 - `env` bindings are exact: destination and source must be valid environment
   variable names, only `from_env` and `required` are accepted, there is no
   ambient inheritance and no wildcard forwarding;
@@ -2504,6 +2524,47 @@ Implemented rules:
 
 Profile-selected file projections, resource limits, and profile inheritance
 are not implemented yet.
+
+## Durable run-wide profile epoch (implemented)
+
+Every pipeline v2 run binds one immutable, content-free profile epoch:
+
+- one `loadProfile` call per unique agent-state profile builds a
+  deep-frozen `ResolvedProfile` carrying the runtime fields (image, OpenCode
+  configuration content, resolved environment) and the content-free identity
+  projection (profile id, image reference, config policy, env declarations,
+  non-secret value digests). The OpenCode configuration is read once; the
+  manifest digest and `OPENCODE_CONFIG_CONTENT` derive from that single
+  string; the environment is resolved once;
+- the epoch manifest is published at the fixed location
+  `<runRoot>/profile-epoch.json` (canonical JSON, mode 0600, immutable
+  publication through the shared substrate; exact-retry adoption; typed
+  `artifact_missing`/`artifact_modified` refusals; zero repair). Profiles
+  appear in the pipeline's `uniqueProfileNames` order; env bindings are
+  destination-sorted; secret bindings never carry a value digest; an
+  optional non-secret binding without a resolved value carries no digest;
+  no host paths, config paths or secret values appear anywhere in the
+  manifest;
+- three separated digest domains: `pipeline-v2-profile-config\0` (OpenCode
+  configuration bytes), `pipeline-v2-profile-env-value\0` (non-secret
+  resolved values), and `pipeline-v2-profile-epoch\0` over the canonical
+  manifest JSON (the durable binding digest);
+- durable state schema v12 stores the mandatory binding
+  `profile_epoch {digest, profile_count}` atomically with `create_run`;
+  schema v11 is rejected with the established no-migration message and is
+  never rewritten;
+- the fresh runner publishes and verifies the artifact before `create_run`;
+  every mutating existing-run flow (`resume`, `resume-plan`,
+  `continue-stage`, `revise-task`, recovery that starts a new activation)
+  recomputes the epoch from the freshly loaded profiles — the same loaded
+  snapshot the runtime factory receives — and refuses a drift with the typed
+  reason `profile_epoch_mismatch` before Launcher auth, Sessions, helper
+  calls, workers and any durable write;
+- secret rotation never changes the epoch (secrets never enter it); a
+  missing required secret remains a profile-load failure; config-root
+  relocation and config-file renames with identical content continue;
+  read-only `inspect`/`events`/`logs` observation never loads profiles and
+  never starts a worker.
 
 ## Adapter-owned worker operations (implemented)
 

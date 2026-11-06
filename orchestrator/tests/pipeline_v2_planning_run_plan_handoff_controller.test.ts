@@ -52,6 +52,7 @@ import {
   productionPlanningRunPlanHandoffOps,
   type PipelineV2PlanningRunPlanHandoffOps,
 } from "../src/pipeline_v2_planning_run_plan_handoff_controller_internal.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -255,7 +256,7 @@ async function buildPrefix(): Promise<Prefix> {
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-   projectProvenance: preparedProjectBinding020 });
+   projectProvenance: preparedProjectBinding020, profileEpoch: V2_PROFILE_EPOCH_BINDING });
     const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
     await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of [
@@ -1527,7 +1528,7 @@ async function buildCycledPrefix(cycles: number): Promise<Prefix> {
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-   projectProvenance: preparedProjectBinding021 });
+   projectProvenance: preparedProjectBinding021, profileEpoch: V2_PROFILE_EPOCH_BINDING });
     const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
     await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of [
@@ -1923,7 +1924,7 @@ async function buildTwoStagePrefix(stageCount: 2 | 3 | 4): Promise<Omit<Prefix, 
       runId: RUN_ID,
       pipeline: pipelineV2RunPipelineIdentity(pipeline1),
       inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-   projectProvenance: preparedProjectBinding022 });
+   projectProvenance: preparedProjectBinding022, profileEpoch: V2_PROFILE_EPOCH_BINDING });
     const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
     await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });
     for (const command of [
@@ -3141,7 +3142,7 @@ async function buildInitialPrefix(): Promise<Prefix> {
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(pipeline1),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    projectProvenance: preparedProjectBinding023,
+    projectProvenance: preparedProjectBinding023, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   const prep1 = await prepareActivationData(pipeline1, runInputs, [], "architect", 1);
   await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "architect", executionRole: "planning" });

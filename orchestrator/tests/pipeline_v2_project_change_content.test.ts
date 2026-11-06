@@ -45,6 +45,7 @@ import {
   realProjectFileStreamIo,
   type ProjectFileStreamIo,
 } from "../src/pipeline_v2_project_stream_internal.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const io = realProjectWorkspaceVerifyIo;
 
@@ -172,7 +173,7 @@ async function buildFinalizedRun(
     runId,
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: inputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    projectProvenance: prepared.binding,
+    projectProvenance: prepared.binding, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   if (options.outcome !== "failed") {
     await sink.dispatch({ kind: "start_agent_execution", stateId: "work", profile: "coder", executionRole: "planning" });

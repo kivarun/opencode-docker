@@ -47,6 +47,7 @@ import type { WorkerLogCapture } from "../src/worker_operation.ts";
 import type { PipelineV2WorkerLogState } from "../src/pipeline_v2_state.ts";
 import { parseWorkerLogArtifact } from "../src/pipeline_v2_worker_log.ts";
 import { publishPipelineV2WorkerLog } from "../src/pipeline_v2_worker_log_store.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -689,7 +690,7 @@ async function prefixCreateRun(harness: Harness): Promise<RunInputsSnapshot> {
       protected: entry.protected,
       digest: entry.digest,
     })),
-    projectProvenance: preparedProjectBinding026,
+    projectProvenance: preparedProjectBinding026, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   return runInputs;
 }

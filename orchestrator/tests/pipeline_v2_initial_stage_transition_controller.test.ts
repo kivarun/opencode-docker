@@ -43,6 +43,7 @@ import { preparePipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_c
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
 import { preparePlanRevisionManifest, prepareTaskRevisionManifest } from "../src/pipeline_v2_run_plan_manifests.ts";
 import { loadPipelineV2 as loadPipelineV2Alias } from "../src/pipeline_v2.ts";
+const V2_PROFILE_EPOCH_BINDING = { digest: "d".repeat(64), profile_count: 1 };
 
 const V2_PROJECT_PROVENANCE_BINDING = { digest: "e".repeat(64), entry_count: 1, copy_policy_version: 1 as const };
 
@@ -558,7 +559,7 @@ async function acceptedBoundary(): Promise<{
     runId: RUN_ID,
     pipeline: pipelineV2RunPipelineIdentity(pipeline),
     inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-    projectProvenance: preparedProjectBinding010,
+    projectProvenance: preparedProjectBinding010, profileEpoch: V2_PROFILE_EPOCH_BINDING,
   });
   await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1);
   const taskDigest = runInputs.inputs[0]!.digest;
@@ -733,7 +734,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-     projectProvenance: preparedProjectBinding011 });
+     projectProvenance: preparedProjectBinding011, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, {}, "plan");
       await recording.dispatch({
         kind: "transition_committed",
@@ -1006,7 +1007,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-     projectProvenance: preparedProjectBinding012 });
+     projectProvenance: preparedProjectBinding012, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
       for (const command of [
         { kind: "agent_data_prepared" },
@@ -1062,7 +1063,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-     projectProvenance: preparedProjectBinding013 });
+     projectProvenance: preparedProjectBinding013, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, {}, "plan");
       const commandsBefore = recording.commands.length;
       const taskDigest = runInputs.inputs[0]!.digest;
@@ -1102,7 +1103,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-     projectProvenance: preparedProjectBinding014 });
+     projectProvenance: preparedProjectBinding014, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       await recording.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
       await recording.dispatch({ kind: "agent_data_prepared" });
       const taskDigest = runInputs.inputs[0]!.digest;
@@ -1214,7 +1215,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-     projectProvenance: preparedProjectBinding015 });
+     projectProvenance: preparedProjectBinding015, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1);
       const taskDigest = runInputs.inputs[0]!.digest;
       const { accepted } = await acceptInitialPlan(pipeline, fixture, recording, taskDigest);
@@ -1272,7 +1273,7 @@ describe("openPipelineV2InitialStageTransition", () => {
         runId: RUN_ID,
         pipeline: pipelineV2RunPipelineIdentity(pipeline),
         inputs: runInputs.inputs.map((entry) => ({ id: entry.id, type: entry.type, protected: entry.protected, digest: entry.digest })),
-     projectProvenance: preparedProjectBinding016 });
+     projectProvenance: preparedProjectBinding016, profileEpoch: V2_PROFILE_EPOCH_BINDING });
       await runPlanningActivation(pipeline, runInputs, [], recording, "architect", 1, PROPOSAL_TWO_STAGES, "plan");
       const taskDigest = runInputs.inputs[0]!.digest;
       const taskA = prepareTaskRevisionManifest({ schema_version: 1, kind: "task_revision", run_id: RUN_ID, task_id: "task-a", revision: 1, previous_sha256: null, origin: "planning_proposal", body: "Body A" });

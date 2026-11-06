@@ -41,6 +41,8 @@ import { ensurePipelineV2StageIteration } from "../src/pipeline_v2_stage_iterati
 import { restorePipelineV2AcceptedRunPlan } from "../src/pipeline_v2_run_plan_restore.ts";
 import { startRoleArgs } from "./pipeline_v2_state_fixtures.ts";
 
+import { V2_PREPARED_PROFILE_EPOCH } from "./helpers/profile_epoch_fixture.ts";
+import { prepareAndPublishRunProfileEpoch } from "./helpers/profile_epoch_fixture.ts";
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const V2_BUNDLE = join(REPO_ROOT, "pipelines", "default-v2");
 const V1_BUNDLE = join(REPO_ROOT, "pipelines", "default");
@@ -471,13 +473,16 @@ test("e2e: the tracked bundled v2 default runs to terminal success in one comman
     writeFileSync(
       join(configRoot, "profiles", "default.yaml"),
       [
-        "schema_version: 1",
-        "image: ghcr.io/example/worker:1",
-        "opencode_config: opencode/default.json",
+        "schema_version: 2",
+        "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "opencode_config:",
+        "  path: opencode/default.json",
+        "  secrets: env_only",
         "env:",
         "  MODEL_API_KEY:",
         "    from_env: DEFAULT_SOURCE_VAR_1",
         "    required: true",
+        "    secret: true",
         "",
       ].join("\n"),
     );
@@ -763,13 +768,16 @@ async function buildRestartWindow(
   writeFileSync(
     join(configRoot, "profiles", "default.yaml"),
     [
-      "schema_version: 1",
-      "image: ghcr.io/example/worker:1",
-      "opencode_config: opencode/default.json",
+      "schema_version: 2",
+      "image: ghcr.io/example/worker@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "opencode_config:",
+      "  path: opencode/default.json",
+      "  secrets: env_only",
       "env:",
       "  MODEL_API_KEY:",
       "    from_env: DEFAULT_SOURCE_VAR_1",
       "    required: true",
+      "    secret: true",
       "",
     ].join("\n"),
   );
@@ -791,6 +799,12 @@ async function buildRestartWindow(
       inputBindings: [{ id: "task", path: taskPath }],
       sink: windowSink(stateRoot, runId) as never,
       runtime: windowRuntime(),
+      profileEpoch: await prepareAndPublishRunProfileEpoch({
+        runRoot,
+        pipeline,
+        configRoot,
+        baseEnv: { HOME: "/home/u", DEFAULT_SOURCE_VAR_1: "default-secret" },
+      }),
     },
     { currentSignal: () => null, freezeSignal: () => null },
   );
