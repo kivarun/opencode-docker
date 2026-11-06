@@ -91,7 +91,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | Order | Increment | Status |
 | ---: | --- | --- |
 | 1 | Durable stage activation context | Complete (b63c4cf; CI 42043441341) |
-| 2 | Durable profile/model epoch | Planned |
+| 2 | Durable profile/model epoch | Complete (8e304bf; CI 42242433550 — build evidence, not test evidence) |
 | 3 | Hard read-only reviewer | Planned |
 | 4 | Separate development pipeline bundle | Planned |
 | 5 | Real dogfood UAT with revision and Apply | Planned |
@@ -235,6 +235,25 @@ activation-specific. Either choice must make a post-restart execution's effectiv
 profile identity provable and must reject silent substitution with a typed
 failure. Explicit profile rebinding is not part of this increment unless
 separately designed.
+
+### Implementation note (2026-11-06): Complete as the durable run-wide profile epoch
+
+The run-wide choice is implemented and documented (`AGENTS.md`, the durable
+run-wide profile epoch bullet; `docs/orchestration-workflow.md`). One
+`loadProfile` call per unique agent-state profile produces a deep-frozen
+`ResolvedProfile` whose content-free identity projection builds the epoch
+manifest (`pipeline-v2-profile-config\0`, `pipeline-v2-profile-env-value\0`
+and `pipeline-v2-profile-epoch\0` digest domains; secrets never produce a
+value digest, presence or length). The manifest is published once at
+`<runRoot>/profile-epoch.json` and bound atomically into durable state
+(schema v12, mandatory `profile_epoch {digest, profile_count}`). Every
+mutating existing-run flow recomputes the epoch from the same loaded snapshot
+the runtime factory receives and refuses drift with the typed
+`profile_epoch_mismatch` before Launcher auth, Sessions, helper calls,
+workers or any durable write. Secret rotation never changes the epoch;
+profile rebinding and migrations stay out of scope. The plan was marked
+complete only after the production commit `8e304bf` and its CI run
+(`images`, success — build evidence, not test evidence).
 
 ## Increment 3: hard read-only reviewer
 
