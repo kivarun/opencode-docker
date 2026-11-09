@@ -567,7 +567,9 @@ states:
     } catch (cause) {
       terminal = (cause as Error).message;
     }
-    expect(terminal).toContain("terminal states carry no execution role");
+    // the fail-closed order: a non-agent state is rejected before any role
+    // is consulted
+    expect(terminal).toContain("not a declared agent state");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -592,10 +594,27 @@ test("R2. the resolver resolves orchestration-less pipelines to the established 
     );
     const pipeline = await loadFrom(root, yaml);
     expect(pipeline.orchestration).toBeUndefined();
-    // No orchestration section: no stage policy can exist, so every agent
-    // state keeps the established read-write workspace (a structural fact,
-    // not a guess).
+    // No orchestration section: no stage policy can exist, so every
+    // declared agent state keeps the established read-write workspace (a
+    // structural fact, not a guess).
     expect(compiledWorkspaceAccessFor(pipeline, "dev")).toBe("read_write");
+
+    // The read-write resolution is still fail-closed: unknown and
+    // non-agent states are rejected even without orchestration metadata.
+    let unknown = "";
+    try {
+      compiledWorkspaceAccessFor(pipeline, "nope");
+    } catch (cause) {
+      unknown = (cause as Error).message;
+    }
+    expect(unknown).toContain("not declared by the pipeline");
+    let terminal = "";
+    try {
+      compiledWorkspaceAccessFor(pipeline, "done");
+    } catch (cause) {
+      terminal = (cause as Error).message;
+    }
+    expect(terminal).toContain("not a declared agent state");
 
     const trusted = await loadFrom(root, stageRoleYaml("read_only"));
     let forged = "";

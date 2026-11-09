@@ -400,16 +400,17 @@ export class PipelineV2OrchestrationError extends Error {
 
 /**
  * The single effective-policy owner of the workspace access of one agent
- * state: given the trusted compiled pipeline and a safe state id it finds
- * the exact compiled execution-role entry, requires agent semantics (the
- * state must be declared and of type `agent`), applies the one default
- * `absent -> "read_write"` for stage roles, and returns the effective
- * `"read_write" | "read_only"` value. Planning roles carry no workspace
- * policy and keep the established read-write planning workspace; a bundle
- * without an orchestration section declares no policy surface at all, so
- * every agent state keeps the established read-write workspace (a
- * structural fact, not a guess — the field cannot exist without the
- * section). The resolver reads nothing but the normalized compiled
+ * state: given the trusted compiled pipeline and a safe state id it first
+ * requires agent semantics (the state must be declared and of type
+ * `agent` — fail-closed before any access is resolved), then finds the
+ * exact compiled execution-role entry and applies the one default
+ * `absent -> "read_write"` for stage roles. Planning roles carry no
+ * workspace policy and keep the established read-write planning workspace;
+ * a bundle without an orchestration section declares no policy surface at
+ * all, so every declared agent state keeps the established read-write
+ * workspace (a structural fact, not a guess — the field cannot exist
+ * without the section, and unknown or non-agent states are rejected even
+ * there). The resolver reads nothing but the normalized compiled
  * metadata — no profile, no prompt, no durable state, no environment, no
  * caller options — and never mutates the pipeline. The activation layout
  * planner, the data plane and the runtime adapters all resolve the
@@ -431,6 +432,21 @@ export function compiledWorkspaceAccessFor(
     );
   }
   const orchestration = pipeline.orchestration;
+  // The state must exist and be an agent state before any access is
+  // resolved — including the orchestration-less read-write case, which is
+  // a structural fact about a declared agent state, not a shortcut for
+  // arbitrary state ids.
+  const state = pipeline.states.find((candidate) => candidate.id === stateId);
+  if (state === undefined) {
+    throw new PipelineV2OrchestrationError(
+      `state ${JSON.stringify(stateId)} is not declared by the pipeline`,
+    );
+  }
+  if (state.type !== "agent") {
+    throw new PipelineV2OrchestrationError(
+      `state ${JSON.stringify(stateId)} is not a declared agent state; the workspace access policy applies only to agent states`,
+    );
+  }
   if (orchestration === undefined) {
     // No orchestration section: no stage policy can exist, so every agent
     // state keeps the established read-write workspace.
@@ -444,11 +460,8 @@ export function compiledWorkspaceAccessFor(
     }
   }
   if (roleEntry === undefined) {
-    const declared = pipeline.states.find((state) => state.id === stateId);
     throw new PipelineV2OrchestrationError(
-      declared === undefined
-        ? `state ${JSON.stringify(stateId)} is not declared by the pipeline`
-        : `state ${JSON.stringify(stateId)} is a ${declared.type} state; terminal states carry no execution role`,
+      `state ${JSON.stringify(stateId)} is a ${state.type} state; terminal states carry no execution role`,
     );
   }
   if (roleEntry.role === "planning") {
@@ -459,12 +472,6 @@ export function compiledWorkspaceAccessFor(
   if (roleEntry.role !== "stage") {
     throw new PipelineV2OrchestrationError(
       `state ${JSON.stringify(stateId)} carries the ${JSON.stringify(roleEntry.role)} role; the workspace access policy applies only to planning and stage agent states`,
-    );
-  }
-  const state = pipeline.states.find((candidate) => candidate.id === stateId);
-  if (state === undefined || state.type !== "agent") {
-    throw new PipelineV2OrchestrationError(
-      `state ${JSON.stringify(stateId)} is not a declared agent state; the workspace access policy applies only to agent states`,
     );
   }
   // The single default: absence stays absence in the compiled metadata and
