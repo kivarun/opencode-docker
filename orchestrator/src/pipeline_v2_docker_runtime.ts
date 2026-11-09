@@ -147,9 +147,11 @@ import {
   ACTIVATION_OUTPUTS_ROOT,
   PROJECT_MOUNT_TARGET,
   requireResolvedPipelineV2Provenance,
+  type PipelineV2WorkspaceAccess,
   type ResolvedPipelineV2,
   type ResolvedV2AgentState,
 } from "./pipeline_v2.ts";
+import { compiledWorkspaceAccessFor } from "./pipeline_v2_orchestration.ts";
 import {
   PIPELINE_V2_EXECUTION_DOCUMENT_CONTAINER_PATH,
   requirePreparedActivationForPipeline,
@@ -428,36 +430,44 @@ function activationPolicyPaths(
  * The immutable Execution Session filesystem request of one activation, in
  * the fixed order: the daemon-visible run root read-only (this explicit
  * workspace entry replaces the implicit workspace grant), the shared
- * run-owned project writable, and exactly the current activation's
- * outputs writable. No separate inputs root is requested — the read-only
- * run root already covers the activation inputs and the execution
- * document, and everything else in the run root (state.json, waits, other
- * activation trees) stays read-only as well. Every path is a
+ * run-owned project at the state's effective workspace access, and exactly
+ * the current activation's outputs writable. No separate inputs root is
+ * requested — the read-only run root already covers the activation inputs
+ * and the execution document, and everything else in the run root (state.json,
+ * waits, other activation trees) stays read-only as well. Every path is a
  * daemon-visible absolute host path derived from the proven run-root
  * projection. Built and frozen before `createChildSession` is called.
  */
-function executionFilesystemRoots(paths: {
-  readonly runRoot: string;
-  readonly project: string;
-  readonly outputs: string;
-}): readonly SessionFilesystemRoot[] {
+function executionFilesystemRoots(
+  paths: {
+    readonly runRoot: string;
+    readonly project: string;
+    readonly outputs: string;
+  },
+  projectAccess: PipelineV2WorkspaceAccess,
+): readonly SessionFilesystemRoot[] {
   const roots: SessionFilesystemRoot[] = [
     { path: paths.runRoot, access: "read_only" },
-    { path: paths.project, access: "read_write" },
+    { path: paths.project, access: projectAccess },
     { path: paths.outputs, access: "read_write" },
   ];
   return deepFreezeRoots(roots);
 }
 
 /**
- * The immutable Tool Session filesystem request: the project workspace
- * writable and nothing else — the worker's only filesystem authority. The
- * Tool Session receives no run root, no activation inputs, no activation
- * outputs and no state directory. Built and frozen before
- * `createChildSession` is called.
+ * The immutable Tool Session filesystem request: the project workspace at
+ * the state's effective workspace access and nothing else — the worker's
+ * only filesystem authority. The Tool Session receives no run root, no
+ * activation inputs, no activation outputs and no state directory, so a
+ * read-only Tool bearer can neither see nor touch the activation outputs
+ * and can never obtain a read-write exposure of the project. Built and
+ * frozen before `createChildSession` is called.
  */
-function toolFilesystemRoots(project: string): readonly SessionFilesystemRoot[] {
-  const roots: SessionFilesystemRoot[] = [{ path: project, access: "read_write" }];
+function toolFilesystemRoots(
+  project: string,
+  projectAccess: PipelineV2WorkspaceAccess,
+): readonly SessionFilesystemRoot[] {
+  const roots: SessionFilesystemRoot[] = [{ path: project, access: projectAccess }];
   return deepFreezeRoots(roots);
 }
 
@@ -486,7 +496,8 @@ function findAgentState(
  *
  * Every factory validation happens before the first helper or filesystem
  * side effect: a missing profile for any agent state rejects the factory
- * outright, and the per-state execution snapshots make later mutations of
+ * outright, and the per-state execution snapshots (profile data and the
+ * effective workspace access) make later mutations of
  * the profile map or the profile objects invisible to activations.
  */
 export function createDockerHelperPipelineV2Runtime(
@@ -526,6 +537,10 @@ export function createDockerHelperPipelineV2Runtime(
   // side effect. Profile env entries are sorted by destination so the
   // env-from argument order is stable across activations.
   const executionData = new Map<string, ProfileExecutionData>();
+  // One immutable workspace-access snapshot per agent state, captured
+  // alongside the profile execution data (see the loop below for the
+  // single-resolver discipline).
+  const workspaceAccess = new Map<string, PipelineV2WorkspaceAccess>();
   for (const state of params.pipeline.states) {
     if (state.type !== "agent") {
       continue;
@@ -573,6 +588,28 @@ export function createDockerHelperPipelineV2Runtime(
       opencodeConfigContent: profile.opencodeConfigContent,
       envEntries,
     });
+
+    // The effective workspace access of this agent state, captured once at
+    // factory creation through the single compiled policy resolver (the
+    // same capture-once discipline as the profile execution snapshots:
+    // later mutations of the pipeline object cannot change a running
+    // factory, and the policy is never recomputed between the Session
+    // creates and the worker run). Bundles without an orchestration
+    // section — the runtime factory is also exercised directly by tests —
+    // declare no policy surface at all: every agent state keeps the
+    // established read-write workspace. Stage agents resolve through the
+    // one resolver (its single default `absent -> read_write`); planning
+    // agents have no workspace-access policy and keep the established
+    // read-write workspace byte-for-byte.
+    const roleEntry = params.pipeline.orchestration?.execution_roles.find(
+      (entry) => entry.state_id === state.id,
+    );
+    workspaceAccess.set(
+      state.id,
+      roleEntry !== undefined && roleEntry.role === "stage"
+        ? compiledWorkspaceAccessFor(params.pipeline, state.id)
+        : "read_write",
+    );
   }
 
   const cli = params.cli;
@@ -974,6 +1011,15 @@ export function createDockerHelperPipelineV2Runtime(
     const projectSource = policyPaths.project;
     const inputsSource = policyPaths.inputs;
     const outputsSource = policyPaths.outputs;
+    // The state's captured workspace access decides the project mount
+    // mode only; the outputs mount stays read-write for every activation
+    // (a read-only reviewer must still create its declared outputs).
+    const workerProjectAccess = workspaceAccess.get(executionRecord.stateId);
+    if (workerProjectAccess === undefined) {
+      throw new Error(
+        `pipeline v2 agent runtime contract violated: state ${JSON.stringify(executionRecord.stateId)} has no workspace-access snapshot`,
+      );
+    }
 
     // The exact `POST /run` request body — the request-parity contract
     // with the docker-helper CLI 2.3.1: the same field set, the same
@@ -1008,7 +1054,14 @@ export function createDockerHelperPipelineV2Runtime(
       ],
       environment: sortedEnvironment,
       mounts: [
-        { source: projectSource, target: PROJECT_MOUNT_TARGET },
+        // The project mount carries `read_only: true` exactly for a
+        // read-only stage activation; the read-write baseline keeps the
+        // established mount shape without the key (byte-identical body).
+        {
+          source: projectSource,
+          target: PROJECT_MOUNT_TARGET,
+          ...(workerProjectAccess === "read_only" ? { read_only: true } : {}),
+        },
         { source: inputsSource, target: ACTIVATION_INPUTS_ROOT, read_only: true },
         { source: outputsSource, target: ACTIVATION_OUTPUTS_ROOT },
       ],
@@ -1064,21 +1117,31 @@ export function createDockerHelperPipelineV2Runtime(
     // The issuance-time filesystem request is computed from the
     // provenance-checked prepared activation and frozen before the
     // session create: the daemon-visible run root read-only (replacing
-    // the implicit workspace grant), the shared run-owned project
-    // writable, and exactly this activation's outputs writable. No
-    // separate inputs root is requested — the read-only run root already
-    // covers the activation inputs and the execution document.
+    // the implicit workspace grant), the shared run-owned project at the
+    // state's captured workspace access, and exactly this activation's
+    // outputs writable. No separate inputs root is requested — the
+    // read-only run root already covers the activation inputs and the
+    // execution document.
     const policyPaths = activationPolicyPaths(
       activation.run_root,
       activation,
       activation.state_id,
       activation.activation_index,
     );
-    const roots = executionFilesystemRoots({
-      runRoot: projection.daemonRoot,
-      project: daemonPathFor("project root", activation.project_root),
-      outputs: daemonPathFor("outputs root", activation.outputs_root),
-    });
+    const projectAccess = workspaceAccess.get(stateId);
+    if (projectAccess === undefined) {
+      throw new Error(
+        `pipeline v2 agent runtime contract violated: state ${JSON.stringify(stateId)} has no workspace-access snapshot`,
+      );
+    }
+    const roots = executionFilesystemRoots(
+      {
+        runRoot: projection.daemonRoot,
+        project: daemonPathFor("project root", activation.project_root),
+        outputs: daemonPathFor("outputs root", activation.outputs_root),
+      },
+      projectAccess,
+    );
     const record = await createSessionRecord(
       "execution",
       activation,
@@ -1151,8 +1214,19 @@ export function createDockerHelperPipelineV2Runtime(
     await requireActivationProjection(activation);
 
     // The Tool Session's only filesystem authority is its own project
-    // workspace root, writable; no other roots exist.
-    const roots = toolFilesystemRoots(daemonPathFor("project root", activation.project_root));
+    // workspace root, at the state's captured workspace access; no other
+    // roots exist (a read-only Tool bearer can neither see the activation
+    // outputs nor obtain a read-write exposure of the project).
+    const toolProjectAccess = workspaceAccess.get(stateId);
+    if (toolProjectAccess === undefined) {
+      throw new Error(
+        `pipeline v2 agent runtime contract violated: state ${JSON.stringify(stateId)} has no workspace-access snapshot`,
+      );
+    }
+    const roots = toolFilesystemRoots(
+      daemonPathFor("project root", activation.project_root),
+      toolProjectAccess,
+    );
     const record = await createSessionRecord(
       "tool",
       activation,

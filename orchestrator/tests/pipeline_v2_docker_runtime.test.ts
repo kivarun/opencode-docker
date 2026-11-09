@@ -132,11 +132,11 @@ interface Setup {
   };
 }
 
-async function writeBundle(root: string): Promise<string> {
+async function writeBundle(root: string, yaml: string = RUNTIME_YAML): Promise<string> {
   const bundle = join(root, "bundle");
   await mkdir(join(bundle, "prompts"), { recursive: true });
   await mkdir(join(bundle, "schemas"), { recursive: true });
-  await writeFile(join(bundle, "pipeline.yaml"), RUNTIME_YAML);
+  await writeFile(join(bundle, "pipeline.yaml"), yaml);
   await writeFile(join(bundle, "prompts", "coder.md"), "implement the task\n");
   await writeFile(join(bundle, "prompts", "architect.md"), "review the patch\n");
   await writeFile(
@@ -145,6 +145,103 @@ async function writeBundle(root: string): Promise<string> {
   );
   return bundle;
 }
+
+/**
+ * A mixed two-stage bundle: `coder` is a read-only stage agent, `reviewer`
+ * a read-write one; both belong to one template, so one factory proves the
+ * per-state capture produces different request documents per state.
+ */
+const MIXED_RUNTIME_YAML = `
+schema_version: 2
+entry_state: coder
+max_transitions: 20
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+  - id: specs
+    type: directory
+    protected: false
+  - id: config
+    type: json
+    protected: true
+    schema: schemas/config.schema.json
+
+outputs: []
+
+orchestration:
+  stage_templates:
+    - id: dev
+      entry_state: coder
+  execution_roles:
+    - state_id: coder
+      role: stage
+      stage_template: dev
+      workspace_access: read_only
+    - state_id: reviewer
+      role: stage
+      stage_template: dev
+
+states:
+  - id: coder
+    type: agent
+    profile: coder
+    prompt: prompts/coder.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+      - id: specs
+        source:
+          pipeline_input: specs
+      - id: config
+        source:
+          pipeline_input: config
+    outputs:
+      - id: patch
+        type: file
+      - id: scratch
+        type: directory
+    timeout_seconds: 60
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: reviewer
+
+  - id: reviewer
+    type: agent
+    profile: architect
+    prompt: prompts/architect.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: report
+        type: file
+    timeout_seconds: 30
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: done
+
+  - id: done
+    type: terminal
+    result: success
+`;
+
+/** The baseline bundle with the reviewer state explicitly declared read_write. */
+const RW_DECLARED_RUNTIME_YAML = MIXED_RUNTIME_YAML.replace(
+  `      role: stage
+      stage_template: dev
+      workspace_access: read_only
+    - state_id: reviewer`,
+  `      role: stage
+      stage_template: dev
+      workspace_access: read_write
+    - state_id: reviewer`,
+);
 
 async function writeSources(root: string): Promise<string> {
   const dir = join(root, "userdata");
@@ -226,6 +323,71 @@ async function setup(): Promise<Setup> {
       max_attempts: 1,
     },
   };
+}
+
+/** The mixed RO/RW bundle setup: prepared activations for both stage states. */
+async function setupMixed(): Promise<
+  Setup & { reviewerPrepared: PreparedActivationData; reviewerView: Setup["coderView"] }
+> {
+  const root = await mkdtemp(join(tmpdir(), "pipeline-v2-docker-runtime-"));
+  const bundle = await writeBundle(root, MIXED_RUNTIME_YAML);
+  const sources = await writeSources(root);
+  const runRoot = join(root, "run");
+  await mkdir(runRoot, { recursive: true });
+  await mkdir(join(runRoot, "project"), { mode: 0o700 });
+  await writeFile(join(runRoot, "project", "README.md"), "project seed\n");
+  const pipeline = await loadPipelineV2(bundle);
+  const snap = await snapshotRunInputs(
+    pipeline,
+    [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: join(sources, "specs") },
+      { id: "config", path: join(sources, "config.json") },
+    ],
+    runRoot,
+  );
+  const profiles = await makeProfiles();
+  const coderPrepared = await prepareActivationData(pipeline, snap, [], "coder", 1);
+  const reviewerPrepared = await prepareActivationData(pipeline, snap, [], "reviewer", 2);
+  return {
+    root,
+    runRoot,
+    bundle,
+    pipeline,
+    snap,
+    profiles,
+    coderPrepared,
+    coderView: {
+      type: "agent",
+      id: "coder",
+      profile: "coder",
+      promptPath: join(bundle, "prompts", "coder.md"),
+      promptContent: "implement the task\n",
+      timeout_seconds: 60,
+      max_attempts: 1,
+    },
+    reviewerPrepared,
+    reviewerView: {
+      type: "agent",
+      id: "reviewer",
+      profile: "architect",
+      promptPath: join(bundle, "prompts", "architect.md"),
+      promptContent: "review the patch\n",
+      timeout_seconds: 30,
+      max_attempts: 1,
+    },
+  };
+}
+
+function filesystemRootsOf(call: RecordedCall | undefined): string[] {
+  const roots: string[] = [];
+  const args = call?.args ?? [];
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === "--filesystem-root") {
+      roots.push(args[index + 1] ?? "");
+    }
+  }
+  return roots;
 }
 
 async function dispose(setup_: Setup): Promise<void> {
@@ -405,6 +567,92 @@ function runCall(calls: RecordedCall[]): RecordedCall {
   const call = calls.find((candidate) => candidate.args[0] === "run");
   expect(call).toBeDefined();
   return call as RecordedCall;
+}
+
+/** Full setup over an explicit bundle YAML (shared by the policy tests). */
+async function setupWithYaml(root: string, yaml: string): Promise<Setup> {
+  const bundle = await writeBundle(root, yaml);
+  const sources = await writeSources(root);
+  const runRoot = join(root, "run");
+  await mkdir(runRoot, { recursive: true });
+  await mkdir(join(runRoot, "project"), { mode: 0o700 });
+  await writeFile(join(runRoot, "project", "README.md"), "project seed\n");
+  const pipeline = await loadPipelineV2(bundle);
+  const snap = await snapshotRunInputs(
+    pipeline,
+    [
+      { id: "task", path: join(sources, "task.txt") },
+      { id: "specs", path: join(sources, "specs") },
+      { id: "config", path: join(sources, "config.json") },
+    ],
+    runRoot,
+  );
+  const profiles = await makeProfiles();
+  const coderPrepared = await prepareActivationData(pipeline, snap, [], "coder", 1);
+  return {
+    root,
+    runRoot,
+    bundle,
+    pipeline,
+    snap,
+    profiles,
+    coderPrepared,
+    coderView: {
+      type: "agent",
+      id: "coder",
+      profile: "coder",
+      promptPath: join(bundle, "prompts", "coder.md"),
+      promptContent: "implement the task\n",
+      timeout_seconds: 60,
+      max_attempts: 1,
+    },
+  };
+}
+
+/** One full activation (both Sessions + worker run) through one fresh factory. */
+async function driveActivation(
+  setup_: Setup,
+  view: Setup["coderView"],
+  prepared: PreparedActivationData,
+): Promise<{
+  runtime: ReturnType<typeof makeRuntime>;
+  execution: PipelineV2ExecutionSession;
+  tool: PipelineV2ToolSession;
+  result: Awaited<ReturnType<PipelineV2ExecutionSession["runAgent"]>>;
+  calls: RecordedCall[];
+  operationRequests: RecordedOperationRequest[];
+}> {
+  const fake = makeFakeCli();
+  const runtime = makeRuntime(setup_, fake);
+  return driveOn(runtime, setup_, view, prepared, fake);
+}
+
+/** One full activation through an already-created factory (calls recorded by `fake`). */
+async function driveOn(
+  runtime: ReturnType<typeof makeRuntime>,
+  setup_: Setup,
+  view: Setup["coderView"],
+  prepared: PreparedActivationData,
+  fake: { calls: RecordedCall[]; operationRequests: RecordedOperationRequest[] },
+): Promise<{
+  runtime: ReturnType<typeof makeRuntime>;
+  execution: PipelineV2ExecutionSession;
+  tool: PipelineV2ToolSession;
+  result: Awaited<ReturnType<PipelineV2ExecutionSession["runAgent"]>>;
+  calls: RecordedCall[];
+  operationRequests: RecordedOperationRequest[];
+}> {
+  const execution = await runtime.createExecutionSession(view, prepared);
+  const tool = await runtime.createToolSession(view, prepared);
+  const result = await execution.runAgent(tool);
+  return {
+    runtime,
+    execution,
+    tool,
+    result,
+    calls: fake.calls,
+    operationRequests: fake.operationRequests,
+  };
 }
 
 function pullCall(calls: RecordedCall[]): RecordedCall {
@@ -1959,6 +2207,320 @@ test("48. both successful session cleanups delete Tool before Execution", async 
     expect(deletes[0]!.args).toContain(driven.tool.sessionId);
     expect(deletes[1]!.args).toContain(driven.execution.sessionId);
   } finally {
+    await dispose(setup_);
+  }
+});
+
+// --- Increment 3: the compiled workspace-access policy -----------------------
+
+test("49. a read-only stage activation issues project read_only in both Sessions, keeps the outputs authority read-write, and mounts /workspace read-only", async () => {
+  const setup_ = await setupMixed();
+  try {
+    const driven = await driveActivation(setup_, setup_.coderView, setup_.coderPrepared);
+    expect(driven.result.status).toBe("completed");
+
+    const createCalls = driven.calls.filter((call) => call.args[1] === "create");
+    expect(createCalls.length).toBe(2);
+    const executionRoots = filesystemRootsOf(createCalls[0]);
+    const toolRoots = filesystemRootsOf(createCalls[1]);
+    expect(executionRoots).toEqual([
+      `${setup_.runRoot}=read_only`,
+      `${setup_.runRoot}/project=read_only`,
+      `${setup_.runRoot}/activations/1-coder/data/outputs=read_write`,
+    ]);
+    expect(createCalls[0]!.args[createCalls[0]!.args.length - 1]).toBe(setup_.runRoot);
+    expect(toolRoots).toEqual([`${setup_.runRoot}/project=read_only`]);
+    expect(createCalls[1]!.args[createCalls[1]!.args.length - 1]).toBe(
+      `${setup_.runRoot}/project`,
+    );
+
+    const body = operationBody(driven.operationRequests);
+    expect(body.mounts).toEqual([
+      { source: "project", target: "/workspace", read_only: true },
+      { source: "activations/1-coder/data/inputs", target: "/pipeline/inputs", read_only: true },
+      { source: "activations/1-coder/data/outputs", target: "/pipeline/outputs" },
+    ]);
+    // the bearer identities are unchanged: the worker holds the Tool bearer
+    expect(
+      (body.environment as Record<string, unknown>)["DOCKER_HELPER_SESSION_TOKEN"],
+    ).toBe("dhc_2");
+    expect(operationRequest(driven.operationRequests).bearer).toBe("dhc_1");
+    await driven.tool.cleanup();
+    await driven.execution.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("50. per-state capture: one factory issues read-only documents for the read-only state and the exact baseline documents for the read-write state", async () => {
+  const setup_ = await setupMixed();
+  try {
+    const readOnly = await driveActivation(setup_, setup_.coderView, setup_.coderPrepared);
+    const readWrite = await driveActivation(setup_, setup_.reviewerView, setup_.reviewerPrepared);
+
+    const roRoots = filesystemRootsOf(
+      readOnly.calls.filter((call) => call.args[1] === "create")[0],
+    );
+    const rwRoots = filesystemRootsOf(
+      readWrite.calls.filter((call) => call.args[1] === "create")[0],
+    );
+    expect(roRoots[1]).toBe(`${setup_.runRoot}/project=read_only`);
+    expect(rwRoots[1]).toBe(`${setup_.runRoot}/project=read_write`);
+    expect(rwRoots[2]).toBe(`${setup_.runRoot}/activations/2-reviewer/data/outputs=read_write`);
+
+    const roBody = operationBody(readOnly.operationRequests);
+    const rwBody = operationBody(readWrite.operationRequests);
+    expect((roBody.mounts as Record<string, unknown>[])[0]).toEqual({
+      source: "project",
+      target: "/workspace",
+      read_only: true,
+    });
+    expect((rwBody.mounts as Record<string, unknown>[])[0]).toEqual({
+      source: "project",
+      target: "/workspace",
+    });
+    // the outputs mount is read-write for both
+    expect((roBody.mounts as Record<string, unknown>[])[2]).toEqual({
+      source: "activations/1-coder/data/outputs",
+      target: "/pipeline/outputs",
+    });
+    expect((rwBody.mounts as Record<string, unknown>[])[2]).toEqual({
+      source: "activations/2-reviewer/data/outputs",
+      target: "/pipeline/outputs",
+    });
+    await readOnly.tool.cleanup();
+    await readOnly.execution.cleanup();
+    await readWrite.tool.cleanup();
+    await readWrite.execution.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("51. a declared workspace_access read_write produces the exact baseline request documents", async () => {
+  const declaredRoot = await mkdtemp(join(tmpdir(), "pipeline-v2-docker-runtime-"));
+  const baselineRoot = await mkdtemp(join(tmpdir(), "pipeline-v2-docker-runtime-"));
+  try {
+    const declared = await setupWithYaml(declaredRoot, RW_DECLARED_RUNTIME_YAML);
+    const baseline = await setupWithYaml(baselineRoot, RUNTIME_YAML);
+    const declaredRun = await driveActivation(declared, declared.coderView, declared.coderPrepared);
+    const baselineRun = await driveActivation(baseline, baseline.coderView, baseline.coderPrepared);
+
+    const normalize = (call: RecordedCall | undefined, root: string): string[] =>
+      (call?.args ?? []).map((arg) => arg.replace(`${root}`, "ROOT"));
+    expect(normalize(declaredRun.calls.filter((call) => call.args[1] === "create")[0], declaredRoot)).toEqual(
+      normalize(baselineRun.calls.filter((call) => call.args[1] === "create")[0], baselineRoot),
+    );
+    expect(normalize(declaredRun.calls.filter((call) => call.args[1] === "create")[1], declaredRoot)).toEqual(
+      normalize(baselineRun.calls.filter((call) => call.args[1] === "create")[1], baselineRoot),
+    );
+    expect(declaredRun.operationRequests[0]?.body).toBe(baselineRun.operationRequests[0]?.body);
+    await declaredRun.tool.cleanup();
+    await declaredRun.execution.cleanup();
+    await baselineRun.tool.cleanup();
+    await baselineRun.execution.cleanup();
+  } finally {
+    await rm(declaredRoot, { recursive: true, force: true });
+    await rm(baselineRoot, { recursive: true, force: true });
+  }
+});
+
+test("52. the policy is captured once: rewriting the bundle after factory creation cannot change an existing runtime", async () => {
+  const setup_ = await setupMixed();
+  try {
+    const fake = makeFakeCli();
+    const runtime = makeRuntime(setup_, fake);
+    const before = await driveOn(runtime, setup_, setup_.coderView, setup_.coderPrepared, fake);
+    expect(filesystemRootsOf(before.calls.filter((call) => call.args[1] === "create")[0])[1]).toBe(
+      `${setup_.runRoot}/project=read_only`,
+    );
+    await before.tool.cleanup();
+    await before.execution.cleanup();
+    const callsAfterFirstPhase = fake.calls.length;
+
+    // Rewrite the bundle on disk: the read-only declaration is removed and
+    // the pipeline reloaded. The existing factory must keep issuing the
+    // captured policy; only a new factory sees the change.
+    await writeFile(
+      join(setup_.bundle, "pipeline.yaml"),
+      MIXED_RUNTIME_YAML.replace("      workspace_access: read_only\n", "\n"),
+    );
+    const reloaded = await loadPipelineV2(setup_.bundle);
+    const stale = await driveOn(runtime, setup_, setup_.coderView, setup_.coderPrepared, fake);
+    const staleCreates = fake.calls
+      .slice(callsAfterFirstPhase)
+      .filter((call) => call.args[1] === "create");
+    expect(filesystemRootsOf(staleCreates[0])[1]).toBe(`${setup_.runRoot}/project=read_only`);
+    await stale.tool.cleanup();
+    await stale.execution.cleanup();
+
+    const freshFake = makeFakeCli();
+    // a fresh run root for the reloaded pipeline (snapshot provenance is
+    // bound to the pipeline object, so the new activation needs a fresh
+    // snapshot over a fresh run-owned project)
+    const runRoot2 = join(setup_.root, "run2");
+    await mkdir(runRoot2, { recursive: true });
+    await mkdir(join(runRoot2, "project"), { mode: 0o700 });
+    await writeFile(join(runRoot2, "project", "README.md"), "project seed\n");
+    const snap2 = await snapshotRunInputs(
+      reloaded,
+      [
+        { id: "task", path: join(setup_.root, "userdata", "task.txt") },
+        { id: "specs", path: join(setup_.root, "userdata", "specs") },
+        { id: "config", path: join(setup_.root, "userdata", "config.json") },
+      ],
+      runRoot2,
+    );
+    const prepared2 = await prepareActivationData(reloaded, snap2, [], "coder", 1);
+    const freshRuntime = makeRuntime(
+      { ...setup_, pipeline: reloaded, runRoot: runRoot2 },
+      freshFake,
+      { runRootProjection: { localRoot: runRoot2, daemonRoot: runRoot2 } },
+    );
+    const changed = await driveOn(freshRuntime, setup_, setup_.coderView, prepared2, freshFake);
+    expect(filesystemRootsOf(changed.calls.filter((call) => call.args[1] === "create")[0])[1]).toBe(
+      `${runRoot2}/project=read_write`,
+    );
+    await changed.tool.cleanup();
+    await changed.execution.cleanup();
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("53. a failed session create for a read-only activation falls back to nothing", async () => {
+  const setup_ = await setupMixed();
+  try {
+    const fake = makeFakeCli({ createCode: 2, createStderr: "invalid_filesystem_policy" });
+    const runtime = makeRuntime(setup_, fake);
+    let failure: unknown = null;
+    try {
+      await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    } catch (cause) {
+      failure = cause;
+    }
+    expect(failure).toBeInstanceOf(DockerHelperError);
+    expect((failure as DockerHelperError).kind).toBe("cli_failure");
+    // exactly one create, with read-only project roots, and no read-write retry
+    const creates = fake.calls.filter((call) => call.args[1] === "create");
+    expect(creates.length).toBe(1);
+    expect(filesystemRootsOf(creates[0])).toEqual([
+      `${setup_.runRoot}=read_only`,
+      `${setup_.runRoot}/project=read_only`,
+      `${setup_.runRoot}/activations/1-coder/data/outputs=read_write`,
+    ]);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("54. both successful cleanups of a read-only activation delete Tool before Execution, exactly once", async () => {
+  const setup_ = await setupMixed();
+  try {
+    const driven = await driveActivation(setup_, setup_.coderView, setup_.coderPrepared);
+    await driven.tool.cleanup();
+    await driven.execution.cleanup();
+    const deletes = driven.calls.filter((call) => call.args[1] === "delete");
+    expect(deletes.length).toBe(2);
+    expect(deletes[0]!.args).toContain(driven.tool.sessionId);
+    expect(deletes[1]!.args).toContain(driven.execution.sessionId);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("54b. a read-only activation with a failing worker still cleans both Sessions tool-first, exactly once", async () => {
+  const setup_ = await setupMixed();
+  try {
+    const fake = makeFakeCli({ runCode: 1 });
+    const runtime = makeRuntime(setup_, fake);
+    const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
+    const result = await execution.runAgent(tool);
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toBe("worker_failed");
+    }
+    await tool.cleanup();
+    await execution.cleanup();
+    const deletes = fake.calls.filter((call) => call.args[1] === "delete");
+    expect(deletes.length).toBe(2);
+    expect(deletes[0]!.args).toContain(tool.sessionId);
+    expect(deletes[1]!.args).toContain(execution.sessionId);
+  } finally {
+    await dispose(setup_);
+  }
+});
+
+test("55. request parity: the production transport sends the exact read-only POST /run body", async () => {
+  const setup_ = await setupMixed();
+  const root = mkdtempSync(join(tmpdir(), "parity-op-"));
+  const socketPath = join(root, "parity.sock");
+  const recorded: Array<{ bearer: string; body: string }> = [];
+  const server = Bun.serve({
+    unix: socketPath,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const bearer = (request.headers.get("Authorization") ?? "").replace(/^Bearer /, "");
+      const body = await request.text();
+      if (url.pathname === "/run") {
+        recorded.push({ bearer, body });
+        return new Response(JSON.stringify({ ok: true, operation_id: "op-parity-ro" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/operations/op-parity-ro/logs") {
+        const offset = Number(url.searchParams.get("offset") ?? "0");
+        return new Response(JSON.stringify({ logs: "", offset, next_offset: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/operations/op-parity-ro") {
+        return new Response(JSON.stringify({ status: "succeeded", exit_code: null, result_code: "succeeded" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname.endsWith("/cancel")) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ error: "no route" }), { status: 404 });
+    },
+  });
+  try {
+    const runtime = makeRuntime(setup_, makeFakeCli(), { productionOperationRunner: true, socketPath });
+    const execution = await runtime.createExecutionSession(setup_.coderView, setup_.coderPrepared);
+    const tool = await runtime.createToolSession(setup_.coderView, setup_.coderPrepared);
+    const result = await execution.runAgent(tool);
+    expect(result.status).toBe("completed");
+    expect(recorded).toHaveLength(1);
+    const request = recorded[0];
+    expect(request?.bearer).toBe("dhc_1");
+    const body = JSON.parse(request?.body ?? "{}") as Record<string, unknown>;
+    expect(body.image).toBe(
+      "ghcr.io/example/coder@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    );
+    expect(body.entrypoint).toBe("opencode");
+    expect(body.workdir).toBe("/workspace");
+    expect(body.helper_socket).toBe(true);
+    expect(body.mounts).toEqual([
+      { source: "project", target: "/workspace", read_only: true },
+      { source: "activations/1-coder/data/inputs", target: "/pipeline/inputs", read_only: true },
+      { source: "activations/1-coder/data/outputs", target: "/pipeline/outputs" },
+    ]);
+    const keyOrder = Object.keys(JSON.parse(request?.body ?? "{}") as Record<string, unknown>);
+    expect(keyOrder).toEqual(["image", "entrypoint", "workdir", "command", "environment", "mounts", "helper_socket"]);
+    expect((body.environment as Record<string, unknown>)["DOCKER_HELPER_SESSION_TOKEN"]).toBe("dhc_2");
+    await execution.cleanup();
+    await tool.cleanup();
+  } finally {
+    server.stop(true);
+    rmSync(root, { recursive: true, force: true });
     await dispose(setup_);
   }
 });

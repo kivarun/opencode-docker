@@ -1937,11 +1937,12 @@ test("28. mutation isolation: results and trusted snapshot are untouched by reso
   });
 });
 
-test("29. the resolver export surface is exactly the three runtime keys", () => {
+test("29. the resolver export surface is exactly the four runtime keys", () => {
   expect(Object.keys(orchestrationModule).sort()).toEqual([
     "PipelineV2OrchestrationError",
     "compiledExecutionRoleFor",
     "compiledStageTemplateFor",
+    "compiledWorkspaceAccessFor",
   ]);
 });
 

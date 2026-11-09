@@ -196,11 +196,18 @@ orchestrator run \
   reach a worker.
 - The runner copies the project source once into the run-owned directory
   `<state-root>/pipeline-runs/<run-id>/project`; every activation mounts that
-  copy read-write at `/workspace` and worker changes persist there across
-  activations. The source directory is never modified, and its path never
+  copy at `/workspace` and worker changes persist there across activations.
+  The mount mode is the state's effective workspace access: the established
+  read-write baseline, or — for a stage agent whose compiled orchestration
+  entry declares `workspace_access: read_only` — read-only in both Sessions
+  of the activation and in the `/workspace` mount, while the activation
+  outputs stay read-write so declared outputs remain fully supported. The
+  policy is bound by the frozen pipeline digest; no CLI/HTTP flag, profile
+  field, env value or durable state can change it. The source directory is
+  never modified, and its path never
   reaches the worker, the pipeline, the durable state, or the results.
 - The durable run state is `<state-root>/pipeline-runs/<run-id>/state.json`
-  (state schema version 11), and the published run outputs stay at the fixed
+  (state schema version 12), and the published run outputs stay at the fixed
   location `<state-root>/pipeline-runs/<run-id>/outputs`. Run outputs are
   never copied to a user-chosen path; the CLI reports the location but does
   not relocate it.
@@ -1954,10 +1961,21 @@ control and stage roles reject `stage_wait` as an unknown field; there are
 no defaults and no inference from `plan_output`, transitions, stage
 templates or stage order; diagnostics are content-free (unknown field names
 are never named, no hostile value is ever echoed).
-**The policy is compiled and digest-bound but the production wait entry does
-not consume it yet** — wiring it into the coordinator is a later increment.
 The
-stage role carries exactly one `stage_template`). There is no default
+stage role carries exactly one `stage_template` plus the optional
+`workspace_access` policy (`read_write | read_only`, the closed
+`PIPELINE_V2_WORKSPACE_ACCESS_VALUES` vocabulary): a read-only stage role
+narrows the run-owned project workspace authority of its agent activations
+to read-only in both Sessions and in the `/workspace` mount, while the
+activation outputs stay read-write so declared outputs (for example a JSON
+review feedback document) remain fully supported. The field is allowed only
+on stage roles bound to agent states — planning/control entries reject it as
+an unknown field and a stage role bound to a decision state rejects it
+(decision states run no container and carry no workspace); absence stays
+absence in the resolved metadata (no default is normalized in), so
+undeclared bundles compile byte-identically, and the effective access of an
+undeclared stage role is `read_write`, owned once by the compiled policy
+resolver. There is no default
 classification and no inference from profiles, state names, prompts, model
 paths or any other content; terminal states never carry a role. Every
 agent/decision state must be listed exactly once; template ids, template
@@ -1977,14 +1995,18 @@ the section's entries is not semantic: the resolved metadata is normalized
 stage-wait action order is semantic and preserved verbatim), so
 permuting equivalent entries yields the identical execution snapshot and
 digest, while changing a role, membership, template entry, `plan_output`
-value or any stage-wait policy field (reason, action set, action order)
-moves the digest. The resolved snapshot carries the metadata as the optional
+value, any stage-wait policy field (reason, action set, action order) or a
+declared `workspace_access` value moves the digest. The resolved snapshot
+carries the metadata as the optional
 deep-frozen `orchestration` field; bundles without the section compile
 exactly as before (the snapshot has no `orchestration` key). The pure
 read-only resolvers live in `orchestrator/src/pipeline_v2_orchestration.ts`
 (`compiledExecutionRoleFor` — a planning role resolves to the exact
 deep-frozen `{state_id, role, plan_output, stage_wait}` —
-`compiledStageTemplateFor`, typed
+`compiledStageTemplateFor`, and `compiledWorkspaceAccessFor` — the single
+effective-policy owner of the workspace access, requiring stage agent
+semantics and applying the one `absent -> read_write` default; the runtime
+adapter resolves the access only through it — typed
 `PipelineV2OrchestrationError`; provenance-gated before any content read).
 No role or template registry is added to the durable pipeline identity —
 the existing `execution_snapshot_sha256` stays the single durable anchor.
@@ -3026,10 +3048,10 @@ stage worker sees the exact bytes of the accepted revision. Multiple tasks
 per stage still fail closed by design; automatic task-body rewriting and
 any scheduler remain later work.
 
-### Pipeline v2 run state (state schema version 11, the production run state of pipeline v2)
+### Pipeline v2 run state (state schema version 12, the production run state of pipeline v2)
 
 `orchestrator/src/pipeline_v2_state.ts` defines the durable run state
-for pipeline schema v2 (state schema version 11, with the
+for pipeline schema v2 (state schema version 12, with the
 nested pipeline identity carrying `schema_version: 2`): logical run inputs
 (id, port type, protected flag, snapshot digest), a shared contiguous
 execution index covering both agent and decision executions (agent

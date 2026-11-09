@@ -33,6 +33,7 @@ import { isPipelineV2SafeId } from "./pipeline_v2_scalar.ts";
 import {
   requireResolvedPipelineV2Provenance,
   type PipelineV2StageWaitActionName,
+  type PipelineV2WorkspaceAccess,
   type ResolvedPipelineV2,
 } from "./pipeline_v2.ts";
 
@@ -157,6 +158,70 @@ export function compiledExecutionRoleFor(
       ? `state ${JSON.stringify(stateId)} is not declared by the pipeline`
       : `state ${JSON.stringify(stateId)} is a ${declared.type} state; terminal states carry no execution role`,
   );
+}
+
+/**
+ * The single effective-policy owner of the workspace access of one agent
+ * state: given the trusted compiled pipeline and a safe state id it finds
+ * the exact compiled execution-role entry, requires stage agent semantics
+ * (the state must be declared, of type `agent`, and carry the `stage`
+ * role), applies the one default `absent -> "read_write"`, and returns the
+ * effective `"read_write" | "read_only"` value. The resolver reads nothing
+ * but the normalized compiled metadata — no profile, no prompt, no durable
+ * state, no environment, no caller options — and never mutates the
+ * pipeline. Runtime adapters must resolve the workspace access only
+ * through this function; there is no second lookup or default site.
+ *
+ * Provenance is checked before anything else (Proxy traps are never
+ * invoked); a missing orchestration section, an unknown state, a
+ * non-agent state or a non-stage role is a typed
+ * `PipelineV2OrchestrationError`. Diagnostics name safe ids only.
+ */
+export function compiledWorkspaceAccessFor(
+  pipeline: ResolvedPipelineV2,
+  stateId: string,
+): PipelineV2WorkspaceAccess {
+  requireResolvedPipelineV2Provenance(pipeline, "compiledWorkspaceAccessFor");
+  if (!isPipelineV2SafeId(stateId)) {
+    throw new PipelineV2OrchestrationError(
+      `compiledWorkspaceAccessFor requires a safe state id, got ${JSON.stringify(stateId)}`,
+    );
+  }
+  const orchestration = pipeline.orchestration;
+  if (orchestration === undefined) {
+    throw new PipelineV2OrchestrationError(
+      "the trusted pipeline declares no orchestration section; compiled workspace access exists only for pipelines with orchestration metadata",
+    );
+  }
+  let roleEntry: { role: string; workspace_access?: PipelineV2WorkspaceAccess } | undefined;
+  for (const entry of orchestration.execution_roles) {
+    if (entry.state_id === stateId) {
+      roleEntry = entry;
+      break;
+    }
+  }
+  if (roleEntry === undefined) {
+    const declared = pipeline.states.find((state) => state.id === stateId);
+    throw new PipelineV2OrchestrationError(
+      declared === undefined
+        ? `state ${JSON.stringify(stateId)} is not declared by the pipeline`
+        : `state ${JSON.stringify(stateId)} is a ${declared.type} state; terminal states carry no execution role`,
+    );
+  }
+  if (roleEntry.role !== "stage") {
+    throw new PipelineV2OrchestrationError(
+      `state ${JSON.stringify(stateId)} carries the ${JSON.stringify(roleEntry.role)} role; the workspace access policy applies only to stage roles`,
+    );
+  }
+  const state = pipeline.states.find((candidate) => candidate.id === stateId);
+  if (state === undefined || state.type !== "agent") {
+    throw new PipelineV2OrchestrationError(
+      `state ${JSON.stringify(stateId)} is not a declared agent state; the workspace access policy applies only to agent states`,
+    );
+  }
+  // The single default: absence stays absence in the compiled metadata and
+  // means the established read-write workspace.
+  return roleEntry.workspace_access ?? "read_write";
 }
 
 /**

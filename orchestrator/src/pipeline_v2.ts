@@ -360,7 +360,30 @@ export type PipelineV2ExecutionRoleSpec =
       readonly plan_ready?: PipelineV2PlanReadySpec;
     }
   | { readonly state_id: string; readonly role: "control" }
-  | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
+  | {
+      readonly state_id: string;
+      readonly role: "stage";
+      readonly stage_template: string;
+      readonly workspace_access?: PipelineV2WorkspaceAccess;
+    };
+
+/**
+ * The closed workspace-access vocabulary of a stage execution role. The
+ * value narrows the run-owned project workspace authority of the role's
+ * agent activations: `read_write` is the established behavior (the
+ * workspace is writable), `read_only` issues the project read-only in both
+ * Sessions of every activation of that state (the worker can modify no
+ * object under `/workspace`; its declared outputs stay fully supported
+ * through the read-write activation outputs). The field is allowed only on
+ * stage roles bound to agent states; planning/control entries and
+ * stage-bound decision states reject it.
+ */
+export type PipelineV2WorkspaceAccess = "read_write" | "read_only";
+
+export const PIPELINE_V2_WORKSPACE_ACCESS_VALUES: readonly PipelineV2WorkspaceAccess[] = [
+  "read_write",
+  "read_only",
+];
 
 export interface PipelineV2StageTemplateSpec {
   readonly id: string;
@@ -497,7 +520,20 @@ export type ResolvedPipelineV2ExecutionRole =
       readonly plan_ready?: ResolvedPipelineV2PlanReady;
     }
   | { readonly state_id: string; readonly role: "control" }
-  | { readonly state_id: string; readonly role: "stage"; readonly stage_template: string };
+  | {
+      readonly state_id: string;
+      readonly role: "stage";
+      readonly stage_template: string;
+      /**
+       * Present exactly when the bundle declares `workspace_access` on the
+       * stage entry; absence stays absence (no default is normalized into
+       * the resolved object), so undeclared bundles keep their exact
+       * pre-existing snapshot bytes and digest. The effective access of an
+       * undeclared stage role is `read_write`, owned once by the compiled
+       * policy resolver.
+       */
+      readonly workspace_access?: PipelineV2WorkspaceAccess;
+    };
 
 export interface ResolvedPipelineV2Orchestration {
   readonly stage_templates: readonly ResolvedPipelineV2StageTemplate[];
@@ -851,15 +887,20 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
     // Exact own enumerable fields for every execution-role entry: an
     // inherited property never satisfies the required shape (the planning
     // role carries the mandatory `stage_wait` policy and may carry the
-    // optional `plan_ready` continuation policy; no other role accepts it).
+    // optional `plan_ready` continuation policy; the stage role may carry
+    // the optional `workspace_access` policy; no other role accepts
+    // either).
     const planningKeys =
       role === "planning" && Object.prototype.hasOwnProperty.call(entry, "plan_ready")
         ? ["state_id", "role", "plan_output", "stage_wait", "plan_ready"]
         : ["state_id", "role", "plan_output", "stage_wait"];
+    const stageKeys = Object.prototype.hasOwnProperty.call(entry, "workspace_access")
+      ? ["state_id", "role", "stage_template", "workspace_access"]
+      : ["state_id", "role", "stage_template"];
     expectExactOwnKeys(
       entry,
       role === "stage"
-        ? ["state_id", "role", "stage_template"]
+        ? stageKeys
         : role === "planning"
           ? planningKeys
           : ["state_id", "role"],
@@ -878,6 +919,14 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
             state_id: stateId,
             role,
             stage_template: validateSafeId(entry.stage_template, `${what} stage_template`),
+            ...(Object.prototype.hasOwnProperty.call(entry, "workspace_access")
+              ? {
+                  workspace_access: parseWorkspaceAccess(
+                    entry.workspace_access,
+                    `${what} workspace_access`,
+                  ),
+                }
+              : {}),
           }
         : role === "planning"
           ? {
@@ -896,6 +945,25 @@ function parseOrchestration(raw: unknown): PipelineV2OrchestrationSpec {
     stage_templates: sortById(templates, (entry) => entry.id),
     execution_roles: sortById(roles, (entry) => entry.state_id),
   };
+}
+
+/**
+ * Parse the optional `workspace_access` policy of one stage role: the
+ * exact closed `PIPELINE_V2_WORKSPACE_ACCESS_VALUES` vocabulary. The style
+ * follows `parseStageWait`/`parsePlanReady`: no hostile value is ever
+ * echoed (a canary can hide in a value), and the diagnostics name only the
+ * contract vocabulary.
+ */
+function parseWorkspaceAccess(raw: unknown, what: string): PipelineV2WorkspaceAccess {
+  if (
+    typeof raw !== "string" ||
+    !(PIPELINE_V2_WORKSPACE_ACCESS_VALUES as readonly string[]).includes(raw)
+  ) {
+    throw new PipelineError(
+      `${what} must be one of ${JSON.stringify(PIPELINE_V2_WORKSPACE_ACCESS_VALUES)}`,
+    );
+  }
+  return raw as PipelineV2WorkspaceAccess;
 }
 
 /**
@@ -953,6 +1021,15 @@ function checkOrchestrationStructure(
     if (role.role === "control" && stateType !== "decision") {
       throw new PipelineError(
         `pipeline orchestration declares role "control" for ${stateType} state ${JSON.stringify(role.state_id)}; control is a decision-state role`,
+      );
+    }
+    if (
+      role.role === "stage" &&
+      stateType === "decision" &&
+      role.workspace_access !== undefined
+    ) {
+      throw new PipelineError(
+        `pipeline orchestration declares stage role with workspace_access for decision state ${JSON.stringify(role.state_id)}; decision states run no container and carry no workspace`,
       );
     }
     roleOfState.set(role.state_id, role);
