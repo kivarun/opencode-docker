@@ -2,7 +2,7 @@
 
 Status: **planned**
 
-Last updated: 2026-11-05
+Last updated: 2026-11-09
 
 Evidence baseline: `6b2ed6263efc8ec990dd6218c02b1434e702bf91`
 
@@ -92,7 +92,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | ---: | --- | --- |
 | 1 | Durable stage activation context | Complete (b63c4cf; CI 42043441341) |
 | 2 | Durable profile/model epoch | Complete (8e304bf; CI 42242433550 — build evidence, not test evidence) |
-| 3 | Hard read-only reviewer | Planned |
+| 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Planned |
 | 5 | Real dogfood UAT with revision and Apply | Planned |
 | 6 | UI model and implementation based on UAT evidence | Planned |
@@ -272,6 +272,44 @@ Required properties:
 
 Do not combine this with reviewer decision semantics; durable agent outputs and
 decision states already exist.
+
+### Implementation note (2026-11-09): Complete as the compiled workspace access policy, live-UAT proven
+
+Implemented and documented (`AGENTS.md`, the compiled orchestration metadata and
+docker-helper runtime adapter bullets; `docs/orchestration-workflow.md`). A stage
+role may declare `workspace_access: read_only` (closed vocabulary,
+`pipeline_v2.ts`-owned; absence stays absence and compiles byte-identically);
+`compiledWorkspaceAccessFor` is the single effective-policy owner with the single
+`read_write` default site and is fail-closed on unknown/non-agent states. The
+activation layout, execution document, Session filesystem policies and the worker
+`POST /run` mount all report the compiled access; there is no read-only to
+read-write fallback. Shipped as `9863be3`, corrected by `a37fe9f` (truthful
+logical activation layout) and `1fb634c` (fail-closed resolver for
+orchestration-less pipelines); CI run `42621186802` published the
+`sha256:bddae3c6…ed75ce` orchestrator image.
+
+Final live UAT (2026-11-09, report
+`increment-3-final-uat-report.md` in the exchange outbox): the digest-pinned
+orchestrator image ran the bundled-default-shaped UAT pipeline (stage role
+declared read-only) through one `orchestrator run` to terminal success against
+the real docker-helper 2.3.1 daemon with a real rotated Launcher credential and
+real LLM workers (`local/glm53-flash`). Proven live: the Execution Session's
+issued snapshot was run-root read-only with the activation outputs read-write
+and the project read-only (subsumed by the run-root entry under the daemon's
+documented normalization); the Tool Session carried exactly one entry — the
+project — read-only, confirmed both by `session show` and by `GET /self` from
+inside the worker; `/workspace` and `/pipeline/inputs` were kernel read-only
+(bindfs `ro`, `docker_helper_ro_projection_t`) and `/pipeline/outputs`
+read-write; a 13-probe write battery (create, overwrite, append, truncate,
+read-write open, rename, unlink, mkdir, symlink, hardlink, chmod, and two
+subprocess variants) was denied with `EROFS`/`EACCES` on every probe while the
+project fingerprint stayed byte-identical; the reviewer's declared JSON output
+was accepted through the existing digest/schema chain and published as the run
+output; Tool-bearer escalation (`POST /run` with a read-write exposure of the
+project) was refused `read_only_root` while the read-only control succeeded and
+session management with a Session bearer stayed `unauthorized`; every
+orchestrator-created Session was deleted (launcher session list empty after
+cleanup) and all UAT trees, credential copies and sessions were removed.
 
 ## Increment 4: development pipeline bundle
 
