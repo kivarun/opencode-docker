@@ -59,6 +59,7 @@ import {
   ACTIVATION_INPUTS_ROOT,
   ACTIVATION_OUTPUTS_ROOT,
   PROJECT_MOUNT_TARGET,
+  compiledWorkspaceAccessFor,
   evaluatePipelineDecisionState,
   parsePortType,
   requireResolvedPipelineV2Provenance,
@@ -139,7 +140,12 @@ async function withRuntimeReason<T>(
  * `snapshotRunInputs` is called; the runtime never creates, clears or
  * copies it (preparing the initial project content is the caller's
  * responsibility), and every activation mounts exactly this one directory
- * at `/workspace` read-write, so changes persist across activations.
+ * at `/workspace` at the state's effective workspace access (the compiled
+ * `workspace_access` policy: read-write for the established baseline,
+ * read-only for a stage agent that declares it), so changes persist across
+ * activations. The activation inputs are always mounted read-only and the
+ * activation outputs always read-write; the registered operator project is
+ * never mounted to a worker.
  *
  * Run-input bindings + snapshot (`snapshotRunInputs`): every declared
  * pipeline input is bound exactly once to an absolute host path whose real
@@ -487,7 +493,8 @@ export interface RunInputsSnapshot {
    * Canonical shared project directory of the whole run. It must exist
    * before the snapshot is created; the runtime never creates, clears or
    * copies it, and every activation mounts exactly this directory at
-   * `/workspace` read-write.
+   * `/workspace` at the state's effective workspace access (compiled
+   * `workspace_access` policy).
    */
   readonly project_root: string;
   readonly inputs: readonly RunInputSnapshotEntry[];
@@ -1351,7 +1358,8 @@ export async function snapshotRunInputs(
 
   // The shared project directory of the whole run must already exist as a
   // real non-symlink directory; the runtime never creates, clears or copies
-  // it, and it is mounted at /workspace by every activation.
+  // it, and it is mounted at /workspace by every activation at the state's
+  // effective workspace access.
   const projectRootPath = join(runRootCanonical, "project");
   await requireRealDirectory(projectRootPath, "run project root");
   const projectRootCanonical = await realpath(projectRootPath);
@@ -2377,6 +2385,7 @@ export async function prepareActivationExecutionDocument(
 function buildExecutionDocument(
   agentState: Extract<ResolvedV2State, { type: "agent" }>,
   activationIndex: number,
+  workspaceAccess: "read_write" | "read_only",
   stageTask?: PreparedStageTaskContext,
 ): string {
   const inputLines = agentState.inputs.map((port, position) =>
@@ -2416,7 +2425,13 @@ function buildExecutionDocument(
     "",
     "## Workspace",
     "",
-    `The shared project directory is mounted at \`${PROJECT_MOUNT_TARGET}\` read-write.`,
+    // The document states the effective workspace access truthfully:
+    // read-write for the established baseline (byte-identical wording),
+    // read-only for a stage agent whose compiled orchestration entry
+    // declares `workspace_access: read_only`.
+    workspaceAccess === "read_only"
+      ? `The shared project directory is mounted at \`${PROJECT_MOUNT_TARGET}\` read-only; write only to your declared outputs.`
+      : `The shared project directory is mounted at \`${PROJECT_MOUNT_TARGET}\` read-write.`,
     "The project sources at `/workspace` are the working product of this activation.",
     "They are not part of the pipeline output-port namespace; do not place",
     "declared outputs anywhere but their declared paths below.",
@@ -2454,7 +2469,11 @@ function buildExecutionDocument(
  * snapshot or the accepted records) and per-port `outputs/` (empty real
  * directories for `directory` outputs; `file`/`json` outputs absent until a
  * worker run creates them). The shared run project directory is mounted at
- * `/workspace`; there is no per-activation project directory. Every
+ * `/workspace` at the state's effective workspace access (the compiled
+ * `workspace_access` policy: read-write for the established baseline,
+ * read-only for a stage agent that declares it; the activation inputs stay
+ * read-only and the declared activation outputs stay read-write for every
+ * activation); there is no per-activation project directory. Every
  * directory is created 0700, every copied file 0600; the activation index
  * must be globally unused, the leaf must be absent beforehand, and the
  * whole leaf tree is removed again when the preparation fails. The project
@@ -2501,6 +2520,12 @@ export async function prepareActivationData(
     );
   }
   const agentState = state;
+  // The effective workspace access of this activation, resolved through the
+  // single policy owner after the established caller-input validation and
+  // before any filesystem effect (planning agents, read-write stage agents
+  // and orchestration-less bundles resolve to the established read-write
+  // workspace).
+  const workspaceAccess = compiledWorkspaceAccessFor(pipeline, safeStateId);
 
   await requireRealDirectory(runRootCanonical, "run root");
   await requireRealDirectory(projectRoot, "run project root");
@@ -2709,13 +2734,23 @@ export async function prepareActivationData(
         // modified.
         const executionDocument = await prepareActivationExecutionDocument(
           inputsRoot,
-          buildExecutionDocument(agentState, activationIndex, stageTask),
+          buildExecutionDocument(agentState, activationIndex, workspaceAccess, stageTask),
         );
         return { dataRoot, inputsRoot, outputsRoot, preparedInputs, preparedOutputs, executionDocument };
       });
 
+    // The logical project mount states the truth: the state's effective
+    // workspace access (the single `compiledWorkspaceAccessFor` owner —
+    // read-write for the established baseline, read-only for a stage agent
+    // whose compiled orchestration entry declares
+    // `workspace_access: read_only`); the activation inputs stay read-only
+    // and the activation outputs stay read-write for every activation.
     const mounts: PreparedActivationMount[] = [
-      { source: projectRoot, target: PROJECT_MOUNT_TARGET, read_only: false },
+      {
+        source: projectRoot,
+        target: PROJECT_MOUNT_TARGET,
+        read_only: workspaceAccess === "read_only",
+      },
       { source: inputsRoot, target: ACTIVATION_INPUTS_ROOT, read_only: true },
       { source: outputsRoot, target: ACTIVATION_OUTPUTS_ROOT, read_only: false },
     ];

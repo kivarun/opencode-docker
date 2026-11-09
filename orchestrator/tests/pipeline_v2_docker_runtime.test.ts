@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isCleanAbsolutePath } from "../src/clean_path.ts";
 import { expect, test } from "bun:test";
-import { loadPipelineV2 } from "../src/pipeline_v2.ts";
+import { loadPipelineV2, planActivationLayout } from "../src/pipeline_v2.ts";
 import {
   acceptActivationOutputs,
   prepareActivationData,
@@ -2521,6 +2521,38 @@ test("55. request parity: the production transport sends the exact read-only POS
   } finally {
     server.stop(true);
     rmSync(root, { recursive: true, force: true });
+    await dispose(setup_);
+  }
+});
+
+test("56. the logical layout and the issued authority agree for one trusted pipeline", async () => {
+  const setup_ = await setupMixed();
+  try {
+    // the read-only stage state: layout true, Session roots and body mount read-only
+    const roLayout = planActivationLayout(setup_.pipeline, "coder");
+    expect(roLayout.project).toEqual({ target: "/workspace", read_only: true });
+    expect(roLayout.output_ports.every((port) => port.read_only === false)).toBe(true);
+    const ro = await driveActivation(setup_, setup_.coderView, setup_.coderPrepared);
+    const roRoots = filesystemRootsOf(ro.calls.filter((call) => call.args[1] === "create")[0]);
+    expect(roRoots[1]).toBe(`${setup_.runRoot}/project=read_only`);
+    expect(
+      (operationBody(ro.operationRequests).mounts as Record<string, unknown>[])[0],
+    ).toEqual({ source: "project", target: "/workspace", read_only: true });
+    await ro.tool.cleanup();
+    await ro.execution.cleanup();
+
+    // the read-write stage state: layout false, Session roots and body mount read-write
+    const rwLayout = planActivationLayout(setup_.pipeline, "reviewer");
+    expect(rwLayout.project).toEqual({ target: "/workspace", read_only: false });
+    const rw = await driveActivation(setup_, setup_.reviewerView, setup_.reviewerPrepared);
+    const rwRoots = filesystemRootsOf(rw.calls.filter((call) => call.args[1] === "create")[0]);
+    expect(rwRoots[1]).toBe(`${setup_.runRoot}/project=read_write`);
+    expect(
+      (operationBody(rw.operationRequests).mounts as Record<string, unknown>[])[0],
+    ).toEqual({ source: "project", target: "/workspace" });
+    await rw.tool.cleanup();
+    await rw.execution.cleanup();
+  } finally {
     await dispose(setup_);
   }
 });

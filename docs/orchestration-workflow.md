@@ -1889,7 +1889,13 @@ producing an immutable plan: ordered input ports (`source`, `type`,
 optional deep-frozen schema snapshot without `schemaPath`, fixed target
 `/pipeline/inputs/<id>`, `read_only: true`), ordered output ports (`type`,
 optional parsed schema snapshot, fixed target `/pipeline/outputs/<id>`,
-`read_only: false`), project mount `/workspace` RW,
+`read_only: false`), the project mount `/workspace` at the state's
+effective workspace access (resolved through the single
+`compiledWorkspaceAccessFor` owner: `read_only: false` for planning
+agents, read-write stage agents and bundles without the policy;
+`read_only: true` for a stage agent whose compiled orchestration entry
+declares `workspace_access: read_only` — the declared output ports stay
+writable in every case),
 `reject_undeclared_outputs: true` — and only logical/structural data,
 never bearers, credentials, env values, host paths, or schema paths.
 Mutations of the source YAML object or of the returned view cannot change
@@ -1907,10 +1913,14 @@ Session capability contracts are fixed next to the planner and implemented
 by the Docker Helper runtime adapter: Execution Session (`type:
 "execution"`, scope run root; orchestrator-only bearer, used only to launch
 workers, never passed to a worker in any form), Tool Session (`type:
-"tool"`, scope project only; bearer handed to the worker; nested containers
-cannot reach pipeline inputs/outputs through helper), and worker mounts
-(project `/workspace` RW, prepared activation inputs `/pipeline/inputs` RO,
-activation outputs `/pipeline/outputs` RW). The helper socket projection is
+"tool"`, scope project only; bearer handed to the worker; its only
+filesystem root is the project at the state's effective workspace access,
+so a read-only Tool bearer can neither see the activation outputs nor
+obtain a read-write project exposure; nested containers cannot reach
+pipeline inputs/outputs through helper), and worker mounts (project
+`/workspace` at the state's effective workspace access, prepared activation
+inputs `/pipeline/inputs` RO, activation outputs `/pipeline/outputs` RW).
+The helper socket projection is
 not a session capability: it lives in the separate immutable Worker Launch
 contract (`WORKER_LAUNCH_CONTRACT`) because it happens once, at worker
 launch through the Execution Session —

@@ -385,6 +385,93 @@ export const PIPELINE_V2_WORKSPACE_ACCESS_VALUES: readonly PipelineV2WorkspaceAc
   "read_only",
 ];
 
+/**
+ * Typed error of the compiled orchestration resolvers. The class is defined
+ * here (next to the compiled policy it reports) and re-exported by
+ * `pipeline_v2_orchestration.ts` for surface compatibility; there is one
+ * implementation owner.
+ */
+export class PipelineV2OrchestrationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PipelineV2OrchestrationError";
+  }
+}
+
+/**
+ * The single effective-policy owner of the workspace access of one agent
+ * state: given the trusted compiled pipeline and a safe state id it finds
+ * the exact compiled execution-role entry, requires agent semantics (the
+ * state must be declared and of type `agent`), applies the one default
+ * `absent -> "read_write"` for stage roles, and returns the effective
+ * `"read_write" | "read_only"` value. Planning roles carry no workspace
+ * policy and keep the established read-write planning workspace; a bundle
+ * without an orchestration section declares no policy surface at all, so
+ * every agent state keeps the established read-write workspace (a
+ * structural fact, not a guess — the field cannot exist without the
+ * section). The resolver reads nothing but the normalized compiled
+ * metadata — no profile, no prompt, no durable state, no environment, no
+ * caller options — and never mutates the pipeline. The activation layout
+ * planner, the data plane and the runtime adapters all resolve the
+ * workspace access only through this function; there is no second lookup
+ * or default site.
+ *
+ * Provenance is checked before anything else (Proxy traps are never
+ * invoked); an unknown state, a non-agent state or a control role is a
+ * typed `PipelineV2OrchestrationError`. Diagnostics name safe ids only.
+ */
+export function compiledWorkspaceAccessFor(
+  pipeline: ResolvedPipelineV2,
+  stateId: string,
+): PipelineV2WorkspaceAccess {
+  requireResolvedPipelineV2Provenance(pipeline, "compiledWorkspaceAccessFor");
+  if (!isPipelineV2SafeId(stateId)) {
+    throw new PipelineV2OrchestrationError(
+      `compiledWorkspaceAccessFor requires a safe state id, got ${JSON.stringify(stateId)}`,
+    );
+  }
+  const orchestration = pipeline.orchestration;
+  if (orchestration === undefined) {
+    // No orchestration section: no stage policy can exist, so every agent
+    // state keeps the established read-write workspace.
+    return "read_write";
+  }
+  let roleEntry: { role: string; workspace_access?: PipelineV2WorkspaceAccess } | undefined;
+  for (const entry of orchestration.execution_roles) {
+    if (entry.state_id === stateId) {
+      roleEntry = entry;
+      break;
+    }
+  }
+  if (roleEntry === undefined) {
+    const declared = pipeline.states.find((state) => state.id === stateId);
+    throw new PipelineV2OrchestrationError(
+      declared === undefined
+        ? `state ${JSON.stringify(stateId)} is not declared by the pipeline`
+        : `state ${JSON.stringify(stateId)} is a ${declared.type} state; terminal states carry no execution role`,
+    );
+  }
+  if (roleEntry.role === "planning") {
+    // Planning roles carry no workspace_access policy; the planning
+    // workspace is the established read-write one.
+    return "read_write";
+  }
+  if (roleEntry.role !== "stage") {
+    throw new PipelineV2OrchestrationError(
+      `state ${JSON.stringify(stateId)} carries the ${JSON.stringify(roleEntry.role)} role; the workspace access policy applies only to planning and stage agent states`,
+    );
+  }
+  const state = pipeline.states.find((candidate) => candidate.id === stateId);
+  if (state === undefined || state.type !== "agent") {
+    throw new PipelineV2OrchestrationError(
+      `state ${JSON.stringify(stateId)} is not a declared agent state; the workspace access policy applies only to agent states`,
+    );
+  }
+  // The single default: absence stays absence in the compiled metadata and
+  // means the established read-write workspace.
+  return roleEntry.workspace_access ?? "read_write";
+}
+
 export interface PipelineV2StageTemplateSpec {
   readonly id: string;
   readonly entry_state: string;
@@ -2125,7 +2212,15 @@ export interface ActivationOutputPortPlan {
 
 export interface ActivationLayoutPlan {
   readonly state_id: string;
-  readonly project: { readonly target: string; readonly read_only: false };
+  /**
+   * The shared run-owned project workspace mount of this activation: the
+   * fixed `/workspace` target at the state's effective workspace access
+   * (`read_only: true` exactly for a stage agent whose compiled
+   * orchestration entry declares `workspace_access: read_only`; the
+   * established read-write baseline for planning agents, read-write stage
+   * agents and bundles without the policy).
+   */
+  readonly project: { readonly target: string; readonly read_only: boolean };
   readonly inputs_root: string;
   readonly outputs_root: string;
   readonly input_ports: readonly ActivationInputPortPlan[];
@@ -2139,8 +2234,14 @@ export interface ActivationLayoutPlan {
  * preserved, targets are fixed container paths, and every structured value
  * is taken from the deep-frozen loader snapshot, so later mutations of the
  * pipeline object (or of the returned view) cannot change the plan. The
- * plan carries only logical and structural data — no bearers, credentials,
- * env values, host paths, or schema paths.
+ * shared run-owned project is planned at the state's effective workspace
+ * access (the single `compiledWorkspaceAccessFor` owner: read-write for
+ * planning agents, read-write stage agents and bundles without the policy;
+ * read-only for a stage agent whose compiled entry declares
+ * `workspace_access: read_only`), while the activation inputs stay
+ * read-only and the declared activation outputs stay read-write for every
+ * activation. The plan carries only logical and structural data — no
+ * bearers, credentials, env values, host paths, or schema paths.
  *
  * Provenance is checked before any field of the pipeline object is read:
  * the argument must be the exact snapshot object a previous successful
@@ -2175,6 +2276,11 @@ export function planActivationLayout(
   }
   const agentState: ResolvedV2AgentState = state;
 
+  // The project workspace access is resolved through the single effective-
+  // policy owner — the same function the runtime adapters use — so the
+  // logical layout and the issued Session/mount authority always agree.
+  const projectAccess = compiledWorkspaceAccessFor(pipeline, stateId);
+
   const inputPorts: ActivationInputPortPlan[] = agentState.inputs.map((port) =>
     deepFreeze({
       id: port.id,
@@ -2198,7 +2304,10 @@ export function planActivationLayout(
 
   return deepFreeze({
     state_id: stateId,
-    project: deepFreeze({ target: PROJECT_MOUNT_TARGET, read_only: false }),
+    project: deepFreeze({
+      target: PROJECT_MOUNT_TARGET,
+      read_only: projectAccess === "read_only",
+    }),
     inputs_root: ACTIVATION_INPUTS_ROOT,
     outputs_root: ACTIVATION_OUTPUTS_ROOT,
     input_ports: Object.freeze(inputPorts),
@@ -2208,16 +2317,23 @@ export function planActivationLayout(
 }
 
 /**
- * Session capability contracts. Documented here and intentionally not wired
- * into the docker-helper transport yet.
+ * Session capability contracts. Both contracts are wired into the
+ * production docker-helper transport (`pipeline_v2_docker_runtime.ts`
+ * creates the Execution/Tool Session pair per activation and cleans it
+ * exactly once).
  *
  * Execution Session: `type: "execution"`, scope is the run root; used only
  * by the orchestrator to launch workers; its bearer is never passed to a
  * worker in any form.
  * Tool Session: `type: "tool"`, scope is the project only; its bearer is
- * handed to the worker. Nested containers launched through a helper socket
- * cannot reach pipeline inputs/outputs. No wide Tool Session workaround
- * exists.
+ * handed to the worker. The Tool Session's only filesystem root is the
+ * shared run-owned project at the state's effective workspace access —
+ * read-write for the established baseline, read-only for a stage agent
+ * whose compiled orchestration entry declares
+ * `workspace_access: read_only` — so a read-only Tool bearer can neither
+ * see the activation outputs nor obtain a read-write project exposure.
+ * Nested containers launched through a helper socket cannot reach pipeline
+ * inputs/outputs. No wide Tool Session workaround exists.
  *
  * The helper socket projection is NOT part of the session contracts: it
  * happens once, when the worker is launched through the Execution Session,
@@ -2271,6 +2387,14 @@ export const WORKER_LAUNCH_CONTRACT: WorkerLaunchContract = deepFreeze({
 export interface WorkerMountPlan {
   readonly source: "project" | "prepared_activation_inputs" | "activation_outputs";
   readonly target: string;
+  /**
+   * The project entry's access follows the state's effective workspace
+   * access (the single `compiledWorkspaceAccessFor` owner); this constant
+   * records the established read-write baseline shape — the read-write
+   * mount carries no `read_only` key, a read-only stage activation mounts
+   * the same source with `read_only: true`. The activation inputs are
+   * always read-only and the activation outputs always read-write.
+   */
   readonly read_only: boolean;
 }
 

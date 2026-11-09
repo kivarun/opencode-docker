@@ -26,9 +26,15 @@
  * `--filesystem-root PATH=ACCESS`, absolute daemon-visible paths, the
  * workspace always the last positional operand): the Execution Session
  * request is exactly the run root `read_only`, the shared run-owned
- * project `read_write`, and the current activation's outputs
- * `read_write` (fixed order); the Tool Session request is exactly its
- * project workspace `read_write`. No separate inputs root is requested:
+ * project at the state's effective workspace access (the compiled
+ * `workspace_access` policy resolved through the single
+ * `compiledWorkspaceAccessFor` owner: read-write for the established
+ * baseline, read-only for a stage agent that declares it), and the current
+ * activation's outputs `read_write` (fixed order); the Tool Session
+ * request is exactly its project workspace at the same effective access,
+ * so a read-only Tool bearer can neither see the activation outputs nor
+ * obtain a read-write project exposure. No separate inputs root is
+ * requested:
  * the read-only run root already covers the activation inputs and the
  * execution document, and the daemon-normalized immutable snapshot is
  * not required to echo the request verbatim. The narrowing can only
@@ -96,8 +102,11 @@
  * log failures are outcome-neutral, and the bounded in-memory log tail
  * is kept for the durable publication increment. The `POST /run` body
  * preserves the exact request parity with the docker-helper CLI 2.3.1:
- * the same field set and order, the same mount order (project RW,
- * activation inputs RO, activation outputs RW) with clean
+ * the same field set and order, the same mount order (project at the
+ * state's effective workspace access — the read-write baseline keeps the
+ * exact mount shape without the key, a read-only stage adds
+ * `read_only: true` — activation inputs RO, activation outputs RW) with
+ * clean
  * workspace-relative sources verified against the prepared activation,
  * and the same resolved environment values (sorted object keys, matching
  * the CLI's map marshaling) with no ambient env inheritance. Worker
@@ -594,22 +603,12 @@ export function createDockerHelperPipelineV2Runtime(
     // same capture-once discipline as the profile execution snapshots:
     // later mutations of the pipeline object cannot change a running
     // factory, and the policy is never recomputed between the Session
-    // creates and the worker run). Bundles without an orchestration
-    // section — the runtime factory is also exercised directly by tests —
-    // declare no policy surface at all: every agent state keeps the
-    // established read-write workspace. Stage agents resolve through the
-    // one resolver (its single default `absent -> read_write`); planning
-    // agents have no workspace-access policy and keep the established
-    // read-write workspace byte-for-byte.
-    const roleEntry = params.pipeline.orchestration?.execution_roles.find(
-      (entry) => entry.state_id === state.id,
-    );
-    workspaceAccess.set(
-      state.id,
-      roleEntry !== undefined && roleEntry.role === "stage"
-        ? compiledWorkspaceAccessFor(params.pipeline, state.id)
-        : "read_write",
-    );
+    // creates and the worker run). The resolver is total over agent
+    // states: planning roles and bundles without an orchestration section
+    // resolve to the established read-write workspace, stage roles to
+    // their declared value or the resolver's single `absent -> read_write`
+    // default.
+    workspaceAccess.set(state.id, compiledWorkspaceAccessFor(params.pipeline, state.id));
   }
 
   const cli = params.cli;
