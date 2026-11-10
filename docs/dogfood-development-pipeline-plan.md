@@ -93,7 +93,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 1 | Durable stage activation context | Complete (b63c4cf; CI 42043441341) |
 | 2 | Durable profile/model epoch | Complete (8e304bf; CI 42242433550 — build evidence, not test evidence) |
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
-| 4 | Separate development pipeline bundle | Planned |
+| 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Planned |
 | 6 | UI model and implementation based on UAT evidence | Planned |
 
@@ -335,6 +335,45 @@ The first bundle uses one stage and one task. It must:
 
 Automatic task rewriting, arbitrary task scheduling and multi-stage progression
 remain out of scope.
+
+### Implementation note (2026-11-10): Complete as the separate bundle `pipelines/development-v1/`
+
+Shipped as `3c7caa1` (CI run `42831456815` published the
+`sha256:14c7e86a…a42a` orchestrator image; the bundle ships through the existing
+`pipelines/**` watch and wholesale `COPY` with no packaging change). The
+implemented graph is `plan` (planning, `architect`) → `implement` (stage,
+`code`, read-write, `stage_task` delivery) → `review` (stage, `review`,
+read-only) → `review_gate` (deterministic decision, stage role) → accepted →
+`done` / `changes_requested` → `relay` (stage, read-only, zero I/O) → `replan`
+(planning, pointer-only proposal over the durable task ledger) → plan-ready
+handoff → next iteration; reserved decision outcomes route to `failed`. The
+relay correction is structural: a decision execution can never be the stage-wait
+recognizer's last stage agent, so the changes-requested edge routes through a
+dedicated stage-role relay agent whose `completed` transition enters the trusted
+stage wait. Both planning roles declare `stage_wait {continue_stage,
+revise_task}` and `plan_ready {stage_position: 1, initial_budget: 1}`: the fresh
+`run` and a successful `orchestrator revise-task` each continue automatically
+(plain `resume` is only the crash/restart path). The reviewer emits separate
+`verdict`/`feedback` JSON ports — the evaluator validates the fact assignment
+fail-closed, so a combined document is impossible — and the run output is the
+required `review` JSON from `review.feedback`. The bundle declares only the
+profile names `architect`/`code`/`review` and ships no profile definitions.
+
+Contract proven by the permanent suite
+`orchestrator/tests/pipeline_development_v1.test.ts` (15 tests through the
+production loader and the production runner path over the deterministic
+transport): loader/digest contracts (exact state graph, normalized orchestration,
+exhaustive decision table, reserved-outcome routing through the engine resolver,
+workspace-access matrix, digest sensitivity for the trusted policies, pinned
+default-v2 byte-identity) and the full operator chain — accepted success
+(revision 35), the changes-requested waiting boundary (revision 41),
+`continue-stage` iteration 2 with unchanged task bytes (revision 68), one-command
+`revise-task` with the revised stage-task bytes consumed by the next iteration
+(revision 79), and both restart seams (a crash between the relay transition and
+the wait entry; a revise-task interrupted inside the plan-ready continuation)
+recovered by plain `orchestrator resume`. No live-LLM UAT is required for this
+increment: the real-LLM behavior of the five prompts and the end-to-end
+revise-and-Apply dogfood remain Increment 5's boundary.
 
 ## Increment 5: dogfood UAT
 
