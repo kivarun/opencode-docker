@@ -2,7 +2,7 @@
 
 Status: **planned**
 
-Last updated: 2026-11-09
+Last updated: 2026-11-10
 
 Evidence baseline: `6b2ed6263efc8ec990dd6218c02b1434e702bf91`
 
@@ -420,9 +420,15 @@ This file is the durable owner of the agreed ordering and scope.
 These are deliberately unresolved and must not be silently chosen by unrelated
 work:
 
-1. Run-wide versus activation-specific durable profile epochs.
-2. Exact schema spelling for trusted per-state workspace access.
-3. Whether reviewer feedback alone is sufficient for the next iteration or
+1. Whether reviewer feedback alone is sufficient for the next iteration or
    whether a separate operator-authored task revision is always required.
-4. Multi-task scheduling semantics after the single-task dogfood pipeline.
-5. The future UI information architecture.
+2. Multi-task scheduling semantics after the single-task dogfood pipeline.
+3. The future UI information architecture.
+
+Previously open and now resolved by their increments:
+
+- Run-wide versus activation-specific durable profile epochs — resolved by
+  Increment 2 (durable run-wide profile epoch, `8e304bf`).
+- Exact schema spelling for trusted per-state workspace access — resolved by
+  Increment 3 (optional stage-role `workspace_access: read_only | read_write`,
+  `9863be3` + `a37fe9f` + `1fb634c`).
