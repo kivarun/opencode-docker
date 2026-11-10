@@ -2753,7 +2753,7 @@ the child Session capability required for its step.
 
 ## Pipeline bundles
 
-The project ships two default pipeline bundles as data under:
+The project ships three default pipeline bundles as data under:
 
 ```text
 pipelines/default/
@@ -2765,6 +2765,12 @@ pipelines/default-v2/
   pipeline.yaml
   prompts/
   schemas/
+
+pipelines/development-v1/
+  pipeline.yaml
+  prompts/
+  schemas/
+  decisions/
 ```
 
 `pipelines/default` is the v1 diagnostic bundle and the production input of
@@ -2786,6 +2792,53 @@ completes to terminal success in the same command). A bundle without the
 policy stops with the `planReady` outcome and continues through the
 manual `orchestrator resume-plan --stage-id stage-1 --initial-budget 1`.
 There is no automatic stage/budget selection beyond the declared policy.
+
+`pipelines/development-v1` is the separate development pipeline bundle. It is
+never selected by a CLI default (both `run` forms keep the bundled
+default-v2); it is selected with an explicit
+`--pipeline-root /opt/orchestrator/pipelines/development-v1`. Its graph is
+
+```text
+plan (agent, planning, architect)
+  --completed--> implement (agent, stage [development entry], code, read-write)
+     --completed--> review (agent, stage [development], review, read-only)
+        --completed--> review_gate (decision, stage [development])
+           --accepted--> done (terminal success)
+           --changes_requested--> relay (agent, stage [development], read-only)
+              --completed--> replan (agent, planning, architect)
+                 --completed--> implement      [plan-ready seam]
+           --uncovered|inconsistent_facts|invalid_facts--> failed (terminal failure)
+```
+
+The run input is the protected `task` file; the run output is the required
+`review` JSON bound to the reviewer's `feedback` output. The implementer and
+the reviewer receive the exact accepted task bytes through the `stage_task`
+port; the reviewer additionally reads the implementer's accepted result and
+emits two separate JSON documents: the `verdict` (exactly
+`{"accepted": bool}` — the fact assignment of the deterministic decision
+model `decisions/review.yaml`) and the `feedback` (summary plus issues).
+Separate ports are required: the decision evaluator validates the fact
+assignment fail-closed, so a combined document would be rejected by the
+evaluator itself. The gate's transition table is exhaustive — one
+transition per model decision id plus one per reserved outcome, the
+reserved outcomes routing to the `failed` terminal. The
+`changes_requested` edge cannot enter the stage wait directly (the wait
+recognizer requires a stage **agent** as the last execution), so the
+deterministic gate routes to the dedicated stage-role `relay` agent (no
+inputs, no outputs, explicitly read-only workspace) whose `completed`
+transition lands on the replanning planner and enters the trusted
+`stage_wait` (`continue_stage`, `revise_task`) exactly as designed. Both
+planning roles carry the `plan_ready` policy (`stage_position: 1`,
+`initial_budget: 1`), so the first `run` continues into the first stage
+iteration automatically and a successful `orchestrator revise-task`
+invocation continues through the replanned plan-ready checkpoint into the
+next implement/review cycle in one command; `orchestrator resume` is only
+the crash/restart recovery path. The bundle declares the semantic profile
+names `architect`, `code`, and `review` only — the deployment config root
+provides one `profiles/<name>.yaml` per name — and ships no profile
+definitions. The full contract and the permanent suite
+(`orchestrator/tests/pipeline_development_v1.test.ts`) are the bundle's
+binding documentation.
 
 The same loaders and validators accept an external pipeline directory selected by
 the user. Creating a custom pipeline must not require rebuilding the

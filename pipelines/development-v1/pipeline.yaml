@@ -1,0 +1,182 @@
+schema_version: 2
+entry_state: plan
+max_transitions: 64
+
+inputs:
+  - id: task
+    type: file
+    protected: true
+
+outputs:
+  - id: review
+    required: true
+    source:
+      state_output:
+        state: review
+        output: feedback
+
+orchestration:
+  stage_templates:
+    - id: development
+      entry_state: implement
+  execution_roles:
+    - state_id: implement
+      role: stage
+      stage_template: development
+    - state_id: plan
+      role: planning
+      plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+      plan_ready:
+        stage_position: 1
+        initial_budget: 1
+    - state_id: relay
+      role: stage
+      stage_template: development
+      workspace_access: read_only
+    - state_id: replan
+      role: planning
+      plan_output: plan
+      stage_wait:
+        reason: stage_iteration_completed
+        actions:
+          - continue_stage
+          - revise_task
+      plan_ready:
+        stage_position: 1
+        initial_budget: 1
+    - state_id: review
+      role: stage
+      stage_template: development
+      workspace_access: read_only
+    - state_id: review_gate
+      role: stage
+      stage_template: development
+
+states:
+  - id: plan
+    type: agent
+    profile: architect
+    prompt: prompts/plan-initial.md
+    inputs:
+      - id: task
+        source:
+          pipeline_input: task
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
+    timeout_seconds: 1200
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: implement
+
+  - id: implement
+    type: agent
+    profile: code
+    prompt: prompts/implement.md
+    inputs:
+      - id: task
+        source:
+          stage_task: {}
+    outputs:
+      - id: result
+        type: json
+        schema: schemas/agent-result.schema.json
+    timeout_seconds: 3600
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: review
+
+  - id: review
+    type: agent
+    profile: review
+    prompt: prompts/review.md
+    inputs:
+      - id: task
+        source:
+          stage_task: {}
+      - id: implementation_result
+        source:
+          state_output:
+            state: implement
+            output: result
+    outputs:
+      - id: verdict
+        type: json
+        schema: schemas/review-verdict.schema.json
+      - id: feedback
+        type: json
+        schema: schemas/review-feedback.schema.json
+    timeout_seconds: 1800
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: review_gate
+
+  - id: review_gate
+    type: decision
+    model: decisions/review.yaml
+    inputs:
+      - id: verdict
+        source:
+          state_output:
+            state: review
+            output: verdict
+    transitions:
+      - outcome: accepted
+        to: done
+      - outcome: changes_requested
+        to: relay
+      - outcome: uncovered
+        to: failed
+      - outcome: inconsistent_facts
+        to: failed
+      - outcome: invalid_facts
+        to: failed
+
+  - id: relay
+    type: agent
+    profile: review
+    prompt: prompts/relay.md
+    inputs: []
+    outputs: []
+    timeout_seconds: 600
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: replan
+
+  - id: replan
+    type: agent
+    profile: architect
+    prompt: prompts/plan-revise.md
+    inputs:
+      - id: review_feedback
+        source:
+          state_output:
+            state: review
+            output: feedback
+    outputs:
+      - id: plan
+        type: json
+        schema: schemas/plan.schema.json
+    timeout_seconds: 1200
+    max_attempts: 1
+    transitions:
+      - outcome: completed
+        to: implement
+
+  - id: done
+    type: terminal
+    result: success
+
+  - id: failed
+    type: terminal
+    result: failed

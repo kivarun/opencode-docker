@@ -1,0 +1,19 @@
+schema_version: 1
+facts:
+  - id: accepted
+decisions:
+  - id: accepted
+  - id: changes_requested
+relations: []
+constraints: []
+rules:
+  - id: accept
+    when:
+      fact: accepted
+      equals: true
+    decision: accepted
+  - id: request_changes
+    when:
+      fact: accepted
+      equals: false
+    decision: changes_requested

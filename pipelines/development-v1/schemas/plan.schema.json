@@ -1,0 +1,45 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "stages", "new_tasks"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "run_plan_proposal" },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "template", "tasks"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "template": { "type": "string", "minLength": 1 },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "depends_on"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "depends_on": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "new_tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "body"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "body": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
