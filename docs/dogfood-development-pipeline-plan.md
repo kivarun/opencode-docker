@@ -2,7 +2,7 @@
 
 Status: **planned**
 
-Last updated: 2026-11-10
+Last updated: 2026-11-12
 
 Evidence baseline: `6b2ed6263efc8ec990dd6218c02b1434e702bf91`
 
@@ -94,8 +94,15 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 2 | Durable profile/model epoch | Complete (8e304bf; CI 42242433550 — build evidence, not test evidence) |
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
-| 5 | Real dogfood UAT with revision and Apply | Planned |
+| 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
 | 6 | UI model and implementation based on UAT evidence | Planned |
+
+Drift-control record (2026-11-12): the plan contains no formal Complete-gate
+for an increment's successor. Per explicit operator decision, Increment 6 is
+permitted to proceed while Increment 5 is incomplete-with-attempts, provided
+the Increment 5 final state and the carried findings below are recorded in
+this file before dependent implementation begins (this commit is that
+record).
 
 Do not combine adjacent increments merely because they touch the same runner or
 state schema. Each increment needs its own red-before evidence, contract,
@@ -406,6 +413,59 @@ Capture:
 - registered-project fingerprints before review and before Apply;
 - UI actions that were unclear, missing or unnecessarily difficult.
 
+### Final state (2026-11-12): Incomplete with attempts
+
+Status is final. Three UAT attempts were launched under the frozen r5
+protocol (`uat-inc5-1/2/3`); attempt 4 is excluded as verdict fishing — a
+re-roll over unchanged frozen assets would select the convenient outcome of
+the combined model implementation/review process, not corrected evidence.
+The completion protocol, Project Apply, the A/B verification matrix, the
+production commit/push/CI and the whole delivery tail were not executed.
+
+Evidence split from the attempts:
+
+- Proven (durable/verified evidence): plan-ready auto-continuation; stage
+  generation/iteration; trusted stage-wait entry; the full revise-task
+  revision-2 intervention chain through the CLI; fail-closed failure handling
+  at every model deviation; profile/config identity (the durable profile
+  epoch verified against config-root digests); the actual reviewer Tool
+  session's issued snapshot showing the read-only project.
+- Not proven: the live kernel-denial probe of the read-only reviewer during
+  an Increment 5 review window; any browser/UI interaction; the Project
+  Changes/content review/Apply/recovery live leg; the delivery tail.
+
+## Findings carried from Increment 5
+
+Two findings are record-only here; neither is implemented by this amendment.
+
+**Finding A — non-deterministic task-revision boundary.** The
+stage-revision gate is decided by the reviewer's `accepted` /
+`changes_requested` verdict over locally-judged partial revisions; identical
+frozen inputs through independent implementer/reviewer executions produced
+opposite gate outcomes, and the evidence does not isolate reviewer verdict
+variability from implementer-output differences. This finding is routed to a
+**separate future design increment (no number)**: the preferred policy
+direction is a deterministic operator-controlled boundary, but the exact
+topology and action contract are **not selected** — the existing wait
+contract offers only `continue_stage`/`revise_task` and provides no operator
+action that terminally accepts a stage after a deterministic wait, so a
+naive rerouting could deadlock; a new durable terminal operator action or a
+different completion contract may be required. A **separate preflight is
+required** before any design or implementation. This finding sharpens open
+decision 1 without resolving it.
+
+**Finding B — browser/UI reachability.** The control-plane HTTP service binds
+inside the orchestrator container and docker-helper provides no port
+publishing, so the shipped browser UI was never reachable during the UAT
+(no browser/UI interaction coverage exists in the Increment 5 evidence).
+Browser reachability is the **prerequisite of the Increment 6 baseline
+browser exercise**, and therefore blocks the IA design and the
+implementation; it does **not** block this amendment. Exactly one read-only
+reachability probe of an operator-side forwarder is authorized after this
+commit: GET-only surface (`GET /`, `GET /ui/app.js`, `GET /v1/projects`),
+no run creation, no mutation routes, no Apply, no UAT-tree changes; a failed
+probe stops for review.
+
 ## Increment 6: UI after dogfood
 
 Design the operator UI from the dogfood workflow rather than extending the
@@ -463,6 +523,10 @@ work:
    whether a separate operator-authored task revision is always required.
 2. Multi-task scheduling semantics after the single-task dogfood pipeline.
 3. The future UI information architecture.
+
+Note (2026-11-12): decision 1 is sharpened by Finding A (see "Findings
+carried from Increment 5"); decisions 1–3 remain open and are not resolved
+by that referred finding or by this record.
 
 Previously open and now resolved by their increments:
 
