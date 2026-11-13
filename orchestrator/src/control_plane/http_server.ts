@@ -165,6 +165,7 @@ interface ParsedRoute {
     | "fresh_run"
     | "inspect"
     | "events"
+    | "identity"
     | "logs_list"
     | "logs_execution"
     | "project_changes"
@@ -341,6 +342,16 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
     }
     return { kind: "events", projectId: null, runId };
   }
+  if (matchesShape(["v1", "runs", "*", "identity"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the identity route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    return { kind: "identity", projectId: null, runId };
+  }
   if (matchesShape(["v1", "runs", "*", "logs"])) {
     if (shapeMethodMismatch("GET")) {
       return new ControlPlaneHttpRequestError("method_not_allowed", "the logs route accepts GET only");
@@ -461,6 +472,8 @@ export function statusForControlPlaneFailure(failure: { readonly layer: string; 
       case "payload_too_large":
         return 413;
       case "stale_observation":
+        return 409;
+      case "stale_snapshot":
         return 409;
       case "project_apply_disabled":
         return 409;
@@ -807,6 +820,113 @@ export function parseEventsQuery(
     return new ControlPlaneHttpRequestError("invalid_request", "the events query carries an unknown field");
   }
   return { after, limit };
+}
+
+/**
+ * The identity query of one run's read-only durable-identity page: an
+ * optional non-negative safe integer record cursor (default 0), the
+ * REQUIRED revision pin for every continuation (`after > 0`; optional on
+ * the first page and whenever given it must equal the loaded snapshot's
+ * revision) and an optional positive safe integer limit (default 100,
+ * maximum 200). The raw query string is parsed strictly with the
+ * identity grammar: no percent-encoding, no bare keys, no duplicates, no
+ * empty values, no sign, fraction or exponent, and no unknown fields.
+ * Grammar violations are `invalid_request`; cursor/revision
+ * contract violations are `invalid_cursor` — a `stale_snapshot` mismatch
+ * is NEVER decided here (the loaded snapshot is authoritative and the
+ * check belongs to the dispatch after the projection load).
+ */
+export function parseIdentityQuery(
+  search: string,
+):
+  | { readonly after: number; readonly revision: number | null; readonly limit: number | null }
+  | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { after: 0, revision: null, limit: null };
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the identity query must not carry encoded components");
+  }
+  let after: number | null = null;
+  let revision: number | null = null;
+  let limit: number | null = null;
+  const decimal = (value: string): number | null => {
+    if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed)) {
+      return null;
+    }
+    return parsed;
+  };
+  for (const part of search.split("&")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) {
+      return new ControlPlaneHttpRequestError("invalid_request", "every identity query field must carry exactly one value");
+    }
+    const key = part.slice(0, separator);
+    const value = part.slice(separator + 1);
+    if (key === "after") {
+      if (after !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the identity query fields must be unique");
+      }
+      const parsed = decimal(value);
+      if (parsed === null) {
+        if (/^-[0-9]+$/.test(value) || value === "-0") {
+          return new ControlPlaneHttpRequestError("invalid_cursor", "the identity query after must be a non-negative safe integer");
+        }
+        return new ControlPlaneHttpRequestError("invalid_request", "the identity query after must be a non-negative safe integer");
+      }
+      after = parsed;
+      continue;
+    }
+    if (key === "revision") {
+      if (revision !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the identity query fields must be unique");
+      }
+      const parsed = decimal(value);
+      if (parsed === null) {
+        if (value === "0" || /^-[0-9]+$/.test(value) || value === "-0") {
+          return new ControlPlaneHttpRequestError("invalid_cursor", "the identity query revision must be a positive safe integer");
+        }
+        return new ControlPlaneHttpRequestError("invalid_request", "the identity query revision must be a positive safe integer");
+      }
+      if (parsed === 0) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", "the identity query revision must be a positive safe integer");
+      }
+      revision = parsed;
+      continue;
+    }
+    if (key === "limit") {
+      if (limit !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the identity query fields must be unique");
+      }
+      const parsed = decimal(value);
+      if (parsed === null) {
+        if (value === "0" || /^-[0-9]+$/.test(value) || value === "-0") {
+          return new ControlPlaneHttpRequestError("invalid_cursor", "the identity query limit must be a positive safe integer up to 200");
+        }
+        return new ControlPlaneHttpRequestError("invalid_request", "the identity query limit must be a positive safe integer up to 200");
+      }
+      if (parsed === 0 || parsed > 200) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", "the identity query limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      continue;
+    }
+    return new ControlPlaneHttpRequestError("invalid_request", "the identity query carries an unknown field");
+  }
+  if (after === null) {
+    after = 0;
+  }
+  if (after > 0 && revision === null) {
+    return new ControlPlaneHttpRequestError("invalid_cursor", "a continuation identity cursor requires its revision pin");
+  }
+  return { after, revision, limit };
 }
 
 /**
@@ -1176,6 +1296,8 @@ export function projectControlPlaneCommandResult(
     projection.kind === "inspectFailure" ||
     projection.kind === "events" ||
     projection.kind === "eventsFailure" ||
+    projection.kind === "identity" ||
+    projection.kind === "identityFailure" ||
     projection.kind === "logs" ||
     projection.kind === "logsExecution" ||
     projection.kind === "logsChunk" ||
@@ -1460,6 +1582,66 @@ export interface EventsProjection {
   readonly next_after: number | null;
 }
 
+/** The versioned durable-identity page projection of one run (P-3). */
+export interface IdentityProjection {
+  readonly schema_version: 1;
+  readonly kind: "identity";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly after: number;
+  readonly records: readonly unknown[];
+  readonly next_after: number | null;
+}
+
+/**
+ * The one projection builder for a verified schemaVersion-1 identity
+ * page: the records are copied without any new classification; no
+ * identity projection carries a filesystem path, so there is no run root
+ * to drop. A typed `invalid_cursor` CLI failure is the request-layer 400
+ * envelope (the existing request-layer reason, reused — no second
+ * owner); a typed `stale_snapshot` CLI failure is the ONE new
+ * request-layer mapping, the 409 envelope (the loaded snapshot's revision
+ * moved between pages — no partial page is ever returned); every other
+ * correctly received identity failure follows the events precedent (a
+ * correctly received failed outcome as a 200 command result).
+ */
+export function projectControlPlaneIdentity(
+  result: OrchestratorCallResult,
+): IdentityProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "identityFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    if (projection.reason === "stale_snapshot") {
+      return { layer: "request", reason: "stale_snapshot" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "identity" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "identity",
+    run_id: projection.runId,
+    revision: projection.revision,
+    after: projection.after,
+    records: projection.records,
+    next_after: projection.nextAfter,
+  };
+}
+
 /**
  * The one projection builder for a verified schemaVersion-1 events
  * projection: the event entries are copied without any new
@@ -1626,6 +1808,7 @@ function projectionResponse(
     | ProjectsDiscoveryProjection
     | RunsDiscoveryProjection
     | EventsProjection
+    | IdentityProjection
     | WorkerLogsProjection
     | ProjectChangesProjection
     | ProjectChangeContentProjection
@@ -1801,14 +1984,15 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       return respondUi(requestFailure(parsed.reason));
     }
     if (
-      parsed.kind !== "projects" &&
-      parsed.kind !== "runs" &&
-      parsed.kind !== "events" &&
-      parsed.kind !== "logs_list" &&
-      parsed.kind !== "logs_execution" &&
-      parsed.kind !== "project_changes" &&
-      parsed.kind !== "project_change_content" &&
-      url.search !== ""
+      (parsed.kind !== "projects" &&
+        parsed.kind !== "runs" &&
+        parsed.kind !== "events" &&
+        parsed.kind !== "identity" &&
+        parsed.kind !== "logs_list" &&
+        parsed.kind !== "logs_execution" &&
+        parsed.kind !== "project_changes" &&
+        parsed.kind !== "project_change_content" &&
+        url.search !== "")
     ) {
       return respondUi(requestFailure("invalid_path"));
     }
@@ -1838,6 +2022,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind === "projects" ||
       parsed.kind === "runs" ||
       parsed.kind === "events" ||
+      parsed.kind === "identity" ||
       parsed.kind === "logs_list" ||
       parsed.kind === "logs_execution" ||
       parsed.kind === "project_changes" ||
@@ -1911,6 +2096,21 @@ async function dispatchControlPlaneRoute(
       };
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneEvents(result));
+    }
+    case "identity": {
+      const query = parseIdentityQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "identity",
+        runId,
+        ...(query.after === 0 ? {} : { after: query.after }),
+        ...(query.revision === null ? {} : { revision: query.revision }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneIdentity(result));
     }
     case "logs_list": {
       const query = parseLogsListQuery(deps.discoveryQuery ?? "");

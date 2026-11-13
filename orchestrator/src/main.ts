@@ -98,6 +98,10 @@ import {
   type PipelineV2InspectOutcome,
 } from "./pipeline_v2_inspect.ts";
 import {
+  identityPipelineV2Run,
+  type PipelineV2IdentityOutcome,
+} from "./pipeline_v2_identity.ts";
+import {
   eventsPipelineV2Run,
   type PipelineV2EventsOutcome,
 } from "./pipeline_v2_events.ts";
@@ -146,6 +150,7 @@ export interface CliIo {
   respondPipelineV2Wait: typeof respondPipelineV2Wait;
   inspectPipelineV2Run: typeof inspectPipelineV2Run;
   eventsPipelineV2Run: typeof eventsPipelineV2Run;
+  identityPipelineV2Run: typeof identityPipelineV2Run;
   logsPipelineV2Run: typeof logsPipelineV2Run;
   projectChangesPipelineV2Run: typeof projectChangesPipelineV2Run;
   projectChangeContentPipelineV2Run: typeof projectChangeContentPipelineV2Run;
@@ -185,6 +190,7 @@ function productionCliIo(): CliIo {
     respondPipelineV2Wait,
     inspectPipelineV2Run,
     eventsPipelineV2Run,
+    identityPipelineV2Run,
     logsPipelineV2Run,
     projectChangesPipelineV2Run,
     projectChangeContentPipelineV2Run,
@@ -222,7 +228,7 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "logs", "project-changes", "project-change-content", "project-apply", "project-apply-inspect"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "identity", "logs", "project-changes", "project-change-content", "project-apply", "project-apply-inspect"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -238,6 +244,7 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "resume-plan" &&
     command !== "inspect" &&
     command !== "events" &&
+    command !== "identity" &&
     command !== "logs" &&
     command !== "project-changes" &&
     command !== "project-change-content" &&
@@ -298,6 +305,16 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // events production API exactly once. No SubprocessCliRunner command
     // dependencies and no mutating command deps object are built for it.
     return await runPipelineV2EventsCommand(parsed, io);
+  }
+  if (parsed.kind === "identity") {
+    // The read-only pipeline v2 identity command: like inspect and
+    // events, it resolves only the state-root projection (no helper
+    // configuration, no Launcher credential, no auth, no subprocess, no
+    // signal registration, no mutation lock, no durable change) and
+    // invokes the identity production API exactly once. No
+    // SubprocessCliRunner command dependencies and no mutating command
+    // deps object are built for it.
+    return await runPipelineV2IdentityCommand(parsed, io);
   }
   if (parsed.kind === "logs") {
     // The read-only pipeline v2 worker logs command: like inspect and
@@ -804,6 +821,55 @@ async function runPipelineV2EventsCommand(
   } else {
     io.writeError(
       `orchestrator: events failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+/**
+ * The read-only pipeline v2 identity command: parse already done. Only
+ * the state-root projection is resolved inside the protected
+ * CLI-configuration boundary; the helper configuration is deliberately
+ * NOT resolved because identity needs no Launcher credential, no Docker
+ * Helper transport, no mutation lock and no signal lifecycle. Any
+ * resolution failure is exit 2 with the usage text and the production API
+ * never called. The path-free success page (or the typed path-free
+ * failure) is the only stdout document in JSON mode; the human mode
+ * prints one content-free stderr summary line.
+ */
+async function runPipelineV2IdentityCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "identity" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2IdentityOutcome = await io.identityPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    after: parsed.after,
+    ...(parsed.revision === null ? {} : { revision: parsed.revision }),
+    limit: parsed.limit,
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: identity ok (run ${outcome.runId}, revision ${outcome.revision}, records ${outcome.records.length}, next-after ${outcome.nextAfter === null ? "none" : outcome.nextAfter})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: identity failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

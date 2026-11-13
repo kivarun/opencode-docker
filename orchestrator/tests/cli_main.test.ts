@@ -35,6 +35,10 @@ import {
   type PipelineV2EventsOutcome,
 } from "../src/pipeline_v2_events.ts";
 import {
+  identityPipelineV2Run,
+  type PipelineV2IdentityOutcome,
+} from "../src/pipeline_v2_identity.ts";
+import {
   type PipelineV2LogsOutcome,
 } from "../src/pipeline_v2_logs.ts";
 import {
@@ -123,6 +127,9 @@ function makeIo(): Recorder {
     resumePipelineV2PlanningRunPlan: (async () => {
       throw new Error("fake resumePipelineV2PlanningRunPlan not configured");
     }) as unknown as CliIo["resumePipelineV2PlanningRunPlan"],
+    identityPipelineV2Run: (async () => {
+      throw new Error("fake identityPipelineV2Run not configured");
+    }) as unknown as CliIo["identityPipelineV2Run"],
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],
@@ -4442,4 +4449,89 @@ test("project-apply-inspect reports the missing-operation failure and JSON mode"
   const parsed = JSON.parse(jsonRec.out[0] as string) as Record<string, unknown>;
   expect(parsed["kind"]).toBeUndefined();
   expect(parsed["status"]).toBe("applied");
+}, 15000);
+
+// --- identity dispatcher ------------------------------------------------------
+
+function identityReport(overrides: Record<string, unknown> = {}): PipelineV2IdentityOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    revision: 12,
+    after: 0,
+    records: [
+      { record: "plan_revision", index: 1, revision: 1, sha256: "a".repeat(64), previous_sha256: null, origin_execution: 1 },
+    ],
+    nextAfter: null,
+    ...overrides,
+  } as PipelineV2IdentityOutcome;
+}
+
+test("identity dispatches exactly once with the parsed pagination and uses no runner", async () => {
+  const rec = makeIo();
+  const identityCalls: unknown[] = [];
+  rec.io.identityPipelineV2Run = (async (options: unknown) => {
+    identityCalls.push(options);
+    return identityReport();
+  }) as unknown as CliIo["identityPipelineV2Run"];
+  const exit = await runCli(
+    ["identity", "--run-id", "run_x", "--config-root", "/cfg", "--after", "4", "--revision", "12", "--limit", "9"],
+    rec.io,
+  );
+  expect(exit).toBe(0);
+  expect(identityCalls).toHaveLength(1);
+  expect(identityCalls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root", after: 4, revision: 12, limit: 9 });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: identity ok (run run_x, revision 12, records 1, next-after none)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("identity reports the failure line without the state root", async () => {
+  const failureRec = makeIo();
+  failureRec.io.identityPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    reason: "run_not_found",
+  })) as unknown as CliIo["identityPipelineV2Run"];
+  const failureExit = await runCli(["identity", "--run-id", "run_x", "--config-root", "/cfg"], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: identity failed (run run_x, reason run_not_found)"]);
+  expect(failureRec.out).toHaveLength(0);
+}, 15000);
+
+test("identity JSON mode prints exactly one path-free document and nothing else on stdout", async () => {
+  const rec = makeIo();
+  rec.io.identityPipelineV2Run = (async () => identityReport()) as unknown as CliIo["identityPipelineV2Run"];
+  const exit = await runCli(["identity", "--run-id", "run_x", "--config-root", "/cfg", "--json"], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  expect(rec.out[0]?.endsWith("\n")).toBe(true);
+  const parsed = JSON.parse(rec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "after", "exitCode", "nextAfter", "ok", "records", "revision", "runId", "schemaVersion",
+  ]);
+  expect(parsed["schemaVersion"]).toBe(1);
+  expect("runRoot" in parsed).toBe(false);
+  expect("state" in parsed).toBe(false);
+  expect(rec.err).toHaveLength(0);
+}, 15000);
+
+test("identity resolver failure is exit 2 with the API never called", async () => {
+  const rec = makeIo();
+  rec.io.resolveStateRootProjection = () => {
+    throw new Error("no state root configured");
+  };
+  let called = 0;
+  rec.io.identityPipelineV2Run = (async () => {
+    called += 1;
+    return identityReport();
+  }) as unknown as CliIo["identityPipelineV2Run"];
+  const exit = await runCli(["identity", "--run-id", "run_x", "--config-root", "/cfg"], rec.io);
+  expect(exit).toBe(2);
+  expect(called).toBe(0);
+  expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
+  expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
 }, 15000);

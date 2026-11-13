@@ -71,6 +71,13 @@ export type OrchestratorCommand =
       readonly limit?: number;
     }
   | {
+      readonly kind: "identity";
+      readonly runId: string;
+      readonly after?: number;
+      readonly revision?: number;
+      readonly limit?: number;
+    }
+  | {
       readonly kind: "logs";
       readonly runId: string;
       readonly executionIndex?: number;
@@ -193,6 +200,7 @@ interface CapturedCommand {
   readonly taskFile: string;
   readonly actionId: string;
   readonly after: number | null;
+  readonly revision: number | null;
   readonly limit: number | null;
   readonly executionIndex: number | null;
   readonly offset: number | null;
@@ -316,6 +324,7 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
     taskFile: "",
     actionId: "",
     after: null,
+    revision: null,
     executionIndex: null,
     offset: null,
     limit: null,
@@ -448,6 +457,35 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
       const limitField = optionalField(command, "limit");
       const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
       return { ...empty, kind, runId: expectSafeIdField(command, "runId", "runId"), after, limit };
+    }
+    case "identity": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "after" && key !== "revision" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on identity command");
+        }
+      }
+      if (!Object.hasOwn(command, "runId")) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "missing field runId on identity command");
+      }
+      const afterField = optionalField(command, "after");
+      const after = afterField.present ? expectNonNegativeIntegerField({ after: afterField.value }, "after", "after") : null;
+      const revisionField = optionalField(command, "revision");
+      const revision = revisionField.present
+        ? expectPositiveIntegerField({ revision: revisionField.value }, "revision", "revision")
+        : null;
+      const limitField = optionalField(command, "limit");
+      const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
+      if (after !== null && after > 0 && revision === null) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "a continuation identity cursor requires its revision pin");
+      }
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        after,
+        revision,
+        limit,
+      };
     }
     case "logs": {
       for (const key of Object.keys(command)) {
@@ -687,6 +725,12 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
     case "events":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
       if (captured.after !== null) argv.push("--after", String(captured.after));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
+      break;
+    case "identity":
+      argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
+      if (captured.after !== null) argv.push("--after", String(captured.after));
+      if (captured.revision !== null) argv.push("--revision", String(captured.revision));
       if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       break;
     case "logs":

@@ -110,6 +110,19 @@ export interface ParsedPipelineEventsArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineIdentityArgs {
+  readonly kind: "identity";
+  readonly runId: string;
+  readonly configRoot: string;
+  /** The exclusive cursor (default 0; parsed canonical non-negative decimal). */
+  readonly after: number;
+  /** The revision pin (required for every after > 0); null when absent. */
+  readonly revision: number | null;
+  /** The page record limit (default 100, maximum 200). */
+  readonly limit: number;
+  readonly json: boolean;
+}
+
 export interface ParsedPipelineProjectChangesArgs {
   readonly kind: "project-changes";
   readonly runId: string;
@@ -145,6 +158,7 @@ export type ParsedCommand =
   | ParsedPipelineResumePlanArgs
   | ParsedPipelineInspectArgs
   | ParsedPipelineEventsArgs
+  | ParsedPipelineIdentityArgs
   | ParsedPipelineLogsArgs
   | ParsedPipelineProjectChangesArgs
   | ParsedPipelineProjectChangeContentArgs
@@ -181,6 +195,12 @@ export function usage(): string {
     "               schema-v8 commit history projected as public event schema 1",
     "               with an exclusive revision cursor - no worker, no Launcher",
     "               credential, no mutation lock and no durable change",
+    "  identity     read-only versioned durable identity of one durable run: the",
+    "               deterministic revision-pinned record stream over generations,",
+    "               iterations, execution roles, task bindings, grants, waits,",
+    "               task/plan ledgers and accepted-output metadata - no worker,",
+    "               no Launcher credential, no mutation lock, no artifact content",
+    "               and no durable change",
     "  logs         read-only versioned worker logs of one durable run: the",
     "               schema-v9 bindings of the agent executions projected as",
     "               public logs schema 1 with bounded base64 content chunks -",
@@ -509,6 +529,43 @@ export function usage(): string {
   "  writes, and a repeated read over an unchanged run is byte-identical.",
   "  Worker stdout/stderr and durable log capture are not part of this",
   "  command.",
+  "",
+  "identity flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID        the run id of the durable run to project; required; a",
+  "                          safe identifier (letters, digits, '_', '.', '-', at most",
+  "                          128 characters)",
+  "  --config-root PATH      non-empty absolute configuration root; required by the",
+  "                          shared command grammar but not used by identity (no",
+  "                          profile is loaded, no Launcher credential is read)",
+  "  --after N               exclusive record cursor into the deterministic identity",
+  "                          stream (default 0); a cursor beyond the stream fails",
+  "                          with reason 'invalid_cursor'",
+  "  --revision R            revision pin of the loaded snapshot; REQUIRED for",
+  "                          every --after > 0 (a continuation without it is",
+  "                          'invalid_cursor'); whenever given it must equal the",
+  "                          loaded revision, otherwise the read fails with reason",
+  "                          'stale_snapshot' before any cursor-range check",
+  "  --limit N               page limit (default 100, maximum 200); a page also",
+  "                          stops before exceeding the fixed per-page byte cap",
+  "                          computed on the serialized CLI document",
+  "  --json                  print exactly one JSON page document on stdout (no",
+  "                          progress lines); errors and diagnostics go to stderr;",
+  "                          the exit code is 1 only when the identity read itself",
+  "                          could not be performed, never because of the run's",
+  "                          own state.",
+  "",
+  "  identity projects the durable identity of the run - stage generations with",
+  "  their flattened iterations, settled execution roles and phases, per-",
+  "  execution task bindings, grants, the full wait journal with declared actions",
+  "  and recorded responses, the task and plan revision ledgers, and accepted",
+  "  output metadata (digests only, never content) - as a deterministic",
+  "  revision-pinned record stream of twelve closed record kinds. Every record",
+  "  carries its in-band 'record' discriminator; the stream order is the durable",
+  "  append-only order; task/plan bodies, log content, prompts, run outputs and",
+  "  filesystem paths are never published, and no document - success or failure -",
+  "  carries a filesystem path. A live run mutating between pages fails the next",
+  "  continuation with 'stale_snapshot'; the client restarts from the first",
+  "  page. mutating commands run without identity.",
   "",
   "logs flags (production pipeline v2, read-only):",
   "  --run-id SAFE_ID        the run id of the durable run to read; required; a",
@@ -1072,6 +1129,164 @@ function parseEventsArgs(argv: string[]): ParsedPipelineEventsArgs {
     runId,
     configRoot,
     after: after ?? 0,
+    limit: limit ?? 100,
+    json,
+  };
+}
+
+/**
+ * Parses the read-only pipeline v2 identity command. The user-facing
+ * contract: `--run-id` (safe-id validated) and `--config-root`
+ * (non-empty absolute path) are required singletons; `--after`
+ * (non-negative decimal safe integer, default 0 — the exclusive identity
+ * stream cursor), `--revision` (the revision pin; REQUIRED for every
+ * `--after > 0`, optional on the first page; positive decimal safe
+ * integer) and `--limit` (positive decimal safe integer, default 100,
+ * maximum 200) are optional singletons; `--json` is an optional
+ * singleton. Identity performs no Launcher authentication, no Docker
+ * Helper transport, no mutation lock and no durable change: it accepts
+ * no `--launcher-id`, no fresh-run flag, no intervention flag, no
+ * state-root flag and no internal index/digest flag — every unknown flag
+ * or positional argument is rejected. The identity projection comes only
+ * from the durable schema-v12 state through the single shared read-only
+ * load chain; no identity document ever carries a filesystem path.
+ */
+function parseIdentityArgs(argv: string[]): ParsedPipelineIdentityArgs {
+  let runId: string | null = null;
+  let configRoot: string | null = null;
+  let after: number | null = null;
+  let revision: number | null = null;
+  let limit: number | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      try {
+        expectSafeId(value, "--run-id");
+      } catch (cause) {
+        throw new Error(
+          `--run-id must be a safe identifier: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+      runId = value;
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--after" || arg.startsWith("--after=")) {
+      const { value, next } = parseValue(argv, i, "--after");
+      requireSingleton(after, "--after");
+      after = parseNonNegativeDecimalSafeInteger(value, "--after");
+      i = next;
+    } else if (arg === "--revision" || arg.startsWith("--revision=")) {
+      const { value, next } = parseValue(argv, i, "--revision");
+      requireSingleton(revision, "--revision");
+      revision = parsePositiveDecimalSafeInteger(value, "--revision");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > 200) {
+        throw new Error("--limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+      throw new Error(
+        "identity does not accept --launcher-id; it performs no Launcher authentication",
+      );
+    } else if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+      throw new Error(
+        "identity does not accept --pipeline-root; the pipeline comes only from the durable state",
+      );
+    } else if (arg === "--project" || arg.startsWith("--project=")) {
+      throw new Error("identity does not accept --project; the run-owned project copy already exists");
+    } else if (arg === "--input" || arg.startsWith("--input=")) {
+      throw new Error("identity does not accept --input; the run-owned input snapshot already exists");
+    } else if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+      throw new Error("identity does not accept --workspace; no worker is launched by identity");
+    } else if (arg === "--image" || arg.startsWith("--image=")) {
+      throw new Error("identity does not accept --image; no worker is launched by identity");
+    } else if (arg === "--profile" || arg.startsWith("--profile=")) {
+      throw new Error("identity does not accept --profile; no profile is loaded by identity");
+    } else if (arg === "--task" || arg.startsWith("--task=")) {
+      throw new Error("identity does not accept --task; there is no task input on an identity read");
+    } else if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+      throw new Error(
+        "identity does not accept --stage-id; stage selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+      throw new Error(
+        "identity does not accept --initial-budget; budget selection is operator policy of 'resume-plan'",
+      );
+    } else if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+      throw new Error(
+        "identity does not accept --wait-index; wait selection belongs to the response and intervention commands",
+      );
+    } else if (arg === "--action" || arg.startsWith("--action=")) {
+      throw new Error(
+        "identity does not accept --action; it changes nothing and records no response",
+      );
+    } else if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+      throw new Error(
+        "identity does not accept --additional-iterations; grants belong to 'continue-stage'",
+      );
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      throw new Error("identity does not accept --task-id; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+      throw new Error("identity does not accept --task-file; task revisions belong to 'revise-task'");
+    } else if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+      throw new Error("identity does not accept --task-body; task revisions belong to 'revise-task'");
+    } else if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+      throw new Error(
+        "identity does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable",
+      );
+    } else if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+      throw new Error(
+        "identity does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable",
+      );
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for identity");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for identity");
+  }
+  return {
+    kind: "identity",
+    runId,
+    configRoot,
+    after: after ?? 0,
+    revision,
     limit: limit ?? 100,
     json,
   };
@@ -1809,7 +2024,7 @@ function parseProjectApplyInspectArgs(argv: string[]): ParsedPipelineProjectAppl
 }
 
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "logs" | "project-changes" | "project-change-content" | "project-apply" | "project-apply-inspect",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "identity" | "logs" | "project-changes" | "project-change-content" | "project-apply" | "project-apply-inspect",
   argv: string[],
 ): ParsedCommand {
   if (kind === "run") {
@@ -1835,6 +2050,9 @@ export function parseCommand(
   }
   if (kind === "events") {
     return parseEventsArgs(argv);
+  }
+  if (kind === "identity") {
+    return parseIdentityArgs(argv);
   }
   if (kind === "logs") {
     return parseLogsArgs(argv);

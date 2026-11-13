@@ -36,6 +36,8 @@ import {
   projectControlPlaneInspect,
   projectControlPlaneEvents,
   parseEventsQuery,
+  projectControlPlaneIdentity,
+  parseIdentityQuery,
   startControlPlaneHttpService,
   statusForControlPlaneFailure,
   type RunningControlPlaneHttpService,
@@ -151,6 +153,7 @@ describe("control-plane HTTP: route parser", () => {
     expect(routeReason("/v1/runs/r1/respond", "POST")).toBe("ok:respond");
     expect(routeReason("/v1/runs/r1/events", "GET")).toBe("ok:events");
     expect(routeReason("/v1/runs/r1/changes", "GET")).toBe("ok:project_changes");
+    expect(routeReason("/v1/runs/r1/identity", "GET")).toBe("ok:identity");
   });
 
   test("method mismatches on known shapes are method_not_allowed", () => {
@@ -162,6 +165,7 @@ describe("control-plane HTTP: route parser", () => {
       ["/v1/runs/r1/respond", "PUT"],
       ["/v1/runs/r1/events", "POST"],
       ["/v1/runs/r1/changes", "POST"],
+      ["/v1/runs/r1/identity", "POST"],
     ] as const) {
       expect(routeReason(path, method)).toBe("method_not_allowed");
     }
@@ -182,11 +186,43 @@ describe("control-plane HTTP: route parser", () => {
     }
   });
 
+  test("the versioned route inventory is exactly 17 routes at the parser", () => {
+    for (const route of [
+      ["/v1/projects/project-a/runs", "POST", "fresh_run"],
+      ["/v1/projects", "GET", "projects"],
+      ["/v1/runs", "GET", "runs"],
+      ["/v1/runs/r1", "GET", "inspect"],
+      ["/v1/runs/r1/resume", "POST", "resume"],
+      ["/v1/runs/r1/resume-plan", "POST", "resume_plan"],
+      ["/v1/runs/r1/continue-stage", "POST", "continue_stage"],
+      ["/v1/runs/r1/revise-task", "POST", "revise_task"],
+      ["/v1/runs/r1/respond", "POST", "respond"],
+      ["/v1/runs/r1/events", "GET", "events"],
+      ["/v1/runs/r1/identity", "GET", "identity"],
+      ["/v1/runs/r1/logs", "GET", "logs_list"],
+      ["/v1/runs/r1/logs/1", "GET", "logs_execution"],
+      ["/v1/runs/r1/changes", "GET", "project_changes"],
+      ["/v1/runs/r1/changes/3/content", "GET", "project_change_content"],
+      ["/v1/runs/r1/project-applies/op-1", "POST", "project_apply_post"],
+      ["/v1/runs/r1/project-applies/op-1", "GET", "project_apply_get"],
+    ] as const) {
+      const [path, method, kind] = route;
+      const parsed = parseControlPlaneRoute(path, method);
+      if (parsed instanceof ControlPlaneHttpRequestError) {
+        throw new Error(`expected ${method} ${path} to parse`);
+      }
+      expect(parsed.kind, path).toBe(kind);
+    }
+    expect(routeReason("/v1/runs/r1/id", "GET")).toBe("unknown_route");
+    expect(routeReason("/v1/runs/r1/change", "GET")).toBe("unknown_route");
+  });
+
   test("unknown routes, extra segments and unsafe ids are refused", () => {
     for (const [path, method] of [
       ["/v1/other/r1", "GET"],
       ["/v1/runs/r1/resume/extra", "POST"],
       ["/v1/runs/r1/unknown-action", "POST"],
+      ["/v1/runs/r1/identity/extra", "GET"],
       ["/v2/runs/r1", "GET"],
     ] as const) {
       expect(routeReason(path, method)).toBe("unknown_route");
@@ -448,6 +484,107 @@ describe("control-plane HTTP: status table and projections", () => {
       }),
     );
     expect(projected).toEqual({ layer: "transport", reason: "internal_error" });
+  });
+
+  test("identity projections copy the identity page path-free", () => {
+    const projection = {
+      kind: "identity" as const,
+      schemaVersion: 1 as const,
+      runId: "r1",
+      revision: 9,
+      after: 3,
+      records: [{ index: 1, record: "plan_revision", revision: 1, task_count: 1, origin_execution: 1 }],
+      nextAfter: 4,
+    };
+    const projected = projectControlPlaneIdentity(asCallResult({ ok: true, projection })) as unknown as Record<string, unknown>;
+    expect(projected).toEqual({
+      schema_version: 1,
+      kind: "identity",
+      run_id: "r1",
+      revision: 9,
+      after: 3,
+      records: [{ index: 1, record: "plan_revision", revision: 1, task_count: 1, origin_execution: 1 }],
+      next_after: 4,
+    });
+    expect(JSON.stringify(projected)).not.toContain("runRoot");
+    expect(JSON.stringify(projected)).not.toContain("/secret/");
+    expect(
+      projectControlPlaneIdentity(asCallResult({ ok: true, projection: { kind: "identity", schemaVersion: 2, runId: "r1", revision: 1, after: 0, records: [], nextAfter: null } })),
+    ).toEqual({ layer: "transport", reason: "internal_error" });
+  });
+
+  test("identity invalid_cursor and stale_snapshot are request-layer, everything else a 200 command result", () => {
+    expect(
+      projectControlPlaneIdentity(asCallResult({ ok: true, projection: { kind: "identityFailure", exitCode: 1, runId: "r1", reason: "invalid_cursor" } })),
+    ).toEqual({ layer: "request", reason: "invalid_cursor" });
+    expect(
+      projectControlPlaneIdentity(asCallResult({ ok: true, projection: { kind: "identityFailure", exitCode: 1, runId: "r1", reason: "stale_snapshot" } })),
+    ).toEqual({ layer: "request", reason: "stale_snapshot" });
+    const failure = projectControlPlaneIdentity(
+      asCallResult({ ok: true, projection: { kind: "identityFailure", exitCode: 1, runId: "r1", reason: "run_state_invalid" } }),
+    ) as unknown as Record<string, unknown>;
+    expect(failure).toEqual({
+      schema_version: 1,
+      kind: "command_result",
+      run_id: "r1",
+      outcome: "failed",
+      exit_code: 1,
+      reason: "run_state_invalid",
+    });
+    expect(projectControlPlaneIdentity(asCallResult({ ok: false, failure: { reason: "spawn_failed", expectedRunId: "r1" } }))).toEqual({
+      layer: "transport",
+      reason: "spawn_failed",
+    });
+  });
+
+  test("the identity query parser accepts after, revision and limit with the exact grammar", () => {
+    expect(parseIdentityQuery("")).toEqual({ after: 0, revision: null, limit: null });
+    expect(parseIdentityQuery("?revision=7")).toEqual({ after: 0, revision: 7, limit: null });
+    expect(parseIdentityQuery("?after=5&revision=7&limit=9")).toEqual({ after: 5, revision: 7, limit: 9 });
+    expect(parseIdentityQuery("?after=0&revision=1")).toEqual({ after: 0, revision: 1, limit: null });
+    expect(parseIdentityQuery("?after=0")).toEqual({ after: 0, revision: null, limit: null });
+    expect(parseIdentityQuery("?limit=200")).toEqual({ after: 0, revision: null, limit: 200 });
+    const requestRejected: Array<[string, string]> = [
+      ["?after=1.5", "non-negative safe integer"],
+      ["?after=1e2", "non-negative safe integer"],
+      ["?after=+1", "non-negative safe integer"],
+      ["?after=01", "non-negative safe integer"],
+      ["?after", "exactly one value"],
+      ["?after=", "non-negative safe integer"],
+      ["?after=1&after=2", "unique"],
+      ["?revision=2.5", "positive safe integer"],
+      ["?revision=+1", "positive safe integer"],
+      ["?revision=1&revision=2", "unique"],
+      ["?limit=2.5", "positive safe integer"],
+      ["?limit=1&limit=2", "unique"],
+      ["?ghost=1", "unknown field"],
+      ["?after=%31", "encoded"],
+    ];
+    const cursorRejected: Array<[string, string]> = [
+      ["?after=5", "continuation identity cursor requires its revision pin"],
+      ["?after=-1", "non-negative safe integer"],
+      ["?revision=0", "positive safe integer"],
+      ["?revision=-1", "positive safe integer"],
+      ["?limit=0", "positive safe integer"],
+      ["?limit=201", "up to 200"],
+      ["?after=5", "continuation identity cursor requires its revision pin"],
+    ];
+    for (const [query, message] of requestRejected) {
+      const parsed = parseIdentityQuery(query);
+      if (!(parsed instanceof ControlPlaneHttpRequestError)) {
+        throw new Error(`expected rejection for ${query}`);
+      }
+      expect(parsed.message, query).toContain(message);
+      expect(parsed.reason, query).toBe("invalid_request");
+    }
+    for (const [query, message] of cursorRejected) {
+      const parsed = parseIdentityQuery(query);
+      if (!(parsed instanceof ControlPlaneHttpRequestError)) {
+        throw new Error(`expected rejection for ${query}`);
+      }
+      expect(parsed.message, query).toContain(message);
+      expect(parsed.reason, query).toBe("invalid_cursor");
+    }
   });
 });
 
@@ -1887,6 +2024,255 @@ describe("control-plane HTTP: lifecycle events route", () => {
     expect(response.body).not.toContain("state");
     expect(response.body).not.toContain("boundary");
     expect(response.body).not.toContain(envRoot);
+  });
+});
+
+describe("control-plane HTTP: identity route", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-identity-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const storeRoot = join(envRoot, "bindings");
+  const projectDir = join(envRoot, "project");
+  let registry: Awaited<ReturnType<typeof loadControlPlaneProjectRegistry>>;
+  const calls: unknown[] = [];
+  let nextResult: OrchestratorCallResult = {
+    ok: true,
+    projection: {
+      kind: "identity",
+      schemaVersion: 1,
+      runId: "identity-run",
+      revision: 5,
+      after: 3,
+      records: [
+        { index: 1, record: "plan_revision", revision: 1, task_count: 1, origin_execution: 1 },
+        { index: 2, record: "wait", wait_index: 1, state_id: "planning", reason: "stage_complete", transition_count: 3 },
+      ],
+      nextAfter: null,
+    },
+  };
+
+  beforeAll(async () => {
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    registry = await loadControlPlaneProjectRegistry(registryPath);
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "identity-run", projectId: "project-a" });
+    await store.claim({ runId: "gone-project-run", projectId: "project-removed" });
+  }, 20000);
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  const callHandler = async (path: string, method = "GET", headers: Record<string, string> = {}, body?: string): Promise<RawResponse> => {
+    const fakeClient = {
+      run: async (command: unknown): Promise<OrchestratorCallResult> => {
+        calls.push(command);
+        return nextResult;
+      },
+    } as unknown as OrchestratorSubprocessClient;
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: fakeClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+    };
+    const request = new Request(`http://127.0.0.1:4711${path}`, {
+      method,
+      headers: { host: "127.0.0.1:4711", ...headers },
+      ...(body === undefined ? {} : { body }),
+    });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    return { status: response.status, headers: Object.fromEntries(response.headers.entries()), body: await response.text() };
+  };
+  const get = (path: string, headers: Record<string, string> = {}): Promise<RawResponse> => callHandler(path, "GET", headers);
+
+  test("a bound run serves the identity page with the exact schema and no path", async () => {
+    const response = await get("/v1/runs/identity-run/identity");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(body).toEqual({
+      schema_version: 1,
+      kind: "identity",
+      run_id: "identity-run",
+      revision: 5,
+      after: 3,
+      records: [
+        { index: 1, record: "plan_revision", revision: 1, task_count: 1, origin_execution: 1 },
+        { index: 2, record: "wait", wait_index: 1, state_id: "planning", reason: "stage_complete", transition_count: 3 },
+      ],
+      next_after: null,
+    });
+    expect(response.body).not.toContain("run_root");
+    expect(response.body).not.toContain(envRoot);
+    expect(response.headers["content-type"]).toBe("application/json");
+    expect(calls).toEqual([{ kind: "identity", runId: "identity-run" }]);
+  });
+
+  test("the query cursor, revision pin and limit travel as typed command fields", async () => {
+    calls.length = 0;
+    await get("/v1/runs/identity-run/identity?after=5&revision=5&limit=2");
+    expect(calls).toEqual([{ kind: "identity", runId: "identity-run", after: 5, revision: 5, limit: 2 }]);
+    calls.length = 0;
+    await get("/v1/runs/identity-run/identity?limit=2&after=5&revision=5");
+    expect(calls).toEqual([{ kind: "identity", runId: "identity-run", after: 5, revision: 5, limit: 2 }]);
+    calls.length = 0;
+    await get("/v1/runs/identity-run/identity?after=0");
+    expect(calls).toEqual([{ kind: "identity", runId: "identity-run" }]);
+    calls.length = 0;
+    await get("/v1/runs/identity-run/identity");
+    expect(calls).toEqual([{ kind: "identity", runId: "identity-run" }]);
+  });
+
+  test("a missing continuation revision pin is the request-layer 400 invalid_cursor", async () => {
+    calls.length = 0;
+    const response = await get("/v1/runs/identity-run/identity?after=5");
+    expect(response.status).toBe(400);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_cursor" });
+    expect(calls).toEqual([]);
+  });
+
+  test("a typed stale_snapshot mismatch is the request-layer 409 before any cursor check", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "identityFailure", exitCode: 1, runId: "identity-run", reason: "stale_snapshot" },
+    };
+    const response = await get("/v1/runs/identity-run/identity?after=999&revision=1");
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "stale_snapshot" });
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "identity",
+        schemaVersion: 1,
+        runId: "identity-run",
+        revision: 5,
+        after: 0,
+        records: [],
+        nextAfter: null,
+      },
+    };
+  });
+
+  test("a typed invalid_cursor from the child is the request-layer 400 too", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "identityFailure", exitCode: 1, runId: "identity-run", reason: "invalid_cursor" },
+    };
+    const response = await get("/v1/runs/identity-run/identity?after=999&revision=5");
+    expect(response.status).toBe(400);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_cursor" });
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "identity",
+        schemaVersion: 1,
+        runId: "identity-run",
+        revision: 5,
+        after: 0,
+        records: [],
+        nextAfter: null,
+      },
+    };
+  });
+
+  test("other identity failures follow the command-result precedent", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "identityFailure", exitCode: 1, runId: "identity-run", reason: "run_state_invalid" },
+    };
+    const response = await get("/v1/runs/identity-run/identity");
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      schema_version: 1,
+      kind: "command_result",
+      run_id: "identity-run",
+      outcome: "failed",
+      exit_code: 1,
+      reason: "run_state_invalid",
+    });
+    expect(JSON.parse(response.body)).not.toHaveProperty("run_root");
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "identity",
+        schemaVersion: 1,
+        runId: "identity-run",
+        revision: 5,
+        after: 0,
+        records: [],
+        nextAfter: null,
+      },
+    };
+  });
+
+  test("an unbound CLI-created run fails closed before any subprocess", async () => {
+    calls.length = 0;
+    const response = await get("/v1/runs/unbound-run/identity");
+    expect(response.status).toBe(404);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "binding_not_found" });
+    expect(calls).toEqual([]);
+  });
+
+  test("a removed registry project stays project_unavailable with the binding kept", async () => {
+    const response = await get("/v1/runs/gone-project-run/identity");
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ schema_version: 1, kind: "error", layer: "binding", reason: "project_unavailable" });
+  });
+
+  test("the identity route accepts GET only and no body", async () => {
+    const post = await callHandler("/v1/runs/identity-run/identity", "POST", { "content-type": "application/json" }, "{}");
+    expect(post.status).toBe(405);
+    const withBody = await callHandler("/v1/runs/identity-run/identity", "GET", { "content-length": "5" }, "hello");
+    expect(withBody.status).toBe(400);
+  });
+
+  test("the loopback gates apply to the identity route unchanged", async () => {
+    const host = await callHandler("/v1/runs/identity-run/identity", "GET", { host: "evil.example" });
+    expect(host.status).toBe(400);
+    expect(JSON.parse(host.body).reason).toBe("invalid_host");
+    const origin = await callHandler("/v1/runs/identity-run/identity", "GET", { origin: "http://evil.example" });
+    expect(origin.status).toBe(400);
+    expect(JSON.parse(origin.body).reason).toBe("invalid_origin");
+  });
+
+  test("the identity response never carries host paths or canaries", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "identity",
+        schemaVersion: 1,
+        runId: "identity-run",
+        revision: 5,
+        after: 3,
+        records: [{ index: 4, record: "execution_agent", execution_index: 1, state_id: "coder", phase: "cleanup_completed", execution_role: "stage", iteration_index: 1, session_ids: null, stage_task: null, worker_log: null, duration: null }],
+        nextAfter: null,
+      },
+    };
+    const response = await get("/v1/runs/identity-run/identity");
+    expect(response.status).toBe(200);
+    expect(response.body).not.toContain(CANARY);
+    expect(response.body).not.toContain(envRoot);
+    expect(response.body).not.toContain("state.json");
   });
 });
 

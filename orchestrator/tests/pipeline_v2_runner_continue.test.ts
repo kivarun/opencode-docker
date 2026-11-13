@@ -1327,6 +1327,9 @@ test("cumulative budget through the CLI: the unsafe request exits 1 without writ
     resumePipelineV2PlanningRunPlan: (async () => {
       throw new Error("fake not configured");
     }) as unknown as CliIo["resumePipelineV2PlanningRunPlan"],
+    identityPipelineV2Run: (async () => {
+      throw new Error("fake identityPipelineV2Run not configured");
+    }) as unknown as CliIo["identityPipelineV2Run"],
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],

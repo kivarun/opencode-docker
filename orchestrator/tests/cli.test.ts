@@ -1709,3 +1709,118 @@ test("usage documents both explicit Project Apply commands", () => {
   expect(text).toContain("the cooperative project lock does not protect");
   expect(text).toContain("against editors or VCS tools that ignore flock");
 });
+
+// --- identity parser ----------------------------------------------------------
+
+test("identity parses the full grammar with both flag forms and defaults", () => {
+  const full = parseCommand("identity", [
+    "--run-id", "rid-x_1",
+    "--config-root", "/cfg",
+    "--after", "10",
+    "--revision", "66",
+    "--limit", "7",
+  ]);
+  if (full.kind !== "identity") {
+    throw new Error("expected identity");
+  }
+  expect(full.runId).toBe("rid-x_1");
+  expect(full.configRoot).toBe("/cfg");
+  expect(full.after).toBe(10);
+  expect(full.revision).toBe(66);
+  expect(full.limit).toBe(7);
+  expect(full.json).toBe(false);
+
+  const equals = parseCommand("identity", ["--run-id=rid", "--config-root=/cfg", "--after=3", "--revision=9", "--limit=200"]);
+  if (equals.kind !== "identity") {
+    throw new Error("expected identity");
+  }
+  expect(equals.after).toBe(3);
+  expect(equals.revision).toBe(9);
+  expect(equals.limit).toBe(200);
+
+  const defaults = parseCommand("identity", ["--run-id", "rid", "--config-root", "/cfg"]);
+  if (defaults.kind !== "identity") {
+    throw new Error("expected identity");
+  }
+  expect(defaults.after).toBe(0);
+  expect(defaults.revision).toBeNull();
+  expect(defaults.limit).toBe(100);
+});
+
+test("identity accepts boundary numerics and rejects the same malformed families as events", () => {
+  const base = ["--run-id", "rid", "--config-root", "/c"];
+  const zeroAfter = parseCommand("identity", [...base, "--after", "0"]);
+  if (zeroAfter.kind !== "identity") throw new Error("expected identity");
+  expect(zeroAfter.revision).toBeNull();
+
+  const maxRevision = parseCommand("identity", [...base, "--revision", String(Number.MAX_SAFE_INTEGER)]);
+  if (maxRevision.kind !== "identity") throw new Error("expected identity");
+  expect(maxRevision.revision).toBe(Number.MAX_SAFE_INTEGER);
+
+  for (const value of ["-1", "+1", "1.5", "1e2", "01", " ", "0x1"]) {
+    expect(() => parseCommand("identity", [...base, "--after", value])).toThrow(/--after must be a non-negative decimal integer/);
+    expect(() => parseCommand("identity", [...base, "--revision", value])).toThrow(/--revision must be a positive decimal integer/);
+    expect(() => parseCommand("identity", [...base, "--limit", value])).toThrow(/--limit must be a positive decimal integer/);
+  }
+  expect(() => parseCommand("identity", [...base, "--after", "" ])).toThrow(/--after requires a value/);
+  expect(() => parseCommand("identity", [...base, "--revision", ""])).toThrow(/--revision requires a value/);
+  expect(() => parseCommand("identity", [...base, "--limit", String(Number.MAX_SAFE_INTEGER)])).toThrow(/--limit must be a positive safe integer up to 200/);
+  expect(() => parseCommand("identity", [...base, "--limit", "201"])).toThrow(/--limit must be a positive safe integer up to 200/);
+  expect(() => parseCommand("identity", [...base, "--after", String(Number.MAX_SAFE_INTEGER + 1)])).toThrow(/--after exceeds the safe integer range/);
+});
+
+test("identity rejects missing, duplicate and value-less flags plus every forbidden flag", () => {
+  expect(() => parseCommand("identity", [])).toThrow(/--run-id SAFE_ID is required for identity/);
+  expect(() => parseCommand("identity", ["--run-id", "rid"])).toThrow(/--config-root ABS is required for identity/);
+  expect(() => parseCommand("identity", ["--run-id", "a", "--run-id", "b", "--config-root", "/c"])).toThrow(
+    /--run-id may be given at most once/,
+  );
+  expect(() => parseCommand("identity", ["--run-id", "rid", "--config-root", "/c", "--revision", "1", "--revision", "2"])).toThrow(
+    /--revision may be given at most once/,
+  );
+  expect(() => parseCommand("identity", ["--run-id", "rid", "--config-root", "/c", "--revision"])).toThrow(
+    /--revision requires a value/,
+  );
+  expect(() => parseCommand("identity", ["--run-id", "rid", "--config-root", "/c", "--json", "--json"])).toThrow(
+    /--json may be given at most once/,
+  );
+  const base = ["--run-id", "rid", "--config-root", "/c"];
+  const rejected: Array<[string, string]> = [
+    ["--launcher-id", "identity does not accept --launcher-id"],
+    ["--pipeline-root", "identity does not accept --pipeline-root"],
+    ["--project", "identity does not accept --project"],
+    ["--input", "identity does not accept --input"],
+    ["--workspace", "no worker is launched by identity"],
+    ["--image", "no worker is launched by identity"],
+    ["--profile", "no profile is loaded by identity"],
+    ["--task", "there is no task input on an identity read"],
+    ["--stage-id", "stage selection is operator policy of 'resume-plan'"],
+    ["--initial-budget", "budget selection is operator policy of 'resume-plan'"],
+    ["--wait-index", "wait selection belongs to the response and intervention commands"],
+    ["--action", "it changes nothing and records no response"],
+    ["--additional-iterations", "grants belong to 'continue-stage'"],
+    ["--task-id", "task revisions belong to 'revise-task'"],
+    ["--task-file", "task revisions belong to 'revise-task'"],
+    ["--task-body", "task revisions belong to 'revise-task'"],
+    ["--state-root", "set the ORCHESTRATOR_STATE_ROOT environment variable"],
+    ["--daemon-state-root", "set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable"],
+  ];
+  for (const [flag, message] of rejected) {
+    expect(() => parseCommand("identity", [...base, flag, "x"]), `${flag} value form`).toThrow(message);
+    expect(() => parseCommand("identity", [...base, `${flag}=x`]), `${flag}= form`).toThrow(message);
+  }
+  expect(() => parseCommand("identity", [...base, "--ghost"])).toThrow("unknown argument: --ghost");
+  expect(() => parseCommand("identity", [...base, "stray"])).toThrow("unknown argument: stray");
+});
+
+test("usage documents the read-only identity command", () => {
+  const text = usage();
+  expect(text).toContain("identity     read-only versioned durable identity of one durable run");
+  expect(text).toContain("identity flags (production pipeline v2, read-only)");
+  expect(text).toContain("--run-id SAFE_ID        the run id of the durable run to project");
+  expect(text).toContain("revision pin of the loaded snapshot; REQUIRED for");
+  expect(text).toContain("'stale_snapshot' before any cursor-range check");
+  expect(text).toContain("no artifact content");
+  expect(text).toContain("twelve closed record kinds");
+  expect(text).toContain("no document - success or failure -");
+});

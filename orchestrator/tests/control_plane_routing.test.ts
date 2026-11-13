@@ -333,6 +333,38 @@ test("events rejects hostile and invalid command shapes", () => {
   expectRoutingError({ kind: "events", runId: "r", ghost: 1 } as never, "invalid_command");
 });
 
+test("identity routes the pagination flags with the revision pin", () => {
+  const plain = routeOrchestratorCommand({ kind: "identity", runId: "cp-run-1" }, ROUTING_CONFIG);
+  expect(plain.argv).toEqual(["identity", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config", "--json"]);
+  expect(plain.expectedRunId).toBe("cp-run-1");
+  const full = routeOrchestratorCommand({ kind: "identity", runId: "cp-run-1", after: 4, revision: 12, limit: 9 }, ROUTING_CONFIG);
+  expect(full.argv).toEqual([
+    "identity", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config",
+    "--after", "4", "--revision", "12", "--limit", "9", "--json",
+  ]);
+  const zeroAfter = routeOrchestratorCommand({ kind: "identity", runId: "cp-run-1", after: 0, revision: 66 }, ROUTING_CONFIG);
+  expect(zeroAfter.argv).toEqual([
+    "identity", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config",
+    "--after", "0", "--revision", "66", "--json",
+  ]);
+  const onlyRunId = routeOrchestratorCommand({ kind: "identity", runId: "cp-run-1" }, ROUTING_CONFIG);
+  expect(onlyRunId.argv).toEqual(["identity", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config", "--json"]);
+});
+
+test("identity rejects hostile and invalid command shapes", () => {
+  expectRoutingError({ kind: "identity", runId: "../escape" }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "" }, "invalid_command");
+  expectRoutingError({ kind: "identity" } as never, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", after: -1 }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", after: 1.5 }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", after: 1, revision: 0 }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", after: 1, revision: 1.5 }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", after: 1, limit: 0 }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", after: 1, limit: 201 }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", after: 1 }, "invalid_command");
+  expectRoutingError({ kind: "identity", runId: "r", ghost: 1 } as never, "invalid_command");
+});
+
 test("logs routes the execution scalars only and rejects hostile shapes", () => {
   const list = routeOrchestratorCommand({ kind: "logs", runId: "cp-run-1" }, ROUTING_CONFIG);
   expect(list.argv).toEqual(["logs", "--run-id", "cp-run-1", "--config-root", "/opt/orchestrator/config", "--json"]);

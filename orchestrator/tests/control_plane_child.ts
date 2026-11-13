@@ -243,6 +243,37 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
     exitCode: 0,
   },
   events_failure: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", runRoot: null, reason: "invalid_cursor" })}\n`, exitCode: 1 },
+  identity_report: {
+    stdout: `${JSON.stringify({
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 1,
+      runId: "cp-child-run",
+      after: 3,
+      revision: 5,
+      records: [
+        { index: 1, record: "plan_revision", revision: 1, task_count: 1, origin_execution: 1 },
+        { index: 2, record: "wait", wait_index: 1, state_id: "planning", reason: "stage_complete", transition_count: 3 },
+      ],
+      nextAfter: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  identity_report_v2: {
+    stdout: `${JSON.stringify({
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 2,
+      runId: "cp-child-run",
+      after: 3,
+      revision: 5,
+      records: [],
+      nextAfter: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  identity_failure: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "stale_snapshot" })}\n`, exitCode: 1 },
+  identity_failure_with_root: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", runRoot: "/tmp/leak", reason: "invalid_cursor" })}\n`, exitCode: 1 },
   logs_list: {
     stdout: `${JSON.stringify({
       ok: true,

@@ -151,6 +151,31 @@ export type OrchestratorEventsProjection =
     };
 
 /**
+ * The projected result of one `identity` call: the exact schemaVersion-1
+ * identity page (the records pass through as opaque frozen JSON — the
+ * client never re-classifies, re-orders or re-derives them; no identity
+ * document, success or failure, carries a filesystem path, so there is no
+ * run root to drop), or the typed identity failure outcome of the CLI
+ * itself with a reason from the closed identity vocabulary.
+ */
+export type OrchestratorIdentityProjection =
+  | {
+      readonly kind: "identity";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly after: number;
+      readonly records: readonly OrchestratorJsonValue[];
+      readonly nextAfter: number | null;
+    }
+  | {
+      readonly kind: "identityFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly reason: string;
+    };
+
+/**
  * The projected result of one `logs` call: the versioned worker-logs
  * projection (the metadata union passes through as frozen JSON; the raw
  * `runRoot` is dropped before the HTTP layer; `dataBase64` is the only
@@ -279,6 +304,7 @@ export type OrchestratorCallResult =
         | OrchestratorRunProjection
         | OrchestratorInspectProjection
         | OrchestratorEventsProjection
+        | OrchestratorIdentityProjection
         | OrchestratorLogsProjection
         | OrchestratorProjectChangesProjection
         | OrchestratorProjectChangeContentProjection
@@ -421,6 +447,19 @@ const EVENTS_REPORT_KEYS = [
   "schemaVersion",
 ] as const;
 const EVENTS_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId", "runRoot"] as const;
+/** The identity CLI success document: path-free — no runRoot member exists. */
+const IDENTITY_REPORT_KEYS = [
+  "after",
+  "exitCode",
+  "nextAfter",
+  "ok",
+  "records",
+  "revision",
+  "runId",
+  "schemaVersion",
+] as const;
+/** The identity CLI failure document: path-free — no runRoot member exists. */
+const IDENTITY_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId"] as const;
 const CHANGES_REPORT_KEYS = [
   "changes",
   "exitCode",
@@ -735,6 +774,81 @@ function parseOutcomeDocument(
           runId,
           revision: parsed["revision"] as number,
           events: deepFreezeValue(parsed["events"] as OrchestratorJsonValue[]),
+          nextAfter: nextAfterValue as number | null,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "identity") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, IDENTITY_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "identity failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "identity failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "identityFailure",
+            exitCode: 1,
+            runId,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, IDENTITY_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "identity report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "identity projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "identity revision must be a positive safe integer");
+      }
+      if (!isNonNegativeSafeInteger(parsed["after"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "identity after must be a non-negative safe integer");
+      }
+      if (!Array.isArray(parsed["records"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "identity records must be an array");
+      }
+      const nextAfterValue = parsed["nextAfter"];
+      if (
+        nextAfterValue !== null &&
+        (typeof nextAfterValue !== "number" || !Number.isSafeInteger(nextAfterValue) || nextAfterValue < 0)
+      ) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "identity nextAfter must be a non-negative safe integer or null");
+      }
+      // No identity document carries a filesystem path: there is no run
+      // root to drop, and the projection proves the success document's
+      // exact own-key set above.
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "identity",
+          schemaVersion: 1,
+          runId,
+          revision: parsed["revision"] as number,
+          after: parsed["after"] as number,
+          records: deepFreezeValue(parsed["records"] as OrchestratorJsonValue[]),
           nextAfter: nextAfterValue as number | null,
         }),
       };

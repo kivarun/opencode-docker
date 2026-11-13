@@ -675,6 +675,57 @@ test("projects an events failure outcome without classifying the reason", async 
   expect(result.projection.runRoot).toBeNull();
 }, 15000);
 
+// --- identity projection -------------------------------------------------------
+
+function identityScenario(scenario: string): { kind: "identity"; runId: string } {
+  return { kind: "identity", runId: `sc-${scenario}` };
+}
+
+test("projects the identity page path-free with the records frozen", async () => {
+  const client = makeClient();
+  const result = await client.run(identityScenario("identity-report"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "identity") throw new Error("unreachable");
+  expect(projection.schemaVersion).toBe(1);
+  expect(projection.runId).toBe("cp-child-run");
+  expect(projection.revision).toBe(5);
+  expect(projection.after).toBe(3);
+  expect(projection.nextAfter).toBeNull();
+  expect(projection.records).toEqual([
+    { index: 1, record: "plan_revision", revision: 1, task_count: 1, origin_execution: 1 },
+    { index: 2, record: "wait", wait_index: 1, state_id: "planning", reason: "stage_complete", transition_count: 3 },
+  ]);
+  expect(Object.isFrozen(projection)).toBe(true);
+  expect(Object.isFrozen(projection.records)).toBe(true);
+  expect(JSON.stringify(projection)).not.toContain("runRoot");
+  expect(JSON.stringify(projection)).not.toContain("/tmp/");
+}, 15000);
+
+test("an identity schemaVersion other than 1 is unsupported_contract", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(identityScenario("identity-report-v2")), "unsupported_contract");
+}, 15000);
+
+test("projects an identity failure outcome without classifying the reason", async () => {
+  const client = makeClient();
+  const result = await client.run(identityScenario("identity-failure"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  expect(result.projection.kind).toBe("identityFailure");
+  if (result.projection.kind !== "identityFailure") throw new Error("unreachable");
+  expect(result.projection.exitCode).toBe(1);
+  expect(result.projection.reason).toBe("stale_snapshot");
+  expect(Object.isFrozen(result.projection)).toBe(true);
+  expect(JSON.stringify(result.projection)).not.toContain("runRoot");
+}, 15000);
+
+test("an identity failure document carrying a filesystem path is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(identityScenario("identity-failure-with-root")), "unexpected_output_shape");
+}, 15000);
+
 // --- logs projection -----------------------------------------------------------
 
 function logsScenario(scenario: string): { kind: "logs"; runId: string } {
