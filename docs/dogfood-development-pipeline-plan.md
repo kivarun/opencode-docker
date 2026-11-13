@@ -2,7 +2,7 @@
 
 Status: **planned**
 
-Last updated: 2026-11-12
+Last updated: 2026-11-13
 
 Evidence baseline: `6b2ed6263efc8ec990dd6218c02b1434e702bf91`
 
@@ -95,7 +95,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
-| 6 | UI model and implementation based on UAT evidence | Planned |
+| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites and implementation not started |
 
 Drift-control record (2026-11-12): the plan contains no formal Complete-gate
 for an increment's successor. Per explicit operator decision, Increment 6 is
@@ -483,6 +483,53 @@ The UI model should be based on the observed primary operations:
 
 No UI contract is selected by this plan yet.
 
+### Accepted UI architecture (2026-11-13)
+
+The **run-centric operational workbench** from
+`increment-6-ui-ia-proposal.md` is accepted as the UI architecture. The
+accepted artifact is exactly 783 lines, SHA-256
+`b3fa11660282ca1cbc7c90db179a3b40a9fa559e492c299a2e7420872e62a955`
+(corrective-pass revision, kept as operator evidence outside the repository;
+this entry is a contract summary, not a duplicate of the artifact). The
+frozen baseline friction report
+(`increment-6-ui-baseline-friction-report.md`) and the reachability probe
+report are evidence inputs to it.
+
+Contract essentials:
+
+- the UI renders only fields with an established owner from the artifact's
+  field-level source matrix — classes `[E]` (shipped route serves it),
+  `[G]` (derivable without ambiguity through a named, permanently tested
+  pure derivation) and `[P-k]` (bounded prerequisite projection);
+- `[X]`-classified fields are never computed, substituted with heuristics
+  or guessed (they are rendered as typed absence/unavailable states, e.g.
+  the generic `Unavailable in effective configuration` for the disabled
+  Apply capability; the run-list status filter and proactive busy chips
+  are removed);
+- P-1 (plan/task revision artifact content), P-2 (accepted reviewer
+  output content) and P-3 (durable-identity projection: stage position/
+  template, settled roles, task bindings, closure reasons, historical wait
+  actions/responses/grant amounts, ledger enumeration, decision records)
+  remain **separate bounded prerequisite increments**, each with its own
+  preflight — bound to the artifact's digest-domain owners (§4a) — and its
+  own review; wire formats are not designed by the IA artifact;
+- dependent UI slices S1–S8 cannot start before their named prerequisites
+  are landed; S1–S3 are presentation-only over `[E]`/`[G]` fields, S4 adds
+  the generic `respond` support, S5–S7 wait for P-3/P-1/P-2, S8 uses only
+  shipped routes;
+- generic `respond` for non-reserved declared action IDs is preserved
+  (the IA routes by the shipped contract, never narrows to one pipeline;
+  the reserved `continue_stage`/`revise_task` ids stay on their dedicated
+  endpoints);
+- security/authority topology is unchanged: operator-side forwarder
+  listening only on loopback `127.0.0.1:<port>`, the container server on
+  `0.0.0.0:<same-port>` (not itself the loopback boundary), browser
+  Host/Origin authority `127.0.0.1:<port>`, foreign Host/Origin failing
+  closed before route parsing.
+
+Implementation has not started; no prerequisite (P-1/P-2/P-3) preflight has
+started.
+
 ## Deferred work
 
 The following are intentionally deferred until after the first development
@@ -522,11 +569,16 @@ work:
 1. Whether reviewer feedback alone is sufficient for the next iteration or
    whether a separate operator-authored task revision is always required.
 2. Multi-task scheduling semantics after the single-task dogfood pipeline.
-3. The future UI information architecture.
 
 Note (2026-11-12): decision 1 is sharpened by Finding A (see "Findings
-carried from Increment 5"); decisions 1–3 remain open and are not resolved
+carried from Increment 5"); decisions 1–2 remain open and are not resolved
 by that referred finding or by this record.
+
+Trace-note (2026-11-13): the former open decision 3 — the future UI
+information architecture — is resolved by the accepted IA artifact of
+2026-11-13 recorded under "Increment 6: Accepted UI architecture" (783-line
+proposal, SHA-256 `b3fa1166…0872e62a955`). Finding A and decisions 1–2
+(reviewer-feedback semantics, multi-task scheduling) remain unresolved.
 
 Previously open and now resolved by their increments:
 
