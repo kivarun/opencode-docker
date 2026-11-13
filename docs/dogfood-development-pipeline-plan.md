@@ -481,8 +481,6 @@ The UI model should be based on the observed primary operations:
 - Project Changes/content review;
 - explicit Apply and recovery state.
 
-No UI contract is selected by this plan yet.
-
 ### Accepted UI architecture (2026-11-13)
 
 The **run-centric operational workbench** from
@@ -501,11 +499,15 @@ Contract essentials:
   field-level source matrix — classes `[E]` (shipped route serves it),
   `[G]` (derivable without ambiguity through a named, permanently tested
   pure derivation) and `[P-k]` (bounded prerequisite projection);
-- `[X]`-classified fields are never computed, substituted with heuristics
-  or guessed (they are rendered as typed absence/unavailable states, e.g.
-  the generic `Unavailable in effective configuration` for the disabled
-  Apply capability; the run-list status filter and proactive busy chips
-  are removed);
+- `[X]`-classified fields have no owner and are therefore REMOVED from the
+  UI: they are never computed, guessed or substituted with heuristics, and
+  they are not displayed;
+- a typed absence/unavailable state is only ever rendered on the authority
+  of a field WITH an established owner; `Unavailable in effective
+  configuration` is derived from `[E] project_apply == false` (the
+  discovery flag), and the Apply disable cause itself stays `[X]` and is
+  not displayed (the run-list status filter and proactive busy chips are
+  likewise removed);
 - P-1 (plan/task revision artifact content), P-2 (accepted reviewer
   output content) and P-3 (durable-identity projection: stage position/
   template, settled roles, task bindings, closure reasons, historical wait
