@@ -95,7 +95,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
-| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites and implementation not started |
+| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisite P-3 landed (afe57ca; CI 43466470183); P-1/P-2 open; UI implementation not started |
 
 Drift-control record (2026-11-12): the plan contains no formal Complete-gate
 for an increment's successor. Per explicit operator decision, Increment 6 is
@@ -529,8 +529,42 @@ Contract essentials:
   Host/Origin authority `127.0.0.1:<port>`, foreign Host/Origin failing
   closed before route parsing.
 
-Implementation has not started; no prerequisite (P-1/P-2/P-3) preflight has
+Implementation has not started (no UI slice S1–S8 has been built). The
+bounded prerequisite **P-3 (durable-identity projection) is landed and
+Complete** (see below); P-1/P-2 and the UI implementation remain not
 started.
+
+### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
+
+P-3 is delivered as one full-stack read-only surface and marked Complete.
+
+- Production commit `afe57ca` ("pipeline v2: add the read-only durable
+  identity projection (P-3)"), CI run `43466470183` — success on the exact
+  delivered SHA; delivery report
+  `/exchange/outbox/increment-6-p3-delivery-report.md`
+  (SHA-256 `fb7239e204bfa1ec5af4ce50ed57b799882cce115fe53be7eb0cbd00b5c4c314`).
+- Shipped contract (as accepted in the P-3 preflight r3; not reopened here):
+  one composite `GET /v1/runs/:runId/identity` over the 17-route inventory;
+  CLI `orchestrator identity`; the 12-kind content-free durable record
+  stream over the schema-v7 ledgers with flattened generations/iterations,
+  wait actions, decision id lists and the mandatory stage-task binding;
+  revision-pinned pagination with the 256 KiB full-document cap;
+  path-free CLI/HTTP documents; `stale_snapshot` as the one new request-layer
+  reason (409), `invalid_cursor` reusing the existing request-layer 400.
+- Verification truth (recorded honestly): P-3 added exactly **29 green
+  tests** (32-test projection matrix plus the appended CLI/routing/
+  subprocess/HTTP batteries net of fixture edits) and `tsc --noEmit -p .`
+  is clean. The local full orchestrator suite is **not green**: it reports
+  130 failures, and those same 130 failures fully reproduce on the clean
+  parent `6004b0c` run — they are not attributable to P-3. The cause is
+  environmental: in the current execution container the filesystem carries
+  a SELinux context, so every ordinary file bears a `security.selinux`
+  xattr, and the fail-closed Apply metadata probe correctly classifies that
+  as `unsupported_metadata`, cascading through the Apply/metadata/lock
+  suites. No P-3 code path overlaps that layer.
+- Not started (unchanged scope): prerequisites P-1/P-2, the UI
+  implementation, live Browser UAT, and Finding A. The accepted P-3
+  contract and the accepted IA artifact are not revisited by this record.
 
 ## Deferred work
 
