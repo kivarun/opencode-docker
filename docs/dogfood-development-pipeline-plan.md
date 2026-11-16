@@ -95,7 +95,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
-| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisite P-3 landed (afe57ca; CI 43466470183); P-1/P-2 open; UI implementation not started |
+| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183) and P-1 (abf95e5; CI 43903686912) landed and Complete; P-2 open; UI implementation not started |
 
 Drift-control record (2026-11-12): the plan contains no formal Complete-gate
 for an increment's successor. Per explicit operator decision, Increment 6 is
@@ -517,7 +517,7 @@ Contract essentials:
   own review; wire formats are not designed by the IA artifact;
 - dependent UI slices S1–S8 cannot start before their named prerequisites
   are landed; S1–S3 are presentation-only over `[E]`/`[G]` fields, S4 adds
-  the generic `respond` support, S5–S7 wait for P-3/P-1/P-2, S8 uses only
+  the generic `respond` support, S5–S7 wait for P-2 (P-3/P-1 are landed), S8 uses only
   shipped routes;
 - generic `respond` for non-reserved declared action IDs is preserved
   (the IA routes by the shipped contract, never narrows to one pipeline;
@@ -530,9 +530,10 @@ Contract essentials:
   closed before route parsing.
 
 Implementation has not started (no UI slice S1–S8 has been built). The
-bounded prerequisite **P-3 (durable-identity projection) is landed and
-Complete** (see below); P-1/P-2 and the UI implementation remain not
-started.
+bounded prerequisites **P-3 (durable-identity projection)** and **P-1
+(task/plan revision artifact content)** are landed and **Complete** (see
+below); P-2 (the accepted reviewer-output content prerequisite) and the
+UI implementation remain not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
 
@@ -565,6 +566,58 @@ P-3 is delivered as one full-stack read-only surface and marked Complete.
 - Not started (unchanged scope): prerequisites P-1/P-2, the UI
   implementation, live Browser UAT, and Finding A. The accepted P-3
   contract and the accepted IA artifact are not revisited by this record.
+
+### Prerequisite P-1 Complete: task/plan revision artifact content (2026-11-16)
+
+P-1 is delivered as one full-stack read-only surface and marked **Complete**
+after the accepted implementation/test review through `abf95e5`. The
+delivery chain is four single thematic commits, each with CI success on
+its exact SHA:
+
+- `fd4c56f` — the P-1 implementation (module, CLI `task-revision`/
+  `plan-revision`, control-plane routing/wire, two HTTP routes, the 19-route
+  inventory pin) — CI `43854088076`;
+- `ff37fea` — the r3 corrective (closed eight-value producer vocabulary in
+  `src/pipeline_v2_content_reasons.ts`; the bounded monotone plan projection
+  cursor with page-only materialization; real-owner envelope evidence;
+  wire/HTTP/CLI `invalid_options` negative pins) — CI `43870829578`;
+- `815df62` — the full-document evidence proof (full top-level CLI documents
+  with the trailing LF and full top-level HTTP response documents through the
+  shipped request handler; measured 258767 / 258776 / 47749 / 47754 bytes) —
+  CI `43877684000`;
+- `abf95e5` — the boundary proof (grammar-derived worst-case envelope
+  expansion on the exact production serializations: task CLI ≤ 771, task
+  HTTP ≤ 780, both ≤ the unchanged 1 024-byte reserve; plan envelope ≤ 1024
+  independently per surface with record bytes owned by the page budget;
+  `full-surface-boundary` naming) — CI `43903686912`.
+
+All four commits leave this plan untouched; all four are test- or
+contract-scoped single commits on a clean tree with `git diff --check`
+clean and a byte-identical `bun.lock`. Delivery report:
+`/exchange/outbox/increment-6-p1-delivery-report.md`
+(SHA-256 `463d62d05d28d41ad8716b2b5b65131906b8951fc23f8c39e36ca5ab6cee333f`,
+final; it also records the red-before table, the per-commit test deltas —
+base delta +50, 4242 → 4292 — and the retry-scope statement: the bounded
+retry exists only inside the boundary-test harness, one initial call plus
+up to three retries, four total calls maximum, and is not evidence of
+one-shot transport reliability).
+
+- Verification truth (recorded honestly): the local full orchestrator suite
+  reports **4303 pass / 130 failures**, and those same 130 failures are
+  set-identical to the clean-parent A/B runs in the same environment (exact
+  failure-set equality against `e499f30` for the base commit and against
+  `815df62` for the boundary-proof commit). The cause is the same
+  environmental one as the P-3 record: the container filesystem carries a
+  SELinux context, so every ordinary file bears a `security.selinux` xattr
+  and the fail-closed Apply metadata probe classifies that as
+  `unsupported_metadata`, cascading through the Apply/metadata/lock suites.
+  No P-1 code path overlaps that layer. `tsc --noEmit -p .` is clean and the
+  `bun.lock` is byte-identical throughout.
+- Not started (unchanged scope): the P-2 prerequisite (accepted
+  reviewer-output content), every UI slice S1–S8, live Browser UAT, and
+  Finding A. The accepted P-1 contract (preflight r2 plus the reviewed r3
+  correctives and the boundary-proof correction) is not reopened by this
+  record.
 
 ## Deferred work
 
