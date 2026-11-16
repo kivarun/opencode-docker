@@ -334,6 +334,8 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
     exitCode: 0,
   },
   plan_content_failure: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "unknown_revision" })}\n`, exitCode: 1 },
+  task_content_failure_options: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "invalid_options" })}\n`, exitCode: 1 },
+  plan_content_failure_options: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "invalid_options" })}\n`, exitCode: 1 },
   logs_list: {
     stdout: `${JSON.stringify({
       ok: true,

@@ -27,7 +27,7 @@ import {
   type PreparedPipelineV2RunPlanRevision,
   type PreparedPipelineV2RunTaskRevision,
 } from "../src/pipeline_v2_run_plan_manifests.ts";
-import { publishPipelineV2TaskRevision, PipelineV2RunPlanStoreError } from "../src/pipeline_v2_run_plan_store.ts";
+import { publishPipelineV2PlanRevision, publishPipelineV2TaskRevision, PipelineV2RunPlanStoreError } from "../src/pipeline_v2_run_plan_store.ts";
 import { preparePipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_candidate.ts";
 import { acceptPipelineV2RunPlanCandidate } from "../src/pipeline_v2_run_plan_controller.ts";
 import { stageTaskBodyDigest } from "../src/pipeline_v2_stage_task.ts";
@@ -549,7 +549,7 @@ test("the task surface validates its numeric classes and its chunk cap", async (
     expect((await draw({ limit: PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK })).ok).toBe(true);
     const overCap = await draw({ limit: PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK + 1 });
     if (overCap.ok) throw new Error("cap not enforced");
-    expect(overCap.reason).toBe("invalid_options");
+    expect(overCap.reason).toBe("internal_error");
     for (const [label, change] of [
       ["limit 0", { limit: 0 }],
       ["limit negative", { limit: -1 }],
@@ -560,8 +560,8 @@ test("the task surface validates its numeric classes and its chunk cap", async (
       ["revision negative", { revision: -3 }],
     ] as const) {
       const outcome = await draw(change as Record<string, unknown>);
-      if (outcome.ok) throw new Error(`expected invalid_options for ${label}`);
-      expect(outcome.reason, label).toBe("invalid_options");
+      if (outcome.ok) throw new Error(`expected internal_error for ${label}`);
+      expect(outcome.reason, label).toBe("internal_error");
       expect(outcome.exitCode, label).toBe(1);
       expect(outcome.runId, label).toBe("");
     }
@@ -572,7 +572,7 @@ test("the task surface validates its numeric classes and its chunk cap", async (
       revision: 1,
     });
     if (unsafeRun.ok) throw new Error("unsafe run id accepted");
-    expect(unsafeRun.reason).toBe("invalid_options");
+    expect(unsafeRun.reason).toBe("internal_error");
     expect(unsafeRun.runId).toBe("");
   } finally {
     await rmSync(fixture.root, { recursive: true, force: true });
@@ -936,7 +936,7 @@ test("the plan surface validates its numeric classes and its limit cap", async (
     expect((await draw({ limit: 200 })).ok).toBe(true);
     const overCap = await draw({ limit: 201 });
     if (overCap.ok) throw new Error("limit cap not enforced");
-    expect(overCap.reason).toBe("invalid_options");
+    expect(overCap.reason).toBe("internal_error");
     for (const [label, change] of [
       ["limit 0", { limit: 0 }],
       ["limit negative", { limit: -7 }],
@@ -946,8 +946,8 @@ test("the plan surface validates its numeric classes and its limit cap", async (
       ["revision 0", { revision: 0 }],
     ] as const) {
       const outcome = await draw(change as Record<string, unknown>);
-      if (outcome.ok) throw new Error(`expected invalid_options for ${label}`);
-      expect(outcome.reason, label).toBe("invalid_options");
+      if (outcome.ok) throw new Error(`expected internal_error for ${label}`);
+      expect(outcome.reason, label).toBe("internal_error");
     }
   } finally {
     await rmSync(fixture.root, { recursive: true, force: true });
@@ -1080,95 +1080,502 @@ test("defaults are the established chunk/page constants", () => {
 // serialized-envelope boundary pins (both surfaces independently)
 // =============================================================================
 
-test("the worst-case serialized CLI task document stays under the envelope cap", () => {
-  // Mirrors the exact shipped CLI serialization shape pinned by the
-  // dispatcher tests (the JSON.stringify(outcome) + "\n" contract).
-  const maxId = "r".repeat(128);
-  const chunk = Buffer.alloc(193_536, 0x61);
-  const cliTaskDoc = {
-    ok: true,
-    exitCode: 0,
-    schemaVersion: 1,
-    runId: maxId,
-    taskId: "t".repeat(128),
-    revision: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    manifestSha256: hex("f"),
-    previousSha256: null,
-    origin: "user_response",
-    body: {
-      byteCount: chunk.byteLength,
-      sha256: hex("e"),
-      offset: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP - 1,
-      limit: PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK,
-      returnedByteCount: chunk.byteLength,
-      nextOffset: null,
-      dataBase64: chunk.toString("base64"),
+// --- real-owner envelope evidence ------------------------------------------------
+
+/**
+ * The one production CliIo for envelope evidence: every content member
+ * is the exact real producer export and stdout/stderr are captured byte
+ * faithfully, so `runCli --json` exercises the shipped dispatcher and
+ * the shipped JSON formatter (`JSON.stringify(outcome) + "\n"`).
+ */
+function makeRealCliIo(stateRoot: string): { io: CliIo; stdout: string[]; stderr: string[] } {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const io: CliIo = {
+    baseEnv: { PATH: "/usr/bin:/bin" },
+    runner: {
+      run: () => Promise.resolve({ code: 0 }),
+      killActive: () => false,
+    },
+    fetchAuth: () => Promise.resolve({ status: 200, body: {} }),
+    resolveHelperConfig: () => ({ socketPath: "/run/dh.sock", credentialFile: "/creds/token" }),
+    resolveStateRootProjection: () => ({ localRoot: stateRoot, daemonRoot: stateRoot }),
+    runPipelineV2: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["runPipelineV2"],
+    resumePipelineV2: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["resumePipelineV2"],
+    continuePipelineV2Stage: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["continuePipelineV2Stage"],
+    revisePipelineV2Task: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["revisePipelineV2Task"],
+    resumePipelineV2PlanningRunPlan: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["resumePipelineV2PlanningRunPlan"],
+    respondPipelineV2Wait: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["respondPipelineV2Wait"],
+    inspectPipelineV2Run: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["inspectPipelineV2Run"],
+    eventsPipelineV2Run: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["eventsPipelineV2Run"],
+    identityPipelineV2Run: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["identityPipelineV2Run"],
+    logsPipelineV2Run: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["logsPipelineV2Run"],
+    projectChangesPipelineV2Run: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["projectChangesPipelineV2Run"],
+    projectChangeContentPipelineV2Run: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["projectChangeContentPipelineV2Run"],
+    taskRevisionContentPipelineV2Run,
+    planRevisionContentPipelineV2Run,
+    projectApplyPipelineV2: (async () => {
+      throw new Error("fixture");
+    }) as CliIo["projectApplyPipelineV2"],
+    projectApplyInspectPipelineV2: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["projectApplyInspectPipelineV2"],
+    runSmoke: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["runSmoke"],
+    runAgentSmoke: (async () => {
+      throw new Error("fixture");
+    }) as unknown as CliIo["runAgentSmoke"],
+    readTaskFile: async () => {
+      throw new Error("fixture");
+    },
+    writeStdout: (text: string) => {
+      stdout.push(text);
+    },
+    writeError: (text: string) => {
+      stderr.push(text);
     },
   };
-  const cliBytes = Buffer.byteLength(`${JSON.stringify(cliTaskDoc)}\n`, "utf8");
-  expect(cliBytes).toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
-  const httpTaskDoc = {
+  return { io, stdout, stderr };
+}
+
+async function dispatchHeavyTask(runId: string, dirs: { stateRoot: string; runRoot: string; pipeline: ResolvedPipelineV2 }, body: string) {
+  clock = 0;
+  const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId, now: nextTick });
+  const inputs: readonly PipelineV2RunInputState[] = [
+    { id: "task", type: "file", protected: true, digest: PROTECTED_DIGEST },
+  ];
+  await sink.dispatch({
+    kind: "create_run",
+    runId,
+    pipeline: pipelineV2RunPipelineIdentity(dirs.pipeline),
+    inputs: inputs.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
+    profileEpoch: V2_PROFILE_EPOCH_BINDING,
+  });
+  await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
+  for (const command of [
+    { kind: "agent_data_prepared" },
+    { kind: "agent_execution_session_created", sessionId: "ev-sess-1" },
+    { kind: "agent_tool_session_created", sessionId: "ev-tool-1" },
+    { kind: "agent_running" },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" } },
+    { kind: "agent_cleanup_completed" },
+  ] as const) {
+    await sink.dispatch(command as never);
+  }
+  const prepared = prepareTaskRevisionManifest({
     schema_version: 1,
     kind: "task_revision",
-    run_id: maxId,
-    task_id: "h".repeat(128),
-    revision: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    manifest_sha256: hex("f"),
+    run_id: runId,
+    task_id: "task-a",
+    revision: 1,
     previous_sha256: null,
-    origin: "user_response",
-    body: {
-      byte_count: chunk.byteLength,
-      sha256: hex("e"),
-      offset: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP - 1,
-      limit: PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK,
-      returned_byte_count: chunk.byteLength,
-      next_offset: null,
-      data_base64: chunk.toString("base64"),
-    },
-  };
-  const httpBytes = Buffer.byteLength(JSON.stringify(httpTaskDoc), "utf8");
-  expect(httpBytes).toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
-  expect(httpBytes).toBeGreaterThan(Number(cliBytes) - Math.max(cliBytes - 10_000, 0));
+    origin: "planning_proposal",
+    body,
+  });
+  await publishPipelineV2TaskRevision(dirs.runRoot, prepared.manifest);
+  await sink.dispatch({ kind: "task_revision_accepted", taskId: "task-a", revision: 1, taskSha256: prepared.sha256 });
+  return prepared;
+}
+
+const HEAVY_BODY = "A".repeat(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+
+test("the shipped CLI option guard owns invalid_options at exit 2 and never emits it as an exit-1 P-1 document", async () => {
+  const runId = "heavy-task-run";
+  const dirs = await makeDirs(runId);
+  try {
+    await dispatchHeavyTask(runId, dirs, HEAVY_BODY);
+    const { io, stdout, stderr } = makeRealCliIo(dirs.stateRoot);
+    const exit = await runCli(
+      ["task-revision", "--run-id", runId, "--task-id", "task-a", "--revision", "1", "--limit", "999955", "--config-root", dirs.bundle, "--json"],
+      io,
+    );
+    expect(exit).toBe(2);
+    expect(stdout).toHaveLength(0);
+    expect(stderr[0]).toContain("--limit must be a positive safe integer up to 193536");
+  } finally {
+    await rmSync(dirs.root, { recursive: true, force: true });
+  }
+}, 60000);
+
+test("the real producer outcome feeds the shipped CLI formatter below the envelope cap", async () => {
+  const runId = "heavy-task-run";
+  const dirs = await makeDirs(runId);
+  try {
+    await dispatchHeavyTask(runId, dirs, HEAVY_BODY);
+    const { io, stdout, stderr } = makeRealCliIo(dirs.stateRoot);
+    const exit = await runCli(
+      ["task-revision", "--run-id", runId, "--task-id", "task-a", "--revision", "1", "--limit", String(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK), "--config-root", dirs.bundle, "--json"],
+      io,
+    );
+    if (exit !== 0) {
+      throw new Error(`CLI exit ${exit}: ${stdout.join("|")} / ${stderr.join("|")}`);
+    }
+    const document = stdout[0] as string;
+    expect(stdout).toHaveLength(1);
+    expect(document.endsWith("\n")).toBe(true);
+    const bytes = Buffer.byteLength(document, "utf8");
+    const outcome = JSON.parse(document) as {
+      body: { dataBase64: string; byteCount: number; returnedByteCount: number; limit: number };
+    };
+    expect(outcome.body.byteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+    expect(outcome.body.returnedByteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+    expect(outcome.body.dataBase64.length).toBe(258_048);
+    expect(bytes, "serialized CLI bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+    expect(stderr.join("")).toBe("");
+  } finally {
+    await rmSync(dirs.root, { recursive: true, force: true });
+  }
+}, 60000);
+
+test("the real subprocess chain projects the shipped CLI document below the envelope cap", async () => {
+  const runId = "heavy-http-run";
+  const dirs = await makeDirs(runId);
+  try {
+    await dispatchHeavyTask(runId, dirs, HEAVY_BODY);
+    const client = new OrchestratorSubprocessClient({
+      bunExecutable: process.execPath,
+      orchestratorEntrypoint: join(import.meta.dir, "..", "src", "main.ts"),
+      workingDirectory: dirs.root,
+      configRoot: dirs.bundle,
+      baseEnv: { PATH: "/usr/bin:/bin", ORCHESTRATOR_STATE_ROOT: dirs.stateRoot },
+      stdoutLimitBytes: 2_000_000,
+      stderrLimitBytes: 1_000_000,
+      sigintGraceMs: 2000,
+    });
+    const call = await client.run({ kind: "task_revision", runId, taskId: "task-a", revision: 1, limit: PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK });
+    if (!call.ok) throw new Error(`transport refused: ${call.failure.reason}`);
+    const projection = call.projection as unknown as { kind: string; body: { byteCount: number } };
+    expect(projection.kind).toBe("taskRevision");
+    expect(projection.body.byteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+    const httpProjection = projectControlPlaneTaskContent(call);
+    if (!("kind" in httpProjection) || (httpProjection as { kind?: string }).kind !== "task_revision") {
+      throw new Error("unexpected http projection");
+    }
+    const serialized = JSON.stringify((httpProjection as { kind: string; body: unknown }).body);
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    expect(bytes, "serialized HTTP bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+  } finally {
+    await rmSync(dirs.root, { recursive: true, force: true });
+  }
+}, 90000);
+
+test("the real production plan page serializes under the envelope cap on both surfaces", async () => {
+  const fixture = await buildHeavyPlanFixture({ stages: 2, tasksPerStage: 100, previousDepends: 10 });
+  try {
+    const { io, stdout, stderr } = makeRealCliIo(fixture.stateRoot);
+    const exit = await runCli(
+      ["plan-revision", "--run-id", fixture.runId, "--revision", "1", "--after", "0", "--limit", "200", "--config-root", fixture.bundle, "--json"],
+      io,
+    );
+    if (exit !== 0) {
+      throw new Error(`CLI exit ${exit}: ${stdout.join("|")} / ${stderr.join("|")}`);
+    }
+    const document = stdout[0] as string;
+    expect(document.endsWith("\n")).toBe(true);
+    const bytes = Buffer.byteLength(document, "utf8");
+    const parsed = JSON.parse(document) as { records: unknown[]; nextAfter: number | null };
+    expect(parsed.records).toHaveLength(200);
+    expect(parsed.nextAfter).toBe(200);
+    expect(bytes, "serialized CLI plan bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+    expect(stderr.join("")).toBe("");
+    const client = new OrchestratorSubprocessClient({
+      bunExecutable: process.execPath,
+      orchestratorEntrypoint: join(import.meta.dir, "..", "src", "main.ts"),
+      workingDirectory: fixture.root,
+      configRoot: fixture.bundle,
+      baseEnv: { PATH: "/usr/bin:/bin", ORCHESTRATOR_STATE_ROOT: fixture.stateRoot },
+      stdoutLimitBytes: 2_000_000,
+      stderrLimitBytes: 1_000_000,
+      sigintGraceMs: 2000,
+    });
+    const call = await client.run({ kind: "plan_revision", runId: fixture.runId, revision: 1, after: 0, limit: 200 });
+    if (!call.ok) throw new Error(`transport refused: ${call.failure.reason}`);
+    const httpProjection = projectControlPlanePlanContent(call);
+    if (!("kind" in httpProjection) || (httpProjection as { kind?: string }).kind !== "plan_revision") {
+      throw new Error("unexpected http plan projection");
+    }
+    const httpBytes = Buffer.byteLength(JSON.stringify((httpProjection as { kind: string; records: unknown }).records), "utf8");
+    expect(httpBytes, "serialized HTTP plan bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+  } finally {
+    await rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 90000);
+test("the producer reason vocabulary is exactly the eight closed values without invalid_options", () => {
+  expect([...PIPELINE_V2_RUN_PLAN_CONTENT_REASONS]).toEqual([
+    "run_not_found",
+    "run_state_invalid",
+    "pipeline_mismatch",
+    "unknown_revision",
+    "artifact_missing",
+    "artifact_modified",
+    "invalid_cursor",
+    "internal_error",
+  ]);
+  expect(JSON.stringify(PIPELINE_V2_RUN_PLAN_CONTENT_REASONS)).not.toContain("invalid_options");
+});
+
+test("a caller shape that bypasses the CLI and routing guards is internal_error with zero content", async () => {
+  const fixture = await buildFixture();
+  try {
+    for (const [label, options] of [
+      ["task unsafe runId", { runId: "BAD ID", stateRoot: fixture.stateRoot, taskId: "task-a", revision: 1 }],
+      ["task unsafe taskId", { runId: RUN_ID, stateRoot: fixture.stateRoot, taskId: "../x", revision: 1 }],
+      ["task bad revision", { runId: RUN_ID, stateRoot: fixture.stateRoot, taskId: "task-a", revision: 0 }],
+      ["task bad offset", { runId: RUN_ID, stateRoot: fixture.stateRoot, taskId: "task-a", revision: 1, offset: -1 }],
+      ["task bad limit", { runId: RUN_ID, stateRoot: fixture.stateRoot, taskId: "task-a", revision: 1, limit: 0 }],
+    ] as const) {
+      const outcome = await taskRevisionContentPipelineV2Run(options as never);
+      if (outcome.ok) throw new Error(`expected internal_error for ${label}`);
+      expect(outcome.reason, label).toBe("internal_error");
+      expect(outcome.runId, label).toBe("");
+    }
+    for (const [label, options] of [
+      ["plan bad revision", { runId: RUN_ID, stateRoot: fixture.stateRoot, revision: 0 }],
+      ["plan bad after", { runId: RUN_ID, stateRoot: fixture.stateRoot, revision: 1, after: -1 }],
+      ["plan bad limit", { runId: RUN_ID, stateRoot: fixture.stateRoot, revision: 1, limit: 0 }],
+    ] as const) {
+      const outcome = await planRevisionContentPipelineV2Run(options as never);
+      if (outcome.ok) throw new Error(`expected internal_error for ${label}`);
+      expect(outcome.reason, label).toBe("internal_error");
+      expect(outcome.runId, label).toBe("");
+    }
+  } finally {
+    await rmSync(fixture.root, { recursive: true, force: true });
+  }
 }, 30000);
 
-test("the worst-case serialized CLI and HTTP plan pages stay under the envelope cap independently", () => {
-  expect(PIPELINE_V2_RUN_PLAN_PLAN_MAX_LIMIT).toBe(200);
-  const maxId = "i".repeat(128);
-  const records = Array.from({ length: 200 }, (_, i) => ({
-    record: "task",
-    stage_position: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    task_position: i + 1,
-    id: maxId,
-    revision: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    sha256: hex("f"),
-  }));
-  const cliPlanDoc = {
-    ok: true,
-    exitCode: 0,
-    schemaVersion: 1,
-    runId: maxId,
-    revision: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    manifestSha256: hex("f"),
-    previousSha256: null,
-    originExecution: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    after: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    records,
-    nextAfter: 2 * PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-  };
-  const cliBytes = Buffer.byteLength(`${JSON.stringify(cliPlanDoc)}\n`, "utf8");
-  expect(cliBytes).toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
-  const httpPlanDoc = {
+// --- bounded projection memory -------------------------------------------------
+
+test("the projection carries no whole-stream record array (structural pin)", () => {
+  const moduleSource = readFileSync(new URL("../src/pipeline_v2_run_plan_content.ts", import.meta.url), "utf8");
+  for (const banned of ["entries.push", "const entries", "planRecordAt"]) {
+    expect(moduleSource, banned).not.toContain(banned);
+  }
+  expect(moduleSource).toContain("export function planRecordCursor(");
+  // The only push site is the page list itself.
+  const pushSites = moduleSource.split(".push(").length - 1;
+  expect(pushSites).toBe(1);
+  expect(moduleSource).toContain("records.push(record)");
+});
+
+interface HeavyManifestSpec {
+  readonly stages: number;
+  readonly tasksPerStage: number;
+  readonly previousDepends: number;
+}
+
+/**
+ * One heavy verified artifact behind a coherent reducer ledger: two
+ * stages of 100 zero-padded 128-char task ids each, every task depending
+ * on its lexical predecessors; the manifest is published by the real
+ * store and accepted into the ledger through the real reducer.
+ */
+async function buildHeavyPlanFixture(spec: HeavyManifestSpec) {
+  const runId = "heavy-plan-run";
+  const dirs = await makeDirs(runId);
+  clock = 0;
+  const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId, now: nextTick });
+  const inputs: readonly PipelineV2RunInputState[] = [
+    { id: "task", type: "file", protected: true, digest: PROTECTED_DIGEST },
+  ];
+  await sink.dispatch({
+    kind: "create_run",
+    runId,
+    pipeline: pipelineV2RunPipelineIdentity(dirs.pipeline),
+    inputs: inputs.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
+    profileEpoch: V2_PROFILE_EPOCH_BINDING,
+  });
+  let plannerSession = 1;
+  await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
+  for (const command of [
+    { kind: "agent_data_prepared" },
+    { kind: "agent_execution_session_created", sessionId: `hs-${plannerSession}` },
+    { kind: "agent_tool_session_created", sessionId: `ht-${plannerSession}` },
+    { kind: "agent_running" },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" } },
+    { kind: "agent_cleanup_completed" },
+  ] as const) {
+    await sink.dispatch(command as never);
+  }
+  let globalTaskId = 0;
+  const descriptorStages: {
+    id: string;
+    template: string;
+    tasks: { id: string; revision: number; sha256: string; depends_on: readonly string[] }[];
+  }[] = [];
+  const preparedTasks: PreparedPipelineV2RunTaskRevision[] = [];
+  for (let stageIndex = 0; stageIndex < spec.stages; stageIndex += 1) {
+    const tasks: { id: string; revision: number; sha256: string; depends_on: readonly string[] }[] = [];
+    const stagePrefix = `stage-${stageIndex + 1}-`;
+    for (let taskIndex = 0; taskIndex < spec.tasksPerStage; taskIndex += 1) {
+      globalTaskId += 1;
+      const id = `${stagePrefix}${String(taskIndex).padStart(3, "0")}${"x".repeat(Math.max(0, 128 - stagePrefix.length - 3))}`;
+      const body = `HEAVY TASK BODY ${globalTaskId}\n`;
+      const prepared = prepareTaskRevisionManifest({
+        schema_version: 1,
+        kind: "task_revision",
+        run_id: runId,
+        task_id: id,
+        revision: 1,
+        previous_sha256: null,
+        origin: "planning_proposal",
+        body,
+      });
+      await publishPipelineV2TaskRevision(dirs.runRoot, prepared.manifest);
+      await sink.dispatch({ kind: "task_revision_accepted", taskId: id, revision: 1, taskSha256: prepared.sha256 });
+      preparedTasks.push(prepared);
+      const dependsOn: string[] = [];
+      for (let back = 1; back <= spec.previousDepends && taskIndex - back >= 0; back += 1) {
+        const prior = tasks[taskIndex - back]!;
+        dependsOn.push(prior.id);
+      }
+      tasks.push({ id, revision: 1, sha256: prepared.sha256, depends_on: dependsOn });
+    }
+    descriptorStages.push({ id: `stage-${stageIndex + 1}`, template: "development", tasks });
+  }
+  const plan = preparePlanRevisionManifest({
     schema_version: 1,
     kind: "plan_revision",
-    run_id: maxId,
-    revision: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    manifest_sha256: hex("f"),
+    run_id: runId,
+    revision: 1,
     previous_sha256: null,
-    origin_execution: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    after: PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-    records,
-    next_after: 2 * PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP,
-  };
-  const httpBytes = Buffer.byteLength(JSON.stringify(httpPlanDoc), "utf8");
-  expect(httpBytes).toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
-}, 30000);
+    root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+    origin_execution: 1,
+    stages: descriptorStages,
+  });
+  await publishPipelineV2PlanRevision(dirs.runRoot, plan.manifest);
+  await sink.dispatch({ kind: "plan_revision_accepted", planRevision: 1, planSha256: plan.sha256, originExecution: 1 });
+  return { ...dirs, runId, plan, };
+}
+
+test("a heavy manifest with large depends_on walks exactly through limit-1 pages with dense cursors", async () => {
+  const fixture = await buildHeavyPlanFixture({ stages: 2, tasksPerStage: 100, previousDepends: 10 });
+  try {
+    const reference: PipelineV2PlanContentRecord[] = [];
+    for (let stageIndex = 0; stageIndex < fixture.plan.manifest.stages.length; stageIndex += 1) {
+      const stage = fixture.plan.manifest.stages[stageIndex]!;
+      reference.push({ record: "stage", stage_position: stageIndex + 1, id: stage.id, template: stage.template });
+      for (let taskIndex = 0; taskIndex < stage.tasks.length; taskIndex += 1) {
+        const task = stage.tasks[taskIndex]!;
+        reference.push({
+          record: "task",
+          stage_position: stageIndex + 1,
+          task_position: taskIndex + 1,
+          id: task.id,
+          revision: task.revision,
+          sha256: task.sha256,
+        });
+        for (let dependencyIndex = 0; dependencyIndex < task.depends_on.length; dependencyIndex += 1) {
+          reference.push({
+            record: "task_dependency",
+            stage_position: stageIndex + 1,
+            task_position: taskIndex + 1,
+            dependency_position: dependencyIndex + 1,
+            task_id: task.depends_on[dependencyIndex]!,
+          });
+        }
+      }
+    }
+    const total = reference.length;
+    expect(planRecordCount(fixture.plan.manifest)).toBe(total);
+    let cursor = 0;
+    let guard = 0;
+    while (cursor < total && guard <= total) {
+      guard += 1;
+      const page = await planRevisionContentPipelineV2Run({
+        runId: fixture.runId,
+        stateRoot: fixture.stateRoot,
+        revision: 1,
+        after: cursor,
+        limit: 1,
+      });
+      if (!page.ok) throw new Error(`page failed at ${cursor}: ${page.reason}`);
+      expect(page.records).toEqual([reference[cursor] as PipelineV2PlanContentRecord]);
+      if (cursor + 1 < total) {
+        expect(page.nextAfter).toBe(cursor + 1);
+      } else {
+        expect(page.nextAfter).toBeNull();
+      }
+      expect(page.after).toBe(cursor);
+      cursor += 1;
+    }
+    expect(cursor).toBe(total);
+    const past = await planRevisionContentPipelineV2Run({
+      runId: fixture.runId,
+      stateRoot: fixture.stateRoot,
+      revision: 1,
+      after: total + 1,
+    });
+    if (past.ok) throw new Error("expected invalid_cursor past the end");
+    expect(past.reason).toBe("invalid_cursor");
+  } finally {
+    await rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 120000);
+
+test("a heavy manifest serves the exact interior records through single-record pages", async () => {
+  const fixture = await buildHeavyPlanFixture({ stages: 1, tasksPerStage: 40, previousDepends: 6 });
+  try {
+    const firstTaskId = "stage-1-000";
+    const stride = 7;
+    for (let pick = 0; pick < 12; pick += 1) {
+      const target = pick * stride;
+      const page = await planRevisionContentPipelineV2Run({
+        runId: fixture.runId,
+        stateRoot: fixture.stateRoot,
+        revision: 1,
+        after: target,
+        limit: 1,
+      });
+      if (!page.ok) throw new Error("unreachable");
+      expect(page.records.length).toBe(1);
+      const record = page.records[0] as PipelineV2PlanContentRecord;
+      if (record.record === "task" && record.task_position === 1) {
+        expect((record as { id: string }).id).toBe(firstTaskId);
+      }
+      expect(record).toBeTruthy();
+    }
+  } finally {
+    await rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 60000);
+
+// =============================================================================
+// r3 corrective imports (kept at the tail so the established pins above
+// stay byte-stable)
+// =============================================================================
+
+import { runCli, type CliIo } from "../src/main.ts";
+import { PIPELINE_V2_RUN_PLAN_CONTENT_REASONS } from "../src/pipeline_v2_content_reasons.ts";
+import { OrchestratorSubprocessClient } from "../src/control_plane/subprocess_client.ts";
+import {
+  projectControlPlanePlanContent,
+  projectControlPlaneTaskContent,
+} from "../src/control_plane/http_server.ts";

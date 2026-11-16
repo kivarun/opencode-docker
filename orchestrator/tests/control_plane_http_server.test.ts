@@ -3667,4 +3667,42 @@ describe("control-plane HTTP: P-1 task/plan content routes", () => {
       expect(serialized).not.toContain("CANARY");
     }
   });
+
+  test("a P-1 child failure outside the closed producer vocabulary is a transport failure at the real client", async () => {
+    const realClient = new OrchestratorSubprocessClient({
+      bunExecutable: process.execPath,
+      orchestratorEntrypoint: join(import.meta.dir, "control_plane_child.ts"),
+      workingDirectory: tmpdir(),
+      configRoot: "/opt/orchestrator/config",
+      baseEnv: { PATH: "/usr/bin:/bin" },
+      stdoutLimitBytes: 1_000_000,
+      stderrLimitBytes: 1_000_000,
+      sigintGraceMs: 2000,
+    });
+    const result = await realClient.run({
+      kind: "task_revision",
+      runId: "sc-task-content-failure-options",
+      taskId: "sc-task",
+      revision: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.failure.reason).toBe("unexpected_output_shape");
+    // the HTTP request layer maps a rejected child document onto the
+    // closed transport failure (502), never a fabricated 200 outcome
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: { run: async (): Promise<OrchestratorCallResult> => result } as unknown as OrchestratorSubprocessClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4712,
+      bodyLimitBytes: 4096,
+    };
+    const request = new Request("http://127.0.0.1:4712/v1/runs/p1-run/tasks/task-a/revisions/1", {
+      method: "GET",
+      headers: { host: "127.0.0.1:4712" },
+    });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    expect(response.status).toBe(502);
+  }, 30000);
 });

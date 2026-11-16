@@ -46,6 +46,7 @@ import type {
   PreparedPipelineV2RunTaskRevision,
 } from "./pipeline_v2_run_plan_manifests.ts";
 import type { PipelineV2RunState, PipelineV2TaskRevisionState, PipelineV2PlanRevisionState } from "./pipeline_v2_state.ts";
+import { PIPELINE_V2_RUN_PLAN_CONTENT_REASONS } from "./pipeline_v2_content_reasons.ts";
 
 /** The default and maximum raw-byte chunk size of the task body stream. */
 export const PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK = 65_536;
@@ -72,34 +73,20 @@ export const PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP = 262_144;
  */
 export const PIPELINE_V2_RUN_PLAN_PAGE_ENVELOPE_RESERVE = 1_024;
 
+/** The chunk serialization envelope budget of the defensive cap guard. */
+const ENVELOPE_RESERVE_FOR_CHUNK = PIPELINE_V2_RUN_PLAN_PAGE_ENVELOPE_RESERVE;
+
 /** The closed plan projection record vocabulary. */
 export const PIPELINE_V2_RUN_PLAN_RECORD_KINDS = ["stage", "task", "task_dependency"] as const;
 
 /** The task origin classes as carried by the accepted task manifest. */
 export const PIPELINE_V2_RUN_PLAN_TASK_ORIGINS = ["planning_proposal", "user_response"] as const;
 
-export type PipelineV2RunPlanContentReason =
-  | "run_not_found"
-  | "invalid_options"
-  | "run_state_invalid"
-  | "pipeline_mismatch"
-  | "unknown_revision"
-  | "artifact_missing"
-  | "artifact_modified"
-  | "invalid_cursor"
-  | "internal_error";
+export { PIPELINE_V2_RUN_PLAN_CONTENT_REASONS } from "./pipeline_v2_content_reasons.ts";
 
-const REASONS: ReadonlySet<PipelineV2RunPlanContentReason> = new Set<PipelineV2RunPlanContentReason>([
-  "run_not_found",
-  "invalid_options",
-  "run_state_invalid",
-  "pipeline_mismatch",
-  "unknown_revision",
-  "artifact_missing",
-  "artifact_modified",
-  "invalid_cursor",
-  "internal_error",
-]);
+export type PipelineV2RunPlanContentReason = (typeof PIPELINE_V2_RUN_PLAN_CONTENT_REASONS)[number];
+
+const REASONS: ReadonlySet<PipelineV2RunPlanContentReason> = new Set<PipelineV2RunPlanContentReason>(PIPELINE_V2_RUN_PLAN_CONTENT_REASONS);
 
 export class PipelineV2RunPlanContentError extends Error {
   declare readonly reason: PipelineV2RunPlanContentReason;
@@ -229,8 +216,11 @@ function failure(runId: string, reason: PipelineV2RunPlanContentReason): Pipelin
 /**
  * The record-page builder: flattens the verified plan manifest into the
  * fixed semantic order and applies the stop-before rule against the
- * envelope cap. Records are projected lazily so the page budget bounds
- * the amount of work per page, never the artifact load itself.
+ * envelope cap. Records are emitted mono-tone from the bounded
+ * projection cursor into the page list only, so the additional
+ * projection memory is the page (`records.length <= limit <= 200`)
+ * plus constant cursor state; the already-loaded manifest is the only
+ * full-shape object, and the traversal to `after`/total stays O(n).
  */
 export function projectPlanRecordsPage(
   total: number,
@@ -267,7 +257,10 @@ export function projectPlanRecordsPage(
   return { records, nextAfter };
 }
 
-/** The exact semantic order of the verified plan manifest. */
+/**
+ * The exact semantic order of the verified plan manifest, enumerated by
+ * a monotone cursor instead of a flattened record array.
+ */
 export function planRecordCount(manifest: PipelineV2RunPlanRevisionManifest): number {
   let count = 0;
   for (const stage of manifest.stages) {
@@ -280,37 +273,111 @@ export function planRecordCount(manifest: PipelineV2RunPlanRevisionManifest): nu
   return count;
 }
 
-function planRecordAt(manifest: PipelineV2RunPlanRevisionManifest): (index: number) => PipelineV2PlanContentRecord {
-  // The fixed flattening order is deterministic; the index walk below is
-  // a direct enumeration of that order.
-  const entries: PipelineV2PlanContentRecord[] = [];
-  for (let stageIndex = 0; stageIndex < manifest.stages.length; stageIndex += 1) {
-    const stage = manifest.stages[stageIndex]!;
-    const stagePosition = stageIndex + 1;
-    entries.push({ record: "stage", stage_position: stagePosition, id: stage.id, template: stage.template });
-    for (let taskIndex = 0; taskIndex < stage.tasks.length; taskIndex += 1) {
-      const task = stage.tasks[taskIndex]!;
-      const taskPosition = taskIndex + 1;
-      entries.push({
-        record: "task",
-        stage_position: stagePosition,
-        task_position: taskPosition,
-        id: task.id,
-        revision: task.revision,
-        sha256: task.sha256,
-      });
-      for (let dependencyIndex = 0; dependencyIndex < task.depends_on.length; dependencyIndex += 1) {
-        entries.push({
-          record: "task_dependency",
-          stage_position: stagePosition,
-          task_position: taskPosition,
-          dependency_position: dependencyIndex + 1,
-          task_id: task.depends_on[dependencyIndex]!,
-        });
-      }
+/**
+ * The bounded projection cursor over the fixed flattening order: per
+ * call it materializes exactly one projected record at the requested
+ * index from the already-loaded manifest; additional projection memory
+ * is constant cursor state (stage/task/dependency counters), never a
+ * second whole-stream array. The manifest itself was already loaded
+ * honestly by the production store loader. Indexes must be monotone
+ * (never decrease) — the page builder walks a page in order — and any
+ * out-of-order seek resets nothing: it fails closed as an invariant.
+ */
+export interface PipelineV2PlanRecordCursor {
+  /** Materializes exactly the one record at `index`. */
+  at(index: number): PipelineV2PlanContentRecord;
+}
+
+export function planRecordCursor(manifest: PipelineV2RunPlanRevisionManifest): PipelineV2PlanRecordCursor {
+  let stageIndex = 0;
+  let taskIndex = 0;
+  let dependencyIndex = 0;
+  /** 0 = about to emit the stage record; 1 = inside a task's records. */
+  let phase: 0 | 1 = 0;
+  let position = 0;
+  const at = (index: number): PipelineV2PlanContentRecord => {
+    if (index < position) {
+      throw new PipelineV2RunPlanContentError("internal_error", "the projection cursor drifted behind the page order");
     }
+    while (position < index) {
+      if (phase === 0) {
+        // advance past the current stage record onto its first task
+        phase = 1;
+        taskIndex = 0;
+        dependencyIndex = 0;
+        position += 1;
+        continue;
+      }
+      const stage = manifest.stages[stageIndex] as PipelineV2RunPlanRevisionManifest["stages"][number] | undefined;
+      if (stage === undefined) {
+        throw new PipelineV2RunPlanContentError("internal_error", "the projection cursor walked past the manifest end");
+      }
+      const task = stage.tasks[taskIndex] as PipelineV2RunPlanRevisionManifest["stages"][number]["tasks"][number] | undefined;
+      if (task === undefined) {
+        // the stage is exhausted: advance to the next stage record
+        stageIndex += 1;
+        phase = 0;
+        position += 1;
+        continue;
+      }
+      if (dependencyIndex < task.depends_on.length) {
+        dependencyIndex += 1;
+        position += 1;
+        continue;
+      }
+      if (taskIndex + 1 < stage.tasks.length) {
+        taskIndex += 1;
+        dependencyIndex = 0;
+        position += 1;
+        continue;
+      }
+      // the stage's last task record was emitted: the next record is the
+      // next stage record
+      stageIndex += 1;
+      phase = 0;
+      position += 1;
+    }
+    const consumedStage = manifest.stages[stageIndex] as PipelineV2RunPlanRevisionManifest["stages"][number] | undefined;
+    if (consumedStage === undefined) {
+      throw new PipelineV2RunPlanContentError("internal_error", "the projection cursor walked past the manifest end");
+    }
+    return projectionRecordAt(manifest, stageIndex, phase, taskIndex, dependencyIndex);
+  };
+  return { at };
+}
+
+/** The exact structural mapping (index, phase, task, dependency) → record. */
+function projectionRecordAt(
+  manifest: PipelineV2RunPlanRevisionManifest,
+  stageIndex: number,
+  phase: 0 | 1,
+  taskIndex: number,
+  dependencyIndex: number,
+): PipelineV2PlanContentRecord {
+  const stagePosition = stageIndex + 1;
+  if (phase === 0) {
+    const stage = manifest.stages[stageIndex]!;
+    return { record: "stage", stage_position: stagePosition, id: stage.id, template: stage.template };
   }
-  return (index: number) => entries[index]!;
+  const stage = manifest.stages[stageIndex]!;
+  const task = stage.tasks[taskIndex]!;
+  if (dependencyIndex === 0) {
+    return {
+      record: "task",
+      stage_position: stagePosition,
+      task_position: taskIndex + 1,
+      id: task.id,
+      revision: task.revision,
+      sha256: task.sha256,
+    };
+  }
+  return {
+    record: "task_dependency",
+    stage_position: stagePosition,
+    task_position: taskIndex + 1,
+    dependency_position: dependencyIndex,
+    task_id: task.depends_on[dependencyIndex - 1]!,
+  };
 }
 
 /**
@@ -362,16 +429,25 @@ export function storeCauseToReason(cause: unknown): PipelineV2RunPlanContentReas
   return "internal_error";
 }
 
+/**
+ * The one authoritative read of the verified durable run behind both
+ * content surfaces. A caller shape that reaches this facade past the
+ * accepted CLI and routing guards is a programmer/invariant failure and
+ * carries no P-1 producer reason of its own: it maps to
+ * `internal_error` with zero content. Every real `loadDurablePipelineV2Run`
+ * reason stays producer-public except the pre-root `invalid_options` and
+ * the reserved pre-runner shapes, which the guards make unreachable and
+ * which therefore never enter the P-1 vocabulary.
+ */
 async function verifiedRun(options: { runId: unknown; stateRoot: string }): Promise<VerifiedRead | PipelineV2RunPlanContentFailure> {
   const runId = options.runId;
   if (typeof runId !== "string" || !isPipelineV2SafeId(runId)) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   const read = await loadDurablePipelineV2Run({ runId, stateRoot: options.stateRoot });
   if (!read.ok) {
-    const reason: PipelineV2RunPlanContentReason = REASONS.has(read.reason as PipelineV2RunPlanContentReason)
-      ? (read.reason as PipelineV2RunPlanContentReason)
-      : "internal_error";
+    const reason: PipelineV2RunPlanContentReason =
+      read.reason === "invalid_options" ? "internal_error" : read.reason;
     return failure(read.runId, reason);
   }
   return { runId: read.runId, runRoot: read.runRoot, state: read.state };
@@ -394,19 +470,19 @@ export async function taskRevisionContentPipelineV2Run(
   const offset = options.offset ?? 0;
   const limit = options.limit ?? PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK;
   if (typeof stateRoot !== "string" || stateRoot === "") {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   if (typeof taskId !== "string" || !isPipelineV2SafeId(taskId)) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   try {
     const read = await verifiedRun({ runId, stateRoot });
@@ -440,6 +516,14 @@ export async function taskRevisionContentPipelineV2Run(
     const returnedByteCount = end - offset;
     const nextOffset = end < byteCount ? end : null;
     const bodyDigest = stageTaskBodyDigest(bodyBytes);
+    const dataBase64 = returnedByteCount === 0 ? "" : bodyBytes.subarray(offset, end).toString("base64");
+    // The unreachable producer-invariant guard: a chunk whose serialized
+    // final envelope could not fit the fixed cap on either surface is
+    // never a partial success. The maximum chunk (193 536 raw bytes)
+    // serializes to 258 048 base64 characters, well below the cap.
+    if (dataBase64.length + ENVELOPE_RESERVE_FOR_CHUNK > PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP) {
+      return failure(verified.runId, "internal_error");
+    }
     return deepFreezeValue({
       ok: true as const,
       exitCode: 0 as const,
@@ -457,7 +541,7 @@ export async function taskRevisionContentPipelineV2Run(
         limit,
         returnedByteCount,
         nextOffset,
-        dataBase64: returnedByteCount === 0 ? "" : bodyBytes.subarray(offset, end).toString("base64"),
+        dataBase64,
       },
     }) satisfies PipelineV2TaskContentReport as PipelineV2TaskContentReport;
   } catch (cause) {
@@ -483,16 +567,16 @@ export async function planRevisionContentPipelineV2Run(
   const after = options.after ?? 0;
   const limit = options.limit ?? PIPELINE_V2_RUN_PLAN_PLAN_DEFAULT_LIMIT;
   if (typeof stateRoot !== "string" || stateRoot === "") {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > PIPELINE_V2_RUN_PLAN_PLAN_MAX_LIMIT) {
-    return failure("", "invalid_options");
+    return failure("", "internal_error");
   }
   try {
     const read = await verifiedRun({ runId, stateRoot });
@@ -526,7 +610,7 @@ export async function planRevisionContentPipelineV2Run(
     if (after > total) {
       return failure(verified.runId, "invalid_cursor");
     }
-    const page = projectPlanRecordsPage(total, planRecordAt(manifest), after, limit);
+    const page = projectPlanRecordsPage(total, planRecordCursor(manifest).at, after, limit);
     return deepFreezeValue({
       ok: true as const,
       exitCode: 0 as const,

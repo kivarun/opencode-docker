@@ -969,3 +969,15 @@ test("plan content failures stay opaque and path-free", async () => {
   expect(failure.projection.reason).toBe("unknown_revision");
   expect(JSON.stringify(failure.projection)).not.toContain("runRoot");
 }, 15000);
+
+// --- P-1 reason vocabulary pins -------------------------------------------------
+
+test("a task content failure outside the closed P-1 producer vocabulary is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(taskContentScenario("task-content-failure-options")), "unexpected_output_shape");
+}, 15000);
+
+test("a plan content failure carrying the reserved option reason is unexpected_output_shape", async () => {
+  const client = makeClient();
+  expectFailure(await client.run(planContentScenario("plan-content-failure-options")), "unexpected_output_shape");
+}, 15000);

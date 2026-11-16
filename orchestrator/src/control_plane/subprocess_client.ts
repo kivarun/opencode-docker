@@ -22,6 +22,7 @@
 import { isCleanAbsolutePath } from "../clean_path.ts";
 import { deepFreezeValue } from "../pipeline_v2_freeze_internal.ts";
 import { isNonNegativeSafeInteger, isLowercaseSha256, isPipelineV2SafeId, isPositiveSafeInteger } from "../pipeline_v2_scalar.ts";
+import { PIPELINE_V2_RUN_PLAN_CONTENT_REASONS } from "../pipeline_v2_content_reasons.ts";
 import { isPipelineV2PublicReason, type PipelineV2PublicReason } from "../pipeline_v2_public_reason.ts";
 import { PIPELINE_V2_APPLY_OPERATION_STATUSES, type PipelineV2ApplyOperationStatus } from "../pipeline_v2_apply_state_internal.ts";
 import { PIPELINE_V2_PROJECT_APPLY_PUBLIC_REASONS, type PipelineV2ProjectApplyPublicReason } from "../pipeline_v2_project_apply.ts";
@@ -679,6 +680,17 @@ function expectExactKeys(document: Record<string, unknown>, expected: readonly s
   }
 }
 
+/** The closed P-1 producer reason set (never copied). */
+const RUN_PLAN_CONTENT_REASONS: ReadonlySet<string> = new Set<string>(PIPELINE_V2_RUN_PLAN_CONTENT_REASONS);
+
+/** The closed-vocabulary check of one P-1 failure reason. */
+function expectRunPlanContentReason(reason: string, what: string): string {
+  if (!RUN_PLAN_CONTENT_REASONS.has(reason)) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} reason is outside the closed P-1 producer vocabulary`);
+  }
+  return reason;
+}
+
 /** The exact own keys of one task-content body chunk. */
 const TASK_BODY_KEYS = [
   "byteCount",
@@ -910,6 +922,7 @@ function parseOutcomeDocument(
         if (reason === "") {
           throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content failure reason must be a non-empty string");
         }
+        expectRunPlanContentReason(reason, "task content failure");
         return {
           ok: true,
           projection: deepFreezeValue({
@@ -996,6 +1009,7 @@ function parseOutcomeDocument(
         if (reason === "") {
           throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content failure reason must be a non-empty string");
         }
+        expectRunPlanContentReason(reason, "plan content failure");
         return {
           ok: true,
           projection: deepFreezeValue({
