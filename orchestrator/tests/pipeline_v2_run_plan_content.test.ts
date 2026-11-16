@@ -1223,14 +1223,104 @@ test("the shipped CLI option guard owns invalid_options at exit 2 and never emit
   }
 }, 60000);
 
-test("the real producer outcome feeds the shipped CLI formatter below the envelope cap", async () => {
-  const runId = "heavy-task-run";
-  const dirs = await makeDirs(runId);
+test("the real max-envelope task CLI document (full JSON + trailing LF) stays below the envelope cap", async () => {
+  const fixture = await buildMaxTaskFixture();
   try {
-    await dispatchHeavyTask(runId, dirs, HEAVY_BODY);
-    const { io, stdout, stderr } = makeRealCliIo(dirs.stateRoot);
+    const { io, stdout, stderr } = makeRealCliIo(fixture.stateRoot);
     const exit = await runCli(
-      ["task-revision", "--run-id", runId, "--task-id", "task-a", "--revision", "1", "--limit", String(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK), "--config-root", dirs.bundle, "--json"],
+      [
+        "task-revision",
+        "--run-id", fixture.runId,
+        "--task-id", fixture.taskId,
+        "--revision", "2",
+        "--limit", String(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK),
+        "--config-root", fixture.bundle,
+        "--json",
+      ],
+      io,
+    );
+    if (exit !== 0) {
+      throw new Error(`CLI exit ${exit}: ${stdout.join("|")} / ${stderr.join("|")}`);
+    }
+    expect(stdout).toHaveLength(1);
+    const document = stdout[0] as string;
+    expect(document.endsWith("\n")).toBe(true);
+    const bytes = Buffer.byteLength(document, "utf8");
+    const outcome = JSON.parse(document) as {
+      runId: string;
+      taskId: string;
+      revision: number;
+      previousSha256: string | null;
+      origin: string;
+      body: { byteCount: number; offset: number; limit: number; returnedByteCount: number; nextOffset: number | null; dataBase64: string };
+    };
+    expect(outcome.revision).toBe(2);
+    expect(outcome.origin).toBe("user_response");
+    expect(outcome.previousSha256).toHaveLength(64);
+    expect(outcome.body.byteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+    expect(outcome.body.limit).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+    expect(outcome.body.returnedByteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+    expect(outcome.body.offset).toBe(0);
+    expect(outcome.body.dataBase64.length).toBe(258_048);
+    expect(bytes, "serialized CLI bytes (full document incl. LF)").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+    // The producer's frame guard is the reserve around the base64
+    // payload; prove with the exact production serialization that the
+    // reserve covers the whole CLI envelope around the maximum chunk.
+    const envelopeBytes = bytes - outcome.body.dataBase64.length;
+    expect(envelopeBytes, "CLI envelope bytes without the payload").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_PAGE_ENVELOPE_RESERVE);
+    expect(stderr.join("")).toBe("");
+  } finally {
+    await rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 60000);
+
+test("the real max-envelope task HTTP response document (full serialized body) stays below the envelope cap", async () => {
+  const fixture = await buildMaxTaskFixture();
+  try {
+    const { response } = await driveMaxEnvelopeHttp(fixture, `/v1/runs/${fixture.runId}/tasks/${fixture.taskId}/revisions/2?limit=${PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK}`);
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    const document = JSON.parse(text) as {
+      schema_version: number;
+      kind: string;
+      run_id: string;
+      task_id: string;
+      revision: number;
+      previous_sha256: string | null;
+      origin: string;
+      body: { byteCount: number; byte_count: number; data_base64: string };
+    };
+    expect(document.schema_version).toBe(1);
+    expect(document.kind).toBe("task_revision");
+    expect(document.run_id).toBe(fixture.runId);
+    expect(document.task_id).toBe(fixture.taskId);
+    expect(document.revision).toBe(2);
+    expect(document.previous_sha256).toHaveLength(64);
+    expect(document.body.byte_count).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
+    expect(document.body.data_base64.length).toBe(258_048);
+    const bytes = Buffer.byteLength(text, "utf8");
+    expect(bytes, "full serialized HTTP response bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+    const envelopeBytes = bytes - document.body.data_base64.length;
+    expect(envelopeBytes, "HTTP envelope bytes without the payload").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_PAGE_ENVELOPE_RESERVE);
+  } finally {
+    await rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 90000);
+
+test("the real max-envelope plan CLI document (full JSON + trailing LF) stays below the envelope cap", async () => {
+  const fixture = await buildHeavyPlanFixture({ stages: 2, tasksPerStage: 100, previousDepends: 10 }, "p".repeat(128));
+  try {
+    const { io, stdout, stderr } = makeRealCliIo(fixture.stateRoot);
+    const exit = await runCli(
+      [
+        "plan-revision",
+        "--run-id", fixture.runId,
+        "--revision", "1",
+        "--after", "0",
+        "--limit", "200",
+        "--config-root", fixture.bundle,
+        "--json",
+      ],
       io,
     );
     if (exit !== 0) {
@@ -1240,92 +1330,54 @@ test("the real producer outcome feeds the shipped CLI formatter below the envelo
     expect(stdout).toHaveLength(1);
     expect(document.endsWith("\n")).toBe(true);
     const bytes = Buffer.byteLength(document, "utf8");
-    const outcome = JSON.parse(document) as {
-      body: { dataBase64: string; byteCount: number; returnedByteCount: number; limit: number };
+    const parsed = JSON.parse(document) as {
+      runId: string;
+      revision: number;
+      manifestSha256: string;
+      previousSha256: string | null;
+      originExecution: number;
+      after: number;
+      records: { record: string }[];
+      nextAfter: number | null;
     };
-    expect(outcome.body.byteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
-    expect(outcome.body.returnedByteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
-    expect(outcome.body.dataBase64.length).toBe(258_048);
-    expect(bytes, "serialized CLI bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
-    expect(stderr.join("")).toBe("");
-  } finally {
-    await rmSync(dirs.root, { recursive: true, force: true });
-  }
-}, 60000);
-
-test("the real subprocess chain projects the shipped CLI document below the envelope cap", async () => {
-  const runId = "heavy-http-run";
-  const dirs = await makeDirs(runId);
-  try {
-    await dispatchHeavyTask(runId, dirs, HEAVY_BODY);
-    const client = new OrchestratorSubprocessClient({
-      bunExecutable: process.execPath,
-      orchestratorEntrypoint: join(import.meta.dir, "..", "src", "main.ts"),
-      workingDirectory: dirs.root,
-      configRoot: dirs.bundle,
-      baseEnv: { PATH: "/usr/bin:/bin", ORCHESTRATOR_STATE_ROOT: dirs.stateRoot },
-      stdoutLimitBytes: 2_000_000,
-      stderrLimitBytes: 1_000_000,
-      sigintGraceMs: 2000,
-    });
-    const call = await client.run({ kind: "task_revision", runId, taskId: "task-a", revision: 1, limit: PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK });
-    if (!call.ok) throw new Error(`transport refused: ${call.failure.reason}`);
-    const projection = call.projection as unknown as { kind: string; body: { byteCount: number } };
-    expect(projection.kind).toBe("taskRevision");
-    expect(projection.body.byteCount).toBe(PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK);
-    const httpProjection = projectControlPlaneTaskContent(call);
-    if (!("kind" in httpProjection) || (httpProjection as { kind?: string }).kind !== "task_revision") {
-      throw new Error("unexpected http projection");
-    }
-    const serialized = JSON.stringify((httpProjection as { kind: string; body: unknown }).body);
-    const bytes = Buffer.byteLength(serialized, "utf8");
-    expect(bytes, "serialized HTTP bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
-  } finally {
-    await rmSync(dirs.root, { recursive: true, force: true });
-  }
-}, 90000);
-
-test("the real production plan page serializes under the envelope cap on both surfaces", async () => {
-  const fixture = await buildHeavyPlanFixture({ stages: 2, tasksPerStage: 100, previousDepends: 10 });
-  try {
-    const { io, stdout, stderr } = makeRealCliIo(fixture.stateRoot);
-    const exit = await runCli(
-      ["plan-revision", "--run-id", fixture.runId, "--revision", "1", "--after", "0", "--limit", "200", "--config-root", fixture.bundle, "--json"],
-      io,
-    );
-    if (exit !== 0) {
-      throw new Error(`CLI exit ${exit}: ${stdout.join("|")} / ${stderr.join("|")}`);
-    }
-    const document = stdout[0] as string;
-    expect(document.endsWith("\n")).toBe(true);
-    const bytes = Buffer.byteLength(document, "utf8");
-    const parsed = JSON.parse(document) as { records: unknown[]; nextAfter: number | null };
+    expect(parsed.runId).toBe(fixture.runId);
     expect(parsed.records).toHaveLength(200);
     expect(parsed.nextAfter).toBe(200);
-    expect(bytes, "serialized CLI plan bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+    expect(bytes, "full serialized plan CLI bytes incl. LF").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
     expect(stderr.join("")).toBe("");
-    const client = new OrchestratorSubprocessClient({
-      bunExecutable: process.execPath,
-      orchestratorEntrypoint: join(import.meta.dir, "..", "src", "main.ts"),
-      workingDirectory: fixture.root,
-      configRoot: fixture.bundle,
-      baseEnv: { PATH: "/usr/bin:/bin", ORCHESTRATOR_STATE_ROOT: fixture.stateRoot },
-      stdoutLimitBytes: 2_000_000,
-      stderrLimitBytes: 1_000_000,
-      sigintGraceMs: 2000,
-    });
-    const call = await client.run({ kind: "plan_revision", runId: fixture.runId, revision: 1, after: 0, limit: 200 });
-    if (!call.ok) throw new Error(`transport refused: ${call.failure.reason}`);
-    const httpProjection = projectControlPlanePlanContent(call);
-    if (!("kind" in httpProjection) || (httpProjection as { kind?: string }).kind !== "plan_revision") {
-      throw new Error("unexpected http plan projection");
-    }
-    const httpBytes = Buffer.byteLength(JSON.stringify((httpProjection as { kind: string; records: unknown }).records), "utf8");
-    expect(httpBytes, "serialized HTTP plan bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
   } finally {
     await rmSync(fixture.root, { recursive: true, force: true });
   }
 }, 90000);
+
+test("the real max-envelope plan HTTP response document (full serialized body) stays below the envelope cap", async () => {
+  const fixture = await buildHeavyPlanFixture({ stages: 2, tasksPerStage: 100, previousDepends: 10 }, "p".repeat(128));
+  try {
+    const { response } = await driveMaxEnvelopeHttp(fixture, `/v1/runs/${fixture.runId}/plans/1?after=0&limit=200`);
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    const document = JSON.parse(text) as {
+      schema_version: number;
+      kind: string;
+      run_id: string;
+      revision: number;
+      records: { record: string }[];
+      next_after: number | null;
+      after: number;
+    };
+    expect(document.schema_version).toBe(1);
+    expect(document.kind).toBe("plan_revision");
+    expect(document.run_id).toBe(fixture.runId);
+    expect(document.records).toHaveLength(200);
+    expect(document.next_after).toBe(200);
+    expect(document.after).toBe(0);
+    const bytes = Buffer.byteLength(text, "utf8");
+    expect(bytes, "full serialized plan HTTP bytes").toBeLessThanOrEqual(PIPELINE_V2_RUN_PLAN_ENVELOPE_BYTE_CAP);
+  } finally {
+    await rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 90000);
+
 test("the producer reason vocabulary is exactly the eight closed values without invalid_options", () => {
   expect([...PIPELINE_V2_RUN_PLAN_CONTENT_REASONS]).toEqual([
     "run_not_found",
@@ -1396,8 +1448,8 @@ interface HeavyManifestSpec {
  * on its lexical predecessors; the manifest is published by the real
  * store and accepted into the ledger through the real reducer.
  */
-async function buildHeavyPlanFixture(spec: HeavyManifestSpec) {
-  const runId = "heavy-plan-run";
+async function buildHeavyPlanFixture(spec: HeavyManifestSpec, requestedRunId = "heavy-plan-run") {
+  const runId = requestedRunId;
   const dirs = await makeDirs(runId);
   clock = 0;
   const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId, now: nextTick });
@@ -1579,3 +1631,188 @@ import {
   projectControlPlanePlanContent,
   projectControlPlaneTaskContent,
 } from "../src/control_plane/http_server.ts";
+
+// =============================================================================
+// r4 final-corrective helpers: the max-envelope fixtures and the one
+// production HTTP serialization driver for the full-document evidence.
+// =============================================================================
+
+import {
+  handleControlPlaneHttpRequest,
+} from "../src/control_plane/http_server.ts";
+import { ControlPlaneRunBindingStore } from "../src/control_plane/run_binding_store.ts";
+import { loadControlPlaneProjectRegistry } from "../src/control_plane/project_registry.ts";
+import { defaultControlPlaneUiRoot, loadControlPlaneUiAssets } from "../src/control_plane/ui_assets.ts";
+
+/**
+ * The maximum-envelope task fixture: 128-character run id and task id
+ * (the safe-id maximum), the maximum reachable numeric surface (the
+ * full 193 536-byte body served as one maximum chunk) and revision 2 —
+ * the chain class whose document carries the 64-hex previous digest and
+ * the `user_response` origin — served through the real reducer chain:
+ * plan r1 acceptance, the planning transition, the durable wait, the
+ * accepted intent and the wait-bound revision-2 task.
+ */
+async function buildMaxTaskFixture(): Promise<{ root: string; bundle: string; runRoot: string; stateRoot: string; runId: string; taskId: string }> {
+  const runId = "r".repeat(128);
+  const taskId = "t".repeat(128);
+  const dirs = await makeDirs(runId);
+  clock = 0;
+  const sink = new PipelineV2RunStateSink({ stateRoot: dirs.stateRoot, runId, now: nextTick });
+  const inputs: readonly PipelineV2RunInputState[] = [
+    { id: "task", type: "file", protected: true, digest: PROTECTED_DIGEST },
+  ];
+  await sink.dispatch({
+    kind: "create_run",
+    runId,
+    pipeline: pipelineV2RunPipelineIdentity(dirs.pipeline),
+    inputs: inputs.map((input) => ({ ...input })),
+    projectProvenance: V2_PROJECT_PROVENANCE_BINDING,
+    profileEpoch: V2_PROFILE_EPOCH_BINDING,
+  });
+  await sink.dispatch({ kind: "start_agent_execution", stateId: "architect", profile: "coder", executionRole: "planning" });
+  for (const command of [
+    { kind: "agent_data_prepared" },
+    { kind: "agent_execution_session_created", sessionId: "max-sess-1" },
+    { kind: "agent_tool_session_created", sessionId: "max-tool-1" },
+    { kind: "agent_running" },
+    { kind: "agent_outputs_accepted", outputs: [], workerLog: { status: "unavailable" } },
+    { kind: "agent_cleanup_completed" },
+  ] as const) {
+    await sink.dispatch(command as never);
+  }
+  const taskR1 = prepareTaskRevisionManifest({
+    schema_version: 1,
+    kind: "task_revision",
+    run_id: runId,
+    task_id: taskId,
+    revision: 1,
+    previous_sha256: null,
+    origin: "planning_proposal",
+    body: "MAX ENVELOPE R1\n",
+  });
+  const plan1 = preparePlanRevisionManifest({
+    schema_version: 1,
+    kind: "plan_revision",
+    run_id: runId,
+    revision: 1,
+    previous_sha256: null,
+    root_task: { input_id: "task", sha256: PROTECTED_DIGEST },
+    origin_execution: 1,
+    stages: [{ id: "stage-1", template: "development", tasks: [{ id: taskId, revision: 1, sha256: taskR1.sha256, depends_on: [] }] }],
+  });
+  await acceptPipelineV2RunPlanCandidate({
+    pipeline: dirs.pipeline,
+    runRoot: dirs.runRoot,
+    sink,
+    candidate: preparePipelineV2RunPlanCandidate({
+      plan: plan1,
+      taskRevisions: [taskR1],
+      previousPlan: null,
+      previousTaskRevisions: [],
+      protectedInputDigest: PROTECTED_DIGEST,
+    }),
+  });
+  await sink.dispatch({
+    kind: "transition_committed",
+    step: { from: "architect", outcome: "completed", to: "dev_entry", transition_index: 0 },
+    executionIndex: 1,
+  });
+  const WAIT_REQUEST = hex("e");
+  const WAIT_INTENT = hex("c");
+  await sink.dispatch({
+    kind: "run_waiting",
+    stateId: "dev_entry",
+    reason: "stage_iteration_limit_exhausted",
+    requestSha256: WAIT_REQUEST,
+    actions: [
+      { id: "continue_stage", to: "dev_entry" },
+      { id: "revise_task", to: "architect" },
+    ],
+  });
+  await sink.dispatch({ kind: "plan_intent_accepted", waitIndex: 1, intentSha256: WAIT_INTENT });
+  const taskR2 = prepareTaskRevisionManifest({
+    schema_version: 1,
+    kind: "task_revision",
+    run_id: runId,
+    task_id: taskId,
+    revision: 2,
+    previous_sha256: taskR1.sha256,
+    origin: "user_response",
+    body: HEAVY_BODY,
+  });
+  await publishPipelineV2TaskRevision(dirs.runRoot, taskR2.manifest);
+  await sink.dispatch({
+    kind: "task_revision_accepted",
+    taskId,
+    revision: 2,
+    taskSha256: taskR2.sha256,
+    waitIndex: 1,
+    intentSha256: WAIT_INTENT,
+  });
+  return { ...dirs, runId, taskId };
+}
+
+/**
+ * The one production HTTP serialization driver: registry + binding store
+ * over the fixture, the real subprocess client spawning the real
+ * production CLI child against the fixture state root, and the shipped
+ * request handler — the returned Response body is the exact document the
+ * production serializer sends.
+ */
+async function driveMaxEnvelopeHttp(
+  fixture: { root: string; bundle: string; stateRoot: string; runId: string },
+  pathAndQuery: string,
+): Promise<{ response: Response }> {
+  const registryPath = join(fixture.root, "registry.json");
+  const projectDir = join(fixture.root, "project");
+  mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    registryPath,
+    JSON.stringify({
+      schema_version: 1,
+      projects: [
+        {
+          id: "project-a",
+          project_root: projectDir,
+          config_root: fixture.bundle,
+          pipeline_root: null,
+          launcher_id: null,
+          input_roots: [],
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+  const registry = await loadControlPlaneProjectRegistry(registryPath);
+  const bindingRoot = join(fixture.root, "binding-store");
+  mkdirSync(bindingRoot, { recursive: true, mode: 0o700 });
+  const bindingStore = await ControlPlaneRunBindingStore.open(bindingRoot);
+  await bindingStore.claim({ runId: fixture.runId, projectId: "project-a" });
+  const client = new OrchestratorSubprocessClient({
+    bunExecutable: process.execPath,
+    orchestratorEntrypoint: join(import.meta.dir, "..", "src", "main.ts"),
+    workingDirectory: fixture.root,
+    configRoot: fixture.bundle,
+    baseEnv: { PATH: "/usr/bin:/bin", ORCHESTRATOR_STATE_ROOT: fixture.stateRoot },
+    stdoutLimitBytes: 2_000_000,
+    stderrLimitBytes: 1_000_000,
+    sigintGraceMs: 2000,
+  });
+  const port = 4719;
+  const deps = {
+    registry,
+    bindingStore,
+    client,
+    assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+    port,
+    bodyLimitBytes: 4096,
+    applyStoreRoot: null,
+  };
+  const request = new Request(`http://127.0.0.1:${port}${pathAndQuery}`, {
+    method: "GET",
+    headers: { host: `127.0.0.1:${port}` },
+  });
+  const response = await handleControlPlaneHttpRequest(deps as never, request);
+  return { response };
+}
