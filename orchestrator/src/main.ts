@@ -102,6 +102,13 @@ import {
   type PipelineV2IdentityOutcome,
 } from "./pipeline_v2_identity.ts";
 import {
+  PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK,
+  planRevisionContentPipelineV2Run,
+  taskRevisionContentPipelineV2Run,
+  type PipelineV2PlanContentOutcome,
+  type PipelineV2TaskContentOutcome,
+} from "./pipeline_v2_run_plan_content.ts";
+import {
   eventsPipelineV2Run,
   type PipelineV2EventsOutcome,
 } from "./pipeline_v2_events.ts";
@@ -151,6 +158,8 @@ export interface CliIo {
   inspectPipelineV2Run: typeof inspectPipelineV2Run;
   eventsPipelineV2Run: typeof eventsPipelineV2Run;
   identityPipelineV2Run: typeof identityPipelineV2Run;
+  taskRevisionContentPipelineV2Run: typeof taskRevisionContentPipelineV2Run;
+  planRevisionContentPipelineV2Run: typeof planRevisionContentPipelineV2Run;
   logsPipelineV2Run: typeof logsPipelineV2Run;
   projectChangesPipelineV2Run: typeof projectChangesPipelineV2Run;
   projectChangeContentPipelineV2Run: typeof projectChangeContentPipelineV2Run;
@@ -191,6 +200,8 @@ function productionCliIo(): CliIo {
     inspectPipelineV2Run,
     eventsPipelineV2Run,
     identityPipelineV2Run,
+    taskRevisionContentPipelineV2Run,
+    planRevisionContentPipelineV2Run,
     logsPipelineV2Run,
     projectChangesPipelineV2Run,
     projectChangeContentPipelineV2Run,
@@ -228,7 +239,9 @@ function v1SignalRegistration(
   }
 }
 
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "identity", "logs", "project-changes", "project-change-content", "project-apply", "project-apply-inspect"] as const;
+const PIPELINE_PLAN_DEFAULT_LIMIT = 100;
+const PIPELINE_TASK_DEFAULT_CHUNK_LIMIT = PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "identity", "logs", "project-changes", "task-revision", "plan-revision", "project-change-content", "project-apply", "project-apply-inspect"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -245,6 +258,8 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "inspect" &&
     command !== "events" &&
     command !== "identity" &&
+    command !== "task-revision" &&
+    command !== "plan-revision" &&
     command !== "logs" &&
     command !== "project-changes" &&
     command !== "project-change-content" &&
@@ -315,6 +330,21 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // SubprocessCliRunner command dependencies and no mutating command
     // deps object are built for it.
     return await runPipelineV2IdentityCommand(parsed, io);
+  }
+  if (parsed.kind === "task-revision") {
+    // The read-only pipeline v2 task-revision command: like the other
+    // read-only content commands it resolves only the state-root
+    // projection (no helper configuration, no Launcher credential, no
+    // auth, no subprocess, no signal registration, no mutation lock, no
+    // durable change) and invokes the content production API exactly
+    // once. The chunk bytes travel only inside JSON documents.
+    return await runPipelineV2TaskRevisionCommand(parsed, io);
+  }
+  if (parsed.kind === "plan-revision") {
+    // The read-only pipeline v2 plan-revision command: the same
+    // read-only shape as task-revision, over the paged semantic record
+    // projection of the accepted plan revision exactly once.
+    return await runPipelineV2PlanRevisionCommand(parsed, io);
   }
   if (parsed.kind === "logs") {
     // The read-only pipeline v2 worker logs command: like inspect and
@@ -870,6 +900,83 @@ async function runPipelineV2IdentityCommand(
   } else {
     io.writeError(
       `orchestrator: identity failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+async function runPipelineV2TaskRevisionCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "task-revision" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2TaskContentOutcome = await io.taskRevisionContentPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    taskId: parsed.taskId,
+    revision: parsed.revision,
+    ...(parsed.offset === 0 ? {} : { offset: parsed.offset }),
+    ...(parsed.limit === PIPELINE_TASK_DEFAULT_CHUNK_LIMIT ? {} : { limit: parsed.limit }),
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: task-revision ok (run ${outcome.runId}, task ${outcome.taskId}, revision ${outcome.revision}, bytes ${outcome.body.returnedByteCount} of ${outcome.body.byteCount}, next ${outcome.body.nextOffset === null ? "end" : outcome.body.nextOffset})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: task-revision failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+async function runPipelineV2PlanRevisionCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "plan-revision" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2PlanContentOutcome = await io.planRevisionContentPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    revision: parsed.revision,
+    ...(parsed.after === 0 ? {} : { after: parsed.after }),
+    ...(parsed.limit === PIPELINE_PLAN_DEFAULT_LIMIT ? {} : { limit: parsed.limit }),
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: plan-revision ok (run ${outcome.runId}, revision ${outcome.revision}, records ${outcome.records.length}, next-after ${outcome.nextAfter === null ? "end" : outcome.nextAfter})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: plan-revision failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

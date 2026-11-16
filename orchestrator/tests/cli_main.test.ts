@@ -39,6 +39,10 @@ import {
   type PipelineV2IdentityOutcome,
 } from "../src/pipeline_v2_identity.ts";
 import {
+  type PipelineV2PlanContentOutcome,
+  type PipelineV2TaskContentOutcome,
+} from "../src/pipeline_v2_run_plan_content.ts";
+import {
   type PipelineV2LogsOutcome,
 } from "../src/pipeline_v2_logs.ts";
 import {
@@ -130,6 +134,12 @@ function makeIo(): Recorder {
     identityPipelineV2Run: (async () => {
       throw new Error("fake identityPipelineV2Run not configured");
     }) as unknown as CliIo["identityPipelineV2Run"],
+    taskRevisionContentPipelineV2Run: (async () => {
+      throw new Error("fake taskRevisionContentPipelineV2Run not configured");
+    }) as unknown as CliIo["taskRevisionContentPipelineV2Run"],
+    planRevisionContentPipelineV2Run: (async () => {
+      throw new Error("fake planRevisionContentPipelineV2Run not configured");
+    }) as unknown as CliIo["planRevisionContentPipelineV2Run"],
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],
@@ -4534,4 +4544,205 @@ test("identity resolver failure is exit 2 with the API never called", async () =
   expect(called).toBe(0);
   expect(rec.err.some((line) => line.includes("no state root configured"))).toBe(true);
   expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
+}, 15000);
+
+// --- P-1 task-revision / plan-revision dispatchers ------------------------------
+
+function taskContentReport(): PipelineV2TaskContentOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    taskId: "task-a",
+    revision: 1,
+    manifestSha256: "a".repeat(64),
+    previousSha256: null,
+    origin: "planning_proposal",
+    body: {
+      byteCount: 12,
+      sha256: "b".repeat(64),
+      offset: 0,
+      limit: 65536,
+      returnedByteCount: 12,
+      nextOffset: null,
+      dataBase64: "Qk9EWS0qLSMmQDI=",
+    },
+  };
+}
+
+function planContentReport(): PipelineV2PlanContentOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    revision: 1,
+    manifestSha256: "a".repeat(64),
+    previousSha256: null,
+    originExecution: 1,
+    after: 0,
+    records: [
+      { record: "stage", stage_position: 1, id: "stage-1", template: "development" },
+    ],
+    nextAfter: null,
+  };
+}
+
+test("task-revision dispatches exactly once with the parsed chunk query and no runner", async () => {
+  const rec = makeIo();
+  const calls: unknown[] = [];
+  rec.io.taskRevisionContentPipelineV2Run = (async (options: unknown) => {
+    calls.push(options);
+    return taskContentReport();
+  }) as unknown as CliIo["taskRevisionContentPipelineV2Run"];
+  const exit = await runCli([
+    "task-revision", "--run-id", "run_x", "--task-id", "task-a", "--revision", "1", "--config-root", "/cfg",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root", taskId: "task-a", revision: 1 });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual([
+    "orchestrator: task-revision ok (run run_x, task task-a, revision 1, bytes 12 of 12, next end)",
+  ]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("task-revision forwards offset and limit non-defaults exactly once with no runner", async () => {
+  const rec = makeIo();
+  const calls: unknown[] = [];
+  rec.io.taskRevisionContentPipelineV2Run = (async (options: unknown) => {
+    calls.push(options);
+    return taskContentReport();
+  }) as unknown as CliIo["taskRevisionContentPipelineV2Run"];
+  const exit = await runCli([
+    "task-revision", "--run-id", "run_x", "--task-id", "task-a", "--revision", "2",
+    "--config-root", "/cfg", "--offset", "8", "--limit", "300",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root", taskId: "task-a", revision: 2, offset: 8, limit: 300 });
+  expect(rec.runnerCalls).toHaveLength(0);
+}, 15000);
+
+test("task-revision reports the failure line without the state root", async () => {
+  const rec = makeIo();
+  rec.io.taskRevisionContentPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    reason: "artifact_modified",
+  })) as unknown as CliIo["taskRevisionContentPipelineV2Run"];
+  const exit = await runCli([
+    "task-revision", "--run-id", "run_x", "--task-id", "task-a", "--revision", "1", "--config-root", "/cfg",
+  ], rec.io);
+  expect(exit).toBe(1);
+  expect(rec.err).toEqual(["orchestrator: task-revision failed (run run_x, reason artifact_modified)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("task-revision JSON mode prints exactly one path-free document and nothing else on stdout", async () => {
+  const rec = makeIo();
+  rec.io.taskRevisionContentPipelineV2Run = (async () => taskContentReport()) as unknown as CliIo["taskRevisionContentPipelineV2Run"];
+  const exit = await runCli([
+    "task-revision", "--run-id", "run_x", "--task-id", "task-a", "--revision", "1", "--config-root", "/cfg", "--json",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  expect(rec.out[0]?.endsWith("\n")).toBe(true);
+  const parsed = JSON.parse(rec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "body", "exitCode", "manifestSha256", "ok", "origin", "previousSha256", "revision", "runId", "schemaVersion", "taskId",
+  ]);
+  const body = parsed["body"] as Record<string, unknown>;
+  expect(Object.keys(body).sort()).toEqual([
+    "byteCount", "dataBase64", "limit", "nextOffset", "offset", "returnedByteCount", "sha256",
+  ]);
+  expect(parsed["schemaVersion"]).toBe(1);
+  expect("runRoot" in parsed).toBe(false);
+  expect("state" in parsed).toBe(false);
+  expect(rec.err).toHaveLength(0);
+}, 15000);
+
+test("task-revision resolver failure is exit 2 with the API never called", async () => {
+  const rec = makeIo();
+  rec.io.resolveStateRootProjection = () => {
+    throw new Error("no state root configured");
+  };
+  let called = 0;
+  rec.io.taskRevisionContentPipelineV2Run = (async () => {
+    called += 1;
+    return taskContentReport();
+  }) as unknown as CliIo["taskRevisionContentPipelineV2Run"];
+  const exit = await runCli([
+    "task-revision", "--run-id", "run_x", "--task-id", "task-a", "--revision", "1", "--config-root", "/cfg",
+  ], rec.io);
+  expect(exit).toBe(2);
+  expect(called).toBe(0);
+  expect(rec.err.some((line) => line.startsWith("usage: orchestrator"))).toBe(true);
+}, 15000);
+
+test("plan-revision dispatches exactly once with the parsed page query and no runner", async () => {
+  const rec = makeIo();
+  const calls: unknown[] = [];
+  rec.io.planRevisionContentPipelineV2Run = (async (options: unknown) => {
+    calls.push(options);
+    return planContentReport();
+  }) as unknown as CliIo["planRevisionContentPipelineV2Run"];
+  const exit = await runCli([
+    "plan-revision", "--run-id", "run_x", "--revision", "1", "--config-root", "/cfg", "--after", "4", "--limit", "9",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual({ runId: "run_x", stateRoot: "/state/root", revision: 1, after: 4, limit: 9 });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual([
+    "orchestrator: plan-revision ok (run run_x, revision 1, records 1, next-after end)",
+  ]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("plan-revision failure, JSON contract and resolver failure match the task-revision shape", async () => {
+  const failureRec = makeIo();
+  failureRec.io.planRevisionContentPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    reason: "unknown_revision",
+  })) as unknown as CliIo["planRevisionContentPipelineV2Run"];
+  const failureExit = await runCli([
+    "plan-revision", "--run-id", "run_x", "--revision", "1", "--config-root", "/cfg",
+  ], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: plan-revision failed (run run_x, reason unknown_revision)"]);
+
+  const jsonRec = makeIo();
+  jsonRec.io.planRevisionContentPipelineV2Run = (async () => planContentReport()) as unknown as CliIo["planRevisionContentPipelineV2Run"];
+  const jsonExit = await runCli([
+    "plan-revision", "--run-id", "run_x", "--revision", "1", "--config-root", "/cfg", "--json",
+  ], jsonRec.io);
+  expect(jsonExit).toBe(0);
+  expect(jsonRec.out).toHaveLength(1);
+  const parsed = JSON.parse(jsonRec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "after", "exitCode", "manifestSha256", "nextAfter", "ok", "originExecution", "previousSha256", "records", "revision", "runId", "schemaVersion",
+  ]);
+  expect(parsed["schemaVersion"]).toBe(1);
+  expect("runRoot" in parsed).toBe(false);
+
+  const resolverRec = makeIo();
+  resolverRec.io.resolveStateRootProjection = () => {
+    throw new Error("no state root configured");
+  };
+  let called = 0;
+  resolverRec.io.planRevisionContentPipelineV2Run = (async () => {
+    called += 1;
+    return planContentReport();
+  }) as unknown as CliIo["planRevisionContentPipelineV2Run"];
+  const resolverExit = await runCli([
+    "plan-revision", "--run-id", "run_x", "--revision", "1", "--config-root", "/cfg",
+  ], resolverRec.io);
+  expect(resolverExit).toBe(2);
+  expect(called).toBe(0);
 }, 15000);

@@ -497,3 +497,89 @@ test("the apply command capture reads every field exactly once through a proxy",
   }
   expect(reads.some((read) => read === "ghost" || read === "launcherId" || read === "pipelineRoot")).toBe(false);
 });
+
+// --- P-1 task/plan content commands --------------------------------------------
+
+test("task_revision routes the exact task-revision argv and rejects hostile shapes", () => {
+  const plain = routeOrchestratorCommand(
+    { kind: "task_revision", runId: "cp-run-1", taskId: "task-a", revision: 1 },
+    ROUTING_CONFIG,
+  );
+  expect(plain.argv).toEqual([
+    "task-revision",
+    "--run-id", "cp-run-1",
+    "--task-id", "task-a",
+    "--revision", "1",
+    "--config-root", "/opt/orchestrator/config",
+    "--json",
+  ]);
+  const full = routeOrchestratorCommand(
+    { kind: "task_revision", runId: "cp-run-1", taskId: "task-a", revision: 2, offset: 8, limit: 1024 },
+    ROUTING_CONFIG,
+  );
+  expect(full.argv).toEqual([
+    "task-revision",
+    "--run-id", "cp-run-1",
+    "--task-id", "task-a",
+    "--revision", "2",
+    "--config-root", "/opt/orchestrator/config",
+    "--offset", "8",
+    "--limit", "1024",
+    "--json",
+  ]);
+  expect(() => routeOrchestratorCommand(
+    { kind: "task_revision", runId: "cp-run-1", taskId: "task-a", revision: 0 } as never,
+    ROUTING_CONFIG,
+  )).toThrow();
+  expect(() => routeOrchestratorCommand(
+    { kind: "task_revision", runId: "cp-run-1", taskId: "../x", revision: 1 } as never,
+    ROUTING_CONFIG,
+  )).toThrow();
+  expect(() => routeOrchestratorCommand(
+    { kind: "task_revision", runId: "cp-run-1", taskId: "task-a", revision: 1, extra: true } as never,
+    ROUTING_CONFIG,
+  )).toThrow();
+  expect(() => routeOrchestratorCommand(
+    { kind: "task_revision", runId: "cp-run-1", taskId: "task-a" } as never,
+    ROUTING_CONFIG,
+  )).toThrow();
+});
+
+test("plan_revision routes the exact plan-revision argv and rejects hostile shapes", () => {
+  const plain = routeOrchestratorCommand(
+    { kind: "plan_revision", runId: "cp-run-1", revision: 1 },
+    ROUTING_CONFIG,
+  );
+  expect(plain.argv).toEqual([
+    "plan-revision",
+    "--run-id", "cp-run-1",
+    "--revision", "1",
+    "--config-root", "/opt/orchestrator/config",
+    "--json",
+  ]);
+  const full = routeOrchestratorCommand(
+    { kind: "plan_revision", runId: "cp-run-1", revision: 2, after: 4, limit: 50 },
+    ROUTING_CONFIG,
+  );
+  expect(full.argv).toEqual([
+    "plan-revision",
+    "--run-id", "cp-run-1",
+    "--revision", "2",
+    "--config-root", "/opt/orchestrator/config",
+    "--after", "4",
+    "--limit", "50",
+    "--json",
+  ]);
+  expect(() => routeOrchestratorCommand(
+    { kind: "plan_revision", runId: "cp-run-1", revision: -3 } as never,
+    ROUTING_CONFIG,
+  )).toThrow();
+  expect(() => routeOrchestratorCommand(
+    { kind: "plan_revision", runId: "cp-run-1", revision: 1, taskId: "task-a" } as never,
+    ROUTING_CONFIG,
+  )).toThrow();
+  expect(() => routeOrchestratorCommand(
+    { kind: "plan_revision", runId: "BAD ID", revision: 1 } as never,
+    ROUTING_CONFIG,
+  )).toThrow();
+});

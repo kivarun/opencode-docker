@@ -1824,3 +1824,134 @@ test("usage documents the read-only identity command", () => {
   expect(text).toContain("twelve closed record kinds");
   expect(text).toContain("no document - success or failure -");
 });
+
+// --- P-1 task-revision / plan-revision parsers --------------------------------
+
+test("task-revision parses the strict read-only grammar with both flag forms and defaults", () => {
+  const full = parseCommand("task-revision", [
+    "--run-id", "rid-x_1",
+    "--task-id", "task-a",
+    "--revision", "2",
+    "--config-root", "/cfg",
+    "--offset", "8",
+    "--limit", "1024",
+  ]);
+  if (full.kind !== "task-revision") {
+    throw new Error("expected task-revision");
+  }
+  expect(full.runId).toBe("rid-x_1");
+  expect(full.taskId).toBe("task-a");
+  expect(full.revision).toBe(2);
+  expect(full.configRoot).toBe("/cfg");
+  expect(full.offset).toBe(8);
+  expect(full.limit).toBe(1024);
+  expect(full.json).toBe(false);
+
+  const equals = parseCommand("task-revision", ["--run-id=rid", "--task-id=task-b", "--revision=1", "--config-root=/cfg"]);
+  if (equals.kind !== "task-revision") {
+    throw new Error("expected task-revision");
+  }
+  expect(equals.offset).toBe(0);
+  expect(equals.limit).toBe(65536);
+
+  const maxChunk = parseCommand("task-revision", [
+    "--run-id", "rid", "--task-id", "t", "--revision", "1", "--config-root", "/c", "--limit", "193536",
+  ]);
+  if (maxChunk.kind !== "task-revision") throw new Error("expected task-revision");
+  expect(maxChunk.limit).toBe(193536);
+});
+
+test("task-revision rejects malformed numeric families, duplicates and forbidden flags", () => {
+  const base = ["--run-id", "rid", "--task-id", "t", "--revision", "1", "--config-root", "/c"];
+  for (const value of ["-1", "+1", "1.5", "1e2", "01", " ", "0x1"]) {
+    expect(() => parseCommand("task-revision", [...base, "--offset", value])).toThrow(/--offset must be a non-negative decimal integer/);
+    expect(() => parseCommand("task-revision", [...base, "--limit", value])).toThrow(/--limit must be a positive decimal integer/);
+    expect(() => parseCommand("task-revision", ["--run-id", "rid", "--task-id", "t", "--config-root", "/c", "--revision", value])).toThrow(/--revision must be a positive decimal integer/);
+  }
+  expect(() => parseCommand("task-revision", [...base, "--offset", ""])).toThrow(/--offset requires a value/);
+  expect(() => parseCommand("task-revision", [...base, "--limit", "193537"])).toThrow(/--limit must be a positive safe integer up to 193536/);
+  expect(() => parseCommand("task-revision", ["--run-id", "rid", "--task-id", "t", "--config-root", "/c", "--revision", "0"])).toThrow(/--revision must be a positive decimal integer/);
+  expect(() => parseCommand("task-revision", ["--task-id", "t", "--revision", "1", "--config-root", "/c"])).toThrow(/--run-id SAFE_ID is required for task-revision/);
+  expect(() => parseCommand("task-revision", ["--run-id", "rid"])).toThrow(/--task-id SAFE_ID is required for task-revision/);
+  expect(() => parseCommand("task-revision", ["--run-id", "rid", "--task-id", "t", "--config-root", "/c"])).toThrow(/--revision N is required for task-revision/);
+  expect(() => parseCommand("task-revision", [...base, "--limit", "1", "--limit", "2"])).toThrow(/--limit may be given at most once/);
+  for (const flag of [
+    "--pipeline-root=/b", "--project=/p", "--input", "--workspace=/w", "--image", "--profile", "--task",
+    "--wait-index", "--action", "--additional-iterations", "--task-file", "--task-body", "--state-root",
+    "--daemon-state-root", "--launcher-id", "--stage-id", "--initial-budget", "--observation", "--side",
+    "--change-index", "--project-id", "--apply-id", "--apply-store-root",
+  ]) {
+    const args = flag.endsWith("=") ? [flag] : [flag, "x"];
+    expect(() => parseCommand("task-revision", [...base, ...args])).toThrow(/task-revision does not accept/);
+  }
+  expect(() => parseCommand("task-revision", [...base, "records"])).toThrow(/unknown argument: records/);
+});
+
+test("task-revision rejects unsafe identifiers without echoing the value", () => {
+  const base = ["--config-root", "/c", "--revision", "1"];
+  expect(() => parseCommand("task-revision", [...base, "--run-id", "BAD ID", "--task-id", "t"])).toThrow(/--run-id must be a safe identifier/);
+  expect(() => parseCommand("task-revision", [...base, "--run-id", "rid", "--task-id", "../x"])).toThrow(/--task-id must be a safe identifier/);
+});
+
+test("plan-revision parses the strict read-only grammar with both flag forms and defaults", () => {
+  const full = parseCommand("plan-revision", [
+    "--run-id", "rid-x_1",
+    "--revision", "3",
+    "--config-root", "/cfg",
+    "--after", "12",
+    "--limit", "77",
+  ]);
+  if (full.kind !== "plan-revision") {
+    throw new Error("expected plan-revision");
+  }
+  expect(full.runId).toBe("rid-x_1");
+  expect(full.revision).toBe(3);
+  expect(full.configRoot).toBe("/cfg");
+  expect(full.after).toBe(12);
+  expect(full.limit).toBe(77);
+  expect(full.json).toBe(false);
+
+  const equals = parseCommand("plan-revision", ["--run-id=rid", "--revision=2", "--config-root=/cfg"]);
+  if (equals.kind !== "plan-revision") {
+    throw new Error("expected plan-revision");
+  }
+  expect(equals.after).toBe(0);
+  expect(equals.limit).toBe(100);
+
+  const maxLimit = parseCommand("plan-revision", ["--run-id", "rid", "--revision", "1", "--config-root", "/c", "--limit", "200"]);
+  if (maxLimit.kind !== "plan-revision") throw new Error("expected plan-revision");
+  expect(maxLimit.limit).toBe(200);
+});
+
+test("plan-revision rejects malformed numeric families, duplicates and forbidden flags", () => {
+  const base = ["--run-id", "rid", "--revision", "1", "--config-root", "/c"];
+  for (const value of ["-1", "+1", "1.5", "1e2", "01", " ", "0x1"]) {
+    expect(() => parseCommand("plan-revision", [...base, "--after", value])).toThrow(/--after must be a non-negative decimal integer/);
+    expect(() => parseCommand("plan-revision", ["--run-id", "rid", "--config-root", "/c", "--revision", value])).toThrow(/--revision must be a positive decimal integer/);
+    expect(() => parseCommand("plan-revision", [...base, "--limit", value])).toThrow(/--limit must be a positive decimal integer/);
+  }
+  expect(() => parseCommand("plan-revision", [...base, "--limit", "201"])).toThrow(/--limit must be a positive safe integer up to 200/);
+  expect(() => parseCommand("plan-revision", ["--revision", "1", "--config-root", "/c", "--after", "0"])).toThrow(/--run-id SAFE_ID is required for plan-revision/);
+  expect(() => parseCommand("plan-revision", ["--run-id", "rid", "--config-root", "/c"])).toThrow(/--revision N is required for plan-revision/);
+  expect(() => parseCommand("plan-revision", [...base, "--after", "1", "--after", "2"])).toThrow(/--after may be given at most once/);
+
+  for (const flag of [
+    "--pipeline-root=/b", "--project=/p", "--input", "--workspace=/w", "--image", "--profile", "--task",
+    "--wait-index", "--action", "--additional-iterations", "--task-file", "--task-body", "--state-root",
+    "--daemon-state-root", "--launcher-id", "--stage-id", "--initial-budget", "--observation", "--side",
+    "--change-index", "--project-id", "--apply-id", "--apply-store-root",
+  ]) {
+    const args = flag.endsWith("=") ? [flag] : [flag, "x"];
+    expect(() => parseCommand("plan-revision", [...base, ...args])).toThrow(/plan-revision does not accept/);
+  }
+  expect(() => parseCommand("plan-revision", [...base, "--task-id", "t"])).toThrow(/plan-revision does not accept/);
+});
+
+test("usage documents the two P-1 content commands and their flags", () => {
+  const text = usage();
+  expect(text).toContain("task-revision read-only byte-exact chunk stream of one accepted task");
+  expect(text).toContain("plan-revision read-only paged deterministic semantic projection of");
+  expect(text).toContain("task-revision/plan-revision flags (production pipeline v2, read-only)");
+  expect(text).toContain("--revision N           the accepted plan/task revision (required; the");
+  expect(text).toContain("193536; plan: default 100, up to 200)");
+});

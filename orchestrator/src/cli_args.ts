@@ -3,6 +3,24 @@ import type { RunInputBinding } from "./pipeline_v2_runtime.ts";
 import { expectSafeId } from "./pipeline_v2_state.ts";
 import { isCleanAbsolutePath } from "./clean_path.ts";
 import { DEFAULT_WORKER_IMAGE } from "./worker.ts";
+import {
+  PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK,
+  PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK,
+} from "./pipeline_v2_run_plan_content.ts";
+
+/** The P-1 task chunk constants, named once for the grammar (single owner). */
+const PIPELINE_TASK_DEFAULT_CHUNK_LIMIT = PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK;
+const PIPELINE_TASK_MAX_CHUNK_LIMIT = PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK;
+
+/** The safe-id validation of every P-1 identity scalar (never echoed on failure). */
+function expectContentSafeId(value: string, flag: string): string {
+  try {
+    expectSafeId(value, flag);
+  } catch (cause) {
+    throw new Error(`${flag} must be a safe identifier`);
+  }
+  return value;
+}
 
 export const DEFAULT_PIPELINE_ROOT = "/opt/orchestrator/pipelines/default";
 
@@ -147,8 +165,38 @@ export interface ParsedPipelineProjectChangeContentArgs {
   readonly json: boolean;
 }
 
+export interface ParsedPipelineTaskRevisionArgs {
+  readonly kind: "task-revision";
+  readonly runId: string;
+  readonly taskId: string;
+  /** The accepted task revision (required positive decimal). */
+  readonly revision: number;
+  readonly configRoot: string;
+  /** Non-negative byte offset into the body (default 0). */
+  readonly offset: number;
+  /** Chunk limit (default 65536, maximum 193536 raw bytes). */
+  readonly limit: number;
+  readonly json: boolean;
+}
+
+export interface ParsedPipelinePlanRevisionArgs {
+  readonly kind: "plan-revision";
+  readonly runId: string;
+  /** The accepted plan revision (required positive decimal). */
+  readonly revision: number;
+  readonly configRoot: string;
+  /** Non-negative record cursor (default 0). */
+  readonly after: number;
+  /** Page record limit (default 100, maximum 200). */
+  readonly limit: number;
+  readonly json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedSmokeArgs
+  | ParsedPipelineTaskRevisionArgs
+  | ParsedPipelinePlanRevisionArgs
+
   | ParsedAgentSmokeArgs
   | ParsedPipelineRunArgs
   | ParsedPipelineResumeArgs
@@ -225,6 +273,15 @@ export function usage(): string {
   "  project-apply-inspect read-only projection of one durable Apply",
   "               operation (status, revision, step counts): never runs",
   "               recovery and never changes any status",
+  "  task-revision read-only byte-exact chunk stream of one accepted task",
+  "               revision's body: ledger-first selection, per-request",
+  "               digest binding, no worker, no Launcher credential, no",
+  "               mutation lock, no artifact write and no durable change",
+  "  plan-revision read-only paged deterministic semantic projection of",
+  "               one accepted plan revision (stages, tasks, dependencies):",
+  "               ledger-first selection, per-page digest binding, no",
+  "               worker, no Launcher credential, no mutation lock and",
+  "               no durable change",
     "  respond      production pipeline v2 wait response: record the user's answer to",
     "               one durably open wait (request manifest -> response manifest ->",
     "               durable wait_response_recorded); the pipeline is NOT continued -",
@@ -531,7 +588,7 @@ export function usage(): string {
   "  command.",
   "",
   "identity flags (production pipeline v2, read-only):",
-  "  --run-id SAFE_ID        the run id of the durable run to project; required; a",
+      "  --run-id SAFE_ID        the run id of the durable run to project; required; a",
   "                          safe identifier (letters, digits, '_', '.', '-', at most",
   "                          128 characters)",
   "  --config-root PATH      non-empty absolute configuration root; required by the",
@@ -554,6 +611,16 @@ export function usage(): string {
   "                          could not be performed, never because of the run's",
   "                          own state.",
   "",
+  "task-revision/plan-revision flags (production pipeline v2, read-only):",
+  "  --task-id SAFE_ID      the accepted task id (task-revision only); a safe",
+  "                          identifier already carried in the durable task ledger",
+  "  --revision N           the accepted plan/task revision (required; the",
+  "                          client selects it from the identity record feed)",
+  "  --offset N             byte offset into the task body (default 0); a",
+  "                          byte beyond the body is 'invalid_cursor'",
+  "  --after N              exclusive record cursor for plan pages (default 0)",
+  "  --limit N              chunk or page limit (task: default 65536, up to",
+  "                          193536; plan: default 100, up to 200)",
   "  identity projects the durable identity of the run - stage generations with",
   "  their flattened iterations, settled execution roles and phases, per-",
   "  execution task bindings, grants, the full wait journal with declared actions",
@@ -1292,6 +1359,260 @@ function parseIdentityArgs(argv: string[]): ParsedPipelineIdentityArgs {
   };
 }
 
+
+/** The read-only flags no P-1 content command may carry (shared wording). */
+function rejectRunPlanContentExtra(command: string, arg: string): string {
+  if (arg === "--pipeline-root" || arg.startsWith("--pipeline-root=")) {
+    return `${command} does not accept --pipeline-root; the pipeline comes only from the durable state`;
+  }
+  if (arg === "--project" || arg.startsWith("--project=")) {
+    return `${command} does not accept --project; the run-owned project copy already exists`;
+  }
+  if (arg === "--input" || arg.startsWith("--input=")) {
+    return `${command} does not accept --input; the run-owned input snapshot already exists`;
+  }
+  if (arg === "--workspace" || arg.startsWith("--workspace=")) {
+    return `${command} does not accept --workspace; no worker is launched by ${command}`;
+  }
+  if (arg === "--image" || arg.startsWith("--image=")) {
+    return `${command} does not accept --image; no worker is launched by ${command}`;
+  }
+  if (arg === "--profile" || arg.startsWith("--profile=")) {
+    return `${command} does not accept --profile; no profile is loaded by ${command}`;
+  }
+  if (arg === "--task" || arg.startsWith("--task=")) {
+    return `${command} does not accept --task; the task input is the durable task ledger`;
+  }
+  if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+    return `${command} does not accept --task-id; task ids belong to 'task-revision'`;
+  }
+  if (arg === "--wait-index" || arg.startsWith("--wait-index=")) {
+    return `${command} does not accept --wait-index; wait selection belongs to the response and intervention commands`;
+  }
+  if (arg === "--action" || arg.startsWith("--action=")) {
+    return `${command} does not accept --action; it changes nothing`;
+  }
+  if (arg === "--additional-iterations" || arg.startsWith("--additional-iterations=")) {
+    return `${command} does not accept --additional-iterations; grants belong to 'continue-stage'`;
+  }
+  if (arg === "--task-file" || arg.startsWith("--task-file=")) {
+    return `${command} does not accept --task-file; task revisions belong to 'revise-task'`;
+  }
+  if (arg === "--task-body" || arg.startsWith("--task-body=")) {
+    return `${command} does not accept --task-body; task revisions belong to 'revise-task'`;
+  }
+  if (arg === "--state-root" || arg.startsWith("--state-root=")) {
+    return `${command} does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable`;
+  }
+  if (arg === "--daemon-state-root" || arg.startsWith("--daemon-state-root=")) {
+    return `${command} does not accept --daemon-state-root; set the ORCHESTRATOR_DAEMON_STATE_ROOT environment variable`;
+  }
+  if (arg === "--launcher-id" || arg.startsWith("--launcher-id=")) {
+    return `${command} does not accept --launcher-id; it performs no Launcher authentication`;
+  }
+  if (arg === "--stage-id" || arg.startsWith("--stage-id=")) {
+    return `${command} does not accept --stage-id; stage selection is operator policy of 'resume-plan'`;
+  }
+  if (arg === "--initial-budget" || arg.startsWith("--initial-budget=")) {
+    return `${command} does not accept --initial-budget; budget selection is operator policy of 'resume-plan'`;
+  }
+  if (arg === "--observation" || arg.startsWith("--observation=")) {
+    return `${command} does not accept --observation; accepted revision artifacts are immutable`;
+  }
+  if (arg === "--side" || arg.startsWith("--side=")) {
+    return `${command} does not accept --side; baseline/result sides belong to 'project-change-content'`;
+  }
+  if (arg === "--change-index" || arg.startsWith("--change-index=")) {
+    return `${command} does not accept --change-index; change indexes belong to 'project-change-content'`;
+  }
+  if (arg === "--project-id" || arg.startsWith("--project-id=")) {
+    return `${command} does not accept --project-id; apply operations belong to 'project-apply'`;
+  }
+  if (arg === "--apply-id" || arg.startsWith("--apply-id=")) {
+    return `${command} does not accept --apply-id; apply operations belong to 'project-apply'`;
+  }
+  if (arg === "--apply-store-root" || arg.startsWith("--apply-store-root=")) {
+    return `${command} does not accept --apply-store-root; apply operations belong to 'project-apply'`;
+  }
+  return `unknown argument: ${arg}`;
+}
+
+function parseTaskRevisionArgs(argv: string[]): ParsedPipelineTaskRevisionArgs {
+  let runId: string | null = null;
+  let taskId: string | null = null;
+  let revision: number | null = null;
+  let configRoot: string | null = null;
+  let offset: number | null = null;
+  let limit: number | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      runId = expectContentSafeId(value, "--run-id");
+      i = next;
+    } else if (arg === "--task-id" || arg.startsWith("--task-id=")) {
+      const { value, next } = parseValue(argv, i, "--task-id");
+      requireSingleton(taskId, "--task-id");
+      taskId = expectContentSafeId(value, "--task-id");
+      i = next;
+    } else if (arg === "--revision" || arg.startsWith("--revision=")) {
+      const { value, next } = parseValue(argv, i, "--revision");
+      requireSingleton(revision, "--revision");
+      revision = parsePositiveDecimalSafeInteger(value, "--revision");
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--offset" || arg.startsWith("--offset=")) {
+      const { value, next } = parseValue(argv, i, "--offset");
+      requireSingleton(offset, "--offset");
+      offset = parseNonNegativeDecimalSafeInteger(value, "--offset");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > PIPELINE_TASK_MAX_CHUNK_LIMIT) {
+        throw new Error(`--limit must be a positive safe integer up to ${PIPELINE_TASK_MAX_CHUNK_LIMIT}`);
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else {
+      throw new Error(rejectRunPlanContentExtra("task-revision", arg));
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for task-revision");
+  }
+  if (taskId === null) {
+    throw new Error("--task-id SAFE_ID is required for task-revision");
+  }
+  if (revision === null) {
+    throw new Error("--revision N is required for task-revision: the revision select");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for task-revision");
+  }
+  return {
+    kind: "task-revision",
+    runId,
+    taskId,
+    revision,
+    configRoot,
+    offset: offset ?? 0,
+    limit: limit ?? PIPELINE_TASK_DEFAULT_CHUNK_LIMIT,
+    json,
+  };
+}
+
+function parsePlanRevisionArgs(argv: string[]): ParsedPipelinePlanRevisionArgs {
+  let runId: string | null = null;
+  let revision: number | null = null;
+  let configRoot: string | null = null;
+  let after: number | null = null;
+  let limit: number | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      runId = expectContentSafeId(value, "--run-id");
+      i = next;
+    } else if (arg === "--revision" || arg.startsWith("--revision=")) {
+      const { value, next } = parseValue(argv, i, "--revision");
+      requireSingleton(revision, "--revision");
+      revision = parsePositiveDecimalSafeInteger(value, "--revision");
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--after" || arg.startsWith("--after=")) {
+      const { value, next } = parseValue(argv, i, "--after");
+      requireSingleton(after, "--after");
+      after = parseNonNegativeDecimalSafeInteger(value, "--after");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > 200) {
+        throw new Error("--limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else {
+      throw new Error(rejectRunPlanContentExtra("plan-revision", arg));
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for plan-revision");
+  }
+  if (revision === null) {
+    throw new Error("--revision N is required for plan-revision: the revision select");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for plan-revision");
+  }
+  return {
+    kind: "plan-revision",
+    runId,
+    revision,
+    configRoot,
+    after: after ?? 0,
+    limit: limit ?? 100,
+    json,
+  };
+}
+
 function parseLogsArgs(argv: string[]): ParsedPipelineLogsArgs {
   let runId: string | null = null;
   let configRoot: string | null = null;
@@ -2024,9 +2345,15 @@ function parseProjectApplyInspectArgs(argv: string[]): ParsedPipelineProjectAppl
 }
 
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "identity" | "logs" | "project-changes" | "project-change-content" | "project-apply" | "project-apply-inspect",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "identity" | "logs" | "project-changes" | "task-revision" | "plan-revision" | "project-change-content" | "project-apply" | "project-apply-inspect",
   argv: string[],
 ): ParsedCommand {
+  if (kind === "task-revision") {
+    return parseTaskRevisionArgs(argv);
+  }
+  if (kind === "plan-revision") {
+    return parsePlanRevisionArgs(argv);
+  }
   if (kind === "run") {
     return parseRunArgs(argv);
   }

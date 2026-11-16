@@ -166,6 +166,8 @@ describe("control-plane HTTP: route parser", () => {
       ["/v1/runs/r1/events", "POST"],
       ["/v1/runs/r1/changes", "POST"],
       ["/v1/runs/r1/identity", "POST"],
+      ["/v1/runs/r1/tasks/task-a/revisions/1", "POST"],
+      ["/v1/runs/r1/plans/2", "POST"],
     ] as const) {
       expect(routeReason(path, method)).toBe("method_not_allowed");
     }
@@ -186,7 +188,7 @@ describe("control-plane HTTP: route parser", () => {
     }
   });
 
-  test("the versioned route inventory is exactly 17 routes at the parser", () => {
+  test("the versioned route inventory is exactly 19 routes at the parser", () => {
     for (const route of [
       ["/v1/projects/project-a/runs", "POST", "fresh_run"],
       ["/v1/projects", "GET", "projects"],
@@ -199,6 +201,8 @@ describe("control-plane HTTP: route parser", () => {
       ["/v1/runs/r1/respond", "POST", "respond"],
       ["/v1/runs/r1/events", "GET", "events"],
       ["/v1/runs/r1/identity", "GET", "identity"],
+      ["/v1/runs/r1/tasks/task-a/revisions/1", "GET", "task_content"],
+      ["/v1/runs/r1/plans/2", "GET", "plan_content"],
       ["/v1/runs/r1/logs", "GET", "logs_list"],
       ["/v1/runs/r1/logs/1", "GET", "logs_execution"],
       ["/v1/runs/r1/changes", "GET", "project_changes"],
@@ -215,6 +219,8 @@ describe("control-plane HTTP: route parser", () => {
     }
     expect(routeReason("/v1/runs/r1/id", "GET")).toBe("unknown_route");
     expect(routeReason("/v1/runs/r1/change", "GET")).toBe("unknown_route");
+    expect(routeReason("/v1/runs/r1/tasks", "GET")).toBe("unknown_route");
+    expect(routeReason("/v1/runs/r1/plans", "GET")).toBe("unknown_route");
   });
 
   test("unknown routes, extra segments and unsafe ids are refused", () => {
@@ -3360,5 +3366,305 @@ describe("control plane HTTP: the explicit Project Apply routes", () => {
     expect(statusForControlPlaneFailure({ layer: "request", reason: "project_apply_disabled" })).toBe(409);
     expect(statusForControlPlaneFailure({ layer: "request", reason: "project_apply_not_found" })).toBe(404);
     expect(statusForControlPlaneFailure({ layer: "request", reason: "stale_observation" })).toBe(409);
+  });
+});
+
+let taskContentBody = "";
+let planContentBody = "";
+function taskContentGet(): string {
+  return taskContentBody;
+}
+function planContentGet(): string {
+  return planContentBody;
+}
+
+describe("control-plane HTTP: P-1 task/plan content routes", () => {
+  const envRoot = mkdtempSync(join(tmpdir(), `cp-http-p1-${CANARY}-`));
+  const registryPath = join(envRoot, "registry.json");
+  const storeRoot = join(envRoot, "bindings");
+  const projectDir = join(envRoot, "project");
+  let registry: Awaited<ReturnType<typeof loadControlPlaneProjectRegistry>>;
+  const calls: unknown[] = [];
+  let nextResult: OrchestratorCallResult = {
+    ok: true,
+    projection: {
+      kind: "taskRevision",
+      schemaVersion: 1,
+      runId: "p1-run",
+      taskId: "task-a",
+      revision: 1,
+      manifestSha256: "a".repeat(64),
+      previousSha256: null,
+      origin: "planning_proposal",
+      body: { byteCount: 4, sha256: "b".repeat(64), offset: 0, limit: 65536, returnedByteCount: 4, nextOffset: null, dataBase64: "Qk9EWQ==" },
+    },
+  };
+
+  beforeAll(async () => {
+    mkdirSync(projectDir, { mode: 0o700 });
+    mkdirSync(storeRoot, { mode: 0o700 });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        schema_version: 1,
+        projects: [
+          {
+            id: "project-a",
+            project_root: projectDir,
+            config_root: join(envRoot, "config"),
+            pipeline_root: null,
+            launcher_id: null,
+            input_roots: [],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(join(envRoot, "config"), { mode: 0o700 });
+    registry = await loadControlPlaneProjectRegistry(registryPath);
+    const store = await ControlPlaneRunBindingStore.open(storeRoot);
+    await store.claim({ runId: "p1-run", projectId: "project-a" });
+    await store.claim({ runId: "p1-gone-run", projectId: "project-removed" });
+  }, 20000);
+
+  afterAll(() => {
+    rmSync(envRoot, { recursive: true, force: true });
+  });
+
+  const callHandler = async (path: string, headers: Record<string, string> = {}): Promise<RawResponse> => {
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: {
+        run: async (command: unknown): Promise<OrchestratorCallResult> => {
+          calls.push(command);
+          return nextResult;
+        },
+      } as unknown as OrchestratorSubprocessClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+    };
+    const request = new Request(`http://127.0.0.1:4711${path}`, {
+      method: "GET",
+      headers: { host: "127.0.0.1:4711", ...headers },
+    });
+    const response = await handleControlPlaneHttpRequest(deps as never, request);
+    return { status: response.status, headers: Object.fromEntries(response.headers.entries()), body: await response.text() };
+  };
+
+  test("the task content route serves the exact snake_case projection with no run root", async () => {
+    const response = await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1?offset=0&limit=2048");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(body).toEqual({
+      schema_version: 1,
+      kind: "task_revision",
+      run_id: "p1-run",
+      task_id: "task-a",
+      revision: 1,
+      manifest_sha256: "a".repeat(64),
+      previous_sha256: null,
+      origin: "planning_proposal",
+      body: { byte_count: 4, sha256: "b".repeat(64), offset: 0, limit: 65536, returned_byte_count: 4, next_offset: null, data_base64: "Qk9EWQ==" },
+    });
+    expect(response.body).not.toContain("run_root");
+    expect(response.body).not.toContain("envRoot");
+    expect(calls).toEqual([
+      { kind: "task_revision", runId: "p1-run", taskId: "task-a", revision: 1, offset: 0, limit: 2048 },
+    ]);
+    taskContentBody = response.body;
+  }, 20000);
+
+  test("the plan content route serves the exact snake_case page with no run root", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "planRevision",
+        schemaVersion: 1,
+        runId: "p1-run",
+        revision: 2,
+        manifestSha256: "c".repeat(64),
+        previousSha256: "d".repeat(64),
+        originExecution: 3,
+        after: 2,
+        records: [
+          { record: "stage", stage_position: 1, id: "stage-1", template: "development" },
+          { record: "task", stage_position: 1, task_position: 1, id: "task-a", revision: 2, sha256: "e".repeat(64) },
+        ],
+        nextAfter: 4,
+      },
+    };
+    const response = await callHandler("/v1/runs/p1-run/plans/2?after=2&limit=50");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+    expect(body).toEqual({
+      schema_version: 1,
+      kind: "plan_revision",
+      run_id: "p1-run",
+      revision: 2,
+      manifest_sha256: "c".repeat(64),
+      previous_sha256: "d".repeat(64),
+      origin_execution: 3,
+      after: 2,
+      records: [
+        { record: "stage", stage_position: 1, id: "stage-1", template: "development" },
+        { record: "task", stage_position: 1, task_position: 1, id: "task-a", revision: 2, sha256: "e".repeat(64) },
+      ],
+      next_after: 4,
+    });
+    expect(response.body).not.toContain("run_root");
+    expect(response.body).not.toContain("root_task");
+    expect(response.body).not.toContain("envRoot");
+    expect(calls[calls.length - 1]).toEqual({ kind: "plan_revision", runId: "p1-run", revision: 2, after: 2, limit: 50 });
+    planContentBody = response.body;
+  }, 20000);
+
+  test("the query grammars are strict and capped", async () => {
+    calls.length = 0;
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "taskRevision",
+        schemaVersion: 1,
+        runId: "p1-run",
+        taskId: "task-a",
+        revision: 1,
+        manifestSha256: "a".repeat(64),
+        previousSha256: null,
+        origin: "planning_proposal",
+        body: { byteCount: 4, sha256: "b".repeat(64), offset: 0, limit: 65536, returnedByteCount: 4, nextOffset: null, dataBase64: "Qk9EWQ==" },
+      },
+    };
+    expect((await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1?limit=193537")).status).toBe(400);
+    expect((await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1?offset=-1")).status).toBe(400);
+    expect((await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1?offset=1.5")).status).toBe(400);
+    expect((await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1?offset=1&offset=2")).status).toBe(400);
+    expect((await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1?after=1")).status).toBe(400);
+    expect((await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1?%61=1")).status).toBe(400);
+    expect((await callHandler("/v1/runs/p1-run/plans/2?limit=201")).status).toBe(400);
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "planRevision",
+        schemaVersion: 1,
+        runId: "p1-run",
+        revision: 2,
+        manifestSha256: "c".repeat(64),
+        previousSha256: "d".repeat(64),
+        originExecution: 3,
+        after: 0,
+        records: [],
+        nextAfter: null,
+      },
+    };
+    expect((await callHandler("/v1/runs/p1-run/plans/2?after=0")).status).toBe(200);
+    const decimalPaths = await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/01");
+    expect(decimalPaths.status).toBe(400);
+    const unsafe = await callHandler("/v1/runs/p1-run/tasks/../x/revisions/1");
+    expect(unsafe.status).toBe(404);
+  }, 20000);
+
+  test("CLI failures map through the one status table and requests stay zero-effect", async () => {
+    nextResult = {
+      ok: true,
+      projection: { kind: "taskRevisionFailure", exitCode: 1, runId: "p1-run", reason: "artifact_modified" },
+    };
+    const taskFailure = await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1");
+    expect(taskFailure.status).toBe(200);
+    expect(JSON.parse(taskFailure.body)).toEqual({
+      schema_version: 1,
+      kind: "command_result",
+      run_id: "p1-run",
+      outcome: "failed",
+      exit_code: 1,
+      reason: "artifact_modified",
+    });
+
+    nextResult = {
+      ok: true,
+      projection: { kind: "planRevisionFailure", exitCode: 1, runId: "p1-run", reason: "unknown_revision" },
+    };
+    const planFailure = await callHandler("/v1/runs/p1-run/plans/1");
+    expect(planFailure.status).toBe(200);
+    expect(JSON.parse(planFailure.body)).toEqual({
+      schema_version: 1,
+      kind: "command_result",
+      run_id: "p1-run",
+      outcome: "failed",
+      exit_code: 1,
+      reason: "unknown_revision",
+    });
+
+    nextResult = {
+      ok: true,
+      projection: { kind: "planRevisionFailure", exitCode: 1, runId: "p1-run", reason: "invalid_cursor" },
+    };
+    const cursorFailure = await callHandler("/v1/runs/p1-run/plans/1?after=999999");
+    expect(cursorFailure.status).toBe(400);
+    expect(JSON.parse(cursorFailure.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_cursor" });
+  }, 20000);
+
+  test("host header and origin gates and GET-only apply to the new routes", async () => {
+    nextResult = {
+      ok: true,
+      projection: {
+        kind: "taskRevision",
+        schemaVersion: 1,
+        runId: "p1-run",
+        taskId: "task-a",
+        revision: 1,
+        manifestSha256: "a".repeat(64),
+        previousSha256: null,
+        origin: "planning_proposal",
+        body: { byteCount: 4, sha256: "b".repeat(64), offset: 0, limit: 65536, returnedByteCount: 4, nextOffset: null, dataBase64: "Qk9EWQ==" },
+      },
+    };
+    const wrongHost = await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1", { host: "evil.example:4711" });
+    expect(wrongHost.status).toBe(400);
+    const wrongOrigin = await callHandler("/v1/runs/p1-run/plans/2?after=0", { origin: "http://evil.example" });
+    expect(wrongOrigin.status).toBe(400);
+    const post = new Request("http://127.0.0.1:4711/v1/runs/p1-run/tasks/task-a/revisions/1", {
+      method: "POST",
+      headers: { host: "127.0.0.1:4711", "content-type": "application/json" },
+      body: "{}",
+    });
+    const deps = {
+      registry,
+      bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+      client: { run: async (): Promise<OrchestratorCallResult> => nextResult } as unknown as OrchestratorSubprocessClient,
+      assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+      port: 4711,
+      bodyLimitBytes: 4096,
+    };
+    const postResponse = await handleControlPlaneHttpRequest(deps as never, post);
+    expect(postResponse.status).toBe(405);
+  }, 20000);
+
+  test("an unbound run fails closed before any subprocess and a removed project stays unavailable", async () => {
+    calls.length = 0;
+    const unbound = await callHandler("/v1/runs/unbound-run/tasks/task-a/revisions/1");
+    expect(unbound.status).toBe(404);
+    expect(calls).toHaveLength(0);
+    const removedProject = await callHandler("/v1/runs/p1-gone-run/plans/1");
+    expect(removedProject.status).toBe(409);
+  }, 20000);
+
+  test("the transport failure maps to 502", async () => {
+    nextResult = { ok: false, failure: { reason: "spawn_failed", expectedRunId: "p1-run" } };
+    const response = await callHandler("/v1/runs/p1-run/tasks/task-a/revisions/1");
+    expect(response.status).toBe(502);
+  }, 20000);
+
+  test("no P-1 route ever carries a host path in a success or failure document", async () => {
+    for (const document of [
+      JSON.parse(taskContentGet()),
+      JSON.parse(planContentGet()),
+    ]) {
+      const serialized = JSON.stringify(document);
+      expect(serialized).not.toContain(envRoot);
+      expect(serialized).not.toContain("/tmp/");
+      expect(serialized).not.toContain("CANARY");
+    }
   });
 });

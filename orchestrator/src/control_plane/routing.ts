@@ -78,6 +78,21 @@ export type OrchestratorCommand =
       readonly limit?: number;
     }
   | {
+      readonly kind: "task_revision";
+      readonly runId: string;
+      readonly taskId: string;
+      readonly revision: number;
+      readonly offset?: number;
+      readonly limit?: number;
+    }
+  | {
+      readonly kind: "plan_revision";
+      readonly runId: string;
+      readonly revision: number;
+      readonly after?: number;
+      readonly limit?: number;
+    }
+  | {
       readonly kind: "logs";
       readonly runId: string;
       readonly executionIndex?: number;
@@ -487,6 +502,51 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
         limit,
       };
     }
+    case "task_revision": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "taskId" && key !== "revision" && key !== "offset" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on task_revision command");
+        }
+      }
+      if (!Object.hasOwn(command, "runId") || !Object.hasOwn(command, "taskId") || !Object.hasOwn(command, "revision")) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "missing required field on task_revision command");
+      }
+      const taskOffsetField = optionalField(command, "offset");
+      const offset = taskOffsetField.present ? expectNonNegativeIntegerField({ offset: taskOffsetField.value }, "offset", "offset") : null;
+      const taskLimitField = optionalField(command, "limit");
+      const limit = taskLimitField.present ? expectPositiveIntegerField({ limit: taskLimitField.value }, "limit", "limit") : null;
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        taskId: expectSafeIdField(command, "taskId", "taskId"),
+        revision: expectPositiveIntegerField({ revision: command["revision"] }, "revision", "revision"),
+        offset,
+        limit,
+      };
+    }
+    case "plan_revision": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "revision" && key !== "after" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on plan_revision command");
+        }
+      }
+      if (!Object.hasOwn(command, "runId") || !Object.hasOwn(command, "revision")) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "missing required field on plan_revision command");
+      }
+      const planAfterField = optionalField(command, "after");
+      const planAfter = planAfterField.present ? expectNonNegativeIntegerField({ after: planAfterField.value }, "after", "after") : null;
+      const planLimitField = optionalField(command, "limit");
+      const planLimit = planLimitField.present ? expectPositiveIntegerField({ limit: planLimitField.value }, "limit", "limit") : null;
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        revision: expectPositiveIntegerField({ revision: command["revision"] }, "revision", "revision"),
+        after: planAfter,
+        limit: planLimit,
+      };
+    }
     case "logs": {
       for (const key of Object.keys(command)) {
         if (key !== "kind" && key !== "runId" && key !== "executionIndex" && key !== "offset" && key !== "limit") {
@@ -673,7 +733,11 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
                 ? "project-apply"
                 : captured.kind === "project_apply_inspect"
                   ? "project-apply-inspect"
-                  : captured.kind;
+                  : captured.kind === "task_revision"
+                    ? "task-revision"
+                    : captured.kind === "plan_revision"
+                      ? "plan-revision"
+                      : captured.kind;
   const argv: string[] = [cliKind];
   switch (captured.kind) {
     case "run": {
@@ -731,6 +795,16 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
       if (captured.after !== null) argv.push("--after", String(captured.after));
       if (captured.revision !== null) argv.push("--revision", String(captured.revision));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
+      break;
+    case "task_revision":
+      argv.push("--run-id", captured.runId, "--task-id", captured.taskId, "--revision", String(captured.revision), "--config-root", routingConfig.configRoot);
+      if (captured.offset !== null) argv.push("--offset", String(captured.offset));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
+      break;
+    case "plan_revision":
+      argv.push("--run-id", captured.runId, "--revision", String(captured.revision), "--config-root", routingConfig.configRoot);
+      if (captured.after !== null) argv.push("--after", String(captured.after));
       if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       break;
     case "logs":

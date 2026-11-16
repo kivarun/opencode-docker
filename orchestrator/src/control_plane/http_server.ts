@@ -177,6 +177,8 @@ interface ParsedRoute {
     | "continue_stage"
     | "revise_task"
     | "respond"
+    | "task_content"
+    | "plan_content"
     | "projects"
     | "runs"
     | "ui_root"
@@ -190,6 +192,10 @@ interface ParsedRoute {
   readonly changeIndex?: number;
   /** The apply id of the explicit Project Apply routes (absent elsewhere). */
   readonly applyId?: string;
+  /** The task id of the task content route (absent elsewhere). */
+  readonly taskId?: string;
+  /** The URL revision select of the content routes (absent elsewhere). */
+  readonly revision?: number;
 }
 
 /**
@@ -288,6 +294,17 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
     }
     return value;
   };
+  /** The canonical decimal for the content-route revision path segment. */
+  const decimalPath = (value: string | undefined): number | null => {
+    if (value === undefined || !/^(0|[1-9][0-9]*)$/.test(value)) {
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+      return null;
+    }
+    return parsed;
+  };
   if (matchesShape(["ui", "app.js"])) {
     if (shapeMethodMismatch("GET")) {
       return new ControlPlaneHttpRequestError("method_not_allowed", "the ui script route accepts GET only");
@@ -351,6 +368,35 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
       return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
     }
     return { kind: "identity", projectId: null, runId };
+  }
+  if (matchesShape(["v1", "runs", "*", "tasks", "*", "revisions", "*"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the task content route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    const taskId = safeId(rest[4]);
+    if (runId === null || taskId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run and task ids must be safe identifiers");
+    }
+    const revision = decimalPath(rest[6]);
+    if (revision === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the revision must be a positive decimal integer");
+    }
+    return { kind: "task_content", projectId: null, runId, taskId, revision };
+  }
+  if (matchesShape(["v1", "runs", "*", "plans", "*"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the plan content route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    const revision = decimalPath(rest[4]);
+    if (revision === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the revision must be a positive decimal integer");
+    }
+    return { kind: "plan_content", projectId: null, runId, revision };
   }
   if (matchesShape(["v1", "runs", "*", "logs"])) {
     if (shapeMethodMismatch("GET")) {
@@ -938,6 +984,110 @@ export function parseIdentityQuery(
  * percent-encoding, no bare keys, no duplicates, no empty values, no
  * sign, fraction or exponent, and no unknown fields.
  */
+export type TaskContentQuery = { readonly offset: number | null; readonly limit: number | null };
+
+/**
+ * The strict query grammar of the task content route: canonical decimal
+ * cursors only, no percent-encoding, bare keys, duplicates, empty
+ * values or unknown fields; violated grammar is the request-layer
+ * `invalid_cursor` refusal (400).
+ */
+export function parseTaskContentQuery(
+  search: string,
+): TaskContentQuery | ControlPlaneHttpRequestError {
+  const result = parseContentQuery(search, "task", 193_536, "offset", "limit");
+  if (result instanceof ControlPlaneHttpRequestError) {
+    return result;
+  }
+  return { offset: result.first, limit: result.second };
+}
+
+export type PlanContentQuery = { readonly after: number | null; readonly limit: number | null };
+
+/**
+ * The strict query grammar of the plan content route: canonical decimal
+ * cursors only, no percent-encoding, bare keys, duplicates, empty
+ * values or unknown fields; violated grammar is the request-layer
+ * `invalid_cursor` refusal (400), and `limit` is capped at the HTTP
+ * page maximum of 200.
+ */
+export function parsePlanContentQuery(
+  search: string,
+): PlanContentQuery | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  const result = parseContentQuery(search, "plan", 200, "after", "limit");
+  if (result instanceof ControlPlaneHttpRequestError) {
+    return result;
+  }
+  return { after: result.first, limit: result.second };
+}
+
+function parseContentQuery(
+  search: string,
+  what: string,
+  maxSecond: number,
+  firstKey: "offset" | "after",
+  secondKey: "limit",
+):
+  | { readonly first: number | null; readonly second: number | null }
+  | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { first: null, second: null };
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_cursor", `the ${what} query must not carry encoded components`);
+  }
+  let first: number | null = null;
+  let second: number | null = null;
+  const decimal = (value: string): number | null => {
+    if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed)) {
+      return null;
+    }
+    return parsed;
+  };
+  for (const part of search.split("&")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) {
+      return new ControlPlaneHttpRequestError("invalid_cursor", `every ${what} query field must carry exactly one value`);
+    }
+    const key = part.slice(0, separator);
+    const value = part.slice(separator + 1);
+    if (key === firstKey) {
+      if (first !== null) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", `the ${what} query fields must be unique`);
+      }
+      const parsed = decimal(value);
+      if (parsed === null) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", `the ${what} query ${firstKey} must be a non-negative safe integer`);
+      }
+      first = parsed;
+      continue;
+    }
+    if (key === secondKey) {
+      if (second !== null) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", `the ${what} query fields must be unique`);
+      }
+      const parsed = decimal(value);
+      if (parsed === null || parsed > maxSecond) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", `the ${what} query ${secondKey} must be a positive safe integer up to ${maxSecond}`);
+      }
+      second = parsed;
+      continue;
+    }
+    return new ControlPlaneHttpRequestError("invalid_cursor", `the ${what} query accepts only ${firstKey} and ${secondKey}`);
+  }
+  return { first, second };
+}
+
 export function parseProjectChangesQuery(
   search: string,
 ): { readonly after: number | null; readonly limit: number | null; readonly observation: string | null } | ControlPlaneHttpRequestError {
@@ -1307,7 +1457,9 @@ export function projectControlPlaneCommandResult(
     projection.kind === "projectChangeContent" ||
     projection.kind === "projectChangeContentFailure" ||
     projection.kind === "projectApplyOperation" ||
-    projection.kind === "projectApplyFailure"
+    projection.kind === "projectApplyFailure" ||
+    projection.kind === "taskRevision" ||
+    projection.kind === "planRevision"
   ) {
     return { layer: "transport", reason: "internal_error" };
   }
@@ -1642,6 +1794,141 @@ export function projectControlPlaneIdentity(
   };
 }
 
+/** The versioned bounded task-body chunk projection of one run (P-1). */
+export interface TaskContentProjection {
+  readonly schema_version: 1;
+  readonly kind: "task_revision";
+  readonly run_id: string;
+  readonly task_id: string;
+  readonly revision: number;
+  readonly manifest_sha256: string;
+  readonly previous_sha256: string | null;
+  readonly origin: string;
+  readonly body: Record<string, unknown>;
+}
+
+/** The versioned paged plan projection of one run (P-1). */
+export interface PlanContentProjection {
+  readonly schema_version: 1;
+  readonly kind: "plan_revision";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly manifest_sha256: string;
+  readonly previous_sha256: string | null;
+  readonly origin_execution: number;
+  readonly after: number;
+  readonly records: readonly unknown[];
+  readonly next_after: number | null;
+}
+
+/**
+ * The one projection builder for a verified schemaVersion-1 task
+ * content chunk: the body fields are copied without any new
+ * classification and the chunk documents are path-free by contract, so
+ * there is no run root to drop. A typed `invalid_cursor` CLI failure is
+ * the request-layer 400 envelope (the existing request-layer reason,
+ * reused); every other correctly received task-content failure follows
+ * the identity precedent (a correctly received failed outcome as a 200
+ * command result).
+ */
+export function projectControlPlaneTaskContent(
+  result: OrchestratorCallResult,
+): TaskContentProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "taskRevisionFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "taskRevision" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  const body = projection.body as {
+    readonly byteCount: number;
+    readonly sha256: string;
+    readonly offset: number;
+    readonly limit: number;
+    readonly returnedByteCount: number;
+    readonly nextOffset: number | null;
+    readonly dataBase64: string;
+  };
+  return {
+    schema_version: 1,
+    kind: "task_revision",
+    run_id: projection.runId,
+    task_id: projection.taskId,
+    revision: projection.revision,
+    manifest_sha256: projection.manifestSha256,
+    previous_sha256: projection.previousSha256,
+    origin: projection.origin,
+    body: {
+      byte_count: body.byteCount,
+      sha256: body.sha256,
+      offset: body.offset,
+      limit: body.limit,
+      returned_byte_count: body.returnedByteCount,
+      next_offset: body.nextOffset,
+      data_base64: body.dataBase64,
+    },
+  };
+}
+
+/**
+ * The one projection builder for a verified schemaVersion-1 plan
+ * content page: the semantic record projection is copied without any
+ * new classification; the page documents are path-free by contract. A
+ * typed `invalid_cursor` CLI failure is the request-layer 400 envelope;
+ * every other correctly received plan-content failure follows the
+ * identity precedent.
+ */
+export function projectControlPlanePlanContent(
+  result: OrchestratorCallResult,
+): PlanContentProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "planRevisionFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "planRevision" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "plan_revision",
+    run_id: projection.runId,
+    revision: projection.revision,
+    manifest_sha256: projection.manifestSha256,
+    previous_sha256: projection.previousSha256,
+    origin_execution: projection.originExecution,
+    after: projection.after,
+    records: projection.records,
+    next_after: projection.nextAfter,
+  };
+}
+
 /**
  * The one projection builder for a verified schemaVersion-1 events
  * projection: the event entries are copied without any new
@@ -1809,6 +2096,8 @@ function projectionResponse(
     | RunsDiscoveryProjection
     | EventsProjection
     | IdentityProjection
+    | TaskContentProjection
+    | PlanContentProjection
     | WorkerLogsProjection
     | ProjectChangesProjection
     | ProjectChangeContentProjection
@@ -1988,6 +2277,8 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
         parsed.kind !== "runs" &&
         parsed.kind !== "events" &&
         parsed.kind !== "identity" &&
+        parsed.kind !== "task_content" &&
+        parsed.kind !== "plan_content" &&
         parsed.kind !== "logs_list" &&
         parsed.kind !== "logs_execution" &&
         parsed.kind !== "project_changes" &&
@@ -2023,6 +2314,8 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind === "runs" ||
       parsed.kind === "events" ||
       parsed.kind === "identity" ||
+      parsed.kind === "task_content" ||
+      parsed.kind === "plan_content" ||
       parsed.kind === "logs_list" ||
       parsed.kind === "logs_execution" ||
       parsed.kind === "project_changes" ||
@@ -2111,6 +2404,37 @@ async function dispatchControlPlaneRoute(
       };
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneIdentity(result));
+    }
+    case "task_content": {
+      const query = parseTaskContentQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "task_revision",
+        runId,
+        taskId: route.taskId as string,
+        revision: route.revision as number,
+        ...(query.offset === null ? {} : { offset: query.offset }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneTaskContent(result));
+    }
+    case "plan_content": {
+      const query = parsePlanContentQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "plan_revision",
+        runId,
+        revision: route.revision as number,
+        ...(query.after === null ? {} : { after: query.after }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlanePlanContent(result));
     }
     case "logs_list": {
       const query = parseLogsListQuery(deps.discoveryQuery ?? "");

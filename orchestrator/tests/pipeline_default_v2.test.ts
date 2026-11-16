@@ -409,6 +409,12 @@ function makeChain(stateRoot: string, resultBody: Record<string, unknown>, credF
     identityPipelineV2Run: (async () => {
       throw new Error("fake identityPipelineV2Run not configured");
     }) as unknown as CliIo["identityPipelineV2Run"],
+    taskRevisionContentPipelineV2Run: (async () => {
+      throw new Error("fake taskRevisionContentPipelineV2Run not configured");
+    }) as unknown as CliIo["taskRevisionContentPipelineV2Run"],
+    planRevisionContentPipelineV2Run: (async () => {
+      throw new Error("fake planRevisionContentPipelineV2Run not configured");
+    }) as unknown as CliIo["planRevisionContentPipelineV2Run"],
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],
@@ -650,6 +656,12 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
       identityPipelineV2Run: (async () => {
       throw new Error("fake identityPipelineV2Run not configured");
     }) as unknown as CliIo["identityPipelineV2Run"],
+      taskRevisionContentPipelineV2Run: (async () => {
+        throw new Error("fake not configured");
+      }) as unknown as CliIo["taskRevisionContentPipelineV2Run"],
+      planRevisionContentPipelineV2Run: (async () => {
+        throw new Error("fake not configured");
+      }) as unknown as CliIo["planRevisionContentPipelineV2Run"],
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],

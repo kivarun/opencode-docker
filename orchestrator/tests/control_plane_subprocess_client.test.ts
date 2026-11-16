@@ -889,3 +889,83 @@ test("an apply operation document with a missing field is unexpected_output_shap
   const client = makeClient();
   expectFailure(await client.run(applyInspectScenario("apply_missing_field")), "unexpected_output_shape");
 }, 15000);
+
+// --- P-1 task/plan content projections -----------------------------------------
+
+function taskContentScenario(scenario: string): { kind: "task_revision"; runId: string; taskId: string; revision: number } {
+  return { kind: "task_revision", runId: `sc-${scenario}`, taskId: "sc-task", revision: 1 };
+}
+
+function planContentScenario(scenario: string): { kind: "plan_revision"; runId: string; revision: number } {
+  return { kind: "plan_revision", runId: `sc-${scenario}`, revision: 1 };
+}
+
+test("projects the task content chunk path-free with the body frozen", async () => {
+  const client = makeClient();
+  const result = await client.run(taskContentScenario("task-content-report"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "taskRevision") throw new Error("unreachable");
+  expect(projection.schemaVersion).toBe(1);
+  expect(projection.runId).toBe("cp-child-run");
+  expect(projection.taskId).toBe("task-a");
+  expect(projection.revision).toBe(1);
+  expect(projection.manifestSha256).toBe("a".repeat(64));
+  expect(projection.previousSha256).toBeNull();
+  expect(projection.origin).toBe("planning_proposal");
+  const body = projection.body as Record<string, unknown>;
+  expect(body["byteCount"]).toBe(12);
+  expect(body["dataBase64"]).toBe("Qk9EWS0qLSMmQDI=");
+  expect(Object.isFrozen(projection)).toBe(true);
+  expect(Object.isFrozen(projection.body)).toBe(true);
+  expect(JSON.stringify(projection)).not.toContain("runRoot");
+  expect(JSON.stringify(projection)).not.toContain("/tmp/");
+}, 15000);
+
+test("task content failures stay opaque and path-free", async () => {
+  const client = makeClient();
+  const failure = await client.run(taskContentScenario("task-content-failure"));
+  expect(failure.ok).toBe(true);
+  if (!failure.ok) throw new Error("unreachable");
+  if (failure.projection.kind !== "taskRevisionFailure") throw new Error("unreachable");
+  expect(failure.projection.exitCode).toBe(1);
+  expect(failure.projection.reason).toBe("artifact_modified");
+  expectFailure(await client.run(taskContentScenario("task-content-failure-with-root")), "unexpected_output_shape");
+  expectFailure(await client.run(taskContentScenario("task-content-report-v2")), "unsupported_contract");
+}, 15000);
+
+test("projects the plan content page path-free with the records frozen", async () => {
+  const client = makeClient();
+  const result = await client.run(planContentScenario("plan-content-report"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "planRevision") throw new Error("unreachable");
+  expect(projection.schemaVersion).toBe(1);
+  expect(projection.runId).toBe("cp-child-run");
+  expect(projection.revision).toBe(1);
+  expect(projection.manifestSha256).toBe("a".repeat(64));
+  expect(projection.previousSha256).toBeNull();
+  expect(projection.originExecution).toBe(1);
+  expect(projection.after).toBe(0);
+  expect(projection.records).toEqual([
+    { record: "stage", stage_position: 1, id: "stage-1", template: "development" },
+    { record: "task", stage_position: 1, task_position: 1, id: "task-a", revision: 1, sha256: "b".repeat(64) },
+  ]);
+  expect(Object.isFrozen(projection)).toBe(true);
+  expect(Object.isFrozen(projection.records)).toBe(true);
+  expect(JSON.stringify(projection)).not.toContain("runRoot");
+  expect(JSON.stringify(projection)).not.toContain("/tmp/");
+}, 15000);
+
+test("plan content failures stay opaque and path-free", async () => {
+  const client = makeClient();
+  const failure = await client.run(planContentScenario("plan-content-failure"));
+  expect(failure.ok).toBe(true);
+  if (!failure.ok) throw new Error("unreachable");
+  if (failure.projection.kind !== "planRevisionFailure") throw new Error("unreachable");
+  expect(failure.projection.exitCode).toBe(1);
+  expect(failure.projection.reason).toBe("unknown_revision");
+  expect(JSON.stringify(failure.projection)).not.toContain("runRoot");
+}, 15000);

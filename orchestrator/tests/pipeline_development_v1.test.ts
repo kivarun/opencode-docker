@@ -539,6 +539,12 @@ function makeChain(stateRoot: string, reviews: readonly ReviewBehavior[], credFi
     identityPipelineV2Run: (async () => {
       throw new Error("fake identityPipelineV2Run not configured");
     }) as unknown as CliIo["identityPipelineV2Run"],
+    taskRevisionContentPipelineV2Run: (async () => {
+      throw new Error("fake taskRevisionContentPipelineV2Run not configured");
+    }) as unknown as CliIo["taskRevisionContentPipelineV2Run"],
+    planRevisionContentPipelineV2Run: (async () => {
+      throw new Error("fake planRevisionContentPipelineV2Run not configured");
+    }) as unknown as CliIo["planRevisionContentPipelineV2Run"],
     inspectPipelineV2Run: (async () => {
       throw new Error("fake inspectPipelineV2Run not configured");
     }) as unknown as CliIo["inspectPipelineV2Run"],

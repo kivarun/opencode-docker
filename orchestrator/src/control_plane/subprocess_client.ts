@@ -176,6 +176,57 @@ export type OrchestratorIdentityProjection =
     };
 
 /**
+ * The projected result of one `task_revision` call: the versioned P-1
+ * task-content chunk (the body chunk fields pass through as frozen
+ * JSON; the documents are path-free, so there is no run root to drop),
+ * or the typed task-content failure outcome of the CLI itself.
+ */
+export type OrchestratorTaskContentProjection =
+  | {
+      readonly kind: "taskRevision";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly taskId: string;
+      readonly revision: number;
+      readonly manifestSha256: string;
+      readonly previousSha256: string | null;
+      readonly origin: string;
+      readonly body: OrchestratorJsonValue;
+    }
+  | {
+      readonly kind: "taskRevisionFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly reason: string;
+    };
+
+/**
+ * The projected result of one `plan_revision` call: the versioned P-1
+ * plan-content page (the semantic record projection passes through as
+ * frozen JSON; the documents are path-free), or the typed plan-content
+ * failure outcome of the CLI itself.
+ */
+export type OrchestratorPlanContentProjection =
+  | {
+      readonly kind: "planRevision";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly manifestSha256: string;
+      readonly previousSha256: string | null;
+      readonly originExecution: number;
+      readonly after: number;
+      readonly records: readonly OrchestratorJsonValue[];
+      readonly nextAfter: number | null;
+    }
+  | {
+      readonly kind: "planRevisionFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly reason: string;
+    };
+
+/**
  * The projected result of one `logs` call: the versioned worker-logs
  * projection (the metadata union passes through as frozen JSON; the raw
  * `runRoot` is dropped before the HTTP layer; `dataBase64` is the only
@@ -305,6 +356,8 @@ export type OrchestratorCallResult =
         | OrchestratorInspectProjection
         | OrchestratorEventsProjection
         | OrchestratorIdentityProjection
+  | OrchestratorTaskContentProjection
+  | OrchestratorPlanContentProjection
         | OrchestratorLogsProjection
         | OrchestratorProjectChangesProjection
         | OrchestratorProjectChangeContentProjection
@@ -460,6 +513,37 @@ const IDENTITY_REPORT_KEYS = [
 ] as const;
 /** The identity CLI failure document: path-free — no runRoot member exists. */
 const IDENTITY_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId"] as const;
+/** The task-content CLI success document: path-free — no runRoot member exists. */
+const TASK_CONTENT_REPORT_KEYS = [
+  "body",
+  "exitCode",
+  "manifestSha256",
+  "ok",
+  "origin",
+  "previousSha256",
+  "revision",
+  "runId",
+  "schemaVersion",
+  "taskId",
+] as const;
+/** The task-content CLI failure document: path-free — the failure envelope keys. */
+const TASK_CONTENT_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId"] as const;
+/** The plan-content CLI success document: path-free — no runRoot member exists. */
+const PLAN_CONTENT_REPORT_KEYS = [
+  "after",
+  "exitCode",
+  "manifestSha256",
+  "nextAfter",
+  "ok",
+  "originExecution",
+  "previousSha256",
+  "records",
+  "revision",
+  "runId",
+  "schemaVersion",
+] as const;
+/** The plan-content CLI failure document: path-free — the failure envelope keys. */
+const PLAN_CONTENT_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId"] as const;
 const CHANGES_REPORT_KEYS = [
   "changes",
   "exitCode",
@@ -593,6 +677,36 @@ function expectExactKeys(document: Record<string, unknown>, expected: readonly s
       throw new OrchestratorSubprocessClientError("unexpected_output_shape", "outcome document has an unexpected own-key set");
     }
   }
+}
+
+/** The exact own keys of one task-content body chunk. */
+const TASK_BODY_KEYS = [
+  "byteCount",
+  "dataBase64",
+  "limit",
+  "nextOffset",
+  "offset",
+  "returnedByteCount",
+  "sha256",
+] as const;
+
+function expectSha256Field(document: Record<string, unknown>, key: string, what: string): string {
+  const value = document[key];
+  if (typeof value !== "string" || !isLowercaseSha256(value)) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} must be a lowercase hex SHA-256`);
+  }
+  return value;
+}
+
+function expectSha256OrNullField(document: Record<string, unknown>, key: string, what: string): string | null {
+  const value = document[key];
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string" || !isLowercaseSha256(value)) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} must be a lowercase hex SHA-256 or null`);
+  }
+  return value;
 }
 
 function expectStringField(document: Record<string, unknown>, key: string): string {
@@ -775,6 +889,169 @@ function parseOutcomeDocument(
           revision: parsed["revision"] as number,
           events: deepFreezeValue(parsed["events"] as OrchestratorJsonValue[]),
           nextAfter: nextAfterValue as number | null,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "task_revision") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, TASK_CONTENT_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "taskRevisionFailure",
+            exitCode: 1,
+            runId,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, TASK_CONTENT_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "task content projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      const taskId = expectStringField(parsed, "taskId");
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content revision must be a positive safe integer");
+      }
+      const manifestSha256 = expectSha256Field(parsed, "manifestSha256", "task content manifest digest");
+      const previousSha256 = expectSha256OrNullField(parsed, "previousSha256", "task content predecessor digest");
+      const origin = expectStringField(parsed, "origin");
+      const body = parsed["body"];
+      if (!isRecord(body)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content body must be an object");
+      }
+      expectExactKeys(body, TASK_BODY_KEYS);
+      if (!isNonNegativeSafeInteger(body["byteCount"]) || !isNonNegativeSafeInteger(body["offset"]) || !isNonNegativeSafeInteger(body["returnedByteCount"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content body cursors must be non-negative safe integers");
+      }
+      if (!isPositiveSafeInteger(body["limit"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content body limit must be a positive safe integer");
+      }
+      const bodyNextOffset = body["nextOffset"];
+      if (bodyNextOffset !== null && !isNonNegativeSafeInteger(bodyNextOffset)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content body nextOffset must be a non-negative safe integer or null");
+      }
+      if (typeof body["sha256"] !== "string" || !isLowercaseSha256(body["sha256"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content body digest must be a lowercase hex SHA-256");
+      }
+      if (typeof body["dataBase64"] !== "string") {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "task content dataBase64 must be a string");
+      }
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "taskRevision",
+          schemaVersion: 1,
+          runId,
+          taskId,
+          revision: parsed["revision"] as number,
+          manifestSha256,
+          previousSha256,
+          origin,
+          body: deepFreezeValue(body as unknown as OrchestratorJsonValue),
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "plan_revision") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, PLAN_CONTENT_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "planRevisionFailure",
+            exitCode: 1,
+            runId,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, PLAN_CONTENT_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "plan content projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content revision must be a positive safe integer");
+      }
+      if (!isPositiveSafeInteger(parsed["originExecution"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content originExecution must be a positive safe integer");
+      }
+      if (!isNonNegativeSafeInteger(parsed["after"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content after must be a non-negative safe integer");
+      }
+      const manifestSha256 = expectSha256Field(parsed, "manifestSha256", "plan content manifest digest");
+      const previousSha256 = expectSha256OrNullField(parsed, "previousSha256", "plan content predecessor digest");
+      if (!Array.isArray(parsed["records"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content records must be an array");
+      }
+      const planNextAfter = parsed["nextAfter"];
+      if (planNextAfter !== null && !isNonNegativeSafeInteger(planNextAfter)) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "plan content nextAfter must be a non-negative safe integer or null");
+      }
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "planRevision",
+          schemaVersion: 1,
+          runId,
+          revision: parsed["revision"] as number,
+          manifestSha256,
+          previousSha256,
+          originExecution: parsed["originExecution"] as number,
+          after: parsed["after"] as number,
+          records: deepFreezeValue(parsed["records"] as OrchestratorJsonValue[]),
+          nextAfter: planNextAfter as number | null,
         }),
       };
     } catch (cause) {
