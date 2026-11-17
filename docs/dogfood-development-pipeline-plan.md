@@ -95,7 +95,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
-| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183) and P-1 (abf95e5; CI 43903686912) landed and Complete; P-2 open; UI implementation not started |
+| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183), P-1 (abf95e5; CI 43903686912) and P-2 (9b08980 + corrective 00422ee; CI 44103077865 / 44113220025) landed and Complete; UI implementation not started |
 
 Drift-control record (2026-11-12): the plan contains no formal Complete-gate
 for an increment's successor. Per explicit operator decision, Increment 6 is
@@ -517,8 +517,8 @@ Contract essentials:
   own review; wire formats are not designed by the IA artifact;
 - dependent UI slices S1–S8 cannot start before their named prerequisites
   are landed; S1–S3 are presentation-only over `[E]`/`[G]` fields, S4 adds
-  the generic `respond` support, S5–S7 wait for P-2 (P-3/P-1 are landed), S8 uses only
-  shipped routes;
+  the generic `respond` support, S5–S7's P-2 prerequisite is landed and
+  Complete (P-3/P-1 landed earlier), S8 uses only shipped routes;
 - generic `respond` for non-reserved declared action IDs is preserved
   (the IA routes by the shipped contract, never narrows to one pipeline;
   the reserved `continue_stage`/`revise_task` ids stay on their dedicated
@@ -530,10 +530,10 @@ Contract essentials:
   closed before route parsing.
 
 Implementation has not started (no UI slice S1–S8 has been built). The
-bounded prerequisites **P-3 (durable-identity projection)** and **P-1
-(task/plan revision artifact content)** are landed and **Complete** (see
-below); P-2 (the accepted reviewer-output content prerequisite) and the
-UI implementation remain not started.
+bounded prerequisites **P-3 (durable-identity projection)**, **P-1
+(task/plan revision artifact content)** and **P-2 (accepted reviewer-output
+content)** are landed and **Complete** (see below); the UI implementation
+remains not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
 
@@ -618,6 +618,68 @@ one-shot transport reliability).
   Finding A. The accepted P-1 contract (preflight r2 plus the reviewed r3
   correctives and the boundary-proof correction) is not reopened by this
   record.
+
+### Prerequisite P-2 Complete: accepted reviewer-output content (2026-11-17)
+
+P-2 is delivered as one full-stack read-only surface — the bounded,
+digest-bound raw-byte slice of one accepted agent execution output — and
+is marked **Complete** after the accepted preflight r4 review, the
+implementation commit and the operator corrective. Delivery chain:
+
+- `9b08980e56f21aac8b31536127b2d77fa06a2a63` — the P-2 implementation
+  (the private `hashByteLength` framing owner with byte-identical
+  `hashBytes`; the typed one-handle streaming helper with open-time
+  identity/size linearization; the durable-record selection facade
+  `orchestrator agent-output` with the closed 9-value producer
+  vocabulary and the shared `PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX = 262 144`;
+  CLI command #19; routing kind `agent_output`; the 20th HTTP route
+  `GET /v1/runs/:runId/agent-outputs/:executionIndex/:outputId`) —
+  CI run `44103077865` — success on the exact SHA;
+- `00422eef9b004dce6347bb7bf0a6deb39669571a` — the operator corrective
+  (mandatory wire terminal-page invariant; the `activations`-root
+  real-directory gate in the token mint; the exact grammar-derived
+  envelope proofs) — CI run `44113220025` — success on the exact SHA.
+
+Both commits leave this plan untouched, are clean-tree commits with
+`git diff --check` clean and a byte-identical `bun.lock`. Red-before was
+materialized on the clean `5b40780` parent before any source change:
+baseline digest literals captured with the pre-refactor
+`acceptedOutputDigest`, fixtures straddling the 128 KiB chunk boundary,
+and the red run showing exactly the new P-2 test material as red
+(everything else in the delta was the documented environmental drift).
+Final delivery report:
+`/exchange/outbox/increment-6-p2-delivery-report.md`
+(SHA-256
+`bc8403e58b404234860b9679853b678833f05f0c7b112cfb39d3e96f24a74710`,
+including §4b recording the corrective).
+
+- Verification truth (recorded honestly): focused suites green — the
+  owner suite 25 tests and 452 tests across the touched
+  CLI/routing/wire/HTTP suites; `tsc --noEmit -p .` clean; the
+  `bun.lock` byte-identical. The full corrective-branch run is
+  **4471 tests, 4339 pass, 132 failures**; this is deliberately NOT
+  claimed as a set-identical A/B: 130 of the failures belong to the
+  pre-existing SELinux/load environmental families recorded under P-3
+  and P-1, and the remaining two are 15-second wall-clock timeouts in an
+  untouched signal battery (an isolated rerun of that file passes
+  42/42); agent-output failures: zero.
+- Closed corrective invariants (per the operator corrective):
+  1. a terminal wire chunk (`nextOffset: null`) must reach exactly
+     `byteCount` (`offset + returnedByteCount === byteCount`), so an
+     offset at the byte count admits only the empty terminal chunk;
+  2. the token mint verifies the `<runRoot>/activations` root as a real
+     non-symlink directory before the activation leaf (absent →
+     `artifact_missing`, symlink/wrong kind → `artifact_modified`), with
+     the symlinked-ancestor-inside-the-run-root refusal pinned;
+  3. the wire negative battery pins `limit: 0` and the unsafe
+     `stateId`/`outputId` identity fields as separate refusals;
+  4. the grammar-derived envelope bounds are proven exactly on measured
+     production documents: CLI document + LF `350 246`, HTTP body
+     `350 254` (payload-free envelopes `718` / `726`;
+     `4·ceil(262144/3) = 349 528` payload exactly).
+- Not started (unchanged scope): every UI slice S1–S8, live Browser UAT,
+  and Finding A. The accepted P-2 contract (preflight r4 plus the
+  operator corrective) is not reopened by this record.
 
 ## Deferred work
 
