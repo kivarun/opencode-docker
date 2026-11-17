@@ -916,7 +916,7 @@ test("projects the task content chunk path-free with the body frozen", async () 
   expect(projection.origin).toBe("planning_proposal");
   const body = projection.body as Record<string, unknown>;
   expect(body["byteCount"]).toBe(12);
-  expect(body["dataBase64"]).toBe("Qk9EWS0qLSMmQDI=");
+  expect(body["dataBase64"]).toBe("Qk9EWS0wMTIzNDU2");
   expect(Object.isFrozen(projection)).toBe(true);
   expect(Object.isFrozen(projection.body)).toBe(true);
   expect(JSON.stringify(projection)).not.toContain("runRoot");
@@ -980,4 +980,71 @@ test("a task content failure outside the closed P-1 producer vocabulary is unexp
 test("a plan content failure carrying the reserved option reason is unexpected_output_shape", async () => {
   const client = makeClient();
   expectFailure(await client.run(planContentScenario("plan-content-failure-options")), "unexpected_output_shape");
+}, 15000);
+
+// --- P-2 agent-output projection ------------------------------------------------
+
+function agentOutputScenario(scenario: string): { kind: "agent_output"; runId: string; executionIndex: number; outputId: string } {
+  return { kind: "agent_output", runId: `sc-agent_output_${scenario}`, executionIndex: 1, outputId: "sc-output" };
+}
+
+test("projects the agent-output chunk path-free with the exact success fields frozen", async () => {
+  const client = makeClient();
+  const result = await client.run(agentOutputScenario("report"));
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error("unreachable");
+  const projection = result.projection;
+  if (projection.kind !== "agentOutput") throw new Error("unreachable");
+  expect(projection.schemaVersion).toBe(1);
+  expect(projection.runId).toBe("cp-child-run");
+  expect(projection.executionIndex).toBe(2);
+  expect(projection.stateId).toBe("review");
+  expect(projection.outputId).toBe("verdict");
+  expect(projection.digest).toBe("a".repeat(64));
+  expect(projection.byteCount).toBe(12);
+  expect(projection.offset).toBe(0);
+  expect(projection.limit).toBe(65536);
+  expect(projection.returnedByteCount).toBe(12);
+  expect(projection.nextOffset).toBeNull();
+  expect(projection.dataBase64).toBe("Qk9EWS0wMTIzNDU2");
+  expect(Object.isFrozen(projection)).toBe(true);
+  expect(JSON.stringify(projection)).not.toContain("runRoot");
+  expect(JSON.stringify(projection)).not.toContain("/tmp/");
+}, 15000);
+
+test("the agent-output wire cursor/frame invariants admit the exact coherent forms only", async () => {
+  const client = makeClient();
+  const success = await client.run(agentOutputScenario("open_ended"));
+  expect(success.ok).toBe(true);
+  if (!success.ok || success.projection.kind !== "agentOutput") throw new Error("unreachable");
+  expect(success.projection.nextOffset).toBe(5);
+
+  const empty = await client.run(agentOutputScenario("empty_terminal"));
+  expect(empty.ok).toBe(true);
+  if (!empty.ok || empty.projection.kind !== "agentOutput") throw new Error("unreachable");
+  expect(empty.projection.returnedByteCount).toBe(0);
+  expect(empty.projection.dataBase64).toBe("");
+
+  expectFailure(await client.run(agentOutputScenario("size_mismatch")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("noncanonical_base64")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("next_bad")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("next_mismatch")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("offset_over")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("limit_over")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("unsafe_runid")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("extra_field")), "unexpected_output_shape");
+}, 15000);
+
+test("the agent-output failure projection admits exactly the P-2 producer vocabulary", async () => {
+  const client = makeClient();
+  const failure = await client.run(agentOutputScenario("failure"));
+  expect(failure.ok).toBe(true);
+  if (!failure.ok || failure.projection.kind !== "agentOutputFailure") throw new Error("unreachable");
+  expect(failure.projection.exitCode).toBe(1);
+  expect(failure.projection.reason).toBe("artifact_modified");
+  expect(JSON.stringify(failure.projection)).not.toContain("/tmp/");
+
+  expectFailure(await client.run(agentOutputScenario("failure_root")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("failure_options")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("bad_vocab")), "unexpected_output_shape");
 }, 15000);

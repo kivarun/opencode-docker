@@ -764,10 +764,23 @@ async function scanDirectoryTree(sourcePath: string, what: string): Promise<Scan
   return entries;
 }
 
-function hashBytes(hasher: Bun.CryptoHasher, bytes: Uint8Array): void {
+/**
+ * The private byte-length framing owner: hashes the 8-byte big-endian
+ * frame plus the given content byte length in two calls. `hashBytes`
+ * (the whole-buffer path used by the acceptance/input digest loops) and
+ * the streaming helper both consume exactly this owner, so the
+ * length-prefix framing has exactly one implementation. Streaming hashes
+ * the length FIRST (from the pinned open-time byte count) and then the
+ * chunks, which is byte-identical to hashing the whole buffer.
+ */
+function hashByteLength(hasher: Bun.CryptoHasher, byteLength: number): void {
   const length = Buffer.alloc(8);
-  length.writeBigUInt64BE(BigInt(bytes.byteLength));
+  length.writeBigUInt64BE(BigInt(byteLength));
   hasher.update(length);
+}
+
+function hashBytes(hasher: Bun.CryptoHasher, bytes: Uint8Array): void {
+  hashByteLength(hasher, bytes.byteLength);
   hasher.update(bytes);
 }
 
@@ -1023,6 +1036,338 @@ async function recomputeRunInputDigest(
   const content = await readRegularFileBytes(path, what);
   hashBytes(hasher, content);
   return hasher.digest("hex");
+}
+
+/**
+ * The typed cause union of the P-2 one-handle streaming helper (read-only
+ * content serving). Absent and inaccessible objects (`artifact_missing`),
+ * any identity/size/read divergence against the validated token
+ * (`artifact_modified`) and unclassified I/O classes (`internal_error`)
+ * are closed machine-readable causes; the content facade maps them
+ * straight into its producer reasons without classifying message text.
+ */
+export type PipelineV2OutputStreamCause = "artifact_missing" | "artifact_modified" | "internal_error";
+
+/**
+ * The typed streaming-helper failure. `reason` is immutable and one of
+ * the closed causes; the diagnostic message stays content-free (no paths,
+ * no bytes, no raw system error text beyond the limited errno suffix
+ * convention used across the data plane).
+ */
+export class PipelineV2OutputStreamError extends PipelineError {
+  declare readonly reason: PipelineV2OutputStreamCause;
+
+  constructor(reason: PipelineV2OutputStreamCause, message: string) {
+    super(message);
+    this.name = "PipelineV2OutputStreamError";
+    Object.defineProperty(this, "reason", {
+      value: reason,
+      writable: false,
+      enumerable: true,
+      configurable: false,
+    });
+  }
+}
+
+/**
+ * The validated artifact identity token minted by the facade pre-check and
+ * consumed by the streaming helper. It binds the artifact to its
+ * canonical path, device and inode identity and the declared port type —
+ * it never carries bytes, digests or byte counts (those are observed at
+ * the open linearization point only).
+ */
+export interface PipelineV2OutputStreamToken {
+  readonly canonicalPath: string;
+  readonly dev: number;
+  readonly ino: number;
+  readonly type: "file" | "json";
+}
+
+/** The streaming-helper result: the digest over the accepted-output
+ * framing of the full artifact content, the open-time byte count, and the
+ * captured raw-byte slice for the requested window. */
+export interface PipelineV2OutputStreamResult {
+  readonly digest: string;
+  readonly byteCount: number;
+  readonly slice: Uint8Array;
+}
+
+/** The bounded read chunk of the streaming pass (2^17 = 128 KiB). */
+const STREAM_CHUNK_BYTES = 131_072;
+
+/**
+ * The P-2 streaming helper: one sequential read pass over one pinned
+ * handle. The contract (accepted preflight r4 §4b):
+ *
+ * 1. the trusted facade pre-check minted the token; the helper pins the
+ *    artifact identity by opening `O_RDONLY|O_NOFOLLOW` at the canonical
+ *    path and comparing the opened `dev`/`ino` with the token — the
+ *    identity linearizes here, never the bytes; any divergence is the
+ *    `artifact_modified` cause before any byte is hashed;
+ * 2. the exact byte count is the `fstat`-observed size at this same
+ *    linearization point; the length-prefix frame is hashed from it
+ *    before any content byte (remaining byte-identical to hashing the
+ *    whole buffer via the one private framing owner);
+ * 3. the content bytes are read sequentially in bounded chunks into the
+ *    hasher and, where they intersect the requested window, into the
+ *    captured slice; the pass never re-opens, never re-stats for size and
+ *    never seeks;
+ * 4. after the pass the read byte count must equal the framing length and
+ *    the final `fstat` of the pinned handle must report the same size —
+ *    any divergence is `artifact_modified`; unlink/rename of the path
+ *    after open does not invalidate the pinned handle;
+ * 5. permission failures on the pinned handle and unclassified I/O
+ *    classes are `internal_error`; open-time ENOENT is
+ *    `artifact_missing`, open-time ELOOP/ENOTDIR and non-regular objects
+ *    are `artifact_modified`.
+ *
+ * The returned record leaves this module only after every handle-level
+ * check passed; the facade must still compare the completed digest with
+ * the durable record digest before any producer success document carries
+ * the slice bytes.
+ *
+ * Caller contract: the facade validates the safe cursor scalars first
+ * (offset inside [0, MAX], limit in [1, MAX]); the helper itself performs
+ * only its own defensive shape validation and maps nothing else.
+ */
+export async function streamAcceptedOutputSlice(
+  token: PipelineV2OutputStreamToken,
+  offset: number,
+  limit: number,
+): Promise<PipelineV2OutputStreamResult> {
+  const defensive = (message: string): PipelineV2OutputStreamError =>
+    new PipelineV2OutputStreamError("internal_error", message);
+  if (typeof token !== "object" || token === null) {
+    throw defensive("the output stream token must be an object");
+  }
+  if (
+    typeof token.canonicalPath !== "string" ||
+    token.canonicalPath === "" ||
+    !Number.isSafeInteger(token.dev) ||
+    token.dev < 0 ||
+    !Number.isSafeInteger(token.ino) ||
+    token.ino < 0 ||
+    (token.type !== "file" && token.type !== "json")
+  ) {
+    throw defensive("the output stream token shape is invalid");
+  }
+  if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) {
+    throw defensive("the output stream offset must be a non-negative safe integer");
+  }
+  if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1) {
+    throw defensive("the output stream limit must be a positive safe integer");
+  }
+
+  let handle: FileHandle;
+  try {
+    handle = await open(token.canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (cause) {
+    if (isErrnoException(cause, "ENOENT")) {
+      throw new PipelineV2OutputStreamError(
+        "artifact_missing",
+        "the accepted output artifact disappeared before the content read",
+      );
+    }
+    if (isErrnoException(cause, "ELOOP") || isErrnoException(cause, "ENOTDIR")) {
+      throw new PipelineV2OutputStreamError(
+        "artifact_modified",
+        "the accepted output artifact path changed identity before the content read",
+      );
+    }
+    throw new PipelineV2OutputStreamError(
+      "internal_error",
+      "the accepted output artifact could not be opened",
+    );
+  }
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile()) {
+      throw new PipelineV2OutputStreamError(
+        "artifact_modified",
+        "the pinned accepted output artifact is not a regular file",
+      );
+    }
+    if (
+      opened.dev !== token.dev ||
+      opened.ino !== token.ino
+    ) {
+      throw new PipelineV2OutputStreamError(
+        "artifact_modified",
+        "the opened accepted output artifact does not match the validated token identity",
+      );
+    }
+    const byteCount = opened.size;
+    if (typeof byteCount !== "number" || !Number.isSafeInteger(byteCount) || byteCount < 0) {
+      throw defensive("the pinned accepted output artifact byte count is not a non-negative safe integer");
+    }
+    const hasher = outputDigestHasher(token.type as PortType);
+    hashByteLength(hasher, byteCount);
+    const windowEnd = Math.min(offset + limit, byteCount);
+    const windowLength = windowEnd > offset ? windowEnd - offset : 0;
+    const slice = Buffer.allocUnsafe(windowLength);
+    const scratch = Buffer.allocUnsafe(STREAM_CHUNK_BYTES);
+    let filePosition = 0;
+    let slicePosition = 0;
+    let totalRead = 0;
+    for (;;) {
+      let result;
+      try {
+        result = await handle.read(scratch, 0, scratch.byteLength, null);
+      } catch {
+        throw new PipelineV2OutputStreamError(
+          "internal_error",
+          "the pinned accepted output artifact could not be read",
+        );
+      }
+      if (result.bytesRead <= 0) {
+        break;
+      }
+      hasher.update(scratch.subarray(0, result.bytesRead));
+      totalRead += result.bytesRead;
+      if (totalRead > byteCount) {
+        throw new PipelineV2OutputStreamError(
+          "artifact_modified",
+          "the pinned accepted output artifact grew during the content read",
+        );
+      }
+      // copy the chunk intersection with the requested window
+      const chunkStart = filePosition;
+      const chunkEnd = filePosition + result.bytesRead;
+      if (windowLength > 0 && chunkEnd > offset && chunkStart < windowEnd) {
+        const copyStart = Math.max(0, offset - chunkStart);
+        const copyEnd = Math.min(result.bytesRead, windowEnd - chunkStart);
+        scratch.subarray(copyStart, copyEnd).copy(slice.subarray(slicePosition));
+        slicePosition += copyEnd - copyStart;
+      }
+      filePosition = chunkEnd;
+    }
+    if (totalRead !== byteCount) {
+      throw new PipelineV2OutputStreamError(
+        "artifact_modified",
+        "the pinned accepted output artifact shrank during the content read",
+      );
+    }
+    const final = await handle.stat();
+    if (
+      final.dev !== token.dev ||
+      final.ino !== token.ino ||
+      final.size !== byteCount ||
+      !final.isFile()
+    ) {
+      throw new PipelineV2OutputStreamError(
+        "artifact_modified",
+        "the pinned accepted output artifact changed during the content read",
+      );
+    }
+    const digest = hasher.digest("hex");
+    const result: { digest: string; byteCount: number; slice: Uint8Array } = {
+      digest,
+      byteCount,
+      slice: new Uint8Array(slice.buffer, slice.byteOffset, windowLength),
+    };
+    Object.freeze(result);
+    return result;
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+      // best effort; the established read path closes the same way
+    }
+  }
+}
+
+/**
+ * The P-2 token mint: resolves one accepted output artifact at its fixed
+ * orchestrator-owned activation path and mints the validated streaming
+ * token exactly like the established accepted-history resolution does —
+ * the activation leaf, `data` and `outputs` parents must be real
+ * non-symlink directories inside the canonical run root, the artifact
+ * must be a real non-symlink regular file with a canonical path inside
+ * the canonical run root. The mint reads identity only (the canonical
+ * path string plus `dev`/`ino`) — bytes and byte counts are observed
+ * exclusively at the helper's open linearization point.
+ *
+ * Typed causes carry exactly the closed cause values; the message stays
+ * content-free.
+ */
+export async function resolveAcceptedOutputArtifact(
+  runRoot: string,
+  executionIndex: number,
+  stateId: string,
+  outputId: string,
+  type: "file" | "json",
+): Promise<PipelineV2OutputStreamToken> {
+  const leafPath = join(runRoot, "activations", `${executionIndex}-${stateId}`);
+  const what = `accepted output artifact ${JSON.stringify(outputId)} of execution ${executionIndex}`;
+  const leafInfo = await lstatOrNull(leafPath);
+  if (leafInfo === null) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_missing",
+      "the accepted output activation leaf does not exist at its fixed path",
+    );
+  }
+  if (leafInfo.isSymbolicLink() || !leafInfo.isDirectory()) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_modified",
+      `the accepted output activation leaf is not a real directory, found ${describeEntry(leafInfo)}`,
+    );
+  }
+  for (const child of [join(leafPath, "data"), join(leafPath, "data", "outputs")]) {
+    const childInfo = await lstatOrNull(child);
+    if (childInfo === null || childInfo.isSymbolicLink() || !childInfo.isDirectory()) {
+      throw new PipelineV2OutputStreamError(
+        "artifact_modified",
+        "the accepted output activation tree is damaged",
+      );
+    }
+  }
+  const fixedPath = join(leafPath, "data", "outputs", outputId);
+  const info = await lstatOrNull(fixedPath);
+  if (info === null) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_missing",
+      "the accepted output artifact does not exist at its fixed activation path",
+    );
+  }
+  if (info.isSymbolicLink()) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_modified",
+      "the accepted output artifact path is a symbolic link",
+    );
+  }
+  if (!info.isFile()) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_modified",
+      `the accepted output artifact is not a regular file, found ${describeEntry(info)}`,
+    );
+  }
+  let canonical: string;
+  try {
+    canonical = await realpath(fixedPath);
+  } catch {
+    throw new PipelineV2OutputStreamError(
+      "artifact_modified",
+      "the accepted output artifact cannot be canonicalized",
+    );
+  }
+  if (!isInsideRoot(runRoot, canonical)) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_modified",
+      "the accepted output artifact resolves outside the canonical run root",
+    );
+  }
+  const token: PipelineV2OutputStreamToken = {
+    canonicalPath: canonical,
+    dev: info.dev,
+    ino: info.ino,
+    type,
+  };
+  return Object.freeze({
+    canonicalPath: token.canonicalPath,
+    dev: token.dev,
+    ino: token.ino,
+    type: token.type,
+  });
 }
 
 /**

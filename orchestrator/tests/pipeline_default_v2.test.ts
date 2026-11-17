@@ -421,6 +421,9 @@ function makeChain(stateRoot: string, resultBody: Record<string, unknown>, credF
     eventsPipelineV2Run: (async () => {
       throw new Error("fake eventsPipelineV2Run not configured");
     }) as unknown as CliIo["eventsPipelineV2Run"],
+    agentOutputContentPipelineV2Run: (async () => {
+      throw new Error("fake agentOutputContentPipelineV2Run not configured");
+    }) as unknown as CliIo["agentOutputContentPipelineV2Run"],
     logsPipelineV2Run: (async () => {
       throw new Error("fake logsPipelineV2Run not configured");
     }) as unknown as CliIo["logsPipelineV2Run"],
@@ -671,6 +674,9 @@ test("e2e: run without --pipeline-root dispatches the bundled v2 default path to
     logsPipelineV2Run: (async () => {
       throw new Error("fake logsPipelineV2Run not configured");
     }) as unknown as CliIo["logsPipelineV2Run"],
+    agentOutputContentPipelineV2Run: (async () => {
+      throw new Error("fake agentOutputContentPipelineV2Run not configured");
+    }) as unknown as CliIo["agentOutputContentPipelineV2Run"],
     projectChangeContentPipelineV2Run: (async () => {
       throw new Error("fake projectChangeContentPipelineV2Run not configured");
     }) as unknown as CliIo["projectChangeContentPipelineV2Run"],

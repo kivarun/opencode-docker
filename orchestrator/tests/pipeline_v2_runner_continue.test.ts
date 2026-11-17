@@ -1351,6 +1351,9 @@ test("cumulative budget through the CLI: the unsafe request exits 1 without writ
     eventsPipelineV2Run: (async () => {
       throw new Error("fake eventsPipelineV2Run not configured");
     }) as unknown as CliIo["eventsPipelineV2Run"],
+    agentOutputContentPipelineV2Run: (async () => {
+      throw new Error("fake agentOutputContentPipelineV2Run not configured");
+    }) as unknown as CliIo["agentOutputContentPipelineV2Run"],
     logsPipelineV2Run: (async () => {
       throw new Error("fake logsPipelineV2Run not configured");
     }) as unknown as CliIo["logsPipelineV2Run"],

@@ -23,6 +23,7 @@ import { isCleanAbsolutePath } from "../clean_path.ts";
 import { deepFreezeValue } from "../pipeline_v2_freeze_internal.ts";
 import { isNonNegativeSafeInteger, isLowercaseSha256, isPipelineV2SafeId, isPositiveSafeInteger } from "../pipeline_v2_scalar.ts";
 import { PIPELINE_V2_RUN_PLAN_CONTENT_REASONS } from "../pipeline_v2_content_reasons.ts";
+import { PIPELINE_V2_OUTPUT_CONTENT_REASONS, PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX } from "../pipeline_v2_content_reasons.ts";
 import { isPipelineV2PublicReason, type PipelineV2PublicReason } from "../pipeline_v2_public_reason.ts";
 import { PIPELINE_V2_APPLY_OPERATION_STATUSES, type PipelineV2ApplyOperationStatus } from "../pipeline_v2_apply_state_internal.ts";
 import { PIPELINE_V2_PROJECT_APPLY_PUBLIC_REASONS, type PipelineV2ProjectApplyPublicReason } from "../pipeline_v2_project_apply.ts";
@@ -226,6 +227,37 @@ export type OrchestratorPlanContentProjection =
       readonly runId: string;
       readonly reason: string;
     };
+/**
+ * The projected result of one `agent_output` call: the versioned
+ * schemaVersion-1 P-2 accepted-agent-output content chunk (path-free; the
+ * exact byte-count/cursor fields are validated beyond the scalar-only
+ * logs precedent, and `dataBase64` is checked as strict canonical base64
+ * whose decoded length equals `returnedByteCount`), or the typed
+ * agent-output failure outcome of the CLI itself.
+ */
+export type OrchestratorAgentOutputProjection =
+  | {
+      readonly kind: "agentOutput";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly executionIndex: number;
+      readonly stateId: string;
+      readonly outputId: string;
+      readonly digest: string;
+      readonly byteCount: number;
+      readonly offset: number;
+      readonly limit: number;
+      readonly returnedByteCount: number;
+      readonly nextOffset: number | null;
+      readonly dataBase64: string;
+    }
+  | {
+      readonly kind: "agentOutputFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly reason: string;
+    };
+
 
 /**
  * The projected result of one `logs` call: the versioned worker-logs
@@ -357,6 +389,7 @@ export type OrchestratorCallResult =
         | OrchestratorInspectProjection
         | OrchestratorEventsProjection
         | OrchestratorIdentityProjection
+  | OrchestratorAgentOutputProjection
   | OrchestratorTaskContentProjection
   | OrchestratorPlanContentProjection
         | OrchestratorLogsProjection
@@ -680,6 +713,85 @@ function expectExactKeys(document: Record<string, unknown>, expected: readonly s
   }
 }
 
+/**
+ * The exact own keys of one P-2 agent-output success document and of its
+ * failure document. The success shape carries exactly the thirteen
+ * contract members, path-free (no run root exists on any P-2 document).
+ */
+const AGENT_OUTPUT_REPORT_KEYS = [
+  "byteCount",
+  "dataBase64",
+  "digest",
+  "exitCode",
+  "executionIndex",
+  "limit",
+  "nextOffset",
+  "offset",
+  "ok",
+  "outputId",
+  "returnedByteCount",
+  "runId",
+  "schemaVersion",
+  "stateId",
+] as const;
+
+const AGENT_OUTPUT_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId"] as const;
+
+/** The closed P-2 producer reason set (never copied). */
+const AGENT_OUTPUT_REASONS: ReadonlySet<string> = new Set<string>(PIPELINE_V2_OUTPUT_CONTENT_REASONS);
+
+/** The closed-vocabulary check of one P-2 failure reason. */
+function expectAgentOutputReason(reason: string, what: string): string {
+  if (!AGENT_OUTPUT_REASONS.has(reason)) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} reason is outside the closed P-2 agent-output producer vocabulary`);
+  }
+  return reason;
+}
+
+/** The safe-id check of one P-2 identity field (no value ever echoed). */
+function expectAgentOutputSafeId(document: Record<string, unknown>, key: string, what: string): string {
+  const value = expectStringField(document, key);
+  if (!isPipelineV2SafeId(value)) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} must be a safe identifier`);
+  }
+  return value;
+}
+
+/** One non-negative safe integer field; rejects fractions and unsafe magnitudes. */
+function expectNonNegInt(document: Record<string, unknown>, key: string, what: string): number {
+  const value = document[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+/** One positive safe integer field, optionally capped at the slice maximum. */
+function expectPosInt(document: Record<string, unknown>, key: string, what: string, cap?: number): number {
+  const value = document[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} must be a positive safe integer`);
+  }
+  if (cap !== undefined && value > cap) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} must not exceed ${cap}`);
+  }
+  return value;
+}
+
+/** The strict canonical base64 of one P-2 chunk payload with its decoded-byte length. */
+function expectAgentOutputBase64(document: Record<string, unknown>, key: string, what: string): { text: string; byteLength: number } {
+  const value = document[key];
+  if (typeof value !== "string") {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} must be a string`);
+  }
+  let decoded: Buffer;
+  decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value) {
+    throw new OrchestratorSubprocessClientError("unexpected_output_shape", `${what} is not canonical base64`);
+  }
+  return { text: value, byteLength: decoded.byteLength };
+}
+
 /** The closed P-1 producer reason set (never copied). */
 const RUN_PLAN_CONTENT_REASONS: ReadonlySet<string> = new Set<string>(PIPELINE_V2_RUN_PLAN_CONTENT_REASONS);
 
@@ -901,6 +1013,102 @@ function parseOutcomeDocument(
           revision: parsed["revision"] as number,
           events: deepFreezeValue(parsed["events"] as OrchestratorJsonValue[]),
           nextAfter: nextAfterValue as number | null,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "agent_output") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, AGENT_OUTPUT_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "agent output failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "agent output failure reason must be a non-empty string");
+        }
+        expectAgentOutputReason(reason, "agent output failure");
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "agentOutputFailure",
+            exitCode: 1,
+            runId,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, AGENT_OUTPUT_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "agent output report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "agent output report schemaVersion must be 1");
+      }
+      const runId = expectAgentOutputSafeId(parsed, "runId", "the agent output run id");
+      const stateId = expectAgentOutputSafeId(parsed, "stateId", "the agent output state id");
+      const outputId = expectAgentOutputSafeId(parsed, "outputId", "the agent output output id");
+      const executionIndex = expectPosInt(parsed, "executionIndex", "the agent output execution index");
+      const digest = expectSha256Field(parsed, "digest", "the agent output digest");
+      const byteCount = expectNonNegInt(parsed, "byteCount", "the agent output byte count");
+      const offset = expectNonNegInt(parsed, "offset", "the agent output offset");
+      const limit = expectPosInt(parsed, "limit", "the agent output limit", PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX);
+      const returnedByteCount = expectNonNegInt(parsed, "returnedByteCount", "the agent output returned byte count");
+      const nextOffsetField = parsed["nextOffset"];
+      let nextOffset: number | null;
+      if (nextOffsetField === null) {
+        nextOffset = null;
+      } else if (typeof nextOffsetField === "number" && Number.isSafeInteger(nextOffsetField) && nextOffsetField >= 0) {
+        nextOffset = nextOffsetField;
+      } else {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output nextOffset must be a non-negative safe integer or null");
+      }
+      const base64 = expectAgentOutputBase64(parsed, "dataBase64", "the agent output payload");
+      if (returnedByteCount > limit) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output returned byte count exceeds the limit");
+      }
+      if (base64.byteLength !== returnedByteCount) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output payload decodes to a different byte count than returnedByteCount");
+      }
+      if (returnedByteCount > byteCount || offset > byteCount - returnedByteCount) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output window exceeds the artifact byte count");
+      }
+      if (nextOffset !== null && nextOffset !== offset + returnedByteCount) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output nextOffset is not the exact tail cursor");
+      }
+      if (nextOffset !== null && nextOffset >= byteCount) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output nextOffset must be beyond the served window");
+      }
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "agentOutput",
+          schemaVersion: 1,
+          runId,
+          executionIndex,
+          stateId,
+          outputId,
+          digest,
+          byteCount,
+          offset,
+          limit,
+          returnedByteCount,
+          nextOffset,
+          dataBase64: base64.text,
         }),
       };
     } catch (cause) {

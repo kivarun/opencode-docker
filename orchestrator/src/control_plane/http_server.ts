@@ -99,6 +99,7 @@ import {
   type OrchestratorCallResult,
   type OrchestratorSubprocessClientConfig,
 } from "./subprocess_client.ts";
+import { PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX } from "../pipeline_v2_content_reasons.ts";
 import {
   defaultControlPlaneUiRoot,
   loadControlPlaneUiAssets,
@@ -178,6 +179,7 @@ interface ParsedRoute {
     | "revise_task"
     | "respond"
     | "task_content"
+    | "agent_output"
     | "plan_content"
     | "projects"
     | "runs"
@@ -194,6 +196,8 @@ interface ParsedRoute {
   readonly applyId?: string;
   /** The task id of the task content route (absent elsewhere). */
   readonly taskId?: string;
+  /** The output id of the agent-output route (absent elsewhere). */
+  readonly outputId?: string;
   /** The URL revision select of the content routes (absent elsewhere). */
   readonly revision?: number;
 }
@@ -435,6 +439,28 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
       return new ControlPlaneHttpRequestError("invalid_path", "the change index must be a positive safe integer");
     }
     return { kind: "project_change_content", projectId: null, runId, changeIndex };
+  }
+  if (matchesShape(["v1", "runs", "*", "agent-outputs", "*", "*"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the agent-output route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    const executionSegment = rest[4];
+    if (executionSegment === undefined || !/^[1-9][0-9]*$/.test(executionSegment)) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the execution index must be a positive decimal integer");
+    }
+    const executionIndex = Number(executionSegment);
+    if (!Number.isSafeInteger(executionIndex) || executionIndex < 1) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the execution index must be a positive safe integer");
+    }
+    const outputId = safeId(rest[5]);
+    if (outputId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the output id must be a safe identifier");
+    }
+    return { kind: "agent_output", projectId: null, runId, executionIndex, outputId };
   }
   if (matchesShape(["v1", "runs", "*", "logs", "*"])) {
     if (shapeMethodMismatch("GET")) {
@@ -1002,6 +1028,25 @@ export function parseTaskContentQuery(
   return { offset: result.first, limit: result.second };
 }
 
+/**
+ * The strict query grammar of the agent-output route: canonical decimal
+ * cursors only, no percent-encoding, bare keys, duplicates, empty
+ * values or unknown fields; the limit cap is the single owner slice
+ * maximum (`PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX`). A violated grammar is
+ * the request-layer `invalid_cursor` refusal (400).
+ */
+export type AgentOutputQuery = { readonly offset: number | null; readonly limit: number | null };
+
+export function parseAgentOutputQuery(
+  search: string,
+): AgentOutputQuery | ControlPlaneHttpRequestError {
+  const result = parseContentQuery(search, "agent-output", PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX, "offset", "limit");
+  if (result instanceof ControlPlaneHttpRequestError) {
+    return result;
+  }
+  return { offset: result.first, limit: result.second };
+}
+
 export type PlanContentQuery = { readonly after: number | null; readonly limit: number | null };
 
 /**
@@ -1459,6 +1504,8 @@ export function projectControlPlaneCommandResult(
     projection.kind === "projectApplyOperation" ||
     projection.kind === "projectApplyFailure" ||
     projection.kind === "taskRevision" ||
+    projection.kind === "agentOutput" ||
+    projection.kind === "agentOutputFailure" ||
     projection.kind === "planRevision"
   ) {
     return { layer: "transport", reason: "internal_error" };
@@ -1892,6 +1939,72 @@ export function projectControlPlaneTaskContent(
  * every other correctly received plan-content failure follows the
  * identity precedent.
  */
+
+/**
+ * The one projection builder for a verified schemaVersion-1 agent-output
+ * content chunk: the bounded raw-byte slice fields are copied without new
+ * classification; the documents are path-free by contract. A typed
+ * `invalid_cursor` CLI failure is the request-layer 400 envelope; every
+ * other correctly received agent-output failure follows the inspect
+ * precedent (a correctly received failed outcome at 200).
+ */
+export function projectControlPlaneAgentOutput(
+  result: OrchestratorCallResult,
+): AgentOutputProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "agentOutputFailure") {
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "agentOutput" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "agent_output",
+    run_id: projection.runId,
+    execution_index: projection.executionIndex,
+    state_id: projection.stateId,
+    output_id: projection.outputId,
+    digest: projection.digest,
+    byte_count: projection.byteCount,
+    offset: projection.offset,
+    limit: projection.limit,
+    returned_byte_count: projection.returnedByteCount,
+    next_offset: projection.nextOffset,
+    data_base64: projection.dataBase64,
+  };
+}
+
+
+export interface AgentOutputProjection {
+  readonly schema_version: 1;
+  readonly kind: "agent_output";
+  readonly run_id: string;
+  readonly execution_index: number;
+  readonly state_id: string;
+  readonly output_id: string;
+  readonly digest: string;
+  readonly byte_count: number;
+  readonly offset: number;
+  readonly limit: number;
+  readonly returned_byte_count: number;
+  readonly next_offset: number | null;
+  readonly data_base64: string;
+}
+
 export function projectControlPlanePlanContent(
   result: OrchestratorCallResult,
 ): PlanContentProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
@@ -2097,6 +2210,7 @@ function projectionResponse(
     | EventsProjection
     | IdentityProjection
     | TaskContentProjection
+    | AgentOutputProjection
     | PlanContentProjection
     | WorkerLogsProjection
     | ProjectChangesProjection
@@ -2110,6 +2224,7 @@ function projectionResponse(
   }
   if (
     (projection as { kind?: string }).kind === "project_change_content" ||
+    (projection as { kind?: string }).kind === "agent_output" ||
     (projection as { kind?: string }).kind === "project_apply_operation"
   ) {
     // The content response never caches: the observation identity is an
@@ -2278,6 +2393,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
         parsed.kind !== "events" &&
         parsed.kind !== "identity" &&
         parsed.kind !== "task_content" &&
+        parsed.kind !== "agent_output" &&
         parsed.kind !== "plan_content" &&
         parsed.kind !== "logs_list" &&
         parsed.kind !== "logs_execution" &&
@@ -2315,6 +2431,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind === "events" ||
       parsed.kind === "identity" ||
       parsed.kind === "task_content" ||
+      parsed.kind === "agent_output" ||
       parsed.kind === "plan_content" ||
       parsed.kind === "logs_list" ||
       parsed.kind === "logs_execution" ||
@@ -2420,6 +2537,22 @@ async function dispatchControlPlaneRoute(
       };
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneTaskContent(result));
+    }
+    case "agent_output": {
+      const query = parseAgentOutputQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "agent_output",
+        runId,
+        executionIndex: route.executionIndex as number,
+        outputId: route.outputId as string,
+        ...(query.offset === null ? {} : { offset: query.offset }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneAgentOutput(result));
     }
     case "plan_content": {
       const query = parsePlanContentQuery(deps.discoveryQuery ?? "");

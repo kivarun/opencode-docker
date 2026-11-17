@@ -46,6 +46,9 @@ import {
   type PipelineV2LogsOutcome,
 } from "../src/pipeline_v2_logs.ts";
 import {
+  type PipelineV2AgentOutputContentOutcome,
+} from "../src/pipeline_v2_agent_output_content.ts";
+import {
   projectChangesPipelineV2Run,
   type PipelineV2ProjectChangesOutcome,
 } from "../src/pipeline_v2_project_changes.ts";
@@ -158,6 +161,9 @@ function makeIo(): Recorder {
     logsPipelineV2Run: (async () => {
       throw new Error("fake logsPipelineV2Run not configured");
     }) as unknown as CliIo["logsPipelineV2Run"],
+    agentOutputContentPipelineV2Run: (async () => {
+      throw new Error("fake agentOutputContentPipelineV2Run not configured");
+    }) as unknown as CliIo["agentOutputContentPipelineV2Run"],
     projectChangesPipelineV2Run: (async () => {
       throw new Error("fake projectChangesPipelineV2Run not configured");
     }) as unknown as CliIo["projectChangesPipelineV2Run"],
@@ -4745,4 +4751,84 @@ test("plan-revision failure, JSON contract and resolver failure match the task-r
   ], resolverRec.io);
   expect(resolverExit).toBe(2);
   expect(called).toBe(0);
+}, 15000);
+
+
+// --- agent-output dispatcher ----------------------------------------------------
+
+function agentOutputReport(overrides: Record<string, unknown> = {}): PipelineV2AgentOutputContentOutcome {
+  return {
+    ok: true,
+    exitCode: 0,
+    schemaVersion: 1,
+    runId: "run_x",
+    executionIndex: 1,
+    stateId: "review",
+    outputId: "verdict",
+    digest: "c".repeat(64),
+    byteCount: 12,
+    offset: 0,
+    limit: 65536,
+    returnedByteCount: 12,
+    nextOffset: null,
+    dataBase64: Buffer.from("HELLO-BYTES!").toString("base64"),
+    ...overrides,
+  } as unknown as PipelineV2AgentOutputContentOutcome;
+}
+
+test("agent-output dispatches exactly once with the parsed scalars and uses no runner", async () => {
+  const rec = makeIo();
+  const calls: unknown[] = [];
+  rec.io.agentOutputContentPipelineV2Run = (async (options: unknown) => {
+    calls.push(options);
+    return agentOutputReport({ limit: 4096, offset: 8 });
+  }) as unknown as CliIo["agentOutputContentPipelineV2Run"];
+  const exit = await runCli([
+    "agent-output", "--run-id", "run_x", "--execution-index", "1", "--output", "verdict",
+    "--config-root", "/cfg", "--offset", "8", "--limit", "4096",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual({
+    runId: "run_x",
+    stateRoot: "/state/root",
+    executionIndex: 1,
+    outputId: "verdict",
+    offset: 8,
+    limit: 4096,
+  });
+  expect(rec.runnerCalls).toHaveLength(0);
+  expect(rec.err).toEqual(["orchestrator: agent-output ok (run run_x, execution 1, output verdict, bytes 12 of 12, next end)"]);
+  expect(rec.out).toHaveLength(0);
+}, 15000);
+
+test("agent-output json mode prints exactly one document and the failure line maps the reason", async () => {
+  const rec = makeIo();
+  rec.io.agentOutputContentPipelineV2Run = (async () => agentOutputReport()) as unknown as CliIo["agentOutputContentPipelineV2Run"];
+  const exit = await runCli([
+    "agent-output", "--run-id", "run_x", "--execution-index", "1", "--output", "verdict", "--config-root", "/cfg", "--json",
+  ], rec.io);
+  expect(exit).toBe(0);
+  expect(rec.out).toHaveLength(1);
+  const parsed = JSON.parse(rec.out[0] ?? "") as Record<string, unknown>;
+  expect(Object.keys(parsed).sort()).toEqual([
+    "byteCount", "dataBase64", "digest", "executionIndex", "exitCode", "limit", "nextOffset",
+    "offset", "ok", "outputId", "returnedByteCount", "runId", "schemaVersion", "stateId",
+  ]);
+  expect(parsed).not.toHaveProperty("runRoot");
+  expect(rec.err).toHaveLength(0);
+
+  const failureRec = makeIo();
+  failureRec.io.agentOutputContentPipelineV2Run = (async () => ({
+    ok: false,
+    exitCode: 1,
+    runId: "run_x",
+    reason: "artifact_modified",
+  })) as unknown as CliIo["agentOutputContentPipelineV2Run"];
+  const failureExit = await runCli([
+    "agent-output", "--run-id", "run_x", "--execution-index", "1", "--output", "verdict", "--config-root", "/cfg",
+  ], failureRec.io);
+  expect(failureExit).toBe(1);
+  expect(failureRec.err).toEqual(["orchestrator: agent-output failed (run run_x, reason artifact_modified)"]);
+  expect(failureRec.out).toHaveLength(0);
 }, 15000);

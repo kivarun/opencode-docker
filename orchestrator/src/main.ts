@@ -117,6 +117,10 @@ import {
   type PipelineV2LogsOutcome,
 } from "./pipeline_v2_logs.ts";
 import {
+  agentOutputContentPipelineV2Run,
+  type PipelineV2AgentOutputContentOutcome,
+} from "./pipeline_v2_agent_output_content.ts";
+import {
   projectChangesPipelineV2Run,
   type PipelineV2ProjectChangesOutcome,
 } from "./pipeline_v2_project_changes.ts";
@@ -161,6 +165,7 @@ export interface CliIo {
   taskRevisionContentPipelineV2Run: typeof taskRevisionContentPipelineV2Run;
   planRevisionContentPipelineV2Run: typeof planRevisionContentPipelineV2Run;
   logsPipelineV2Run: typeof logsPipelineV2Run;
+  agentOutputContentPipelineV2Run: typeof agentOutputContentPipelineV2Run;
   projectChangesPipelineV2Run: typeof projectChangesPipelineV2Run;
   projectChangeContentPipelineV2Run: typeof projectChangeContentPipelineV2Run;
   projectApplyPipelineV2: typeof applyPipelineV2ProjectOperation;
@@ -203,6 +208,7 @@ function productionCliIo(): CliIo {
     taskRevisionContentPipelineV2Run,
     planRevisionContentPipelineV2Run,
     logsPipelineV2Run,
+    agentOutputContentPipelineV2Run,
     projectChangesPipelineV2Run,
     projectChangeContentPipelineV2Run,
     projectApplyPipelineV2: applyPipelineV2ProjectOperation,
@@ -241,7 +247,7 @@ function v1SignalRegistration(
 
 const PIPELINE_PLAN_DEFAULT_LIMIT = 100;
 const PIPELINE_TASK_DEFAULT_CHUNK_LIMIT = PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK;
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "identity", "logs", "project-changes", "task-revision", "plan-revision", "project-change-content", "project-apply", "project-apply-inspect"] as const;
+const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "identity", "logs", "agent-output", "project-changes", "task-revision", "plan-revision", "project-change-content", "project-apply", "project-apply-inspect"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -261,6 +267,7 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "task-revision" &&
     command !== "plan-revision" &&
     command !== "logs" &&
+    command !== "agent-output" &&
     command !== "project-changes" &&
     command !== "project-change-content" &&
     command !== "project-apply" &&
@@ -355,6 +362,16 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // SubprocessCliRunner command dependencies and no mutating command
     // deps object are built for it.
     return await runPipelineV2LogsCommand(parsed, io);
+  }
+  if (parsed.kind === "agent-output") {
+    // The read-only pipeline v2 agent-output content command: like
+    // inspect, events, logs and the P-1 content commands it resolves only
+    // the state-root projection (no helper configuration, no Launcher
+    // credential, no auth, no subprocess, no signal registration, no
+    // mutation lock, no durable change) and invokes the content
+    // production API exactly once. The content bytes travel only inside
+    // JSON documents.
+    return await runPipelineV2AgentOutputCommand(parsed, io);
   }
   if (parsed.kind === "project-change-content") {
     // The read-only pipeline v2 project-change-content command: like
@@ -1021,6 +1038,45 @@ async function runPipelineV2LogsCommand(
   } else {
     io.writeError(
       `orchestrator: logs failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+async function runPipelineV2AgentOutputCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "agent-output" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2AgentOutputContentOutcome = await io.agentOutputContentPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    executionIndex: parsed.executionIndex,
+    outputId: parsed.outputId,
+    ...(parsed.offset === 0 ? {} : { offset: parsed.offset }),
+    ...(parsed.limit === 65536 ? {} : { limit: parsed.limit }),
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: agent-output ok (run ${outcome.runId}, execution ${outcome.executionIndex}, output ${outcome.outputId}, bytes ${outcome.returnedByteCount} of ${outcome.byteCount}, next ${outcome.nextOffset === null ? "end" : outcome.nextOffset})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: agent-output failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

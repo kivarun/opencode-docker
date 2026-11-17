@@ -583,3 +583,45 @@ test("plan_revision routes the exact plan-revision argv and rejects hostile shap
     ROUTING_CONFIG,
   )).toThrow();
 });
+
+// --- P-2 agent-output command ----------------------------------------------------
+
+test("agent_output routes the exact agent-output argv with the required config-root and rejects hostile shapes", () => {
+  const plain = routeOrchestratorCommand(
+    { kind: "agent_output", runId: "cp-run-1", executionIndex: 1, outputId: "verdict" },
+    ROUTING_CONFIG,
+  );
+  expect(plain.argv).toEqual([
+    "agent-output",
+    "--run-id", "cp-run-1",
+    "--execution-index", "1",
+    "--output", "verdict",
+    "--config-root", "/opt/orchestrator/config",
+    "--json",
+  ]);
+  const full = routeOrchestratorCommand(
+    { kind: "agent_output", runId: "cp-run-1", executionIndex: 3, outputId: "snap", offset: 8, limit: 1024 },
+    ROUTING_CONFIG,
+  );
+  expect(full.argv).toEqual([
+    "agent-output",
+    "--run-id", "cp-run-1",
+    "--execution-index", "3",
+    "--output", "snap",
+    "--config-root", "/opt/orchestrator/config",
+    "--offset", "8",
+    "--limit", "1024",
+    "--json",
+  ]);
+  expect(full.expectedRunId).toBe("cp-run-1");
+  for (const hostile of [
+    { kind: "agent_output", runId: "cp-run-1", executionIndex: 0, outputId: "verdict" },
+    { kind: "agent_output", runId: "cp-run-1", executionIndex: 1, outputId: "verdict", limit: 262145 },
+    { kind: "agent_output", runId: "cp-run-1", executionIndex: 1, outputId: "../x" },
+    { kind: "agent_output", runId: "cp-run-1", executionIndex: 1, outputId: "verdict", extra: true },
+    { kind: "agent_output", runId: "cp-run-1", outputId: "verdict" },
+    { kind: "agent_output", runId: "cp-run-1", executionIndex: 1.5, outputId: "verdict" },
+  ]) {
+    expect(() => routeOrchestratorCommand(hostile as never, ROUTING_CONFIG)).toThrow();
+  }
+});

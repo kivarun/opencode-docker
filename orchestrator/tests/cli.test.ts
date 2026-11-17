@@ -1955,3 +1955,82 @@ test("usage documents the two P-1 content commands and their flags", () => {
   expect(text).toContain("--revision N           the accepted plan/task revision (required; the");
   expect(text).toContain("193536; plan: default 100, up to 200)");
 });
+
+// --- P-2 agent-output parser ---------------------------------------------------
+
+test("agent-output parses the strict read-only grammar with both flag forms and defaults", () => {
+  const full = parseCommand("agent-output", [
+    "--run-id", "rid-x_1",
+    "--execution-index", "3",
+    "--output", "verdict",
+    "--config-root", "/cfg",
+    "--offset", "8",
+    "--limit", "1024",
+  ]);
+  if (full.kind !== "agent-output") {
+    throw new Error("expected agent-output");
+  }
+  expect(full.runId).toBe("rid-x_1");
+  expect(full.executionIndex).toBe(3);
+  expect(full.outputId).toBe("verdict");
+  expect(full.configRoot).toBe("/cfg");
+  expect(full.offset).toBe(8);
+  expect(full.limit).toBe(1024);
+  expect(full.json).toBe(false);
+
+  const equals = parseCommand("agent-output", ["--run-id=rid", "--execution-index=2", "--output=o1", "--config-root=/cfg"]);
+  if (equals.kind !== "agent-output") {
+    throw new Error("expected agent-output");
+  }
+  expect(equals.offset).toBe(0);
+  expect(equals.limit).toBe(65536);
+
+  const maxChunk = parseCommand("agent-output", [
+    "--run-id", "rid", "--execution-index", "1", "--output", "o", "--config-root", "/c", "--limit", "262144",
+  ]);
+  if (maxChunk.kind !== "agent-output") throw new Error("expected agent-output");
+  expect(maxChunk.limit).toBe(262144);
+});
+
+test("agent-output rejects malformed numeric families, duplicates and forbidden flags", () => {
+  const base = ["--run-id", "rid", "--execution-index", "1", "--output", "o", "--config-root", "/c"];
+  for (const value of ["-1", "+1", "1.5", "1e2", "01", " ", "0x1"]) {
+    expect(() => parseCommand("agent-output", [...base, "--offset", value])).toThrow(/--offset must be a non-negative decimal integer/);
+    expect(() => parseCommand("agent-output", [...base, "--limit", value])).toThrow(/--limit must be a positive decimal integer/);
+    expect(() => parseCommand("agent-output", ["--run-id", "rid", "--config-root", "/c", "--execution-index", value])).toThrow(/--execution-index must be a positive decimal integer/);
+  }
+  expect(() => parseCommand("agent-output", [...base, "--offset", ""])).toThrow(/--offset requires a value/);
+  expect(() => parseCommand("agent-output", [...base, "--limit", "262145"])).toThrow(/--limit must be a positive safe integer up to 262144/);
+  expect(() => parseCommand("agent-output", [...base, "--limit", "0"])).toThrow(/--limit must be a positive decimal integer/);
+  expect(() => parseCommand("agent-output", ["--execution-index", "1", "--output", "o", "--config-root", "/c"])).toThrow(/--run-id SAFE_ID is required for agent-output/);
+  expect(() => parseCommand("agent-output", ["--run-id", "rid", "--execution-index", "1", "--config-root", "/c"])).toThrow(/--output SAFE_ID is required for agent-output/);
+  expect(() => parseCommand("agent-output", ["--run-id", "rid", "--output", "o", "--config-root", "/c"])).toThrow(/--execution-index N is required for agent-output/);
+  expect(() => parseCommand("agent-output", ["--run-id", "rid", "--execution-index", "1", "--output", "o"])).toThrow(/--config-root ABS is required for agent-output/);
+  expect(() => parseCommand("agent-output", [...base, "--limit", "1", "--limit", "2"])).toThrow(/--limit may be given at most once/);
+  expect(() => parseCommand("agent-output", [...base, "--config-root", "c", "--config-root", "/c"])).toThrow(/--config-root may be given at most once/);
+  expect(() => parseCommand("agent-output", ["--run-id", "rid", "--execution-index", "1", "--output", "o", "--config-root", "relative/path"])).toThrow(/--config-root must be an absolute path/);
+  for (const flag of [
+    "--pipeline-root=/b", "--project=/p", "--input", "--workspace=/w", "--image", "--profile", "--task",
+    "--wait-index", "--action", "--additional-iterations", "--task-file", "--task-body", "--state-root",
+    "--daemon-state-root", "--launcher-id", "--stage-id", "--initial-budget", "--observation", "--side",
+    "--change-index", "--project-id", "--apply-id", "--apply-store-root", "--task-id", "--revision",
+    "--after", "--execution-index=1",
+  ]) {
+    const args = flag.endsWith("=") ? [flag] : [flag, "x"];
+    expect(() => parseCommand("agent-output", [...base, ...args])).toThrow();
+  }
+  expect(() => parseCommand("agent-output", [...base, "records"])).toThrow(/unknown argument: records/);
+});
+
+test("agent-output rejects unsafe identifiers without echoing the value", () => {
+  const base = ["--execution-index", "1", "--config-root", "/c"];
+  expect(() => parseCommand("agent-output", [...base, "--run-id", "BAD ID", "--output", "o"])).toThrow(/--run-id must be a safe identifier/);
+  expect(() => parseCommand("agent-output", [...base, "--run-id", "rid", "--output", "../x"])).toThrow(/--output must be a safe identifier/);
+});
+
+test("usage documents the agent-output command and its flags", () => {
+  const text = usage();
+  expect(text).toContain("agent-output read-only bounded raw-byte slice of one accepted");
+  expect(text).toContain("agent-output flags (production pipeline v2, read-only)");
+  expect(text).toContain("--output SAFE_ID       the declared output port id of the execution's");
+});

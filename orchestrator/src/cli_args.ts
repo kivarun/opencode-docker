@@ -1,6 +1,7 @@
 import type { AgentSmokeOptions } from "./agent_smoke.ts";
 import type { RunInputBinding } from "./pipeline_v2_runtime.ts";
 import { expectSafeId } from "./pipeline_v2_state.ts";
+import { PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX } from "./pipeline_v2_content_reasons.ts";
 import { isCleanAbsolutePath } from "./clean_path.ts";
 import { DEFAULT_WORKER_IMAGE } from "./worker.ts";
 import {
@@ -11,6 +12,10 @@ import {
 /** The P-1 task chunk constants, named once for the grammar (single owner). */
 const PIPELINE_TASK_DEFAULT_CHUNK_LIMIT = PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK;
 const PIPELINE_TASK_MAX_CHUNK_LIMIT = PIPELINE_V2_RUN_PLAN_TASK_MAX_CHUNK;
+
+/** The P-2 agent-output slice constants, named once for the grammar (single owner). */
+const PIPELINE_OUTPUT_DEFAULT_CHUNK_LIMIT = 65_536;
+const PIPELINE_OUTPUT_MAX_CHUNK_LIMIT = PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX;
 
 /** The safe-id validation of every P-1 identity scalar (never echoed on failure). */
 function expectContentSafeId(value: string, flag: string): string {
@@ -106,6 +111,17 @@ export interface ParsedPipelineInspectArgs {
   readonly kind: "inspect";
   readonly runId: string;
   readonly configRoot: string;
+  readonly json: boolean;
+}
+
+export interface ParsedPipelineAgentOutputArgs {
+  readonly kind: "agent-output";
+  readonly runId: string;
+  readonly executionIndex: number;
+  readonly outputId: string;
+  readonly configRoot: string;
+  readonly offset: number;
+  readonly limit: number;
   readonly json: boolean;
 }
 
@@ -207,6 +223,7 @@ export type ParsedCommand =
   | ParsedPipelineInspectArgs
   | ParsedPipelineEventsArgs
   | ParsedPipelineIdentityArgs
+  | ParsedPipelineAgentOutputArgs
   | ParsedPipelineLogsArgs
   | ParsedPipelineProjectChangesArgs
   | ParsedPipelineProjectChangeContentArgs
@@ -273,6 +290,11 @@ export function usage(): string {
   "  project-apply-inspect read-only projection of one durable Apply",
   "               operation (status, revision, step counts): never runs",
   "               recovery and never changes any status",
+  "  agent-output read-only bounded raw-byte slice of one accepted agent",
+  "               execution output: durable-record selection, digest-bound",
+  "               serving through one linearized open, no worker, no",
+  "               Launcher credential, no mutation lock, no artifact write",
+  "               and no durable change",
   "  task-revision read-only byte-exact chunk stream of one accepted task",
   "               revision's body: ledger-first selection, per-request",
   "               digest binding, no worker, no Launcher credential, no",
@@ -610,6 +632,27 @@ export function usage(): string {
   "                          the exit code is 1 only when the identity read itself",
   "                          could not be performed, never because of the run's",
   "                          own state.",
+  "",
+  "agent-output flags (production pipeline v2, read-only):",
+  "  --run-id SAFE_ID        the run id of the durable run to read; required; a",
+  "                          safe identifier (letters, digits, '_', '.', '-', at most",
+  "                          128 characters)",
+  "  --execution-index N     the execution index of the accepted agent output;",
+  "                          required; a positive decimal integer without sign,",
+  "                          leading zeros, fraction, exponent or whitespace",
+  "  --output SAFE_ID       the declared output port id of the execution's",
+  "                          accepted record (and of the agent state); required",
+  "  --config-root PATH      non-empty absolute configuration root; required by the",
+  "                          shared command grammar but not used by agent-output",
+  "                          (no profile is loaded, no Launcher credential is read)",
+  "  [--offset N]            raw-byte offset of the content window (default 0)",
+  "  [--limit N]             maximum raw bytes per response (default 65536,",
+  "                          maximum 262144); the cursor counts raw bytes",
+  "  --json                  print exactly one JSON versioned content document on",
+  "                          stdout (no progress lines); errors and diagnostics go",
+  "                          to stderr; the exit code is 1 only when the content",
+  "                          read itself could not be performed, never because of",
+  "                          the run's own state.",
   "",
   "task-revision/plan-revision flags (production pipeline v2, read-only):",
   "  --task-id SAFE_ID      the accepted task id (task-revision only); a safe",
@@ -1401,6 +1444,9 @@ function rejectRunPlanContentExtra(command: string, arg: string): string {
   if (arg === "--task-body" || arg.startsWith("--task-body=")) {
     return `${command} does not accept --task-body; task revisions belong to 'revise-task'`;
   }
+  if (arg === "--output" || arg.startsWith("--output=")) {
+    return `${command} does not accept --output; output ids belong to 'agent-output'`;
+  }
   if (arg === "--state-root" || arg.startsWith("--state-root=")) {
     return `${command} does not accept --state-root; set the ORCHESTRATOR_STATE_ROOT environment variable`;
   }
@@ -1609,6 +1655,99 @@ function parsePlanRevisionArgs(argv: string[]): ParsedPipelinePlanRevisionArgs {
     configRoot,
     after: after ?? 0,
     limit: limit ?? 100,
+    json,
+  };
+}
+
+function parseAgentOutputArgs(argv: string[]): ParsedPipelineAgentOutputArgs {
+  let runId: string | null = null;
+  let executionIndex: number | null = null;
+  let outputId: string | null = null;
+  let configRoot: string | null = null;
+  let offset: number | null = null;
+  let limit: number | null = null;
+  let json = false;
+
+  const requireSingleton = (current: unknown, flag: string): void => {
+    if (current !== null) {
+      throw new Error(`${flag} may be given at most once`);
+    }
+  };
+  const requireAbsolute = (value: string, flag: string): string => {
+    if (!value.startsWith("/")) {
+      throw new Error(`${flag} must be an absolute path`);
+    }
+    return value;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (arg === "--run-id" || arg.startsWith("--run-id=")) {
+      const { value, next } = parseValue(argv, i, "--run-id");
+      requireSingleton(runId, "--run-id");
+      runId = expectContentSafeId(value, "--run-id");
+      i = next;
+    } else if (arg === "--execution-index" || arg.startsWith("--execution-index=")) {
+      const { value, next } = parseValue(argv, i, "--execution-index");
+      requireSingleton(executionIndex, "--execution-index");
+      executionIndex = parsePositiveDecimalSafeInteger(value, "--execution-index");
+      i = next;
+    } else if (arg === "--output" || arg.startsWith("--output=")) {
+      const { value, next } = parseValue(argv, i, "--output");
+      requireSingleton(outputId, "--output");
+      outputId = expectContentSafeId(value, "--output");
+      i = next;
+    } else if (arg === "--config-root" || arg.startsWith("--config-root=")) {
+      const { value, next } = parseValue(argv, i, "--config-root");
+      requireSingleton(configRoot, "--config-root");
+      configRoot = requireAbsolute(value, "--config-root");
+      i = next;
+    } else if (arg === "--offset" || arg.startsWith("--offset=")) {
+      const { value, next } = parseValue(argv, i, "--offset");
+      requireSingleton(offset, "--offset");
+      offset = parseNonNegativeDecimalSafeInteger(value, "--offset");
+      i = next;
+    } else if (arg === "--limit" || arg.startsWith("--limit=")) {
+      const { value, next } = parseValue(argv, i, "--limit");
+      requireSingleton(limit, "--limit");
+      const parsed = parsePositiveDecimalSafeInteger(value, "--limit");
+      if (parsed > PIPELINE_OUTPUT_MAX_CHUNK_LIMIT) {
+        throw new Error(`--limit must be a positive safe integer up to ${PIPELINE_OUTPUT_MAX_CHUNK_LIMIT}`);
+      }
+      limit = parsed;
+      i = next;
+    } else if (arg === "--json") {
+      if (json) {
+        throw new Error("--json may be given at most once");
+      }
+      json = true;
+    } else if (arg.startsWith("--json=")) {
+      throw new Error("--json does not take a value");
+    } else {
+      throw new Error(rejectRunPlanContentExtra("agent-output", arg));
+    }
+  }
+
+  if (runId === null) {
+    throw new Error("--run-id SAFE_ID is required for agent-output");
+  }
+  if (outputId === null) {
+    throw new Error("--output SAFE_ID is required for agent-output");
+  }
+  if (executionIndex === null) {
+    throw new Error("--execution-index N is required for agent-output: the execution select");
+  }
+  if (configRoot === null) {
+    throw new Error("--config-root ABS is required for agent-output");
+  }
+  return {
+    kind: "agent-output",
+    runId,
+    executionIndex,
+    outputId,
+    configRoot,
+    offset: offset ?? 0,
+    limit: limit ?? PIPELINE_OUTPUT_DEFAULT_CHUNK_LIMIT,
     json,
   };
 }
@@ -2345,7 +2484,7 @@ function parseProjectApplyInspectArgs(argv: string[]): ParsedPipelineProjectAppl
 }
 
 export function parseCommand(
-  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "identity" | "logs" | "project-changes" | "task-revision" | "plan-revision" | "project-change-content" | "project-apply" | "project-apply-inspect",
+  kind: "smoke" | "agent-smoke" | "run" | "resume" | "respond" | "continue-stage" | "revise-task" | "resume-plan" | "inspect" | "events" | "identity" | "logs" | "agent-output" | "project-changes" | "task-revision" | "plan-revision" | "project-change-content" | "project-apply" | "project-apply-inspect",
   argv: string[],
 ): ParsedCommand {
   if (kind === "task-revision") {
@@ -2383,6 +2522,9 @@ export function parseCommand(
   }
   if (kind === "logs") {
     return parseLogsArgs(argv);
+  }
+  if (kind === "agent-output") {
+    return parseAgentOutputArgs(argv);
   }
   if (kind === "project-changes") {
     return parseProjectChangesArgs(argv);

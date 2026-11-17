@@ -32,6 +32,7 @@ import {
   parseRespondBody,
   parseResumePlanBody,
   parseReviseTaskBody,
+  parseAgentOutputQuery,
   projectControlPlaneCommandResult,
   projectControlPlaneInspect,
   projectControlPlaneEvents,
@@ -188,9 +189,10 @@ describe("control-plane HTTP: route parser", () => {
     }
   });
 
-  test("the versioned route inventory is exactly 19 routes at the parser", () => {
+  test("the versioned route inventory is exactly 20 routes at the parser", () => {
     for (const route of [
       ["/v1/projects/project-a/runs", "POST", "fresh_run"],
+      ["/v1/runs/r1/agent-outputs/1/verdict", "GET", "agent_output"],
       ["/v1/projects", "GET", "projects"],
       ["/v1/runs", "GET", "runs"],
       ["/v1/runs/r1", "GET", "inspect"],
@@ -217,6 +219,9 @@ describe("control-plane HTTP: route parser", () => {
       }
       expect(parsed.kind, path).toBe(kind);
     }
+    expect(routeReason("/v1/runs/r1/agent-outputs", "GET")).toBe("unknown_route");
+    expect(routeReason("/v1/runs/r1/agent-outputs/1", "GET")).toBe("unknown_route");
+    expect(routeReason("/v1/runs/r1/agent-outputs/1/verdict", "POST")).toBe("method_not_allowed");
     expect(routeReason("/v1/runs/r1/id", "GET")).toBe("unknown_route");
     expect(routeReason("/v1/runs/r1/change", "GET")).toBe("unknown_route");
     expect(routeReason("/v1/runs/r1/tasks", "GET")).toBe("unknown_route");
@@ -3704,5 +3709,139 @@ describe("control-plane HTTP: P-1 task/plan content routes", () => {
     });
     const response = await handleControlPlaneHttpRequest(deps as never, request);
     expect(response.status).toBe(502);
+  }, 30000);
+});
+
+// --- P-2 agent-output route ----------------------------------------------------
+
+describe("control-plane HTTP: P-2 agent-output route", () => {
+  const routeReason2 = (path: string, method: string): string => {
+    const parsed = parseControlPlaneRoute(path, method);
+    if (parsed instanceof ControlPlaneHttpRequestError) {
+      return parsed.reason;
+    }
+    return `ok:${parsed.kind}`;
+  };
+
+  test("the agent-output route parses GET with a positive execution index and safe output id", () => {
+    expect(routeReason2("/v1/runs/r1/agent-outputs/1/verdict", "GET")).toBe("ok:agent_output");
+    expect(routeReason2("/v1/runs/r1/agent-outputs/01/verdict", "GET")).toBe("invalid_path");
+    expect(routeReason2("/v1/runs/r1/agent-outputs/0/verdict", "GET")).toBe("invalid_path");
+    expect(routeReason2("/v1/runs/r1/agent-outputs/1/verdict", "POST")).toBe("method_not_allowed");
+    expect(routeReason2("/v1/runs/r1/agent-outputs/1/not_a_safe_id！", "GET")).toBe("invalid_path");
+    for (const path of [
+      "/v1/runs/r1/agent-outputs",
+      "/v1/runs/r1/agent-outputs/1",
+      "/v1/runs/r1/agent-outputs/1/verdict/extra",
+    ]) {
+      expect(routeReason2(path, "GET")).toBe("unknown_route");
+    }
+  });
+
+  test("the agent-output query grammar is strict and capped at the shared slice maximum", () => {
+    expect((parseAgentOutputQuery("?offset=12&limit=262144") as { offset: number; limit: number })).toEqual({ offset: 12, limit: 262144 });
+    expect((parseAgentOutputQuery("") as { offset: number | null; limit: number | null })).toEqual({ offset: null, limit: null });
+    for (const bad of ["?limit=262145", "?offset=-1", "?offset=01", "?offset=1&offset=2", "?limit=1.5", "?after=1", "?x=1", "?offset=", "?%61=1"]) {
+      const result = parseAgentOutputQuery(bad);
+      if (!(result instanceof ControlPlaneHttpRequestError)) throw new Error(`expected refusal for ${bad}`);
+      expect(result.reason).toBe("invalid_cursor");
+    }
+  });
+
+  test("the dispatch composes the bound agent-output command with defaults mapped to absences", async () => {
+    const storeRoot = mkdtempSync(join(tmpdir(), "p2-http-bind-"));
+    const envRoot2 = mkdtempSync(join(tmpdir(), "p2-http-env-"));
+    try {
+      mkdirSync(join(envRoot2, "project"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(envRoot2, "cfg"), { recursive: true, mode: 0o700 });
+      const registryPath = join(envRoot2, "registry.json");
+      writeFileSync(
+        registryPath,
+        JSON.stringify({ schema_version: 1, projects: [{ id: "project-a", project_root: join(envRoot2, "project"), config_root: join(envRoot2, "cfg"), pipeline_root: null, launcher_id: null, input_roots: [] }] }),
+        { mode: 0o600 },
+      );
+      const registry = await loadControlPlaneProjectRegistry(registryPath);
+      const bindingStore = await ControlPlaneRunBindingStore.open(storeRoot);
+      await bindingStore.claim({ runId: "p2-run", projectId: "project-a" });
+      const calls: unknown[] = [];
+      let nextResult: OrchestratorCallResult = {
+        ok: true,
+        projection: {
+          kind: "agentOutput",
+          schemaVersion: 1,
+          runId: "p2-run",
+          executionIndex: 1,
+          stateId: "review",
+          outputId: "verdict",
+          digest: "a".repeat(64),
+          byteCount: 12,
+          offset: 0,
+          limit: 2048,
+          returnedByteCount: 12,
+          nextOffset: null,
+          dataBase64: "Qk9EWS0wMTIzNDU2",
+        },
+      } as unknown as OrchestratorCallResult;
+      const handler = async (pathAndQuery: string): Promise<{ status: number; body: string; headers: Record<string, string> }> => {
+        const deps = {
+          registry,
+          bindingStore: await ControlPlaneRunBindingStore.open(storeRoot),
+          client: {
+            run: async (command: unknown): Promise<OrchestratorCallResult> => {
+              calls.push(command);
+              return nextResult;
+            },
+          } as unknown as OrchestratorSubprocessClient,
+          assets: loadControlPlaneUiAssets(defaultControlPlaneUiRoot()),
+          port: 4713,
+          bodyLimitBytes: 4096,
+        };
+        const request = new Request(`http://127.0.0.1:4713${pathAndQuery}`, {
+          method: "GET",
+          headers: { host: "127.0.0.1:4713" },
+        });
+        const response = await handleControlPlaneHttpRequest(deps as never, request);
+        return { status: response.status, body: await response.text(), headers: Object.fromEntries(response.headers.entries()) };
+      };
+      const success = await handler("/v1/runs/p2-run/agent-outputs/1/verdict?offset=0&limit=2048");
+      expect(success.status).toBe(200);
+      expect(success.headers["cache-control"]).toBe("no-store");
+      const body = JSON.parse(success.body) as Record<string, unknown>;
+      expect(body).toEqual({
+        schema_version: 1,
+        kind: "agent_output",
+        run_id: "p2-run",
+        execution_index: 1,
+        state_id: "review",
+        output_id: "verdict",
+        digest: "a".repeat(64),
+        byte_count: 12,
+        offset: 0,
+        limit: 2048,
+        returned_byte_count: 12,
+        next_offset: null,
+        data_base64: "Qk9EWS0wMTIzNDU2",
+      });
+      expect(success.body).not.toContain("run_root");
+      expect(success.body).not.toContain("/tmp/");
+      expect(calls[calls.length - 1]).toEqual({ kind: "agent_output", runId: "p2-run", executionIndex: 1, outputId: "verdict", offset: 0, limit: 2048 });
+      const defaults = await handler("/v1/runs/p2-run/agent-outputs/2/snap");
+      expect(calls[calls.length - 1]).toEqual({ kind: "agent_output", runId: "p2-run", executionIndex: 2, outputId: "snap" });
+
+      nextResult = { ok: true, projection: { kind: "agentOutputFailure", exitCode: 1, runId: "p2-run", reason: "unknown_output" } } as unknown as OrchestratorCallResult;
+      const failure = await handler("/v1/runs/p2-run/agent-outputs/1/verdict");
+      expect(failure.status).toBe(200);
+      expect(JSON.parse(failure.body)).toEqual({
+        schema_version: 1, kind: "command_result", run_id: "p2-run", outcome: "failed", exit_code: 1, reason: "unknown_output",
+      });
+
+      nextResult = { ok: true, projection: { kind: "agentOutputFailure", exitCode: 1, runId: "p2-run", reason: "invalid_cursor" } } as unknown as OrchestratorCallResult;
+      const cursor = await handler("/v1/runs/p2-run/agent-outputs/1/verdict?offset=999999");
+      expect(cursor.status).toBe(400);
+      expect(JSON.parse(cursor.body)).toEqual({ schema_version: 1, kind: "error", layer: "request", reason: "invalid_cursor" });
+    } finally {
+      rmSync(storeRoot, { recursive: true, force: true });
+      rmSync(envRoot2, { recursive: true, force: true });
+    }
   }, 30000);
 });

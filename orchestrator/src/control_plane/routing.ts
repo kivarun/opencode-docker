@@ -99,6 +99,14 @@ export type OrchestratorCommand =
       readonly offset?: number;
       readonly limit?: number;
     }
+  | {
+      readonly kind: "agent_output";
+      readonly runId: string;
+      readonly executionIndex: number;
+      readonly outputId: string;
+      readonly offset?: number;
+      readonly limit?: number;
+    }
   | { readonly kind: "resume"; readonly runId: string; readonly launcherId?: string }
   | {
       readonly kind: "resume_plan";
@@ -213,6 +221,7 @@ interface CapturedCommand {
   readonly additionalIterations: number;
   readonly taskId: string;
   readonly taskFile: string;
+  readonly outputId: string;
   readonly actionId: string;
   readonly after: number | null;
   readonly revision: number | null;
@@ -243,6 +252,16 @@ function expectPositiveIntegerField(record: Record<string, unknown>, key: string
   const value = record[key];
   if (!isPositiveSafeInteger(value)) {
     throw new OrchestratorSubprocessClientError("invalid_command", `${what} must be a positive safe integer`);
+  }
+  return value;
+}
+
+import { PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX } from "../pipeline_v2_content_reasons.ts";
+
+function expectOutputLimitField(record: Record<string, unknown>, key: string, what: string): number {
+  const value = expectPositiveIntegerField(record, key, what);
+  if (value > PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX) {
+    throw new OrchestratorSubprocessClientError("invalid_command", `${key} must not exceed ${PIPELINE_V2_OUTPUT_SLICE_LIMIT_MAX} on the agent_output command`);
   }
   return value;
 }
@@ -337,6 +356,7 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
     additionalIterations: 0,
     taskId: "",
     taskFile: "",
+    outputId: "",
     actionId: "",
     after: null,
     revision: null,
@@ -547,6 +567,35 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
         limit: planLimit,
       };
     }
+    case "agent_output": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "executionIndex" && key !== "outputId" && key !== "offset" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on agent_output command");
+        }
+      }
+      for (const key of ["runId", "executionIndex", "outputId"] as const) {
+        if (!Object.hasOwn(command, key)) {
+          throw new OrchestratorSubprocessClientError("invalid_command", `missing field ${key} on agent_output command`);
+        }
+      }
+      const outputOffsetField = optionalField(command, "offset");
+      const outputOffset = outputOffsetField.present
+        ? expectNonNegativeIntegerField({ offset: outputOffsetField.value }, "offset", "offset")
+        : null;
+      const outputLimitField = optionalField(command, "limit");
+      const outputLimit = outputLimitField.present
+        ? expectOutputLimitField({ limit: outputLimitField.value }, "limit", "limit")
+        : null;
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        executionIndex: expectPositiveIntegerField({ executionIndex: command["executionIndex"] }, "executionIndex", "executionIndex"),
+        outputId: expectSafeIdField(command, "outputId", "outputId"),
+        offset: outputOffset,
+        limit: outputLimit,
+      };
+    }
     case "logs": {
       for (const key of Object.keys(command)) {
         if (key !== "kind" && key !== "runId" && key !== "executionIndex" && key !== "offset" && key !== "limit") {
@@ -735,9 +784,11 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
                   ? "project-apply-inspect"
                   : captured.kind === "task_revision"
                     ? "task-revision"
-                    : captured.kind === "plan_revision"
-                      ? "plan-revision"
-                      : captured.kind;
+                    : captured.kind === "agent_output"
+                      ? "agent-output"
+                      : captured.kind === "plan_revision"
+                        ? "plan-revision"
+                        : captured.kind;
   const argv: string[] = [cliKind];
   switch (captured.kind) {
     case "run": {
@@ -799,6 +850,20 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
       break;
     case "task_revision":
       argv.push("--run-id", captured.runId, "--task-id", captured.taskId, "--revision", String(captured.revision), "--config-root", routingConfig.configRoot);
+      if (captured.offset !== null) argv.push("--offset", String(captured.offset));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
+      break;
+    case "agent_output":
+      argv.push(
+        "--run-id",
+        captured.runId,
+        "--execution-index",
+        String(captured.executionIndex),
+        "--output",
+        captured.outputId,
+        "--config-root",
+        routingConfig.configRoot,
+      );
       if (captured.offset !== null) argv.push("--offset", String(captured.offset));
       if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       break;

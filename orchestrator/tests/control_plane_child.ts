@@ -292,7 +292,7 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
         limit: 65536,
         returnedByteCount: 12,
         nextOffset: null,
-        dataBase64: "Qk9EWS0qLSMmQDI=",
+        dataBase64: "Qk9EWS0wMTIzNDU2",
       },
     })}\n`,
     exitCode: 0,
@@ -336,6 +336,109 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
   plan_content_failure: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "unknown_revision" })}\n`, exitCode: 1 },
   task_content_failure_options: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "invalid_options" })}\n`, exitCode: 1 },
   plan_content_failure_options: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "invalid_options" })}\n`, exitCode: 1 },
+  agent_output_report: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 12, nextOffset: null, dataBase64: "Qk9EWS0wMTIzNDU2",
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_open_ended: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 5, nextOffset: 5, dataBase64: Buffer.from("Hello", "utf8").toString("base64"),
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_empty_terminal: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 12, limit: 65536,
+      returnedByteCount: 0, nextOffset: null, dataBase64: "",
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_failure: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "artifact_modified" })}\n`, exitCode: 1 },
+  agent_output_failure_root: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", runRoot: "/tmp/leak", reason: "invalid_cursor" })}\n`, exitCode: 1 },
+  agent_output_failure_options: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "invalid_options" })}\n`, exitCode: 1 },
+  agent_output_bad_vocab: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "unknown_revision" })}\n`, exitCode: 1 },
+  agent_output_size_mismatch: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 12, nextOffset: null, dataBase64: Buffer.from("Hello", "utf8").toString("base64"),
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_noncanonical_base64: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 1, offset: 0, limit: 65536,
+      returnedByteCount: 1, nextOffset: null, dataBase64: "QQ",
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_next_bad: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 5, nextOffset: -1, dataBase64: Buffer.from("Hello", "utf8").toString("base64"),
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_next_mismatch: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 5, nextOffset: 7, dataBase64: Buffer.from("Hello", "utf8").toString("base64"),
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_offset_over: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 99, limit: 65536,
+      returnedByteCount: 2, nextOffset: 101, dataBase64: Buffer.from("Hi", "utf8").toString("base64"),
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_limit_over: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 262145,
+      returnedByteCount: 12, nextOffset: null, dataBase64: "Qk9EWS0wMTIzNDU2",
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_unsafe_runid: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "BAD ID",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 12, nextOffset: null, dataBase64: "Qk9EWS0wMTIzNDU2",
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_extra_field: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 12, nextOffset: null, dataBase64: "Qk9EWS0wMTIzNDU2", runRoot: "/tmp/leak",
+    })}\n`,
+    exitCode: 0,
+  },
   logs_list: {
     stdout: `${JSON.stringify({
       ok: true,
