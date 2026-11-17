@@ -11,7 +11,7 @@
  * `pipeline-v2-output\0` framing owner.
  */
 import { expect, test } from "bun:test";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -572,6 +572,8 @@ test("the post-open identity binding: a replaced inode with a fresh token serves
 const SMALL_FILE_CONTENT = Buffer.from(`SNAPSHOT ${CANARY}\n`, "utf8");
 const VERDICT_CONTENT = Buffer.from('{"ok":true}\n', "utf8");
 const FEEDBACK_CONTENT = Buffer.from('{"text":"minor issues"}\n', "utf8");
+const PORT_SNAP: PortSuite = { id: "snap", type: "file", content: SMALL_FILE_CONTENT };
+
 const ALL_PORTS: readonly PortSuite[] = [
   { id: "verdict", type: "json", content: VERDICT_CONTENT },
   { id: "feedback", type: "json", content: FEEDBACK_CONTENT },
@@ -772,6 +774,29 @@ test("tamper battery: byte flip, kind substitution, symlink, truncation, growth,
     writeFileSync(join(escaped, "snap"), original, { mode: 0o600 });
     symlinkSync(escaped, outputsParent);
     expectFailure(await call(runId, dirs, 1, "snap"), "artifact_modified", runId);
+  } finally {
+    rmSync(dirs.root, { recursive: true, force: true });
+  }
+}, 60000);
+
+test("a symlinked activations ancestor inside the run root is artifact_modified before any content", async () => {
+  const dirs = await makeDirs("p2-actlink-", PLANNING_ROLE_YAML, `${RENDER_STATE_YAML}\n${DONE_STATE_YAML}`);
+  const runId = "actlink-run";
+  try {
+    await buildAcceptedRun(dirs, runId, [PORT_SNAP]);
+    const runRoot = dirs.runRoot!;
+    const mirrored = join(runRoot, "mirror", "activations");
+    mkdirSync(join(runRoot, "mirror"), { recursive: true, mode: 0o700 });
+    renameSync(join(runRoot, "activations"), mirrored);
+    symlinkSync(mirrored, join(runRoot, "activations"));
+    const before = await fingerprintTree(dirs.stateRoot);
+    expectFailure(await call(runId, dirs, 1, "snap"), "artifact_modified", runId);
+    expect(await fingerprintTree(dirs.stateRoot)).toBe(before);
+    rmSync(join(runRoot, "activations"));
+    renameSync(mirrored, join(runRoot, "activations"));
+    const restored = await call(runId, dirs, 1, "snap", { limit: 4 });
+    if (!restored.ok) throw new Error("expected success after restore");
+    expect(restored.returnedByteCount).toBe(4);
   } finally {
     rmSync(dirs.root, { recursive: true, force: true });
   }
@@ -1077,13 +1102,15 @@ test("the full-envelope CLI document (max ids, max payload, real dispatcher) sta
       numericFieldExpansion(outcome.executionIndex) +
       numericFieldExpansion(outcome.byteCount) +
       numericFieldExpansion(outcome.offset) +
-      // a null nextOffset consumes 4 characters and cannot expand
-      (outcome.nextOffset === null ? 0 : numericFieldExpansion(outcome.nextOffset));
-    expect(bytes + expansion, "derived grammar-max CLI document + LF").toBeLessThanOrEqual(350_246);
+      // a null nextOffset expands by replacing the 4-character "null" with
+      // the widest 16-digit number: exactly 12 allowance characters.
+      (outcome.nextOffset === null ? 12 : numericFieldExpansion(outcome.nextOffset));
+    // The controlled form derives the exact accepted r4 worst case.
+    expect(bytes + expansion, "derived grammar-max CLI document + LF").toBe(350_246);
     expect(bytes + expansion).toBeLessThanOrEqual(4_000_000);
     // The §6 empty-payload envelope figure is the honest decomposition
     // bound for this construction: envelope (doc minus payload) <= 718.
-    expect(bytes - 349_528, "CLI envelope without the max payload").toBeLessThanOrEqual(718);
+    expect(bytes - 349_528 + expansion, "CLI envelope without the max payload, worst case").toBe(718);
     expect(stderr.join("")).toBe("");
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
@@ -1112,11 +1139,13 @@ test("the full-envelope HTTP response document (real service) stays far below th
       numericFieldExpansion(1) +
       numericFieldExpansion(document.byte_count) +
       numericFieldExpansion(document.offset) +
-      // a null next_offset consumes 4 characters and cannot expand
-      (document.next_offset === null ? 0 : numericFieldExpansion(document.next_offset));
-    expect(bytes + expansion, "derived grammar-max HTTP document").toBeLessThanOrEqual(350_254);
+      // a null next_offset expands by replacing the 4-character "null"
+      // with the widest 16-digit number: exactly 12 allowance characters.
+      (document.next_offset === null ? 12 : numericFieldExpansion(document.next_offset));
+    // The controlled form derives the exact accepted r4 worst case.
+    expect(bytes + expansion, "derived grammar-max HTTP document").toBe(350_254);
     expect(bytes + expansion).toBeLessThanOrEqual(1_048_576);
-    expect(bytes - 349_528, "HTTP envelope without the max payload").toBeLessThanOrEqual(726);
+    expect(bytes - 349_528 + expansion, "HTTP envelope without the max payload, worst case").toBe(726);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

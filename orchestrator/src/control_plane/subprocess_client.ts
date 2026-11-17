@@ -1090,6 +1090,9 @@ function parseOutcomeDocument(
       if (nextOffset !== null && nextOffset !== offset + returnedByteCount) {
         throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output nextOffset is not the exact tail cursor");
       }
+      if (nextOffset === null && returnedByteCount !== byteCount - offset) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output terminal chunk is not the exact end of the artifact");
+      }
       if (nextOffset !== null && nextOffset >= byteCount) {
         throw new OrchestratorSubprocessClientError("unexpected_output_shape", "the agent output nextOffset must be beyond the served window");
       }

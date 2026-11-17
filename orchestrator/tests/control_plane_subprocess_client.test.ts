@@ -1032,6 +1032,15 @@ test("the agent-output wire cursor/frame invariants admit the exact coherent for
   expectFailure(await client.run(agentOutputScenario("offset_over")), "unexpected_output_shape");
   expectFailure(await client.run(agentOutputScenario("limit_over")), "unexpected_output_shape");
   expectFailure(await client.run(agentOutputScenario("unsafe_runid")), "unexpected_output_shape");
+  // terminal-page invariant: nextOffset === null requires the exact end
+  expectFailure(await client.run(agentOutputScenario("terminal_prefix")), "unexpected_output_shape");
+  // offset === byteCount admits only the empty terminal chunk
+  expectFailure(await client.run(agentOutputScenario("end_nonempty")), "unexpected_output_shape");
+  // limit 0 is outside the chunk grammar
+  expectFailure(await client.run(agentOutputScenario("limit_zero")), "unexpected_output_shape");
+  // the two safe-id identity fields are rejected separately by value
+  expectFailure(await client.run(agentOutputScenario("unsafe_state")), "unexpected_output_shape");
+  expectFailure(await client.run(agentOutputScenario("unsafe_output")), "unexpected_output_shape");
   expectFailure(await client.run(agentOutputScenario("extra_field")), "unexpected_output_shape");
 }, 15000);
 

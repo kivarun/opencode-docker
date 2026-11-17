@@ -1297,6 +1297,20 @@ export async function resolveAcceptedOutputArtifact(
   outputId: string,
   type: "file" | "json",
 ): Promise<PipelineV2OutputStreamToken> {
+  const activationsPath = join(runRoot, "activations");
+  const activationsInfo = await lstatOrNull(activationsPath);
+  if (activationsInfo === null) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_missing",
+      "the accepted output activations root does not exist",
+    );
+  }
+  if (activationsInfo.isSymbolicLink() || !activationsInfo.isDirectory()) {
+    throw new PipelineV2OutputStreamError(
+      "artifact_modified",
+      "the accepted output activations root is not a real directory",
+    );
+  }
   const leafPath = join(runRoot, "activations", `${executionIndex}-${stateId}`);
   const what = `accepted output artifact ${JSON.stringify(outputId)} of execution ${executionIndex}`;
   const leafInfo = await lstatOrNull(leafPath);

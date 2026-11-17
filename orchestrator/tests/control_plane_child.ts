@@ -430,6 +430,51 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
     })}\n`,
     exitCode: 0,
   },
+  agent_output_terminal_prefix: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 5, nextOffset: null, dataBase64: Buffer.from("Hello", "utf8").toString("base64"),
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_end_nonempty: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 12, limit: 65536,
+      returnedByteCount: 3, nextOffset: null, dataBase64: Buffer.from("abc", "utf8").toString("base64"),
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_limit_zero: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 0,
+      returnedByteCount: 0, nextOffset: 0, dataBase64: "",
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_unsafe_state: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "BAD ID", outputId: "verdict",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 12, nextOffset: null, dataBase64: "Qk9EWS0wMTIzNDU2",
+    })}\n`,
+    exitCode: 0,
+  },
+  agent_output_unsafe_output: {
+    stdout: `${JSON.stringify({
+      ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
+      executionIndex: 2, stateId: "review", outputId: "bad/id!",
+      digest: "a".repeat(64), byteCount: 12, offset: 0, limit: 65536,
+      returnedByteCount: 12, nextOffset: null, dataBase64: "Qk9EWS0wMTIzNDU2",
+    })}\n`,
+    exitCode: 0,
+  },
   agent_output_extra_field: {
     stdout: `${JSON.stringify({
       ok: true, exitCode: 0, schemaVersion: 1, runId: "cp-child-run",
