@@ -5511,6 +5511,137 @@ function railStateIdOf(entry) {
   return typeof value === "string" && isSafeId(value) ? value : null;
 }
 
+/** The exact top-level key set of the frozen timeline model. */
+const RAIL_TIMELINE_KEYS = Object.freeze([
+  "runId",
+  "cursor",
+  "snapshotRevision",
+  "events",
+  "nextAfter",
+  "stopped",
+  "error",
+]);
+
+function railPositiveSafeInteger(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+function railNonNegativeSafeInteger(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * The one strict shape owner of the identity derivation. It validates
+ * the EXACT frozen timeline model `createTimelineState`/`applyEventsPage`
+ * produce — every deviation is a model-shape failure of the whole
+ * derivation (the zero-event fallback), never skipped events and never
+ * a partial result:
+ * - exact own keys and types, the frozen model and its frozen events;
+ * - the stopped/error coherence (`stopTimeline` sets both together);
+ * - the cursor/snapshotRevision/nextAfter coherence of the merge chain
+ *   (cursor <= snapshotRevision; nextAfter null iff cursor equals the
+ *   snapshot revision; non-null nextAfter equals the cursor);
+ * - the dense event prefix: `events.length === cursor` and every entry
+ *   a frozen-shaped applied event — record, revision exactly index+1,
+ *   a kind of the closed public vocabulary through the one
+ *   `eventReferenceKeys` owner carrying exactly `{revision, kind}` plus
+ *   its kind's reference keys, and well-typed identity references for
+ *   the identity kinds.
+ * A malformed entry is a shape failure wherever it sits in the model;
+ * only semantic lifecycle contradictions stay bounded by the applied
+ * inspect revision (the dense-prefix rule of §3.2.1).
+ */
+function railTimelineShapeValid(timeline) {
+  if (isRecord(timeline) !== true || Object.isFrozen(timeline) !== true) {
+    return false;
+  }
+  const own = Object.keys(timeline);
+  if (own.length !== RAIL_TIMELINE_KEYS.length) {
+    return false;
+  }
+  for (const key of RAIL_TIMELINE_KEYS) {
+    if (Object.hasOwn(timeline, key) !== true) {
+      return false;
+    }
+  }
+  if (isSafeId(timeline["runId"]) !== true) {
+    return false;
+  }
+  if (railNonNegativeSafeInteger(timeline["cursor"]) !== true) {
+    return false;
+  }
+  if (railNonNegativeSafeInteger(timeline["snapshotRevision"]) !== true) {
+    return false;
+  }
+  if (Array.isArray(timeline["events"]) !== true || Object.isFrozen(timeline["events"]) !== true) {
+    return false;
+  }
+  const nextAfter = timeline["nextAfter"];
+  if (nextAfter !== null && railPositiveSafeInteger(nextAfter) !== true) {
+    return false;
+  }
+  if (typeof timeline["stopped"] !== "boolean") {
+    return false;
+  }
+  if (timeline["error"] !== null && isRecord(timeline["error"]) !== true) {
+    return false;
+  }
+  if (timeline["stopped"] === true && timeline["error"] === null) {
+    return false;
+  }
+  if (timeline["stopped"] === false && timeline["error"] !== null) {
+    return false;
+  }
+  if (timeline["cursor"] > timeline["snapshotRevision"]) {
+    return false;
+  }
+  if (nextAfter === null) {
+    if (timeline["cursor"] !== timeline["snapshotRevision"]) {
+      return false;
+    }
+  } else if (timeline["cursor"] !== nextAfter || nextAfter > timeline["snapshotRevision"]) {
+    return false;
+  }
+  const events = timeline["events"];
+  if (events.length !== timeline["cursor"]) {
+    return false;
+  }
+  for (let index = 0; index < events.length; index += 1) {
+    const entry = events[index];
+    if (isRecord(entry) !== true) {
+      return false;
+    }
+    if (railRevisionOf(entry) !== index + 1) {
+      return false;
+    }
+    const refs = eventReferenceKeys(entry["kind"]);
+    if (refs === null) {
+      return false;
+    }
+    if (Object.hasOwn(entry, "kind") !== true || Object.hasOwn(entry, "revision") !== true) {
+      return false;
+    }
+    if (Object.keys(entry).length !== refs.length + 2) {
+      return false;
+    }
+    for (const ref of refs) {
+      if (Object.hasOwn(entry, ref) !== true) {
+        return false;
+      }
+    }
+    if (refs.includes("generation_index") && railStageIndexOf(entry, "generation_index") === null) {
+      return false;
+    }
+    if (refs.includes("iteration_index") && railStageIndexOf(entry, "iteration_index") === null) {
+      return false;
+    }
+    if (refs.includes("state_id") && railStateIdOf(entry) === null) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * The one identity derivation of the run rail: a single forward scan
  * over the dense journal prefix bound to the applied inspect revision
@@ -5524,41 +5655,33 @@ function railStateIdOf(entry) {
  * one fixed fallback string; contradictions inside the prefix fail the
  * derivation closed, contradictions after the applied inspect revision
  * are ignored entirely. Identity-relevant entry count is the only
- * magnitude the fallback label may carry.
+ * magnitude the fallback label may carry. Gate 1 is the one strict
+ * timeline-shape owner: foreign shapes, missing/extra keys, malformed
+ * entries and unknown kinds anywhere in the model fall back whole
+ * (the ignored-entry leniency of the first revision is gone).
  */
 export function deriveRunRailIdentity(timeline, inspectRevision) {
-  if (isTimelineState(timeline) !== true) {
+  if (railTimelineShapeValid(timeline) !== true) {
     return railFallbackResult(0);
   }
-  if (timeline.stopped === true || isRecord(timeline.error) === true) {
+  if (timeline["stopped"] !== false) {
     return railFallbackResult(0);
   }
   const inspect =
     typeof inspectRevision === "number" && Number.isSafeInteger(inspectRevision) && inspectRevision >= 1
       ? inspectRevision
       : null;
-  if (inspect === null) {
-    return railFallbackResult(0);
+  if (inspect === null || timeline["cursor"] < inspect) {
+    return railFallbackResult(timeline["cursor"] < inspect ? timeline["cursor"] : 0);
   }
-  const events = timeline.events;
-  let considered = 0;
-  let maxAppliedRevision = 0;
+  const events = timeline["events"];
+  const considered = inspect;
   let openGeneration = null;
   let openIteration = null;
   let currentState = null;
   let contradiction = false;
-  for (const entry of events) {
-    if (!isRecord(entry)) {
-      continue;
-    }
-    const revision = railRevisionOf(entry);
-    if (revision === null || revision > inspect) {
-      continue;
-    }
-    considered += 1;
-    if (revision > maxAppliedRevision) {
-      maxAppliedRevision = revision;
-    }
+  for (let index = 0; index < inspect; index += 1) {
+    const entry = events[index];
     if (contradiction) {
       continue;
     }
@@ -5609,9 +5732,6 @@ export function deriveRunRailIdentity(timeline, inspectRevision) {
       }
     }
   }
-  if (timeline.cursor < inspect || maxAppliedRevision < inspect) {
-    return railFallbackResult(considered);
-  }
   if (contradiction) {
     return railFallbackResult(considered);
   }
@@ -5634,6 +5754,26 @@ function railIdentityText(derivation) {
 
 const RAIL_CHIP_NONE = Object.freeze({ state: "none", projectApply: null });
 
+/** The exact parsed run-entry shape of the applied runs model
+ * (`parseRunsDocument`): the three own keys with the run id and the
+ * project id as safe ids and a typed `projectAvailable` boolean. An
+ * entry without its authoritative run id — or any foreign shape — is
+ * not an authoritative selected-run entry (§9.4 condition 1) and can
+ * never carry the capability claim on its project fields alone. */
+function railRunEntryValid(entry) {
+  if (isRecord(entry) !== true) {
+    return false;
+  }
+  const own = Object.keys(entry);
+  if (own.length !== 3) {
+    return false;
+  }
+  if (Object.hasOwn(entry, "runId") !== true || Object.hasOwn(entry, "projectId") !== true || Object.hasOwn(entry, "projectAvailable") !== true) {
+    return false;
+  }
+  return isSafeId(entry["runId"]) === true && isSafeId(entry["projectId"]) === true && typeof entry["projectAvailable"] === "boolean";
+}
+
 function railChipResult(available, projectApply) {
   return Object.freeze({ state: available ? "available" : "unavailable", projectApply });
 }
@@ -5644,15 +5784,19 @@ function railChipResult(available, projectApply) {
  * authoritative selected-run entry in the applied runs model, that
  * entry carrying `projectAvailable === true`, a matching discovery
  * project in the applied discovery model, and that project entry
- * declaring a typed `project_apply` boolean. Any failing condition
- * yields no claim at all: absence is never rendered as a false claim
- * and never as an absence text; `projectAvailable` is part of the
- * authority so a stale matching discovery entry can never resurrect a
- * claim for a run whose binding reports the project unavailable.
+ * declaring a typed `project_apply` boolean. Condition 1 is owned by
+ * the one strict run-entry shape above: the exact three-key parsed
+ * entry with a safe `runId` and a safe `projectId` — an entry missing
+ * its run id (or any foreign shape) is never authoritative even when
+ * its project fields alone would satisfy conditions 2-4. Any failing
+ * condition yields no claim at all: absence is never rendered as a
+ * false claim and never as an absence text; `projectAvailable` is part
+ * of the authority so a stale matching discovery entry can never
+ * resurrect a claim for a run whose binding reports the project
+ * unavailable.
  */
 export function deriveRunRailCapability(projectsModel, runEntry) {
-  const entry = isRecord(runEntry) ? runEntry : null;
-  if (entry === null || entry["projectAvailable"] !== true || !isSafeId(entry["projectId"])) {
+  if (railRunEntryValid(runEntry) !== true || runEntry["projectAvailable"] !== true) {
     return RAIL_CHIP_NONE;
   }
   if (
@@ -5672,7 +5816,7 @@ export function deriveRunRailCapability(projectsModel, runEntry) {
     ) {
       return RAIL_CHIP_NONE;
     }
-    if (project["id"] === entry["projectId"]) {
+    if (project["id"] === runEntry["projectId"]) {
       projectEntry = project;
     }
   }

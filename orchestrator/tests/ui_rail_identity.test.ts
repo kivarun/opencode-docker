@@ -507,5 +507,241 @@ describe("ui rail identity: the capability derivation (§9.4)", () => {
   });
 });
 
+/** A shallow copy of the applied 66-event oracle model for one shape
+ * mutation; the mutation runs before the freeze so the copy carries
+ * the tainted field and nothing else changes. */
+function timelineVariant(mutate: (copy: Record<string, unknown>) => void): UiTimelineState {
+  const timeline = oracleTimeline(66, null) as unknown as Record<string, unknown>;
+  const copy: Record<string, unknown> = { ...timeline };
+  mutate(copy);
+  return Object.freeze(copy) as unknown as UiTimelineState;
+}
+
+function timelineWithEvents(
+  mutateEvents: (events: Record<string, unknown>[]) => void,
+  mutate: (copy: Record<string, unknown>) => void = () => {},
+): UiTimelineState {
+  return timelineVariant((copy) => {
+    const events = [...(copy["events"] as Record<string, unknown>[])].map((entry) => ({ ...entry }));
+    mutateEvents(events);
+    copy["events"] = Object.freeze(events);
+    mutate(copy);
+  });
+}
+
+
+/** The exact event at an oracle index under noUncheckedIndexedAccess. */
+function eventAt(events: Record<string, unknown>[], index: number): Record<string, unknown> {
+  const entry = events[index];
+  if (entry === undefined) {
+    throw new Error(`missing oracle index ${index}`);
+  }
+  return entry;
+}
+
+describe("ui rail identity: the strict timeline shape gate (corrective)", () => {
+  const F0: UiRunRailDerivation = { kind: "fallback", label: "identity: from journal (0 events)", events: 0 };
+  const timeline = oracleTimeline(66, null);
+
+  function variant(mutate: (copy: Record<string, unknown>) => void): UiTimelineState {
+    const copy: Record<string, unknown> = { ...(timeline as unknown as Record<string, unknown>) };
+    mutate(copy);
+    return Object.freeze(copy) as unknown as UiTimelineState;
+  }
+
+  test("a missing and an extra top-level key fail the shape gate", () => {
+    const missing = variant((copy) => {
+      delete copy["snapshotRevision"];
+    });
+    expect(deriveRunRailIdentity(missing, 39)).toEqual(F0);
+    const extra = variant((copy) => {
+      copy["extra"] = 1;
+    });
+    expect(deriveRunRailIdentity(extra, 39)).toEqual(F0);
+  });
+
+  test("a stop/error field of the wrong type fails the shape gate", () => {
+    expect(deriveRunRailIdentity(variant((copy) => { copy["stopped"] = 1; }), 39)).toEqual(F0);
+    expect(deriveRunRailIdentity(variant((copy) => { copy["stopped"] = "true"; }), 39)).toEqual(F0);
+    expect(deriveRunRailIdentity(variant((copy) => { copy["error"] = "boom"; }), 39)).toEqual(F0);
+    expect(deriveRunRailIdentity(variant((copy) => { copy["error"] = 3; }), 39)).toEqual(F0);
+  });
+
+  test("the stopped/error coherence of the merge chain is enforced", () => {
+    expect(deriveRunRailIdentity(variant((copy) => { copy["error"] = { layer: "x", reason: "y" }; }), 39)).toEqual(F0);
+    // a well-formed stopped/error pair stays a HEALTH failure (gate 2),
+    // still the zero-event fallback
+    const stopped = variant((copy) => {
+      copy["stopped"] = true;
+      copy["error"] = { layer: "transport", reason: "network_error" };
+    });
+    expect(deriveRunRailIdentity(stopped, 39)).toEqual(F0);
+  });
+
+  test("an unfrozen model and an unfrozen events array fail the shape gate", () => {
+    const unfrozen = { ...(timeline as unknown as Record<string, unknown>) };
+    expect(deriveRunRailIdentity(unfrozen as unknown as UiTimelineState, 39)).toEqual(F0);
+    const frozenOuter = variant((copy) => {
+      copy["events"] = [...(copy["events"] as unknown[])];
+    });
+    expect(deriveRunRailIdentity(frozenOuter, 39)).toEqual(F0);
+  });
+
+  test("the cursor/snapshotRevision/nextAfter coherence is enforced", () => {
+    expect(deriveRunRailIdentity(variant((copy) => { copy["nextAfter"] = 40; }), 39)).toEqual(F0);
+    expect(deriveRunRailIdentity(variant((copy) => { copy["nextAfter"] = -1; }), 39)).toEqual(F0);
+    expect(deriveRunRailIdentity(variant((copy) => { copy["cursor"] = 67; }), 39)).toEqual(F0);
+    expect(deriveRunRailIdentity(variant((copy) => { copy["snapshotRevision"] = 65; }), 39)).toEqual(F0);
+  });
+
+  test("a non-record event anywhere in the loaded model fails the whole derivation", () => {
+    expect(
+      deriveRunRailIdentity(timelineWithEvents((events) => [...events, null as unknown as Record<string, unknown>], (copy) => {
+        copy["cursor"] = 67;
+        copy["snapshotRevision"] = 67;
+      }), 39),
+    ).toEqual(F0);
+    expect(
+      deriveRunRailIdentity(timelineWithEvents((events) => [...events, "not-an-event" as unknown as Record<string, unknown>], (copy) => {
+        copy["cursor"] = 67;
+        copy["snapshotRevision"] = 67;
+      }), 39),
+    ).toEqual(F0);
+  });
+
+  test("an invalid, duplicate and gapped revision fails the shape gate", () => {
+    // invalid revision text
+    expect(
+      deriveRunRailIdentity(
+        timelineWithEvents((events) => {
+          eventAt(events, 2)["revision"] = "three";
+        }),
+        39,
+      ),
+    ).toEqual(F0);
+    // duplicated revision position
+    expect(
+      deriveRunRailIdentity(
+        timelineWithEvents((events) => {
+          eventAt(events, 2)["revision"] = 1;
+        }),
+        39,
+      ),
+    ).toEqual(F0);
+    // gapped prefix: dropping an entry shifts every later revision off
+    // its dense position
+    expect(deriveRunRailIdentity(timelineWithEvents((events) => { events.splice(2, 1); }), 39)).toEqual(F0);
+    // an events array longer than the cursor
+    expect(
+      deriveRunRailIdentity(timelineWithEvents((events) => [...events], (copy) => { copy["cursor"] = 65; }), 39),
+    ).toEqual(F0);
+  });
+
+  test("an unknown kind fails the shape gate", () => {
+    expect(
+      deriveRunRailIdentity(
+        timelineWithEvents((events) => {
+          eventAt(events, 0)["kind"] = "not_a_kind";
+        }),
+        39,
+      ),
+    ).toEqual(F0);
+  });
+
+  test("a malformed identity reference and an extra event key fail the shape gate", () => {
+    // generation_index of the wrong type (a shape failure wherever it
+    // sits in the model, unlike the semantic lifecycle contradictions)
+    expect(
+      deriveRunRailIdentity(
+        timelineWithEvents((events) => {
+          eventAt(events, 11)["generation_index"] = "one";
+        }),
+        39,
+      ),
+    ).toEqual(F0);
+    // a missing identity reference
+    expect(
+      deriveRunRailIdentity(
+        timelineWithEvents((events) => {
+          delete eventAt(events, 11)["generation_index"];
+        }),
+        39,
+      ),
+    ).toEqual(F0);
+    // an extra reference key on an otherwise valid entry
+    expect(
+      deriveRunRailIdentity(
+        timelineWithEvents((events) => {
+          eventAt(events, 0)["extra_ref"] = 1;
+        }),
+        39,
+      ),
+    ).toEqual(F0);
+    // a malformed state reference of the start kind
+    expect(
+      deriveRunRailIdentity(
+        timelineWithEvents((events) => {
+          eventAt(events, 1)["state_id"] = "not a safe id";
+        }),
+        39,
+      ),
+    ).toEqual(F0);
+  });
+
+  test("the resolved triple is unreachable over every malformed vector", () => {
+    const vectors: UiTimelineState[] = [
+      variant((copy) => { delete copy["snapshotRevision"]; }),
+      variant((copy) => { copy["extra"] = 1; }),
+      variant((copy) => { copy["stopped"] = 1; }),
+      variant((copy) => { copy["error"] = "boom"; }),
+      timelineWithEvents((events) => { eventAt(events, 2)["revision"] = 1; }),
+      timelineWithEvents((events) => { eventAt(events, 0)["kind"] = "not_a_kind"; }),
+    ];
+    for (const vector of vectors) {
+      const derived = deriveRunRailIdentity(vector, 39);
+      if (derived.kind !== "fallback") {
+        throw new Error(`a malformed vector resolved: ${JSON.stringify(derived)}`);
+      }
+      if (derived.events !== 0) {
+        throw new Error(`a shape failure must fall back with the zero-event label: ${derived.events}`);
+      }
+      expect(derived.kind).toBe("fallback");
+    }
+  });
+});
+
+describe("ui rail capability: the authoritative run entry (corrective)", () => {
+  const projects = (projectApply: boolean) => ({
+    kind: "projects",
+    projects: [Object.freeze({ id: "project-a", inputRootIds: Object.freeze(["tasks"]), projectApply })],
+  });
+
+  test("an entry without its run id is never an authoritative selected-run entry", () => {
+    // the exact reported vector: project fields alone carry no claim
+    expect(deriveRunRailCapability(projects(true), { projectId: "project-a", projectAvailable: true }).state).toBe("none");
+    // and a run id present but unsafe is equally non-authoritative
+    expect(deriveRunRailCapability(projects(true), { runId: "", projectId: "project-a", projectAvailable: true }).state).toBe("none");
+    expect(deriveRunRailCapability(projects(true), { runId: "not a safe id", projectId: "project-a", projectAvailable: true }).state).toBe("none");
+    expect(deriveRunRailCapability(projects(true), { runId: 42, projectId: "project-a", projectAvailable: true }).state).toBe("none");
+  });
+
+  test("a foreign run-entry shape yields no claim", () => {
+    expect(
+      deriveRunRailCapability(projects(true), { runId: "run-a", projectId: "project-a", projectAvailable: true, extra: 1 }).state,
+    ).toBe("none");
+    expect(deriveRunRailCapability(projects(true), { runId: "run-a", projectId: 42, projectAvailable: true }).state).toBe("none");
+    expect(deriveRunRailCapability(projects(true), { runId: "run-a", projectId: "project-a", projectAvailable: "yes" }).state).toBe("none");
+    expect(deriveRunRailCapability(projects(true), { runId: "run-a", projectAvailable: true }).state).toBe("none");
+    expect(deriveRunRailCapability(projects(true), "run-a" as unknown).state).toBe("none");
+  });
+
+  test("the exact parsed three-key entry stays a claim (positive control)", () => {
+    expect(deriveRunRailCapability(projects(true), Object.freeze({ runId: "run-a", projectId: "project-a", projectAvailable: true }))).toEqual({
+      state: "available",
+      projectApply: true,
+    });
+  });
+});
+
 
 
