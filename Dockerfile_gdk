@@ -6,6 +6,12 @@ FROM registry.gitlab.com/gitlab-org/gitlab-development-kit/gitlab-gdk-in-a-box:l
 ARG DOCKER_HELPER_VERSION=2.3.1
 ARG DOCKER_HELPER_SHA256=78798f5b85e78b210fb4b2cb57b3f4f9c18a6e49f5f3c39670170f147bb191e1
 
+# Pinned GitLab CLI (glab) and GitLab Orbit CLI (musl static build).
+ARG GLAB_VERSION=1.131.0
+ARG GLAB_SHA256=580dbca43835b47267e512476a442f6b2e8785a82b26ccacee22bd7010662b2d
+ARG ORBIT_CLI_VERSION=1.4.0
+ARG ORBIT_CLI_SHA256=9f22c79693acb68b5a9a61397db1d0f390898f4274ad7bae297b61ebabdf79cc
+
 USER root
 
 RUN apt-get update \
@@ -71,7 +77,71 @@ RUN set -eux; \
     \
     rm -rf "${archive}" "/tmp/${bundle}"
 
+# Install the pinned glab and Orbit CLI binaries before the gdk user:
+# both are checksum-verified downloads, installed in a single layer so a
+# failed verify leaves no artifacts behind and no extra layers are added.
+# (a) glab goes to /usr/local/bin for every user;
+# (b) the musl-static orbit binary goes where glab's managed-binary
+#     feature looks by default (~/.config/glab-cli/bin/orbit inside the
+#     gdk home), pre-seeding that location so the runtime never needs the
+#     auto-download path; each directory level is created explicitly
+#     because `install -d` leaves intermediate components root-owned,
+#     which would make the gdk-side `glab config set` fail to write its
+#     atomically renamed config file.
+RUN set -eux; \
+    glab_archive="/tmp/glab.tar.gz"; \
+    orbit_archive="/tmp/orbit.tar.gz"; \
+    \
+    curl -fsSL --retry 3 \
+        "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.tar.gz" \
+        -o "${glab_archive}"; \
+    echo "${GLAB_SHA256}  ${glab_archive}" | sha256sum -c -; \
+    \
+    curl -fsSL --retry 3 \
+        "https://gitlab.com/api/v4/projects/77960826/packages/generic/orbit-cli/${ORBIT_CLI_VERSION}/orbit-cli-linux-musl-x86_64.tar.gz" \
+        -o "${orbit_archive}"; \
+    echo "${ORBIT_CLI_SHA256}  ${orbit_archive}" | sha256sum -c -; \
+    \
+    mkdir /tmp/glab-dist /tmp/orbit-dist; \
+    tar -xzf "${glab_archive}" -C /tmp/glab-dist; \
+    tar -xzf "${orbit_archive}" -C /tmp/orbit-dist; \
+    \
+    install -m 0755 \
+        /tmp/glab-dist/bin/glab \
+        /usr/local/bin/glab; \
+    \
+    install -d \
+        -m 0755 \
+        -o gdk \
+        -g gdk \
+        /home/gdk/.config; \
+    install -d \
+        -m 0700 \
+        -o gdk \
+        -g gdk \
+        /home/gdk/.config/glab-cli; \
+    install -d \
+        -m 0700 \
+        -o gdk \
+        -g gdk \
+        /home/gdk/.config/glab-cli/bin; \
+    install -m 0755 \
+        -o gdk \
+        -g gdk \
+        /tmp/orbit-dist/orbit \
+        /home/gdk/.config/glab-cli/bin/orbit; \
+    \
+    glab --version; \
+    /home/gdk/.config/glab-cli/bin/orbit --version; \
+    \
+    rm -rf "${glab_archive}" "${orbit_archive}" /tmp/glab-dist /tmp/orbit-dist
+
 ENV HOME=/home/gdk
+
+# Default GitLab host for the GDK workspace; the access token is injected
+# at runtime (never baked into the image).
+ENV GITLAB_HOST=gitlab-test.xbet.lan
+
 ENV PATH="/home/gdk/.local/share/mise/shims:/home/gdk/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV OPENCODE_CONFIG=/etc/opencode/opencode-gitlab.jsonc
 
@@ -80,5 +150,29 @@ WORKDIR /workspace
 USER gdk
 
 RUN /home/gdk/.local/bin/mise use --global ruby@3.3.11
+
+# Wire glab to the pre-seeded orbit binary at its default managed-binary
+# location: the managed-path and install-state keys are set explicitly so
+# `glab orbit` runs the pinned binary with no download or install prompt
+# (this feature gate stores its keys only in the global configuration,
+# hence --global). The config file itself is then pinned to 0600.
+RUN set -eux; \
+    glab config set --global orbit_cli_auto_run true; \
+    glab config set --global orbit_cli_auto_download true; \
+    glab config set --global orbit_cli_binary_path /home/gdk/.config/glab-cli/bin/orbit; \
+    glab config set --global orbit_cli_binary_version "${GLAB_VERSION}"; \
+    glab config set --global orbit_cli_binary_checksum "${ORBIT_CLI_SHA256}"; \
+    chmod 0600 /home/gdk/.config/glab-cli/config.yml; \
+    \
+    test "$(glab config get orbit_cli_binary_path)" = /home/gdk/.config/glab-cli/bin/orbit; \
+    \
+    glab orbit --help > /tmp/glab-orbit-help.txt 2>&1; \
+    ! grep -q "is not installed" /tmp/glab-orbit-help.txt; \
+    rm -f /tmp/glab-orbit-help.txt; \
+    \
+    glab --version; \
+    /home/gdk/.config/glab-cli/bin/orbit --version; \
+    test "$(glab --version | cut -d' ' -f2)" = "${GLAB_VERSION}"; \
+    test "$(/home/gdk/.config/glab-cli/bin/orbit --version | cut -d' ' -f2)" = "${ORBIT_CLI_VERSION}"
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
