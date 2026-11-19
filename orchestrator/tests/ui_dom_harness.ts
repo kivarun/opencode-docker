@@ -140,6 +140,9 @@ export interface UiHarness {
   liveStateLine(): string;
   detailRunId(): string;
   detailStatus(): string;
+  railIdentityText(): string;
+  railCapabilityText(): string;
+  railCapabilityRendered(): boolean;
   /** The `textContent` of every rendered run-controls child, joined by `|`. */
   controlsText(): string;
   /** The `Revision|Kind|References` triple of every rendered event row. */
@@ -214,6 +217,8 @@ const UI_ELEMENT_IDS = [
   "detail-status",
   "detail-revision",
   "detail-boundary",
+  "detail-identity",
+  "detail-apply-capability",
   "outputs-body",
   "outputs-table",
   "detail-run-id",
@@ -433,6 +438,9 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
     liveStateLine: () => harness.element("live-state").textContent,
     detailRunId: () => harness.element("detail-run-id").textContent,
     detailStatus: () => harness.element("detail-status").textContent,
+    railIdentityText: () => harness.element("detail-identity").textContent,
+    railCapabilityText: () => harness.element("detail-apply-capability").textContent,
+    railCapabilityRendered: () => !harness.element("detail-apply-capability").hidden,
     controlsText: () => harness.element("run-controls").children.map((node) => node.textContent).join("|"),
     eventsRows: () =>
       harness.element("events-body").children.map((row) => row.children.map((cell) => cell.textContent).join("|")),
@@ -530,19 +538,23 @@ export function runDocument(
   };
 }
 
-export function runsPageDocument(runIds: readonly string[]): Record<string, unknown> {
+export function runsPageDocument(
+  runIds: readonly string[],
+  projectId = "project-a",
+  projectAvailable = true,
+): Record<string, unknown> {
   return {
     schema_version: 1,
     kind: "runs",
-    runs: runIds.map((runId) => ({ run_id: runId, project_id: "project-a", project_available: true })),
+    runs: runIds.map((runId) => ({ run_id: runId, project_id: projectId, project_available: projectAvailable })),
     next_after: null,
   };
 }
 
-export function projectsDocument(): Record<string, unknown> {
+export function projectsDocument(projectApply = false): Record<string, unknown> {
   return {
     schema_version: 2,
     kind: "projects",
-    projects: [{ id: "project-a", input_roots: [{ id: "tasks" }], project_apply: false }],
+    projects: [{ id: "project-a", input_roots: [{ id: "tasks" }], project_apply: projectApply }],
   };
 }

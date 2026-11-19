@@ -33,6 +33,8 @@ interface PagePlan {
   readonly startRevision?: number;
   readonly hold?: boolean;
   readonly fail?: "network" | "invalid_cursor" | "not_found" | "contract";
+  /** Exact parsed entries; overrides the kinds builder. */
+  readonly entries?: Record<string, unknown>[];
 }
 
 function eventEntry(kind: string, revision: number): Record<string, unknown> {
@@ -150,7 +152,7 @@ function makeProbe(
           kind: "events",
           run_id: events[1],
           revision: plan.revision,
-          events: kinds.map((kind, index) => eventEntry(kind, start + index)),
+          events: plan.entries ?? kinds.map((kind, index) => eventEntry(kind, start + index)),
           next_after: plan.nextAfter === undefined ? null : plan.nextAfter,
         });
       } finally {
@@ -816,6 +818,172 @@ describe("ui events wiring: a manual Inspect never restarts the timeline", () =>
     ]);
     expect(harness.eventsRows().length).toBe(11);
     expect(harness.eventsMeta()).toBe("Detail revision: 11 · Events revision: 11 · Cursor: 11 · caught up");
+    harness.dispose();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* S1 run rail on the real module wiring (w2 timeline transitions and  */
+/* w4 zero-POST/no-extra-GET counters).                                */
+/* ------------------------------------------------------------------ */
+
+function railEventEntry(kind: string, revision: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const keys = eventReferenceKeys(kind);
+  if (keys === null) {
+    throw new Error(`unknown test kind ${kind}`);
+  }
+  const entry: Record<string, unknown> = { revision, kind };
+  for (const key of keys) {
+    entry[key] = key === "state_id" ? "dev_entry" : 1;
+  }
+  for (const key of Object.keys(overrides)) {
+    entry[key] = overrides[key];
+  }
+  return entry;
+}
+
+/** The exact 66-event oracle of the S1 preflight: the six identity-
+ * relevant kinds at their reported positions, everything else an
+ * identity-inert transition event. */
+function railOracle(): Record<string, unknown>[] {
+  const entries: Record<string, unknown>[] = [];
+  const filler = () => {
+    entries.push(railEventEntry("transition_committed", entries.length + 1));
+  };
+  const start = (stateId: string) => {
+    entries.push(railEventEntry("start_agent_execution", entries.length + 1, { execution_index: 1, state_id: stateId }));
+  };
+  entries.push(railEventEntry("create_run", 1));
+  start("architect");
+  for (let index = 0; index < 9; index += 1) filler();
+  entries.push(railEventEntry("stage_generation_opened", 12, { generation_index: 1 }));
+  entries.push(railEventEntry("stage_iteration_opened", 13, { generation_index: 1, iteration_index: 1 }));
+  filler();
+  start("dev_entry");
+  for (let index = 0; index < 6; index += 1) filler();
+  entries.push(railEventEntry("transition_committed", 22, { execution_index: 2, transition_index: 2 }));
+  entries.push(railEventEntry("run_waiting", 23, { wait_index: 1 }));
+  filler();
+  entries.push(railEventEntry("iteration_grant_recorded", 25, { grant_index: 1 }));
+  entries.push(railEventEntry("stage_iteration_closed", 26, { generation_index: 1, iteration_index: 1 }));
+  entries.push(railEventEntry("wait_response_recorded", 27, { wait_index: 1 }));
+  entries.push(railEventEntry("stage_iteration_opened", 28, { generation_index: 1, iteration_index: 2 }));
+  start("dev_entry");
+  for (let index = 0; index < 6; index += 1) filler();
+  entries.push(railEventEntry("transition_committed", 36, { execution_index: 3, transition_index: 3 }));
+  entries.push(railEventEntry("run_waiting", 37, { wait_index: 2 }));
+  filler();
+  filler();
+  entries.push(railEventEntry("stage_iteration_closed", 40, { generation_index: 1, iteration_index: 2 }));
+  entries.push(railEventEntry("wait_response_recorded", 41, { wait_index: 2 }));
+  start("architect");
+  for (let index = 0; index < 9; index += 1) filler();
+  entries.push(railEventEntry("stage_generation_closed", 52, { generation_index: 1 }));
+  entries.push(railEventEntry("stage_generation_opened", 53, { generation_index: 2 }));
+  entries.push(railEventEntry("stage_iteration_opened", 54, { generation_index: 2, iteration_index: 1 }));
+  entries.push(railEventEntry("transition_committed", 55, { execution_index: 4, transition_index: 4 }));
+  start("dev_entry");
+  for (let index = 0; index < 6; index += 1) filler();
+  entries.push(railEventEntry("transition_committed", 63, { execution_index: 5, transition_index: 5 }));
+  entries.push(railEventEntry("terminal_reached", 64));
+  filler();
+  entries.push(railEventEntry("run_succeeded", 66));
+  if (entries.length !== 66) {
+    throw new Error(`rail oracle drift: ${entries.length}`);
+  }
+  return entries;
+}
+
+const RESOLVED_TEXT_1_2 = "Generation 1 · Iteration 2 · State dev_entry";
+
+describe("ui events wiring: the S1 run rail on every timeline transition", () => {
+  test("w2. a fallback identity resolves when the events page lands after its anchoring inspect", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [
+        {
+          revision: 39,
+          boundary: { kind: "in_flight", executionIndex: 3, stateId: "dev_entry", executionRole: "stage", phase: "running" },
+        },
+      ],
+      [{ revision: 66, entries: railOracle(), nextAfter: null, hold: true }],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.click("refresh-projects");
+    await Bun.sleep(3);
+    harness.clickRunInspect(0);
+    probe.releaseInspects();
+    await Bun.sleep(5);
+    // the applied inspect bound the rail before any journal page arrived
+    expect(harness.railIdentityText()).toBe("identity: from journal (0 events)");
+    probe.releaseEvents();
+    await Bun.sleep(5);
+    expect(harness.railIdentityText()).toBe(RESOLVED_TEXT_1_2);
+    expect(harness.railCapabilityText()).toBe("Project apply: Unavailable in effective configuration");
+    expect(harness.railCapabilityRendered()).toBe(true);
+    // zero POST and exactly one events GET at each rail re-render site
+    expect(probe.posts).toEqual([]);
+    expect(harness.eventsMeta()).toBe("Detail revision: 39 · Events revision: 66 · Cursor: 66 · caught up");
+    harness.dispose();
+  });
+
+  test("w2. a timeline error falls back honestly and issues no further request", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [
+        {
+          revision: 39,
+          boundary: { kind: "in_flight", executionIndex: 3, stateId: "dev_entry", executionRole: "stage", phase: "running" },
+        },
+      ],
+      [{ revision: 4, fail: "network" }],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness.railIdentityText()).toBe("identity: from journal (0 events)");
+    expect(harness.eventsMeta()).toContain("stopped");
+    expect(probe.posts).toEqual([]);
+    expect(probe.eventsGets.length).toBe(1);
+    harness.dispose();
+  });
+
+  test("w2. the Reload timeline resets the rail to the zero-event fallback and re-resolves", async () => {
+    const probe = makeProbe(
+      ["run-a"],
+      [
+        {
+          revision: 39,
+          boundary: { kind: "in_flight", executionIndex: 3, stateId: "dev_entry", executionRole: "stage", phase: "running" },
+        },
+        { revision: 39, boundary: { kind: "in_flight" } },
+      ],
+      [
+        { revision: 66, entries: railOracle(), nextAfter: null },
+        { revision: 66, entries: railOracle(), nextAfter: null, hold: true },
+      ],
+    );
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness.railIdentityText()).toBe(RESOLVED_TEXT_1_2);
+    harness.click("events-reload");
+    await Bun.sleep(5);
+    // the reset path re-rendered the rail before the new page arrived
+    expect(harness.railIdentityText()).toBe("identity: from journal (0 events)");
+    probe.releaseEvents();
+    await Bun.sleep(5);
+    // the reloaded journal alone stays unbound (no inspect anchor after
+    // the reset); the next applied authoritative inspect re-resolves
+    expect(harness.railIdentityText()).toBe("identity: from journal (0 events)");
+    harness.click("inspect-selected");
+    await Bun.sleep(5);
+    expect(harness.railIdentityText()).toBe(RESOLVED_TEXT_1_2);
+    expect(probe.posts).toEqual([]);
+    expect(probe.eventsGets).toEqual([
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+      { path: "/v1/runs/run-a/events?after=0&limit=100", after: 0 },
+    ]);
     harness.dispose();
   });
 });

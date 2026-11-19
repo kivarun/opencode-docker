@@ -19,6 +19,7 @@ import {
   type UiHarness,
   type UiHarnessClock,
 } from "./ui_dom_harness.ts";
+import { eventReferenceKeys } from "../ui/app.js";
 
 interface WireEvent {
   readonly kind: "start" | "finish";
@@ -60,12 +61,20 @@ function makeWiringFetch(
     postResults?: Record<string, Record<string, unknown>>;
     postHold?: boolean;
     postFails?: boolean;
+    /** Exact runs documents served per `/v1/runs?` GET (cycled). */
+    runsPages?: Record<string, unknown>[];
+    /** The exact projects document served for `/v1/projects`. */
+    projectsDoc?: Record<string, unknown>;
+    /** Exact events documents served per events GET (cycled). */
+    eventsPages?: Record<string, unknown>[];
   } = {},
 ): WiringProbe {
   const events: WireEvent[] = [];
   const posts: string[] = [];
   let seq = 0;
   let inspectSeq = 0;
+  let runsPageSeq = 0;
+  let eventsPageSeq = 0;
   let active = 0;
   let maxActive = 0;
   const inspectGates: (() => void)[] = [];
@@ -115,10 +124,24 @@ function makeWiringFetch(
       return jsonResponse(result);
     }
     if (path === "/v1/projects") {
-      return jsonResponse(projectsDocument());
+      return jsonResponse(options.projectsDoc ?? projectsDocument());
+    }
+    const eventsGet = /^\/v1\/runs\/([^/]+)\/events\?after=(\d+)&limit=(\d+)$/.exec(path);
+    if (eventsGet !== null && options.eventsPages !== undefined) {
+      const page =
+        options.eventsPages[Math.min(eventsPageSeq, options.eventsPages.length - 1)] ?? null;
+      eventsPageSeq += 1;
+      if (page !== null) {
+        return jsonResponse(page);
+      }
     }
     if (path.startsWith("/v1/runs?")) {
-      return jsonResponse(runsPageDocument(runs));
+      const page =
+        options.runsPages === undefined
+          ? runsPageDocument(runs)
+          : (options.runsPages[Math.min(runsPageSeq, options.runsPages.length - 1)] ?? runsPageDocument(runs));
+      runsPageSeq += 1;
+      return jsonResponse(page);
     }
     throw new Error(`unexpected harness request ${method} ${path}`);
   };
@@ -545,5 +568,302 @@ describe("ui inspect wiring: the single-flight stress battery on the real module
       harness.dispose();
     }
     expect(maxActiveAcrossAll).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* S1 run rail on the real module wiring: the identity line across the */
+/* boundary families (w1), the capability chip authority matrix (w3),  */
+/* the zero-POST transport counters (w4) and the run-list shape (w5).  */
+/* ------------------------------------------------------------------ */
+
+function railEventEntry(kind: string, revision: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const keys = eventReferenceKeys(kind);
+  if (keys === null) {
+    throw new Error(`unknown test kind ${kind}`);
+  }
+  const entry: Record<string, unknown> = { revision, kind };
+  for (const key of keys) {
+    entry[key] = key === "state_id" ? "dev_entry" : 1;
+  }
+  for (const key of Object.keys(overrides)) {
+    entry[key] = overrides[key];
+  }
+  return entry;
+}
+
+/** The exact 66-event oracle of the S1 preflight (position-exact). */
+function railOracle(): Record<string, unknown>[] {
+  const entries: Record<string, unknown>[] = [];
+  const filler = () => {
+    entries.push(railEventEntry("transition_committed", entries.length + 1));
+  };
+  const start = (stateId: string) => {
+    entries.push(railEventEntry("start_agent_execution", entries.length + 1, { execution_index: 1, state_id: stateId }));
+  };
+  entries.push(railEventEntry("create_run", 1));
+  start("architect");
+  for (let index = 0; index < 9; index += 1) filler();
+  entries.push(railEventEntry("stage_generation_opened", 12, { generation_index: 1 }));
+  entries.push(railEventEntry("stage_iteration_opened", 13, { generation_index: 1, iteration_index: 1 }));
+  filler();
+  start("dev_entry");
+  for (let index = 0; index < 6; index += 1) filler();
+  entries.push(railEventEntry("transition_committed", 22, { execution_index: 2, transition_index: 2 }));
+  entries.push(railEventEntry("run_waiting", 23, { wait_index: 1 }));
+  filler();
+  entries.push(railEventEntry("iteration_grant_recorded", 25, { grant_index: 1 }));
+  entries.push(railEventEntry("stage_iteration_closed", 26, { generation_index: 1, iteration_index: 1 }));
+  entries.push(railEventEntry("wait_response_recorded", 27, { wait_index: 1 }));
+  entries.push(railEventEntry("stage_iteration_opened", 28, { generation_index: 1, iteration_index: 2 }));
+  start("dev_entry");
+  for (let index = 0; index < 6; index += 1) filler();
+  entries.push(railEventEntry("transition_committed", 36, { execution_index: 3, transition_index: 3 }));
+  entries.push(railEventEntry("run_waiting", 37, { wait_index: 2 }));
+  filler();
+  filler();
+  entries.push(railEventEntry("stage_iteration_closed", 40, { generation_index: 1, iteration_index: 2 }));
+  entries.push(railEventEntry("wait_response_recorded", 41, { wait_index: 2 }));
+  start("architect");
+  for (let index = 0; index < 9; index += 1) filler();
+  entries.push(railEventEntry("stage_generation_closed", 52, { generation_index: 1 }));
+  entries.push(railEventEntry("stage_generation_opened", 53, { generation_index: 2 }));
+  entries.push(railEventEntry("stage_iteration_opened", 54, { generation_index: 2, iteration_index: 1 }));
+  entries.push(railEventEntry("transition_committed", 55, { execution_index: 4, transition_index: 4 }));
+  start("dev_entry");
+  for (let index = 0; index < 6; index += 1) filler();
+  entries.push(railEventEntry("transition_committed", 63, { execution_index: 5, transition_index: 5 }));
+  entries.push(railEventEntry("terminal_reached", 64));
+  filler();
+  entries.push(railEventEntry("run_succeeded", 66));
+  if (entries.length !== 66) {
+    throw new Error(`rail oracle drift: ${entries.length}`);
+  }
+  return entries;
+}
+
+const ORACLE_EVENTS_PAGE = (): Record<string, unknown> => ({
+  schema_version: 1,
+  kind: "events",
+  run_id: "run-a",
+  revision: 66,
+  events: railOracle(),
+  next_after: null,
+});
+
+async function railBoot(
+  probe: WiringProbe,
+  clock: UiHarnessClock | null,
+  runs: readonly string[],
+  loadProjects: boolean,
+): Promise<UiHarness> {
+  const harness = await createUiHarness(
+    clock === null ? { fetchImpl: probe.fetchImpl } : { fetchImpl: probe.fetchImpl, clock },
+  );
+  harness.click("refresh-runs");
+  await Bun.sleep(2);
+  expect(harness.runRows()).toEqual([...runs]);
+  if (loadProjects) {
+    harness.click("refresh-projects");
+    await Bun.sleep(2);
+  }
+  return harness;
+}
+
+describe("ui inspect wiring: the S1 run rail", () => {
+  test("w1. the rail renders family by family (in-flight, waiting, terminal success, terminal failure)", async () => {
+    const fixtures: {
+      name: string;
+      status: string;
+      boundary: Record<string, unknown>;
+      revision: number;
+      identity: string;
+    }[] = [
+      {
+        name: "in_flight",
+        status: "running",
+        boundary: { kind: "in_flight", executionIndex: 3, stateId: "dev_entry", executionRole: "stage", phase: "running" },
+        revision: 39,
+        identity: "Generation 1 · Iteration 2 · State dev_entry",
+      },
+      {
+        name: "waiting",
+        status: "waiting",
+        boundary: {
+          kind: "waiting",
+          waitIndex: 2,
+          reason: "stage_iteration_limit_exhausted",
+          actions: [
+            { id: "continue_stage", to: "dev_entry" },
+            { id: "revise_task", to: "architect" },
+          ],
+        },
+        revision: 37,
+        identity: "Generation 1 · Iteration 2 · State dev_entry",
+      },
+      {
+        name: "terminal success",
+        status: "succeeded",
+        boundary: { kind: "succeeded", terminalStateId: "success" },
+        revision: 66,
+        identity: "Generation 2 · Iteration 1 · State dev_entry",
+      },
+      {
+        name: "terminal failure",
+        status: "failed",
+        boundary: { kind: "failed", reason: "worker_failed" },
+        revision: 66,
+        identity: "Generation 2 · Iteration 1 · State dev_entry",
+      },
+    ];
+    for (const fixture of fixtures) {
+      const probe = makeWiringFetch(
+        ["run-a"],
+        [{ revision: fixture.revision, status: fixture.status, boundary: fixture.boundary }],
+        { eventsPages: [ORACLE_EVENTS_PAGE()] },
+      );
+      const harness = await railBoot(probe, null, ["run-a"], false);
+      harness.clickRunInspect(0);
+      await Bun.sleep(5);
+      expect(harness.detailStatus(), fixture.name).toBe(fixture.status);
+      expect(harness.railIdentityText(), fixture.name).toBe(fixture.identity);
+      expect(probe.posts, fixture.name).toEqual([]);
+      expect(harness.eventsRows().length, fixture.name).toBe(66);
+      harness.dispose();
+    }
+  });
+
+  test("w3. the chip follows the four-condition authority matrix", async () => {
+    const fullOptions = (apply: boolean) => ({
+      runsPages: [runsPageDocument(["run-a"], "project-a", true)],
+      projectsDoc: projectsDocument(apply),
+      eventsPages: [ORACLE_EVENTS_PAGE()],
+    });
+    // all four authority conditions hold with project_apply true
+    const available = makeWiringFetch(["run-a"], [{ revision: 39 }], fullOptions(true));
+    const harnessA = await railBoot(available, null, ["run-a"], true);
+    harnessA.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harnessA.railCapabilityText()).toBe("Project apply: available");
+    expect(harnessA.railCapabilityRendered()).toBe(true);
+    expect(available.posts).toEqual([]);
+    harnessA.dispose();
+    // all four authority conditions hold with project_apply false
+    const unavailable = makeWiringFetch(["run-a"], [{ revision: 39 }], fullOptions(false));
+    const harnessB = await railBoot(unavailable, null, ["run-a"], true);
+    harnessB.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harnessB.railCapabilityText()).toBe("Project apply: Unavailable in effective configuration");
+    expect(harnessB.railCapabilityRendered()).toBe(true);
+    expect(unavailable.posts).toEqual([]);
+    harnessB.dispose();
+    // the discovery model never arrived: no claim at all
+    const undiscovered = makeWiringFetch(["run-a"], [{ revision: 39 }], { eventsPages: [ORACLE_EVENTS_PAGE()] });
+    const harnessC = await railBoot(undiscovered, null, ["run-a"], false);
+    harnessC.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harnessC.railCapabilityText()).toBe("");
+    expect(harnessC.railCapabilityRendered()).toBe(false);
+    harnessC.dispose();
+  });
+
+  test("w3. an authority loss removes the claim and never touches the identity line", async () => {
+    // the project_available flip on the selected run's binding
+    const probe = makeWiringFetch(["run-a"], [{ revision: 39 }], {
+      runsPages: [runsPageDocument(["run-a"], "project-a", true), runsPageDocument(["run-a"], "project-a", false)],
+      projectsDoc: projectsDocument(true),
+      eventsPages: [ORACLE_EVENTS_PAGE()],
+    });
+    const harness = await railBoot(probe, null, ["run-a"], true);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness.railCapabilityText()).toBe("Project apply: available");
+    expect(harness.railCapabilityRendered()).toBe(true);
+    const identityBefore = harness.railIdentityText();
+    harness.click("refresh-runs");
+    await Bun.sleep(5);
+    // the claim is removed with zero residual text while the identity
+    // line stays byte-identical across the same transition
+    expect(harness.railCapabilityText()).toBe("");
+    expect(harness.railCapabilityRendered()).toBe(false);
+    expect(harness.railIdentityText()).toBe(identityBefore);
+    // a fresh discovery application (the stale matching entry) never
+    // resurrects the claim against the unavailable binding
+    harness.click("refresh-projects");
+    await Bun.sleep(5);
+    expect(harness.railCapabilityText()).toBe("");
+    expect(harness.railCapabilityRendered()).toBe(false);
+    expect(harness.railIdentityText()).toBe(identityBefore);
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+    // the same authority loss through the discovery side (the project
+    // id disappears from the applied discovery model)
+    const options2: Parameters<typeof makeWiringFetch>[2] = {
+      runsPages: [runsPageDocument(["run-a"], "project-a", true)],
+      projectsDoc: projectsDocument(true),
+      eventsPages: [ORACLE_EVENTS_PAGE()],
+    };
+    const probe2 = makeWiringFetch(["run-a"], [{ revision: 39 }], options2);
+    const harness2 = await railBoot(probe2, null, ["run-a"], true);
+    harness2.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness2.railCapabilityText()).toBe("Project apply: available");
+    options2.projectsDoc = {
+      schema_version: 2,
+      kind: "projects",
+      projects: [{ id: "project-b", input_roots: [{ id: "tasks" }], project_apply: true }],
+    };
+    harness2.click("refresh-projects");
+    await Bun.sleep(5);
+    expect(harness2.railCapabilityText()).toBe("");
+    expect(harness2.railCapabilityRendered()).toBe(false);
+    expect(harness2.railIdentityText()).toBe(identityBefore);
+    harness2.dispose();
+  });
+
+  test("w3. the chip refreshes after renderProjects from the absent to the available claim", async () => {
+    const options: Parameters<typeof makeWiringFetch>[2] = {
+      runsPages: [runsPageDocument(["run-a"], "project-a", true)],
+      projectsDoc: projectsDocument(false),
+      eventsPages: [ORACLE_EVENTS_PAGE()],
+    };
+    const probe = makeWiringFetch(["run-a"], [{ revision: 39 }], options);
+    const harness = await railBoot(probe, null, ["run-a"], true);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness.railCapabilityText()).toBe("Project apply: Unavailable in effective configuration");
+    options.projectsDoc = projectsDocument(true);
+    harness.click("refresh-projects");
+    await Bun.sleep(5);
+    expect(harness.railCapabilityText()).toBe("Project apply: available");
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+  });
+
+  test("w4+w5. zero POST on every rail site and the run list keeps its exact shape", async () => {
+    const probe = makeWiringFetch(["run-a", "run-b"], [{ revision: 39 }], {
+      runsPages: [runsPageDocument(["run-a", "run-b"], "project-a", true)],
+      projectsDoc: projectsDocument(true),
+      eventsPages: [ORACLE_EVENTS_PAGE()],
+    });
+    const harness = await railBoot(probe, null, ["run-a", "run-b"], true);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    expect(harness.railIdentityText()).toBe("Generation 1 · Iteration 2 · State dev_entry");
+    harness.click("refresh-runs");
+    await Bun.sleep(5);
+    expect(harness.railIdentityText()).toBe("Generation 1 · Iteration 2 · State dev_entry");
+    harness.click("refresh-projects");
+    await Bun.sleep(5);
+    expect(harness.railIdentityText()).toBe("Generation 1 · Iteration 2 · State dev_entry");
+    // no mutating request ever left the wire for the rail
+    expect(probe.posts).toEqual([]);
+    // the run list keeps its exact current shape: four cells
+    // (Run / Project / Project available / actions) and no status column
+    for (const row of harness.element("runs-body").children) {
+      expect(row.children.length).toBe(4);
+    }
+    expect(harness.element("runs-body").children[1]?.children[2]?.textContent).toBe("yes");
+    harness.dispose();
   });
 });

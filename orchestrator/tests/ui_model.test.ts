@@ -560,6 +560,8 @@ describe("ui model: export surface and source restrictions", () => {
         "CONTENT_HEX_DISPLAY_BYTES",
         "DIFF_MAX_LINES_PER_SIDE",
         "DIFF_MAX_WORK_CELLS",
+        "deriveRunRailIdentity",
+        "deriveRunRailCapability",
         "parseProjectChangeContentDocument",
         "requestProjectChangeContentJson",
         "projectChangeContentRequestPath",

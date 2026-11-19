@@ -249,3 +249,7 @@ button:disabled {
   border-radius: 4px;
   padding: 0.5rem;
 }
+
+.rail-line {
+  font-size: 0.85rem;
+}

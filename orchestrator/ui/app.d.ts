@@ -387,6 +387,18 @@ export declare function timelineSummary(state: UiTimelineState, inspectRevision:
 
 export declare function timelineAnnouncement(previous: UiTimelineState, next: UiTimelineState): string | null;
 
+export type UiRunRailDerivation =
+  | { readonly kind: "resolved"; readonly generation: number; readonly iteration: number; readonly state: string }
+  | { readonly kind: "fallback"; readonly label: string; readonly events: number };
+
+export type UiRunRailCapability =
+  | { readonly state: "none"; readonly projectApply: null }
+  | { readonly state: "available" | "unavailable"; readonly projectApply: boolean };
+
+export declare function deriveRunRailIdentity(timeline: unknown, inspectRevision: unknown): UiRunRailDerivation;
+
+export declare function deriveRunRailCapability(projectsModel: unknown, runEntry: unknown): UiRunRailCapability;
+
 export interface UiEventsTransportIo {
   /** The only events GET site; receives the request's abort signal. */
   readonly fetchEvents: (runId: string, after: number, signal: AbortSignal) => Promise<UiEventsResult | undefined>;

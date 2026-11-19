@@ -5435,6 +5435,7 @@ function renderProjects(model) {
   if (previous !== "" && model.projects.some((project) => project.id === previous)) {
     select.value = previous;
   }
+  renderRunRail();
 }
 
 function renderRuns(state) {
@@ -5478,6 +5479,260 @@ function renderRunDetail(model) {
   document.getElementById("outputs-table").hidden = false;
 }
 
+/* S1 REGION START -------------------------------------------------- */
+/* Run rail (S1): one derived identity line and one capability chip,   */
+/* both pure presentations over the already-applied models.            */
+/* ------------------------------------------------------------------ */
+
+/** The last applied authoritative inspect model the rail was rendered
+ * with; the non-inspect rail call sites re-render from this snapshot. */
+let lastRailInspectModel = null;
+
+function railFallbackResult(events) {
+  return Object.freeze({ kind: "fallback", label: `identity: from journal (${events} events)`, events });
+}
+
+function railResolvedResult(generation, iteration, state) {
+  return Object.freeze({ kind: "resolved", generation, iteration, state });
+}
+
+function railRevisionOf(entry) {
+  const revision = entry["revision"];
+  return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 1 ? revision : null;
+}
+
+function railStageIndexOf(entry, key) {
+  const value = entry[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : null;
+}
+
+function railStateIdOf(entry) {
+  const value = entry["state_id"];
+  return typeof value === "string" && isSafeId(value) ? value : null;
+}
+
+/**
+ * The one identity derivation of the run rail: a single forward scan
+ * over the dense journal prefix bound to the applied inspect revision
+ * (`events[revision] <= inspectRevision`), tracking the open stage
+ * generation, its open iteration and the state id of the execution
+ * started inside that iteration. The state is owned by the currently
+ * open iteration and is never carried across iterations or
+ * generations; execution starts outside an open iteration (planning,
+ * control, pre-generation) are observed and ignored for identity. All
+ * eligibility gate failures and journal contradictions render as the
+ * one fixed fallback string; contradictions inside the prefix fail the
+ * derivation closed, contradictions after the applied inspect revision
+ * are ignored entirely. Identity-relevant entry count is the only
+ * magnitude the fallback label may carry.
+ */
+export function deriveRunRailIdentity(timeline, inspectRevision) {
+  if (isTimelineState(timeline) !== true) {
+    return railFallbackResult(0);
+  }
+  if (timeline.stopped === true || isRecord(timeline.error) === true) {
+    return railFallbackResult(0);
+  }
+  const inspect =
+    typeof inspectRevision === "number" && Number.isSafeInteger(inspectRevision) && inspectRevision >= 1
+      ? inspectRevision
+      : null;
+  if (inspect === null) {
+    return railFallbackResult(0);
+  }
+  const events = timeline.events;
+  let considered = 0;
+  let maxAppliedRevision = 0;
+  let openGeneration = null;
+  let openIteration = null;
+  let currentState = null;
+  let contradiction = false;
+  for (const entry of events) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const revision = railRevisionOf(entry);
+    if (revision === null || revision > inspect) {
+      continue;
+    }
+    considered += 1;
+    if (revision > maxAppliedRevision) {
+      maxAppliedRevision = revision;
+    }
+    if (contradiction) {
+      continue;
+    }
+    if (entry.kind === "stage_generation_opened") {
+      const generation = railStageIndexOf(entry, "generation_index");
+      if (openGeneration !== null || generation === null) {
+        contradiction = true;
+      } else {
+        openGeneration = generation;
+        openIteration = null;
+        currentState = null;
+      }
+    } else if (entry.kind === "stage_iteration_opened") {
+      const generation = railStageIndexOf(entry, "generation_index");
+      const iteration = railStageIndexOf(entry, "iteration_index");
+      if (openGeneration === null || generation !== openGeneration || openIteration !== null || iteration === null) {
+        contradiction = true;
+      } else {
+        openIteration = iteration;
+        currentState = null;
+      }
+    } else if (entry.kind === "stage_iteration_closed") {
+      const generation = railStageIndexOf(entry, "generation_index");
+      const iteration = railStageIndexOf(entry, "iteration_index");
+      if (openGeneration === null || openIteration === null || generation !== openGeneration || iteration !== openIteration) {
+        contradiction = true;
+      } else {
+        openIteration = null;
+        currentState = null;
+      }
+    } else if (entry.kind === "stage_generation_closed") {
+      const generation = railStageIndexOf(entry, "generation_index");
+      if (openGeneration === null || generation !== openGeneration) {
+        contradiction = true;
+      } else {
+        openGeneration = null;
+        openIteration = null;
+        currentState = null;
+      }
+    } else if (entry.kind === "start_agent_execution" || entry.kind === "start_decision_execution") {
+      if (openGeneration !== null && openIteration !== null) {
+        const stateId = railStateIdOf(entry);
+        if (stateId === null) {
+          contradiction = true;
+        } else {
+          currentState = stateId;
+        }
+      }
+    }
+  }
+  if (timeline.cursor < inspect || maxAppliedRevision < inspect) {
+    return railFallbackResult(considered);
+  }
+  if (contradiction) {
+    return railFallbackResult(considered);
+  }
+  if (openGeneration === null || openIteration === null || currentState === null) {
+    return railFallbackResult(considered);
+  }
+  return railResolvedResult(openGeneration, openIteration, currentState);
+}
+
+/** The stopped/errored timeline and the unbound derivation are
+ * handled inside the derivation itself (§3.2.3 gates 1-3); the
+ * renderer only guards the model-timeline binding below.
+ */
+function railIdentityText(derivation) {
+  if (derivation.kind === "resolved") {
+    return `Generation ${derivation.generation} · Iteration ${derivation.iteration} · State ${derivation.state}`;
+  }
+  return derivation.label;
+}
+
+const RAIL_CHIP_NONE = Object.freeze({ state: "none", projectApply: null });
+
+function railChipResult(available, projectApply) {
+  return Object.freeze({ state: available ? "available" : "unavailable", projectApply });
+}
+
+/**
+ * The one capability derivation of the run rail chip: a claim exists
+ * only when ALL FOUR authority conditions hold simultaneously — an
+ * authoritative selected-run entry in the applied runs model, that
+ * entry carrying `projectAvailable === true`, a matching discovery
+ * project in the applied discovery model, and that project entry
+ * declaring a typed `project_apply` boolean. Any failing condition
+ * yields no claim at all: absence is never rendered as a false claim
+ * and never as an absence text; `projectAvailable` is part of the
+ * authority so a stale matching discovery entry can never resurrect a
+ * claim for a run whose binding reports the project unavailable.
+ */
+export function deriveRunRailCapability(projectsModel, runEntry) {
+  const entry = isRecord(runEntry) ? runEntry : null;
+  if (entry === null || entry["projectAvailable"] !== true || !isSafeId(entry["projectId"])) {
+    return RAIL_CHIP_NONE;
+  }
+  if (
+    projectsModel === null ||
+    isRecord(projectsModel) !== true ||
+    projectsModel["kind"] !== "projects" ||
+    Array.isArray(projectsModel["projects"]) !== true
+  ) {
+    return RAIL_CHIP_NONE;
+  }
+  let projectEntry = null;
+  for (const project of projectsModel["projects"]) {
+    if (
+      isRecord(project) !== true ||
+      isSafeId(project["id"]) !== true ||
+      typeof project["projectApply"] !== "boolean"
+    ) {
+      return RAIL_CHIP_NONE;
+    }
+    if (project["id"] === entry["projectId"]) {
+      projectEntry = project;
+    }
+  }
+  if (projectEntry === null) {
+    return RAIL_CHIP_NONE;
+  }
+  return railChipResult(projectEntry["projectApply"], projectEntry["projectApply"]);
+}
+
+const RAIL_CHIP_AVAILABLE_TEXT = "Project apply: available";
+const RAIL_CHIP_UNAVAILABLE_TEXT = "Project apply: Unavailable in effective configuration";
+
+/**
+ * The dedicated rail renderer: the derived identity line and the
+ * capability chip. Not owned by renderRunDetail; invoked at every
+ * already-applied-model site (the applied inspect, every timeline
+ * transition, the run selection change and the discovery/runs refresh
+ * sites). Pure DOM presentation — no fetch, no timer, no mutation.
+ */
+function renderRunRail(inspectModel) {
+  const givenModel = inspectModel === undefined;
+  const model = givenModel ? lastRailInspectModel : inspectModel;
+  if (givenModel !== true) {
+    lastRailInspectModel = inspectModel;
+  }
+  const identity = document.getElementById("detail-identity");
+  const chip = document.getElementById("detail-apply-capability");
+  if (identity === null || chip === null) {
+    return;
+  }
+  // The rail renders only for the timeline of the still-selected run;
+  // a model of another run (or no applied inspect at all) zeros the
+  // rail instead of presenting a stale derivation. The inspect anchor
+  // itself stays owned by the application sites: after a timeline
+  // reset (`lastInspectRevision === null`) the derivation reports the
+  // honest zero-event fallback.
+  const bound = model !== null && timeline !== null && timeline.runId === model.runId ? model : null;
+  if (bound === null) {
+    identity.textContent = "";
+    chip.textContent = "";
+    chip.hidden = true;
+    return;
+  }
+  identity.textContent = railIdentityText(deriveRunRailIdentity(timeline, lastInspectRevision));
+  const authority = authorityFor(model.runId);
+  const capability = deriveRunRailCapability(authority.projectsModel, authority.runEntry);
+  // no claim at all: the chip is hidden and cleared, never rendered as
+  // a false or absence text
+  if (capability.state === "none") {
+    chip.textContent = "";
+    chip.hidden = true;
+    return;
+  }
+  chip.hidden = false;
+  chip.textContent =
+    capability.state === "available" ? RAIL_CHIP_AVAILABLE_TEXT : RAIL_CHIP_UNAVAILABLE_TEXT;
+}
+
+/* S1 REGION END ----------------------------------------------------- */
+
 /* ------------------------------------------------------------------ */
 /* Lifecycle timeline (v4): the thin DOM adapter of the events feed.   */
 /* ------------------------------------------------------------------ */
@@ -5518,6 +5773,7 @@ function ensureTimelineFor(runId) {
   document.getElementById("events-section").hidden = false;
   resetTimelineDom();
   renderTimelineMeta();
+  renderRunRail();
   return true;
 }
 
@@ -5620,6 +5876,7 @@ function applyEventsOutcome(runId, after, result) {
 function finishTimelineUpdate(previous) {
   announceTimeline(previous, timeline);
   renderTimelineMeta();
+  renderRunRail();
 }
 
 function requestTimelinePage(runId, after) {
@@ -5678,6 +5935,7 @@ async function reloadTimeline() {
   lastInspectRevision = null;
   resetTimelineDom();
   renderTimelineMeta();
+  renderRunRail();
   if (pending !== null) {
     await pending;
   }
@@ -5711,6 +5969,7 @@ function showRunModel(model, options = {}) {
   ensureTimelineFor(model.runId);
   ensureWorkerLogsFor(model.runId);
   lastInspectRevision = model.revision;
+  renderRunRail(model);
   renderTimelineMeta();
   maybeTailEvents(model);
   // the applied authoritative inspect drives the automatic metadata
@@ -5872,6 +6131,7 @@ async function refreshRuns(announce) {
   if (result.ok && result.model.kind === "runs") {
     runsState = applyRunsPage(createRunsState(), result.model);
     renderRuns(runsState);
+    renderRunRail();
     if (announce) {
       setStatus("Runs refreshed.");
     }
@@ -5893,6 +6153,7 @@ async function loadMoreRuns() {
   if (result.ok && result.model.kind === "runs") {
     runsState = applyRunsPage(runsState, result.model);
     renderRuns(runsState);
+    renderRunRail();
     setStatus("More runs loaded.");
     return;
   }

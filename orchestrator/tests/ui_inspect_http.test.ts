@@ -389,6 +389,13 @@ describe("ui inspect http: the real control-plane service", () => {
     expect(startCount() - startsBefore).toBe(2);
     expect(harness.element("detail-revision").textContent !== "").toBe(true);
     expect(harness.detailStatus()).toBe("running");
+    // S1 rail over the real service: the plan-ready planning ladder of
+    // the frozen run carries no open stage iteration, so the identity
+    // line renders the single fixed journal-derived fallback and the
+    // chip claim follows the applied discovery (not loaded here)
+    expect(harness.railIdentityText()).toMatch(/^identity: from journal \(\d+ events\)$/);
+    expect(harness.railCapabilityText()).toBe("");
+    expect(harness.railCapabilityRendered()).toBe(false);
     expect(fingerprintTree(runTree)).toBe(before);
     harness.dispose();
   }, 60000);
