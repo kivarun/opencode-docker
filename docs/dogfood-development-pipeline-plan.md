@@ -2,7 +2,7 @@
 
 Status: **planned**
 
-Last updated: 2026-11-13
+Last updated: 2026-11-20
 
 Evidence baseline: `6b2ed6263efc8ec990dd6218c02b1434e702bf91`
 
@@ -529,11 +529,11 @@ Contract essentials:
   Host/Origin authority `127.0.0.1:<port>`, foreign Host/Origin failing
   closed before route parsing.
 
-Implementation has not started (no UI slice S1–S8 has been built). The
-bounded prerequisites **P-3 (durable-identity projection)**, **P-1
-(task/plan revision artifact content)** and **P-2 (accepted reviewer-output
-content)** are landed and **Complete** (see below); the UI implementation
-remains not started.
+Only the first UI slice S1 has been built and is **Complete** (see the S1
+record below). The bounded prerequisites **P-3 (durable-identity
+projection)**, **P-1 (task/plan revision artifact content)** and **P-2
+(accepted reviewer-output content)** are landed and **Complete** (see
+below); the remaining UI implementation (S2–S8) remains not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
 
@@ -680,6 +680,57 @@ including §4b recording the corrective).
 - Not started (unchanged scope): every UI slice S1–S8, live Browser UAT,
   and Finding A. The accepted P-2 contract (preflight r4 plus the
   operator corrective) is not reopened by this record.
+
+### S1 Complete: run rail identity line + capability chip (2026-11-20)
+
+S1 (the run-rail identity line plus the Project Apply capability chip in
+the Browser UI runs list) is delivered over the shipped read-only surfaces
+(`GET /v1/runs`, `GET /v1/runs/:runId`, `GET /v1/projects`) and is marked
+**Complete** after the accepted implementation review plus the operator
+corrective demanding a strict timeline-shape gate and an authoritative
+run-entry source for the chip.
+
+- Implementation `95de891fde12331a94e8730131eb6dec67d2549f` — CI run
+  `44531848737` — success on the exact SHA;
+- corrective `29b548ce39462c02d9e763c27c1c10ac45538e7b` ("ui: enforce the
+  corrective S1 shape gates (timeline shape owner + authoritative run
+  entry)") — CI run `44548172198` — success on the exact SHA. Both commits
+  touch UI files and their suites only, leave this plan untouched, and are
+  clean-tree commits with `git diff --check` clean and a byte-identical
+  `bun.lock`.
+- Evidence: implementation report
+  `/exchange/outbox/increment-6-s1-implementation-report.md`
+  (SHA-256 `0596a59597a1de3be6ee4e8699ff603fe6104003a9ad91734434e5579c991b3e`);
+  smoke-failure diagnosis
+  `/exchange/outbox/increment-6-s1-smoke-failure-diagnosis.md`
+  (SHA-256 `fe98a6988ed40b08c4e9f37a93686d15d6927493538fe247b127b1d989654dcd`).
+- Verification truth (recorded honestly, full-run equality is
+  deliberately NOT claimed): targeted S1 suites green (35-test
+  `ui_rail_identity` suite incl. the 13 corrective shape/authority pins;
+  touched `ui_model`/`ui_events_wiring`/`ui_inspect_wiring`/
+  `ui_inspect_http` green); focused A/B 528 pass / 9 fail with the
+  failure-name set equal to the baseline set; full run 4514 tests,
+  4383 pass, 131 failures; `tsc --noEmit` and `git diff --check` clean;
+  `bun.lock` unchanged. The run contains **one new failure beyond the
+  established environmental families**, in the pre-existing
+  `orchestrator/tests/smoke.test.ts` signal battery (test 7, exact vector
+  `b2: expected "session_created", received "worker_running"`). Controlled
+  A/B (60 full-file runs per side over `1727a69` vs `29b548c` worktrees)
+  plus a timed diagnostic trace proved the whole smoke/lifecycle/state
+  chain byte-identical between the two commits: the identical test-name
+  family reproduces on the clean base (9 failing runs / 60, incl. the
+  exact `b2 → worker_running` vector in base runs i17 and i59), so the
+  failure is **pre-existing, not S1-caused**. Traces prove two mechanisms
+  (signal recorded before the lifecycle checkpoint skipping the
+  `worker_running` write; a FIFO `open(R)` hang after a writer that
+  finished before the reader opened); the exact 691-vector mechanism
+  remains unresolved while its base reproduction excludes S1 causality.
+  The inherited smoke signal/FIFO harness instability is not fixed and
+  stays out of S1 scope (separate harness finding, not started).
+- Not started (unchanged scope): UI slices S2–S8, live Browser UAT,
+  Finding A, and the smoke-harness fix. The accepted S1 scope and the
+  corrective shape-gate/authority invariants are not reopened by this
+  record.
 
 ## Deferred work
 
