@@ -525,6 +525,15 @@ export interface UiWorkerLogsState {
   readonly selectedExecutionIndex: number | null;
   readonly content: UiWorkerLogContent | null;
   readonly requestState: "idle" | "loading" | "ready" | "failed";
+  /**
+   * The closed S2 request descriptor: the kind of the one unsettled
+   * logs GET as published viewer state. `metadata` carries no
+   * execution, `content` names exactly the selected execution and the
+   * null form is all-null; every desire terminal (settle, fail,
+   * selection change, run change, invalidation) returns the null form.
+   */
+  readonly requestKind: "metadata" | "content" | null;
+  readonly requestExecutionIndex: number | null;
   readonly error: { readonly layer: string; readonly reason: string } | null;
 }
 

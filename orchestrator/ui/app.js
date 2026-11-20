@@ -1538,7 +1538,9 @@ export function createLogsTransport(io) {
   });
 }
 
-/** The empty logs state of one run selection. */
+/** The empty logs state of one run selection. The closed S2 request
+ * descriptor (`requestKind`/`requestExecutionIndex`) starts in the null
+ * form: no unsettled logs GET exists yet. */
 export function createWorkerLogsState(runId) {
   return Object.freeze({
     runId,
@@ -1547,6 +1549,8 @@ export function createWorkerLogsState(runId) {
     selectedExecutionIndex: null,
     content: null,
     requestState: "idle",
+    requestKind: null,
+    requestExecutionIndex: null,
     error: null,
   });
 }
@@ -1616,6 +1620,44 @@ export function createWorkerLogViewer(io) {
   // one automatic list GET, and a failed application never re-triggers
   // for the same revision.
   let requestedRevision = 0;
+  // The S2 desire-liveness registry: the tokens of the desires whose
+  // transport callback may still arrive. It mirrors the single-flight
+  // transport's own supersession: a new content desire supersedes every
+  // live desire (an active metadata refresh is aborted and a queued one
+  // withdrawn), while a new metadata desire supersedes the live metadata
+  // desires only (an in-flight content request is protected). A
+  // callback whose token is no longer live is stale; it changes nothing
+  // in the published state. The tokens are an internal liveness marker,
+  // never part of the published descriptor.
+  let nextDesireToken = 0;
+  const liveDesires = new Map();
+
+  /** Establishes one transport desire: prunes the superseded live
+   * desires exactly like the transport would and returns this
+   * desire's token. */
+  const beginDesire = (kind) => {
+    nextDesireToken += 1;
+    if (kind === "content") {
+      liveDesires.clear();
+    } else {
+      for (const [token, liveKind] of liveDesires) {
+        if (liveKind === "metadata") {
+          liveDesires.delete(token);
+        }
+      }
+    }
+    liveDesires.set(nextDesireToken, kind);
+    return nextDesireToken;
+  };
+
+  /** One desire terminal: the token leaves the registry and the
+   * published descriptor returns to the null form. */
+  const endDesire = (token) => {
+    liveDesires.delete(token);
+    if (state !== null) {
+      state = Object.freeze({ ...state, requestKind: null, requestExecutionIndex: null });
+    }
+  };
 
   const publish = () => {
     onState(state);
@@ -1627,6 +1669,7 @@ export function createWorkerLogViewer(io) {
     decoder = createLogChunkDecoder();
     lastChunkDesire = null;
     requestedRevision = 0;
+    liveDesires.clear();
     publish();
   };
 
@@ -1642,43 +1685,51 @@ export function createWorkerLogViewer(io) {
     return { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } };
   };
 
-  const applyFailure = (result) => {
-    if (result === undefined) {
-      // a superseded or disposed request: no state change
-      return;
-    }
-    if (result.ok) {
-      return;
-    }
+  /** One desire-terminal failure: the token leaves the registry and the
+   * descriptor returns to the null form together with the failed state,
+   * so no row can stay pending over a settled desire. */
+  const applyFailure = (result, token) => {
+    liveDesires.delete(token);
     state = Object.freeze({
       ...state,
       requestState: "failed",
       error: Object.freeze({ layer: result.failure.layer, reason: result.failure.reason }),
+      requestKind: null,
+      requestExecutionIndex: null,
     });
     publish();
   };
 
   /**
-   * One metadata application: the list of the same run. The immutable
-   * binding of a loaded execution is verified before the list is
-   * accepted; an unchanged binding preserves the loaded content, the
-   * selection and the decoder state.
+   * One metadata application: the list of the same run, applied only
+   * while its desire is still live. The immutable binding of a loaded
+   * execution is verified before the list is accepted; an unchanged
+   * binding preserves the loaded content, the selection and the decoder
+   * state. Every terminal — success, failure, a transport settlement
+   * without a result — closes the desire: the descriptor returns to the
+   * null form, so a settled list can never hold a row pending.
    */
-  const applyMetadataResult = (result, requestedRunId) => {
-    if (state === null || state.runId !== requestedRunId || result === undefined) {
+  const applyMetadataResult = (result, requestedRunId, token) => {
+    if (state === null || state.runId !== requestedRunId || !liveDesires.has(token)) {
+      return; // the desire is already dead under a newer transition
+    }
+    if (result === undefined) {
+      // the transport settled without a result; the descriptor still closes
+      endDesire(token);
+      publish();
       return;
     }
     if (!result.ok) {
-      applyFailure(result);
+      applyFailure(result, token);
       return;
     }
     const model = result.model;
     if (model.kind !== "worker_logs") {
-      applyFailure(endpointFailure(model));
+      applyFailure(endpointFailure(model), token);
       return;
     }
     if (model.runId !== state.runId) {
-      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }, token);
       return;
     }
     if (state.content !== null) {
@@ -1690,16 +1741,12 @@ export function createWorkerLogViewer(io) {
         && entry.truncatedDaemon === state.content.truncatedDaemon
         && entry.truncatedLocal === state.content.truncatedLocal;
       if (!bindingUnchanged) {
-        state = Object.freeze({
-          ...state,
-          requestState: "failed",
-          error: Object.freeze({ layer: "viewer", reason: "invalid_log_binding" }),
-        });
-        publish();
+        applyFailure({ ok: false, failure: { layer: "viewer", reason: "invalid_log_binding" } }, token);
         return;
       }
     }
     requestedRevision = Math.max(requestedRevision, model.revision);
+    endDesire(token);
     state = Object.freeze({
       ...state,
       snapshotRevision: model.revision,
@@ -1712,38 +1759,47 @@ export function createWorkerLogViewer(io) {
 
   /**
    * One content application: a validated chunk of the selected
-   * execution, decoded through the one incremental decoder. A chunk
-   * that does not continue the expected raw-byte cursor is stale or
-   * duplicated: it is settled as a typed contract failure without
-   * touching the decoder, so a retried offset can never duplicate
-   * already applied text.
+   * execution, decoded through the one incremental decoder, applied
+   * only while its desire is still live. A chunk that does not continue
+   * the expected raw-byte cursor is stale or duplicated: it is settled
+   * as a typed contract failure without touching the decoder, so a
+   * retried offset can never duplicate already applied text. Every
+   * terminal closes the desire: the descriptor returns to the null
+   * form, so a settled chunk can never hold a row pending.
    */
-  const applyChunkResult = (result, requestedRunId, executionIndex, expectedOffset) => {
-    if (state === null || state.runId !== requestedRunId || result === undefined) {
+  const applyChunkResult = (result, requestedRunId, executionIndex, expectedOffset, token) => {
+    if (state === null || state.runId !== requestedRunId || !liveDesires.has(token)) {
+      return; // the desire is already dead under a newer transition
+    }
+    if (result === undefined) {
+      // the transport settled without a result; the descriptor still closes
+      endDesire(token);
+      publish();
       return;
     }
     if (!result.ok) {
-      applyFailure(result);
+      applyFailure(result, token);
       return;
     }
     const model = result.model;
     if (model.kind !== "worker_log" || model.runId !== state.runId || model.executionIndex !== executionIndex) {
       applyFailure(model.kind === "worker_log" || model.kind === "error" || model.kind === "command_result"
         ? { ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }
-        : endpointFailure(model));
+        : endpointFailure(model), token);
       return;
     }
     if (model.status !== "captured" && model.status !== "truncated") {
-      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }, token);
       return;
     }
     if (model.offset !== expectedOffset || (state.content !== null && state.content.executionIndex !== executionIndex)) {
-      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } });
+      applyFailure({ ok: false, failure: { layer: "contract", reason: "unexpected_kind" } }, token);
       return;
     }
     const isFinal = model.nextOffset === null;
     const decodedPart = decoder.decodeChunk(model.dataBase64, isFinal);
     lastChunkDesire = null;
+    endDesire(token);
     state = Object.freeze({
       ...state,
       snapshotRevision: model.revision,
@@ -1776,24 +1832,37 @@ export function createWorkerLogViewer(io) {
       transport.invalidate();
       state = null;
       lastChunkDesire = null;
+      liveDesires.clear();
     },
     /**
      * The explicit metadata load or refresh: one bounded GET of the
-     * list endpoint. Never automatic on its own.
+     * list endpoint. Never automatic on its own. The published
+     * descriptor establishes the metadata form (no execution named) so
+     * no row can render a content pending over it.
      */
     fetchLogsList() {
       if (state === null || state.requestState === "loading") {
         return;
       }
-      state = Object.freeze({ ...state, requestState: "loading", error: null });
+      state = Object.freeze({
+        ...state,
+        requestState: "loading",
+        error: null,
+        requestKind: "metadata",
+        requestExecutionIndex: null,
+      });
       publish();
+      const token = beginDesire("metadata");
       const requestedRunId = state.runId;
       transport.request({
         runId: state.runId,
         kind: "metadata",
         path: workerLogsRequestPath(state.runId, null, 0, 0),
         onApplied: (result) => {
-          applyMetadataResult(result, requestedRunId);
+          if (!liveDesires.has(token)) {
+            return; // a stale or superseded callback changes nothing
+          }
+          applyMetadataResult(result, requestedRunId, token);
         },
       });
     },
@@ -1803,6 +1872,8 @@ export function createWorkerLogViewer(io) {
      * selected run issues exactly one list GET; every later applied
      * inspect issues one list GET only when its revision is strictly
      * greater than the last requested one. Never loads payload bytes.
+     * The descriptor stays in the metadata form for the duration: an
+     * automatic refresh never renders a row pending.
      */
     inspectApplied(model) {
       if (state === null || !isRecord(model) || model.runId !== state.runId) {
@@ -1813,19 +1884,31 @@ export function createWorkerLogViewer(io) {
         return;
       }
       requestedRevision = revision;
+      const token = beginDesire("metadata");
       const requestedRunId = state.runId;
+      state = Object.freeze({ ...state, requestKind: "metadata", requestExecutionIndex: null });
+      publish();
       transport.request({
         runId: state.runId,
         kind: "metadata",
         path: workerLogsRequestPath(state.runId, null, 0, 0),
         onApplied: (result) => {
-          applyMetadataResult(result, requestedRunId);
+          if (!liveDesires.has(token)) {
+            return; // a stale or superseded callback changes nothing
+          }
+          applyMetadataResult(result, requestedRunId, token);
         },
       });
     },
-    /** One execution selection: fresh content and a fresh decoder; an
-     * in-flight content desire of the previous selection is foreign and
-     * its late response is dropped by the transition guard. */
+    /**
+     * One execution selection: fresh content and a fresh decoder; an
+     * in-flight content desire of the previous selection is closed by
+     * the selection transition itself (the §6 seam): the descriptor
+     * returns to the null form, the published state settles and the
+     * desire's late response is dropped before it can influence the
+     * render. An unsettled metadata desire is untouched — its
+     * application is selection-independent.
+     */
     selectExecution(index) {
       if (state === null || !Number.isSafeInteger(index) || index < 1) {
         return;
@@ -1838,13 +1921,29 @@ export function createWorkerLogViewer(io) {
         return;
       }
       decoder.reset();
-      state = Object.freeze({ ...state, selectedExecutionIndex: index, content: null, error: null });
+      const closesContentDesire = state.requestKind === "content";
+      for (const [token, kind] of liveDesires) {
+        if (kind === "content") {
+          liveDesires.delete(token);
+        }
+      }
+      state = Object.freeze({
+        ...state,
+        selectedExecutionIndex: index,
+        content: null,
+        error: null,
+        requestState: closesContentDesire && state.requestState === "loading" ? "ready" : state.requestState,
+        requestKind: closesContentDesire ? null : state.requestKind,
+        requestExecutionIndex: closesContentDesire ? null : state.requestExecutionIndex,
+      });
       publish();
     },
     /**
      * The explicit `Load log` press of the selected execution: one
      * bounded chunk GET continuing the raw-byte cursor. Read-only over
      * the already authorized API: any boundary may read a durable log.
+     * The published descriptor names exactly this execution for the
+     * duration: the row renders the pending affordance in place.
      */
     fetchChunk() {
       if (state === null || state.selectedExecutionIndex === null || state.requestState === "loading") {
@@ -1859,8 +1958,15 @@ export function createWorkerLogViewer(io) {
       }
       const executionIndex = state.selectedExecutionIndex;
       const expectedOffset = state.content === null ? 0 : state.content.nextOffset;
-      state = Object.freeze({ ...state, requestState: "loading", error: null });
+      state = Object.freeze({
+        ...state,
+        requestState: "loading",
+        error: null,
+        requestKind: "content",
+        requestExecutionIndex: executionIndex,
+      });
       publish();
+      const token = beginDesire("content");
       lastChunkDesire = { executionIndex, offset: expectedOffset };
       const requestedRunId = state.runId;
       transport.request({
@@ -1868,16 +1974,23 @@ export function createWorkerLogViewer(io) {
         kind: "content",
         path: workerLogsRequestPath(state.runId, executionIndex, expectedOffset, 65536),
         onApplied: (result) => {
+          if (!liveDesires.has(token)) {
+            return; // a stale or superseded callback changes nothing
+          }
           if (state === null || state.selectedExecutionIndex !== executionIndex) {
             return; // a foreign content desire of a previous selection
           }
-          applyChunkResult(result, requestedRunId, executionIndex, expectedOffset);
+          applyChunkResult(result, requestedRunId, executionIndex, expectedOffset, token);
         },
       });
     },
-    /** One retry click: exactly one re-request of the last failed chunk
+    /**
+     * One retry click: exactly one re-request of the last failed chunk
      * desire of the still-selected execution. The failed chunk never
-     * touched the decoder, so the retry cannot duplicate text. */
+     * touched the decoder, so the retry cannot duplicate text. The
+     * retry re-establishes the descriptor with the exact prior
+     * execution identity before the re-GET.
+     */
     retryLastChunkRequest() {
       if (state === null || state.requestState !== "failed" || lastChunkDesire === null) {
         return;
@@ -1887,18 +2000,28 @@ export function createWorkerLogViewer(io) {
       }
       const retryOffset = lastChunkDesire.offset;
       const retryExecutionIndex = lastChunkDesire.executionIndex;
-      state = Object.freeze({ ...state, requestState: "loading", error: null });
+      state = Object.freeze({
+        ...state,
+        requestState: "loading",
+        error: null,
+        requestKind: "content",
+        requestExecutionIndex: retryExecutionIndex,
+      });
       publish();
+      const token = beginDesire("content");
       const requestedRunId = state.runId;
       transport.request({
         runId: state.runId,
         kind: "content",
         path: workerLogsRequestPath(state.runId, retryExecutionIndex, retryOffset, 65536),
         onApplied: (result) => {
+          if (!liveDesires.has(token)) {
+            return; // a stale or superseded callback changes nothing
+          }
           if (state === null || state.selectedExecutionIndex !== retryExecutionIndex) {
             return;
           }
-          applyChunkResult(result, requestedRunId, retryExecutionIndex, retryOffset);
+          applyChunkResult(result, requestedRunId, retryExecutionIndex, retryOffset, token);
         },
       });
     },
@@ -7265,22 +7388,61 @@ function resetWorkerLogsDom() {
   document.getElementById("logs-table").hidden = true;
 }
 
+/** The closed S2 row-action table, derived from the published viewer
+ * state only (no DOM-local pending flag, no module flag, no timer):
+ * an unselected row stays the selection-only View affordance; a
+ * non-loadable selected row never receives a load label; a selected
+ * loadable row shows the in-place Load log affordance, disabled
+ * `Loading…` while exactly its own content GET is unsettled and
+ * disabled `Loaded` once the artifact is fully read (a press of either
+ * disabled form can create no GET, and the viewer refuses both). */
+function workerLogRowAction(entry, state) {
+  if (state.selectedExecutionIndex !== entry.executionIndex) {
+    return { label: "View", disabled: false };
+  }
+  if (entry.status !== "captured" && entry.status !== "truncated") {
+    return { label: "View", disabled: false };
+  }
+  const content = state.content;
+  if (content !== null && content.executionIndex === entry.executionIndex && content.nextOffset === null) {
+    return { label: "Loaded", disabled: true };
+  }
+  const pending =
+    state.requestState === "loading" &&
+    state.requestKind === "content" &&
+    state.requestExecutionIndex === entry.executionIndex;
+  if (pending) {
+    return { label: "Loading…", disabled: true };
+  }
+  return { label: "Load log", disabled: false };
+}
+
 /** One metadata row: the execution identity, the status and, for a
- * captured/truncated execution, the confirmed byte count. */
-function workerLogRow(entry) {
+ * captured/truncated execution, the confirmed byte count; the closed
+ * row-action affordance reads the published viewer state. */
+function workerLogRow(entry, state) {
   const row = document.createElement("tr");
   row.appendChild(element("td", String(entry.executionIndex)));
   row.appendChild(element("td", entry.stateId));
   row.appendChild(element("td", entry.status));
   row.appendChild(element("td", entry.byteCount === undefined ? "" : String(entry.byteCount)));
   row.appendChild(element("td", entry.truncatedDaemon === true || entry.truncatedLocal === true ? "yes" : ""));
+  const action = workerLogRowAction(entry, state);
   const actions = document.createElement("td");
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = "View";
+  button.textContent = action.label;
+  button.disabled = action.disabled;
   button.addEventListener("click", () => {
     clearMessages();
-    if (workerLogViewer !== null) {
+    if (workerLogViewer === null) {
+      return;
+    }
+    if (state.selectedExecutionIndex === entry.executionIndex) {
+      // the in-place Load-log affordance (and the disabled Loaded form:
+      // the viewer refuses the fully-read artifact without a GET)
+      workerLogViewer.fetchChunk();
+    } else {
       workerLogViewer.selectExecution(entry.executionIndex);
     }
   });
@@ -7310,7 +7472,7 @@ function renderWorkerLogs(state) {
   const body = document.getElementById("logs-body");
   body.replaceChildren();
   for (const entry of state.logs) {
-    body.appendChild(workerLogRow(entry));
+    body.appendChild(workerLogRow(entry, state));
   }
   document.getElementById("logs-table").hidden = state.logs.length === 0;
   const empty = document.getElementById("logs-empty");

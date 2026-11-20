@@ -86,6 +86,102 @@ const viewButtonOfRow = (harness: Awaited<ReturnType<typeof createUiHarness>>, r
   return button;
 };
 
+/** The first button of one logs metadata row (the closed S2 row affordance). */
+const rowButtonOf = (harness: Awaited<ReturnType<typeof createUiHarness>>, row: number): FakeElement => {
+  const buttons = harness.element("logs-body").children[row]!.querySelectorAll("button");
+  if (buttons.length === 0) {
+    throw new Error(`no action button on logs row ${row}`);
+  }
+  return buttons[0]!;
+};
+
+interface DeferredFetchPlan {
+  /** The metadata-list revisions in call order; the last one repeats. */
+  readonly listRevisions?: readonly number[];
+  /** The metadata entries per list call; the last one repeats. */
+  readonly listMetadata?: readonly Record<string, unknown>[][];
+  /** The chunk documents in call order; the last one repeats. */
+  readonly chunkModels?: readonly Record<string, unknown>[];
+  /** The inspect revisions in call order; the last one repeats. */
+  readonly inspectRevisions?: readonly number[];
+  /** The 1-based metadata-list calls whose responses stay unsettled. */
+  readonly holdListCalls?: readonly number[];
+  /** The 1-based chunk calls whose responses stay unsettled. */
+  readonly holdChunkCalls?: readonly number[];
+}
+
+/** A production-shaped logs fetch whose designated responses stay
+ * unsettled until the test releases them, so the wiring can observe the
+ * pending affordance states of the closed S2 row table. */
+function makeDeferredLogsFetch(plans: DeferredFetchPlan = {}) {
+  const listRevisions = plans.listRevisions ?? [24];
+  const listMetadata = plans.listMetadata ?? [defaultMetadata()];
+  const chunkModels = plans.chunkModels ?? [];
+  const inspectRevisions = plans.inspectRevisions ?? [24];
+  const holdListCalls = plans.holdListCalls ?? [];
+  const holdChunkCalls = plans.holdChunkCalls ?? [];
+  const pending: ((response: Response) => void)[] = [];
+  const calls = { list: 0, chunk: 0, inspect: 0 };
+  const fetchImpl = async (path: string, init?: RequestInit): Promise<Response> => {
+    const method = init !== undefined && typeof init.method === "string" ? init.method : "GET";
+    if (method === "POST") {
+      return jsonResponse({
+        schema_version: 1,
+        kind: "command_result",
+        run_id: "run-a",
+        outcome: "succeeded",
+        exit_code: 0,
+      });
+    }
+    if (path === "/v1/projects") {
+      return jsonResponse(projectsDocument());
+    }
+    if (path === "/v1/runs" || path.startsWith("/v1/runs?")) {
+      return jsonResponse(runsPageDocument(["run-a"]));
+    }
+    if (/^\/v1\/runs\/run-a\/events\?after=(\d+)&limit=\d+$/.test(path)) {
+      const entries = ["create_run", "start_agent_execution"].map((kind, index) => eventEntry(kind, index + 1));
+      return jsonResponse({ schema_version: 1, kind: "events", run_id: "run-a", revision: 2, events: entries, next_after: null });
+    }
+    if (path === "/v1/runs/run-a/logs") {
+      calls.list += 1;
+      if (holdListCalls.includes(calls.list)) {
+        return new Promise<Response>((resolve) => { pending.push(resolve); });
+      }
+      const index = Math.min(calls.list - 1, listRevisions.length - 1);
+      const entries = listMetadata[Math.min(calls.list - 1, listMetadata.length - 1)] ?? defaultMetadata();
+      return jsonResponse({ schema_version: 1, kind: "worker_logs", run_id: "run-a", revision: listRevisions[index], logs: entries });
+    }
+    if (path.startsWith("/v1/runs/run-a/logs/")) {
+      calls.chunk += 1;
+      if (holdChunkCalls.includes(calls.chunk)) {
+        return new Promise<Response>((resolve) => { pending.push(resolve); });
+      }
+      const model = chunkModels[Math.min(calls.chunk - 1, chunkModels.length - 1)] ?? chunkBody(1, "hello world");
+      return jsonResponse(model);
+    }
+    if (path === "/v1/runs/run-a") {
+      calls.inspect += 1;
+      const index = Math.min(calls.inspect - 1, inspectRevisions.length - 1);
+      return jsonResponse(runDocument("run-a", inspectRevisions[index] ?? 24, "running", { kind: "in_flight" }));
+    }
+    throw new Error(`unexpected fetch path: ${path}`);
+  };
+  return {
+    fetchImpl,
+    counts: () => ({ list: calls.list, chunk: calls.chunk, inspect: calls.inspect }),
+    /** Releases the oldest unsettled held response. */
+    release(model: Record<string, unknown>): void {
+      const resolve = pending.shift();
+      if (resolve === undefined) {
+        throw new Error("no held response to release");
+      }
+      resolve(jsonResponse(model));
+    },
+    heldCount: () => pending.length,
+  };
+}
+
 function makeLogsFetch(plans: {
   readonly list?: LogsPlan | readonly LogsPlan[];
   readonly chunks?: readonly LogsPlan[];
@@ -843,6 +939,228 @@ describe("worker logs wiring", () => {
     expect(text).toContain("<script>alert(1)</script>"); // rendered as text, never markup
     expect(text).toContain("\u0000");
     expect(text).toContain("\u001b[31m");
+    harness.dispose();
+  });
+});
+
+describe("the S2 row-button affordance", () => {
+  const bootDeferred = async (plans: DeferredFetchPlan = {}) => {
+    const transport = makeDeferredLogsFetch(plans);
+    const harness = await createUiHarness({ fetchImpl: transport.fetchImpl });
+    harness.click("refresh-runs");
+    await Bun.sleep(10);
+    harness.clickRunInspect(0);
+    await Bun.sleep(10);
+    return { harness, transport };
+  };
+
+  test("unselected rows keep the selection-only View affordance for every status", async () => {
+    const { harness } = await bootDeferred({
+      listMetadata: [[
+        { execution_index: 1, state_id: "architect", status: "pending" },
+        { execution_index: 2, state_id: "review", status: "unavailable" },
+        capturedMetadataAt(3),
+        { ...capturedMetadataAt(4), state_id: "fix", status: "truncated", sha256: "c".repeat(64), truncated_daemon: true },
+      ]],
+    });
+    for (let row = 0; row < 4; row += 1) {
+      const button = rowButtonOf(harness, row);
+      expect(button.textContent).toBe("View");
+      expect(button.disabled).toBe(false);
+    }
+    harness.dispose();
+  });
+
+  test("a non-loadable selected row stays selection-only and never renders a load label", async () => {
+    const { harness } = await bootDeferred({
+      listMetadata: [[
+        { execution_index: 1, state_id: "architect", status: "pending" },
+        { execution_index: 2, state_id: "review", status: "unavailable" },
+      ]],
+    });
+    viewButtonOfRow(harness, 0).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("View");
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    viewButtonOfRow(harness, 1).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 1).textContent).toBe("View");
+    expect(rowButtonOf(harness, 1).disabled).toBe(false);
+    expect(harness.logsButtonState("logs-next-chunk").hidden).toBe(true);
+    harness.dispose();
+  });
+
+  test("selecting a loadable row relabels it in place: Load log → Loading… → Loaded with zero extra GETs", async () => {
+    const { harness, transport } = await bootDeferred({ holdChunkCalls: [1] });
+    expect(rowButtonOf(harness, 0).textContent).toBe("View");
+    viewButtonOfRow(harness, 0).click();
+    await Bun.sleep(10);
+    const load = rowButtonOf(harness, 0);
+    expect(load.textContent).toBe("Load log");
+    expect(load.disabled).toBe(false);
+    load.click();
+    await Bun.sleep(10);
+    expect(transport.counts().chunk).toBe(1);
+    const pendingButton = rowButtonOf(harness, 0);
+    expect(pendingButton.textContent).toBe("Loading…");
+    expect(pendingButton.disabled).toBe(true);
+    // the load affordance of the pending row never triggers a second GET,
+    // from click or from the standalone button
+    pendingButton.click();
+    harness.click("logs-next-chunk");
+    await Bun.sleep(10);
+    expect(transport.counts().chunk).toBe(1);
+    expect(harness.logsButtonState("logs-next-chunk").hidden).toBe(false); // a chunk may still follow
+    expect(harness.logsButtonState("logs-next-chunk").disabled).toBe(true); // the wire slot is single
+    // the terminal chunk settles the row into Loaded
+    transport.release(chunkBody(1, "hello world"));
+    await Bun.sleep(10);
+    const loaded = rowButtonOf(harness, 0);
+    expect(loaded.textContent).toBe("Loaded");
+    expect(loaded.disabled).toBe(true);
+    loaded.click();
+    await Bun.sleep(10);
+    expect(transport.counts().chunk).toBe(1); // a Loaded press creates zero GETs
+    expect(harness.logsButtonState("logs-next-chunk").hidden).toBe(true);
+    harness.dispose();
+  });
+
+  test("a partially read artifact keeps its load affordance until the tail is consumed", async () => {
+    const firstChunk = {
+      ...chunkBody(1, "ab", { byte_count: 100, sha256: "c".repeat(64), truncated_daemon: true }),
+      next_offset: 2,
+    };
+    const secondChunk = {
+      ...chunkBody(1, "c".repeat(98), { byte_count: 100, sha256: "c".repeat(64), truncated_daemon: true }),
+      offset: 2,
+    };
+    const { harness, transport } = await bootDeferred({
+      listMetadata: [[{ ...capturedMetadataAt(1), sha256: "c".repeat(64), byte_count: 100, truncated_daemon: true }]],
+      chunkModels: [firstChunk, secondChunk],
+      holdChunkCalls: [1, 2],
+    });
+    viewButtonOfRow(harness, 0).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    rowButtonOf(harness, 0).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Loading…");
+    transport.release(firstChunk);
+    await Bun.sleep(10);
+    expect(harness.logsContent()).toBe("ab");
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log"); // a tail remains: still loadable
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    rowButtonOf(harness, 0).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Loading…");
+    transport.release(secondChunk);
+    await Bun.sleep(10);
+    expect(harness.logsContent()).toBe("ab" + "c".repeat(98));
+    expect(rowButtonOf(harness, 0).textContent).toBe("Loaded");
+    harness.dispose();
+  });
+
+  test("an unsettled manual metadata refresh keeps every row affordance settled", async () => {
+    const { harness, transport } = await bootDeferred({ holdListCalls: [2] });
+    viewButtonOfRow(harness, 0).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    harness.click("logs-load");
+    await Bun.sleep(10);
+    expect(transport.heldCount()).toBe(1);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log"); // metadata loading is never a row pending
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    expect(harness.logsStatus()).toContain("Loading…"); // the section status shows the wire
+    transport.release({ schema_version: 1, kind: "worker_logs", run_id: "run-a", revision: 30, logs: defaultMetadata() });
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    expect(harness.logsStatus()).toContain("snapshot revision 30");
+    harness.dispose();
+  });
+
+  test("an unsettled automatic metadata refresh keeps every row affordance settled", async () => {
+    const transport = makeDeferredLogsFetch({ inspectRevisions: [24, 30], holdListCalls: [2] });
+    const harness = await createUiHarness({ fetchImpl: transport.fetchImpl });
+    harness.click("refresh-runs");
+    await Bun.sleep(10);
+    harness.clickRunInspect(0);
+    await Bun.sleep(10);
+    viewButtonOfRow(harness, 0).click();
+    await Bun.sleep(10);
+    harness.click("inspect-selected"); // the applied revision-30 inspect issues the automatic list GET
+    await Bun.sleep(10);
+    expect(transport.heldCount()).toBe(1);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    transport.release({ schema_version: 1, kind: "worker_logs", run_id: "run-a", revision: 30, logs: defaultMetadata() });
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    expect(harness.logsStatus()).toContain("snapshot revision 30");
+    harness.dispose();
+  });
+
+  test("a content GET failure returns the row affordance to Load log", async () => {
+    const transport = makeLogsFetch({
+      inspect: { revision: 24, boundary: { kind: "in_flight" } },
+      chunks: [{ revision: 24, fail: "network" }, { revision: 24 }],
+    });
+    const harness = await createUiHarness({ fetchImpl: transport.fetchImpl });
+    harness.click("refresh-runs");
+    await Bun.sleep(10);
+    harness.clickRunInspect(0);
+    await Bun.sleep(10);
+    viewButtonOfRow(harness, 0).click();
+    await Bun.sleep(10);
+    rowButtonOf(harness, 0).click();
+    harness.click("logs-next-chunk"); // refused while the exact desire is unsettled
+    await Bun.sleep(10);
+    expect(harness.logsStatus()).toContain("transport: network_error");
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log"); // the failed desire cleared the pending
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    expect(transport.chunkGets).toHaveLength(1);
+    // one explicit Load-log press re-reads from the same cursor
+    rowButtonOf(harness, 0).click();
+    await Bun.sleep(10);
+    expect(transport.chunkGets).toHaveLength(2);
+    expect(harness.logsContent()).toBe("hello world");
+    expect(rowButtonOf(harness, 0).textContent).toBe("Loaded");
+    harness.dispose();
+  });
+
+  test("the selection change settles the stale pending presentation in the DOM", async () => {
+    const { harness, transport } = await bootDeferred({
+      listMetadata: [[capturedMetadataAt(1), capturedMetadataAt(2)]],
+      chunkModels: [chunkBody(1, "late-race-text"), chunkBody(2, "f-text")],
+      holdChunkCalls: [1, 2],
+    });
+    viewButtonOfRow(harness, 0).click(); // select E
+    await Bun.sleep(10);
+    rowButtonOf(harness, 0).click(); // the Load log press; the chunk response is held
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Loading…");
+    expect(rowButtonOf(harness, 0).disabled).toBe(true);
+    // select F while E's GET is in flight
+    viewButtonOfRow(harness, 1).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("View"); // E ceased pending immediately
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    expect(rowButtonOf(harness, 1).textContent).toBe("Load log"); // F never inherits the pending
+    expect(harness.logsStatus()).not.toContain("Loading…"); // the published state is settled
+    expect(harness.logsContent()).toBe("");
+    // the late response of E renders nothing and re-pends nothing
+    transport.release(chunkBody(1, "late-race-text"));
+    await Bun.sleep(10);
+    expect(harness.logsContent()).toBe("");
+    expect(rowButtonOf(harness, 0).textContent).toBe("View");
+    expect(rowButtonOf(harness, 1).textContent).toBe("Load log");
+    // F loads its own artifact through the same flow
+    rowButtonOf(harness, 1).click();
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 1).textContent).toBe("Loading…");
+    transport.release(chunkBody(2, "f-text"));
+    await Bun.sleep(10);
+    expect(harness.logsContent()).toBe("f-text");
+    expect(rowButtonOf(harness, 1).textContent).toBe("Loaded");
     harness.dispose();
   });
 });

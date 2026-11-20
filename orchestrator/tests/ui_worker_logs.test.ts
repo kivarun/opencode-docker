@@ -772,8 +772,9 @@ describe("the logs layer source restrictions", () => {
     // own inspectApplied declaration and its own call site beside the
     // logs ones)
     expect(appSource.split("inspectApplied(").length - 1).toBe(4); // two declarations + two call sites
-    // the content fetch is invoked only from the user action path
-    expect(appSource.split("fetchChunk()").length - 1).toBe(2); // declaration + one click site
+    // the content fetch is invoked exactly from the two user action
+    // paths (the standalone button and the S2 in-row Load log affordance)
+    expect(appSource.split("fetchChunk()").length - 1).toBe(3); // declaration + two call sites
   });
 
   test("the logs section is manual-only for content: no auto-load of payload bytes", () => {
@@ -807,5 +808,399 @@ describe("the logs layer source restrictions", () => {
     expect(appSource).not.toContain("payload_base64");
     expect(appSource).not.toContain("workerlog.json");
     expect(appSource).not.toContain(".workerlog");
+  });
+
+  test("the S2 in-row affordance is one derivation with a single published-state reader", () => {
+    // one row-action derivation owner
+    expect(appSource.split("function workerLogRowAction(").length - 1).toBe(1);
+    // one row builder calling it
+    expect(appSource.split("function workerLogRow(").length - 1).toBe(1);
+    expect(appSource.split("workerLogRow(").length - 1).toBe(2); // declaration + one call site
+    // the closed label vocabulary is produced only by the derivation
+    expect(appSource.split('label: "View"').length - 1).toBe(2);
+    expect(appSource.split('label: "Load log"').length - 1).toBe(1);
+    expect(appSource.split('label: "Loading…"').length - 1).toBe(1);
+    expect(appSource.split('label: "Loaded"').length - 1).toBe(1);
+    // the chunk action is invoked from the standalone handler and the row handler
+    expect(appSource.split("fetchChunk()").length - 1).toBe(3); // declaration + two call sites
+  });
+});
+
+describe("the S2 request descriptor and desire liveness", () => {
+  type RecordedDesire = {
+    readonly runId: string;
+    readonly kind: "metadata" | "content";
+    readonly path: string;
+    fire(result: unknown): void;
+  };
+
+  const makeRecordingViewer = (runId = "run-a") => {
+    const desires: RecordedDesire[] = [];
+    const transport = {
+      request: (desire: Record<string, unknown>) => {
+        desires.push({
+          runId: desire["runId"] as string,
+          kind: desire["kind"] as "metadata" | "content",
+          path: desire["path"] as string,
+          fire: (result: unknown) => (desire["onApplied"] as (r: unknown) => void)(result),
+        });
+        return Promise.resolve(undefined) as never;
+      },
+      invalidate: () => undefined,
+      dispose: () => undefined,
+    };
+    const states: (UiWorkerLogsState | null)[] = [];
+    const viewer = createWorkerLogViewer({ transport: transport as never, onState: (state) => states.push(state) });
+    viewer.transitionToLogsView(runId);
+    return { viewer, states, desires };
+  };
+
+  /** A deep snapshot of the published state: every stale-callback pin
+   * compares against this byte-equivalent copy. */
+  const snapshot = (viewer: ReturnType<typeof createWorkerLogViewer>): UiWorkerLogsState | null =>
+    structuredClone(viewer.currentState()) as UiWorkerLogsState | null;
+
+  const capturedEntry = (index = 1, overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    executionIndex: index,
+    stateId: index === 1 ? "architect" : "execute",
+    status: "captured",
+    sha256: index === 1 ? "a".repeat(64) : "b".repeat(64),
+    byteCount: 11,
+    truncatedDaemon: false,
+    truncatedLocal: false,
+    ...overrides,
+  });
+
+  const plainEntry = (index: number, status: string): Record<string, unknown> => ({
+    executionIndex: index,
+    stateId: "architect",
+    status,
+  });
+
+  const chunkOk = (
+    executionIndex: number,
+    offset: number,
+    nextOffset: number | null,
+    overrides: Record<string, unknown> = {},
+  ): unknown => ({
+    ok: true,
+    model: {
+      kind: "worker_log",
+      runId: "run-a",
+      revision: 24,
+      executionIndex,
+      stateId: executionIndex === 1 ? "architect" : "execute",
+      status: "captured",
+      sha256: executionIndex === 1 ? "a".repeat(64) : "b".repeat(64),
+      byteCount: 11,
+      truncatedDaemon: false,
+      truncatedLocal: false,
+      offset,
+      dataBase64: b64("hello world"),
+      nextOffset,
+      ...overrides,
+    },
+  });
+
+  const listOk = (revision: number, logs: readonly Record<string, unknown>[]): unknown => ({
+    ok: true,
+    model: { kind: "worker_logs", runId: "run-a", revision, logs },
+  });
+
+  const transportFailure = (): unknown => ({ ok: false, failure: { layer: "transport", reason: "network_error" } });
+
+  const descriptorOf = (state: UiWorkerLogsState): { requestKind: string | null; requestExecutionIndex: number | null } => ({
+    requestKind: state.requestKind,
+    requestExecutionIndex: state.requestExecutionIndex,
+  });
+
+  /** The §4 coherence rules hold after every transition: a content
+   * descriptor names the exact selected execution, a metadata descriptor
+   * carries no execution and the null form is all-null. */
+  const expectDescriptorCoherent = (viewer: ReturnType<typeof createWorkerLogViewer>) => {
+    const state = viewer.currentState();
+    if (state === null) {
+      return;
+    }
+    if (state.requestKind === null) {
+      expect(state.requestExecutionIndex).toBeNull();
+      return;
+    }
+    expect(state.requestKind === "metadata" || state.requestKind === "content").toBe(true);
+    if (state.requestKind === "metadata") {
+      expect(state.requestExecutionIndex).toBeNull();
+      return;
+    }
+    expect(state.requestExecutionIndex).not.toBeNull();
+    expect(state.requestExecutionIndex).toBe(state.selectedExecutionIndex);
+  };
+
+  test("the fresh state carries the null-by-null descriptor", () => {
+    const initial = createWorkerLogsState("run-a");
+    expect(initial.requestKind).toBeNull();
+    expect(initial.requestExecutionIndex).toBeNull();
+    const { viewer } = makeRecordingViewer();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+  });
+
+  test("a manual metadata load establishes the metadata descriptor and every terminal clears it", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.fetchLogsList();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("loading");
+    expect(desires).toHaveLength(1);
+    expect(desires[0]!.kind).toBe("metadata");
+    expectDescriptorCoherent(viewer);
+    // a settled list closes the desire: the descriptor is null again
+    desires[0]!.fire(listOk(24, [capturedEntry()]));
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("ready");
+    expectDescriptorCoherent(viewer);
+    // a failed list also closes the desire
+    viewer.fetchLogsList();
+    expect(desires).toHaveLength(2);
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    desires[1]!.fire(transportFailure());
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    expectDescriptorCoherent(viewer);
+  });
+
+  test("an automatic inspect-driven metadata refresh establishes the same metadata descriptor", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    expect(desires).toHaveLength(1);
+    desires[0]!.fire(listOk(24, [capturedEntry()]));
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("ready");
+  });
+
+  test("the content descriptor names exactly the selected execution and settle/fail clear it", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry(1), capturedEntry(2)]));
+    viewer.selectExecution(2);
+    viewer.fetchChunk();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 2 });
+    expect(viewer.currentState()!.requestState).toBe("loading");
+    expectDescriptorCoherent(viewer);
+    desires[1]!.fire(chunkOk(2, 0, null));
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    // the failed desire also clears: retry re-establishes the same identity
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(3);
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    desires[2]!.fire(transportFailure());
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    viewer.retryLastChunkRequest();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    expect(viewer.currentState()!.requestState).toBe("loading");
+    expect(desires).toHaveLength(4);
+    expect(desires[3]!.kind).toBe("content");
+  });
+
+  test("a duplicate load press while the exact pending desire is unsettled creates no second desire", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry()]));
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(2);
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    const before = snapshot(viewer);
+    viewer.fetchChunk(); // refused: the exact content desire is unsettled
+    expect(desires).toHaveLength(2);
+    expect(viewer.currentState()).toEqual(before);
+  });
+
+  test("the selection seam settles a content GET: descriptor closed, no inheritance, late response dropped", () => {
+    const { viewer, desires, states } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry(1), capturedEntry(2)]));
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    // the selection transition: settles the published state immediately
+    viewer.selectExecution(2);
+    const settled = viewer.currentState()!;
+    expect(settled.requestState).not.toBe("loading");
+    expect(descriptorOf(settled)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(settled.content).toBeNull();
+    expect(settled.selectedExecutionIndex).toBe(2);
+    expect(desires).toHaveLength(2); // no additional request
+    // the late response of the dead desire changes nothing
+    const settledSnapshot = structuredClone(settled);
+    desires[0]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()).toEqual(settledSnapshot);
+    expect(viewer.currentState()!.content).toBeNull();
+    expect(viewer.currentState()!.requestState).not.toBe("loading");
+    // and a fresh load of F re-establishes its own descriptor
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(3);
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 2 });
+    expect(viewer.currentState()!.requestState).toBe("loading");
+    // and the older callback remains inert after the new desire started
+    const beforeLate = snapshot(viewer);
+    desires[0]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()).toEqual(beforeLate);
+    expect(states.length).toBeGreaterThan(0);
+  });
+
+  test("race: a late terminal of an in-flight metadata refresh is inert after a content desire started", async () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry()]));
+    viewer.selectExecution(1);
+    // the automatic metadata refresh A: it never opens a content pending
+    viewer.inspectApplied({ runId: "run-a", revision: 30 });
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("ready");
+    // the explicit Load log press starts the content GET F: A is dead
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(3);
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    expect(viewer.currentState()!.requestState).toBe("loading");
+    const pendingSnapshot = snapshot(viewer);
+    // the late settle of A removes no pending affordance and changes no field
+    desires[1]!.fire(listOk(30, [capturedEntry()]));
+    expect(viewer.currentState()).toEqual(pendingSnapshot);
+    // the late failure of A is equally inert
+    desires[1]!.fire(transportFailure());
+    expect(viewer.currentState()).toEqual(pendingSnapshot);
+    // the real terminal still applies
+    desires[2]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+  });
+
+  test("race: a late terminal of the failed attempt 1 clears nothing of the attempt-2 desire", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry()]));
+    viewer.selectExecution(1);
+    viewer.fetchChunk(); // attempt 1
+    desires[1]!.fire(transportFailure());
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    viewer.retryLastChunkRequest(); // attempt 2: the descriptor re-binds the same execution
+    const retryDesire = desires[2]!;
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    const retrySnapshot = snapshot(viewer);
+    // the late SUCCESS terminal of attempt 1 clears neither the attempt-2
+    // descriptor nor its pending affordance
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()).toEqual(retrySnapshot);
+    // the late FAILURE terminal of attempt 1 is equally inert
+    desires[1]!.fire(transportFailure());
+    expect(viewer.currentState()).toEqual(retrySnapshot);
+    // and the live attempt still settles normally
+    retryDesire.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+  });
+
+  test("race: run change, viewer reset and drop close out every older callback", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry()]));
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(2);
+    // the run change: the fresh state owns the view; the older callback is inert
+    viewer.transitionToLogsView("run-b");
+    const fresh = viewer.currentState()!;
+    expect(fresh.requestState).toBe("idle");
+    expect(descriptorOf(fresh)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()).toEqual(fresh);
+    // the same reset back to the first run keeps the property
+    viewer.transitionToLogsView("run-a");
+    const reset = viewer.currentState()!;
+    desires[1]!.fire(transportFailure());
+    expect(viewer.currentState()).toEqual(reset);
+    // the drop view: the late callback cannot resurrect a state
+    viewer.dropView();
+    expect(viewer.currentState()).toBeNull();
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()).toBeNull();
+    // and the viewer resumes normally afterwards
+    viewer.transitionToLogsView("run-a");
+    expect(viewer.currentState()!.requestState).toBe("idle");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+  });
+
+  test("every published state keeps the descriptor coherence across the whole transition table", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    const check = () => expectDescriptorCoherent(viewer);
+    check();
+    viewer.fetchLogsList();
+    check();
+    desires[0]!.fire(transportFailure());
+    check();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    check();
+    desires[1]!.fire(listOk(24, [capturedEntry(1), plainEntry(2, "pending"), plainEntry(3, "unavailable")]));
+    check();
+    viewer.selectExecution(1);
+    check();
+    viewer.fetchChunk();
+    check();
+    desires[2]!.fire(chunkOk(1, 0, 7));
+    check();
+    viewer.fetchChunk(); // a continuation of a partially read artifact
+    check();
+    desires[3]!.fire(chunkOk(1, 7, null));
+    check();
+    viewer.selectExecution(2); // the pending status is selection-only
+    check();
+    const before = desires.length;
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(before); // non-captured rows establish no content desire
+    check();
+    viewer.selectExecution(3); // the unavailable status is selection-only
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(before);
+    check();
+    // a selection during an unsettled metadata refresh keeps the metadata form
+    viewer.inspectApplied({ runId: "run-a", revision: 30 });
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    check();
+    viewer.selectExecution(1);
+    check();
+    expect(descriptorOf(viewer.currentState()!).requestKind).toBe("metadata");
+    desires[4]!.fire(transportFailure());
+    check();
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    // a mid-run selection change closes a live content desire with no new desire
+    viewer.inspectApplied({ runId: "run-a", revision: 31 });
+    desires[5]!.fire(listOk(31, [capturedEntry(1), capturedEntry(2)]));
+    check();
+    viewer.selectExecution(1);
+    viewer.fetchChunk();
+    check();
+    viewer.selectExecution(2);
+    check();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    // and a run change resets everything to the null form
+    viewer.transitionToLogsView("run-b");
+    check();
+  });
+
+  test("no descriptor form can name a foreign or unselected execution in the published state", () => {
+    const { viewer, desires } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry(1), capturedEntry(2)]));
+    viewer.selectExecution(2);
+    viewer.fetchChunk();
+    expect(viewer.currentState()!.requestExecutionIndex).toBe(2);
+    expect(viewer.currentState()!.selectedExecutionIndex).toBe(2);
+    // the settle of the wrong execution is dropped before it becomes state
+    desires[1]!.fire(chunkOk(2, 0, null, { executionIndex: 1 }));
+    expect(viewer.currentState()!.content).toBeNull();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
   });
 });
