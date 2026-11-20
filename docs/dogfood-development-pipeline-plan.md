@@ -529,11 +529,12 @@ Contract essentials:
   Host/Origin authority `127.0.0.1:<port>`, foreign Host/Origin failing
   closed before route parsing.
 
-Only the first UI slice S1 has been built and is **Complete** (see the S1
-record below). The bounded prerequisites **P-3 (durable-identity
-projection)**, **P-1 (task/plan revision artifact content)** and **P-2
-(accepted reviewer-output content)** are landed and **Complete** (see
-below); the remaining UI implementation (S2–S8) remains not started.
+Only the first two UI slices S1 and S2 have been built and are **Complete**
+(see the S1 and S2 records below). The bounded prerequisites **P-3
+(durable-identity projection)**, **P-1 (task/plan revision artifact
+content)** and **P-2 (accepted reviewer-output content)** are landed and
+**Complete** (see below); the remaining UI implementation (S3–S8) remains
+not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
 
@@ -729,6 +730,65 @@ run-entry source for the chip.
   Finding A, and the smoke-harness fix. The accepted S1 scope and the
   corrective shape-gate/authority invariants are not reopened by this
   record.
+
+### S2 Complete: worker-logs in-place Load-log affordance (2026-11-20)
+
+S2 (the in-place `Load log` row affordance of the Worker logs section,
+served over the shipped read-only logs endpoints only) is delivered and
+marked **Complete** after the accepted implementation review plus the
+operator corrective that established the descriptor ownership.
+
+- Implementation `7cbfe447f3f7a0f668771784d50f844e2f205218` ("ui: add the
+  S2 worker-log row load affordance with the desire-liveness descriptor")
+  — CI run `44743285931` — success on the exact SHA; the review then
+  found the descriptor-ownership defect (a metadata desire could replace
+  a live content descriptor) and one false selection race-pin in the
+  test suite.
+- Corrective `9a1398a9b740d116ad25bd16483c4f3cd5039c1c` ("ui: give the
+  S2 worker-log descriptor a desire-token owner (corrective)") — CI run
+  `44753687087` — success on the exact SHA. Both commits touch UI files
+  and their suites only, leave this plan untouched, and are clean-tree
+  commits with `git diff --check` clean and a byte-identical `bun.lock`.
+- Evidence: implementation report (final, including the §6 corrective
+  record) `/exchange/outbox/increment-6-s2-implementation-report.md`
+  (SHA-256
+  `612fa579054f1e7c543b5253895763e1cc62850b09b23d41b26b560072a855ff`,
+  291 lines).
+- Closed corrective contract (C1/C2/C3): the published request descriptor
+  (`requestKind`/`requestExecutionIndex`) is owned by the viewer's
+  private desire-liveness registry and derived at every publish — a live
+  content desire carries the presentation priority over metadata; a
+  metadata desire requested during a content GET stays queued/live
+  (the transport's existing arbitration) without replacing
+  `content/executionIndex`, so the row keeps the disabled `Loading…`
+  affordance through the overlap; every terminal — settle, failure
+  (including `applyFailure`), a transport settlement without a result —
+  removes its token and re-derives the descriptor from the remaining
+  live desires (a content terminal with a live metadata desire yields
+  `metadata/null`; the last terminal yields `null/null`); stale and
+  superseded callbacks are byte-inert; the ownership tokens stay private
+  viewer state and never appear in the published document. The closed
+  row-affordance vocabulary is `View` / `Load log` / disabled `Loading…`
+  / disabled `Loaded`, derived only from the published viewer state; the
+  standalone `logs-next-chunk` control is unchanged.
+- Verification truth (recorded honestly): focused S2 suites
+  (`ui_worker_logs` + `ui_worker_logs_wiring` + `ui_model` +
+  `control_plane_ui_worker_logs`) 161/161 pass; the corrective added
+  exactly 8 tests (6+1 reverse-overlap/structural plus the corrected
+  selection race-pin) with a red-before of exactly 7 failing tests on
+  the clean S2 base; `tsc --noEmit` clean; `git diff --check` clean;
+  `bun.lock` byte-identical. Full A/B against the S2 base commit
+  (candidate tree vs `7cbfe447` worktrees, identical environment/bun,
+  concurrent whole-suite runs): base 4534 tests / 4404 pass / 130
+  failing names, candidate 4542 tests / 4412 pass / 130 failing names —
+  the failing-name sets are set-identical and every name on both sides
+  sits inside the recorded 130-name environment baseline, with no
+  smoke-family name failing on either side this run; the cross-side test
+  delta is exactly the 8 new passing S2 tests.
+- Not started (unchanged scope): UI slices S3–S8, live Browser UAT,
+  Finding A, and the smoke-harness fix. The accepted S2 scope, the
+  corrective ownership contract and the row-affordance vocabulary are
+  not reopened by this record.
 
 ## Deferred work
 
