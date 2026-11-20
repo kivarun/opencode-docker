@@ -187,6 +187,23 @@ function reviewButton(harness: Awaited<ReturnType<typeof bootWith>>["harness"], 
   return button;
 }
 
+/** The Review content button of the change row rendering `pathText`;
+ * data rows have exactly six cells, so a wrapper row (one cell) is
+ * never matched — no position-derived lookup after an anchor. */
+function reviewButtonForPath(harness: Awaited<ReturnType<typeof bootWith>>["harness"], pathText: string) {
+  const row = harness.element("changes-body").children.find(
+    (candidate) => candidate.tagName === "TR" && candidate.children.length === 6 && candidate.children[0]!.textContent === pathText,
+  );
+  if (row === undefined) {
+    throw new Error(`no data row for ${pathText}`);
+  }
+  const button = row.querySelectorAll("button").find((node) => node.textContent === "Review content");
+  if (button === undefined) {
+    throw new Error(`no Review content button on the row for ${pathText}`);
+  }
+  return button;
+}
+
 describe("v7 wiring: zero content GETs until the explicit Review", () => {
   test("the terminal inspect loads the changes metadata; no content GET and no preload", async () => {
     const { harness, wire } = await bootWith([addedEntry()]);
@@ -410,8 +427,10 @@ describe("v7 wiring: the explicit Review drives the exact content requests", () 
     );
     reviewButton(harness, 0).click();
     await Bun.sleep(4);
-    // the second Review supersedes the hanging first baseline request
-    reviewButton(harness, 1).click();
+    // the second Review supersedes the hanging first baseline request;
+    // the anchored wrapper shifts the row positions, so the lookup is
+    // by the path text (S3), never by row position
+    reviewButtonForPath(harness, "README.md").click();
     await Bun.sleep(8);
     expect(harness.element("content-review-meta").textContent).toContain("README.md");
     expect(harness.element("content-result-view").textContent).toBe("one\nXXX\ntwo\n");
@@ -451,5 +470,251 @@ describe("v7 wiring: the explicit Review drives the exact content requests", () 
     harness.click("changes-reload");
     await Bun.sleep(4);
     expect(wire.requests.filter((request) => request.path.includes("/content")).length).toBe(contentGets);
+  });
+});
+
+/* S3 battery (anchoring): the closed placement contract of the
+ * content review panel — a single wrapper row `tr > td[colspan="6"]`
+ * carrying the unmodified `#content-review-panel` element, positioned
+ * directly after the reviewed change row, with a connected parking
+ * slot as the only alternative placement. */
+
+/** The wrapper row inside `changes-body`: the one row whose only child
+ * is a table cell whose only child is the panel element. */
+function reviewWrapperRow(harness: Awaited<ReturnType<typeof bootWith>>["harness"]) {
+  const panel = harness.element("content-review-panel");
+  return harness.element("changes-body").children.find(
+    (row) =>
+      row.tagName === "TR" &&
+      row.children.length === 1 &&
+      row.children[0]!.tagName === "TD" &&
+      row.children[0]!.children.length === 1 &&
+      row.children[0]!.children[0] === panel,
+  );
+}
+
+describe("S3 wiring: the anchored content review panel", () => {
+  test("a Review anchors the panel directly after the clicked change row", async () => {
+    const { harness, wire } = await bootWith(
+      [addedEntry(), modifiedEntry()],
+      [
+        (path) => (path.includes("side=baseline") && path.includes("changes/1/") ? contentDocument({ changeIndex: 1, side: "baseline", status: "implicit_empty" }) : undefined),
+        (path) => (path.includes("side=result") ? contentDocument({ changeIndex: 1, side: "result", status: "available", bytes: new TextEncoder().encode("hi dog") }) : undefined),
+      ],
+    );
+    reviewButton(harness, 0).click();
+    await Bun.sleep(8);
+    const body = harness.element("changes-body");
+    // two data rows plus exactly one wrapper row after the anchor
+    expect(body.children.length).toBe(3);
+    const wrapper = body.children[1]!;
+    expect(wrapper.tagName).toBe("TR");
+    const cell = wrapper.children[0]!;
+    expect(cell.tagName).toBe("TD");
+    expect(cell.colSpan).toBe(6);
+    const panel = harness.element("content-review-panel");
+    expect(cell.children.length).toBe(1);
+    expect(cell.children[0]).toBe(panel);
+    expect(panel.hidden).toBe(false);
+    // the shipped content semantics are unchanged behind the new home
+    expect(harness.element("content-result-view").textContent).toBe("hi dog");
+    expect(harness.element("content-baseline-status").textContent).toContain("empty side");
+    // anchoring itself fetched nothing: still only the two explicit GETs
+    expect(wire.requests.filter((request) => request.path.includes("/content")).length).toBe(2);
+    expect(wire.requests.filter((request) => request.path.startsWith("/v1/runs/run-a/changes?")).length).toBe(1);
+  });
+
+  test("a second Review moves the same wrapper to the new anchor row", async () => {
+    const { harness, wire } = await bootWith(
+      [addedEntry(), modifiedEntry()],
+      [
+        (path) => {
+          const side = path.includes("side=baseline") ? "baseline" : "result";
+          const index = path.includes("changes/1/") ? 1 : 2;
+          if (index === 1) {
+            return contentDocument({ changeIndex: 1, side, status: side === "baseline" ? "implicit_empty" : "available", bytes: new TextEncoder().encode("dog") });
+          }
+          return contentDocument({ changeIndex: 2, side, status: "available", bytes: new TextEncoder().encode(side === "baseline" ? "one\ntwo\n" : "one\nXXX\ntwo\n"), sha256: side === "baseline" ? SHA2 : SHA });
+        },
+      ],
+    );
+    reviewButtonForPath(harness, "dogfood.txt").click();
+    await Bun.sleep(6);
+    expect(reviewWrapperRow(harness)).toBe(harness.element("changes-body").children[1]);
+    reviewButtonForPath(harness, "README.md").click();
+    await Bun.sleep(8);
+    const body = harness.element("changes-body");
+    expect(body.children.length).toBe(3);
+    const wrapper = reviewWrapperRow(harness);
+    expect(wrapper).toBeDefined();
+    expect(wrapper).toBe(body.children[2]);
+    expect(harness.element("content-review-panel").hidden).toBe(false);
+    // still exactly one panel element in the whole tree
+    const panel = harness.element("content-review-panel");
+    expect(wrapper!.children[0]!.children[0]).toBe(panel);
+    // two full reviews: exactly four explicit content GETs
+    expect(wire.requests.filter((request) => request.path.includes("/content")).length).toBe(4);
+  });
+
+  test("Close keeps the shipped panel contract while removing the wrapper", async () => {
+    const { harness } = await bootWith(
+      [addedEntry()],
+      [
+        (path) => (path.includes("side=baseline") ? contentDocument({ changeIndex: 1, side: "baseline", status: "implicit_empty" }) : undefined),
+        (path) => (path.includes("side=result") ? contentDocument({ changeIndex: 1, side: "result", status: "available", bytes: new TextEncoder().encode("dog") }) : undefined),
+      ],
+    );
+    reviewButton(harness, 0).click();
+    await Bun.sleep(6);
+    expect(reviewWrapperRow(harness)).toBeDefined();
+    harness.click("content-review-close");
+    await Bun.sleep(2);
+    expect(harness.element("content-review-panel").hidden).toBe(true);
+    expect(reviewWrapperRow(harness)).toBeUndefined();
+  });
+
+  test("an early content publish before any changes rows parks the panel hidden", async () => {
+    const hangingChanges = new Promise<Response>(() => undefined);
+    const wire = makeFetch([], []);
+    const harness = await createUiHarness({
+      fetchImpl: (path, init) => (path.includes("/changes") && !path.includes("/content") ? hangingChanges : wire.fetchImpl(path, init)),
+    });
+    try {
+      harness.click("refresh-runs");
+      await Bun.sleep(4);
+      harness.clickRunInspect(0);
+      await Bun.sleep(6);
+      // the changes GET never resolved: no rows, no wrapper, and the
+      // early content publishes left the panel parked and hidden
+      expect(harness.element("changes-body").children.length).toBe(0);
+      expect(harness.element("content-review-panel").hidden).toBe(true);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  test("repeated content publishes keep exactly one wrapper and the anchored state", async () => {
+    const bigByteCount = 131072;
+    const bigEntry: Record<string, unknown> = {
+      index: 1,
+      path: "big.txt",
+      change: "added",
+      source_relation: "matches_baseline",
+      baseline: null,
+      result: fileNode({ byte_count: bigByteCount }),
+    };
+    const { harness, wire } = await bootWith(
+      [bigEntry],
+      [
+        (path) => {
+          if (path.includes("side=baseline")) {
+            return contentDocument({ changeIndex: 1, side: "baseline", status: "implicit_empty" });
+          }
+          const offset = Number(/offset=(\d+)/.exec(path)?.[1] ?? 0);
+          const length = Math.min(65536, bigByteCount - offset);
+          return contentDocument({
+            changeIndex: 1,
+            side: "result",
+            status: "available",
+            byteCount: bigByteCount,
+            offset,
+            bytes: new Uint8Array(length).fill(65),
+            nextOffset: offset + length < bigByteCount ? offset + length : null,
+          });
+        },
+      ],
+    );
+    reviewButton(harness, 0).click();
+    await Bun.sleep(6);
+    const body = harness.element("changes-body");
+    expect(body.children.length).toBe(2);
+    expect(body.children[1]).toBe(reviewWrapperRow(harness));
+    expect(harness.element("content-review-panel").hidden).toBe(false);
+    harness.click("content-review-load-result");
+    await Bun.sleep(6);
+    // the second publish re-derived the same anchor: still one wrapper
+    // at the same position, reproduced around the never-cloned panel
+    expect(body.children.length).toBe(2);
+    expect(body.children[1]).toBe(reviewWrapperRow(harness));
+    expect(body.children[1]!.children[0]!.children[0]).toBe(harness.element("content-review-panel"));
+    expect(harness.element("content-review-panel").hidden).toBe(false);
+    expect(wire.requests.filter((request) => request.path.includes("/content")).length).toBe(3);
+  });
+
+  test("a same-observation reload that drops the reviewed row hides the panel without discarding the review", async () => {
+    const pages = [
+      changesPage(OBS, [addedEntry(), modifiedEntry()]),
+      changesPage(OBS, [addedEntry()]),
+    ];
+    let pageIndex = 0;
+    const wire = makeFetch([addedEntry(), modifiedEntry()], [
+      (path) => (path.includes("side=baseline") ? contentDocument({ changeIndex: 2, side: "baseline", status: "available", bytes: new TextEncoder().encode("one\ntwo\n"), sha256: SHA2 }) : undefined),
+      (path) => (path.includes("side=result") ? contentDocument({ changeIndex: 2, side: "result", status: "available", bytes: new TextEncoder().encode("one\nTWO\ntwo\n") }) : undefined),
+    ]);
+    const harness = await createUiHarness({
+      fetchImpl: (path, init) => (path.startsWith("/v1/runs/run-a/changes?") ? Promise.resolve(jsonResponse(pages[Math.min(pageIndex++, pages.length - 1)]!)) : wire.fetchImpl(path, init)),
+    });
+    try {
+      harness.click("refresh-runs");
+      await Bun.sleep(4);
+      harness.clickRunInspect(0);
+      await Bun.sleep(4);
+      reviewButtonForPath(harness, "README.md").click();
+      await Bun.sleep(6);
+      expect(reviewWrapperRow(harness)).toBeDefined();
+      expect(harness.element("content-review-panel").hidden).toBe(false);
+      harness.click("changes-reload");
+      await Bun.sleep(6);
+      // the shorter same-observation page dropped the reviewed row:
+      // the panel hides and parks, the loaded review stays intact
+      expect(harness.element("content-review-panel").hidden).toBe(true);
+      expect(reviewWrapperRow(harness)).toBeUndefined();
+      expect(harness.element("content-result-view").textContent).toBe("one\nTWO\ntwo\n");
+      expect(harness.element("content-baseline-status").textContent).toContain("available");
+      // no content re-fetch happened
+      expect(wire.requests.filter((request) => request.path.includes("/content")).length).toBe(2);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  test("a restored row re-anchors the same loaded review without a re-fetch", async () => {
+    const pages = [
+      changesPage(OBS, [addedEntry(), modifiedEntry()]),
+      changesPage(OBS, [addedEntry()]),
+      changesPage(OBS, [addedEntry(), modifiedEntry()]),
+    ];
+    let pageIndex = 0;
+    const wire = makeFetch([addedEntry(), modifiedEntry()], [
+      (path) => (path.includes("side=baseline") ? contentDocument({ changeIndex: 2, side: "baseline", status: "available", bytes: new TextEncoder().encode("one\ntwo\n"), sha256: SHA2 }) : undefined),
+      (path) => (path.includes("side=result") ? contentDocument({ changeIndex: 2, side: "result", status: "available", bytes: new TextEncoder().encode("one\nTWO\ntwo\n") }) : undefined),
+    ]);
+    const harness = await createUiHarness({
+      fetchImpl: (path, init) => (path.startsWith("/v1/runs/run-a/changes?") ? Promise.resolve(jsonResponse(pages[Math.min(pageIndex++, pages.length - 1)]!)) : wire.fetchImpl(path, init)),
+    });
+    try {
+      harness.click("refresh-runs");
+      await Bun.sleep(4);
+      harness.clickRunInspect(0);
+      await Bun.sleep(4);
+      reviewButtonForPath(harness, "README.md").click();
+      await Bun.sleep(6);
+      harness.click("changes-reload");
+      await Bun.sleep(6);
+      expect(harness.element("content-review-panel").hidden).toBe(true);
+      // the full page returns under the same observation: the loaded
+      // review re-anchors to the restored row with its bytes intact
+      harness.click("changes-reload");
+      await Bun.sleep(6);
+      const body = harness.element("changes-body");
+      expect(body.children.length).toBe(3);
+      const wrapper = reviewWrapperRow(harness);
+      expect(wrapper).toBe(body.children[2]);
+      expect(harness.element("content-review-panel").hidden).toBe(false);
+      expect(harness.element("content-result-view").textContent).toBe("one\nTWO\ntwo\n");
+      expect(wire.requests.filter((request) => request.path.includes("/content")).length).toBe(2);
+    } finally {
+      harness.dispose();
+    }
   });
 });

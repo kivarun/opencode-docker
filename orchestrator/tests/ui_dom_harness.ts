@@ -32,6 +32,8 @@ export class FakeElement {
   type = "";
   autocomplete = "";
   spellcheck = false;
+  /** The reflected colspan cell attribute (real-DOM IDL property). */
+  colSpan = 0;
   private readonly listeners: FakeListener[] = [];
 
   constructor(tagName: string, id = "") {
@@ -60,6 +62,31 @@ export class FakeElement {
     child.parent = this;
     this.children.push(child);
     return child;
+  }
+
+  /** Mirrors the real-DOM `Node.insertBefore` move contract: the node
+   * is removed from any current parent first (reparenting), a `null`
+   * reference appends at the end, a reference that is not a child of
+   * this element throws (the real DOM raises NotFoundError), and no
+   * child ever appears in two parents or twice in one parent. */
+  insertBefore(node: FakeElement, reference: FakeElement | null): FakeElement {
+    if (reference !== null && reference.parent !== this) {
+      throw new Error("NotFoundError: insertBefore reference is not a child of this node");
+    }
+    if (node.parent !== null) {
+      const siblings = node.parent.children;
+      const at = siblings.indexOf(node);
+      if (at >= 0) {
+        siblings.splice(at, 1);
+      }
+    }
+    node.parent = this;
+    if (reference === null) {
+      this.children.push(node);
+    } else {
+      this.children.splice(this.children.indexOf(reference), 0, node);
+    }
+    return node;
   }
 
   replaceChildren(): void {

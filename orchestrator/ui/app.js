@@ -6942,6 +6942,57 @@ const contentViewer = createProjectChangeContentViewer({
   onState: (state) => renderContentReview(state),
 });
 
+/* S3: the single placement/visibility owner of the content review
+ * panel. The panel is the one shipped element: it either sits anchored
+ * behind its change row inside the changes table (a valid
+ * tr > td[colspan=6] structure) or rests hidden in its shipped static
+ * slot at the end of the project changes section. Every move goes
+ * through insertBefore(node, reference) — the reference is the
+ * map-carried next data row or null, never a position or a scan. */
+
+const REVIEW_TABLE_COLUMN_COUNT = 6;
+let reviewRowReferences = new Map();
+let reviewWrapperRow = null;
+
+function parkContentReviewPanel() {
+  const panel = document.getElementById("content-review-panel");
+  document.getElementById("project-changes-section").insertBefore(panel, null);
+  if (reviewWrapperRow !== null) {
+    reviewWrapperRow.remove();
+    reviewWrapperRow = null;
+  }
+  panel.hidden = true;
+}
+
+function placeContentReviewPanel() {
+  parkContentReviewPanel();
+  const contentState = contentViewer.currentState();
+  const changesState = projectChangesViewer === null ? null : projectChangesViewer.currentState();
+  if (
+    contentState === null ||
+    contentState.changeIndex === null ||
+    changesState === null ||
+    changesState.runId !== contentState.runId ||
+    changesState.observation === null
+  ) {
+    return;
+  }
+  const anchor = reviewRowReferences.get(contentState.changeIndex);
+  if (anchor === undefined) {
+    return;
+  }
+  const body = document.getElementById("changes-body");
+  const panel = document.getElementById("content-review-panel");
+  const wrapperRow = document.createElement("tr");
+  const wrapperCell = document.createElement("td");
+  wrapperCell.colSpan = REVIEW_TABLE_COLUMN_COUNT;
+  wrapperRow.appendChild(wrapperCell);
+  wrapperCell.insertBefore(panel, null);
+  body.insertBefore(wrapperRow, anchor.insertBefore);
+  reviewWrapperRow = wrapperRow;
+  panel.hidden = false;
+}
+
 /** The side a content Retry click re-requests; set by the render
  * adapter from the viewer state, never persisted anywhere. */
 let contentRetrySide = null;
@@ -7077,6 +7128,8 @@ function ensureProjectChangesFor(runId) {
 }
 
 function resetProjectChangesDom() {
+  parkContentReviewPanel();
+  reviewRowReferences = new Map();
   document.getElementById("changes-body").replaceChildren();
   document.getElementById("changes-table").hidden = true;
   document.getElementById("changes-empty").textContent = "";
@@ -7085,7 +7138,6 @@ function resetProjectChangesDom() {
   document.getElementById("changes-summary").textContent = "";
   document.getElementById("changes-reload").hidden = true;
   document.getElementById("changes-load-more").hidden = true;
-  document.getElementById("content-review-panel").hidden = true;
 }
 
 /** The read-only metadata text of one baseline/result node; every
@@ -7136,7 +7188,13 @@ function renderProjectChanges(state) {
   const loadMore = document.getElementById("changes-load-more");
   const table = document.getElementById("changes-table");
   const body = document.getElementById("changes-body");
+  // the review panel is preserved through the rebuild: it is parked
+  // (connected, hidden) before the body is emptied and re-placed by
+  // the one placement owner after the rows and their insertion
+  // references exist again
+  parkContentReviewPanel();
   body.replaceChildren();
+  const builtRows = [];
   for (const entry of state.changes) {
     const row = document.createElement("tr");
     row.appendChild(element("td", entry.path));
@@ -7155,7 +7213,18 @@ function renderProjectChanges(state) {
     actions.appendChild(reviewButton);
     row.appendChild(actions);
     body.appendChild(row);
+    builtRows.push({ index: entry.index, row });
   }
+  // the insertion references are resolved only after every data row
+  // exists: each entry carries its row and the next data row (null for
+  // the last), so the placement owner never scans the body
+  reviewRowReferences = new Map();
+  for (let position = 0; position < builtRows.length; position++) {
+    const current = builtRows[position];
+    const next = position + 1 < builtRows.length ? builtRows[position + 1].row : null;
+    reviewRowReferences.set(current.index, { row: current.row, insertBefore: next });
+  }
+  placeContentReviewPanel();
   table.hidden = state.changes.length === 0;
   const presentation = PROJECT_PRESENTATION_LABELS[state.presentationState] ?? state.presentationState;
   const loadedTotal = state.summary === null ? "" : ` · loaded ${state.changes.length} of ${state.summary.total}`;
@@ -7269,7 +7338,9 @@ function renderContentReview(state) {
   const loadResult = document.getElementById("content-review-load-result");
   const retry = document.getElementById("content-review-retry");
   const reloadChanges = document.getElementById("content-review-reload-changes");
-  panel.hidden = state.changeIndex === null;
+  // the placement owner derives the panel's position and visibility
+  // from the published viewer states; this render only fills content
+  placeContentReviewPanel();
   meta.textContent = state.changeIndex === null
     ? ""
     : `change ${state.changeIndex} · ${state.changePath} · ${state.changeKind} · observation ${state.observation.slice(0, 12)}…`;

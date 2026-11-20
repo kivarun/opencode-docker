@@ -659,6 +659,27 @@ describe("ui model: export surface and source restrictions", () => {
       expect(cssSource.includes(banned)).toBe(false);
     }
   });
+
+  test("the content review panel keeps its shipped static parking slot (S3 preservation)", () => {
+    const sectionAt = htmlSource.indexOf('<div id="project-changes-section" hidden>');
+    const applyAt = htmlSource.indexOf('<div id="project-apply-section" hidden>');
+    expect(sectionAt).toBeGreaterThan(0);
+    expect(applyAt).toBeGreaterThan(sectionAt);
+    const section = htmlSource.slice(sectionAt, applyAt);
+    const actionsIn = section.indexOf('<div class="events-actions">');
+    const panelIn = section.indexOf('<div id="content-review-panel" hidden>');
+    expect(actionsIn).toBeGreaterThan(0);
+    // the parking home stays behind the explicit actions row
+    expect(panelIn).toBeGreaterThan(actionsIn);
+    // the panel block still owns its close control in the shipped slot
+    expect(section.indexOf('id="content-review-close"', panelIn)).toBeGreaterThan(panelIn);
+  });
+
+  test("the content review panel's hidden flag has a single placement owner (S3)", () => {
+    // no render/reset path may write the panel's hidden flag by element
+    // lookup; the placement owner owns the flag over a local reference
+    expect(appSource.includes('("content-review-panel").hidden')).toBe(false);
+  });
 });
 
 /* ------------------------------------------------------------------ */
