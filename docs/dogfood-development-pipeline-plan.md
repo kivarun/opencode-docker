@@ -774,17 +774,22 @@ operator corrective that established the descriptor ownership.
 - Verification truth (recorded honestly): focused S2 suites
   (`ui_worker_logs` + `ui_worker_logs_wiring` + `ui_model` +
   `control_plane_ui_worker_logs`) 161/161 pass; the corrective added
-  exactly 8 tests (6+1 reverse-overlap/structural plus the corrected
-  selection race-pin) with a red-before of exactly 7 failing tests on
-  the clean S2 base; `tsc --noEmit` clean; `git diff --check` clean;
-  `bun.lock` byte-identical. Full A/B against the S2 base commit
-  (candidate tree vs `7cbfe447` worktrees, identical environment/bun,
-  concurrent whole-suite runs): base 4534 tests / 4404 pass / 130
-  failing names, candidate 4542 tests / 4412 pass / 130 failing names —
-  the failing-name sets are set-identical and every name on both sides
-  sits inside the recorded 130-name environment baseline, with no
-  smoke-family name failing on either side this run; the cross-side test
-  delta is exactly the 8 new passing S2 tests.
+  exactly 8 new tests — 7 in `ui_worker_logs.test.ts` (1 structural
+  ownership pin plus 6 reverse-overlap/failure-path pins) and 1
+  production-DOM wiring pin in `ui_worker_logs_wiring.test.ts`; the
+  existing selection-seam race test was corrected in place to fire the
+  actual killed content desire (`desires[1]`) and is therefore not one
+  of the new tests. The materialized red-before on the clean S2 base is
+  7 fail / 90 pass and refers to the seven new viewer tests; no separate
+  red-before claim is made for the new wiring test. `tsc --noEmit`
+  clean; `git diff --check` clean; `bun.lock` byte-identical. Full A/B
+  against the S2 base commit (candidate tree vs `7cbfe447` worktrees,
+  identical environment/bun, concurrent whole-suite runs): base 4534
+  tests / 4404 pass / 130 failing names, candidate 4542 tests / 4412
+  pass / 130 failing names — the failing-name sets are set-identical and
+  every name on both sides sits inside the recorded 130-name environment
+  baseline, with no smoke-family name failing on either side this run;
+  the cross-side test delta is exactly the 8 new passing S2 tests.
 - Not started (unchanged scope): UI slices S3–S8, live Browser UAT,
   Finding A, and the smoke-harness fix. The accepted S2 scope, the
   corrective ownership contract and the row-affordance vocabulary are
