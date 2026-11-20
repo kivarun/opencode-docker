@@ -526,11 +526,17 @@ export interface UiWorkerLogsState {
   readonly content: UiWorkerLogContent | null;
   readonly requestState: "idle" | "loading" | "ready" | "failed";
   /**
-   * The closed S2 request descriptor: the kind of the one unsettled
-   * logs GET as published viewer state. `metadata` carries no
+   * The closed S2 request descriptor: the kind of the one
+   * presentation-owning unsettled logs GET. The published descriptor is
+   * owned by the viewer's private desire-liveness registry, never
+   * written by hand: a live content desire carries the presentation
+   * priority over metadata (a metadata desire requested during a
+   * content GET stays queued/live without replacing
+   * `content/executionIndex`), and every desire terminal re-derives the
+   * descriptor from the remaining live desires. `metadata` carries no
    * execution, `content` names exactly the selected execution and the
-   * null form is all-null; every desire terminal (settle, fail,
-   * selection change, run change, invalidation) returns the null form.
+   * null form is all-null; the ownership tokens never appear in the
+   * published document.
    */
   readonly requestKind: "metadata" | "content" | null;
   readonly requestExecutionIndex: number | null;

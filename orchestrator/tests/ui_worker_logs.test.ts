@@ -1032,20 +1032,27 @@ describe("the S2 request descriptor and desire liveness", () => {
     expect(settled.content).toBeNull();
     expect(settled.selectedExecutionIndex).toBe(2);
     expect(desires).toHaveLength(2); // no additional request
-    // the late response of the dead desire changes nothing
+    // the late response of the dead CONTENT desire (desires[1], the exact
+    // desire the selection killed) changes nothing — late success first
     const settledSnapshot = structuredClone(settled);
-    desires[0]!.fire(chunkOk(1, 0, null));
+    desires[1]!.fire(chunkOk(1, 0, null));
     expect(viewer.currentState()).toEqual(settledSnapshot);
     expect(viewer.currentState()!.content).toBeNull();
     expect(viewer.currentState()!.requestState).not.toBe("loading");
+    // and the late failure of the same dead desire is equally inert
+    desires[1]!.fire(transportFailure());
+    expect(viewer.currentState()).toEqual(settledSnapshot);
     // and a fresh load of F re-establishes its own descriptor
     viewer.fetchChunk();
     expect(desires).toHaveLength(3);
     expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 2 });
     expect(viewer.currentState()!.requestState).toBe("loading");
-    // and the older callback remains inert after the new desire started
+    // the older callback remains inert after the new desire started —
+    // late success and late failure are both byte-inert here too
     const beforeLate = snapshot(viewer);
-    desires[0]!.fire(chunkOk(1, 0, null));
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()).toEqual(beforeLate);
+    desires[1]!.fire(transportFailure());
     expect(viewer.currentState()).toEqual(beforeLate);
     expect(states.length).toBeGreaterThan(0);
   });
@@ -1202,5 +1209,152 @@ describe("the S2 request descriptor and desire liveness", () => {
     desires[1]!.fire(chunkOk(2, 0, null, { executionIndex: 1 }));
     expect(viewer.currentState()!.content).toBeNull();
     expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+  });
+
+  /** The reverse-overlap setup: the metadata list is applied, execution
+   * 1 is selected and its content GET is unsettled while an automatic
+   * metadata refresh is requested behind it (the transport queues the
+   * metadata desire; the viewer keeps it live). The descriptor must
+   * stay in the content form through the whole overlap. */
+  const bootContentWithQueuedMetadata = () => {
+    const { viewer, desires, states } = makeRecordingViewer();
+    viewer.inspectApplied({ runId: "run-a", revision: 24 });
+    desires[0]!.fire(listOk(24, [capturedEntry(1), capturedEntry(2)]));
+    viewer.selectExecution(1);
+    viewer.fetchChunk(); // the live content desire F
+    expect(desires).toHaveLength(2);
+    viewer.inspectApplied({ runId: "run-a", revision: 30 }); // the queued metadata desire M
+    expect(desires).toHaveLength(3);
+    expect(desires[1]!.kind).toBe("content");
+    expect(desires[2]!.kind).toBe("metadata");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    return { viewer, desires, states };
+  };
+
+  test("the corrective descriptor ownership is structural: one derivation, no imperative write site", () => {
+    // the initial state and the derivation are the only authors of the
+    // published descriptor fields: the imperative write sites of the
+    // pre-corrective shape (applyFailure, endDesire, the five desire
+    // establishments and the selection seam) are gone
+    expect(appSource.split("requestKind:").length - 1).toBe(5); // initial state + the four derivation returns
+    expect(appSource.split("requestExecutionIndex:").length - 1).toBe(5);
+    // the derivation is applied inside the one publish site only
+    expect(appSource.split("descriptorForPublish").length - 1).toBe(2); // declaration + the one publish call
+    expect(appSource.split("hasLiveContentDesire").length - 1).toBe(2); // declaration + the one selection-seam call
+    // the ownership tokens stay private viewer state and never reach the
+    // DOM model: the published state shape carries no registry field
+    expect(appSource.split("nextDesireToken").length - 1).toBe(4); // declaration, increment, set and return
+    const initial = createWorkerLogsState("run-a");
+    expect(Object.keys(initial).sort()).toEqual([
+      "content",
+      "error",
+      "logs",
+      "requestExecutionIndex",
+      "requestKind",
+      "requestState",
+      "runId",
+      "selectedExecutionIndex",
+      "snapshotRevision",
+    ]);
+  });
+
+  test("reverse overlap: a metadata desire during a live content GET never takes the descriptor", () => {
+    const { viewer } = bootContentWithQueuedMetadata();
+    // the descriptor still names the live content desire exactly, so the
+    // row affordance keeps the disabled Loading… form (the wiring proves
+    // the rendered label; here the published derivation inputs are pinned)
+    expect(viewer.currentState()!.requestState).toBe("loading");
+    expect(viewer.currentState()!.selectedExecutionIndex).toBe(1);
+    // further automatic refreshes cannot take the descriptor either
+    viewer.inspectApplied({ runId: "run-a", revision: 31 });
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    expect(viewer.currentState()!.requestState).toBe("loading");
+  });
+
+  test("reverse overlap: the content owner's terminal hands the descriptor to the remaining metadata desire", () => {
+    const { viewer, desires } = bootContentWithQueuedMetadata();
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("ready");
+    // the content result applied exactly once: a repeated terminal of the
+    // settled desire is byte-inert and the metadata form survives
+    const settled = snapshot(viewer);
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()).toEqual(settled);
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+  });
+
+  test("reverse overlap: the last desire terminal returns the descriptor to the null form", () => {
+    const { viewer, desires } = bootContentWithQueuedMetadata();
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    desires[2]!.fire(listOk(30, [capturedEntry(1), capturedEntry(2)]));
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("ready");
+    expect(viewer.currentState()!.snapshotRevision).toBe(30);
+    expect(viewer.currentState()!.logs).toHaveLength(2);
+  });
+
+  test("reverse overlap: a metadata terminal cannot lift the live content pending", () => {
+    const { viewer, desires } = bootContentWithQueuedMetadata();
+    // the metadata terminal settles the metadata view but leaves the
+    // content descriptor exactly as it is
+    desires[2]!.fire(listOk(30, [capturedEntry(1), capturedEntry(2)]));
+    expect(viewer.currentState()!.requestState).toBe("ready"); // the metadata view settled
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    const afterMeta = snapshot(viewer);
+    // and the metadata failure terminal is equally unable to lift it
+    viewer.inspectApplied({ runId: "run-a", revision: 31 });
+    expect(desires).toHaveLength(4);
+    desires[3]!.fire(transportFailure());
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 1 });
+    // the live content owner still settles normally and applies exactly once
+    expect(viewer.currentState()).not.toEqual(afterMeta); // the metadata failure applied its own fields
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    expect(viewer.currentState()!.requestState).toBe("ready");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+  });
+
+  test("reverse overlap: a new content desire supersedes the live metadata and becomes the single owner", () => {
+    const { viewer, desires } = bootContentWithQueuedMetadata();
+    // first the content owner is closed by the selection seam: the queued
+    // metadata desire stays the sole presentation owner
+    viewer.selectExecution(2);
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    // the closed content desire's late terminal stays inert
+    desires[1]!.fire(chunkOk(1, 0, null));
+    expect(viewer.currentState()!.content).toBeNull();
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    // a new content desire supersedes the live metadata desire
+    viewer.fetchChunk();
+    expect(desires).toHaveLength(4);
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "content", requestExecutionIndex: 2 });
+    expect(viewer.currentState()!.requestState).toBe("loading");
+    // the superseded metadata desire's terminals are inert on both forms
+    desires[2]!.fire(listOk(30, [capturedEntry(1), capturedEntry(2)]));
+    const beforeInert = snapshot(viewer);
+    desires[2]!.fire(transportFailure());
+    expect(viewer.currentState()).toEqual(beforeInert);
+    // and when the single owner settles, the descriptor is the null form
+    desires[3]!.fire(chunkOk(2, 0, null));
+    expect(viewer.currentState()!.content!.text).toBe("hello world");
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+  });
+
+  test("reverse overlap: the failure path of the content owner re-derives without clearing a live metadata owner", () => {
+    const { viewer, desires } = bootContentWithQueuedMetadata();
+    desires[1]!.fire(transportFailure());
+    expect(viewer.currentState()!.requestState).toBe("failed");
+    // the failed content owner leaves the queued metadata desire as the
+    // remaining live owner: the descriptor is the metadata form, never
+    // an unconditional null form
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: "metadata", requestExecutionIndex: null });
+    desires[2]!.fire(listOk(30, [capturedEntry(1), capturedEntry(2)]));
+    expect(descriptorOf(viewer.currentState()!)).toEqual({ requestKind: null, requestExecutionIndex: null });
+    expect(viewer.currentState()!.requestState).toBe("ready");
   });
 });

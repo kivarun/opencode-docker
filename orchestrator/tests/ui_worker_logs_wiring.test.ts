@@ -1127,6 +1127,51 @@ describe("the S2 row-button affordance", () => {
     harness.dispose();
   });
 
+  test("an automatic metadata refresh during a held content GET keeps the row Loading…", async () => {
+    const { harness, transport } = await bootDeferred({
+      listMetadata: [[capturedMetadataAt(1), capturedMetadataAt(2)]],
+      inspectRevisions: [24, 30],
+      holdChunkCalls: [1],
+      holdListCalls: [2],
+    });
+    viewButtonOfRow(harness, 0).click(); // select execution 1
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    rowButtonOf(harness, 0).click(); // the content GET is held on the wire
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Loading…");
+    expect(rowButtonOf(harness, 0).disabled).toBe(true);
+    // the applied revision-30 inspect requests the automatic metadata
+    // refresh while the content GET is unsettled: the descriptor stays
+    // owned by the content desire and the row label never changes
+    harness.click("inspect-selected");
+    await Bun.sleep(10);
+    expect(rowButtonOf(harness, 0).textContent).toBe("Loading…");
+    expect(rowButtonOf(harness, 0).disabled).toBe(true);
+    expect(rowButtonOf(harness, 1).textContent).toBe("View"); // the other rows stay selection-only
+    expect(transport.heldCount()).toBe(1); // only the chunk GET is unsettled; the metadata is queued behind it
+    // the content terminal hands the presentation to the queued metadata:
+    // the row leaves the content pending in place
+    transport.release({
+      ...chunkBody(1, "hello w"),
+      byte_count: 11,
+      next_offset: 7,
+    });
+    await Bun.sleep(10);
+    expect(harness.logsContent()).toBe("hello w");
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    expect(transport.counts().list).toBe(2); // the queued metadata GET started after the chunk settled
+    // the metadata terminal re-derives the metadata view; the descriptor
+    // returns to the null form behind the same rows
+    transport.release({ schema_version: 1, kind: "worker_logs", run_id: "run-a", revision: 30, logs: [capturedMetadataAt(1), capturedMetadataAt(2)] });
+    await Bun.sleep(10);
+    expect(harness.logsStatus()).toContain("snapshot revision 30");
+    expect(rowButtonOf(harness, 0).textContent).toBe("Load log");
+    expect(rowButtonOf(harness, 0).disabled).toBe(false);
+    harness.dispose();
+  });
+
   test("the selection change settles the stale pending presentation in the DOM", async () => {
     const { harness, transport } = await bootDeferred({
       listMetadata: [[capturedMetadataAt(1), capturedMetadataAt(2)]],
