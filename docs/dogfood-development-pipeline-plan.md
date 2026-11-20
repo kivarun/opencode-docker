@@ -685,7 +685,8 @@ including §4b recording the corrective).
 
 S1 (the run-rail identity line plus the Project Apply capability chip in
 the Browser UI runs list) is delivered over the shipped read-only surfaces
-(`GET /v1/runs`, `GET /v1/runs/:runId`, `GET /v1/projects`) and is marked
+(`GET /v1/runs`, `GET /v1/runs/:runId`, `GET /v1/runs/:runId/events`,
+`GET /v1/projects`) and is marked
 **Complete** after the accepted implementation review plus the operator
 corrective demanding a strict timeline-shape gate and an authoritative
 run-entry source for the chip.
@@ -711,22 +712,19 @@ run-entry source for the chip.
   `ui_inspect_http` green); focused A/B 528 pass / 9 fail with the
   failure-name set equal to the baseline set; full run 4514 tests,
   4383 pass, 131 failures; `tsc --noEmit` and `git diff --check` clean;
-  `bun.lock` unchanged. The run contains **one new failure beyond the
-  established environmental families**, in the pre-existing
+  `bun.lock` unchanged. The run contains **one additional failure name
+  relative to the recorded 130-name baseline**, in the pre-existing
   `orchestrator/tests/smoke.test.ts` signal battery (test 7, exact vector
   `b2: expected "session_created", received "worker_running"`). Controlled
   A/B (60 full-file runs per side over `1727a69` vs `29b548c` worktrees)
-  plus a timed diagnostic trace proved the whole smoke/lifecycle/state
-  chain byte-identical between the two commits: the identical test-name
-  family reproduces on the clean base (9 failing runs / 60, incl. the
-  exact `b2 → worker_running` vector in base runs i17 and i59), so the
-  failure is **pre-existing, not S1-caused**. Traces prove two mechanisms
-  (signal recorded before the lifecycle checkpoint skipping the
-  `worker_running` write; a FIFO `open(R)` hang after a writer that
-  finished before the reader opened); the exact 691-vector mechanism
-  remains unresolved while its base reproduction excludes S1 causality.
-  The inherited smoke signal/FIFO harness instability is not fixed and
-  stays out of S1 scope (separate harness finding, not started).
+  proved the whole smoke/lifecycle/state chain byte-identical between the
+  two commits: the identical test-name family reproduces on the clean
+  base (9 failing runs / 60, incl. the exact `b2 → worker_running` vector
+  in base runs i17 and i59), so the failure is **pre-existing, not
+  S1-caused** — S1 causality is excluded, while the exact mechanism of
+  that 691-vector remains unresolved. The inherited smoke signal/FIFO
+  harness instability is not fixed and stays out of S1 scope (separate
+  harness finding, not started).
 - Not started (unchanged scope): UI slices S2–S8, live Browser UAT,
   Finding A, and the smoke-harness fix. The accepted S1 scope and the
   corrective shape-gate/authority invariants are not reopened by this
