@@ -6973,7 +6973,8 @@ function placeContentReviewPanel() {
     contentState.changeIndex === null ||
     changesState === null ||
     changesState.runId !== contentState.runId ||
-    changesState.observation === null
+    changesState.observation === null ||
+    changesState.observation !== contentState.observation
   ) {
     return;
   }

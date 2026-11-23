@@ -64,14 +64,18 @@ export class FakeElement {
     return child;
   }
 
-  /** Mirrors the real-DOM `Node.insertBefore` move contract: the node
-   * is removed from any current parent first (reparenting), a `null`
-   * reference appends at the end, a reference that is not a child of
-   * this element throws (the real DOM raises NotFoundError), and no
-   * child ever appears in two parents or twice in one parent. */
+  /** Mirrors the real-DOM `Node.insertBefore` move contract: a node
+   * inserted before itself (`node === reference`) is a no-op, the node
+   * is removed from any other current parent first (reparenting), a
+   * `null` reference appends at the end, a reference that is not a
+   * child of this element throws (the real DOM raises NotFoundError),
+   * and no child ever appears in two parents or twice in one parent. */
   insertBefore(node: FakeElement, reference: FakeElement | null): FakeElement {
     if (reference !== null && reference.parent !== this) {
       throw new Error("NotFoundError: insertBefore reference is not a child of this node");
+    }
+    if (node === reference) {
+      return node;
     }
     if (node.parent !== null) {
       const siblings = node.parent.children;

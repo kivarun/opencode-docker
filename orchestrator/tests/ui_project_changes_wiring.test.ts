@@ -949,3 +949,364 @@ describe("S3 wiring: anchoring survives the changes render cycle", () => {
     expect(tbody.children[0]).toBe(first);
   });
 });
+
+describe("S3 corrective wiring: observation binding, late callbacks and request accounting", () => {
+  /** The panel family snapshot: the listed elements with their text,
+   * visibility, disabled state and topology, serialized as JSON so two
+   * snapshots compare byte-for-byte. */
+  const PANEL_FAMILY_IDS = [
+    "content-review-panel",
+    "content-review-meta",
+    "content-review-status",
+    "content-baseline-status",
+    "content-baseline-view",
+    "content-result-status",
+    "content-result-view",
+    "content-diff-status",
+    "content-diff-view",
+    "content-review-load-baseline",
+    "content-review-load-result",
+    "content-review-retry",
+    "content-review-reload-changes",
+    "content-review-close",
+  ];
+  function contentReviewSnapshot(harness: ChangesHarness): string {
+    const parentChain = (element: FakeElement): string => {
+      const chain: string[] = [];
+      let current = element.parent;
+      while (current !== null) {
+        chain.push(current.id !== "" ? `#${current.id}` : current.tagName);
+        current = current.parent;
+      }
+      return chain.join("<") || "(detached)";
+    };
+    const parts: Record<string, unknown> = {};
+    const capture = (id: string) => {
+      const element = harness.element(id);
+      parts[id] =
+        element === undefined
+          ? null
+          : {
+              tag: element.tagName,
+              text: element.textContent,
+              hidden: element.hidden,
+              disabled: element.disabled,
+              className: element.className,
+              parent: element.parent === null ? "(detached)" : parentChain(element),
+              index: element.parent === null ? -1 : element.parent.children.indexOf(element),
+              childTags: element.children.map((child) => child.tagName),
+            };
+    };
+    for (const id of PANEL_FAMILY_IDS) {
+      capture(id);
+    }
+    capture("error");
+    return JSON.stringify(parts);
+  }
+
+  function contentDocFor(runId: string, observation: string, side: string, bytes: string, sha256: string) {
+    let binary = "";
+    for (const character of new TextEncoder().encode(bytes)) {
+      binary += String.fromCharCode(character);
+    }
+    return {
+      schema_version: 1,
+      kind: "project_change_content",
+      run_id: runId,
+      revision: 12,
+      observation,
+      change_index: 1,
+      side,
+      status: "available",
+      byte_count: bytes.length,
+      sha256,
+      offset: 0,
+      data_base64: btoa(binary),
+      next_offset: null,
+    };
+  }
+  function emptyBaselineDoc(runId: string, observation: string) {
+    return {
+      schema_version: 1,
+      kind: "project_change_content",
+      run_id: runId,
+      revision: 12,
+      observation,
+      change_index: 1,
+      side: "baseline",
+      status: "implicit_empty",
+      byte_count: 0,
+      offset: 0,
+      data_base64: "",
+      next_offset: null,
+    };
+  }
+  const OBS_A = "a".repeat(64);
+  const OBS_B = "b".repeat(64);
+  const OBS_C = "f".repeat(64);
+  const resultSha = "c".repeat(64);
+  const otherSha = "f".repeat(64);
+  const resultText = "one\nTWO\ntwo\n";
+
+  test("a diverging changes observation parks the anchored panel; the panel may re-anchor after the content follows to the new observation", async () => {
+    const entriesA = [{ ...addedEntry(), result: fileNode({ byte_count: 12 }) }, modifiedEntry()];
+    const entriesB = [
+      { ...addedEntry(), result: fileNode({ byte_count: 12, sha256: otherSha }) },
+      { ...modifiedEntry(), result: fileNode({ byte_count: 34, sha256: otherSha }) },
+    ];
+    const wire = makeFetch({
+      changes: [changesPage({ entries: entriesA }), changesPage({ observation: OBS_B, entries: entriesB })],
+    });
+    let contentGets = 0;
+    const harness = await createUiHarness({
+      fetchImpl: (path, init) => {
+        if (/^\/v1\/runs\/run-a\/changes\/\d+\/content\?/.test(path)) {
+          contentGets += 1;
+          const observation = path.includes(`observation=${OBS_B}`) ? OBS_B : OBS_A;
+          const sha256 = observation === OBS_B ? otherSha : resultSha;
+          if (path.includes("side=baseline")) {
+            return Promise.resolve(jsonResponse(emptyBaselineDoc("run-a", observation)));
+          }
+          return Promise.resolve(jsonResponse(contentDocFor("run-a", observation, "result", resultText, sha256)));
+        }
+        return wire.fetchImpl(path, init);
+      },
+    });
+    try {
+      harness.click("refresh-runs");
+      await wait();
+      await harness.clickRunInspect(0);
+      await wait();
+      expect(wire.changesGets.length).toBe(1);
+      reviewButtonForPath(harness, "dogfood.txt").click();
+      await wait();
+      expect(reviewWrapperRow(harness)).toBeDefined();
+      expect(harness.element("content-review-panel").hidden).toBe(false);
+      expect(harness.element("content-result-view").textContent).toBe(resultText);
+      // the same-run reload moves the metadata to observation B under
+      // the same run id and change index: the anchored review may not
+      // survive it — the panel has to sit parked and hidden with no
+      // wrapper row
+      harness.click("changes-reload");
+      await wait();
+      const body = harness.element("changes-body");
+      expect(body.children.length).toBe(2);
+      expect(reviewWrapperRow(harness)).toBeUndefined();
+      expect(harness.element("content-review-panel").hidden).toBe(true);
+      expect(harness.element("content-review-meta").textContent).toBe("");
+      // once the content follows to observation B (a new explicit
+      // Review under the new observation), re-anchoring is allowed
+      reviewButtonForPath(harness, "dogfood.txt").click();
+      await wait();
+      expect(reviewWrapperRow(harness)).toBeDefined();
+      expect(harness.element("content-review-panel").hidden).toBe(false);
+      expect(harness.element("content-result-view").textContent).toBe(resultText);
+      expect(wire.changesGets.length).toBe(2);
+      expect(wire.posts.length).toBe(0);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  test("a late old-run success callback leaves the content-review DOM byte-equivalent", async () => {
+    const wire = makeFetch({
+      runs: ["run-a", "run-b"],
+      inspect: [succeededInspect, succeededInspect],
+      changes: [
+        changesPage({ entries: [{ ...addedEntry(), result: fileNode({ byte_count: 12 }) }, modifiedEntry()] }),
+        changesPage({ runId: "run-b", entries: [{ ...addedEntry(), result: fileNode({ byte_count: 12 }) }] }),
+      ],
+    });
+    const gates: Array<(response: Response) => void> = [];
+    const harness = await createUiHarness({
+      fetchImpl: (path, init) => {
+        if (/^\/v1\/runs\/run-a\/changes\/\d+\/content\?/.test(path)) {
+          if (path.includes("side=baseline")) {
+            // the gate honours the transport's abort signal exactly
+            // like fetch: an aborted response is never delivered
+            return new Promise<Response>((resolve, reject) => {
+              const signal = init?.signal ?? null;
+              let settled = false;
+              const finish = (deliver: () => void) => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                deliver();
+              };
+              if (signal !== null) {
+                signal.addEventListener("abort", () => finish(() => reject(new Error("aborted"))), { once: true });
+              }
+              gates.push((response) => finish(() => resolve(response)));
+            }) as never;
+          }
+          return Promise.resolve(jsonResponse(contentDocFor("run-a", OBS_A, "result", resultText, resultSha)));
+        }
+        return wire.fetchImpl(path, init);
+      },
+    });
+    try {
+      harness.click("refresh-runs");
+      await wait();
+      await harness.clickRunInspect(0);
+      await wait();
+      reviewButtonForPath(harness, "dogfood.txt").click();
+      await wait(10);
+      expect(harness.element("content-baseline-status").textContent).toContain("Loading");
+      // switch to run B; every legitimate transition settles before the
+      // snapshot
+      await harness.clickRunInspect(1);
+      await wait();
+      const before = contentReviewSnapshot(harness);
+      // the old run's baseline response arrives late as a success
+      gates[0]?.(jsonResponse(contentDocFor("run-a", OBS_A, "baseline", "one\ntwo\ntext", "d".repeat(64))));
+      await wait();
+      expect(contentReviewSnapshot(harness)).toBe(before);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  test("a late old-run failure callback leaves the content-review DOM byte-equivalent", async () => {
+    const wire = makeFetch({
+      runs: ["run-a", "run-b"],
+      inspect: [succeededInspect, succeededInspect],
+      changes: [
+        changesPage({ entries: [{ ...addedEntry(), result: fileNode({ byte_count: 12 }) }, modifiedEntry()] }),
+        changesPage({ runId: "run-b", entries: [{ ...addedEntry(), result: fileNode({ byte_count: 12 }) }] }),
+      ],
+    });
+    const gates: Array<(response: Response) => void> = [];
+    const harness = await createUiHarness({
+      fetchImpl: (path, init) => {
+        if (/^\/v1\/runs\/run-a\/changes\/\d+\/content\?/.test(path)) {
+          if (path.includes("side=baseline")) {
+            // the gate honours the transport's abort signal exactly
+            // like fetch: an aborted response is never delivered
+            return new Promise<Response>((resolve, reject) => {
+              const signal = init?.signal ?? null;
+              let settled = false;
+              const finish = (deliver: () => void) => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                deliver();
+              };
+              if (signal !== null) {
+                signal.addEventListener("abort", () => finish(() => reject(new Error("aborted"))), { once: true });
+              }
+              gates.push((response) => finish(() => resolve(response)));
+            }) as never;
+          }
+          return Promise.resolve(jsonResponse(contentDocFor("run-a", OBS_A, "result", resultText, resultSha)));
+        }
+        return wire.fetchImpl(path, init);
+      },
+    });
+    try {
+      harness.click("refresh-runs");
+      await wait();
+      await harness.clickRunInspect(0);
+      await wait();
+      reviewButtonForPath(harness, "dogfood.txt").click();
+      await wait(10);
+      expect(harness.element("content-baseline-status").textContent).toContain("Loading");
+      await harness.clickRunInspect(1);
+      await wait();
+      const before = contentReviewSnapshot(harness);
+      // the old run's baseline response arrives late as a transport
+      // failure
+      gates[0]?.(new Response("boom", { status: 500 }));
+      await wait();
+      expect(contentReviewSnapshot(harness)).toBe(before);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  test("terminal succeeded and failed runs drive exactly the expected requests", async () => {
+    let contentGets = 0;
+    const wire = makeFetch({
+      runs: ["run-a", "run-b"],
+      inspect: [succeededInspect, failedInspect],
+      changes: [
+        changesPage({ entries: [{ ...addedEntry(), result: fileNode({ byte_count: 12 }) }, modifiedEntry()] }),
+        changesPage({ runId: "run-b", entries: [{ ...addedEntry(), result: fileNode({ byte_count: 12 }) }] }),
+      ],
+    });
+    const harness = await createUiHarness({
+      fetchImpl: (path, init) => {
+        const contentMatch = /^\/v1\/runs\/(run-[ab])\/changes\/\d+\/content\?/.exec(path);
+        if (contentMatch !== null) {
+          contentGets += 1;
+          const runId = contentMatch[1] ?? "run-a";
+          if (path.includes("side=baseline")) {
+            return Promise.resolve(jsonResponse(emptyBaselineDoc(runId, OBS_A)));
+          }
+          return Promise.resolve(jsonResponse(contentDocFor(runId, OBS_A, "result", resultText, resultSha)));
+        }
+        return wire.fetchImpl(path, init);
+      },
+    });
+    try {
+      harness.click("refresh-runs");
+      await wait();
+      // succeeded terminal run
+      await harness.clickRunInspect(0);
+      await wait();
+      expect(wire.changesGets.length).toBe(1);
+      const contentGetsBefore = contentGets;
+      reviewButtonForPath(harness, "dogfood.txt").click();
+      await wait();
+      expect(harness.element("content-result-view").textContent).toBe(resultText);
+      expect(contentGets - contentGetsBefore).toBe(2);
+      expect(wire.changesGets.length).toBe(1);
+      expect(wire.posts.length).toBe(0);
+      // failed terminal run
+      await harness.clickRunInspect(1);
+      await wait();
+      expect(wire.changesGets.length).toBe(2);
+      const contentGetsAfterSwitch = contentGets;
+      reviewButtonForPath(harness, "dogfood.txt").click();
+      await wait();
+      expect(harness.element("content-result-view").textContent).toBe(resultText);
+      expect(contentGets - contentGetsAfterSwitch).toBe(2);
+      expect(wire.changesGets.length).toBe(2);
+      expect(wire.posts.length).toBe(0);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  test("FakeElement.insertBefore(node, node) is an exact no-op (S3 corrective)", () => {
+    const parent = new FakeElement("tbody", "");
+    const first = new FakeElement("tr", "");
+    const second = new FakeElement("tr", "");
+    const third = new FakeElement("tr", "");
+    parent.appendChild(first);
+    parent.appendChild(second);
+    parent.appendChild(third);
+    // a node inserted before itself stays exactly where it is
+    parent.insertBefore(second, second);
+    expect(parent.children.map((child) => child === first ? "first" : child === second ? "second" : "third")).toEqual(
+      ["first", "second", "third"],
+    );
+    expect(second.parent).toBe(parent);
+    expect(parent.children.filter((child) => child === second).length).toBe(1);
+    // the head-of-list form is equally inert
+    parent.insertBefore(first, first);
+    expect(parent.children[0]).toBe(first);
+    expect(parent.children.map((child) => child.tagName)).toEqual(["TR", "TR", "TR"]);
+    expect(first.parent).toBe(parent);
+    expect(parent.children.filter((child) => child === first).length).toBe(1);
+    // node === reference outside the target parent keeps the real-DOM
+    // NotFoundError mirror: the throwing contract is not weakened
+    const foreignParent = new FakeElement("tbody", "");
+    const foreign = new FakeElement("tr", "");
+    foreignParent.appendChild(foreign);
+    expect(() => parent.insertBefore(foreign, foreign)).toThrow();
+    expect(parent.children.length).toBe(3);
+    expect(foreign.parent).toBe(foreignParent);
+  });
+});
