@@ -681,11 +681,19 @@ describe("ui model: export surface and source restrictions", () => {
     expect(appSource.includes('("content-review-panel").hidden')).toBe(false);
   });
 
-  test("the placement owner carries exactly one observation-equality gate (S3 evidence)", () => {
+  test("the observation-equality gate is owned exactly once by placeContentReviewPanel (S3 evidence)", () => {
     // the fail-closed observation binding of the placement owner: the
-    // owner refuses to anchor a review whose recorded observation
-    // differs from the loaded metadata observation
-    expect(appSource.split("changesState.observation !== contentState.observation").length - 1).toBe(1);
+    // gate must exist exactly once in the whole source and exactly
+    // once inside the extracted `placeContentReviewPanel` body, so the
+    // pin proves both uniqueness and ownership by the placement owner
+    const gate = "changesState.observation !== contentState.observation";
+    const start = appSource.indexOf("function placeContentReviewPanel()");
+    const end = appSource.indexOf("let contentRetrySide = null;");
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const ownerSource = appSource.slice(start, end);
+    expect(appSource.split(gate).length - 1).toBe(1);
+    expect(ownerSource.split(gate).length - 1).toBe(1);
   });
 });
 
