@@ -680,6 +680,13 @@ describe("ui model: export surface and source restrictions", () => {
     // lookup; the placement owner owns the flag over a local reference
     expect(appSource.includes('("content-review-panel").hidden')).toBe(false);
   });
+
+  test("the placement owner carries exactly one observation-equality gate (S3 evidence)", () => {
+    // the fail-closed observation binding of the placement owner: the
+    // owner refuses to anchor a review whose recorded observation
+    // differs from the loaded metadata observation
+    expect(appSource.split("changesState.observation !== contentState.observation").length - 1).toBe(1);
+  });
 });
 
 /* ------------------------------------------------------------------ */

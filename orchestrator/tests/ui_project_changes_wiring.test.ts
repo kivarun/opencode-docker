@@ -1108,7 +1108,7 @@ describe("S3 corrective wiring: observation binding, late callbacks and request 
     }
   });
 
-  test("a late old-run success callback leaves the content-review DOM byte-equivalent", async () => {
+  test("after the abort the saved content response is never delivered and the content-review DOM stays byte-equivalent", async () => {
     const wire = makeFetch({
       runs: ["run-a", "run-b"],
       inspect: [succeededInspect, succeededInspect],
@@ -1118,12 +1118,15 @@ describe("S3 corrective wiring: observation binding, late callbacks and request 
       ],
     });
     const gates: Array<(response: Response) => void> = [];
+    const gateState = { aborted: false, delivered: false };
     const harness = await createUiHarness({
       fetchImpl: (path, init) => {
         if (/^\/v1\/runs\/run-a\/changes\/\d+\/content\?/.test(path)) {
           if (path.includes("side=baseline")) {
             // the gate honours the transport's abort signal exactly
-            // like fetch: an aborted response is never delivered
+            // like fetch: an aborted response is never delivered; the
+            // saved gate records whether the delivery attempt would
+            // have gone through
             return new Promise<Response>((resolve, reject) => {
               const signal = init?.signal ?? null;
               let settled = false;
@@ -1135,9 +1138,19 @@ describe("S3 corrective wiring: observation binding, late callbacks and request 
                 deliver();
               };
               if (signal !== null) {
-                signal.addEventListener("abort", () => finish(() => reject(new Error("aborted"))), { once: true });
+                signal.addEventListener(
+                  "abort",
+                  () => {
+                    gateState.aborted = true;
+                    finish(() => reject(new Error("aborted")));
+                  },
+                  { once: true },
+                );
               }
-              gates.push((response) => finish(() => resolve(response)));
+              gates.push((response) => finish(() => {
+                gateState.delivered = true;
+                resolve(response);
+              }));
             }) as never;
           }
           return Promise.resolve(jsonResponse(contentDocFor("run-a", OBS_A, "result", resultText, resultSha)));
@@ -1158,16 +1171,21 @@ describe("S3 corrective wiring: observation binding, late callbacks and request 
       await harness.clickRunInspect(1);
       await wait();
       const before = contentReviewSnapshot(harness);
-      // the old run's baseline response arrives late as a success
+      // the transport aborted the old request at the run switch; the
+      // saved (success-shaped) response can no longer be delivered, so
+      // this proves the abort contract and the post-settle DOM
+      // stability — it does not deliver a late callback
       gates[0]?.(jsonResponse(contentDocFor("run-a", OBS_A, "baseline", "one\ntwo\ntext", "d".repeat(64))));
       await wait();
+      expect(gateState.aborted).toBe(true);
+      expect(gateState.delivered).toBe(false);
       expect(contentReviewSnapshot(harness)).toBe(before);
     } finally {
       harness.dispose();
     }
   });
 
-  test("a late old-run failure callback leaves the content-review DOM byte-equivalent", async () => {
+  test("after the abort a failing saved response is never delivered and the content-review DOM stays byte-equivalent", async () => {
     const wire = makeFetch({
       runs: ["run-a", "run-b"],
       inspect: [succeededInspect, succeededInspect],
@@ -1177,12 +1195,15 @@ describe("S3 corrective wiring: observation binding, late callbacks and request 
       ],
     });
     const gates: Array<(response: Response) => void> = [];
+    const gateState = { aborted: false, delivered: false };
     const harness = await createUiHarness({
       fetchImpl: (path, init) => {
         if (/^\/v1\/runs\/run-a\/changes\/\d+\/content\?/.test(path)) {
           if (path.includes("side=baseline")) {
             // the gate honours the transport's abort signal exactly
-            // like fetch: an aborted response is never delivered
+            // like fetch: an aborted response is never delivered; the
+            // saved gate records whether the delivery attempt would
+            // have gone through
             return new Promise<Response>((resolve, reject) => {
               const signal = init?.signal ?? null;
               let settled = false;
@@ -1194,9 +1215,19 @@ describe("S3 corrective wiring: observation binding, late callbacks and request 
                 deliver();
               };
               if (signal !== null) {
-                signal.addEventListener("abort", () => finish(() => reject(new Error("aborted"))), { once: true });
+                signal.addEventListener(
+                  "abort",
+                  () => {
+                    gateState.aborted = true;
+                    finish(() => reject(new Error("aborted")));
+                  },
+                  { once: true },
+                );
               }
-              gates.push((response) => finish(() => resolve(response)));
+              gates.push((response) => finish(() => {
+                gateState.delivered = true;
+                resolve(response);
+              }));
             }) as never;
           }
           return Promise.resolve(jsonResponse(contentDocFor("run-a", OBS_A, "result", resultText, resultSha)));
@@ -1215,10 +1246,14 @@ describe("S3 corrective wiring: observation binding, late callbacks and request 
       await harness.clickRunInspect(1);
       await wait();
       const before = contentReviewSnapshot(harness);
-      // the old run's baseline response arrives late as a transport
-      // failure
+      // the transport aborted the old request at the run switch; the
+      // saved (failure-shaped) response can no longer be delivered, so
+      // this proves the abort contract and the post-settle DOM
+      // stability — it does not deliver a late callback
       gates[0]?.(new Response("boom", { status: 500 }));
       await wait();
+      expect(gateState.aborted).toBe(true);
+      expect(gateState.delivered).toBe(false);
       expect(contentReviewSnapshot(harness)).toBe(before);
     } finally {
       harness.dispose();
