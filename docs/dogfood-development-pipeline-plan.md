@@ -831,8 +831,9 @@ the accepted implementation review plus three operator corrective cycles
   parking (body-last, `hidden=true`, wrapper removed); the run +
   observation binding (no anchor for a foreign run, a stale observation
   or an absent index — the panel hides without discarding viewer
-  state); terminal visibility preserved as its own top-level section
-  after the table; no new requests, mutations, routes, timers or
+  state); terminal succeeded and failed runs preserve the existing Project Changes
+  section, summary, table and anchoring behavior; S3 introduces no new
+  visibility behavior; no new requests, mutations, routes, timers or
   storage introduced; the production-like abort path never delivers a
   post-abort response and the DOM stays byte-equivalent — no delivered
   late-callback execution evidence is claimed.
