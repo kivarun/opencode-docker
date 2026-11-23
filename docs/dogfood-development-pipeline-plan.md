@@ -529,11 +529,11 @@ Contract essentials:
   Host/Origin authority `127.0.0.1:<port>`, foreign Host/Origin failing
   closed before route parsing.
 
-Only the first two UI slices S1 and S2 have been built and are **Complete**
-(see the S1 and S2 records below). The bounded prerequisites **P-3
-(durable-identity projection)**, **P-1 (task/plan revision artifact
+Only the first three UI slices S1, S2 and S3 have been built and are
+**Complete** (see the S1–S3 records below). The bounded prerequisites
+**P-3 (durable-identity projection)**, **P-1 (task/plan revision artifact
 content)** and **P-2 (accepted reviewer-output content)** are landed and
-**Complete** (see below); the remaining UI implementation (S3–S8) remains
+**Complete** (see below); the remaining UI implementation (S4–S8) remains
 not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
@@ -790,10 +790,66 @@ operator corrective that established the descriptor ownership.
   every name on both sides sits inside the recorded 130-name environment
   baseline, with no smoke-family name failing on either side this run;
   the cross-side test delta is exactly the 8 new passing S2 tests.
-- Not started (unchanged scope): UI slices S3–S8, live Browser UAT,
+- Not started (unchanged scope): UI slices S4–S8, live Browser UAT,
   Finding A, and the smoke-harness fix. The accepted S2 scope, the
   corrective ownership contract and the row-affordance vocabulary are
   not reopened by this record.
+
+### S3 Complete: Project changes review panel placement (2026-11-23)
+
+S3 (anchoring the inline Project change content review panel inside the
+Project changes table, directly behind its change row, without affecting
+any other section or request) is delivered and marked **Complete** after
+the accepted implementation review plus three operator corrective cycles
+(production, evidence, evidence-scope).
+
+- The delivery chain is four single thematic commits, each with CI
+  success on its exact SHA; all four touch UI files and their suites
+  only (the last two are test-only), leave this plan untouched, and are
+  clean-tree commits with `git diff --check` clean and a byte-identical
+  `bun.lock`:
+  - `6d186bbe9664ed9bdc07a41198c4dc75aa6ed1ba` — implementation — CI
+    run `44785209551`;
+  - `f4700a50a9667a9234b40ca54ad27d6ade0ec885` — production corrective
+    (observation-equality gate + `insertBefore` no-op guard) — CI run
+    `45148948514`;
+  - `e2e2289faa92bebbb441bafb2a02b30e93ab11c9` — abort/evidence
+    corrective (abort-contract test renames, abort assertions) — CI run
+    `45163817851`;
+  - `d0aa57a5759a6b945e0672280c58a6cb320aba1d` — owner-scoped evidence
+    pin (the gate asserted once globally and once inside the
+    `placeContentReviewPanel` body) — CI run `45182392460`.
+- Evidence: implementation report (final revision)
+  `/exchange/outbox/increment-6-s3-implementation-report.md`
+  (SHA-256
+  `ddae94b340702bee3c9fab01e2abea61fb77726b643e2194e6bd08d87fb469d5`).
+- Final contract (as reviewed, not reopened by this record):
+  one placement/visibility owner (`placeContentReviewPanel` — park,
+  gate, wrap, anchor, register; the map owner
+  `reviewRowReferences` is rebuilt per render); a valid
+  `tbody > tr > td[colspan=6] > panel` topology; connected hidden
+  parking (body-last, `hidden=true`, wrapper removed); the run +
+  observation binding (no anchor for a foreign run, a stale observation
+  or an absent index — the panel hides without discarding viewer
+  state); terminal visibility preserved as its own top-level section
+  after the table; no new requests, mutations, routes, timers or
+  storage introduced; the production-like abort path never delivers a
+  post-abort response and the DOM stays byte-equivalent — no delivered
+  late-callback execution evidence is claimed.
+- Verification truth (recorded honestly): focused suites green at
+  every stage; a controlled full A/B at the production corrective —
+  candidate tree vs `9237925` worktrees, sequential runs: base 4412
+  pass / 130 suite-environment failures, candidate 4430 pass / 130,
+  failing-name sets set-identical to the recorded environment baseline
+  (`candidate − base = 0`); the final owner-scoped pin is red on
+  `6d186bb` (measured on the base worktree) and green 59/59 `ui_model`
+  on `d0aa57a` (test-only; no new full A/B was required); TypeScript
+  and `git diff --check` clean; lockfile, `package.json`,
+  `ui/index.html` and `ui/style.css` byte-identical throughout.
+- Not started (unchanged scope): UI slices S4–S8, live Browser UAT,
+  Finding A, and the smoke-harness fix. The accepted S3 scope, the
+  corrective observation-gate contract and the abort-contract test
+  wording are not reopened by this record.
 
 ## Deferred work
 
