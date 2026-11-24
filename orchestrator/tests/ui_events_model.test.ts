@@ -475,7 +475,9 @@ describe("ui events model: source restrictions of the events layer", () => {
       expect(appSource.includes(banned)).toBe(false);
     }
     // the events path never mutates: no mutating endpoint names there
-    const eventsRegion = appSource.slice(appSource.indexOf("Lifecycle events (v4)"), appSource.indexOf("Manual lifecycle controls"));
+    // (the region ends where the S4 confirmation panel begins — S4
+    // legitimately introduces the generic respond POST)
+    const eventsRegion = appSource.slice(appSource.indexOf("Lifecycle events (v4)"), appSource.indexOf("Confirmation panel (S4)"));
     for (const banned of ["/resume", "continue-stage", "revise-task", "/respond", "method: \"POST\""]) {
       expect(eventsRegion.includes(banned)).toBe(false);
     }

@@ -128,6 +128,8 @@ export interface UiReviseTaskControl {
   readonly waitIndex: number;
   readonly projectId: string;
   readonly inputRootIds: readonly string[];
+  /** The declared action destination; contract metadata only. */
+  readonly actionTo: string;
 }
 
 export interface UiReviseTaskBlockedControl {
@@ -135,12 +137,25 @@ export interface UiReviseTaskBlockedControl {
   readonly runId: string;
   readonly waitIndex: number;
   readonly cause: "projects_not_loaded" | "project_missing" | "project_unavailable" | "no_input_roots";
+  /** The declared action destination; contract metadata only. */
+  readonly actionTo: string;
+}
+
+export interface UiRespondControl {
+  readonly kind: "respond";
+  readonly runId: string;
+  readonly waitIndex: number;
+  /** The declared generic action id (never a reserved id). */
+  readonly actionId: string;
+  /** The declared action destination; contract metadata only. */
+  readonly actionTo: string;
 }
 
 export type UiWaitingControl =
-  | { readonly kind: "continue_stage"; readonly runId: string; readonly waitIndex: number }
+  | { readonly kind: "continue_stage"; readonly runId: string; readonly waitIndex: number; readonly actionTo: string }
   | UiReviseTaskControl
-  | UiReviseTaskBlockedControl;
+  | UiReviseTaskBlockedControl
+  | UiRespondControl;
 
 export type UiRunActionModel =
   | { readonly kind: "resume"; readonly runId: string }
@@ -157,7 +172,7 @@ export interface UiRunActionAuthority {
 
 export declare function buildRunActionModel(runModel: unknown, authority: UiRunActionAuthority | null): UiRunActionModel;
 
-export type UiMutationEndpoint = "resume" | "resume_plan" | "continue_stage" | "revise_task";
+export type UiMutationEndpoint = "resume" | "resume_plan" | "continue_stage" | "revise_task" | "respond";
 
 export interface UiMutationRequest {
   readonly endpoint: UiMutationEndpoint;

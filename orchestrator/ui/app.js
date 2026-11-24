@@ -728,6 +728,133 @@ export async function requestEventsJson(fetchImpl, path, init, expectedRunId) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Confirmation panel (S4): one current confirmation for the page.      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The one page-level current-confirmation owner: at most one waiting
+ * action confirmation exists at any instant. The record keeps
+ * `{token, request, describe, source, panel}` where `request` is the
+ * frozen result of exactly one `buildMutationRequest` call — the only
+ * displayed and only sent request — and `source` is the frozen
+ * normalized source identity (never object identity) the owner
+ * validates against every applied inspect and authority publish.
+ */
+let currentConfirmation = null;
+let confirmationCounter = 0;
+/** The last applied authoritative inspect of the selected run; the
+ * open-confirmation source identity is built from it at submit time. */
+let lastRunModel = null;
+
+/**
+ * The normalized revise authority of one run from the current
+ * discovery: the exact binding and the exact matching project snapshot
+ * with its ordered input-root ids, or null when the authority is
+ * unavailable for the run.
+ */
+function normalizeReviseAuthority(runId, authority) {
+  const projectsModel = isRecord(authority) ? authority["projectsModel"] : null;
+  const runEntry = isRecord(authority) ? authority["runEntry"] : null;
+  if (
+    !isRecord(projectsModel) ||
+    projectsModel["kind"] !== "projects" ||
+    !isRecord(runEntry) ||
+    runEntry["runId"] !== runId
+  ) {
+    return null;
+  }
+  const project = projectsModel["projects"].find((entry) => isRecord(entry) && entry["id"] === runEntry["projectId"]);
+  if (project === undefined) {
+    return null;
+  }
+  if (!Array.isArray(project["inputRootIds"]) || project["inputRootIds"].some((root) => !isSafeId(root))) {
+    return null;
+  }
+  const roots = Object.freeze(project["inputRootIds"].slice());
+  return Object.freeze({
+    projectId: runEntry["projectId"],
+    projectAvailable: runEntry["projectAvailable"] === true,
+    inputRootIds: roots,
+    equals(other) {
+      if (other === null) {
+        return false;
+      }
+      if (other.projectId !== this.projectId || other.projectAvailable !== this.projectAvailable) {
+        return false;
+      }
+      const otherRoots = other.inputRootIds;
+      return (
+        Array.isArray(otherRoots) &&
+        otherRoots.length === roots.length &&
+        roots.every((root, index) => root === otherRoots[index])
+      );
+    },
+  });
+}
+
+/**
+ * The source identity of one open confirmation, frozen as normalized
+ * values: the run id, the document key of the applied inspect it was
+ * built from, the declared action (id, destination, kind), and — for
+ * revise — the normalized revise authority. Recorded actions never use
+ * object identity, so authority refreshes are compared by content.
+ */
+function confirmationSourceOf(control, model, authority) {
+  const hasModel = isRecord(model) && model["runId"] === control.runId;
+  return Object.freeze({
+    runId: control.runId,
+    documentKey: hasModel ? liveObservationDocumentKey(model) : null,
+    actionId: control.kind === "respond" ? control.actionId : control.kind,
+    actionTo: control.actionTo,
+    reviseAuthority:
+      control.kind === "revise_task" && control.projectId !== undefined
+        ? normalizeReviseAuthority(control.runId, authority)
+        : null,
+  });
+}
+
+/** Whether an open confirmation still matches the applied inspection. */
+function confirmationMatches(entry, model, authority) {
+  const source = entry.source;
+  if (!isRecord(model) || model["runId"] !== source.runId) {
+    return false;
+  }
+  if (source.documentKey === null || liveObservationDocumentKey(model) !== source.documentKey) {
+    return false;
+  }
+  if (source.reviseAuthority === null) {
+    return true;
+  }
+  const revised = normalizeReviseAuthority(source.runId, authority);
+  return source.reviseAuthority.equals(revised);
+}
+
+/** Destroys the open confirmation, if any. The panel itself dies with
+ * the surrounding controls re-render; this only owns the state. */
+function destroyCurrentConfirmation() {
+  if (currentConfirmation !== null && currentConfirmation.panel !== null) {
+    currentConfirmation.panel.remove();
+  }
+  currentConfirmation = null;
+}
+
+/**
+ * The authority-publish invalidation point: an open revise-task
+ * confirmation is destroyed when the normalized revise authority of
+ * its run changed (binding gone, projectAvailable flipped, project id
+ * changed, matching project gone, ordered input roots changed).
+ */
+function dropConfirmationIfAuthorityChanged() {
+  if (currentConfirmation === null || currentConfirmation.source.reviseAuthority === null) {
+    return;
+  }
+  const revised = normalizeReviseAuthority(currentConfirmation.source.runId, authorityFor(currentConfirmation.source.runId));
+  if (!currentConfirmation.source.reviseAuthority.equals(revised)) {
+    destroyCurrentConfirmation();
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Manual lifecycle controls (v2): inspect document → action model.    */
 /* ------------------------------------------------------------------ */
 
@@ -761,13 +888,20 @@ function expectWaitingBoundaryFields(runId, boundary) {
   if (!Array.isArray(actions) || actions.length === 0) {
     return null;
   }
+  const seen = new Set();
   for (const action of actions) {
-    if (!isRecord(action) || typeof action["id"] !== "string" || action["id"] === "" || typeof action["to"] !== "string" || action["to"] === "") {
+    // closed per-action contract (S4): exact own keys, safe ids, unique
+    // ids; any structural damage moves the whole boundary fail closed
+    if (!isRecord(action) || Object.keys(action).length !== 2 || !Object.hasOwn(action, "id") || !Object.hasOwn(action, "to")) {
       return null;
     }
-    if (!RESERVED_WAIT_ACTIONS.includes(action["id"])) {
-      return unusableBoundary(runId, "unknown_action");
+    if (!isSafeId(action["id"]) || !isSafeId(action["to"])) {
+      return null;
     }
+    if (seen.has(action["id"])) {
+      return null;
+    }
+    seen.add(action["id"]);
   }
   return waitIndex;
 }
@@ -820,15 +954,20 @@ export function buildRunActionModel(runModel, authority) {
   const runEntry = isRecord(authority) ? authority["runEntry"] : null;
   const controls = boundary["actions"].map((action) => {
     if (action["id"] === "continue_stage") {
-      return Object.freeze({ kind: "continue_stage", runId, waitIndex });
+      return Object.freeze({ kind: "continue_stage", runId, waitIndex, actionTo: action["to"] });
     }
-    return Object.freeze(reviseTaskControl(runId, waitIndex, projectsModel, runEntry));
+    if (action["id"] === "revise_task") {
+      return Object.freeze(reviseTaskControl(runId, waitIndex, projectsModel, runEntry, action["to"]));
+    }
+    // any other declared safe action id routes to the generic respond
+    // control; the declared `to` travels as contract metadata only
+    return Object.freeze({ kind: "respond", runId, waitIndex, actionId: action["id"], actionTo: action["to"] });
   });
   return Object.freeze({ kind: "waiting", runId, controls: Object.freeze(controls) });
 }
 
-function reviseTaskControl(runId, waitIndex, projectsModel, runEntry) {
-  const blocked = (cause) => ({ kind: "revise_task_blocked", runId, waitIndex, cause });
+function reviseTaskControl(runId, waitIndex, projectsModel, runEntry, actionTo) {
+  const blocked = (cause) => ({ kind: "revise_task_blocked", runId, waitIndex, actionTo, cause });
   if (!isRecord(projectsModel) || projectsModel["kind"] !== "projects") {
     return blocked("projects_not_loaded");
   }
@@ -846,7 +985,7 @@ function reviseTaskControl(runId, waitIndex, projectsModel, runEntry) {
   if (!Array.isArray(project["inputRootIds"]) || project["inputRootIds"].length === 0) {
     return blocked("no_input_roots");
   }
-  return { kind: "revise_task", runId, waitIndex, projectId, inputRootIds: project["inputRootIds"] };
+  return { kind: "revise_task", runId, waitIndex, projectId, inputRootIds: project["inputRootIds"], actionTo };
 }
 
 /**
@@ -917,6 +1056,24 @@ export function buildMutationRequest(action, formValues) {
         task_id: taskId,
         task: Object.freeze({ root_id: rootId, ref }),
       }),
+    });
+  }
+  if (action["kind"] === "respond") {
+    // the request-owner guard: the model routing alone cannot make an
+    // exported call safe — a forged respond control naming a reserved
+    // id (or any unsafe shape) is refused here with zero request
+    const waitIndex = action["waitIndex"];
+    if (typeof waitIndex !== "number" || !Number.isSafeInteger(waitIndex) || waitIndex < 1) {
+      throw new UiContractError("no_mutation");
+    }
+    const actionId = action["actionId"];
+    if (!isSafeId(actionId) || RESERVED_WAIT_ACTIONS.includes(actionId)) {
+      throw new UiContractError("no_mutation");
+    }
+    return Object.freeze({
+      endpoint: "respond",
+      path: `/v1/runs/${runId}/respond`,
+      body: Object.freeze({ wait_index: waitIndex, action_id: actionId }),
     });
   }
   throw new UiContractError("no_mutation");
@@ -5587,6 +5744,9 @@ function authorityFor(runId) {
 
 function renderProjects(model) {
   projectsState = model;
+  // the discovery publish is one exact invalidation point of an open
+  // revise-task confirmation (normalized authority compared by content)
+  dropConfirmationIfAuthorityChanged();
   const body = document.getElementById("projects-body");
   body.replaceChildren();
   for (const project of model.projects) {
@@ -5611,6 +5771,11 @@ function renderProjects(model) {
 }
 
 function renderRuns(state) {
+  runsState = state;
+  // the runs discovery publish is one exact invalidation point of an
+  // open revise-task confirmation (normalized authority compared by
+  // content, including the projectAvailable flip)
+  dropConfirmationIfAuthorityChanged();
   const body = document.getElementById("runs-body");
   body.replaceChildren();
   for (const run of state.runs) {
@@ -6273,9 +6438,18 @@ function showRunModel(model, options = {}) {
   const changed = options.force === true || key !== lastDocumentKey;
   lastDocumentKey = key;
   selectedRunId = model.runId;
+  lastRunModel = model;
   if (changed) {
+    const modelAuthority = authorityFor(model.runId);
+    // the applied authoritative inspect is one exact invalidation point
+    // of the open confirmation: a changed document identity, a changed
+    // wait or action set, a non-waiting boundary or a changed revise
+    // authority destroy it (state destroy, never only a DOM removal)
+    if (currentConfirmation !== null && !confirmationMatches(currentConfirmation, model, modelAuthority)) {
+      destroyCurrentConfirmation();
+    }
     renderRunDetail(model);
-    renderRunControls(buildRunActionModel(model, authorityFor(model.runId)));
+    renderRunControls(buildRunActionModel(model, modelAuthority));
     if (mutationGate.isInFlight()) {
       setMutationControlsDisabled(true);
     }
@@ -6414,6 +6588,9 @@ function inspectRun(runId) {
   setStatus(`Inspecting run ${runId}…`);
   applySchedulerEffect(scheduler.runSelected(runId));
   selectedRunId = runId;
+  // selecting another run destroys any open confirmation before the
+  // GET response arrives (the state destroy, never only a DOM removal)
+  destroyCurrentConfirmation();
   applySchedulerEffect(scheduler.takeOverInspect(runId));
   document.getElementById("detail-run-id").textContent = `Run ${runId}`;
   document.getElementById("inspect-selected").hidden = false;
@@ -6545,14 +6722,42 @@ function notifyObservationOfInspect(runId) {
  * fetch, and the shared flow owns the outcome, the lost-response
  * recovery and the authoritative inspect.
  */
-async function submitAction(action, readForm, describe) {
-  if (!mutationGate.begin()) {
-    return;
-  }
-  setMutationControlsDisabled(true);
-  let mutationObserved = false;
-  try {
-    let request;
+/**
+ * The one mutating submit path AND the single mutation-admission owner:
+ * admission is synchronous and before the first await — the token check
+ * (confirmation press) or the direct submit, the one `mutationGate`
+ * admission, the atomic consumption of the saved frozen request for a
+ * confirmed press (after which the confirmation is destroyed and any
+ * re-click, including after settlement, is stale), then the controls
+ * disable, the existing flow, and the `finally` restore. A stale token
+ * or a busy gate leaves the confirmation, the controls, the status and
+ * the DOM byte-unchanged with zero POST.
+ */
+async function submitAction(admission, readForm, describe) {
+  let request;
+  let runId;
+  if (typeof admission === "number") {
+    // the Confirm press: token check first (a stale or unknown token is
+    // byte-inert and never reaches the gate)
+    const entry = currentConfirmation;
+    if (entry === null || entry.token !== admission) {
+      return;
+    }
+    if (!mutationGate.begin()) {
+      return;
+    }
+    currentConfirmation = null;
+    if (entry.panel !== null) {
+      entry.panel.remove();
+    }
+    request = entry.request;
+    describe = entry.describe;
+    runId = entry.source.runId;
+  } else {
+    if (!mutationGate.begin()) {
+      return;
+    }
+    const action = admission;
     try {
       request = buildMutationRequest(action, readForm());
     } catch (error) {
@@ -6562,19 +6767,24 @@ async function submitAction(action, readForm, describe) {
       }
       throw error;
     }
+    runId = action.runId;
+  }
+  setMutationControlsDisabled(true);
+  let mutationObserved = false;
+  try {
     inspectTransport.invalidate();
     applySchedulerEffect(scheduler.mutationStarted());
     mutationObserved = true;
-    setStatus(`Sending ${describe} for run ${action.runId}…`);
+    setStatus(`Sending ${describe} for run ${runId}…`);
     await postMutation(request, {
-      runId: action.runId,
+      runId,
       handlers: {
         onCommandResult: async (model) => {
           setStatus(describeCommandResult(model));
           await refreshRuns(false);
         },
         onLost: () => {
-          setStatus(`outcome unknown; the ${describe} request for run ${action.runId} may have been received; checking once…`);
+          setStatus(`outcome unknown; the ${describe} request for run ${runId} may have been received; checking once…`);
         },
         onRecovered: (model) => {
           if (selectedRunId !== model.runId) {
@@ -6656,7 +6866,7 @@ function continueStageForm(control) {
   form.appendChild(submit);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    void submitAction(control, () => ({
+    openConfirmation(control, () => ({
       additionalIterations: iterationsField.querySelector("input").value,
     }), "continue-stage");
   });
@@ -6690,7 +6900,7 @@ function reviseTaskForm(control) {
   form.appendChild(submit);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    void submitAction(control, () => ({
+    openConfirmation(control, () => ({
       taskId: taskField.querySelector("input").value,
       rootId: rootSelect.value,
       ref: refField.querySelector("input").value,
@@ -6751,11 +6961,115 @@ function renderRunControls(action) {
         container.appendChild(continueStageForm(control));
       } else if (control.kind === "revise_task") {
         container.appendChild(reviseTaskForm(control));
+      } else if (control.kind === "respond") {
+        container.appendChild(respondForm(control));
       } else {
         container.appendChild(blockedReviseControl(control));
       }
     }
+    if (currentConfirmation !== null) {
+      container.appendChild(currentConfirmation.panel);
+    }
   }
+}
+
+/** The one confirmation-open path of every waiting action: the form
+ * values are read exactly once and the request is built exactly once —
+ * the frozen result is the single request owner of the confirmation
+ * (the Confirm press never re-reads the form and never rebuilds). */
+function openConfirmation(control, readForm, describe) {
+  // a new submit always replaces the open confirmation: the old panel
+  // and its token die here, the new confirmation owns the page
+  destroyCurrentConfirmation();
+  let request;
+  try {
+    request = buildMutationRequest(control, readForm());
+  } catch (error) {
+    if (error instanceof UiContractError) {
+      showError(`contract: ${error.reason}`);
+      return;
+    }
+    throw error;
+  }
+  confirmationCounter += 1;
+  const entry = {
+    token: confirmationCounter,
+    request,
+    describe,
+    source: confirmationSourceOf(control, lastRunModel, authorityFor(control.runId)),
+    panel: null,
+  };
+  entry.panel = renderConfirmationPanel(entry);
+  currentConfirmation = entry;
+  document.getElementById("run-controls").appendChild(entry.panel);
+}
+
+/** The confirmation panel: read-only textContent of the endpoint and
+ * the exact canonical body of the saved request, plus Confirm (the
+ * single admission path) and Cancel (zero POST by contract). */
+function renderConfirmationPanel(entry) {
+  const panel = document.createElement("div");
+  panel.className = "confirmation-panel";
+  const runId = entry.source.runId;
+  panel.appendChild(element("p", `Confirm ${describeLabel(entry.describe)} for run ${runId}?`));
+  panel.appendChild(element("p", `POST ${entry.request.path}`));
+  panel.appendChild(element("pre", JSON.stringify(entry.request.body)));
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "mutation-control";
+  confirm.textContent = "Confirm";
+  confirm.addEventListener("click", () => {
+    void submitAction(entry.token);
+  });
+  panel.appendChild(confirm);
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "confirmation-cancel";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => {
+    if (currentConfirmation !== null && currentConfirmation.token === entry.token) {
+      destroyCurrentConfirmation();
+      panel.remove();
+    }
+  });
+  panel.appendChild(cancel);
+  return panel;
+}
+
+function describeLabel(describe) {
+  if (describe === "continue-stage") {
+    return "continue stage";
+  }
+  if (describe === "revise-task") {
+    return "revise task";
+  }
+  return `respond (${describeLabelAction(describe)})`;
+}
+
+function describeLabelAction(describe) {
+  // the describe string of a generic action is the declared action id
+  return describe.endsWith("-action") ? describe.slice(0, -7) : describe;
+}
+
+function respondForm(control) {
+  const form = document.createElement("form");
+  form.appendChild(waitIndexLine(control));
+  form.appendChild(
+    element(
+      "p",
+      `Respond with the declared action ${control.actionId} (the destination ${control.actionTo} is contract metadata only).`,
+    ),
+  );
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "mutation-control";
+  submit.textContent = "Respond";
+  form.appendChild(submit);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    openConfirmation(control, () => ({}), `${control.actionId}-action`);
+  });
+  return form;
 }
 
 async function submitNewRun(event) {

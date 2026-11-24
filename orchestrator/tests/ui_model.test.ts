@@ -615,7 +615,6 @@ describe("ui model: export surface and source restrictions", () => {
       "POST_RETRY",
       "retryPost",
       "setInterval",
-      "/respond",
       "stage-1",
       "stage-2",
       "task-a",
@@ -634,7 +633,9 @@ describe("ui model: export surface and source restrictions", () => {
     // owner); the GETs are the discovery and inspect reads
     expect(appSource.split('method: "POST"').length - 1).toBe(2);
     expect(appSource.split('method: "GET"').length - 1).toBe(0);
-    expect(appSource.split("buildMutationRequest(").length - 1).toBe(2);
+    // one definition + the direct submit path + the single S4
+    // confirmation-open site (the request is built exactly once there)
+    expect(appSource.split("buildMutationRequest(").length - 1).toBe(3);
     expect(appSource.split("buildRunActionModel(").length - 1).toBe(2);
     expect(appSource.split("runMutationFlow(").length - 1).toBe(2);
     expect(appSource.split("postMutation(").length - 1).toBe(3);
@@ -843,7 +844,11 @@ describe("ui v2: boundary-to-control matrix", () => {
     expect(reasonOf("succeeded", { kind: "resumable", stateId: "s", transitionCount: 1 })).toBe("status_boundary_mismatch");
     expect(reasonOf("failed", { kind: "failed", reason: "r" }) === "none").toBe(true);
     expect(reasonOf("running", { kind: "plan_ready", planningExecutionIndex: 1, continuation: "auto" })).toBe("unknown_continuation");
-    expect(reasonOf("waiting", { kind: "waiting", waitIndex: 1, reason: "r", actions: [{ id: "other_action", to: "x" }] })).toBe("unknown_action");
+    // a well-formed non-reserved id is a valid generic action (S4); the
+    // fail-closed classes are the structural ones asserted below
+    expect(reasonOf("waiting", { kind: "waiting", waitIndex: 1, reason: "r", actions: [{ id: "other_action" }] })).toBe(
+      "invalid_boundary_shape",
+    );
     expect(reasonOf("waiting", { kind: "waiting", waitIndex: 0, reason: "r", actions: [{ id: "continue_stage", to: "x" }] })).toBe(
       "invalid_boundary_shape",
     );
@@ -936,6 +941,105 @@ describe("ui v2: the one mutation request builder", () => {
       expect(contractReason(() => buildMutationRequest(action, {}))).toBe("no_mutation");
     }
     expect(contractReason(() => buildMutationRequest(buildRunActionModel(waitingRun(["continue_stage"]), null), {}))).toBe("no_mutation");
+  });
+});
+
+describe("ui v4 action routing (S4): closed parser, reserved and generic controls, respond request owner", () => {
+  const genericWaitingRun = (actions: readonly { id: string; to: string }[]): UiApiModel =>
+    runModelOf("waiting", { kind: "waiting", waitIndex: 2, reason: "stage_iteration_completed", actions });
+
+  test("a declared generic action becomes a respond control and never poisons the reserved ones", () => {
+    const generic = buildRunActionModel(genericWaitingRun([{ id: "sync_check", to: "verify_gate" }]), null) as UiRunActionModel & {
+      kind: "waiting";
+    };
+    expect(generic.kind).toBe("waiting");
+    expect(generic.controls.map((control) => control.kind)).toEqual(["respond"]);
+    const mixed = buildRunActionModel(
+      genericWaitingRun([
+        { id: "continue_stage", to: "stage_entry" },
+        { id: "sync_check", to: "verify_gate" },
+        { id: "revise_task", to: "architect" },
+        { id: "custom_check", to: "audit" },
+      ]),
+      AUTHORITY_AVAILABLE,
+    ) as UiRunActionModel & { kind: "waiting" };
+    expect(mixed.controls.map((control) => control.kind)).toEqual(["continue_stage", "respond", "revise_task", "respond"]);
+    expect(mixed.controls[1]).toMatchObject({ kind: "respond", runId: "run-a", waitIndex: 2, actionId: "sync_check", actionTo: "verify_gate" });
+    expect(mixed.controls[3]).toMatchObject({ kind: "respond", actionId: "custom_check", actionTo: "audit" });
+  });
+
+  test("an unsafe or duplicate declared action or an extra field fails closed (invalid_boundary_shape)", () => {
+    const reasonOf = (actions: unknown): string =>
+      (buildRunActionModel(runModelOf("waiting", { kind: "waiting", waitIndex: 2, reason: "r", actions }), null) as UiRunActionModel & {
+        reason?: string;
+      }).reason ?? "none";
+    expect(reasonOf([{ id: "../bad", to: "verify" }])).toBe("invalid_boundary_shape");
+    expect(reasonOf([{ id: "sync_check", to: "../bad" }])).toBe("invalid_boundary_shape");
+    expect(reasonOf([{ id: "", to: "verify" }])).toBe("invalid_boundary_shape");
+    expect(reasonOf([{ id: "sync_check", to: "" }])).toBe("invalid_boundary_shape");
+    expect(
+      reasonOf([
+        { id: "sync_check", to: "a" },
+        { id: "sync_check", to: "b" },
+      ]),
+    ).toBe("invalid_boundary_shape");
+    expect(reasonOf([{ id: "continue_stage", to: "x", hostile: 1 }])).toBe("invalid_boundary_shape");
+    expect(reasonOf([{ id: "continue_stage", to: "x", hostile: undefined }])).toBe("invalid_boundary_shape");
+    expect(reasonOf("not-an-array")).toBe("invalid_boundary_shape");
+  });
+
+  test("the respond request is exactly wait_index and action_id", () => {
+    const model = buildRunActionModel(genericWaitingRun([{ id: "sync_check", to: "verify_gate" }]), null) as UiRunActionModel & {
+      kind: "waiting";
+    };
+    expect(buildMutationRequest(model.controls[0], {})).toEqual({
+      endpoint: "respond",
+      path: "/v1/runs/run-a/respond",
+      body: { wait_index: 2, action_id: "sync_check" },
+    });
+  });
+
+  test("forged respond controls for reserved ids are refused by the request owner", () => {
+    for (const actionId of ["continue_stage", "revise_task"]) {
+      expect(contractReason(() => buildMutationRequest({ kind: "respond", runId: "run-a", waitIndex: 2, actionId, actionTo: "x" }, {}))).toBe(
+        "no_mutation",
+      );
+    }
+  });
+
+  test("an unsafe generic action id or an invalid wait index is no_mutation", () => {
+    const refused: readonly Record<string, unknown>[] = [
+      { kind: "respond", runId: "run-a", waitIndex: 2, actionId: "../bad" },
+      { kind: "respond", runId: "run-a", waitIndex: 2, actionId: "" },
+      { kind: "respond", runId: "run-a", waitIndex: 2 },
+      { kind: "respond", runId: "run-a", waitIndex: 0, actionId: "sync_check" },
+      { kind: "respond", runId: "run-a", waitIndex: -1, actionId: "sync_check" },
+      { kind: "respond", runId: "run-a", waitIndex: 1.5, actionId: "sync_check" },
+      { kind: "respond", runId: "run-a", waitIndex: "2", actionId: "sync_check" },
+      { kind: "respond", runId: "run-a", waitIndex: String(2 ** 53), actionId: "sync_check" },
+    ];
+    for (const control of refused) {
+      expect(contractReason(() => buildMutationRequest(control, {}))).toBe("no_mutation");
+    }
+  });
+
+  test("the declared destination is contract metadata only and never enters the request", () => {
+    const model = buildRunActionModel(genericWaitingRun([{ id: "sync_check", to: "verify_gate" }]), null) as UiRunActionModel & {
+      kind: "waiting";
+    };
+    const request = buildMutationRequest(model.controls[0], {}) as { body: Record<string, unknown> };
+    expect(Object.keys(request.body).sort()).toEqual(["action_id", "wait_index"]);
+    expect(JSON.stringify(request.body).includes("verify_gate")).toBe(false);
+  });
+
+  test("only the respond control builds the respond route; reserved ids are never routed there", () => {
+    expect(appSource.split("/v1/runs/${runId}/respond").length - 1).toBe(1);
+    expect(appSource.includes("RESERVED_WAIT_ACTIONS.includes(actionId)")).toBe(true);
+    for (const reserved of ["continue_stage", "revise_task"]) {
+      expect(contractReason(() => buildMutationRequest({ kind: "respond", runId: "run-a", waitIndex: 1, actionId: reserved }, {}))).toBe(
+        "no_mutation",
+      );
+    }
   });
 });
 

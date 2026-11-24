@@ -16,6 +16,7 @@ import {
   projectsDocument,
   runDocument,
   runsPageDocument,
+  FakeElement,
   type UiHarness,
   type UiHarnessClock,
 } from "./ui_dom_harness.ts";
@@ -40,6 +41,8 @@ interface WiringProbe {
   readonly fetchImpl: (path: string, init?: RequestInit) => Promise<Response>;
   readonly events: WireEvent[];
   readonly posts: string[];
+  /** The exact JSON body string of every POST, in wire order. */
+  readonly postBodies: (string | undefined)[];
   active(): number;
   maxActive(): number;
   /** The number of inspect GETs that entered the wire so far. */
@@ -71,6 +74,7 @@ function makeWiringFetch(
 ): WiringProbe {
   const events: WireEvent[] = [];
   const posts: string[] = [];
+  const postBodies: (string | undefined)[] = [];
   let seq = 0;
   let inspectSeq = 0;
   let runsPageSeq = 0;
@@ -106,6 +110,7 @@ function makeWiringFetch(
     }
     if (method === "POST") {
       posts.push(`${method} ${path}`);
+      postBodies.push(init === undefined ? undefined : (init.body as string | undefined));
       if (options.postFails === true) {
         throw new Error("network gone");
       }
@@ -149,6 +154,7 @@ function makeWiringFetch(
     fetchImpl,
     events,
     posts,
+    postBodies,
     active: () => active,
     maxActive: () => maxActive,
     callsCount: () => inspectSeq,
@@ -864,6 +870,476 @@ describe("ui inspect wiring: the S1 run rail", () => {
       expect(row.children.length).toBe(4);
     }
     expect(harness.element("runs-body").children[1]?.children[2]?.textContent).toBe("yes");
+    harness.dispose();
+  });
+});
+
+
+describe("S4 confirmation wiring: one-shot admission, tokens and invalidation", () => {
+  /** The standard mixed waiting boundary: the declared action order is
+   * a generic respond action first, then the two reserved ones. The
+   * declared order must survive into the rendered control order. */
+  const WAITING_ACTIONS = [
+    { id: "sync_check", to: "decide" },
+    { id: "continue_stage", to: "dev_entry" },
+    { id: "revise_task", to: "architect" },
+  ];
+
+  function waitingBoundary(
+    waitIndex: number,
+    actions: readonly Record<string, unknown>[] = WAITING_ACTIONS,
+  ): Record<string, unknown> {
+    return { kind: "waiting", waitIndex, reason: "iteration-closed", actions: [...actions] };
+  }
+
+  function waitingPlan(revision: number, waitIndex = 1, actions = WAITING_ACTIONS): InspectPlan {
+    return { revision, status: "waiting", boundary: waitingBoundary(waitIndex, actions) };
+  }
+
+  interface S4BootOptions {
+    runsPages?: Record<string, unknown>[];
+    projectsDoc?: Record<string, unknown>;
+    readonly postHold?: boolean;
+    readonly postFails?: boolean;
+  }
+
+  interface S4Boot {
+    readonly harness: UiHarness;
+    readonly probe: WiringProbe;
+  }
+
+  async function s4Boot(
+    plans: readonly InspectPlan[],
+    unitOptions: S4BootOptions = {},
+    runs: readonly string[] = ["run-a"],
+  ): Promise<S4Boot & { options: S4BootOptions }> {
+    // the options object itself stays the caller's: c12/c13 mutate its
+    // `projectsDoc`/`runsPages` entries and the fetch closure reads them
+    // live, exactly like the established rail tests
+    const options: NonNullable<Parameters<typeof makeWiringFetch>[2]> = {
+      runsPages: unitOptions.runsPages ?? [runsPageDocument(runs)],
+      projectsDoc: unitOptions.projectsDoc ?? projectsDocument(),
+      eventsPages: [ORACLE_EVENTS_PAGE()],
+      postHold: unitOptions.postHold === true,
+      postFails: unitOptions.postFails === true,
+    };
+    const first: InspectPlan | undefined = plans[0];
+    const startPlan: InspectPlan =
+      first !== undefined
+        ? {
+            revision: first.revision,
+            status: first.status ?? "waiting",
+            boundary: first.boundary ?? waitingBoundary(1),
+          }
+        : { revision: 10, status: "waiting", boundary: waitingBoundary(1) };
+    const probe = makeWiringFetch(runs, [startPlan, ...plans.slice(1)], options);
+    const harness = await boot(probe, null, runs);
+    // the revise control is only rendered unblocked once the project
+    // discovery is loaded; the standard boot loads it first
+    harness.click("refresh-projects");
+    await Bun.sleep(4);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    return { harness, probe, options };
+  }
+
+  function waitForms(harness: UiHarness): FakeElement[] {
+    return harness.element("run-controls").children.filter((child) => child.tagName === "FORM");
+  }
+
+  function formLabel(harness: UiHarness, index: number): string {
+    const form = waitForms(harness)[index];
+    if (form === undefined) {
+      throw new Error(`wait form missing: ${index}`);
+    }
+    const button = form.children.find(
+      (child: FakeElement) => child.tagName === "BUTTON" && child.className.split(" ").includes("mutation-control"),
+    );
+    return button === undefined ? "" : button.textContent;
+  }
+
+  function submitFormAt(harness: UiHarness, index: number): void {
+    const form = waitForms(harness)[index];
+    if (form === undefined) {
+      throw new Error(`wait form missing: ${index}`);
+    }
+    form.dispatch("submit");
+  }
+
+  function panelOf(harness: UiHarness): FakeElement | null {
+    return harness.element("run-controls").querySelector(".confirmation-panel");
+  }
+
+  function panelLines(harness: UiHarness): string[] {
+    const panel = panelOf(harness);
+    if (panel === null) {
+      return [];
+    }
+    return panel.children
+      .filter((child: FakeElement) => child.tagName !== "BUTTON")
+      .map((child: FakeElement) => child.textContent);
+  }
+
+  function panelButton(harness: UiHarness, text: string): FakeElement | null {
+    const panel = panelOf(harness);
+    if (panel === null) {
+      return null;
+    }
+    return panel.children.find((child) => child.tagName === "BUTTON" && child.textContent === text) ?? null;
+  }
+
+  const REVISE_BODY =
+    '{"wait_index":1,"task_id":"task-a","task":{"root_id":"tasks","ref":"notes"}}';
+
+  function fieldInput(form: FakeElement, className: string): FakeElement {
+    const wrapper = form.querySelector(`.${className}`);
+    if (wrapper === null) {
+      throw new Error(`field ${className} missing`);
+    }
+    if (wrapper.tagName === "INPUT") {
+      return wrapper;
+    }
+    const input = wrapper.children.find((child: FakeElement) => child.tagName === "INPUT");
+    if (input === undefined) {
+      throw new Error(`field ${className} input missing`);
+    }
+    return input;
+  }
+
+  function openRevise(harness: UiHarness): void {
+    const form = waitForms(harness)[2];
+    if (form === undefined) {
+      throw new Error("revise form missing");
+    }
+    fieldInput(form, "form-task-id").value = "task-a";
+    fieldInput(form, "form-task-ref").value = "notes";
+    // the fake DOM has no native select default; the real browser would
+    // select the first declared input root
+    const rootSelect = form.querySelector(".form-root-id");
+    if (rootSelect === null) {
+      throw new Error("root select missing");
+    }
+    rootSelect.value = "tasks";
+    form.dispatch("submit");
+  }
+
+  function openContinue(harness: UiHarness, iterations: string): void {
+    const form = waitForms(harness)[1];
+    if (form === undefined) {
+      throw new Error("continue form missing");
+    }
+    fieldInput(form, "form-additional-iterations").value = iterations;
+    form.dispatch("submit");
+  }
+
+  test("c1. the respond form opens the exact saved request; Confirm POSTs it byte-exactly once", async () => {
+    const booted = await s4Boot([
+      waitingPlan(10, 1),
+      waitingPlan(11, 1),
+    ]);
+    const { harness, probe } = booted;
+    // the declared action order is preserved: respond, continue, revise
+    expect(formLabel(harness, 0)).toBe("Respond");
+    expect(formLabel(harness, 1)).toBe("Continue stage");
+    expect(formLabel(harness, 2)).toBe("Revise task");
+    expect(panelOf(harness)).toBeNull();
+    expect(probe.posts).toEqual([]);
+    // the respond form opens the confirmation; nothing is sent yet
+    submitFormAt(harness, 0);
+    expect(probe.posts).toEqual([]);
+    expect(panelLines(harness)).toEqual([
+      "Confirm respond (sync_check) for run run-a?",
+      "POST /v1/runs/run-a/respond",
+      '{"wait_index":1,"action_id":"sync_check"}',
+    ]);
+    // Confirm posts the exact saved body once
+    panelButton(harness, "Confirm")?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
+    expect(probe.postBodies).toEqual(['{"wait_index":1,"action_id":"sync_check"}']);
+    // the settlement re-inspects; the rebuilt controls carry no panel
+    await Bun.sleep(4);
+    expect(harness.element("detail-revision").textContent).toBe("11");
+    expect(panelOf(harness)).toBeNull();
+    harness.dispose();
+  });
+
+  test("c2. the request build happens once at open: a later form mutation cannot reach the POST", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)]);
+    const { harness, probe } = booted;
+    openContinue(harness, "1");
+    expect(panelLines(harness)).toEqual([
+      "Confirm continue stage for run run-a?",
+      "POST /v1/runs/run-a/continue-stage",
+      '{"wait_index":1,"additional_iterations":1}',
+    ]);
+    // the form's live field changes after the confirmation is open; the
+    // panel and the future POST body must stay byte-equal
+    fieldInput(waitForms(harness)[1] as FakeElement, "form-additional-iterations").value = "7";
+    expect(panelLines(harness)[2]).toBe('{"wait_index":1,"additional_iterations":1}');
+    panelButton(harness, "Confirm")?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/continue-stage"]);
+    expect(probe.postBodies).toEqual(['{"wait_index":1,"additional_iterations":1}']);
+    harness.dispose();
+  });
+
+  test("c3. Cancel destroys the confirmation with zero POST; the stale confirm stays inert after it", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)]);
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    const cancel = panelButton(harness, "Cancel");
+    const confirm = panelButton(harness, "Confirm");
+    expect(cancel).not.toBeNull();
+    expect(confirm).not.toBeNull();
+    cancel?.dispatch("click");
+    expect(panelOf(harness)).toBeNull();
+    expect(probe.posts).toEqual([]);
+    // the stale, captured confirm can never become the admission
+    confirm?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+  });
+
+  test("c4. one token: an immediate double confirm is one POST and stays one after settlement", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)]);
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    const confirm = panelButton(harness, "Confirm");
+    confirm?.dispatch("click");
+    confirm?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
+    // the stale ref after the settled mutation is consumed as well
+    confirm?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
+    expect(probe.postBodies).toEqual(['{"wait_index":1,"action_id":"sync_check"}']);
+    harness.dispose();
+  });
+
+  test("c5. a busy gate refuses the confirm without consuming the open confirmation", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)], { postHold: true });
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    panelButton(harness, "Confirm")?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
+    // the first POST holds the gate; a fresh confirmation is still openable
+    submitFormAt(harness, 0);
+    const bodyLine = panelLines(harness)[2];
+    expect(bodyLine).toBe('{"wait_index":1,"action_id":"sync_check"}');
+    panelButton(harness, "Confirm")?.dispatch("click");
+    await Bun.sleep(4);
+    // zero additional POST and the confirmation stays open unchanged
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
+    expect(panelLines(harness)[2]).toBe(bodyLine);
+    // the held POST settles; the run flow finishes normally
+    probe.releasePosts();
+    await Bun.sleep(6);
+    harness.dispose();
+  });
+
+  test("c6. a failed settlement never re-arms: the consumed confirmation stays inert", async () => {
+    // the failed POST transport is outcome unknown: no error line, the
+    // lost-response recovery inspects once, and no re-arming of the
+    // consumed confirmation
+    const booted = await s4Boot([
+      waitingPlan(10, 1),
+      waitingPlan(11, 1),
+    ], {
+      postFails: true,
+    });
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    const confirm = panelButton(harness, "Confirm");
+    expect(confirm).not.toBeNull();
+    confirm?.dispatch("click");
+    await Bun.sleep(6);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
+    expect(harness.error()).toBe("");
+    // the recovery inspect settled and re-rendered the waiting run
+    expect(panelOf(harness)).toBeNull();
+    expect(harness.element("detail-revision").textContent).toBe("11");
+    confirm?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
+    harness.dispose();
+  });
+
+  test("c7. a changed wait index destroys the open confirmation; the stale confirm is inert", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1), waitingPlan(11, 2)]);
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    const stale = panelButton(harness, "Confirm");
+    expect(stale).not.toBeNull();
+    harness.click("inspect-selected");
+    await Bun.sleep(6);
+    expect(panelOf(harness)).toBeNull();
+    expect(probe.posts).toEqual([]);
+    expect(harness.element("detail-revision").textContent).toBe("11");
+    stale?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+  });
+
+  test("c8. a disappeared declared action destroys the open confirmation", async () => {
+    const booted = await s4Boot([
+      waitingPlan(10, 1),
+      waitingPlan(11, 1, [{ id: "continue_stage", to: "dev_entry" }]),
+    ]);
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    const stale = panelButton(harness, "Confirm");
+    harness.click("inspect-selected");
+    await Bun.sleep(6);
+    expect(panelOf(harness)).toBeNull();
+    expect(waitForms(harness).length).toBe(1);
+    stale?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+  });
+
+  test("c9. a non-waiting boundary destroys the open confirmation and drops the forms", async () => {
+    const booted = await s4Boot([
+      waitingPlan(10, 1),
+      { revision: 11, status: "running", boundary: { kind: "in_flight" } },
+    ]);
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    const stale = panelButton(harness, "Confirm");
+    harness.click("inspect-selected");
+    await Bun.sleep(6);
+    expect(panelOf(harness)).toBeNull();
+    expect(waitForms(harness).length).toBe(0);
+    stale?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+  });
+
+  test("c10. selecting another run destroys the confirmation before any GET response", async () => {
+    const booted = await s4Boot(
+      [waitingPlan(10, 1), { revision: 31, status: "running", boundary: { kind: "in_flight" } }],
+      {},
+      ["run-a", "run-b"],
+    );
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    expect(panelOf(harness)).not.toBeNull();
+    harness.clickRunInspect(1);
+    // the destroy happens synchronously at the selection click, before
+    // the run-b GET response could arrive
+    expect(panelOf(harness)).toBeNull();
+    await Bun.sleep(6);
+    expect(probe.posts).toEqual([]);
+    expect(harness.detailRunId()).toBe("Run run-b");
+    harness.dispose();
+  });
+
+  test("c11. an identical runs/projects refresh keeps the revise confirmation and Posts it once", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)]);
+    const { harness, probe } = booted;
+    openRevise(harness);
+    expect(panelLines(harness)).toEqual([
+      "Confirm revise task for run run-a?",
+      "POST /v1/runs/run-a/revise-task",
+      REVISE_BODY,
+    ]);
+    harness.click("refresh-runs");
+    await Bun.sleep(4);
+    harness.click("refresh-projects");
+    await Bun.sleep(4);
+    // the identical authority keeps the confirmation; the panel shows
+    // the one saved request built at open
+    expect(panelLines(harness)).toEqual([
+      "Confirm revise task for run run-a?",
+      "POST /v1/runs/run-a/revise-task",
+      REVISE_BODY,
+    ]);
+    panelButton(harness, "Confirm")?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/revise-task"]);
+    expect(probe.postBodies).toEqual([REVISE_BODY]);
+    harness.dispose();
+  });
+
+  test("c12. an ordered input-root change on the bound project destroys the revise confirmation", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)], {
+      runsPages: [runsPageDocument(["run-a"], "project-a", true)],
+      projectsDoc: {
+        schema_version: 2,
+        kind: "projects",
+        projects: [
+          { id: "project-a", input_roots: [{ id: "tasks" }, { id: "notes" }], project_apply: false },
+        ],
+      },
+    });
+    const { harness, probe } = booted;
+    openRevise(harness);
+    expect(panelOf(harness)).not.toBeNull();
+    const stale = panelButton(harness, "Confirm");
+    // the same project with a differently ordered root list is a changed
+    // authority: the confirmation dies (state destroy), zero POST
+    booted.options.projectsDoc = {
+      schema_version: 2,
+      kind: "projects",
+      projects: [
+        { id: "project-a", input_roots: [{ id: "notes" }, { id: "tasks" }], project_apply: false },
+      ],
+    };
+    harness.click("refresh-projects");
+    await Bun.sleep(4);
+    expect(panelOf(harness)).toBeNull();
+    expect(probe.posts).toEqual([]);
+    stale?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+  });
+
+  test("c13. a projectAvailable true→false flip with unchanged id and roots destroys the revise confirmation", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)], {
+      runsPages: [runsPageDocument(["run-a"], "project-a", true)],
+    });
+    const { harness, probe } = booted;
+    openRevise(harness);
+    expect(panelOf(harness)).not.toBeNull();
+    const stale = panelButton(harness, "Confirm");
+    booted.options.runsPages = [runsPageDocument(["run-a"], "project-a", false)];
+    harness.click("refresh-runs");
+    await Bun.sleep(4);
+    expect(panelOf(harness)).toBeNull();
+    expect(probe.posts).toEqual([]);
+    stale?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual([]);
+    harness.dispose();
+  });
+
+  test("c14. a stale detached cancel cannot close the newer confirmation", async () => {
+    const booted = await s4Boot([waitingPlan(10, 1)]);
+    const { harness, probe } = booted;
+    submitFormAt(harness, 0);
+    const stalePanel = panelOf(harness);
+    const staleCancel = panelButton(harness, "Cancel");
+    expect(stalePanel).not.toBeNull();
+    expect(staleCancel).not.toBeNull();
+    // a second respond submission replaces the confirmation
+    submitFormAt(harness, 0);
+    const newer = panelOf(harness);
+    expect(newer).not.toBeNull();
+    expect(newer).not.toBe(stalePanel);
+    // the stale panel token can never close or consume the newer one
+    staleCancel?.dispatch("click");
+    expect(panelOf(harness)).toBe(newer);
+    expect(probe.posts).toEqual([]);
+    panelButton(harness, "Confirm")?.dispatch("click");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/respond"]);
     harness.dispose();
   });
 });
