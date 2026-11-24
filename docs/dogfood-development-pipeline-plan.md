@@ -862,9 +862,12 @@ review plus two accepted corrective rounds.
 
 - The delivery chain is three single thematic commits, each with CI
   success on its exact SHA; all three touch UI files and their suites
-  only (the correctives touch `ui/app.js` and `ui_model.test.ts`
-  only), leave this plan untouched, and are clean-tree commits with
-  `git diff --check` clean and a byte-identical `bun.lock`:
+  only (`451e63b`: `ui/app.js`, `tests/ui_model.test.ts`,
+  `tests/ui_inspect_wiring.test.ts` — the wiring file carries the
+  behavioral c15 gate-leak pin; `47adeb50`: `ui/app.js` and
+  `tests/ui_model.test.ts` only), leave this plan untouched, and are
+  clean-tree commits with `git diff --check` clean and a byte-identical
+  `bun.lock`:
   - `7f79b43` — implementation — CI run `45370189214`;
   - `451e63b` — corrective r1 (direct-submit gate leak fixed for the
     direct path; confirmation holder restored to the frozen
