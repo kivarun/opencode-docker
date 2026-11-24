@@ -1041,6 +1041,50 @@ describe("ui v4 action routing (S4): closed parser, reserved and generic control
       );
     }
   });
+
+  test("the confirmation holder is one exact frozen owner without panel, describe or function fields", () => {
+    // the authoritative holder is exactly one frozen record of the
+    // three keys token/request/sourceIdentity; the DOM panel lives in
+    // the separate non-authoritative element variable and the describe
+    // label is derived from the frozen source identity
+    const region = appSource.slice(
+      appSource.indexOf("Confirmation panel (S4)"),
+      appSource.indexOf("Manual lifecycle controls"),
+    );
+    expect(appSource.includes("sourceIdentity: confirmationSourceOf(")).toBe(true);
+    expect(appSource.includes("currentConfirmationPanel = renderConfirmationPanel(")).toBe(true);
+    // the authoritative record carries no panel, no describe and no
+    // function-valued field anywhere in the source identity
+    for (const banned of ["entry.panel", "currentConfirmation.panel", "entry.describe", "currentConfirmation.describe"]) {
+      expect(appSource.includes(banned)).toBe(false);
+    }
+    const identity = region.slice(region.indexOf("function confirmationSourceOf"), region.indexOf("function confirmationDescribe"));
+    expect(identity).not.toBe("");
+    for (const field of ["runId:", "documentKey:", "waitIndex:", "actionId:", "actionTo:", "actionKind:", "reviseAuthority:"]) {
+      expect(identity.includes(field)).toBe(true);
+    }
+    expect(identity.includes("=>")).toBe(false);
+    expect(identity.includes("equals(")).toBe(false);
+    // the revise authority is frozen data compared by the pure
+    // function; nested records and the root list are frozen
+    const authority = region.slice(region.indexOf("function buildReviseAuthoritySnapshot"), region.indexOf("function reviseAuthorityEquals"));
+    expect(authority).not.toBe("");
+    expect(authority.includes("binding: Object.freeze({")).toBe(true);
+    expect(authority.includes("project: Object.freeze({")).toBe(true);
+    expect(authority.includes("inputRootIds: Object.freeze(")).toBe(true);
+    const compare = region.slice(region.indexOf("function reviseAuthorityEquals"), region.indexOf("/** The source identity"));
+    expect(compare).not.toBe("");
+    // the post-begin direct submit path shares ONE gate-owned
+    // try/finally with the flow (a rejected build releases the gate)
+    const submitRegion = appSource.slice(appSource.indexOf("async function submitAction"), appSource.indexOf("let controlCounter = 0"));
+    expect(submitRegion).not.toBe("");
+    expect(submitRegion.split("mutationGate.begin()").length - 1).toBe(2);
+    expect(submitRegion.split("mutationGate.end()").length - 1).toBe(1);
+    expect(submitRegion.indexOf("mutationGate.end()")).toBeGreaterThan(
+      submitRegion.indexOf("async function submitAction"),
+    );
+    expect(submitRegion.includes("finally {")).toBe(true);
+  });
 });
 
 describe("ui v2: endpoint-specific response acceptance", () => {

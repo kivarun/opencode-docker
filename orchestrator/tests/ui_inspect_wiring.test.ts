@@ -1343,3 +1343,65 @@ describe("S4 confirmation wiring: one-shot admission, tokens and invalidation", 
     harness.dispose();
   });
 });
+
+describe("S4 corrective wiring: the mutation gate owns every post-begin path", () => {
+  function planReadyPlan(revision: number): InspectPlan {
+    return {
+      revision,
+      status: "running",
+      boundary: { kind: "plan_ready", continuation: "resume_plan" },
+    };
+  }
+
+  function resumePlanFormOf(harness: UiHarness): FakeElement {
+    const form = harness.element("run-controls").children.find((child) => child.tagName === "FORM");
+    if (form === undefined) {
+      throw new Error("resume-plan form missing");
+    }
+    return form;
+  }
+
+  function resumePlanField(form: FakeElement, className: string): FakeElement {
+    const wrapper = form.querySelector(`.${className}`);
+    if (wrapper === null) {
+      throw new Error(`field ${className} missing`);
+    }
+    if (wrapper.tagName === "INPUT") {
+      return wrapper;
+    }
+    const input = wrapper.children.find((child: FakeElement) => child.tagName === "INPUT");
+    if (input === undefined) {
+      throw new Error(`field ${className} input missing`);
+    }
+    return input;
+  }
+
+  test("c15. a rejected direct submit releases the gate: the corrected resubmit POSTs exactly once", async () => {
+    const probe = makeWiringFetch(["run-a"], [
+      planReadyPlan(40),
+      planReadyPlan(41),
+    ], {
+      runsPages: [runsPageDocument(["run-a"])],
+      eventsPages: [ORACLE_EVENTS_PAGE()],
+    });
+    const harness = await boot(probe, null, ["run-a"]);
+    harness.clickRunInspect(0);
+    await Bun.sleep(5);
+    const form = resumePlanFormOf(harness);
+    // an invalid submit is refused with zero POST and a contract error
+    resumePlanField(form, "form-stage-id").value = "";
+    resumePlanField(form, "form-initial-budget").value = "1";
+    form.dispatch("submit");
+    await Bun.sleep(4);
+    expect(probe.posts).toEqual([]);
+    expect(harness.error()).toContain("invalid_stage_id");
+    // the corrected values resubmit and must reach exactly one POST
+    resumePlanField(form, "form-stage-id").value = "stage-1";
+    resumePlanField(form, "form-initial-budget").value = "2";
+    form.dispatch("submit");
+    await Bun.sleep(6);
+    expect(probe.posts).toEqual(["POST /v1/runs/run-a/resume-plan"]);
+    expect(probe.postBodies).toEqual(['{"stage_id":"stage-1","initial_budget":2}']);
+    harness.dispose();
+  });
+});

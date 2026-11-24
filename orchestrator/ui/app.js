@@ -733,14 +733,18 @@ export async function requestEventsJson(fetchImpl, path, init, expectedRunId) {
 
 /**
  * The one page-level current-confirmation owner: at most one waiting
- * action confirmation exists at any instant. The record keeps
- * `{token, request, describe, source, panel}` where `request` is the
- * frozen result of exactly one `buildMutationRequest` call — the only
- * displayed and only sent request — and `source` is the frozen
- * normalized source identity (never object identity) the owner
- * validates against every applied inspect and authority publish.
+ * action confirmation exists at any instant. The authoritative record
+ * is exactly one frozen `{token, request, sourceIdentity}` — `token`
+ * the one-shot admission token, `request` the frozen result of exactly
+ * one `buildMutationRequest` call (the only displayed and only sent
+ * request), and `sourceIdentity` the frozen normalized source identity
+ * (never object identity) the owner validates against every applied
+ * inspect and authority publish. The rendered DOM panel is deliberately
+ * not part of the authoritative state: it lives in the separate
+ * non-authoritative `currentConfirmationPanel` element variable.
  */
 let currentConfirmation = null;
+let currentConfirmationPanel = null;
 let confirmationCounter = 0;
 /** The last applied authoritative inspect of the selected run; the
  * open-confirmation source identity is built from it at submit time. */
@@ -752,7 +756,7 @@ let lastRunModel = null;
  * with its ordered input-root ids, or null when the authority is
  * unavailable for the run.
  */
-function normalizeReviseAuthority(runId, authority) {
+function buildReviseAuthoritySnapshot(runId, authority) {
   const projectsModel = isRecord(authority) ? authority["projectsModel"] : null;
   const runEntry = isRecord(authority) ? authority["runEntry"] : null;
   if (
@@ -763,33 +767,53 @@ function normalizeReviseAuthority(runId, authority) {
   ) {
     return null;
   }
-  const project = projectsModel["projects"].find((entry) => isRecord(entry) && entry["id"] === runEntry["projectId"]);
+  const projectId = runEntry["projectId"];
+  if (!isSafeId(projectId)) {
+    return null;
+  }
+  const project = projectsModel["projects"].find((entry) => isRecord(entry) && entry["id"] === projectId);
   if (project === undefined) {
     return null;
   }
   if (!Array.isArray(project["inputRootIds"]) || project["inputRootIds"].some((root) => !isSafeId(root))) {
     return null;
   }
-  const roots = Object.freeze(project["inputRootIds"].slice());
   return Object.freeze({
-    projectId: runEntry["projectId"],
-    projectAvailable: runEntry["projectAvailable"] === true,
-    inputRootIds: roots,
-    equals(other) {
-      if (other === null) {
-        return false;
-      }
-      if (other.projectId !== this.projectId || other.projectAvailable !== this.projectAvailable) {
-        return false;
-      }
-      const otherRoots = other.inputRootIds;
-      return (
-        Array.isArray(otherRoots) &&
-        otherRoots.length === roots.length &&
-        roots.every((root, index) => root === otherRoots[index])
-      );
-    },
+    binding: Object.freeze({
+      runId,
+      projectId,
+      projectAvailable: runEntry["projectAvailable"] === true,
+    }),
+    project: Object.freeze({
+      id: projectId,
+      inputRootIds: Object.freeze(project["inputRootIds"].slice()),
+    }),
   });
+}
+
+/** The pure content comparison of two revise authority snapshots (both
+ * built by `buildReviseAuthoritySnapshot` or literal null); no method
+ * lives on the frozen data. */
+function reviseAuthorityEquals(stored, current) {
+  if (stored === null || current === null) {
+    return stored === current;
+  }
+  if (
+    stored.binding.runId !== current.binding.runId ||
+    stored.binding.projectId !== current.binding.projectId ||
+    stored.binding.projectAvailable !== current.binding.projectAvailable
+  ) {
+    return false;
+  }
+  if (stored.project.id !== current.project.id) {
+    return false;
+  }
+  const storedRoots = stored.project.inputRootIds;
+  const currentRoots = current.project.inputRootIds;
+  return (
+    storedRoots.length === currentRoots.length &&
+    storedRoots.every((root, index) => root === currentRoots[index])
+  );
 }
 
 /**
@@ -801,21 +825,37 @@ function normalizeReviseAuthority(runId, authority) {
  */
 function confirmationSourceOf(control, model, authority) {
   const hasModel = isRecord(model) && model["runId"] === control.runId;
+  const actionKind = control.kind;
   return Object.freeze({
     runId: control.runId,
     documentKey: hasModel ? liveObservationDocumentKey(model) : null,
-    actionId: control.kind === "respond" ? control.actionId : control.kind,
-    actionTo: control.actionTo,
+    waitIndex: typeof control.waitIndex === "number" ? control.waitIndex : null,
+    actionId: actionKind === "respond" ? control.actionId : actionKind,
+    actionTo: control.actionTo === undefined ? null : control.actionTo,
+    actionKind: actionKind,
     reviseAuthority:
-      control.kind === "revise_task" && control.projectId !== undefined
-        ? normalizeReviseAuthority(control.runId, authority)
+      actionKind === "revise_task" && control.projectId !== undefined
+        ? buildReviseAuthoritySnapshot(control.runId, authority)
         : null,
   });
 }
 
+/** The describe label of one open confirmation, derived exclusively
+ * from the frozen source identity (the holder carries no `describe`
+ * field). */
+function confirmationDescribe(sourceIdentity) {
+  if (sourceIdentity.actionKind === "continue_stage") {
+    return "continue-stage";
+  }
+  if (sourceIdentity.actionKind === "revise_task") {
+    return "revise-task";
+  }
+  return `respond (${sourceIdentity.actionId})`;
+}
+
 /** Whether an open confirmation still matches the applied inspection. */
 function confirmationMatches(entry, model, authority) {
-  const source = entry.source;
+  const source = entry.sourceIdentity;
   if (!isRecord(model) || model["runId"] !== source.runId) {
     return false;
   }
@@ -825,15 +865,16 @@ function confirmationMatches(entry, model, authority) {
   if (source.reviseAuthority === null) {
     return true;
   }
-  const revised = normalizeReviseAuthority(source.runId, authority);
-  return source.reviseAuthority.equals(revised);
+  const revised = buildReviseAuthoritySnapshot(source.runId, authority);
+  return reviseAuthorityEquals(source.reviseAuthority, revised);
 }
 
-/** Destroys the open confirmation, if any. The panel itself dies with
- * the surrounding controls re-render; this only owns the state. */
+/** Destroys the open confirmation: the authoritative record and its
+ * rendered panel both die here (the panel is not part of the record). */
 function destroyCurrentConfirmation() {
-  if (currentConfirmation !== null && currentConfirmation.panel !== null) {
-    currentConfirmation.panel.remove();
+  if (currentConfirmationPanel !== null) {
+    currentConfirmationPanel.remove();
+    currentConfirmationPanel = null;
   }
   currentConfirmation = null;
 }
@@ -845,11 +886,12 @@ function destroyCurrentConfirmation() {
  * changed, matching project gone, ordered input roots changed).
  */
 function dropConfirmationIfAuthorityChanged() {
-  if (currentConfirmation === null || currentConfirmation.source.reviseAuthority === null) {
+  if (currentConfirmation === null || currentConfirmation.sourceIdentity.reviseAuthority === null) {
     return;
   }
-  const revised = normalizeReviseAuthority(currentConfirmation.source.runId, authorityFor(currentConfirmation.source.runId));
-  if (!currentConfirmation.source.reviseAuthority.equals(revised)) {
+  const runId = currentConfirmation.sourceIdentity.runId;
+  const revised = buildReviseAuthoritySnapshot(runId, authorityFor(runId));
+  if (!reviseAuthorityEquals(currentConfirmation.sourceIdentity.reviseAuthority, revised)) {
     destroyCurrentConfirmation();
   }
 }
@@ -6746,32 +6788,44 @@ async function submitAction(admission, readForm, describe) {
     if (!mutationGate.begin()) {
       return;
     }
+    // admission is atomic: consume the request and destroy the
+    // confirmation immediately behind the successful begin
     currentConfirmation = null;
-    if (entry.panel !== null) {
-      entry.panel.remove();
+    if (currentConfirmationPanel !== null) {
+      currentConfirmationPanel.remove();
+      currentConfirmationPanel = null;
     }
     request = entry.request;
-    describe = entry.describe;
-    runId = entry.source.runId;
+    describe = confirmationDescribe(entry.sourceIdentity);
+    runId = entry.sourceIdentity.runId;
   } else {
     if (!mutationGate.begin()) {
       return;
     }
     const action = admission;
-    try {
-      request = buildMutationRequest(action, readForm());
-    } catch (error) {
-      if (error instanceof UiContractError) {
-        showError(`contract: ${error.reason}`);
-        return;
-      }
-      throw error;
-    }
     runId = action.runId;
   }
-  setMutationControlsDisabled(true);
+  // from a successful begin on, every path of this submit — including
+  // the direct build request refusal — runs under ONE try/finally that
+  // releases the gate again, so a rejected form can never leak the
+  // global mutation gate
+  let controlsDisabled = false;
   let mutationObserved = false;
   try {
+    if (request === undefined) {
+      const action = admission;
+      try {
+        request = buildMutationRequest(action, readForm());
+      } catch (error) {
+        if (error instanceof UiContractError) {
+          showError(`contract: ${error.reason}`);
+          return;
+        }
+        throw error;
+      }
+    }
+    setMutationControlsDisabled(true);
+    controlsDisabled = true;
     inspectTransport.invalidate();
     applySchedulerEffect(scheduler.mutationStarted());
     mutationObserved = true;
@@ -6805,7 +6859,9 @@ async function submitAction(admission, readForm, describe) {
     });
   } finally {
     mutationGate.end();
-    setMutationControlsDisabled(false);
+    if (controlsDisabled) {
+      setMutationControlsDisabled(false);
+    }
     if (mutationObserved) {
       applySchedulerEffect(scheduler.mutationCompleted());
     }
@@ -6868,7 +6924,7 @@ function continueStageForm(control) {
     event.preventDefault();
     openConfirmation(control, () => ({
       additionalIterations: iterationsField.querySelector("input").value,
-    }), "continue-stage");
+    }));
   });
   return form;
 }
@@ -6904,7 +6960,7 @@ function reviseTaskForm(control) {
       taskId: taskField.querySelector("input").value,
       rootId: rootSelect.value,
       ref: refField.querySelector("input").value,
-    }), "revise-task");
+    }));
   });
   return form;
 }
@@ -6967,8 +7023,8 @@ function renderRunControls(action) {
         container.appendChild(blockedReviseControl(control));
       }
     }
-    if (currentConfirmation !== null) {
-      container.appendChild(currentConfirmation.panel);
+    if (currentConfirmation !== null && currentConfirmationPanel !== null) {
+      container.appendChild(currentConfirmationPanel);
     }
   }
 }
@@ -6977,7 +7033,7 @@ function renderRunControls(action) {
  * values are read exactly once and the request is built exactly once —
  * the frozen result is the single request owner of the confirmation
  * (the Confirm press never re-reads the form and never rebuilds). */
-function openConfirmation(control, readForm, describe) {
+function openConfirmation(control, readForm) {
   // a new submit always replaces the open confirmation: the old panel
   // and its token die here, the new confirmation owns the page
   destroyCurrentConfirmation();
@@ -6991,17 +7047,15 @@ function openConfirmation(control, readForm, describe) {
     }
     throw error;
   }
-  confirmationCounter += 1;
-  const entry = {
-    token: confirmationCounter,
+  const entry = Object.freeze({
+    token: confirmationCounter + 1,
     request,
-    describe,
-    source: confirmationSourceOf(control, lastRunModel, authorityFor(control.runId)),
-    panel: null,
-  };
-  entry.panel = renderConfirmationPanel(entry);
+    sourceIdentity: confirmationSourceOf(control, lastRunModel, authorityFor(control.runId)),
+  });
+  confirmationCounter = entry.token;
   currentConfirmation = entry;
-  document.getElementById("run-controls").appendChild(entry.panel);
+  currentConfirmationPanel = renderConfirmationPanel(entry);
+  document.getElementById("run-controls").appendChild(currentConfirmationPanel);
 }
 
 /** The confirmation panel: read-only textContent of the endpoint and
@@ -7010,8 +7064,8 @@ function openConfirmation(control, readForm, describe) {
 function renderConfirmationPanel(entry) {
   const panel = document.createElement("div");
   panel.className = "confirmation-panel";
-  const runId = entry.source.runId;
-  panel.appendChild(element("p", `Confirm ${describeLabel(entry.describe)} for run ${runId}?`));
+  const runId = entry.sourceIdentity.runId;
+  panel.appendChild(element("p", `Confirm ${confirmationLabel(entry.sourceIdentity)} for run ${runId}?`));
   panel.appendChild(element("p", `POST ${entry.request.path}`));
   panel.appendChild(element("pre", JSON.stringify(entry.request.body)));
   const confirm = document.createElement("button");
@@ -7029,26 +7083,22 @@ function renderConfirmationPanel(entry) {
   cancel.addEventListener("click", () => {
     if (currentConfirmation !== null && currentConfirmation.token === entry.token) {
       destroyCurrentConfirmation();
-      panel.remove();
     }
   });
   panel.appendChild(cancel);
   return panel;
 }
 
-function describeLabel(describe) {
-  if (describe === "continue-stage") {
+/** The label of one open confirmation, derived exclusively from the
+ * frozen source identity of the holder. */
+function confirmationLabel(sourceIdentity) {
+  if (sourceIdentity.actionKind === "continue_stage") {
     return "continue stage";
   }
-  if (describe === "revise-task") {
+  if (sourceIdentity.actionKind === "revise_task") {
     return "revise task";
   }
-  return `respond (${describeLabelAction(describe)})`;
-}
-
-function describeLabelAction(describe) {
-  // the describe string of a generic action is the declared action id
-  return describe.endsWith("-action") ? describe.slice(0, -7) : describe;
+  return `respond (${sourceIdentity.actionId})`;
 }
 
 function respondForm(control) {
@@ -7067,7 +7117,7 @@ function respondForm(control) {
   form.appendChild(submit);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    openConfirmation(control, () => ({}), `${control.actionId}-action`);
+    openConfirmation(control, () => ({}));
   });
   return form;
 }
