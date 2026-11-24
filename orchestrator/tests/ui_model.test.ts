@@ -1044,15 +1044,88 @@ describe("ui v4 action routing (S4): closed parser, reserved and generic control
 
   test("the confirmation holder is one exact frozen owner without panel, describe or function fields", () => {
     // the authoritative holder is exactly one frozen record of the
-    // three keys token/request/sourceIdentity; the DOM panel lives in
-    // the separate non-authoritative element variable and the describe
-    // label is derived from the frozen source identity
+    // three keys token/request/sourceIdentity, created by exactly one
+    // Object.freeze initializer inside openConfirmation; the DOM panel
+    // lives in the separate non-authoritative element variable and the
+    // describe label is derived from the frozen source identity
     const region = appSource.slice(
       appSource.indexOf("Confirmation panel (S4)"),
       appSource.indexOf("Manual lifecycle controls"),
     );
-    expect(appSource.includes("sourceIdentity: confirmationSourceOf(")).toBe(true);
-    expect(appSource.includes("currentConfirmationPanel = renderConfirmationPanel(")).toBe(true);
+    // owner scope: the openConfirmation definition up to the next
+    // top-level function definition
+    const owner = appSource.slice(
+      appSource.indexOf("function openConfirmation"),
+      appSource.indexOf("function renderConfirmationPanel"),
+    );
+    expect(owner.length).toBeGreaterThan(0);
+    // exactly one frozen construction site, exactly one assignment of
+    // the authoritative holder and exactly two nullings beyond the
+    // initial let declaration (destroy and the one-shot admission
+    // consumption)
+    expect(appSource.split("currentConfirmation = Object.freeze({").length - 1).toBe(0);
+    expect(appSource.split("currentConfirmation = entry;").length - 1).toBe(1);
+    expect(appSource.split("currentConfirmation = null;").length - 1).toBe(3);
+    // extract the exact frozen initializer
+    const begin = owner.indexOf("const entry = Object.freeze({");
+    const braceStart = owner.indexOf("{", begin);
+    let braceDepth = 0;
+    let braceEnd = -1;
+    for (let i = braceStart; i < owner.length; i += 1) {
+      if (owner[i] === "{") {
+        braceDepth += 1;
+      } else if (owner[i] === "}") {
+        braceDepth -= 1;
+        if (braceDepth === 0) {
+          braceEnd = i;
+          break;
+        }
+      }
+    }
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(braceEnd).toBeGreaterThan(braceStart);
+    const initializer = owner.slice(begin, owner.indexOf("});", braceEnd) + 3);
+    const body = owner.slice(braceStart + 1, braceEnd);
+    // top-level key extraction with parenthesis awareness
+    const entries = [];
+    let nestDepth = 0;
+    let current = "";
+    for (const ch of body) {
+      if (ch === "(" || ch === "[") {
+        nestDepth += 1;
+      } else if (ch === ")" || ch === "]") {
+        nestDepth -= 1;
+      }
+      if (ch === "," && nestDepth === 0) {
+        entries.push(current.trim());
+        current = "";
+      } else if (ch === "\n") {
+        current += " ";
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim().length > 0) {
+      entries.push(current.trim());
+    }
+    expect(
+      entries.map((entry) => (entry.split(":")[0] ?? entry).trim()),
+    ).toEqual([
+      "token",
+      "request",
+      "sourceIdentity",
+    ]);
+    // the exact normalized initializer proves the exact record content:
+    // no panel, no describe, no method fields inside the holder
+    expect(initializer.replace(/\s+/g, " ")).toBe(
+      "const entry = Object.freeze({ token: confirmationCounter + 1, request, " +
+        "sourceIdentity: confirmationSourceOf(control, lastRunModel, authorityFor(control.runId)), });",
+    );
+    // the panel element is assigned outside the initializer and never
+    // recorded inside the authoritative record
+    expect(initializer.includes("currentConfirmationPanel")).toBe(false);
+    const panelAssignment = owner.indexOf("currentConfirmationPanel = renderConfirmationPanel(");
+    expect(panelAssignment).toBeGreaterThan(owner.indexOf("});", braceEnd));
     // the authoritative record carries no panel, no describe and no
     // function-valued field anywhere in the source identity
     for (const banned of ["entry.panel", "currentConfirmation.panel", "entry.describe", "currentConfirmation.describe"]) {
@@ -1074,16 +1147,35 @@ describe("ui v4 action routing (S4): closed parser, reserved and generic control
     expect(authority.includes("inputRootIds: Object.freeze(")).toBe(true);
     const compare = region.slice(region.indexOf("function reviseAuthorityEquals"), region.indexOf("/** The source identity"));
     expect(compare).not.toBe("");
-    // the post-begin direct submit path shares ONE gate-owned
-    // try/finally with the flow (a rejected build releases the gate)
+    // the gate owns EVERY post-begin path structurally: one begin, an
+    // immediate try, the confirmation consumption inside the gate-owned
+    // region and one release in the finally
     const submitRegion = appSource.slice(appSource.indexOf("async function submitAction"), appSource.indexOf("let controlCounter = 0"));
     expect(submitRegion).not.toBe("");
-    expect(submitRegion.split("mutationGate.begin()").length - 1).toBe(2);
-    expect(submitRegion.split("mutationGate.end()").length - 1).toBe(1);
-    expect(submitRegion.indexOf("mutationGate.end()")).toBeGreaterThan(
-      submitRegion.indexOf("async function submitAction"),
-    );
-    expect(submitRegion.includes("finally {")).toBe(true);
+    expect(submitRegion.split("mutationGate.begin()").length - 1).toBe(1);
+    const beginIndex = submitRegion.indexOf("mutationGate.begin()");
+    const tryIndex = submitRegion.indexOf("try {", beginIndex);
+    const finallyIndex = submitRegion.indexOf("finally {", tryIndex);
+    expect(beginIndex).toBeGreaterThanOrEqual(0);
+    expect(tryIndex).toBeGreaterThan(beginIndex);
+    expect(finallyIndex).toBeGreaterThan(tryIndex);
+    // zero effects sit between the successful begin and the gate-owned
+    // region (no await, no state mutation, no build request)
+    const between = submitRegion.slice(beginIndex + "mutationGate.begin()".length, tryIndex);
+    expect(between.includes("await")).toBe(false);
+    expect(between.includes("currentConfirmation")).toBe(false);
+    expect(between.includes("buildMutationRequest")).toBe(false);
+    // the confirmation consumption and every other post-begin path are
+    // inside the gate-owned region; the single release is in the
+    // finally and nothing follows it before the function end
+    const consumption = submitRegion.indexOf("currentConfirmation = null;", tryIndex);
+    expect(consumption).toBeGreaterThan(tryIndex);
+    expect(consumption).toBeLessThan(finallyIndex);
+    expect(submitRegion.indexOf("currentConfirmationPanel.remove()", tryIndex)).toBeGreaterThan(tryIndex);
+    expect(submitRegion.indexOf("currentConfirmationPanel.remove()")).toBeLessThan(finallyIndex);
+    expect(submitRegion.indexOf("mutationGate.end()")).toBeGreaterThan(finallyIndex);
+    expect(submitRegion.slice(submitRegion.indexOf("mutationGate.end()") + "mutationGate.end()".length).replace(/^[\s\S]*?\n/, "").includes("mutationGate.")).toBe(false);
+    expect(submitRegion.includes("generate:")).toBe(false);
   });
 });
 

@@ -6776,44 +6776,44 @@ function notifyObservationOfInspect(runId) {
  * the DOM byte-unchanged with zero POST.
  */
 async function submitAction(admission, readForm, describe) {
-  let request;
-  let runId;
-  if (typeof admission === "number") {
-    // the Confirm press: token check first (a stale or unknown token is
-    // byte-inert and never reaches the gate)
-    const entry = currentConfirmation;
+  // pre-admission classification: the token check is byte-inert and
+  // never reaches the gate
+  const isConfirm = typeof admission === "number";
+  let entry = null;
+  if (isConfirm) {
+    entry = currentConfirmation;
     if (entry === null || entry.token !== admission) {
       return;
     }
-    if (!mutationGate.begin()) {
-      return;
-    }
-    // admission is atomic: consume the request and destroy the
-    // confirmation immediately behind the successful begin
-    currentConfirmation = null;
-    if (currentConfirmationPanel !== null) {
-      currentConfirmationPanel.remove();
-      currentConfirmationPanel = null;
-    }
-    request = entry.request;
-    describe = confirmationDescribe(entry.sourceIdentity);
-    runId = entry.sourceIdentity.runId;
-  } else {
-    if (!mutationGate.begin()) {
-      return;
-    }
-    const action = admission;
-    runId = action.runId;
   }
-  // from a successful begin on, every path of this submit — including
-  // the direct build request refusal — runs under ONE try/finally that
-  // releases the gate again, so a rejected form can never leak the
+  if (!mutationGate.begin()) {
+    return;
+  }
+  // from a successful begin on, EVERY path of this submit — the
+  // confirmation consumption, the direct build request refusal, every
+  // asynchronous continuation — runs under ONE try/finally that
+  // releases the gate again, so no post-begin path can ever leak the
   // global mutation gate
   let controlsDisabled = false;
   let mutationObserved = false;
+  let request;
+  let runId;
   try {
-    if (request === undefined) {
+    if (isConfirm) {
+      // admission is atomic: consume the confirmation and destroy the
+      // panel inside the gate-owned region, immediately behind the
+      // successful begin
+      currentConfirmation = null;
+      if (currentConfirmationPanel !== null) {
+        currentConfirmationPanel.remove();
+        currentConfirmationPanel = null;
+      }
+      request = entry.request;
+      describe = confirmationDescribe(entry.sourceIdentity);
+      runId = entry.sourceIdentity.runId;
+    } else {
       const action = admission;
+      runId = action.runId;
       try {
         request = buildMutationRequest(action, readForm());
       } catch (error) {
