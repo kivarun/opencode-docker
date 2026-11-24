@@ -95,7 +95,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
-| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183), P-1 (abf95e5; CI 43903686912) and P-2 (9b08980 + corrective 00422ee; CI 44103077865 / 44113220025) landed and Complete; UI implementation not started |
+| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183), P-1 (abf95e5; CI 43903686912) and P-2 (9b08980 + corrective 00422ee; CI 44103077865 / 44113220025) landed and Complete; UI slices S1–S3 Complete (see their records below) and S4 Complete (7f79b43 → 451e63b → 47adeb50; CI 45370189214 / 45376514804 / 45397965027); S5–S8 not started |
 
 Drift-control record (2026-11-12): the plan contains no formal Complete-gate
 for an increment's successor. Per explicit operator decision, Increment 6 is
@@ -529,11 +529,11 @@ Contract essentials:
   Host/Origin authority `127.0.0.1:<port>`, foreign Host/Origin failing
   closed before route parsing.
 
-Only the first three UI slices S1, S2 and S3 have been built and are
-**Complete** (see the S1–S3 records below). The bounded prerequisites
+The first four UI slices S1, S2, S3 and S4 have been built and are
+**Complete** (see the S1–S4 records below). The bounded prerequisites
 **P-3 (durable-identity projection)**, **P-1 (task/plan revision artifact
 content)** and **P-2 (accepted reviewer-output content)** are landed and
-**Complete** (see below); the remaining UI implementation (S4–S8) remains
+**Complete** (see below); the remaining UI implementation (S5–S8) remains
 not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
@@ -851,6 +851,95 @@ the accepted implementation review plus three operator corrective cycles
   Finding A, and the smoke-harness fix. The accepted S3 scope, the
   corrective observation-gate contract and the abort-contract test
   wording are not reopened by this record.
+
+### S4 Complete: generic respond confirmation with one-shot admission (2026-11-24)
+
+S4 (declared non-reserved wait actions route through the generic
+`respond` endpoint behind a single page-level confirmation with a
+per-submit one-shot token admission and the one global mutation gate)
+is delivered and marked **Complete** after the accepted implementation
+review plus two accepted corrective rounds.
+
+- The delivery chain is three single thematic commits, each with CI
+  success on its exact SHA; all three touch UI files and their suites
+  only (the correctives touch `ui/app.js` and `ui_model.test.ts`
+  only), leave this plan untouched, and are clean-tree commits with
+  `git diff --check` clean and a byte-identical `bun.lock`:
+  - `7f79b43` — implementation — CI run `45370189214`;
+  - `451e63b` — corrective r1 (direct-submit gate leak fixed for the
+    direct path; confirmation holder restored to the frozen
+    contract) — CI run `45376514804`;
+  - `47adeb50` — corrective r2 (structural gate-owner restructure;
+    owner-scoped exact holder pin) — CI run `45397965027`.
+- Both post-first-delivery defects are recorded explicitly:
+  - **Gate leak (C1):** at `7f79b43` the direct-submit branch of
+    `submitAction` ran `mutationGate.begin()` before
+    `buildMutationRequest`, so every rejected form left the global
+    mutation gate in flight and the next valid submit produced zero
+    POSTs (regression vs `a161e4e`; red-before wiring pin c15
+    materialized this on `7f79b43`). The r1 fix covered only the
+    direct path, while the r1 record's claim that the entire
+    post-begin path was covered proved **false at `451e63b`** — the
+    Confirm path still consumed the confirmation between the
+    successful `begin()` and the `try`. r2 restructured `submitAction`
+    so the invariant holds structurally: exactly one
+    `mutationGate.begin()` site, one common `try/finally` opened
+    immediately after the admission decision, the confirmation
+    consumption, panel removal, direct request build and every await
+    inside the gate-owned region, exactly one `mutationGate.end()` in
+    the `finally`; stale-token and busy-gate checks remain
+    pre-admission and byte-inert. The gate-region structure is pinned
+    permanently in `ui_model`.
+  - **Holder contract drift (C2):** at `7f79b43` the confirmation
+    holder was a mutable five-field record carrying the derived
+    describe, the DOM panel and a revise-authority object with an
+    `equals` method. r1 restored the accepted contract: exactly one
+    frozen `Object.freeze({token, request, sourceIdentity})`
+    construction (seven-field frozen `sourceIdentity`), the DOM panel
+    in a separate non-authoritative element variable, the describe
+    label derived, and frozen pure authority data compared by a
+    separate pure function. r2 added the owner-scoped exact pin: the
+    `const entry = Object.freeze({...})` initializer is extracted
+    inside `openConfirmation`, its exact top-level key set and its
+    normalized record form are proved (`token`, `request`,
+    `sourceIdentity` only — no panel, no describe, no methods), and
+    the panel element is proven absent from and assigned strictly
+    after the initializer.
+- Evidence: implementation report (final revision, corrective r2)
+  `/exchange/outbox/increment-6-s4-implementation-report.md`
+  (SHA-256
+  `3bfc9604297f028ea1f495f74bd5c6a3cd564ec8da86eb7c867f7d660e920efd`).
+  Per operator direction the unrelated `RESULTS.md` (MNB37a package
+  lifecycle) was not used as S4 evidence.
+- Final contract (as reviewed, not reopened by this record): the
+  closed per-action parser keeps a shape-damaged waiting boundary
+  `unusable_boundary` with zero POST; declared action ids route to
+  `respond` (`POST /v1/runs/<runId>/respond`, exact `{wait_index,
+  action_id}` body built once by `buildMutationRequest`; reserved
+  `continue_stage`/`revise_task` stay on their dedicated endpoints and
+  a forged reserved respond is refused `no_mutation`); one page-level
+  confirmation with a read-only saved-request panel (endpoint and
+  canonical body shown before any POST); one-shot admission through
+  the per-submit token with atomic consume-and-destroy behind the
+  successful gate begin; the invalidation matrix (changed applied
+  inspect identity, changed wait index, mixed→single action-set
+  change, non-waiting boundary, disappeared action, synchronous run
+  switch, revise-authority content change) never re-arms a consumed
+  confirmation.
+- Verification truth (recorded honestly): focused suites green at the
+  delivered SHA (`ui_model` 67/67, `ui_inspect_wiring` 32/32; the
+  pre-existing `control_plane_ui_project_apply` environment failures
+  unchanged); a controlled sequential full A/B against a clean
+  `a161e4e` worktree: candidate 4455 pass / 130 fail / 4585 tests,
+  base 4432 pass / 130 fail / 4562 tests, failing-name sets
+  set-identical to the recorded 130-name environment baseline
+  (`candidate − base = 0`); TypeScript (`tsc --noEmit`) and
+  `git diff --check` clean; `package.json`, `bun.lock`,
+  `ui/index.html` and `ui/style.css` byte-identical throughout.
+- Not started (unchanged scope): UI slices S5–S8, live Browser UAT,
+  Finding A, and the smoke-harness fix. The accepted S4 scope, the
+  one-shot admission contract and the confirmation-holder contract are
+  not reopened by this record.
 
 ## Deferred work
 
