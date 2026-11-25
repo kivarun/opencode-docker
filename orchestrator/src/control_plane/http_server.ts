@@ -167,6 +167,7 @@ interface ParsedRoute {
     | "inspect"
     | "events"
     | "identity"
+    | "execution_bindings"
     | "logs_list"
     | "logs_execution"
     | "project_changes"
@@ -372,6 +373,16 @@ export function parseControlPlaneRoute(pathname: string, method: string): Parsed
       return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
     }
     return { kind: "identity", projectId: null, runId };
+  }
+  if (matchesShape(["v1", "runs", "*", "execution-bindings"])) {
+    if (shapeMethodMismatch("GET")) {
+      return new ControlPlaneHttpRequestError("method_not_allowed", "the execution-bindings route accepts GET only");
+    }
+    const runId = safeId(rest[2]);
+    if (runId === null) {
+      return new ControlPlaneHttpRequestError("invalid_path", "the run id must be a safe identifier");
+    }
+    return { kind: "execution_bindings", projectId: null, runId };
   }
   if (matchesShape(["v1", "runs", "*", "tasks", "*", "revisions", "*"])) {
     if (shapeMethodMismatch("GET")) {
@@ -1002,6 +1013,112 @@ export function parseIdentityQuery(
 }
 
 /**
+ * The execution-bindings query of one run's read-only binding page: an
+ * optional non-negative safe integer cursor (default 0), an optional
+ * positive safe integer revision pin (REQUIRED for every continuation)
+ * and an optional positive safe integer limit (default 100, maximum
+ * 200). The raw query string is parsed strictly with exactly the
+ * identity grammar (no percent-encoding, no bare keys, no duplicates,
+ * no empty values, no sign, fraction or exponent, and no unknown
+ * fields). Grammar violations are `invalid_request`; cursor/revision
+ * contract violations are `invalid_cursor` — a `stale_snapshot` mismatch
+ * is NEVER decided here (the loaded snapshot is authoritative and the
+ * check belongs to the dispatch after the projection load).
+ */
+export function parseExecutionBindingsQuery(
+  search: string,
+):
+  | { readonly after: number; readonly revision: number | null; readonly limit: number | null }
+  | ControlPlaneHttpRequestError {
+  if (search.startsWith("?")) {
+    search = search.slice(1);
+  }
+  if (search === "") {
+    return { after: 0, revision: null, limit: null };
+  }
+  if (search.includes("%")) {
+    return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query must not carry encoded components");
+  }
+  let after: number | null = null;
+  let revision: number | null = null;
+  let limit: number | null = null;
+  const decimal = (value: string): number | null => {
+    if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+      return null;
+    }
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed)) {
+      return null;
+    }
+    return parsed;
+  };
+  for (const part of search.split("&")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) {
+      return new ControlPlaneHttpRequestError("invalid_request", "every execution-bindings query field must carry exactly one value");
+    }
+    const key = part.slice(0, separator);
+    const value = part.slice(separator + 1);
+    if (key === "after") {
+      if (after !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query fields must be unique");
+      }
+      const parsed = decimal(value);
+      if (parsed === null) {
+        if (/^-[0-9]+$/.test(value) || value === "-0") {
+          return new ControlPlaneHttpRequestError("invalid_cursor", "the execution-bindings query after must be a non-negative safe integer");
+        }
+        return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query after must be a non-negative safe integer");
+      }
+      after = parsed;
+      continue;
+    }
+    if (key === "revision") {
+      if (revision !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query fields must be unique");
+      }
+      const parsed = decimal(value);
+      if (parsed === null) {
+        if (value === "0" || /^-[0-9]+$/.test(value) || value === "-0") {
+          return new ControlPlaneHttpRequestError("invalid_cursor", "the execution-bindings query revision must be a positive safe integer");
+        }
+        return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query revision must be a positive safe integer");
+      }
+      if (parsed === 0) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", "the execution-bindings query revision must be a positive safe integer");
+      }
+      revision = parsed;
+      continue;
+    }
+    if (key === "limit") {
+      if (limit !== null) {
+        return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query fields must be unique");
+      }
+      const parsed = decimal(value);
+      if (parsed === null) {
+        if (value === "0" || /^-[0-9]+$/.test(value) || value === "-0") {
+          return new ControlPlaneHttpRequestError("invalid_cursor", "the execution-bindings query limit must be a positive safe integer up to 200");
+        }
+        return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query limit must be a positive safe integer up to 200");
+      }
+      if (parsed === 0 || parsed > 200) {
+        return new ControlPlaneHttpRequestError("invalid_cursor", "the execution-bindings query limit must be a positive safe integer up to 200");
+      }
+      limit = parsed;
+      continue;
+    }
+    return new ControlPlaneHttpRequestError("invalid_request", "the execution-bindings query carries an unknown field");
+  }
+  if (after === null) {
+    after = 0;
+  }
+  if (after > 0 && revision === null) {
+    return new ControlPlaneHttpRequestError("invalid_cursor", "a continuation execution-bindings cursor requires its revision pin");
+  }
+  return { after, revision, limit };
+}
+
+/**
  * The project-changes query of one run's read-only workspace-changes
  * page: an optional non-negative safe integer entry cursor (default 0),
  * an optional positive safe integer limit (default 100, maximum 200) and
@@ -1493,6 +1610,8 @@ export function projectControlPlaneCommandResult(
     projection.kind === "eventsFailure" ||
     projection.kind === "identity" ||
     projection.kind === "identityFailure" ||
+    projection.kind === "executionBindings" ||
+    projection.kind === "executionBindingsFailure" ||
     projection.kind === "logs" ||
     projection.kind === "logsExecution" ||
     projection.kind === "logsChunk" ||
@@ -1833,6 +1952,68 @@ export function projectControlPlaneIdentity(
   return {
     schema_version: 1,
     kind: "identity",
+    run_id: projection.runId,
+    revision: projection.revision,
+    after: projection.after,
+    records: projection.records,
+    next_after: projection.nextAfter,
+  };
+}
+
+/** The versioned execution-binding page projection of one run (S5-P0). */
+export interface ExecutionBindingsProjection {
+  readonly schema_version: 1;
+  readonly kind: "execution_bindings";
+  readonly run_id: string;
+  readonly revision: number;
+  readonly after: number;
+  readonly records: readonly unknown[];
+  readonly next_after: number | null;
+}
+
+/**
+ * The one projection builder for a verified schemaVersion-1
+ * execution-bindings page: the records are copied without any new
+ * classification; no binding projection carries a filesystem path, so
+ * there is no run root to drop. A typed `invalid_cursor` CLI failure is
+ * the request-layer 400 envelope; a typed `stale_snapshot` CLI failure
+ * is the request-layer 409 envelope (the loaded snapshot's revision
+ * moved between pages — no partial page is ever returned); every other
+ * correctly received failure follows the identity precedent (a correctly
+ * received failed outcome as a 200 command result).
+ */
+export function projectControlPlaneExecutionBindings(
+  result: OrchestratorCallResult,
+): ExecutionBindingsProjection | CommandOutcomeProjection | ControlPlaneHttpFailure {
+  if (!result.ok) {
+    return { layer: "transport", reason: result.failure.reason };
+  }
+  const projection = result.projection;
+  if (projection.kind === "executionBindingsFailure") {
+    if (projection.exitCode !== 1 || projection.reason === undefined) {
+      return { layer: "transport", reason: "internal_error" };
+    }
+    if (projection.reason === "invalid_cursor") {
+      return { layer: "request", reason: "invalid_cursor" };
+    }
+    if (projection.reason === "stale_snapshot") {
+      return { layer: "request", reason: "stale_snapshot" };
+    }
+    return {
+      schema_version: 1,
+      kind: "command_result",
+      run_id: projection.runId,
+      outcome: "failed",
+      exit_code: projection.exitCode,
+      reason: projection.reason,
+    } satisfies CommandOutcomeProjection;
+  }
+  if (projection.kind !== "executionBindings" || projection.schemaVersion !== 1) {
+    return { layer: "transport", reason: "internal_error" };
+  }
+  return {
+    schema_version: 1,
+    kind: "execution_bindings",
     run_id: projection.runId,
     revision: projection.revision,
     after: projection.after,
@@ -2209,6 +2390,7 @@ function projectionResponse(
     | RunsDiscoveryProjection
     | EventsProjection
     | IdentityProjection
+    | ExecutionBindingsProjection
     | TaskContentProjection
     | AgentOutputProjection
     | PlanContentProjection
@@ -2430,6 +2612,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
       parsed.kind === "runs" ||
       parsed.kind === "events" ||
       parsed.kind === "identity" ||
+      parsed.kind === "execution_bindings" ||
       parsed.kind === "task_content" ||
       parsed.kind === "agent_output" ||
       parsed.kind === "plan_content" ||
@@ -2521,6 +2704,21 @@ async function dispatchControlPlaneRoute(
       };
       const result = await deps.client.run(command);
       return projectionResponse(projectControlPlaneIdentity(result));
+    }
+    case "execution_bindings": {
+      const query = parseExecutionBindingsQuery(deps.discoveryQuery ?? "");
+      if (query instanceof ControlPlaneHttpRequestError) {
+        return requestFailure(query.reason);
+      }
+      const command: OrchestratorCommand = {
+        kind: "execution_bindings",
+        runId,
+        ...(query.after === 0 ? {} : { after: query.after }),
+        ...(query.revision === null ? {} : { revision: query.revision }),
+        ...(query.limit === null ? {} : { limit: query.limit }),
+      };
+      const result = await deps.client.run(command);
+      return projectionResponse(projectControlPlaneExecutionBindings(result));
     }
     case "task_content": {
       const query = parseTaskContentQuery(deps.discoveryQuery ?? "");

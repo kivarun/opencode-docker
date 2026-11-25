@@ -137,6 +137,9 @@ function makeIo(): Recorder {
     identityPipelineV2Run: (async () => {
       throw new Error("fake identityPipelineV2Run not configured");
     }) as unknown as CliIo["identityPipelineV2Run"],
+    executionBindingsPipelineV2Run: (async () => {
+      throw new Error("fake executionBindingsPipelineV2Run not configured");
+    }) as unknown as CliIo["executionBindingsPipelineV2Run"],
     taskRevisionContentPipelineV2Run: (async () => {
       throw new Error("fake taskRevisionContentPipelineV2Run not configured");
     }) as unknown as CliIo["taskRevisionContentPipelineV2Run"],

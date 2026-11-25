@@ -78,6 +78,13 @@ export type OrchestratorCommand =
       readonly limit?: number;
     }
   | {
+      readonly kind: "execution_bindings";
+      readonly runId: string;
+      readonly after?: number;
+      readonly revision?: number;
+      readonly limit?: number;
+    }
+  | {
       readonly kind: "task_revision";
       readonly runId: string;
       readonly taskId: string;
@@ -522,6 +529,35 @@ function captureOrchestratorCommand(command: unknown): CapturedCommand {
         limit,
       };
     }
+    case "execution_bindings": {
+      for (const key of Object.keys(command)) {
+        if (key !== "kind" && key !== "runId" && key !== "after" && key !== "revision" && key !== "limit") {
+          throw new OrchestratorSubprocessClientError("invalid_command", "unknown field on execution_bindings command");
+        }
+      }
+      if (!Object.hasOwn(command, "runId")) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "missing field runId on execution_bindings command");
+      }
+      const afterField = optionalField(command, "after");
+      const after = afterField.present ? expectNonNegativeIntegerField({ after: afterField.value }, "after", "after") : null;
+      const revisionField = optionalField(command, "revision");
+      const revision = revisionField.present
+        ? expectPositiveIntegerField({ revision: revisionField.value }, "revision", "revision")
+        : null;
+      const limitField = optionalField(command, "limit");
+      const limit = limitField.present ? expectPositiveIntegerField({ limit: limitField.value }, "limit", "limit") : null;
+      if (after !== null && after > 0 && revision === null) {
+        throw new OrchestratorSubprocessClientError("invalid_command", "a continuation execution_bindings cursor requires its revision pin");
+      }
+      return {
+        ...empty,
+        kind,
+        runId: expectSafeIdField(command, "runId", "runId"),
+        after,
+        revision,
+        limit,
+      };
+    }
     case "task_revision": {
       for (const key of Object.keys(command)) {
         if (key !== "kind" && key !== "runId" && key !== "taskId" && key !== "revision" && key !== "offset" && key !== "limit") {
@@ -788,7 +824,9 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
                       ? "agent-output"
                       : captured.kind === "plan_revision"
                         ? "plan-revision"
-                        : captured.kind;
+                        : captured.kind === "execution_bindings"
+                          ? "execution-bindings"
+                          : captured.kind;
   const argv: string[] = [cliKind];
   switch (captured.kind) {
     case "run": {
@@ -843,6 +881,12 @@ export function routeOrchestratorCommand(command: OrchestratorCommand, routingCo
       if (captured.limit !== null) argv.push("--limit", String(captured.limit));
       break;
     case "identity":
+      argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
+      if (captured.after !== null) argv.push("--after", String(captured.after));
+      if (captured.revision !== null) argv.push("--revision", String(captured.revision));
+      if (captured.limit !== null) argv.push("--limit", String(captured.limit));
+      break;
+    case "execution_bindings":
       argv.push("--run-id", captured.runId, "--config-root", routingConfig.configRoot);
       if (captured.after !== null) argv.push("--after", String(captured.after));
       if (captured.revision !== null) argv.push("--revision", String(captured.revision));

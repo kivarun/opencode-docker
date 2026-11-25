@@ -178,6 +178,31 @@ export type OrchestratorIdentityProjection =
     };
 
 /**
+ * The projected result of one `execution_bindings` call: the exact
+ * schemaVersion-1 binding page (the records pass through as opaque
+ * frozen JSON — the client never re-classifies, re-orders or re-derives
+ * them; no binding document, success or failure, carries a filesystem
+ * path, so there is no run root to drop), or the typed failure outcome
+ * of the CLI itself with a reason from the closed binding vocabulary.
+ */
+export type OrchestratorExecutionBindingsProjection =
+  | {
+      readonly kind: "executionBindings";
+      readonly schemaVersion: 1;
+      readonly runId: string;
+      readonly revision: number;
+      readonly after: number;
+      readonly records: readonly OrchestratorJsonValue[];
+      readonly nextAfter: number | null;
+    }
+  | {
+      readonly kind: "executionBindingsFailure";
+      readonly exitCode: 1;
+      readonly runId: string;
+      readonly reason: string;
+    };
+
+/**
  * The projected result of one `task_revision` call: the versioned P-1
  * task-content chunk (the body chunk fields pass through as frozen
  * JSON; the documents are path-free, so there is no run root to drop),
@@ -389,6 +414,7 @@ export type OrchestratorCallResult =
         | OrchestratorInspectProjection
         | OrchestratorEventsProjection
         | OrchestratorIdentityProjection
+        | OrchestratorExecutionBindingsProjection
   | OrchestratorAgentOutputProjection
   | OrchestratorTaskContentProjection
   | OrchestratorPlanContentProjection
@@ -547,6 +573,19 @@ const IDENTITY_REPORT_KEYS = [
 ] as const;
 /** The identity CLI failure document: path-free — no runRoot member exists. */
 const IDENTITY_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId"] as const;
+/** The execution-bindings CLI success document: path-free — no runRoot member exists. */
+const EXECUTION_BINDINGS_REPORT_KEYS = [
+  "after",
+  "exitCode",
+  "nextAfter",
+  "ok",
+  "records",
+  "revision",
+  "runId",
+  "schemaVersion",
+] as const;
+/** The execution-bindings CLI failure document: path-free — no runRoot member exists. */
+const EXECUTION_BINDINGS_FAILURE_KEYS = ["exitCode", "ok", "reason", "runId"] as const;
 /** The task-content CLI success document: path-free — no runRoot member exists. */
 const TASK_CONTENT_REPORT_KEYS = [
   "body",
@@ -1346,6 +1385,81 @@ function parseOutcomeDocument(
         ok: true,
         projection: deepFreezeValue({
           kind: "identity",
+          schemaVersion: 1,
+          runId,
+          revision: parsed["revision"] as number,
+          after: parsed["after"] as number,
+          records: deepFreezeValue(parsed["records"] as OrchestratorJsonValue[]),
+          nextAfter: nextAfterValue as number | null,
+        }),
+      };
+    } catch (cause) {
+      if (cause instanceof OrchestratorSubprocessClientError) {
+        return fail(cause.reason, cause.message, expectedRunId);
+      }
+      throw cause;
+    }
+  }
+  if (commandKind === "execution_bindings") {
+    if (exitCode === 1) {
+      try {
+        expectExactKeys(parsed, EXECUTION_BINDINGS_FAILURE_KEYS);
+        if (parsed["ok"] !== false || parsed["exitCode"] !== 1) {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "execution-bindings failure document has an unexpected shape");
+        }
+        const runId = expectStringField(parsed, "runId");
+        const reason = expectStringField(parsed, "reason");
+        if (reason === "") {
+          throw new OrchestratorSubprocessClientError("unexpected_output_shape", "execution-bindings failure reason must be a non-empty string");
+        }
+        return {
+          ok: true,
+          projection: deepFreezeValue({
+            kind: "executionBindingsFailure",
+            exitCode: 1,
+            runId,
+            reason,
+          }),
+        };
+      } catch (cause) {
+        if (cause instanceof OrchestratorSubprocessClientError) {
+          return fail(cause.reason, cause.message, expectedRunId);
+        }
+        throw cause;
+      }
+    }
+    try {
+      expectExactKeys(parsed, EXECUTION_BINDINGS_REPORT_KEYS);
+      if (parsed["ok"] !== true || parsed["exitCode"] !== 0) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "execution-bindings report has an unexpected shape");
+      }
+      if (parsed["schemaVersion"] !== 1) {
+        throw new OrchestratorSubprocessClientError("unsupported_contract", "execution-bindings projection schemaVersion must be 1");
+      }
+      const runId = expectStringField(parsed, "runId");
+      if (!isPositiveSafeInteger(parsed["revision"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "execution-bindings revision must be a positive safe integer");
+      }
+      if (!isNonNegativeSafeInteger(parsed["after"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "execution-bindings after must be a non-negative safe integer");
+      }
+      if (!Array.isArray(parsed["records"])) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "execution-bindings records must be an array");
+      }
+      const nextAfterValue = parsed["nextAfter"];
+      if (
+        nextAfterValue !== null &&
+        (typeof nextAfterValue !== "number" || !Number.isSafeInteger(nextAfterValue) || nextAfterValue < 0)
+      ) {
+        throw new OrchestratorSubprocessClientError("unexpected_output_shape", "execution-bindings nextAfter must be a non-negative safe integer or null");
+      }
+      // No execution-bindings document carries a filesystem path: there is
+      // no run root to drop, and the projection proves the success
+      // document's exact own-key set above.
+      return {
+        ok: true,
+        projection: deepFreezeValue({
+          kind: "executionBindings",
           schemaVersion: 1,
           runId,
           revision: parsed["revision"] as number,

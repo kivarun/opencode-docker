@@ -102,6 +102,10 @@ import {
   type PipelineV2IdentityOutcome,
 } from "./pipeline_v2_identity.ts";
 import {
+  executionBindingsPipelineV2Run,
+  type PipelineV2ExecutionBindingsOutcome,
+} from "./pipeline_v2_execution_bindings.ts";
+import {
   PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK,
   planRevisionContentPipelineV2Run,
   taskRevisionContentPipelineV2Run,
@@ -162,6 +166,7 @@ export interface CliIo {
   inspectPipelineV2Run: typeof inspectPipelineV2Run;
   eventsPipelineV2Run: typeof eventsPipelineV2Run;
   identityPipelineV2Run: typeof identityPipelineV2Run;
+  executionBindingsPipelineV2Run: typeof executionBindingsPipelineV2Run;
   taskRevisionContentPipelineV2Run: typeof taskRevisionContentPipelineV2Run;
   planRevisionContentPipelineV2Run: typeof planRevisionContentPipelineV2Run;
   logsPipelineV2Run: typeof logsPipelineV2Run;
@@ -205,6 +210,7 @@ function productionCliIo(): CliIo {
     inspectPipelineV2Run,
     eventsPipelineV2Run,
     identityPipelineV2Run,
+    executionBindingsPipelineV2Run,
     taskRevisionContentPipelineV2Run,
     planRevisionContentPipelineV2Run,
     logsPipelineV2Run,
@@ -247,7 +253,7 @@ function v1SignalRegistration(
 
 const PIPELINE_PLAN_DEFAULT_LIMIT = 100;
 const PIPELINE_TASK_DEFAULT_CHUNK_LIMIT = PIPELINE_V2_RUN_PLAN_TASK_DEFAULT_CHUNK;
-const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "identity", "logs", "agent-output", "project-changes", "task-revision", "plan-revision", "project-change-content", "project-apply", "project-apply-inspect"] as const;
+export const COMMANDS = ["smoke", "agent-smoke", "run", "resume", "respond", "continue-stage", "revise-task", "resume-plan", "inspect", "events", "identity", "execution-bindings", "logs", "agent-output", "project-changes", "task-revision", "plan-revision", "project-change-content", "project-apply", "project-apply-inspect"] as const;
 
 export async function runCli(argv: readonly string[], io: CliIo = productionCliIo()): Promise<number> {
   const command = argv[0];
@@ -264,6 +270,7 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     command !== "inspect" &&
     command !== "events" &&
     command !== "identity" &&
+    command !== "execution-bindings" &&
     command !== "task-revision" &&
     command !== "plan-revision" &&
     command !== "logs" &&
@@ -337,6 +344,16 @@ export async function runCli(argv: readonly string[], io: CliIo = productionCliI
     // SubprocessCliRunner command dependencies and no mutating command
     // deps object are built for it.
     return await runPipelineV2IdentityCommand(parsed, io);
+  }
+  if (parsed.kind === "execution-bindings") {
+    // The read-only pipeline v2 execution-bindings command: like identity
+    // it resolves only the state-root projection (no helper
+    // configuration, no Launcher credential, no auth, no subprocess, no
+    // signal registration, no mutation lock, no durable change) and
+    // invokes the execution-bindings production API exactly once. No
+    // SubprocessCliRunner command dependencies and no mutating command
+    // deps object are built for it.
+    return await runPipelineV2ExecutionBindingsCommand(parsed, io);
   }
   if (parsed.kind === "task-revision") {
     // The read-only pipeline v2 task-revision command: like the other
@@ -917,6 +934,44 @@ async function runPipelineV2IdentityCommand(
   } else {
     io.writeError(
       `orchestrator: identity failed (run ${outcome.runId}, reason ${outcome.reason})`,
+    );
+  }
+  return outcome.exitCode;
+}
+
+async function runPipelineV2ExecutionBindingsCommand(
+  parsed: Extract<Awaited<ReturnType<typeof parseCommand>>, { kind: "execution-bindings" }>,
+  io: CliIo,
+): Promise<number> {
+  let stateRootProjection;
+  try {
+    stateRootProjection = io.resolveStateRootProjection(io.baseEnv);
+  } catch (cause) {
+    io.writeError(`error: ${cause instanceof Error ? cause.message : String(cause)}`);
+    io.writeError(usage());
+    return 2;
+  }
+
+  const outcome: PipelineV2ExecutionBindingsOutcome = await io.executionBindingsPipelineV2Run({
+    runId: parsed.runId,
+    stateRoot: stateRootProjection.localRoot,
+    after: parsed.after,
+    ...(parsed.revision === null ? {} : { revision: parsed.revision }),
+    limit: parsed.limit,
+  });
+
+  if (parsed.json) {
+    io.writeStdout(`${JSON.stringify(outcome)}\n`);
+    return outcome.exitCode;
+  }
+
+  if (outcome.ok) {
+    io.writeError(
+      `orchestrator: execution-bindings ok (run ${outcome.runId}, revision ${outcome.revision}, records ${outcome.records.length}, next-after ${outcome.nextAfter === null ? "none" : outcome.nextAfter})`,
+    );
+  } else {
+    io.writeError(
+      `orchestrator: execution-bindings failed (run ${outcome.runId}, reason ${outcome.reason})`,
     );
   }
   return outcome.exitCode;

@@ -118,7 +118,7 @@ describe("pipeline v2 commit provenance: the 66-command lifecycle oracle", () =>
     expect(state.status).toBe("success");
     expect(state.revision).toBe(66);
     expect(state.schema_version).toBe(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION);
-    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(12);
+    expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(13);
     expect(state.commit_history).toHaveLength(66);
     state.commit_history.forEach((entry, index) => {
       expect(entry.revision).toBe(index + 1);
@@ -267,10 +267,17 @@ describe("pipeline v2 commit provenance: the ambiguity clusters resolve durably"
     expect(a.revision).toBe(52);
     expect(b.revision).toBe(52);
     expect(c.revision).toBe(52);
-    const strip = (state: PipelineV2RunState): string =>
-      JSON.stringify({ ...JSON.parse(JSON.stringify(state)) as Record<string, unknown>, commit_history: undefined });
-    expect(strip(a)).toBe(strip(b));
-    expect(strip(a)).toBe(strip(c));
+    // The durable riding (schema v13) records the reducer's own instant
+    // truth: in order (a) the old generation was already closed when the
+    // planning execution started, so it rides no generation; in orders
+    // (b) and (c) the old generation was still open. Every order therefore
+    // carries its own honest projection instead of the pre-v13 shared
+    // strip-equality; every document stays loader-valid (asserted below).
+    const fourthExecutionRides = (state: PipelineV2RunState): number | undefined =>
+      state.executions[3]?.generation_index;
+    expect(fourthExecutionRides(a)).toBeUndefined();
+    expect(fourthExecutionRides(b)).toBe(1);
+    expect(fourthExecutionRides(c)).toBe(1);
     const closeRevisionOf = (state: PipelineV2RunState): number => {
       const entry = state.commit_history.find((candidate) => candidate.kind === "stage_generation_closed");
       return entry!.revision;

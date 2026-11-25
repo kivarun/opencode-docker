@@ -1,5 +1,5 @@
 /**
- * Durable run state for pipeline schema v2 (state schema version 12).
+ * Durable run state for pipeline schema v2 (state schema version 13).
  *
  * Pure substrate: a versioned state document, an exact-field loader, and a
  * pure command reducer. Nothing here touches the filesystem, docker-helper,
@@ -127,7 +127,7 @@ import {
   type PipelineV2ProfileEpochBinding,
 } from "./pipeline_v2_profile_epoch.ts";
 
-export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 12;
+export const PIPELINE_V2_RUN_STATE_SCHEMA_VERSION = 13;
 
 /** The closed execution-role vocabulary fixed on every execution at start. */
 export const PIPELINE_V2_EXECUTION_ROLES = ["planning", "control", "stage"] as const;
@@ -408,6 +408,13 @@ export interface PipelineV2AgentExecutionState {
   execution_role: PipelineV2ExecutionRole;
   /** The open iteration a stage execution runs in; absent for planning/control. */
   iteration_index?: number;
+  /**
+   * The open stage generation the execution started in (schema v13):
+   * written by the reducer itself from its own open-generation truth at
+   * every start, present exactly when a generation is open at that
+   * instant; a stage execution always carries it. Never rewritten.
+   */
+  generation_index?: number;
   phase: PipelineV2AgentExecutionPhase;
   /** Durable id of the orchestrator-owned Execution Session (run-root scope). */
   execution_session_id?: string;
@@ -439,6 +446,13 @@ export interface PipelineV2DecisionExecutionState {
   execution_role: PipelineV2ExecutionRole;
   /** The open iteration a stage execution runs in; absent for planning/control. */
   iteration_index?: number;
+  /**
+   * The open stage generation the execution started in (schema v13):
+   * written by the reducer itself from its own open-generation truth at
+   * every start, present exactly when a generation is open at that
+   * instant; a stage execution always carries it. Never rewritten.
+   */
+  generation_index?: number;
   phase: PipelineV2DecisionExecutionPhase;
   input_digest: string;
   result?: PipelineDecisionStateRecord;
@@ -1426,57 +1440,62 @@ function rejectLegacySchemaVersions(value: unknown): void {
   const version = (value as Record<string, unknown>).schema_version;
   if (version === 1) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v1 migration exists)",
+      "pipeline v2 run state has schema_version 1, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v1 migration exists)",
     );
   }
   if (version === 2) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 12 is the supported contract; no v2 migration exists)",
+      "pipeline v2 run state has schema_version 2, which is the production pipeline v1 run-state contract, not a pipeline v2 run state (schema version 13 is the supported contract; no v2 migration exists)",
     );
   }
   if (version === 3) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v3 migration exists)",
+      "pipeline v2 run state has schema_version 3, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v3 migration exists)",
     );
   }
   if (version === 4) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v4 migration exists)",
+      "pipeline v2 run state has schema_version 4, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v4 migration exists)",
     );
   }
   if (version === 5) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v5 migration exists)",
+      "pipeline v2 run state has schema_version 5, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v5 migration exists)",
     );
   }
   if (version === 6) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v6 migration exists)",
+      "pipeline v2 run state has schema_version 6, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v6 migration exists)",
     );
   }
   if (version === 7) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v7 migration exists)",
+      "pipeline v2 run state has schema_version 7, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v7 migration exists)",
     );
   }
   if (version === 8) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v8 migration exists)",
+      "pipeline v2 run state has schema_version 8, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v8 migration exists)",
     );
   }
   if (version === 9) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v9 migration exists)",
+      "pipeline v2 run state has schema_version 9, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v9 migration exists)",
     );
   }
   if (version === 10) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v10 migration exists)",
+      "pipeline v2 run state has schema_version 10, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v10 migration exists)",
     );
   }
   if (version === 11) {
     throw new PipelineV2StateError(
-      "pipeline v2 run state has schema_version 11, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v11 migration exists)",
+      "pipeline v2 run state has schema_version 11, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v11 migration exists)",
+    );
+  }
+  if (version === 12) {
+    throw new PipelineV2StateError(
+      "pipeline v2 run state has schema_version 12, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v12 migration exists)",
     );
   }
   if (version !== undefined && version !== PIPELINE_V2_RUN_STATE_SCHEMA_VERSION) {
@@ -1589,7 +1608,7 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
     value,
     what,
     ["index", "type", "state_id", "attempt", "profile", "phase", "execution_role", "worker_log"],
-    ["iteration_index", "execution_session_id", "tool_session_id", "session_cleanup", "stage_task", "outputs", "failure_reason"],
+    ["iteration_index", "generation_index", "execution_session_id", "tool_session_id", "session_cleanup", "stage_task", "outputs", "failure_reason"],
   );
   if (obj.type !== "agent") {
     throw new PipelineV2StateError(`${what}.type must be "agent", got ${JSON.stringify(obj.type)}`);
@@ -1681,6 +1700,14 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
   // The role/iteration biconditional: a stage execution carries exactly
   // the open iteration index it runs in; planning and control executions
   // never carry one.
+  //
+  // The durable generation riding (schema v13): a stage execution also
+  // carries the open generation it started in from the reducer's own
+  // truth; planning and control executions record the generation their
+  // start instant fell in, or carry none when no generation was open.
+  // Both fields are optional structural fields apart from the stage
+  // requirement; the positional replay checks the recorded value and the
+  // presence/absence against the allowed positional candidate set.
   if (execution.execution_role === "stage") {
     if (obj.iteration_index === undefined) {
       throw new PipelineV2StateError(
@@ -1691,9 +1718,23 @@ function validateAgentExecution(value: unknown, what: string): PipelineV2AgentEx
       obj.iteration_index,
       `${what}.iteration_index`,
     );
+    if (obj.generation_index === undefined) {
+      throw new PipelineV2StateError(
+        `${what} has the "stage" execution role but records no generation_index`,
+      );
+    }
+    execution.generation_index = expectSafePositiveInteger(
+      obj.generation_index,
+      `${what}.generation_index`,
+    );
   } else if (obj.iteration_index !== undefined) {
     throw new PipelineV2StateError(
       `${what} has the ${JSON.stringify(execution.execution_role)} execution role but records an iteration index`,
+    );
+  } else if (obj.generation_index !== undefined) {
+    execution.generation_index = expectSafePositiveInteger(
+      obj.generation_index,
+      `${what}.generation_index`,
     );
   }
 
@@ -1960,7 +2001,7 @@ function validateDecisionExecution(value: unknown, what: string): PipelineV2Deci
     value,
     what,
     ["index", "type", "state_id", "phase", "input_digest", "execution_role"],
-    ["iteration_index", "result", "failure_reason"],
+    ["iteration_index", "generation_index", "result", "failure_reason"],
   );
   if (obj.type !== "decision") {
     throw new PipelineV2StateError(`${what}.type must be "decision", got ${JSON.stringify(obj.type)}`);
@@ -1978,6 +2019,13 @@ function validateDecisionExecution(value: unknown, what: string): PipelineV2Deci
     phase,
     input_digest: expectSha256(obj.input_digest, `${what}.input_digest`),
   };
+  // The durable generation riding (schema v13): a stage execution also
+  // carries the open generation it started in from the reducer's own
+  // truth; planning and control executions record the generation their
+  // start instant fell in, or carry none when no generation was open.
+  // Both fields are optional structural fields apart from the stage
+  // requirement; the positional replay checks the recorded value and the
+  // presence/absence against the allowed positional candidate set.
   if (execution.execution_role === "stage") {
     if (obj.iteration_index === undefined) {
       throw new PipelineV2StateError(
@@ -1988,9 +2036,23 @@ function validateDecisionExecution(value: unknown, what: string): PipelineV2Deci
       obj.iteration_index,
       `${what}.iteration_index`,
     );
+    if (obj.generation_index === undefined) {
+      throw new PipelineV2StateError(
+        `${what} has the "stage" execution role but records no generation_index`,
+      );
+    }
+    execution.generation_index = expectSafePositiveInteger(
+      obj.generation_index,
+      `${what}.generation_index`,
+    );
   } else if (obj.iteration_index !== undefined) {
     throw new PipelineV2StateError(
       `${what} has the ${JSON.stringify(execution.execution_role)} execution role but records an iteration index`,
+    );
+  } else if (obj.generation_index !== undefined) {
+    execution.generation_index = expectSafePositiveInteger(
+      obj.generation_index,
+      `${what}.generation_index`,
     );
   }
   if (obj.result !== undefined) {
@@ -3593,7 +3655,7 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         // the candidate set is accepted, exactly as the restore verifier
         // resolves it through the shared query.
         const referencedIndex = startingExecution.iteration_index!;
-        const candidates: { generation: PipelineV2StageGenerationRecord; iteration: PipelineV2StageIterationRecord }[] = [];
+        let candidates: { generation: PipelineV2StageGenerationRecord; iteration: PipelineV2StageIterationRecord }[] = [];
         for (const generation of generations) {
           for (const iteration of generation.iterations) {
             if (iterationOpenForStart(iteration, ordinal)) {
@@ -3604,6 +3666,20 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
         if (candidates.length === 0) {
           throw new PipelineV2StateError(
             `execution ${startingExecution.index} has the "stage" role but no iteration is open at committed transition count ${ordinal}`,
+          );
+        }
+        // The durable generation riding (schema v13): a stage execution
+        // names the exact open generation the reducer wrote at its start,
+        // so the admissible candidate set is narrowed by the recorded
+        // generation before the iteration reference is checked against it.
+        // The narrowed set becoming empty is a typed rejection with safe
+        // integers only — the generation ledger and the riding cannot
+        // drift apart.
+        const recordedGeneration = startingExecution.generation_index!;
+        candidates = candidates.filter((candidate) => candidate.generation.index === recordedGeneration);
+        if (candidates.length === 0) {
+          throw new PipelineV2StateError(
+            `execution ${startingExecution.index} records generation ${recordedGeneration}, which is not open at committed transition count ${ordinal}`,
           );
         }
         if (!candidates.some((candidate) => candidate.iteration.index === referencedIndex)) {
@@ -3634,6 +3710,45 @@ export function validatePipelineV2RunState(value: unknown): PipelineV2RunState {
           throw new PipelineV2StateError(
             `execution ${startingExecution.index} has the ${JSON.stringify(startingExecution.execution_role)} role but starts inside the open iteration of generation ${open.generation.index}`,
           );
+        }
+        // The durable generation riding (schema v13): a planning/control
+        // execution records the generation its start instant fell in, or
+        // carries none when no generation was open there. The replay
+        // resolves this against the allowed positional candidate set —
+        // the generations the anchors admit as open at the start ordinal
+        // (opened at or before it, closed after it or at the boundary).
+        // Same-boundary records (an opening or a closure anchored exactly
+        // at the start ordinal) cannot disprove either form, because the
+        // reducer admits both dispatch orders inside the boundary window;
+        // the recorded value is the tie-breaker: present, it must name a
+        // candidate; absent, no candidate may be provably open strictly
+        // before the boundary. Generations are index-contiguous from 1,
+        // so the candidate set never holds an index above the ledger.
+        const riding = startingExecution.generation_index;
+        const openCandidates = generations.filter(
+          (generation) =>
+            generation.opened_transition_count <= ordinal &&
+            (generation.closed === undefined ||
+              generation.closed.closed_transition_count >= ordinal),
+        );
+        if (riding !== undefined) {
+          if (!openCandidates.some((generation) => generation.index === riding)) {
+            throw new PipelineV2StateError(
+              `execution ${startingExecution.index} records generation ${riding}, which is not open at committed transition count ${ordinal}`,
+            );
+          }
+        } else {
+          const provablyOpen = openCandidates.find(
+            (generation) =>
+              generation.opened_transition_count < ordinal &&
+              (generation.closed === undefined ||
+                generation.closed.closed_transition_count > ordinal),
+          );
+          if (provablyOpen !== undefined) {
+            throw new PipelineV2StateError(
+              `execution ${startingExecution.index} records no generation, but generation ${provablyOpen.index} is open at committed transition count ${ordinal}`,
+            );
+          }
         }
       }
     }
@@ -5492,6 +5607,10 @@ export function reducePipelineV2RunCommand(
       );
       requireStartableCursor(current, command.stateId);
       const iterationIndex = requireIterationForRole(current, role, command.iterationIndex, "start_agent_execution");
+      // The durable riding (schema v13): the open generation is the
+      // reducer's own truth at the start instant; a stage start always
+      // has one (its open iteration belongs to it).
+      const openGeneration = openGenerationOf(current);
       const execution: PipelineV2AgentExecutionState = {
         index: current.executions.length + 1,
         type: "agent",
@@ -5502,6 +5621,7 @@ export function reducePipelineV2RunCommand(
         phase: "started",
         worker_log: null,
         ...(iterationIndex !== undefined ? { iteration_index: iterationIndex } : {}),
+        ...(openGeneration !== undefined ? { generation_index: openGeneration.index } : {}),
       };
       next.executions = [...next.executions, execution];
       break;
@@ -5770,6 +5890,10 @@ export function reducePipelineV2RunCommand(
       );
       requireStartableCursor(current, command.stateId);
       const iterationIndex = requireIterationForRole(current, role, command.iterationIndex, "start_decision_execution");
+      // The durable riding (schema v13): the open generation is the
+      // reducer's own truth at the start instant; a stage start always
+      // has one (its open iteration belongs to it).
+      const openGeneration = openGenerationOf(current);
       const execution: PipelineV2DecisionExecutionState = {
         index: current.executions.length + 1,
         type: "decision",
@@ -5778,6 +5902,7 @@ export function reducePipelineV2RunCommand(
         phase: "evaluating",
         input_digest: command.inputDigest,
         ...(iterationIndex !== undefined ? { iteration_index: iterationIndex } : {}),
+        ...(openGeneration !== undefined ? { generation_index: openGeneration.index } : {}),
       };
       next.executions = [...next.executions, execution];
       break;

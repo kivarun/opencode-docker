@@ -1182,6 +1182,9 @@ function makeRealCliIo(stateRoot: string): { io: CliIo; stdout: string[]; stderr
     inspectPipelineV2Run: (async () => { throw new Error("fixture"); }) as unknown as CliIo["inspectPipelineV2Run"],
     eventsPipelineV2Run: (async () => { throw new Error("fixture"); }) as unknown as CliIo["eventsPipelineV2Run"],
     identityPipelineV2Run: (async () => { throw new Error("fixture"); }) as unknown as CliIo["identityPipelineV2Run"],
+    executionBindingsPipelineV2Run: (async () => {
+      throw new Error("fake executionBindingsPipelineV2Run not configured");
+    }) as unknown as CliIo["executionBindingsPipelineV2Run"],
     logsPipelineV2Run: (async () => { throw new Error("fixture"); }) as unknown as CliIo["logsPipelineV2Run"],
     projectChangesPipelineV2Run: (async () => { throw new Error("fixture"); }) as unknown as CliIo["projectChangesPipelineV2Run"],
     projectChangeContentPipelineV2Run: (async () => { throw new Error("fixture"); }) as unknown as CliIo["projectChangeContentPipelineV2Run"],

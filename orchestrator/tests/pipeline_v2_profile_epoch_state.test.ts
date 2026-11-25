@@ -46,19 +46,19 @@ function createRun(profileEpoch: unknown = BINDING) {
 }
 
 test("state v12: the schema version is 12 and v11 is rejected with the no-migration message", () => {
-  expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(12);
+  expect(PIPELINE_V2_RUN_STATE_SCHEMA_VERSION).toBe(13);
   expect(() => validatePipelineV2RunState({ schema_version: 11 })).toThrow(
-    "pipeline v2 run state has schema_version 11, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v11 migration exists)",
+    "pipeline v2 run state has schema_version 11, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v11 migration exists)",
   );
   expect(() => parsePipelineV2RunState('{"schema_version":11}')).toThrow(
-    "pipeline v2 run state has schema_version 11, which is unsupported by this orchestrator (schema version 12 is the supported contract; no v11 migration exists)",
+    "pipeline v2 run state has schema_version 11, which is unsupported by this orchestrator (schema version 13 is the supported contract; no v11 migration exists)",
   );
 });
 
 test("state v12: create_run stores the mandatory profile_epoch binding atomically", () => {
   const state = createRun();
   expect(state.profile_epoch).toEqual({ digest: DIGEST, profile_count: 1 });
-  expect(state.schema_version).toBe(12);
+  expect(state.schema_version).toBe(13);
   const json = JSON.stringify(state);
   expect(json).toContain('"profile_epoch":{"digest":"' + DIGEST + '","profile_count":1}');
   const parsed = parsePipelineV2RunState(json);
@@ -120,7 +120,7 @@ test("state v12: the binding survives restart through the store round-trip", asy
     const reopened = new PipelineV2RunStateStore({ stateRoot, runId: "epoch-restart" });
     const loaded = await reopened.load();
     expect(loaded!.profile_epoch).toEqual(V2_PREPARED_PROFILE_EPOCH_BINDING);
-    expect(loaded!.schema_version).toBe(12);
+    expect(loaded!.schema_version).toBe(13);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -157,7 +157,7 @@ test("state v12: the durable document carries only the digest and count, no prof
 test("state v12: the loader keeps the stored binding byte-for-byte without any migration", async () => {
   const state: PipelineV2RunState = createRun();
   const json = JSON.stringify(state);
-  const v11Document = json.replace('"schema_version":12', '"schema_version":11');
+  const v11Document = json.replace('"schema_version":13', '"schema_version":11');
   expect(v11Document).not.toBe(json);
   const before = v11Document.length;
   let rethrown: unknown = null;

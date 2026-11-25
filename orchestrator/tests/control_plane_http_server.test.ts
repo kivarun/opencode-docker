@@ -189,7 +189,7 @@ describe("control-plane HTTP: route parser", () => {
     }
   });
 
-  test("the versioned route inventory is exactly 20 routes at the parser", () => {
+  test("the versioned route inventory is exactly 21 routes at the parser", () => {
     for (const route of [
       ["/v1/projects/project-a/runs", "POST", "fresh_run"],
       ["/v1/runs/r1/agent-outputs/1/verdict", "GET", "agent_output"],
@@ -203,6 +203,7 @@ describe("control-plane HTTP: route parser", () => {
       ["/v1/runs/r1/respond", "POST", "respond"],
       ["/v1/runs/r1/events", "GET", "events"],
       ["/v1/runs/r1/identity", "GET", "identity"],
+      ["/v1/runs/r1/execution-bindings", "GET", "execution_bindings"],
       ["/v1/runs/r1/tasks/task-a/revisions/1", "GET", "task_content"],
       ["/v1/runs/r1/plans/2", "GET", "plan_content"],
       ["/v1/runs/r1/logs", "GET", "logs_list"],

@@ -274,6 +274,37 @@ const SCENARIOS: Record<string, { stdout: string; exitCode: number; stderr?: str
   },
   identity_failure: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "stale_snapshot" })}\n`, exitCode: 1 },
   identity_failure_with_root: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", runRoot: "/tmp/leak", reason: "invalid_cursor" })}\n`, exitCode: 1 },
+  execution_bindings_report: {
+    stdout: `${JSON.stringify({
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 1,
+      runId: "cp-child-run",
+      revision: 24,
+      after: 0,
+      records: [
+        { record: "execution_binding", execution_index: 1, generation_index: null, iteration_index: null },
+        { record: "execution_binding", execution_index: 2, generation_index: 1, iteration_index: 1 },
+      ],
+      nextAfter: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  execution_bindings_failure: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", reason: "stale_snapshot" })}\n`, exitCode: 1 },
+  execution_bindings_bad_version: {
+    stdout: `${JSON.stringify({
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 2,
+      runId: "cp-child-run",
+      revision: 24,
+      after: 0,
+      records: [],
+      nextAfter: null,
+    })}\n`,
+    exitCode: 0,
+  },
+  execution_bindings_failure_with_root: { stdout: `${JSON.stringify({ ok: false, exitCode: 1, runId: "cp-child-run", runRoot: "/tmp/leak", reason: "invalid_cursor" })}\n`, exitCode: 1 },
   task_content_report: {
     stdout: `${JSON.stringify({
       ok: true,

@@ -1127,6 +1127,9 @@ function makeRealCliIo(stateRoot: string): { io: CliIo; stdout: string[]; stderr
     identityPipelineV2Run: (async () => {
       throw new Error("fixture");
     }) as unknown as CliIo["identityPipelineV2Run"],
+    executionBindingsPipelineV2Run: (async () => {
+      throw new Error("fake executionBindingsPipelineV2Run not configured");
+    }) as unknown as CliIo["executionBindingsPipelineV2Run"],
     agentOutputContentPipelineV2Run: (async () => {
       throw new Error("fake agentOutputContentPipelineV2Run not configured");
     }) as unknown as CliIo["agentOutputContentPipelineV2Run"],
