@@ -95,7 +95,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
-| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183), P-1 (abf95e5; CI 43903686912) and P-2 (9b08980 + corrective 00422ee; CI 44103077865 / 44113220025) landed and Complete; UI slices S1–S3 Complete (see their records below) and S4 Complete (7f79b43 → 451e63b → 47adeb50; CI 45370189214 / 45376514804 / 45397965027); S5–S8 not started |
+| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183), P-1 (abf95e5; CI 43903686912) and P-2 (9b08980 + corrective 00422ee; CI 44103077865 / 44113220025) landed and Complete; UI slices S1–S3 Complete (see their records below) and S4 Complete (7f79b43 → 451e63b → 47adeb50; CI 45370189214 / 45376514804 / 45397965027); the S5 prerequisite S5-P0 is landed and Complete (d0a9e4c + b0d1abe; CI 45603562120 / 45638353441 — see its record below); UI slices S5–S8 not started |
 
 Drift-control record (2026-11-12): the plan contains no formal Complete-gate
 for an increment's successor. Per explicit operator decision, Increment 6 is
@@ -534,7 +534,10 @@ The first four UI slices S1, S2, S3 and S4 have been built and are
 **P-3 (durable-identity projection)**, **P-1 (task/plan revision artifact
 content)** and **P-2 (accepted reviewer-output content)** are landed and
 **Complete** (see below); the remaining UI implementation (S5–S8) remains
-not started.
+not started. The S5 prerequisite
+**S5-P0 (the execution→generation/iteration binding and the
+`execution-bindings` projection)** is likewise landed and **Complete**
+(see its record below); UI slice S5 itself remains not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
 
@@ -943,6 +946,71 @@ review plus two accepted corrective rounds.
   Finding A, and the smoke-harness fix. The accepted S4 scope, the
   one-shot admission contract and the confirmation-holder contract are
   not reopened by this record.
+
+### S5-P0 Complete: execution→generation/iteration binding + projection (2026-11-25)
+
+S5-P0 — the durable `execution → (generation, iteration)` binding at
+state schema version 13 plus the versioned read-only
+`execution-bindings` projection (CLI command, routing kind and HTTP
+route) — is delivered and marked **Complete** after the r3 preflight
+contract (`/exchange/outbox/increment-6-s5p0-preflight-report.md`) and
+three review rounds: the first delivery was rejected on three findings,
+the corrective pass fixed them, and a boundedness evidence corrective
+closed the last defect.
+
+- Delivery commits, each with CI success on its exact SHA and a clean
+  tree:
+  - `d0a9e4c` ("orchestrator: S5-P0 execution→generation/iteration
+    binding (state schema v13) + execution-bindings projection") — the
+    production change plus both overlay batteries and the
+    green-preservation wave — CI run `45603562120`;
+  - `b0d1abe` ("orchestrator: S5-P0 grammar-bound boundedness evidence
+    test (test-only)") — `src/` byte-identical to `d0a9e4c` — CI run
+    `45638353441`.
+- The rejected-first-delivery findings are recorded honestly:
+  - **D1:** the v1 report mis-stated the durable invariant
+    (`generation_index present ⇔ stage`), while the real defect was the
+    loader's planning/control positional check — corrected to the
+    allowed positional candidate set with the recorded value as
+    tie-breaker (present must name a candidate open at the start
+    ordinal; absence refused when a generation is provably open strictly
+    before the boundary; same-anchor boundary records cannot disprove
+    either form; the established `starts inside the open iteration`
+    diagnostic keeps precedence). The "null unreachable" claim was
+    removed — reducer-absent riding is genuinely reachable and
+    permanently tested (initial planning; control after a
+    same-boundary closure; both replan dispatch orders).
+  - **D2:** the v1 report described a four-kinded stream duplicating
+    the P-3 ledgers; the code never contained it — the shipped stream
+    is exactly the frozen r3 grammar (one
+    `{record:"execution_binding", execution_index, generation_index,
+    iteration_index}` per durable execution, null-normalized).
+  - **D3:** the v1 pass was a candidate worktree, not a delivery;
+    corrected by the thematic commit/push/CI/clean-tree chain.
+  - **Boundedness evidence (post-acceptance):** the grammar-max fixture
+    permanent test (128-code-unit safe run id, 200 maximal records of
+    16-digit safe integers, widest revision/after, non-null maximal
+    `next`) rendered through the real CLI formatter and the real HTTP
+    serializer: CLI 27,676 bytes incl. LF (SHA-256
+    `4c6bcdbe10b93bd18a8650cce5e89d1ce19e234bf35f84168983989d89c36c70`),
+    HTTP body 27,683 bytes (SHA-256
+    `5a070ac2933852ceb628e42b7e90643ffd2c051ff53d881712e1da89513adb7c`)
+    — ≈ 10.56% of the 262,144-byte page cap each (the cap is ≈ 9.47×
+    the documents; 234,468 and 234,461 bytes free respectively).
+- Delivery report (accepted): v3 with the arithmetic fix,
+  `/exchange/outbox/increment-6-s5p0-delivery-report-v3.md` (SHA-256
+  `3f7f01141551aadfa09a8e5feed791de00711a7f57ad0d00dfd675e8e5d8aff2`).
+- Verification truth (as recorded in the accepted report): sequential
+  full A/B against a clean `855b434` worktree — candidate 4509 pass /
+  130 fail / 76,567 expect(), base 4455 pass / 130 fail / 76,215
+  expect(), failing-name sets identical to the accepted 130-name
+  baseline (`candidate − base = 0`); overlay batteries 54/54 and the
+  grammar-max suite 31/31; `tsc --noEmit` and `git diff --check`
+  clean; the A/B was not re-run after the test-only corrective
+  (`src/` byte-identical).
+- Not started (unchanged scope): UI slice S5 and the remaining S5–S8,
+  live Browser UAT, Finding A, and the smoke-harness fix. The accepted
+  S5-P0 contract is not reopened by this record.
 
 ## Deferred work
 
