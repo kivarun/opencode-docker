@@ -537,8 +537,10 @@ describe("ui events model: source restrictions of the events layer", () => {
     const requestAt = inspectBody.indexOf("requestTimelinePage(");
     expect(guardAt).toBeGreaterThan(-1);
     expect(requestAt).toBeGreaterThan(guardAt);
-    // the stale-page contract error is owned once by the merge: no
-    // other code path names, catches or masks it
-    expect(appSource.split('"stale_page"').length - 1).toBe(1);
+    // the stale-page contract error is owned once by each merging
+    // family: the events merge and, since S5, the two lifecycle-history
+    // stream owners (the identity page merge, the bindings page merge
+    // and their shared page-acceptance core)
+    expect(appSource.split('"stale_page"').length - 1).toBe(5);
   });
 });

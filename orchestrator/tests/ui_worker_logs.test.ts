@@ -771,7 +771,7 @@ describe("the logs layer source restrictions", () => {
     // authoritative inspect path (the v6 project-changes viewer adds its
     // own inspectApplied declaration and its own call site beside the
     // logs ones)
-    expect(appSource.split("inspectApplied(").length - 1).toBe(4); // two declarations + two call sites
+    expect(appSource.split("inspectApplied(").length - 1).toBe(6); // three sections: the logs, the changes and the S5 lifecycle-history viewers, each one declaration + one applied-inspect call site
     // the content fetch is invoked exactly from the two user action
     // paths (the standalone button and the S2 in-row Load log affordance)
     expect(appSource.split("fetchChunk()").length - 1).toBe(3); // declaration + two call sites

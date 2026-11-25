@@ -156,6 +156,32 @@
         <button type="button" id="events-retry" hidden>Retry timeline</button>
       </div>
     </div>
+    <div id="lifecycle-history-section" hidden>
+      <h3 id="lh-heading">Lifecycle history</h3>
+      <p id="lh-status" aria-live="polite" class="lh-status"></p>
+      <div class="lh-streams">
+        <p id="lh-identity-meta" class="lh-meta"></p>
+        <p id="lh-bindings-meta" class="lh-meta"></p>
+        <div class="events-actions">
+          <button type="button" id="lh-identity-load-more" hidden>Load more identity</button>
+          <button type="button" id="lh-bindings-load-more" hidden>Load more bindings</button>
+          <button type="button" id="lh-reload" hidden>Reload history</button>
+        </div>
+      </div>
+      <h4 class="lh-subheading">Iterations</h4>
+      <div id="lh-iterations" class="lh-cards"></div>
+      <h4 class="lh-subheading">Compare</h4>
+      <div class="lh-compare-controls">
+        <label for="lh-compare-a">Side A</label>
+        <select id="lh-compare-a"></select>
+        <label for="lh-compare-b">Side B</label>
+        <select id="lh-compare-b"></select>
+        <button type="button" id="lh-compare-apply">Apply</button>
+      </div>
+      <div id="lh-compare" class="lh-cards"></div>
+      <h4 class="lh-subheading">Historical interventions</h4>
+      <div id="lh-historical" class="lh-cards"></div>
+    </div>
   </section>
   <section id="new-run-section" aria-labelledby="new-run-heading">
     <h2 id="new-run-heading">New run</h2>

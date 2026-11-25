@@ -728,7 +728,584 @@ export async function requestEventsJson(fetchImpl, path, init, expectedRunId) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Lifecycle history (v9): the identity and execution-binding streams.  */
+/* Contract owners of the P-3 identity documents and the S5-P0          */
+/* execution-binding documents. Both pages are revision-pinned; the     */
+/* expected response kind stays bound to the called endpoint.           */
+/* ------------------------------------------------------------------ */
+
+const IDENTITY_SCHEMA_VERSION = 1;
+const IDENTITY_PAGE_LIMIT = 100;
+const IDENTITY_MAX_LIMIT = 200;
+
+/** The closed 12-kind identity record vocabulary with the exact own-key
+ * shapes of every kind (bijective with `PIPELINE_V2_IDENTITY_RECORD_KINDS`
+ * of `src/pipeline_v2_identity.ts`). Every value is content-free: safe
+ * ids, lowercase digests, closed-vocabulary strings and bounded numbers. */
+const IDENTITY_RECORD_KEYS = Object.freeze({
+  plan_revision: Object.freeze(["index", "revision", "sha256", "previous_sha256", "origin_execution"]),
+  task_revision: Object.freeze(["index", "task_id", "revision", "sha256", "previous_sha256", "wait_index", "intent_sha256"]),
+  generation: Object.freeze([
+    "index",
+    "stage_id",
+    "stage_position",
+    "template_id",
+    "plan_sha256",
+    "initial_budget",
+    "opened_transition_count",
+    "iteration_count",
+    "open_iteration",
+    "closed",
+  ]),
+  iteration: Object.freeze(["generation_index", "index", "opened_transition_count", "closed"]),
+  grant: Object.freeze(["index", "generation_index", "wait_index", "intent_sha256", "additional_iterations"]),
+  wait: Object.freeze([
+    "index",
+    "transition_count",
+    "state_id",
+    "reason",
+    "request_sha256",
+    "intent_sha256",
+    "response",
+  ]),
+  wait_action: Object.freeze(["wait_index", "id", "to"]),
+  execution_agent: Object.freeze(["index", "type", "state_id", "execution_role", "iteration_index", "phase", "stage_task"]),
+  execution_decision: Object.freeze([
+    "index",
+    "type",
+    "state_id",
+    "execution_role",
+    "iteration_index",
+    "phase",
+    "input_digest",
+    "result",
+  ]),
+  agent_output: Object.freeze(["execution_index", "id", "digest"]),
+  decision_active_constraint: Object.freeze(["execution_index", "position", "id"]),
+  decision_violated_relation: Object.freeze(["execution_index", "position", "id"]),
+});
+
+function expectSafeIdString(record, key) {
+  const value = expectString(record, key);
+  if (!isSafeId(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  return value;
+}
+
+function expectDigest(value) {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  return value;
+}
+
+function expectDigestOrNull(value) {
+  if (value === null) {
+    return null;
+  }
+  return expectDigest(value);
+}
+
+function expectIndexOrNull(value) {
+  if (value === null) {
+    return null;
+  }
+  return expectPositiveInteger({ value }, "value");
+}
+
+function expectIdOrNull(value) {
+  if (value === null) {
+    return null;
+  }
+  return expectSafeIdString({ value }, "value");
+}
+
+function expectTextValue(value) {
+  const text = typeof value === "string" ? value : null;
+  if (text === null || text.length === 0) {
+    throw new UiContractError("invalid_shape");
+  }
+  return text;
+}
+
+function expectTextOrNull(value) {
+  if (value === null) {
+    return null;
+  }
+  return expectTextValue(value);
+}
+
+function expectStageTask(value) {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  expectShape(value, ["task_id", "task_revision", "task_manifest_sha256", "body_sha256"]);
+  return Object.freeze({
+    taskId: expectSafeIdString(value, "task_id"),
+    taskRevision: expectPositiveInteger(value, "task_revision"),
+    taskManifestSha256: expectDigest(value["task_manifest_sha256"]),
+    bodySha256: expectDigest(value["body_sha256"]),
+  });
+}
+
+function expectCount(value) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new UiContractError("invalid_shape");
+  }
+  return value;
+}
+
+function expectGenerationOpenIteration(value) {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  expectShape(value, ["index", "opened_transition_count"]);
+  return Object.freeze({
+    index: expectPositiveInteger(value, "index"),
+    openedTransitionCount: expectCount(value["opened_transition_count"]),
+  });
+}
+
+function expectGenerationClosure(value) {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  expectShape(value, ["by", "closed_transition_count"]);
+  return Object.freeze({ by: expectTextOrNull(value["by"]), closedTransitionCount: expectCount(value["closed_transition_count"]) });
+}
+
+function expectIterationClosure(value) {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  expectShape(value, ["by", "wait_index", "closed_transition_count"]);
+  return Object.freeze({
+    by: expectTextOrNull(value["by"]),
+    waitIndex: expectIndexOrNull(value["wait_index"]),
+    closedTransitionCount: expectCount(value["closed_transition_count"]),
+  });
+}
+
+function expectWaitResponse(value) {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  expectShape(value, ["action_id", "response_sha256"]);
+  return Object.freeze({
+    actionId: expectSafeIdString(value, "action_id"),
+    responseSha256: expectDigest(value["response_sha256"]),
+  });
+}
+
+function expectDecisionResult(value) {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const status = value["status"];
+  if (status === "selected") {
+    expectShape(value, ["status", "outcome", "decision", "rule_id"]);
+    return Object.freeze({
+      status,
+      outcome: expectSafeIdString(value, "outcome"),
+      decision: expectSafeIdString(value, "decision"),
+      ruleId: expectSafeIdString(value, "rule_id"),
+    });
+  }
+  if (status === "uncovered" || status === "inconsistent_facts") {
+    expectShape(value, ["status", "outcome"]);
+    if (value["outcome"] !== status) {
+      throw new UiContractError("invalid_shape");
+    }
+    return Object.freeze({ status, outcome: status });
+  }
+  if (status === "invalid_facts") {
+    expectShape(value, ["status", "outcome", "reason", "fact_id", "actual_type"]);
+    if (value["outcome"] !== status) {
+      throw new UiContractError("invalid_shape");
+    }
+    return Object.freeze({
+      status,
+      outcome: status,
+      reason: expectTextOrNull(value["reason"]),
+      factId: expectIdOrNull(value["fact_id"]),
+      actualType: expectIdOrNull(value["actual_type"]),
+    });
+  }
+  throw new UiContractError("invalid_shape");
+}
+
+/**
+ * The one parser of one identity record: the exact own-key shape of the
+ * named kind and the member grammar; every semantics question (placement,
+ * ledger chains) belongs to the state owner, never to the document parser.
+ */
+function parseIdentityRecord(entry) {
+  if (!isRecord(entry)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const kind = entry["record"];
+  if (typeof kind !== "string" || !Object.hasOwn(IDENTITY_RECORD_KEYS, kind)) {
+    throw new UiContractError("unknown_record_kind");
+  }
+  const allowed = IDENTITY_RECORD_KEYS[kind];
+  if (Object.keys(entry).length !== allowed.length + 1) {
+    throw new UiContractError("invalid_shape");
+  }
+  for (const key of allowed) {
+    if (!Object.hasOwn(entry, key)) {
+      throw new UiContractError("invalid_shape");
+    }
+  }
+  const index = (key) => expectPositiveInteger(entry, key);
+  const digestKey = (key) => expectDigest(entry[key]);
+  switch (kind) {
+    case "plan_revision":
+      return Object.freeze({
+        record: kind,
+        index: index("index"),
+        revision: index("revision"),
+        sha256: digestKey("sha256"),
+        previousSha256: expectDigestOrNull(entry["previous_sha256"]),
+        originExecution: index("origin_execution"),
+      });
+    case "task_revision":
+      return Object.freeze({
+        record: kind,
+        index: index("index"),
+        taskId: expectSafeIdString(entry, "task_id"),
+        revision: index("revision"),
+        sha256: digestKey("sha256"),
+        previousSha256: expectDigestOrNull(entry["previous_sha256"]),
+        waitIndex: expectIndexOrNull(entry["wait_index"]),
+        intentSha256: expectDigestOrNull(entry["intent_sha256"]),
+      });
+    case "generation":
+      return Object.freeze({
+        record: kind,
+        index: index("index"),
+        stageId: expectSafeIdString(entry, "stage_id"),
+        stagePosition: index("stage_position"),
+        templateId: expectSafeIdString(entry, "template_id"),
+        planSha256: digestKey("plan_sha256"),
+        initialBudget: index("initial_budget"),
+        openedTransitionCount: expectCount(entry["opened_transition_count"]),
+        iterationCount: index("iteration_count"),
+        openIteration: expectGenerationOpenIteration(entry["open_iteration"]),
+        closed: expectGenerationClosure(entry["closed"]),
+      });
+    case "iteration":
+      return Object.freeze({
+        record: kind,
+        generationIndex: index("generation_index"),
+        index: index("index"),
+        openedTransitionCount: expectCount(entry["opened_transition_count"]),
+        closed: expectIterationClosure(entry["closed"]),
+      });
+    case "grant":
+      return Object.freeze({
+        record: kind,
+        index: index("index"),
+        generationIndex: index("generation_index"),
+        waitIndex: index("wait_index"),
+        intentSha256: digestKey("intent_sha256"),
+        additionalIterations: index("additional_iterations"),
+      });
+    case "wait":
+      return Object.freeze({
+        record: kind,
+        index: index("index"),
+        transitionCount: expectCount(entry["transition_count"]),
+        stateId: expectSafeIdString(entry, "state_id"),
+        reason: expectTextOrNull(entry["reason"]),
+        requestSha256: digestKey("request_sha256"),
+        intentSha256: expectDigestOrNull(entry["intent_sha256"]),
+        response: expectWaitResponse(entry["response"]),
+      });
+    case "wait_action":
+      return Object.freeze({
+        record: kind,
+        waitIndex: index("wait_index"),
+        id: expectSafeIdString(entry, "id"),
+        to: expectSafeIdString(entry, "to"),
+      });
+    case "execution_agent":
+      return Object.freeze({
+        record: kind,
+        index: index("index"),
+        type: expectTextOrNull(entry["type"]),
+        stateId: expectSafeIdString(entry, "state_id"),
+        executionRole: expectTextOrNull(entry["execution_role"]),
+        iterationIndex: expectIndexOrNull(entry["iteration_index"]),
+        phase: expectTextOrNull(entry["phase"]),
+        stageTask: expectStageTask(entry["stage_task"]),
+      });
+    case "execution_decision":
+      return Object.freeze({
+        record: kind,
+        index: index("index"),
+        type: expectTextOrNull(entry["type"]),
+        stateId: expectSafeIdString(entry, "state_id"),
+        executionRole: expectTextOrNull(entry["execution_role"]),
+        iterationIndex: expectIndexOrNull(entry["iteration_index"]),
+        phase: expectTextOrNull(entry["phase"]),
+        inputDigest: digestKey("input_digest"),
+        result: expectDecisionResult(entry["result"]),
+      });
+    case "agent_output":
+      return Object.freeze({
+        record: kind,
+        executionIndex: index("execution_index"),
+        id: expectSafeIdString(entry, "id"),
+        digest: digestKey("digest"),
+      });
+    case "decision_active_constraint":
+    case "decision_violated_relation":
+      return Object.freeze({
+        record: kind,
+        executionIndex: index("execution_index"),
+        position: index("position"),
+        id: expectSafeIdString(entry, "id"),
+      });
+    default:
+      throw new UiContractError("unknown_record_kind");
+  }
+}
+
+/**
+ * The one parser of the versioned identity document (schema 1, kind
+ * `identity`): exact own keys, a positive-safe revision, records in
+ * preserved journal order, and the cursor coherence of the pinned
+ * revision stream (`next_after` is null exactly at the end of the
+ * loaded glowstream; otherwise it equals `after + records.length`).
+ * The `run_id` must equal the selected run.
+ */
+export function parseIdentityDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "identity") {
+    throw new UiContractError("unknown_kind");
+  }
+  expectShape(document, ["schema_version", "kind", "run_id", "revision", "after", "records", "next_after"]);
+  const runId = expectString(document, "run_id");
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (typeof expectedRunId !== "string" || runId !== expectedRunId) {
+    throw new UiContractError("unexpected_run");
+  }
+  const after = expectNonNegativeInteger(document, "after");
+  const records = expectArray(document, "records").map(parseIdentityRecord);
+  const nextAfter = document["next_after"];
+  if (nextAfter !== null) {
+    if (typeof nextAfter !== "number" || !Number.isSafeInteger(nextAfter) || nextAfter < 1) {
+      throw new UiContractError("invalid_shape");
+    }
+    if (nextAfter !== after + records.length) {
+      throw new UiContractError("invalid_shape");
+    }
+  }
+  return Object.freeze({
+    kind: "identity",
+    runId,
+    revision: expectPositiveInteger(document, "revision"),
+    after,
+    records: Object.freeze(records),
+    nextAfter,
+  });
+}
+
+/** The exact one-kind execution-binding record (`{record:
+ * "execution_binding", execution_index, generation_index,
+ * iteration_index}`), in durable journal order. */
+function parseExecutionBindingRecord(entry) {
+  if (!isRecord(entry)) {
+    throw new UiContractError("invalid_shape");
+  }
+  expectShape(entry, ["record", "execution_index", "generation_index", "iteration_index"]);
+  const record = entry["record"];
+  if (record !== "execution_binding") {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({
+    record: "execution_binding",
+    executionIndex: expectPositiveInteger(entry, "execution_index"),
+    generationIndex: expectIndexOrNull(entry["generation_index"]),
+    iterationIndex: expectIndexOrNull(entry["iteration_index"]),
+  });
+}
+
+/** The one parser of the versioned execution-bindings document (schema 1,
+ * kind `execution_bindings`); the glide cursor coherence of the pinned
+ * revision stream mirrors the identity document. */
+export function parseExecutionBindingsDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "execution_bindings") {
+    throw new UiContractError("unknown_kind");
+  }
+  expectShape(document, ["schema_version", "kind", "run_id", "revision", "after", "records", "next_after"]);
+  const runId = expectString(document, "run_id");
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (typeof expectedRunId !== "string" || runId !== expectedRunId) {
+    throw new UiContractError("unexpected_run");
+  }
+  const after = expectNonNegativeInteger(document, "after");
+  const records = expectArray(document, "records").map(parseExecutionBindingRecord);
+  const nextAfter = document["next_after"];
+  if (nextAfter !== null) {
+    if (typeof nextAfter !== "number" || !Number.isSafeInteger(nextAfter) || nextAfter < 1) {
+      throw new UiContractError("invalid_shape");
+    }
+    if (nextAfter !== after + records.length) {
+      throw new UiContractError("invalid_shape");
+    }
+  }
+  return Object.freeze({
+    kind: "execution_bindings",
+    runId,
+    revision: expectPositiveInteger(document, "revision"),
+    after,
+    records: Object.freeze(records),
+    nextAfter,
+  });
+}
+
+/**
+ * The identity endpoint classifier: a well-formed `identity` document of
+ * the selected run, or one of the endpoint's documented failure
+ * envelopes (`error`, or the failed `command_result` of a rejected
+ * identity read). A succeeded command result is unsuitable; every other
+ * kind fails closed.
+ */
+export function parseIdentityEndpointDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "identity") {
+    return parseIdentityDocument(document, expectedRunId);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/** The execution-bindings endpoint classifier (mirrors the identity one). */
+export function parseExecutionBindingsEndpointDocument(document, expectedRunId) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "execution_bindings") {
+    return parseExecutionBindingsDocument(document, expectedRunId);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/** The one URL builder of every identity request; the revision pin
+ * travels on the first page and every continuation (never omitted once
+ * the pinned stream is bound). */
+export function identityRequestPath(runId, after, revision, limit) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  if (revision !== null && (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1)) {
+    throw new UiContractError("invalid_cursor");
+  }
+  let path = `/v1/runs/${runId}/identity?after=${after}`;
+  if (revision !== null) {
+    path += `&revision=${revision}`;
+  }
+  return `${path}&limit=${typeof limit === "number" && Number.isSafeInteger(limit) ? limit : IDENTITY_PAGE_LIMIT}`;
+}
+
+/** The one URL builder of every execution-bindings request (the identity
+ * grammar, the execution-bindings route). */
+export function executionBindingsRequestPath(runId, after, revision, limit) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  if (revision !== null && (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1)) {
+    throw new UiContractError("invalid_cursor");
+  }
+  let path = `/v1/runs/${runId}/execution-bindings?after=${after}`;
+  if (revision !== null) {
+    path += `&revision=${revision}`;
+  }
+  return `${path}&limit=${typeof limit === "number" && Number.isSafeInteger(limit) ? limit : IDENTITY_PAGE_LIMIT}`;
+}
+
+/** The identity endpoint client: the expected response kind stays bound
+ * to the called endpoint. */
+export async function requestIdentityJson(fetchImpl, path, init, expectedRunId) {
+  return requestJsonDocument(fetchImpl, path, init, (document) => parseIdentityEndpointDocument(document, expectedRunId));
+}
+
+/** The execution-bindings endpoint client. */
+export async function requestExecutionBindingsJson(fetchImpl, path, init, expectedRunId) {
+  return requestJsonDocument(fetchImpl, path, init, (document) => parseExecutionBindingsEndpointDocument(document, expectedRunId));
+}
+
+/* ------------------------------------------------------------------ */
 /* Confirmation panel (S4): one current confirmation for the page.      */
+
 /* ------------------------------------------------------------------ */
 
 /**
@@ -5719,6 +6296,665 @@ export function createEventsTransport(io) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Lifecycle history (v9): the two stream transports, the merged state  */
+/* and the derivation of the frozen view. Both streams are revision-    */
+/* pinned to the applied inspect revision; a stale snapshot on either   */
+/* stream clears the whole semantic view. No POST, no timers, no        */
+/* browser storage.                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The one single-flight stream transport maker shared by both lifecycle
+ * streams (the changes/logs governance: at most one unsettled request,
+ * an initial desire supersedes the active one and coalesces as the
+ * single follow-up, a continuation while busy is refused without a
+ * second fetch, superseded responses are dropped, aborts are best
+ * effort and never free the slot themselves).
+ */
+function createLifecycleHistoryStreamTransport(fetchKey, io) {
+  if (!isRecord(io) || typeof io[fetchKey] !== "function" || typeof io["onStarted"] !== "function" || typeof io["onSettled"] !== "function") {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const fetchPage = io[fetchKey];
+  const onStarted = io["onStarted"];
+  const onSettled = io["onSettled"];
+  let active = null;
+  let desired = null;
+  let disposed = false;
+
+  const startRequest = (request) => {
+    if (active !== null) {
+      throw new UiContractError("transport_slot_busy");
+    }
+    active = request;
+    const controller = new AbortController();
+    request.controller = controller;
+    onStarted(request.runId);
+    void (async () => {
+      let result;
+      try {
+        result = await fetchPage(request.path, request.runId, controller.signal);
+      } catch {
+        result = undefined;
+      } finally {
+        settleActive(request, result);
+      }
+    })();
+  };
+
+  const settleActive = (request, result) => {
+    try {
+      if (request.superseded) {
+        if (desired === null) {
+          onSettled(request.runId);
+        }
+      } else {
+        request.onApplied(result);
+        onSettled(request.runId);
+      }
+    } finally {
+      active = null;
+      const followUp = desired;
+      desired = null;
+      request.resolve(result);
+      if (followUp !== null && !disposed) {
+        startRequest(followUp);
+      }
+    }
+  };
+
+  return Object.freeze({
+    request(desire) {
+      const runId = isRecord(desire) && isSafeId(desire["runId"]) ? desire["runId"] : null;
+      const path = isRecord(desire) && typeof desire["path"] === "string" ? desire["path"] : null;
+      const kind = isRecord(desire) && (desire["kind"] === "initial" || desire["kind"] === "continuation") ? desire["kind"] : null;
+      const onApplied = isRecord(desire) && typeof desire["onApplied"] === "function" ? desire["onApplied"] : null;
+      let resolveResult = null;
+      const settled = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      if (disposed || runId === null || path === null || kind === null || onApplied === null) {
+        resolveResult(undefined);
+        return settled;
+      }
+      const request = { runId, path, kind, onApplied, superseded: false, controller: null, resolve: resolveResult };
+      if (active === null) {
+        startRequest(request);
+      } else if (kind === "continuation") {
+        resolveResult(undefined);
+        return settled;
+      } else {
+        active.superseded = true;
+        active.controller.abort();
+        const replaced = desired;
+        desired = request;
+        if (replaced !== null) {
+          replaced.resolve(undefined);
+        }
+      }
+      return settled;
+    },
+    invalidate() {
+      if (active !== null) {
+        active.superseded = true;
+        active.controller.abort();
+      }
+      const withdrawn = desired;
+      desired = null;
+      if (withdrawn !== null) {
+        withdrawn.resolve(undefined);
+      }
+    },
+    dispose() {
+      disposed = true;
+      this.invalidate();
+    },
+  });
+}
+
+export function createIdentityTransport(io) {
+  return createLifecycleHistoryStreamTransport("fetchIdentity", io);
+}
+
+export function createExecutionBindingsTransport(io) {
+  return createLifecycleHistoryStreamTransport("fetchBindings", io);
+}
+
+/* The merged two-stream state (functional, frozen rebuilds). */
+
+export function createLifecycleHistoryState(runId, pin) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  if (typeof pin !== "number" || !Number.isSafeInteger(pin) || pin < 1) {
+    throw new UiContractError("invalid_shape");
+  }
+  const emptyStream = Object.freeze({
+    records: Object.freeze([]),
+    cursor: 0,
+    nextAfter: null,
+    loaded: false,
+  });
+  return Object.freeze({
+    runId,
+    pin,
+    identity: emptyStream,
+    bindings: emptyStream,
+    error: null,
+  });
+}
+
+function isLifecycleHistoryState(state) {
+  return (
+    isRecord(state) &&
+    isSafeId(state["runId"]) &&
+    typeof state["pin"] === "number" &&
+    Number.isSafeInteger(state["pin"]) &&
+    state["pin"] >= 1 &&
+    isRecord(state["identity"]) &&
+    isRecord(state["bindings"]) &&
+    Array.isArray(state["identity"]["records"]) &&
+    Array.isArray(state["bindings"]["records"])
+  );
+}
+
+function acceptStreamPage(stream, page, requestedAfter) {
+  if (typeof requestedAfter !== "number" || !Number.isSafeInteger(requestedAfter) || requestedAfter < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  if (requestedAfter !== stream["cursor"]) {
+    throw new UiContractError("stale_page");
+  }
+  if (stream["loaded"] && requestedAfter === 0) {
+    throw new UiContractError("stale_page");
+  }
+  const records = page["records"];
+  const nextAfter = page["nextAfter"];
+  return Object.freeze({
+    records: Object.freeze([...stream["records"], ...records]),
+    cursor: nextAfter === null ? requestedAfter + records.length : nextAfter,
+    nextAfter,
+    loaded: true,
+  });
+}
+
+/**
+ * The one merge of one validated identity page into the state. The page
+ * must carry exactly the pinned revision (stale handling is global);
+ * the requested cursor must equal the applied cursor.
+ */
+export function applyIdentityPage(state, page, requestedAfter) {
+  if (!isLifecycleHistoryState(state) || !isRecord(page) || page["kind"] !== "identity") {
+    throw new UiContractError("invalid_state");
+  }
+  if (page["revision"] !== state["pin"]) {
+    throw new UiContractError("stale_page");
+  }
+  return Object.freeze({
+    ...state,
+    identity: acceptStreamPage(state["identity"], page, requestedAfter),
+  });
+}
+
+/** The one merge of one validated execution-bindings page (mirrors the
+ * identity merge; both streams of one state share the same pin). */
+export function applyBindingsPage(state, page, requestedAfter) {
+  if (!isLifecycleHistoryState(state) || !isRecord(page) || page["kind"] !== "execution_bindings") {
+    throw new UiContractError("invalid_state");
+  }
+  if (page["revision"] !== state["pin"]) {
+    throw new UiContractError("stale_page");
+  }
+  return Object.freeze({
+    ...state,
+    bindings: acceptStreamPage(state["bindings"], page, requestedAfter),
+  });
+}
+
+/** A stream failure stops both streams with the typed failure (global
+ * stale handling: either stream's failure clears the whole view). */
+function applyStreamFailure(state, which, failure) {
+  return Object.freeze({ ...state, error: Object.freeze({ which, ...failure }) });
+}
+
+function streamComplete(stream) {
+  return stream["loaded"] === true && stream["nextAfter"] === null;
+}
+
+/** The execution view of an identity execution record with its cluster
+ * members (decision id lists, agent outputs) and the placement from the
+ * binding record (the only allowed binding). */
+function executionView(execution, binding, cluster) {
+  return Object.freeze({
+    record: execution,
+    binding: binding === undefined ? null : Object.freeze(binding),
+    outputs: cluster.outputs,
+    activeConstraints: cluster.activeConstraints,
+    violatedRelations: cluster.violatedRelations,
+  });
+}
+
+/** The raw history pass: groups the identity records into generation
+ * cards, iteration rows, waits/actions, grants and per-execution
+ * clusters; returns the typed structural error on an unresolvable
+ * reference. */
+function lifecycleHistoryRawView(state) {
+  const raw = {
+    generations: [],
+    grantList: [],
+    waits: [],
+    actionByWait: new Map(),
+    generationByIndex: new Map(),
+    bindingByExecution: new Map(),
+    clusterByExecution: new Map(),
+    agentsByIndex: new Map(),
+    decisionsByIndex: new Map(),
+  };
+  for (const record of state["identity"]["records"]) {
+    const kind = record.record;
+    if (kind === "generation") {
+      const card = { generation: record, iterations: [], executions: [], };
+      raw.generations.push(card);
+      raw.generationByIndex.set(record.index, card);
+    } else if (kind === "iteration") {
+      const card = raw.generationByIndex.get(record.generationIndex);
+      if (card === undefined) {
+        return { error: { layer: "contract", reason: "orphan_iteration" } };
+      }
+      card.iterations.push(record);
+    } else if (kind === "grant") {
+      raw.grantList.push(record);
+    } else if (kind === "wait") {
+      raw.waits.push(record);
+    } else if (kind === "wait_action") {
+      const list = raw.actionByWait.get(record.waitIndex) ?? [];
+      list.push(record);
+      raw.actionByWait.set(record.waitIndex, list);
+    } else if (kind === "execution_agent") {
+      raw.agentsByIndex.set(record.index, record);
+    } else if (kind === "execution_decision") {
+      raw.decisionsByIndex.set(record.index, record);
+    } else {
+      const cluster =
+        raw.clusterByExecution.get(record.executionIndex) ??
+        { outputs: [], activeConstraints: [], violatedRelations: [] };
+      if (kind === "agent_output") {
+        cluster.outputs.push(record);
+      } else if (kind === "decision_active_constraint") {
+        cluster.activeConstraints.push(record);
+      } else {
+        cluster.violatedRelations.push(record);
+      }
+      raw.clusterByExecution.set(record.executionIndex, cluster);
+    }
+  }
+  for (const record of state["bindings"]["records"]) {
+    raw.bindingByExecution.set(record.executionIndex, record);
+  }
+  return raw;
+}
+
+function emptyCluster() {
+  return { outputs: [], activeConstraints: [], violatedRelations: [] };
+}
+
+/**
+ * The one derivation of the rendered view. `terminal` (true for a
+ * succeeded or failed applied inspect) gates the historical
+ * interventions group; the placed/unplaced relationship errors are
+ * typed contract failures when both streams are complete, and
+ * `not loaded yet` placeholders while any stream is partial.
+ */
+export function deriveLifecycleHistory(state, terminal) {
+  if (!isLifecycleHistoryState(state)) {
+    throw new UiContractError("invalid_state");
+  }
+  if (state["error"] !== null) {
+    return Object.freeze({
+      complete: false,
+      generations: Object.freeze([]),
+      unplacedExecutions: Object.freeze([]),
+      historical: null,
+      grants: Object.freeze([]),
+      error: state["error"],
+    });
+  }
+  const complete = streamComplete(state["identity"]) && streamComplete(state["bindings"]);
+  const raw = lifecycleHistoryRawView(state);
+  if (raw.error !== undefined) {
+    return Object.freeze({
+      complete: false,
+      generations: Object.freeze([]),
+      unplacedExecutions: Object.freeze([]),
+      historical: null,
+      grants: Object.freeze([]),
+      error: Object.freeze(raw.error),
+    });
+  }
+  const unplaced = [];
+  const orphanBindings = [];
+  for (const [index, execution] of raw.agentsByIndex) {
+    placeExecution(execution, raw, index, unplaced, orphanBindings, complete);
+  }
+  for (const [index, decision] of raw.decisionsByIndex) {
+    placeExecution(decision, raw, index, unplaced, orphanBindings, complete);
+  }
+  if (complete && orphanBindings.length > 0) {
+    return Object.freeze({
+      complete: false,
+      generations: Object.freeze([]),
+      unplacedExecutions: Object.freeze([]),
+      historical: null,
+      grants: Object.freeze([]),
+      error: Object.freeze({ layer: "contract", reason: orphanBindings[0] }),
+    });
+  }
+  const grantsByGeneration = new Map();
+  for (const grant of raw.grantList) {
+    const list = grantsByGeneration.get(grant.generationIndex) ?? [];
+    list.push(grant);
+    grantsByGeneration.set(grant.generationIndex, list);
+  }
+  const generations = Object.freeze(
+    raw.generations.map((card) =>
+      Object.freeze({
+        generation: card.generation,
+        iterations: Object.freeze([...card.iterations]),
+        executions: Object.freeze([...card.executions]),
+        grants: Object.freeze(grantsByGeneration.get(card.generation.index) ?? []),
+      }),
+    ),
+  );
+  let historical = null;
+  if (terminal === true) {
+    const actions = [];
+    for (const [waitIndex, list] of raw.actionByWait) {
+      for (const action of list) {
+        actions.push(Object.freeze({ waitIndex, action }));
+      }
+    }
+    historical = Object.freeze({
+      waits: Object.freeze([...raw.waits]),
+      actions: Object.freeze(actions),
+      grants: Object.freeze([...raw.grantList]),
+    });
+  }
+  return Object.freeze({
+    complete,
+    generations,
+    unplacedExecutions: Object.freeze(unplaced),
+    historical,
+    grants: Object.freeze([...raw.grantList]),
+    error: null,
+  });
+}
+
+function placeExecution(execution, raw, index, unplaced, orphanBindings, complete) {
+  const cluster = raw.clusterByExecution.get(index) ?? emptyCluster();
+  const binding = raw.bindingByExecution.get(index);
+  if (binding === undefined) {
+    if (complete) {
+      orphanBindings.push("missing_binding");
+      return;
+    }
+    unplaced.push(executionView(execution, undefined, cluster));
+    return;
+  }
+  if (binding.generationIndex === null) {
+    unplaced.push(executionView(execution, binding, cluster));
+    return;
+  }
+  const card = raw.generationByIndex.get(binding.generationIndex);
+  if (card === undefined) {
+    if (complete) {
+      orphanBindings.push("unresolved_generation");
+      unplaced.push(executionView(execution, binding, cluster));
+      return;
+    }
+    unplaced.push(executionView(execution, binding, cluster));
+    return;
+  }
+  if (card.executions === undefined) {
+    card.executions = [];
+  }
+  card.executions.push(executionView(execution, binding, cluster));
+}
+
+/**
+ * The closed state machine of the Lifecycle history section. It owns no
+ * fetch and no URL: every desire goes to one of the two single-flight
+ * transports. Both streams are pinned to the revision of the applied
+ * authoritative inspect; a revision change and a run change reset both
+ * streams and the compare selection; a stale snapshot on either stream
+ * clears the whole semantic view and offers only the explicit reload.
+ * The viewer never POSTs, never starts a timer and never touches
+ * browser storage.
+ */
+export function createLifecycleHistoryViewer(io) {
+  if (
+    !isRecord(io) ||
+    !isRecord(io["identityTransport"]) ||
+    !isRecord(io["bindingsTransport"]) ||
+    typeof io["onState"] !== "function"
+  ) {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const identityTransport = io["identityTransport"];
+  const bindingsTransport = io["bindingsTransport"];
+  const onState = io["onState"];
+  let state = null;
+  let disposed = false;
+
+  const publish = () => {
+    onState(state);
+  };
+
+  const requestIdentity = (runId, after, kind, pin) => {
+    identityTransport.request({
+      runId,
+      kind,
+      path: identityRequestPath(runId, after, pin),
+      onApplied: (result) => {
+        applyIdentityOutcome(result, after);
+      },
+    });
+  };
+
+  const requestBindings = (runId, after, kind, pin) => {
+    bindingsTransport.request({
+      runId,
+      kind,
+      path: executionBindingsRequestPath(runId, after, pin),
+      onApplied: (result) => {
+        applyBindingsOutcome(result, after);
+      },
+    });
+  };
+
+  const streamOutcomeFailure = (which, stateNow, result) => {
+    if (result === undefined) {
+      return applyStreamFailure(stateNow, which, { layer: "transport", reason: "network_error" });
+    }
+    if (result.ok === false) {
+      return applyStreamFailure(stateNow, which, result.failure);
+    }
+    const model = result.model;
+    if (model.kind === "error") {
+      if (model.reason === "stale_snapshot") {
+        return { stale: true };
+      }
+      return applyStreamFailure(stateNow, which, { layer: model.layer, reason: model.reason });
+    }
+    if (model.kind === "command_result") {
+      return applyStreamFailure(
+        stateNow,
+        which,
+        model.runId === stateNow["runId"]
+          ? { layer: "orchestrator", reason: model.reason ?? "unknown_failure" }
+          : { layer: "contract", reason: "unexpected_run" },
+      );
+    }
+    return null;
+  };
+
+  const applyIdentityOutcome = (result, requestedAfter) => {
+    if (disposed || state === null) {
+      return;
+    }
+    const outcome = streamOutcomeFailure("identity", state, result);
+    if (outcome !== null) {
+      if (outcome.stale === true) {
+        restartStreams(state);
+      } else {
+        state = outcome;
+      }
+      publish();
+      return;
+    }
+    try {
+      state = applyIdentityPage(state, result.model, requestedAfter);
+    } catch (error) {
+      if (error instanceof UiContractError) {
+        state = applyStreamFailure(state, "identity", { layer: "contract", reason: error.reason });
+        publish();
+        return;
+      }
+      throw error;
+    }
+    publish();
+  };
+
+  const applyBindingsOutcome = (result, requestedAfter) => {
+    if (disposed || state === null) {
+      return;
+    }
+    const outcome = streamOutcomeFailure("bindings", state, result);
+    if (outcome !== null) {
+      if (outcome.stale === true) {
+        restartStreams(state);
+      } else {
+        state = outcome;
+      }
+      publish();
+      return;
+    }
+    try {
+      state = applyBindingsPage(state, result.model, requestedAfter);
+    } catch (error) {
+      if (error instanceof UiContractError) {
+        state = applyStreamFailure(state, "bindings", { layer: "contract", reason: error.reason });
+        publish();
+        return;
+      }
+      throw error;
+    }
+    publish();
+  };
+
+  /** The restart of both streams from their existing pin (the stale
+   * snapshot path never invents a revision: only an applied inspect
+   * establishes a new pin). */
+  const restartStreams = (previous) => {
+    state = createLifecycleHistoryState(previous["runId"], previous["pin"]);
+    // request again without invalidating: an initial desire superseded
+    // over an in-flight page still converges (the superseded response
+    // is dropped), so the restart never depends on invalidate timing
+    startStreams(previous["runId"], previous["pin"]);
+  };
+
+  const startStreams = (runId, pin) => {
+    requestIdentity(runId, 0, "initial", pin);
+    requestBindings(runId, 0, "initial", pin);
+  };
+
+  return Object.freeze({
+    /**
+     * The inspect-driven hook: the first inspect of a run and every
+     * changed revision reset both streams to the new pin and issue the
+     * two initial GETs; an unchanged pin issues nothing (the streams
+     * continue their own cursors). A stream error short-circuits until
+     * an explicit reload or a revision change.
+     */
+    inspectApplied(model) {
+      if (disposed || !isRecord(model) || model["kind"] !== "run") {
+        return;
+      }
+      const runId = model["runId"];
+      const revision = model["revision"];
+      if (state === null || state["runId"] !== runId) {
+        identityTransport.invalidate();
+        bindingsTransport.invalidate();
+        state = createLifecycleHistoryState(runId, revision);
+        startStreams(runId, revision);
+        publish();
+        return;
+      }
+      if (state["pin"] !== revision) {
+        identityTransport.invalidate();
+        bindingsTransport.invalidate();
+        state = createLifecycleHistoryState(runId, revision);
+        startStreams(runId, revision);
+        publish();
+        return;
+      }
+      if (state["error"] !== null) {
+        return;
+      }
+      // a first page transport-refused at admission time is retried by
+      // the following applied inspect of the same revision
+      if (!state["identity"]["loaded"]) {
+        startStreams(runId, state["pin"]);
+        publish();
+      }
+    },
+    loadMoreIdentity() {
+      if (disposed || state === null || state["error"] !== null) {
+        return;
+      }
+      const stream = state["identity"];
+      if (!stream["loaded"] || stream["nextAfter"] === null) {
+        return;
+      }
+      requestIdentity(state["runId"], stream["nextAfter"], "continuation", state["pin"]);
+    },
+    loadMoreBindings() {
+      if (disposed || state === null || state["error"] !== null) {
+        return;
+      }
+      const stream = state["bindings"];
+      if (!stream["loaded"] || stream["nextAfter"] === null) {
+        return;
+      }
+      requestBindings(state["runId"], stream["nextAfter"], "continuation", state["pin"]);
+    },
+    reload() {
+      if (disposed || state === null) {
+        return;
+      }
+      restartStreams(state);
+      startStreams(state["runId"], state["pin"]);
+      publish();
+    },
+    reset() {
+      identityTransport.invalidate();
+      bindingsTransport.invalidate();
+      state = null;
+      publish();
+    },
+    currentState() {
+      return state;
+    },
+    dispose() {
+      disposed = true;
+      identityTransport.invalidate();
+      bindingsTransport.invalidate();
+      state = null;
+      publish();
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Thin DOM adapter: createElement/textContent only.                   */
 /* ------------------------------------------------------------------ */
 
@@ -6501,6 +7737,14 @@ function showRunModel(model, options = {}) {
   ensureTimelineFor(model.runId);
   ensureWorkerLogsFor(model.runId);
   lastInspectRevision = model.revision;
+  // the applied authoritative inspect provides the pin and drives the
+  // two initial lifecycle-history GETs (identity + execution bindings)
+  ensureLifecycleHistoryFor(model.runId);
+  lifecycleHistoryTerminal = model.status === "succeeded" || model.status === "failed";
+  if (lifecycleHistoryViewer !== null) {
+    lifecycleHistoryViewer.inspectApplied(model);
+    renderLifecycleHistory(lifecycleHistoryViewer.currentState());
+  }
   renderRunRail(model);
   renderTimelineMeta();
   maybeTailEvents(model);
@@ -7262,6 +8506,453 @@ function ensureWorkerLogsFor(runId) {
   workerLogViewer.transitionToLogsView(runId);
   document.getElementById("worker-logs-section").hidden = false;
   resetWorkerLogsDom();
+}
+
+/* ------------------------------------------------------------------ */
+/* Lifecycle history (v9): the thin DOM adapter of the merged streams.  */
+/* ------------------------------------------------------------------ */
+
+let lifecycleHistoryViewer = null;
+let lifecycleHistoryRunId = null;
+let lifecycleHistoryTerminal = false;
+
+const lhIdentityTransport = createIdentityTransport({
+  fetchIdentity: (path, runId, signal) => requestIdentityJson(fetchImplementation, path, { signal }, runId),
+  onStarted: () => {
+    for (const id of ["lh-identity-load-more", "lh-bindings-load-more", "lh-reload"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["lh-identity-load-more", "lh-bindings-load-more", "lh-reload"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+const lhBindingsTransport = createExecutionBindingsTransport({
+  fetchBindings: (path, runId, signal) => requestExecutionBindingsJson(fetchImplementation, path, { signal }, runId),
+  onStarted: () => {
+    for (const id of ["lh-identity-load-more", "lh-bindings-load-more", "lh-reload"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["lh-identity-load-more", "lh-bindings-load-more", "lh-reload"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+function resetLifecycleHistoryDom() {
+  document.getElementById("lh-identity-meta").textContent = "";
+  document.getElementById("lh-bindings-meta").textContent = "";
+  document.getElementById("lh-iterations").replaceChildren();
+  document.getElementById("lh-compare").replaceChildren();
+  document.getElementById("lh-historical").replaceChildren();
+  document.getElementById("lh-status").textContent = "";
+  document.getElementById("lh-identity-load-more").hidden = true;
+  document.getElementById("lh-bindings-load-more").hidden = true;
+  document.getElementById("lh-reload").hidden = true;
+}
+
+/** The section of the selected run: the viewer lives for the whole page
+ * and resets its streams itself whenever the selected run or the
+ * applied inspect revision changes; a run change additionally resets
+ * the DOM. `inspectApplied` (called from the applied inspect flow)
+ * issues the initial pinned GET pair; nothing else triggers a fetch. */
+function ensureLifecycleHistoryFor(runId) {
+  const runChanged = lifecycleHistoryRunId !== runId;
+  if (lifecycleHistoryViewer === null) {
+    lifecycleHistoryViewer = createLifecycleHistoryViewer({
+      identityTransport: lhIdentityTransport,
+      bindingsTransport: lhBindingsTransport,
+      onState: (state) => renderLifecycleHistory(state),
+    });
+  }
+  if (runChanged) {
+    lifecycleHistoryViewer.reset();
+    lifecycleHistoryRunId = runId;
+    resetLifecycleHistoryDom();
+  }
+  document.getElementById("lifecycle-history-section").hidden = false;
+}
+
+function digestShorthand(digest) {
+  return digest.slice(0, 16);
+}
+
+function kvLine(parent, label, value) {
+  const line = document.createElement("div");
+  line.className = "lh-kv";
+  const name = document.createElement("span");
+  name.className = "lh-kv-name";
+  name.textContent = label;
+  const valueNode = document.createElement("span");
+  valueNode.textContent = value;
+  line.appendChild(name);
+  line.appendChild(valueNode);
+  parent.appendChild(line);
+}
+
+function executionLines(row, view) {
+  const execution = view.record;
+  const bindingNote =
+    view.binding === null
+      ? "not loaded yet"
+      : view.binding.generationIndex === null
+        ? "planning/control (no generation)"
+        : `generation ${view.binding.generationIndex}, iteration ${view.binding.iterationIndex === null ? "–" : view.binding.iterationIndex}`;
+  kvLine(row, "execution", `${execution.index} · ${execution.type} ${execution.stateId}`);
+  kvLine(row, "role", `${execution.executionRole} · phase ${execution.phase} · iteration ${execution.iterationIndex === null ? "–" : execution.iterationIndex}`);
+  kvLine(row, "binding", bindingNote);
+  if (execution.stageTask !== undefined && execution.stageTask !== null) {
+    kvLine(
+      row,
+      "stage task",
+      `${execution.stageTask.taskId} r${execution.stageTask.taskRevision} · manifest ${digestShorthand(execution.stageTask.taskManifestSha256)} · body ${digestShorthand(execution.stageTask.bodySha256)}`,
+    );
+  }
+  if (execution.result !== undefined && execution.result !== null) {
+    const result = execution.result;
+    if (result.status === "selected") {
+      kvLine(row, "decision", `selected ${result.outcome} (decision ${result.decision}, rule ${result.ruleId})`);
+    } else if (result.status === "invalid_facts") {
+      kvLine(
+        row,
+        "decision",
+        `invalid facts ${result.reason}${result.factId !== null ? ` · fact ${result.factId}` : ""}${result.actualType !== null ? ` (${result.actualType})` : ""}`,
+      );
+    } else {
+      kvLine(row, "decision", result.status);
+    }
+  }
+  for (const output of view.outputs) {
+    kvLine(row, "output", `${output.id} · ${digestShorthand(output.digest)}`);
+  }
+  if (view.activeConstraints.length > 0) {
+    kvLine(row, "active constraints", view.activeConstraints.map((entry) => entry.id).join(", "));
+  }
+  if (view.violatedRelations.length > 0) {
+    kvLine(row, "violated relations", view.violatedRelations.map((entry) => entry.id).join(", "));
+  }
+}
+
+const LH_CLOSURE_REASONS = ["grant", "replanned", "normal_close", "exhausted", "next_stage", "final_stage"];
+
+function closureText(closed, waitText) {
+  if (closed === null) {
+    return "open";
+  }
+  return `${closed.by}${closed.waitIndex != null ? ` (wait ${closed.waitIndex})` : ""} at ${closed.closedTransitionCount}${waitText}`;
+}
+
+function renderGenerationCard(card, parent) {
+  const generation = card.generation;
+  const node = document.createElement("div");
+  node.className = "lh-card";
+  const heading = document.createElement("h5");
+  heading.textContent = `Generation ${generation.index} — stage ${generation.stageId} (position ${generation.stagePosition}, template ${generation.templateId})`;
+  node.appendChild(heading);
+  kvLine(node, "plan", digestShorthand(generation.planSha256));
+  kvLine(node, "initial budget", String(generation.initialBudget));
+  kvLine(node, "opened at", String(generation.openedTransitionCount));
+  kvLine(node, "iterations", String(generation.iterationCount));
+  kvLine(
+    node,
+    "open iteration",
+    generation.openIteration === null
+      ? "–"
+      : `${generation.openIteration.index} (opened at ${generation.openIteration.openedTransitionCount})`,
+  );
+  let closedText = closureText(generation.closed, "");
+  let ran = false;
+  if (generation.closed !== null && !LH_CLOSURE_REASONS.includes(generation.closed.by)) {
+    closedText = `unexpected closure reason ${generation.closed.by}`;
+    const span = document.createElement("span");
+    span.className = "lh-contract-error";
+    span.textContent = closedText;
+    node.appendChild(span);
+    ran = true;
+  }
+  if (!ran) {
+    kvLine(node, "closed", closedText);
+  }
+  for (const grant of card.grants) {
+    kvLine(node, "grant", `#${grant.index} · ${grant.additionalIterations} additional iteration${grant.additionalIterations === 1 ? "" : "s"} · wait ${grant.waitIndex} · intent ${digestShorthand(grant.intentSha256)}`);
+  }
+  for (const iteration of card.iterations) {
+    const row = document.createElement("div");
+    row.className = "lh-iteration";
+    kvLine(row, `iteration ${iteration.index}`, `opened at ${iteration.openedTransitionCount} · ${closureText(iteration.closed, "")}`);
+    for (const view of card.executions) {
+      if (view.binding !== null && view.binding.iterationIndex === iteration.index) {
+        executionLines(row, view);
+      }
+    }
+    node.appendChild(row);
+  }
+  for (const view of card.executions) {
+    if (view.binding === null || view.binding.iterationIndex === null) {
+      const row = document.createElement("div");
+      row.className = "lh-execution-unplaced";
+      kvLine(row, "execution in this generation", String(view.record.index));
+      executionLines(row, view);
+      node.appendChild(row);
+    }
+  }
+  parent.appendChild(node);
+}
+
+function renderCompare(container, cardA, cardB) {
+  container.replaceChildren();
+  if (cardA === null && cardB === null) {
+    const note = document.createElement("p");
+    note.textContent = "Select two iterations of the same stage template and press Apply.";
+    container.appendChild(note);
+    return;
+  }
+  if (cardA === null || cardB === null) {
+    const note = document.createElement("p");
+    note.textContent = "Both sides must be selected.";
+    container.appendChild(note);
+    return;
+  }
+  const generationA = cardA.generation;
+  const generationB = cardB.generation;
+  if (generationA.templateId !== generationB.templateId) {
+    const note = document.createElement("p");
+    note.textContent = `contract: template_mismatch (${generationA.templateId} vs ${generationB.templateId})`;
+    container.appendChild(note);
+    return;
+  }
+  const rows = document.createElement("div");
+  const side = (label, card) => {
+    const box = document.createElement("div");
+    box.className = "lh-compare-side";
+    const heading = document.createElement("h5");
+    heading.textContent = `${label}: Generation ${card.generation.index} · iteration ${card.iterations.length === 0 ? "–" : String(card.iterations[card.iterations.length - 1].index)}`;
+    box.appendChild(heading);
+    kvLine(box, "plan", digestShorthand(card.generation.planSha256));
+    kvLine(box, "initial budget", String(card.generation.initialBudget));
+    kvLine(box, "opened at", String(card.generation.openedTransitionCount));
+    kvLine(box, "closed", closureText(card.generation.closed, ""));
+    for (const execution of card.executions) {
+      if (execution.record.stageTask !== undefined && execution.record.stageTask !== null) {
+        kvLine(
+          box,
+          "task",
+          `${execution.record.stageTask.taskId} r${execution.record.stageTask.taskRevision} body ${digestShorthand(execution.record.stageTask.bodySha256)}`,
+        );
+      }
+    }
+    for (const grant of card.grants) {
+      kvLine(box, "grant", `+${grant.additionalIterations} (wait ${grant.waitIndex})`);
+    }
+    container.appendChild(box);
+  };
+  side("Side A", cardA);
+  side("Side B", cardB);
+  const compareNote = document.createElement("p");
+  compareNote.textContent =
+    generationA.planSha256 === generationB.planSha256
+      ? "Both generations were planned on the same plan revision."
+      : "The generations were planned on different plan revisions.";
+  rows.appendChild(compareNote);
+  container.appendChild(rows);
+}
+
+function renderHistorical(container, derived) {
+  container.replaceChildren();
+  const historical = derived.historical;
+  if (historical === null) {
+    const note = document.createElement("p");
+    note.textContent = "Historical interventions appear on terminal runs.";
+    container.appendChild(note);
+    return;
+  }
+  if (historical.waits.length === 0) {
+    const note = document.createElement("p");
+    note.textContent = "No user intervention happened in this run.";
+    container.appendChild(note);
+    return;
+  }
+  for (const wait of historical.waits) {
+    const node = document.createElement("div");
+    node.className = "lh-card";
+    const heading = document.createElement("h5");
+    heading.textContent = `Wait ${wait.index} at transition ${wait.transitionCount} — ${wait.reason} (state ${wait.stateId})`;
+    node.appendChild(heading);
+    kvLine(node, "request", digestShorthand(wait.requestSha256));
+    if (wait.intentSha256 !== null) {
+      kvLine(node, "intent", digestShorthand(wait.intentSha256));
+    }
+    const declared = historical.actions.filter((entry) => entry.waitIndex === wait.index);
+    if (declared.length > 0 && wait.response === null) {
+      const span = document.createElement("span");
+      span.className = "lh-contract-error";
+      span.textContent = `An answered wait carries no recorded response (wait ${wait.index}).`;
+      node.appendChild(span);
+    }
+    if (declared.length === 0 && wait.response !== null) {
+      const span = document.createElement("span");
+      span.className = "lh-contract-error";
+      span.textContent = `A wait response with no declared action (wait ${wait.index}).`;
+      node.appendChild(span);
+    }
+    for (const entry of declared) {
+      const line = document.createElement("div");
+      line.className = "lh-kv";
+      const name = document.createElement("span");
+      name.className = "lh-kv-name";
+      name.textContent = "action";
+      const value = document.createElement("span");
+      value.textContent = `${entry.action.id} → ${entry.action.to}`;
+      line.appendChild(name);
+      line.appendChild(value);
+      node.appendChild(line);
+    }
+    kvLine(
+      node,
+      "response",
+      wait.response === null ? "not answered" : `${wait.response.actionId} · ${digestShorthand(wait.response.responseSha256)}`,
+    );
+    container.appendChild(node);
+  }
+}
+
+function renderLifecycleHistory(state) {
+  const section = document.getElementById("lifecycle-history-section");
+  if (section === null || section.hidden) {
+    return;
+  }
+  if (state === null) {
+    return;
+  }
+  const identity = state.identity;
+  const bindings = state.bindings;
+  const metaA = `Identity stream: ${identity.loaded ? `loaded to ${identity.cursor}${identity.nextAfter === null ? " (complete)" : " (more available)"}` : "not loaded"} · revision ${identity.loaded ? String(state.pin) : "–"}`;
+  const metaB = `Bindings stream: ${bindings.loaded ? `loaded to ${bindings.cursor}${bindings.nextAfter === null ? " (complete)" : " (more available)"}` : "not loaded"} · revision ${bindings.loaded ? String(state.pin) : "–"}`;
+  document.getElementById("lh-identity-meta").textContent = metaA;
+  document.getElementById("lh-bindings-meta").textContent = metaB;
+  const derived = deriveLifecycleHistory(state, lifecycleHistoryTerminal);
+  const status = document.getElementById("lh-status");
+  status.textContent = "";
+  if (state.error !== null) {
+    status.textContent = `${state.error.which} stream: ${state.error.layer}: ${state.error.reason}`;
+    document.getElementById("lh-reload").hidden = false;
+    document.getElementById("lh-identity-load-more").hidden = true;
+    document.getElementById("lh-bindings-load-more").hidden = true;
+    return;
+  }
+  document.getElementById("lh-identity-load-more").hidden = identity.nextAfter === null;
+  document.getElementById("lh-bindings-load-more").hidden = bindings.nextAfter === null;
+  document.getElementById("lh-reload").hidden = false;
+  const iterations = document.getElementById("lh-iterations");
+  iterations.replaceChildren();
+  if (!state.identity.loaded || !state.bindings.loaded) {
+    const note = document.createElement("p");
+    note.className = "lh-partial";
+    note.textContent = "The lifecycle history is not loaded yet (either stream is pending).";
+    iterations.appendChild(note);
+    return;
+  }
+  if (derived.error !== null) {
+    const note = document.createElement("p");
+    note.className = "lh-contract-error";
+    note.textContent = `contract: ${derived.error.reason} — the placement between the streams failed; reload both streams.`;
+    iterations.appendChild(note);
+    document.getElementById("lh-reload").hidden = false;
+    return;
+  }
+  if (derived.generations.length === 0 && derived.unplacedExecutions.length === 0) {
+    const note = document.createElement("p");
+    note.textContent = "No stage generations are recorded in this run.";
+    iterations.appendChild(note);
+  }
+  for (const card of derived.generations) {
+    renderGenerationCard(card, iterations);
+  }
+  if (derived.unplacedExecutions.length > 0) {
+    const unplacedBox = document.createElement("div");
+    unplacedBox.className = "lh-card";
+    const heading = document.createElement("h5");
+    heading.textContent = "Planning and control executions (no stage generation)";
+    unplacedBox.appendChild(heading);
+    for (const view of derived.unplacedExecutions) {
+      executionLines(unplacedBox, view);
+    }
+    iterations.appendChild(unplacedBox);
+  }
+  renderCompareCards(derived);
+  renderHistorical(document.getElementById("lh-historical"), derived);
+  status.textContent =
+    derived.complete && derived.error === null ? "Streams complete." : "Waiting for more stream pages.";
+}
+
+let lhCompareSelection = { a: null, b: null };
+
+function compareChoiceLabel(card) {
+  const lastIteration = card.iterations.length === 0 ? null : card.iterations[card.iterations.length - 1];
+  return `Generation ${card.generation.index} · template ${card.generation.templateId}${lastIteration === null ? "" : ` · iteration ${lastIteration.index}`}`;
+}
+
+function renderCompareCards(derived) {
+  const container = document.getElementById("lh-compare");
+  const state = lifecycleHistoryViewer.currentState();
+  if (state === null) {
+    return;
+  }
+  const selectA = document.getElementById("lh-compare-a");
+  const selectB = document.getElementById("lh-compare-b");
+  selectA.replaceChildren();
+  selectB.replaceChildren();
+  const addPlaceholder = (select) => {
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "— select —";
+    select.appendChild(placeholder);
+  };
+  addPlaceholder(selectA);
+  addPlaceholder(selectB);
+  const choices = [];
+  derived.generations.forEach((card) => {
+    const option = document.createElement("option");
+    const key = String(card.generation.index);
+    option.value = key;
+    option.textContent = compareChoiceLabel(card);
+    choices.push(key);
+    selectA.appendChild(option);
+  });
+  derived.generations.forEach((card) => {
+    const option = document.createElement("option");
+    option.value = String(card.generation.index);
+    option.textContent = compareChoiceLabel(card);
+    selectB.appendChild(option);
+  });
+  if (lhCompareSelection.a !== null && !choices.includes(lhCompareSelection.a)) {
+    lhCompareSelection = { a: null, b: null };
+  }
+  if (lhCompareSelection.b !== null && !choices.includes(lhCompareSelection.b)) {
+    lhCompareSelection = { a: null, b: null };
+  }
+  selectA.value = lhCompareSelection.a ?? "";
+  selectB.value = lhCompareSelection.b ?? "";
+  const applyButton = document.getElementById("lh-compare-apply");
+  const generationByIndex = new Map();
+  for (const card of derived.generations) {
+    generationByIndex.set(String(card.generation.index), card);
+  }
+  applyButton.textContent = "Apply compare";
+  if (lhCompareSelection.a === null && lhCompareSelection.b === null) {
+    renderCompare(container, null, null);
+    return;
+  }
+  renderCompare(
+    container,
+    lhCompareSelection.a === null ? null : generationByIndex.get(lhCompareSelection.a) ?? null,
+    lhCompareSelection.b === null ? null : generationByIndex.get(lhCompareSelection.b) ?? null,
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -8095,6 +9786,35 @@ function boot() {
   });
   document.getElementById("events-retry").addEventListener("click", () => {
     retryTimeline();
+  });
+  document.getElementById("lh-identity-load-more").addEventListener("click", () => {
+    clearMessages();
+    if (lifecycleHistoryViewer !== null) {
+      lifecycleHistoryViewer.loadMoreIdentity();
+    }
+  });
+  document.getElementById("lh-bindings-load-more").addEventListener("click", () => {
+    clearMessages();
+    if (lifecycleHistoryViewer !== null) {
+      lifecycleHistoryViewer.loadMoreBindings();
+    }
+  });
+  document.getElementById("lh-reload").addEventListener("click", () => {
+    clearMessages();
+    if (lifecycleHistoryViewer !== null) {
+      lifecycleHistoryViewer.reload();
+    }
+  });
+  document.getElementById("lh-compare-apply").addEventListener("click", () => {
+    const valueA = document.getElementById("lh-compare-a").value;
+    const valueB = document.getElementById("lh-compare-b").value;
+    lhCompareSelection = {
+      a: valueA === "" ? null : valueA,
+      b: valueB === "" ? null : valueB,
+    };
+    if (lifecycleHistoryViewer !== null) {
+      renderLifecycleHistory(lifecycleHistoryViewer.currentState());
+    }
   });
   document.getElementById("logs-load").addEventListener("click", () => {
     clearMessages();

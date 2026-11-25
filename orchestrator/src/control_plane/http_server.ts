@@ -2574,6 +2574,7 @@ export async function handleControlPlaneHttpRequest(deps: ControlPlaneHttpServic
         parsed.kind !== "runs" &&
         parsed.kind !== "events" &&
         parsed.kind !== "identity" &&
+        parsed.kind !== "execution_bindings" &&
         parsed.kind !== "task_content" &&
         parsed.kind !== "agent_output" &&
         parsed.kind !== "plan_content" &&

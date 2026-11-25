@@ -1106,3 +1106,112 @@ export declare function createProjectApplyViewer(io: {
   readonly onState: (state: UiProjectApplyState | null) => void;
   readonly onApplied?: (identity: { readonly runId: string; readonly applyId: string; readonly observation: string }) => void;
 }): UiProjectApplyViewer;
+
+/* Lifecycle history (v9): the identity and execution-binding streams. */
+
+export interface UiIdentityPage {
+  readonly kind: "identity";
+  readonly runId: string;
+  readonly revision: number;
+  readonly after: number;
+  readonly records: readonly Record<string, unknown>[];
+  readonly nextAfter: number | null;
+}
+
+export interface UiExecutionBindingsPage {
+  readonly kind: "execution_bindings";
+  readonly runId: string;
+  readonly revision: number;
+  readonly after: number;
+  readonly records: readonly Record<string, unknown>[];
+  readonly nextAfter: number | null;
+}
+
+export declare function parseIdentityDocument(document: unknown, expectedRunId: string): UiIdentityPage;
+export declare function parseExecutionBindingsDocument(document: unknown, expectedRunId: string): UiExecutionBindingsPage;
+export declare function parseIdentityEndpointDocument(document: unknown, expectedRunId: string): unknown;
+export declare function parseExecutionBindingsEndpointDocument(document: unknown, expectedRunId: string): unknown;
+export declare function identityRequestPath(runId: string, after: number, revision: number | null, limit?: number): string;
+export declare function executionBindingsRequestPath(runId: string, after: number, revision: number | null, limit?: number): string;
+export declare function requestIdentityJson(fetchImpl: unknown, path: string, init: unknown, expectedRunId: string): Promise<unknown>;
+export declare function requestExecutionBindingsJson(fetchImpl: unknown, path: string, init: unknown, expectedRunId: string): Promise<unknown>;
+
+export interface UiLifecycleHistoryTransport {
+  request(desire: {
+    readonly runId: string;
+    readonly kind: "initial" | "continuation";
+    readonly path: string;
+    readonly onApplied: (result: unknown) => void;
+  }): Promise<unknown>;
+  invalidate(): Promise<unknown> | null;
+  dispose(): void;
+}
+
+export declare function createIdentityTransport(io: {
+  readonly fetchIdentity: (path: string, runId: string, signal: AbortSignal | undefined) => Promise<unknown>;
+  readonly onStarted: (runId: string) => void;
+  readonly onSettled: (runId: string) => void;
+}): UiLifecycleHistoryTransport;
+
+export declare function createExecutionBindingsTransport(io: {
+  readonly fetchBindings: (path: string, runId: string, signal: AbortSignal | undefined) => Promise<unknown>;
+  readonly onStarted: (runId: string) => void;
+  readonly onSettled: (runId: string) => void;
+}): UiLifecycleHistoryTransport;
+
+export interface UiLifecycleHistoryState {
+  readonly runId: string;
+  readonly pin: number;
+  readonly identity: {
+    readonly records: readonly Record<string, unknown>[];
+    readonly cursor: number;
+    readonly nextAfter: number | null;
+    readonly loaded: boolean;
+  };
+  readonly bindings: {
+    readonly records: readonly Record<string, unknown>[];
+    readonly cursor: number;
+    readonly nextAfter: number | null;
+    readonly loaded: boolean;
+  };
+  readonly error: { readonly which: "identity" | "bindings"; readonly layer: string; readonly reason: string } | null;
+}
+
+export declare function createLifecycleHistoryState(runId: string, pin: number): UiLifecycleHistoryState;
+export declare function applyIdentityPage(
+  state: UiLifecycleHistoryState,
+  page: UiIdentityPage,
+  requestedAfter: number,
+): UiLifecycleHistoryState;
+export declare function applyBindingsPage(
+  state: UiLifecycleHistoryState,
+  page: UiExecutionBindingsPage,
+  requestedAfter: number,
+): UiLifecycleHistoryState;
+export declare function deriveLifecycleHistory(
+  state: UiLifecycleHistoryState,
+  terminal: boolean,
+): {
+  readonly complete: boolean;
+  readonly generations: readonly unknown[];
+  readonly unplacedExecutions: readonly unknown[];
+  readonly historical: unknown;
+  readonly grants: readonly unknown[];
+  readonly error: { readonly layer: string; readonly reason: string } | null;
+};
+
+export interface UiLifecycleHistoryViewer {
+  inspectApplied(model: { readonly kind: "run"; readonly runId: string; readonly revision: number }): void;
+  loadMoreIdentity(): void;
+  loadMoreBindings(): void;
+  reload(): void;
+  reset(): void;
+  currentState(): UiLifecycleHistoryState | null;
+  dispose(): void;
+}
+
+export declare function createLifecycleHistoryViewer(io: {
+  readonly identityTransport: UiLifecycleHistoryTransport;
+  readonly bindingsTransport: UiLifecycleHistoryTransport;
+  readonly onState: (state: UiLifecycleHistoryState | null) => void;
+}): UiLifecycleHistoryViewer;

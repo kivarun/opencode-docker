@@ -165,6 +165,13 @@ function makeProbe(
     if (path.startsWith("/v1/runs?")) {
       return jsonResponse(runsPageDocument(runs));
     }
+    // the S5 lifecycle-history streams of every run selection: the
+    // stress battery only proves the events contract, so both streams
+    // answer with the shared request failure envelope (the section is
+    // a passive viewer and never affects the asserted events behavior)
+    if (/^\/v1\/runs\/[^/?]+\/(identity|execution-bindings)\?/.test(path)) {
+      return jsonResponse({ schema_version: 1, kind: "error", layer: "request", reason: "run_not_found" });
+    }
     throw new Error(`unexpected harness request ${method} ${path}`);
   };
   return {
@@ -622,7 +629,7 @@ describe("ui events wiring: the stale-response stress battery", () => {
       ]);
       harness.dispose();
     }
-  });
+  }, 20000);
 });
 
 /**

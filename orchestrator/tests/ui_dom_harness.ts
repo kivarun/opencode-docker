@@ -313,6 +313,19 @@ const UI_ELEMENT_IDS = [
   "project-apply-retry",
   "project-apply-check",
   "project-apply-continue",
+  "lifecycle-history-section",
+  "lh-status",
+  "lh-identity-meta",
+  "lh-bindings-meta",
+  "lh-identity-load-more",
+  "lh-bindings-load-more",
+  "lh-reload",
+  "lh-iterations",
+  "lh-compare",
+  "lh-compare-a",
+  "lh-compare-b",
+  "lh-compare-apply",
+  "lh-historical",
 ] as const;
 
 export interface UiHarnessOptions {

@@ -2155,6 +2155,23 @@ describe("control-plane HTTP: identity route", () => {
     expect(calls).toEqual([{ kind: "identity", runId: "identity-run" }]);
   });
 
+  test("the execution-bindings route accepts the same typed query fields", async () => {
+    nextResult = asCallResult({ ok: true, projection: { kind: "executionBindings", schemaVersion: 1, runId: "identity-run", revision: 5, after: 0, records: [], nextAfter: null } });
+    calls.length = 0;
+    const withQuery = await get("/v1/runs/identity-run/execution-bindings?after=0&revision=5&limit=2");
+    expect(withQuery.status).toBe(200);
+    const body = JSON.parse(withQuery.body) as Record<string, unknown>;
+    expect(body).toEqual({ schema_version: 1, kind: "execution_bindings", run_id: "identity-run", revision: 5, after: 0, records: [], next_after: null });
+    expect(calls).toEqual([{ kind: "execution_bindings", runId: "identity-run", revision: 5, limit: 2 }]);
+    calls.length = 0;
+    await get("/v1/runs/identity-run/execution-bindings");
+    expect(calls).toEqual([{ kind: "execution_bindings", runId: "identity-run" }]);
+    // a `stale_snapshot` failure keeps the request-layer 409 envelope
+    nextResult = asCallResult({ ok: true, projection: { kind: "executionBindingsFailure", exitCode: 1, runId: "identity-run", runRoot: null, reason: "stale_snapshot" } });
+    expect((await get("/v1/runs/identity-run/execution-bindings?after=5&revision=5")).status).toBe(409);
+    calls.length = 0;
+  });
+
   test("a missing continuation revision pin is the request-layer 400 invalid_cursor", async () => {
     calls.length = 0;
     const response = await get("/v1/runs/identity-run/identity?after=5");
