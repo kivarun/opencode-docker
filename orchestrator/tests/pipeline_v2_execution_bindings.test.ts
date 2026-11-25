@@ -32,6 +32,7 @@ import {
 import {
   OrchestratorSubprocessClient,
   type OrchestratorCallResult,
+  type OrchestratorJsonValue,
 } from "../src/control_plane/subprocess_client.ts";
 import { OrchestratorSubprocessClientError } from "../src/control_plane/routing.ts";
 import { PipelineV2RunStateSink } from "../src/pipeline_v2_state_sink.ts";
@@ -360,6 +361,91 @@ describe("the dual-envelope byte cap over a shape-only walk", () => {
     });
     expect(Buffer.byteLength(cliDocument, "utf8")).toBeLessThanOrEqual(PIPELINE_V2_EXECUTION_BINDINGS_PAGE_BYTE_LIMIT);
     expect(Buffer.byteLength(httpBody, "utf8")).toBeLessThanOrEqual(PIPELINE_V2_EXECUTION_BINDINGS_PAGE_BYTE_LIMIT);
+  });
+  test("the grammar-bound maximality proof: the maximal page fits both real production envelopes", () => {
+    // A grammar-bound fixture, NOT a reducer-reachable run: no durable
+    // execution may carry MAX_SAFE_INTEGER indexes (the durable grammar
+    // admits them, the reducer never writes them). The proof renders the
+    // widest possible page — 128-code-unit safe run id, 200 records of
+    // 16-digit safe integers in every applicable field, the widest
+    // revision/after and an arithmetic-consistent non-null 16-digit
+    // nextAfter — through the REAL production serialization chain: the
+    // real CLI formatter (main.ts's `JSON.stringify(outcome)` plus the
+    // trailing newline, over the exact success-shape literal order) and
+    // the real HTTP serializer (`projectControlPlaneExecutionBindings`
+    // followed by the production `jsonBody` JSON.stringify). The pin on
+    // the exact measured sizes makes any widening regress loudly.
+    const MAX = Number.MAX_SAFE_INTEGER;
+    const records: readonly PipelineV2ExecutionBindingRecord[] = Array.from(
+      { length: PIPELINE_V2_EXECUTION_BINDINGS_MAX_LIMIT },
+      () => ({
+        record: "execution_binding" as const,
+        execution_index: MAX,
+        generation_index: MAX,
+        iteration_index: MAX,
+      }),
+    );
+    const after = MAX - PIPELINE_V2_EXECUTION_BINDINGS_MAX_LIMIT;
+    // The real CLI document: the exact production success shape, in the
+    // exact field order `executionBindingsPipelineV2Run` constructs it,
+    // serialized by the exact production formatter (`JSON.stringify`
+    // plus the single trailing newline).
+    const cliDocument = `${JSON.stringify({
+      ok: true,
+      exitCode: 0,
+      schemaVersion: 1,
+      runId: "x".repeat(128),
+      revision: MAX,
+      after,
+      records,
+      nextAfter: MAX,
+    })}\n`;
+    // The real HTTP body: the production projection builder consumes the
+    // verified subprocess-client projection and the production
+    // serializer stringifies it — nothing else may shape the document.
+    const projection = projectControlPlaneExecutionBindings({
+      ok: true,
+      projection: {
+        kind: "executionBindings",
+        schemaVersion: 1,
+        runId: "x".repeat(128),
+        revision: MAX,
+        after,
+        records: records as unknown as readonly OrchestratorJsonValue[],
+        nextAfter: MAX,
+      },
+    } as never);
+    if (!("kind" in projection) || projection.kind !== "execution_bindings") {
+      throw new Error("the real projection builder must route the grammar-max page");
+    }
+    const httpBody = JSON.stringify(projection);
+    const cliBytes = Buffer.byteLength(cliDocument, "utf8");
+    const httpBytes = Buffer.byteLength(httpBody, "utf8");
+    // Independent verification against the accepted page cap on both
+    // full production envelopes (CLI incl. its trailing LF).
+    expect(cliBytes).toBeLessThanOrEqual(PIPELINE_V2_EXECUTION_BINDINGS_PAGE_BYTE_LIMIT);
+    expect(httpBytes).toBeLessThanOrEqual(PIPELINE_V2_EXECUTION_BINDINGS_PAGE_BYTE_LIMIT);
+    // The exact measured sizes: any widening of the grammar regresses
+    // loudly instead of silently loosening the bound.
+    expect(cliBytes).toBe(27676);
+    expect(httpBytes).toBe(27683);
+    // Non-producibility of an overflow, by construction: the wire limit
+    // is the record cap (200), so the grammar-max page above is the
+    // widest producible page; a single record can never exceed it.
+    expect(PIPELINE_V2_EXECUTION_BINDINGS_MAX_LIMIT).toBe(200);
+    for (const record of [records[0]!]) {
+      const single = `${JSON.stringify({
+        ok: true,
+        exitCode: 0,
+        schemaVersion: 1,
+        runId: "x".repeat(128),
+        revision: MAX,
+        after: MAX - 1,
+        records: [record],
+        nextAfter: MAX,
+      })}\n`;
+      expect(Buffer.byteLength(single, "utf8")).toBeLessThanOrEqual(cliBytes);
+    }
   });
 });
 
