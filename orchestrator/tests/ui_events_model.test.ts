@@ -541,6 +541,9 @@ describe("ui events model: source restrictions of the events layer", () => {
     // family: the events merge and, since S5, the two lifecycle-history
     // stream owners (the identity page merge, the bindings page merge
     // and their shared page-acceptance core)
-    expect(appSource.split('"stale_page"').length - 1).toBe(5);
+    // since S6 the plan/tasks slice adds its own ledger page merges
+    // (the pinned identity ledger page and the plan revision page), so
+    // the stale_page sites grow by exactly the two new merges
+    expect(appSource.split('"stale_page"').length - 1).toBe(7);
   });
 });

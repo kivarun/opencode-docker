@@ -6311,7 +6311,7 @@ export function createEventsTransport(io) {
  * second fetch, superseded responses are dropped, aborts are best
  * effort and never free the slot themselves).
  */
-function createLifecycleHistoryStreamTransport(fetchKey, io) {
+function createStreamTransport(fetchKey, io) {
   if (!isRecord(io) || typeof io[fetchKey] !== "function" || typeof io["onStarted"] !== "function" || typeof io["onSettled"] !== "function") {
     throw new UiContractError("invalid_transport_io");
   }
@@ -6333,7 +6333,7 @@ function createLifecycleHistoryStreamTransport(fetchKey, io) {
     void (async () => {
       let result;
       try {
-        result = await fetchPage(request.path, request.runId, controller.signal);
+        result = await fetchPage(request.path, request.runId, controller.signal, request.binding);
       } catch {
         result = undefined;
       } finally {
@@ -6377,7 +6377,12 @@ function createLifecycleHistoryStreamTransport(fetchKey, io) {
         resolveResult(undefined);
         return settled;
       }
-      const request = { runId, path, kind, onApplied, superseded: false, controller: null, resolve: resolveResult };
+      const binding = isRecord(desire) && desire["binding"] !== undefined && (desire["binding"] === null || isRecord(desire["binding"])) ? desire["binding"] : undefined;
+      if (isRecord(desire) && Object.hasOwn(desire, "binding") && binding === undefined) {
+        resolveResult(undefined);
+        return settled;
+      }
+      const request = { runId, path, kind, binding, onApplied, superseded: false, controller: null, resolve: resolveResult };
       if (active === null) {
         startRequest(request);
       } else if (kind === "continuation") {
@@ -6413,11 +6418,11 @@ function createLifecycleHistoryStreamTransport(fetchKey, io) {
 }
 
 export function createIdentityTransport(io) {
-  return createLifecycleHistoryStreamTransport("fetchIdentity", io);
+  return createStreamTransport("fetchIdentity", io);
 }
 
 export function createExecutionBindingsTransport(io) {
-  return createLifecycleHistoryStreamTransport("fetchBindings", io);
+  return createStreamTransport("fetchBindings", io);
 }
 
 /* The merged two-stream state (functional, frozen rebuilds). */
@@ -6955,6 +6960,1365 @@ export function createLifecycleHistoryViewer(io) {
 }
 
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Plan and tasks (S6): the second consumer of the P-3 identity         */
+/* ledger — its own pinned stream instance — plus the two bounded P-1   */
+/* content surfaces (the byte-exact task-body chunk stream and the      */
+/* paged semantic plan projection). Read-only: no POST, no timers, no   */
+/* browser storage, no cross-domain digest claims. The cursor           */
+/* invariants and the fail-closed body publication policy implement the */
+/* accepted S6 preflight contract (increment 6 preflight r4).          */
+/* ------------------------------------------------------------------ */
+
+const S6_TASK_CHUNK_LIMIT_DEFAULT = 65536;
+const S6_TASK_CHUNK_LIMIT_MAX = 193536;
+const S6_PLAN_PAGE_LIMIT_DEFAULT = 100;
+const S6_PLAN_PAGE_LIMIT_MAX = 200;
+export const S6_BODY_RETAINED_BYTES_CAP = 262144;
+export const S6_PLAN_RECORDS_RETAINED_CAP = 4096;
+const S6_TASK_ORIGIN_CLASSES = ["planning_proposal", "user_response"];
+const S6_TASK_BODY_DIGEST_DOMAIN = "pipeline-v2-stage-task-body\0";
+
+/** The exact shape of one content request binding (what the viewer
+ * issued); a hostile caller object is refused before any other read. */
+function s6TaskExpectation(expected) {
+  if (!isRecord(expected) || !isSafeId(expected["runId"]) || !isSafeId(expected["taskId"])) {
+    throw new UiContractError("invalid_request");
+  }
+  if (!isPositiveSafeIndex(expected["revision"])) {
+    throw new UiContractError("invalid_request");
+  }
+  return expected;
+}
+
+function s6PlanExpectation(expected) {
+  if (!isRecord(expected) || !isSafeId(expected["runId"]) || !isPositiveSafeIndex(expected["revision"])) {
+    throw new UiContractError("invalid_request");
+  }
+  return expected;
+}
+
+/**
+ * The dedicated parser of one task-content chunk document (schema 1,
+ * kind `task_revision`): exact own keys at every level, the closed
+ * origin vocabulary, a strict canonical base64 payload with
+ * `data.byteLength === returned_byte_count`, and the full cursor
+ * matrix: the returned bytes never exceed the page limit;
+ * `end = offset + returned_byte_count` is a safe integer at or below
+ * `byte_count`; zero progress is impossible (a chunk with
+ * `end < byte_count` carries a positive `returned_byte_count` and a
+ * strictly moving `next_offset`; a zero-length chunk exists only as
+ * the terminal chunk of a complete body); `next_offset` is `null`
+ * exactly when `end === byte_count` and otherwise exactly `end`. The
+ * bytes live only in the frozen `data` byte array — never in a
+ * diagnostic or a URL.
+ */
+export function parseTaskContentDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "task_revision") {
+    throw new UiContractError("unknown_kind");
+  }
+  expectShape(document, ["schema_version", "kind", "run_id", "task_id", "revision", "manifest_sha256", "previous_sha256", "origin", "body"]);
+  const binding = expected === null ? null : s6TaskExpectation(expected);
+  if (binding !== null) {
+    if (!isSafeId(expectString(document, "run_id")) || document["run_id"] !== binding["runId"]) {
+      throw new UiContractError("unexpected_run");
+    }
+  } else if (!isSafeId(expectString(document, "run_id"))) {
+    throw new UiContractError("invalid_shape");
+  }
+  const runId = document["run_id"];
+  const taskId = expectSafeIdString(document, "task_id");
+  const revision = expectPositiveInteger(document, "revision");
+  const manifestSha256 = expectDigest(document["manifest_sha256"]);
+  const previousSha256 = expectDigestOrNull(document["previous_sha256"]);
+  const origin = expectOneOf(document, "origin", S6_TASK_ORIGIN_CLASSES);
+  if (!isRecord(document["body"])) {
+    throw new UiContractError("invalid_shape");
+  }
+  const body = document["body"];
+  expectShape(body, ["byte_count", "sha256", "offset", "limit", "returned_byte_count", "next_offset", "data_base64"]);
+  const byteCount = expectNonNegativeInteger(body, "byte_count");
+  const bodySha256 = expectDigest(body["sha256"]);
+  const offset = expectNonNegativeInteger(body, "offset");
+  const limit = expectPositiveInteger(body, "limit");
+  const returnedByteCount = expectNonNegativeInteger(body, "returned_byte_count");
+  const nextOffsetValue = body["next_offset"];
+  if (nextOffsetValue !== null && !isPositiveSafeIndex(nextOffsetValue)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (typeof body["data_base64"] !== "string") {
+    throw new UiContractError("invalid_shape");
+  }
+  const data = expectBase64Bytes(body["data_base64"]);
+  if (data.byteLength !== returnedByteCount) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (returnedByteCount > limit) {
+    throw new UiContractError("invalid_shape");
+  }
+  const end = offset + returnedByteCount;
+  if (!Number.isSafeInteger(end) || end > byteCount) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (returnedByteCount === 0 && (end !== byteCount || nextOffsetValue !== null)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (end < byteCount && (nextOffsetValue === null || nextOffsetValue !== end || nextOffsetValue <= offset)) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (nextOffsetValue !== null && nextOffsetValue !== end) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (nextOffsetValue !== null && end === byteCount) {
+    throw new UiContractError("invalid_shape");
+  }
+  if (binding !== null && (taskId !== binding["taskId"] || revision !== binding["revision"])) {
+    throw new UiContractError("unexpected_selection");
+  }
+  return Object.freeze({
+    kind: "task_revision",
+    runId,
+    taskId,
+    revision,
+    manifestSha256,
+    previousSha256,
+    origin,
+    body: Object.freeze({
+      byteCount,
+      bodySha256,
+      offset,
+      limit,
+      returnedByteCount,
+      nextOffset: nextOffsetValue,
+      data,
+    }),
+  });
+}
+
+/** One projected plan record; exact own keys per kind, positions
+ * positive-safe, ids safe, digests lowercase 64-hex. */
+function s6ParsePlanRecord(entry) {
+  if (!isRecord(entry)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const kind = entry["record"];
+  if (kind === "stage") {
+    expectShape(entry, ["record", "stage_position", "id", "template"]);
+    return Object.freeze({
+      record: kind,
+      stagePosition: expectPositiveInteger(entry, "stage_position"),
+      id: expectSafeIdString(entry, "id"),
+      template: expectSafeIdString(entry, "template"),
+    });
+  }
+  if (kind === "task") {
+    expectShape(entry, ["record", "stage_position", "task_position", "id", "revision", "sha256"]);
+    return Object.freeze({
+      record: kind,
+      stagePosition: expectPositiveInteger(entry, "stage_position"),
+      taskPosition: expectPositiveInteger(entry, "task_position"),
+      id: expectSafeIdString(entry, "id"),
+      revision: expectPositiveInteger(entry, "revision"),
+      sha256: expectDigest(entry["sha256"]),
+    });
+  }
+  if (kind === "task_dependency") {
+    expectShape(entry, ["record", "stage_position", "task_position", "dependency_position", "task_id"]);
+    return Object.freeze({
+      record: kind,
+      stagePosition: expectPositiveInteger(entry, "stage_position"),
+      taskPosition: expectPositiveInteger(entry, "task_position"),
+      dependencyPosition: expectPositiveInteger(entry, "dependency_position"),
+      taskId: expectSafeIdString(entry, "task_id"),
+    });
+  }
+  throw new UiContractError("invalid_shape");
+}
+
+/**
+ * The dedicated parser of one plan-content page (schema 1, kind
+ * `plan_revision`): exact own keys, the closed 3-record-kind
+ * vocabulary, and the dense cursors with the identical no-progress
+ * rule (`next_after !== null` requires `records.length > 0` and equals
+ * `after + records.length`; an empty page is valid only with
+ * `next_after === null`).
+ */
+export function parsePlanContentDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] !== "plan_revision") {
+    throw new UiContractError("unknown_kind");
+  }
+  expectShape(document, ["schema_version", "kind", "run_id", "revision", "manifest_sha256", "previous_sha256", "origin_execution", "after", "records", "next_after"]);
+  const binding = expected === null ? null : s6PlanExpectation(expected);
+  if (binding !== null) {
+    if (!isSafeId(expectString(document, "run_id")) || document["run_id"] !== binding["runId"]) {
+      throw new UiContractError("unexpected_run");
+    }
+  } else if (!isSafeId(expectString(document, "run_id"))) {
+    throw new UiContractError("invalid_shape");
+  }
+  const runId = document["run_id"];
+  const revision = expectPositiveInteger(document, "revision");
+  const manifestSha256 = expectDigest(document["manifest_sha256"]);
+  const previousSha256 = expectDigestOrNull(document["previous_sha256"]);
+  const originExecution = expectPositiveInteger(document, "origin_execution");
+  const after = expectNonNegativeInteger(document, "after");
+  const records = expectArray(document, "records").map(s6ParsePlanRecord);
+  const nextAfter = document["next_after"];
+  if (nextAfter !== null) {
+    if (records.length === 0 || !isPositiveSafeIndex(nextAfter) || nextAfter !== after + records.length) {
+      throw new UiContractError("invalid_shape");
+    }
+  }
+  if (binding !== null && revision !== binding["revision"]) {
+    throw new UiContractError("unexpected_selection");
+  }
+  return Object.freeze({
+    kind: "plan_revision",
+    runId,
+    revision,
+    manifestSha256,
+    previousSha256,
+    originExecution,
+    after,
+    records: Object.freeze(records),
+    nextAfter,
+  });
+}
+
+/** The task-content endpoint classifier: one well-formed chunk of the
+ * requested selection, or one of the endpoint's documented failure
+ * envelopes. */
+export function parseTaskContentEndpointDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "task_revision") {
+    return parseTaskContentDocument(document, expected);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/** The plan-content endpoint classifier (mirrors the task one). */
+export function parsePlanContentEndpointDocument(document, expected) {
+  if (!isRecord(document)) {
+    throw new UiContractError("not_a_document");
+  }
+  if (document["schema_version"] !== IDENTITY_SCHEMA_VERSION) {
+    throw new UiContractError("unknown_schema_version");
+  }
+  if (document["kind"] === "plan_revision") {
+    return parsePlanContentDocument(document, expected);
+  }
+  if (document["kind"] === "error") {
+    return parseErrorDocument(document);
+  }
+  if (document["kind"] === "command_result") {
+    const model = parseCommandResultDocument(document);
+    if (model.outcome !== "failed") {
+      throw new UiContractError("unexpected_kind");
+    }
+    return model;
+  }
+  throw new UiContractError("unknown_kind");
+}
+
+/** The one URL builder of every task-content request. */
+export function taskContentRequestPath(runId, taskId, revision, offset, limit) {
+  if (!isSafeId(runId) || !isSafeId(taskId) || !isPositiveSafeIndex(revision)) {
+    throw new UiContractError("invalid_request");
+  }
+  if (!isSafeIndex(offset) || !isPositiveSafeIndex(limit) || limit > S6_TASK_CHUNK_LIMIT_MAX) {
+    throw new UiContractError("invalid_cursor");
+  }
+  return `/v1/runs/${runId}/tasks/${taskId}/revisions/${revision}?offset=${offset}&limit=${limit}`;
+}
+
+/** The one URL builder of every plan-content request. */
+export function planContentRequestPath(runId, revision, after, limit) {
+  if (!isSafeId(runId) || !isPositiveSafeIndex(revision)) {
+    throw new UiContractError("invalid_request");
+  }
+  if (!isSafeIndex(after) || !isPositiveSafeIndex(limit) || limit > S6_PLAN_PAGE_LIMIT_MAX) {
+    throw new UiContractError("invalid_cursor");
+  }
+  return `/v1/runs/${runId}/plans/${revision}?after=${after}&limit=${limit}`;
+}
+
+/** The task-content client: the expected response type stays bound to
+ * the requested selection. */
+export async function requestTaskContentJson(fetcher, path, init, expected) {
+  return requestJsonDocument(fetcher, path, init, (document) => parseTaskContentEndpointDocument(document, expected));
+}
+
+/** The plan-content client (mirrors the task one). */
+export async function requestPlanContentJson(fetcher, path, init, expected) {
+  return requestJsonDocument(fetcher, path, init, (document) => parsePlanContentEndpointDocument(document, expected));
+}
+
+/* The two content transports over the shared stream factory; the
+ * optional fourth argument carries the request binding to the client. */
+
+export function createTaskContentTransport(io) {
+  return createStreamTransport("fetchTaskContent", io);
+}
+
+export function createPlanContentTransport(io) {
+  return createStreamTransport("fetchPlanContent", io);
+}
+
+/** Byte helpers of the body verification: the exact framing of the
+ * single production owner (`stageTaskBodyDigest`), reproduced
+ * byte-for-byte in the browser. */
+function s6ConcatBytes(parts) {
+  let total = 0;
+  for (const part of parts) {
+    if (!(part instanceof Uint8Array)) {
+      throw new UiContractError("invalid_shape");
+    }
+    total += part.byteLength;
+  }
+  if (!Number.isSafeInteger(total)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.byteLength;
+  }
+  return out;
+}
+
+function s6LatinBytes(text) {
+  const bytes = new Uint8Array(text.length);
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code > 255) {
+      throw new UiContractError("invalid_shape");
+    }
+    bytes[index] = code;
+  }
+  return bytes;
+}
+
+/**
+ * One browser-side recomputation of the stage-task body digest over the
+ * exact reassembled bytes: resolves the recomputed lowercase hex digest
+ * on a match and `null` on a mismatch (the none/some result). The
+ * caller owns the publication policy and the epoch/token handling.
+ */
+export async function verifyTaskBodyDigest(bytes, expectedDigest) {
+  if (!(bytes instanceof Uint8Array) || typeof expectedDigest !== "string" || !/^[0-9a-f]{64}$/.test(expectedDigest)) {
+    throw new UiContractError("invalid_shape");
+  }
+  const lengthBytes = new Uint8Array(8);
+  let value = bytes.byteLength;
+  for (let index = 7; index >= 0; index -= 1) {
+    lengthBytes[index] = value % 256;
+    value = Math.floor(value / 256);
+  }
+  const framed = s6ConcatBytes([
+    s6LatinBytes(S6_TASK_BODY_DIGEST_DOMAIN),
+    lengthBytes,
+    bytes,
+  ]);
+  const subtle = typeof crypto === "undefined" ? undefined : crypto.subtle;
+  if (subtle === undefined || typeof subtle.digest !== "function") {
+    throw new Error("unavailable: webcrypto digest");
+  }
+  const digest = await subtle.digest("SHA-256", framed);
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return hex === expectedDigest ? hex : null;
+}
+
+/* ------------------------------------------------------------------ */
+/* The merged S6 state: the pinned identity-ledger stream (the same     */
+/* record kinds the section reads) plus the two content targets.       */
+/* ------------------------------------------------------------------ */
+
+export function createPlanTasksState(runId, pin) {
+  if (!isSafeId(runId)) {
+    throw new UiContractError("invalid_run_id");
+  }
+  if (!isPositiveSafeIndex(pin)) {
+    throw new UiContractError("invalid_shape");
+  }
+  return Object.freeze({
+    runId,
+    pin,
+    identity: Object.freeze({ records: Object.freeze([]), cursor: 0, nextAfter: null, loaded: false }),
+    error: null,
+    staleCleared: false,
+    taskTarget: null,
+    planTarget: null,
+  });
+}
+
+function isPlanTasksState(state) {
+  return (
+    isRecord(state) &&
+    isSafeId(state["runId"]) &&
+    isPositiveSafeIndex(state["pin"]) &&
+    isRecord(state["identity"]) &&
+    Array.isArray(state["identity"]["records"]) &&
+    (state["taskTarget"] === null || isRecord(state["taskTarget"])) &&
+    (state["planTarget"] === null || isRecord(state["planTarget"]))
+  );
+}
+
+/** The one merge of one validated ledger page; the requested `after`
+ * must equal the stream cursor and the revision must equal the pin
+ * (the identical continuation rules of the first stream). */
+export function applyPlanTasksIdentityPage(state, page, requestedAfter) {
+  if (!isPlanTasksState(state) || !isRecord(page) || page["kind"] !== "identity") {
+    throw new UiContractError("invalid_state");
+  }
+  if (page["revision"] !== state["pin"]) {
+    throw new UiContractError("stale_page");
+  }
+  if (requestedAfter !== state["identity"]["cursor"]) {
+    throw new UiContractError("stale_page");
+  }
+  return Object.freeze({
+    ...state,
+    identity: Object.freeze({
+      records: Object.freeze([...state["identity"]["records"], ...page["records"]]),
+      cursor: page["nextAfter"] === null ? state["identity"]["cursor"] + page["records"].length : page["nextAfter"],
+      nextAfter: page["nextAfter"],
+      loaded: true,
+    }),
+  });
+}
+
+function s6WithTaskTarget(state, taskTarget) {
+  return Object.freeze({ ...state, taskTarget });
+}
+
+function s6WithPlanTarget(state, planTarget) {
+  return Object.freeze({ ...state, planTarget });
+}
+
+function s6NewTaskTarget(taskId, revision, ledgerSha256, ledgerPreviousSha256, epoch, initialLimit) {
+  return {
+    kind: "task",
+    key: `task:${taskId}:${revision}`,
+    taskId,
+    revision,
+    epoch,
+    ledgerSha256,
+    ledgerPreviousSha256,
+    status: "requesting",
+    envelope: null,
+    cursor: 0,
+    inFlightLimit: initialLimit,
+    truncatedPending: initialLimit >= S6_BODY_RETAINED_BYTES_CAP,
+    chunkCount: 0,
+    retained: Object.freeze([]),
+    retainedBytes: 0,
+    decodedText: "",
+    decoder: null,
+    terminal: false,
+    truncated: false,
+    integrity: "pending",
+    verifiedDigest: null,
+    failure: null,
+  };
+}
+
+function s6NewPlanTarget(revision, ledgerSha256, ledgerPreviousSha256, ledgerOriginExecution, epoch, initialLimit) {
+  return {
+    kind: "plan",
+    key: `plan:${revision}`,
+    revision,
+    epoch,
+    ledgerSha256,
+    ledgerPreviousSha256,
+    ledgerOriginExecution,
+    status: "requesting",
+    envelope: null,
+    cursor: 0,
+    inFlightLimit: initialLimit,
+    records: Object.freeze([]),
+    terminal: false,
+    truncated: false,
+    failure: null,
+  };
+}
+
+function s6TaskFailure(target, layer, reason) {
+  return Object.freeze({
+    ...target,
+    status: "failed",
+    failure: Object.freeze({ layer, reason }),
+    decoder: null,
+    decodedText: "",
+    retained: Object.freeze([]),
+  });
+}
+
+function s6PlanFailure(target, layer, reason) {
+  return Object.freeze({
+    ...target,
+    status: "failed",
+    failure: Object.freeze({ layer, reason }),
+  });
+}
+
+/**
+ * The one merge of one accepted task chunk. The request binding (the
+ * triple cursor equality, the document offsets/limit vs the requested
+ * pair), the ledger binding of the first chunk, the envelope
+ * immutability of every later chunk and the caps run BEFORE any decode
+ * or merge; every violation is a typed contract failure (never a
+ * TypeError). The streaming decoder is created on the first chunk and
+ * survives the merges; the terminal chunk flushes it.
+ */
+export function applyTaskChunk(state, model, requestedOffset, requestedLimit, requestReaderId) {
+  if (!isPlanTasksState(state) || state["taskTarget"] === null || !isRecord(model) || model["kind"] !== "task_revision") {
+    throw new UiContractError("invalid_state");
+  }
+  const target = state["taskTarget"];
+  if (requestedOffset !== target["cursor"]) {
+    throw new UiContractError("stale_request");
+  }
+  if (requestReaderId !== target["readerId"]) {
+    throw new UiContractError("stale_reader");
+  }
+  if (
+    typeof requestedOffset !== "number" ||
+    !Number.isSafeInteger(requestedOffset) ||
+    requestedOffset < 0 ||
+    typeof requestedLimit !== "number" ||
+    !Number.isSafeInteger(requestedLimit) ||
+    requestedLimit < 1 ||
+    requestedLimit > S6_TASK_CHUNK_LIMIT_MAX
+  ) {
+    throw new UiContractError("invalid_cursor");
+  }
+  const body = model["body"];
+  if (body["offset"] !== requestedOffset || body["limit"] !== requestedLimit) {
+    throw new UiContractError("request_mismatch");
+  }
+  if (target["envelope"] === null) {
+    if (model["manifestSha256"] !== target["ledgerSha256"] || model["previousSha256"] !== target["ledgerPreviousSha256"]) {
+      throw new UiContractError("artifact_modified");
+    }
+  } else if (
+    target["envelope"]["manifestSha256"] !== model["manifestSha256"] ||
+    target["envelope"]["previousSha256"] !== model["previousSha256"] ||
+    target["envelope"]["origin"] !== model["origin"] ||
+    target["envelope"]["byteCount"] !== body["byteCount"] ||
+    target["envelope"]["bodySha256"] !== body["bodySha256"]
+  ) {
+    throw new UiContractError("envelope_drift");
+  }
+  if (target["retainedBytes"] + body["returnedByteCount"] > S6_BODY_RETAINED_BYTES_CAP) {
+    throw new UiContractError("retention_cap");
+  }
+  const chunk = body["data"];
+  const terminal = body["nextOffset"] === null;
+  if (!terminal && target["truncatedPending"]) {
+    throw new UiContractError("retention_cap");
+  }
+  let decoder = target["decoder"];
+  if (decoder === null) {
+    try {
+      decoder = new TextDecoder("utf-8", { fatal: true });
+    } catch {
+      throw new UiContractError("unsupported_environment");
+    }
+  }
+  let decodedText = target["decodedText"];
+  try {
+    decodedText += decoder.decode(chunk, { stream: !terminal });
+  } catch {
+    throw new UiContractError("decode_failed");
+  }
+  const retained = Object.freeze([...target["retained"], chunk]);
+  const retainedBytes = target["retainedBytes"] + body["returnedByteCount"];
+  const envelope =
+    target["envelope"] === null
+      ? Object.freeze({
+          manifestSha256: model["manifestSha256"],
+          previousSha256: model["previousSha256"],
+          origin: model["origin"],
+          byteCount: body["byteCount"],
+          bodySha256: body["bodySha256"],
+        })
+      : target["envelope"];
+  const nextTarget = Object.freeze({
+    ...target,
+    status: terminal ? (target["truncatedPending"] ? "truncated" : "verifying") : "streaming",
+    envelope,
+    cursor: terminal ? target["cursor"] + body["returnedByteCount"] : body["nextOffset"],
+    readerId: target["readerId"] + 1,
+    chunkCount: target["chunkCount"] + 1,
+    retained,
+    retainedBytes,
+    decodedText,
+    decoder,
+    terminal,
+    truncated: target["truncatedPending"] && terminal,
+  });
+  return s6WithTaskTarget(state, nextTarget);
+}
+
+/**
+ * The one merge of one accepted plan page (the identical guard order:
+ * the request binding, the uncapped retention bound, the ledger
+ * binding on the first page, the envelope immutability afterwards).
+ */
+export function applyPlanPage(state, model, requestedAfter, requestedLimit, requestReaderId) {
+  if (!isPlanTasksState(state) || state["planTarget"] === null || !isRecord(model) || model["kind"] !== "plan_revision") {
+    throw new UiContractError("invalid_state");
+  }
+  const target = state["planTarget"];
+  if (requestedAfter !== target["cursor"]) {
+    throw new UiContractError("stale_request");
+  }
+  if (requestReaderId !== target["readerId"]) {
+    throw new UiContractError("stale_reader");
+  }
+  if (typeof requestedAfter !== "number" || !Number.isSafeInteger(requestedAfter) || requestedAfter < 0) {
+    throw new UiContractError("invalid_cursor");
+  }
+  if (
+    typeof requestedLimit !== "number" ||
+    !Number.isSafeInteger(requestedLimit) ||
+    requestedLimit < 1 ||
+    requestedLimit > S6_PLAN_PAGE_LIMIT_MAX
+  ) {
+    throw new UiContractError("invalid_cursor");
+  }
+  if (model["after"] !== requestedAfter || model["records"].length > requestedLimit) {
+    throw new UiContractError("request_mismatch");
+  }
+  if (target["records"].length + model["records"].length > S6_PLAN_RECORDS_RETAINED_CAP) {
+    throw new UiContractError("retention_cap");
+  }
+  if (target["envelope"] === null) {
+    if (
+      model["manifestSha256"] !== target["ledgerSha256"] ||
+      model["previousSha256"] !== target["ledgerPreviousSha256"] ||
+      model["originExecution"] !== target["ledgerOriginExecution"]
+    ) {
+      throw new UiContractError("artifact_modified");
+    }
+  } else if (
+    target["envelope"]["manifestSha256"] !== model["manifestSha256"] ||
+    target["envelope"]["previousSha256"] !== model["previousSha256"] ||
+    target["envelope"]["originExecution"] !== model["originExecution"]
+  ) {
+    throw new UiContractError("envelope_drift");
+  }
+  const terminal = model["nextAfter"] === null;
+  const retained = target["records"].length + model["records"].length;
+  const envelope =
+    target["envelope"] === null
+      ? Object.freeze({
+          manifestSha256: model["manifestSha256"],
+          previousSha256: model["previousSha256"],
+          originExecution: model["originExecution"],
+        })
+      : target["envelope"];
+  const nextTarget = Object.freeze({
+    ...target,
+    status: terminal ? "ready" : retained >= S6_PLAN_RECORDS_RETAINED_CAP ? "truncated" : "streaming",
+    envelope,
+    cursor: terminal ? target["cursor"] + model["records"].length : model["nextAfter"],
+    readerId: target["readerId"] + 1,
+    records: Object.freeze([...target["records"], ...model["records"]]),
+    terminal,
+    truncated: !terminal && retained >= S6_PLAN_RECORDS_RETAINED_CAP,
+  });
+  return s6WithPlanTarget(state, nextTarget);
+}
+
+function s6TaskIntegrityOf(target) {
+  if (target["failure"] !== null) {
+    return "failed";
+  }
+  if (target["truncated"]) {
+    return "unverified_truncated";
+  }
+  return target["integrity"];
+}
+
+/**
+ * One derivation of the rendered view; the cross-checks attach claims
+ * of complete inputs only (the durable task evidence requires the
+ * complete identity stream plus a verified integrity, and the plan
+ * pointer check requires the complete plan target over the complete
+ * ledger); every partial state renders its honest pending form. Pure:
+ * recomputed from the state records on every call.
+ */
+export function derivePlanTasksView(state) {
+  if (!isPlanTasksState(state)) {
+    throw new UiContractError("invalid_state");
+  }
+  const identity = state["identity"];
+  const complete = identity["loaded"] === true && identity["nextAfter"] === null;
+  const ledgerByTaskPair = new Map();
+  const taskLedger = [];
+  const planLedger = [];
+  for (const record of identity["records"]) {
+    if (record["record"] === "task_revision") {
+      taskLedger.push(record);
+      ledgerByTaskPair.set(`${record["taskId"]}@${record["revision"]}`, record);
+    } else if (record["record"] === "plan_revision") {
+      planLedger.push(record);
+    }
+  }
+  let taskTarget = null;
+  if (state["taskTarget"] !== null) {
+    const target = state["taskTarget"];
+    const matching = [];
+    if (complete) {
+      for (const record of identity["records"]) {
+        const stageTask = record["record"] === "execution_agent" ? record["stageTask"] : null;
+        if (stageTask !== null && stageTask !== undefined && stageTask["taskId"] === target["taskId"] && stageTask["taskRevision"] === target["revision"]) {
+          matching.push(stageTask);
+        }
+      }
+    }
+    const integrity = s6TaskIntegrityOf(target);
+    let durable;
+    if (!complete) {
+      durable = "pending_stream";
+    } else if (integrity !== "verified" || target["envelope"] === null) {
+      durable = "not_verified";
+    } else {
+      const matchingManifest = matching.filter((stageTask) => stageTask["taskManifestSha256"] === target["envelope"]["manifestSha256"]);
+      if (matching.length === 0 || matchingManifest.length === 0) {
+        durable = "absent";
+      } else if (matchingManifest.some((stageTask) => stageTask["bodySha256"] === target["verifiedDigest"])) {
+        durable = "verified";
+      } else {
+        durable = "failed";
+      }
+    }
+    const envelope = target["envelope"];
+    const publish = target["status"] === "truncated" ? integrity === "unverified_truncated" : target["status"] === "ready" && integrity === "verified";
+    taskTarget = Object.freeze({
+      taskId: target["taskId"],
+      revision: target["revision"],
+      status: target["status"],
+      failure: target["failure"],
+      byteCount: envelope === null ? null : envelope["byteCount"],
+      retainedBytes: target["retainedBytes"],
+      truncated: target["truncated"],
+      integrity,
+      durable,
+      verifiedDigest: target["verifiedDigest"],
+      manifestSha256: envelope === null ? null : envelope["manifestSha256"],
+      bodySha256: envelope === null ? null : envelope["bodySha256"],
+      text: publish ? target["decodedText"] : null,
+    });
+  }
+  let planTarget = null;
+  if (state["planTarget"] !== null) {
+    const target = state["planTarget"];
+    let pointerStatus;
+    if (!complete || target["terminal"] === false || target["truncated"]) {
+      pointerStatus = "pending";
+    } else {
+      let resolved = true;
+      for (const record of target["records"]) {
+        if (record["record"] !== "task") {
+          continue;
+        }
+        const ledgerRecord = ledgerByTaskPair.get(`${record["id"]}@${record["revision"]}`);
+        if (ledgerRecord === undefined || ledgerRecord["sha256"] !== record["sha256"]) {
+          resolved = false;
+          break;
+        }
+      }
+      pointerStatus = resolved ? "verified" : "failed";
+    }
+    const envelope = target["envelope"];
+    planTarget = Object.freeze({
+      revision: target["revision"],
+      status: target["status"],
+      failure: target["failure"],
+      manifestSha256: envelope === null ? null : envelope["manifestSha256"],
+      originExecution: envelope === null ? null : envelope["originExecution"],
+      records: target["records"],
+      pointerStatus,
+    });
+  }
+  return Object.freeze({
+    complete,
+    error: state["error"],
+    staleCleared: state["staleCleared"],
+    taskLedger: Object.freeze(taskLedger),
+    planLedger: Object.freeze(planLedger),
+    taskTarget,
+    planTarget,
+  });
+}
+
+/**
+ * The closed state machine of the Plan-and-tasks section: three
+ * single-flight transports, one checksum selection per axis, the same
+ * continuation contract, the epoch-gated body verification and the
+ * fail-closed publication policy. A stale snapshot or a typed failure
+ * clears the whole view and waits for the next applied authoritative
+ * revision (no automatic re-issue, no same-pin restart). Never POSTs,
+ * never timers, never browser storage.
+ */
+export function createPlanTasksViewer(io) {
+  if (
+    !isRecord(io) ||
+    !isRecord(io["identityTransport"]) ||
+    !isRecord(io["taskTransport"]) ||
+    !isRecord(io["planTransport"]) ||
+    typeof io["onState"] !== "function"
+  ) {
+    throw new UiContractError("invalid_transport_io");
+  }
+  const identityTransport = io["identityTransport"];
+  const taskTransport = io["taskTransport"];
+  const planTransport = io["planTransport"];
+  const onState = io["onState"];
+  let state = null;
+  let disposed = false;
+  let nextEpoch = 1;
+  let nextReaderId = 1;
+  let identityInFlight = false;
+  let taskInFlight = false;
+  let planInFlight = false;
+
+  const publish = () => {
+    onState(state);
+  };
+
+  const alive = () => !disposed;
+
+  const clearForRefresh = () => {
+    if (!alive() || state === null) {
+      return;
+    }
+    state = Object.freeze({
+      ...createPlanTasksState(state["runId"], state["pin"]),
+      staleCleared: true,
+    });
+    publish();
+  };
+
+  const failTaskTarget = (layer, reason) => {
+    if (!alive() || state === null || state["taskTarget"] === null) {
+      return;
+    }
+    state = s6WithTaskTarget(state, s6TaskFailure(state["taskTarget"], layer, reason));
+    publish();
+  };
+
+  const failPlanTarget = (layer, reason) => {
+    if (!alive() || state === null || state["planTarget"] === null) {
+      return;
+    }
+    state = s6WithPlanTarget(state, s6PlanFailure(state["planTarget"], layer, reason));
+    publish();
+  };
+
+  /** Any non-chunk/page outcome (protocol error, orchestrator failure,
+   * transport loss) clears the whole view and waits. */
+  const clearFromOutcome = (result, runId) => {
+    if (result === undefined || result.ok === false) {
+      clearForRefresh();
+      return;
+    }
+    const model = result.model;
+    if (model.kind === "error" && model.reason === "stale_snapshot") {
+      clearForRefresh();
+      return;
+    }
+    clearForRefresh();
+  };
+
+  const requestIdentity = (runId, after, kind, pin) => {
+    if (!alive() || state === null) {
+      return;
+    }
+    identityInFlight = true;
+    identityTransport.request({
+      runId,
+      kind,
+      path: identityRequestPath(runId, after, pin, IDENTITY_PAGE_LIMIT),
+      onApplied: (result) => {
+        identityInFlight = false;
+        const live = state;
+        if (!alive() || live === null || live["runId"] !== runId) {
+          return;
+        }
+        if (result === undefined || result.ok === false || result.model.kind !== "identity") {
+          clearFromOutcome(result, runId);
+          return;
+        }
+        try {
+          const next = applyPlanTasksIdentityPage(live, result.model, after);
+          state = next;
+        } catch (error) {
+          if (error instanceof UiContractError) {
+            clearForRefresh();
+            return;
+          }
+          throw error;
+        }
+        publish();
+      },
+    });
+  };
+
+  const ledgerTaskRecord = (taskId, revision) => {
+    const live = state;
+    if (live === null) {
+      return null;
+    }
+    for (const record of live["identity"]["records"]) {
+      if (record["record"] === "task_revision" && record["taskId"] === taskId && record["revision"] === revision) {
+        return record;
+      }
+    }
+    return null;
+  };
+
+  const ledgerPlanRecord = (revision) => {
+    const live = state;
+    if (live === null) {
+      return null;
+    }
+    for (const record of live["identity"]["records"]) {
+      if (record["record"] === "plan_revision" && record["revision"] === revision) {
+        return record;
+      }
+    }
+    return null;
+  };
+
+  const scheduleTaskVerification = (capturedKey, capturedEpoch) => {
+    const live = state;
+    if (
+      live === null ||
+      live["taskTarget"] === null ||
+      live["taskTarget"]["key"] !== capturedKey ||
+      live["taskTarget"]["epoch"] !== capturedEpoch ||
+      live["taskTarget"]["terminal"] !== true
+    ) {
+      return;
+    }
+    const target = live["taskTarget"];
+    if (target["envelope"] === null || target["status"] !== "verifying") {
+      return;
+    }
+    const bytes = s6ConcatBytes([...target["retained"]]);
+    const envelope = target["envelope"];
+    void verifyTaskBodyDigest(bytes, envelope["bodySha256"]).then(
+      (hex) => {
+        const nowLive = state;
+        if (!alive() || nowLive === null || nowLive["taskTarget"] === null) {
+          return;
+        }
+        const nowTarget = nowLive["taskTarget"];
+        if (nowTarget["key"] !== capturedKey || nowTarget["epoch"] !== capturedEpoch || nowTarget["envelope"] !== envelope) {
+          return;
+        }
+        if (hex === null) {
+          failTaskTarget("contract", "artifact_modified");
+          return;
+        }
+        state = s6WithTaskTarget(
+          nowLive,
+          Object.freeze({
+            ...nowTarget,
+            status: "ready",
+            integrity: "verified",
+            verifiedDigest: hex,
+          }),
+        );
+        publish();
+      },
+      () => {
+        const nowLive = state;
+        if (!alive() || nowLive === null || nowLive["taskTarget"] === null) {
+          return;
+        }
+        const nowTarget = nowLive["taskTarget"];
+        if (nowTarget["key"] !== capturedKey || nowTarget["epoch"] !== capturedEpoch) {
+          return;
+        }
+        failTaskTarget("contract", "verification_unavailable");
+      },
+    );
+  };
+
+  /** Maps one settled task request failure to the target-failure
+   * presentation with its manual Retry (transport loss, error envelope
+   * or failed command result); the identity stream keeps its separate
+   * clear discipline. */
+  const s6OutcomeFailure = (result) => {
+    if (result === undefined || result.ok !== true) {
+      const failure = result !== undefined && result.ok === false ? result.failure : null;
+      return failure === null ? { layer: "transport", reason: "network_error" } : { layer: failure.layer, reason: failure.reason };
+    }
+    const model = result.model;
+    if (model !== null && typeof model === "object") {
+      if (model.kind === "error") {
+        return { layer: model.layer, reason: model.reason };
+      }
+      if (model.kind === "command_result") {
+        return { layer: "orchestrator", reason: model.reason ?? "failed" };
+      }
+    }
+    return null;
+  };
+
+  const requestTask = (targetAtIssue, offset, limit, kind) => {
+    if (!alive() || state === null || state["taskTarget"] === null) {
+      return;
+    }
+    const live = state["taskTarget"];
+    if (live["key"] !== targetAtIssue["key"] || live["epoch"] !== targetAtIssue["epoch"]) {
+      return;
+    }
+    taskInFlight = true;
+    taskTransport.request({
+      runId: state["runId"],
+      kind,
+      binding: Object.freeze({ runId: state["runId"], taskId: live["taskId"], revision: live["revision"] }),
+      path: taskContentRequestPath(state["runId"], live["taskId"], live["revision"], offset, limit),
+      onApplied: (result) => {
+        taskInFlight = false;
+        const nowLive = state;
+        if (
+          !alive() ||
+          nowLive === null ||
+          nowLive["taskTarget"] === null ||
+          nowLive["taskTarget"]["key"] !== targetAtIssue["key"] ||
+          nowLive["taskTarget"]["epoch"] !== targetAtIssue["epoch"]
+        ) {
+          return;
+        }
+        const endpointFailure = s6OutcomeFailure(result);
+        if (endpointFailure !== null) {
+          failTaskTarget(endpointFailure.layer, endpointFailure.reason);
+          return;
+        }
+        try {
+          state = applyTaskChunk(state, result.model, offset, limit, targetAtIssue["readerId"]);
+        } catch (error) {
+          if (error instanceof UiContractError) {
+            failTaskTarget("contract", error.reason);
+            return;
+          }
+          throw error;
+        }
+        publish();
+        scheduleTaskVerification(targetAtIssue["key"], targetAtIssue["epoch"]);
+      },
+    });
+  };
+
+  const requestPlan = (targetAtIssue, after, limit, kind) => {
+    if (!alive() || state === null || state["planTarget"] === null) {
+      return;
+    }
+    const live = state["planTarget"];
+    if (live["key"] !== targetAtIssue["key"] || live["epoch"] !== targetAtIssue["epoch"]) {
+      return;
+    }
+    planInFlight = true;
+    planTransport.request({
+      runId: state["runId"],
+      kind,
+      binding: Object.freeze({ runId: state["runId"], revision: live["revision"] }),
+      path: planContentRequestPath(state["runId"], live["revision"], after, limit),
+      onApplied: (result) => {
+        planInFlight = false;
+        const nowLive = state;
+        if (
+          !alive() ||
+          nowLive === null ||
+          nowLive["planTarget"] === null ||
+          nowLive["planTarget"]["key"] !== targetAtIssue["key"] ||
+          nowLive["planTarget"]["epoch"] !== targetAtIssue["epoch"]
+        ) {
+          return;
+        }
+        const endpointFailure = s6OutcomeFailure(result);
+        if (endpointFailure !== null) {
+          failPlanTarget(endpointFailure.layer, endpointFailure.reason);
+          return;
+        }
+        try {
+          state = applyPlanPage(state, result.model, after, limit, targetAtIssue["readerId"]);
+        } catch (error) {
+          if (error instanceof UiContractError) {
+            failPlanTarget("contract", error.reason);
+            return;
+          }
+          throw error;
+        }
+        publish();
+      },
+    });
+  };
+
+  const initialTaskLimit = () => Math.min(S6_TASK_CHUNK_LIMIT_DEFAULT, S6_BODY_RETAINED_BYTES_CAP);
+  const continuationTaskLimit = (target) => Math.min(S6_TASK_CHUNK_LIMIT_DEFAULT, S6_BODY_RETAINED_BYTES_CAP - target["retainedBytes"]);
+  const initialPlanLimit = () => Math.min(S6_PLAN_PAGE_LIMIT_DEFAULT, S6_PLAN_RECORDS_RETAINED_CAP);
+  const continuationPlanLimit = (target) => Math.min(S6_PLAN_PAGE_LIMIT_DEFAULT, S6_PLAN_RECORDS_RETAINED_CAP - target["records"].length);
+
+  return Object.freeze({
+    inspectApplied(runModel) {
+      if (disposed || !isRecord(runModel) || runModel["kind"] !== "run" || !isSafeId(runModel["runId"]) || !isPositiveSafeIndex(runModel["revision"])) {
+        return;
+      }
+      const runId = runModel["runId"];
+      const revision = runModel["revision"];
+      if (state === null || state["runId"] !== runId || state["pin"] !== revision) {
+        identityTransport.invalidate();
+        taskTransport.invalidate();
+        planTransport.invalidate();
+        identityInFlight = false;
+        taskInFlight = false;
+        planInFlight = false;
+        state = createPlanTasksState(runId, revision);
+        if (!identityInFlight) {
+          requestIdentity(runId, 0, "initial", revision);
+        }
+        publish();
+        return;
+      }
+      if (state["staleCleared"] || state["error"] !== null) {
+        // the stale-snapshot discipline: wait for the next applied
+        // revision or the explicit reload
+        return;
+      }
+      if (!state["identity"]["loaded"] && !identityInFlight) {
+        requestIdentity(runId, 0, "initial", state["pin"]);
+        publish();
+      }
+    },
+    selectTask(taskId, revision) {
+      if (!alive() || state === null) {
+        throw new UiContractError("invalid_state");
+      }
+      if (!isSafeId(taskId) || !isPositiveSafeIndex(revision)) {
+        throw new UiContractError("invalid_request");
+      }
+      const record = ledgerTaskRecord(taskId, revision);
+      if (record === null) {
+        // D2: the stream has not completed yet — the row stays inert
+        return;
+      }
+      const live = state["taskTarget"];
+      if (taskInFlight && live !== null && live["status"] === "requesting" && live["taskId"] === taskId && live["revision"] === revision) {
+        // D1: the identical selection is already in flight
+        return;
+      }
+      taskTransport.invalidate();
+      taskInFlight = false;
+      const readerId = nextReaderId;
+      nextReaderId += 1;
+      const target = Object.freeze({
+        ...s6NewTaskTarget(taskId, revision, record["sha256"], record["previousSha256"], nextEpoch, initialTaskLimit()),
+        readerId,
+      });
+      nextEpoch += 1;
+      state = s6WithTaskTarget(state, target);
+      publish();
+      requestTask(target, 0, initialTaskLimit(), "initial");
+    },
+    selectPlan(revision) {
+      if (!alive() || state === null) {
+        throw new UiContractError("invalid_state");
+      }
+      if (!isPositiveSafeIndex(revision)) {
+        throw new UiContractError("invalid_request");
+      }
+      const record = ledgerPlanRecord(revision);
+      if (record === null) {
+        return;
+      }
+      const live = state["planTarget"];
+      if (planInFlight && live !== null && live["status"] === "requesting" && live["revision"] === revision) {
+        return;
+      }
+      planTransport.invalidate();
+      planInFlight = false;
+      const readerId = nextReaderId;
+      nextReaderId += 1;
+      const target = Object.freeze({
+        ...s6NewPlanTarget(revision, record["sha256"], record["previousSha256"], record["originExecution"], nextEpoch, initialPlanLimit()),
+        readerId,
+      });
+      nextEpoch += 1;
+      state = s6WithPlanTarget(state, target);
+      publish();
+      requestPlan(target, 0, initialPlanLimit(), "initial");
+    },
+    loadMoreIdentity() {
+      if (!alive() || state === null || state["error"] !== null || state["staleCleared"] || identityInFlight) {
+        return;
+      }
+      const stream = state["identity"];
+      if (!stream["loaded"] || stream["nextAfter"] === null) {
+        return;
+      }
+      requestIdentity(state["runId"], stream["nextAfter"], "continuation", state["pin"]);
+    },
+    loadMoreTaskBody() {
+      if (!alive() || state === null || state["taskTarget"] === null) {
+        return;
+      }
+      const target = state["taskTarget"];
+      if (target["failure"] !== null || target["terminal"] || target["truncatedPending"] || taskInFlight) {
+        return;
+      }
+      const remaining = S6_BODY_RETAINED_BYTES_CAP - target["retainedBytes"];
+      if (remaining <= 0 || target["cursor"] >= S6_BODY_RETAINED_BYTES_CAP) {
+        return;
+      }
+      const limit = continuationTaskLimit(target);
+      const readerId = nextReaderId;
+      nextReaderId += 1;
+      state = s6WithTaskTarget(state, Object.freeze({ ...target, inFlightLimit: limit, readerId }));
+      requestTask(state["taskTarget"], target["cursor"], limit, "continuation");
+    },
+    retryTaskBody() {
+      if (!alive() || state === null || state["taskTarget"] === null || taskInFlight) {
+        return;
+      }
+      taskTransport.invalidate();
+      taskInFlight = false;
+      const previous = state["taskTarget"];
+      const record = ledgerTaskRecord(previous["taskId"], previous["revision"]);
+      if (record === null) {
+        failTaskTarget("contract", "contract_row_gone");
+        return;
+      }
+      const readerId = nextReaderId;
+      nextReaderId += 1;
+      const target = Object.freeze({
+        ...s6NewTaskTarget(previous["taskId"], previous["revision"], record["sha256"], record["previousSha256"], nextEpoch, initialTaskLimit()),
+        readerId,
+      });
+      nextEpoch += 1;
+      state = s6WithTaskTarget(state, target);
+      publish();
+      requestTask(target, 0, initialTaskLimit(), "initial");
+    },
+    loadMorePlanPage() {
+      if (!alive() || state === null || state["planTarget"] === null) {
+        return;
+      }
+      const target = state["planTarget"];
+      if (target["failure"] !== null || target["terminal"] || target["truncated"] || planInFlight) {
+        return;
+      }
+      const remaining = S6_PLAN_RECORDS_RETAINED_CAP - target["records"].length;
+      if (remaining <= 0) {
+        return;
+      }
+      const limit = continuationPlanLimit(target);
+      const readerId = nextReaderId;
+      nextReaderId += 1;
+      state = s6WithPlanTarget(state, Object.freeze({ ...target, inFlightLimit: limit, readerId }));
+      requestPlan(state["planTarget"], target["cursor"], limit, "continuation");
+    },
+    retryPlanContent() {
+      if (!alive() || state === null || state["planTarget"] === null || planInFlight) {
+        return;
+      }
+      planTransport.invalidate();
+      planInFlight = false;
+      const previous = state["planTarget"];
+      const record = ledgerPlanRecord(previous["revision"]);
+      if (record === null) {
+        failPlanTarget("contract", "contract_row_gone");
+        return;
+      }
+      const readerId = nextReaderId;
+      nextReaderId += 1;
+      const target = Object.freeze({
+        ...s6NewPlanTarget(previous["revision"], record["sha256"], record["previousSha256"], record["originExecution"], nextEpoch, initialPlanLimit()),
+        readerId,
+      });
+      nextEpoch += 1;
+      state = s6WithPlanTarget(state, target);
+      publish();
+      requestPlan(target, 0, initialPlanLimit(), "initial");
+    },
+    reload() {
+      if (!alive() || state === null || identityInFlight) {
+        return;
+      }
+      identityTransport.invalidate();
+      taskTransport.invalidate();
+      planTransport.invalidate();
+      identityInFlight = false;
+      taskInFlight = false;
+      planInFlight = false;
+      state = createPlanTasksState(state["runId"], state["pin"]);
+      publish();
+      requestIdentity(state["runId"], 0, "initial", state["pin"]);
+    },
+    refreshBindings() {
+      if (!alive()) {
+        return;
+      }
+      publish();
+    },
+    reset() {
+      identityTransport.invalidate();
+      taskTransport.invalidate();
+      planTransport.invalidate();
+      identityInFlight = false;
+      taskInFlight = false;
+      planInFlight = false;
+      state = null;
+      publish();
+    },
+    currentState() {
+      return state;
+    },
+    dispose() {
+      disposed = true;
+      identityTransport.invalidate();
+      taskTransport.invalidate();
+      planTransport.invalidate();
+      state = null;
+      publish();
+    },
+  });
+}
+
 /* Thin DOM adapter: createElement/textContent only.                   */
 /* ------------------------------------------------------------------ */
 
@@ -7744,6 +9108,13 @@ function showRunModel(model, options = {}) {
   if (lifecycleHistoryViewer !== null) {
     lifecycleHistoryViewer.inspectApplied(model);
     renderLifecycleHistory(lifecycleHistoryViewer.currentState());
+  }
+  // the applied authoritative inspect provides the pin and drives the
+  // plan-and-tasks pinned ledger GET (plus its stale-clear discipline)
+  ensurePlanTasksFor(model.runId);
+  if (planTasksViewer !== null) {
+    planTasksViewer.inspectApplied(model);
+    renderPlanTasks(planTasksViewer.currentState());
   }
   renderRunRail(model);
   renderTimelineMeta();
@@ -8576,6 +9947,337 @@ function ensureLifecycleHistoryFor(runId) {
     resetLifecycleHistoryDom();
   }
   document.getElementById("lifecycle-history-section").hidden = false;
+}
+
+/* Plan and tasks (S6): the thin DOM adapter of the pinned ledger
+ * stream and the two content surfaces. Created once per selection; a
+ * run or revision change resets the viewer (the transports invalidate
+ * their in-flight GETs). */
+
+let planTasksViewer = null;
+let planTasksRunId = null;
+
+const ptIdentityTransport = createIdentityTransport({
+  fetchIdentity: (path, runId, signal) => requestIdentityJson(fetchImplementation, path, { signal }, runId),
+  onStarted: () => {
+    for (const id of ["pt-identity-load-more", "pt-reload", "pt-task-load-more", "pt-task-retry", "pt-plan-load-more", "pt-plan-retry"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["pt-identity-load-more", "pt-reload", "pt-task-load-more", "pt-task-retry", "pt-plan-load-more", "pt-plan-retry"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+const ptTaskTransport = createTaskContentTransport({
+  fetchTaskContent: (path, runId, signal, binding) => requestTaskContentJson(fetchImplementation, path, { signal }, binding === undefined ? null : binding),
+  onStarted: () => {
+    for (const id of ["pt-identity-load-more", "pt-reload", "pt-task-load-more", "pt-task-retry", "pt-plan-load-more", "pt-plan-retry"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["pt-identity-load-more", "pt-reload", "pt-task-load-more", "pt-task-retry", "pt-plan-load-more", "pt-plan-retry"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+const ptPlanTransport = createPlanContentTransport({
+  fetchPlanContent: (path, runId, signal, binding) => requestPlanContentJson(fetchImplementation, path, { signal }, binding === undefined ? null : binding),
+  onStarted: () => {
+    for (const id of ["pt-identity-load-more", "pt-reload", "pt-task-load-more", "pt-task-retry", "pt-plan-load-more", "pt-plan-retry"]) {
+      document.getElementById(id).disabled = true;
+    }
+  },
+  onSettled: () => {
+    for (const id of ["pt-identity-load-more", "pt-reload", "pt-task-load-more", "pt-task-retry", "pt-plan-load-more", "pt-plan-retry"]) {
+      document.getElementById(id).disabled = false;
+    }
+  },
+});
+
+function s6Paragraph(parent, className, text) {
+  const node = document.createElement("p");
+  node.className = className;
+  node.textContent = text;
+  parent.appendChild(node);
+  return node;
+}
+
+function s6RenderLedgerRows(body, rows, buildButtonId) {
+  body.replaceChildren();
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    for (const cell of row.cells) {
+      const td = document.createElement("td");
+      td.textContent = cell;
+      tr.appendChild(td);
+    }
+    const actionCell = document.createElement("td");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = buildButtonId(row);
+    button.textContent = "Open";
+    actionCell.appendChild(button);
+    tr.appendChild(actionCell);
+    body.appendChild(tr);
+  }
+}
+
+function s6TaskStatusText(view) {
+  if (view === null) {
+    return "No task body selected.";
+  }
+  if (view.failure !== null) {
+    return `Failed (${view.failure.layer}: ${view.failure.reason}). Use Retry body.`;
+  }
+  if (view.status === "unrequested") {
+    return "Selected; not loaded yet.";
+  }
+  if (view.status === "requesting") {
+    return "Requesting body chunks…";
+  }
+  if (view.status === "streaming") {
+    return `Streaming body (${view.retainedBytes} bytes retained${view.byteCount === null ? "" : ` of ${view.byteCount}`})…`;
+  }
+  if (view.status === "verifying") {
+    return `Verifying body digest (${view.retainedBytes} bytes retained)…`;
+  }
+  if (view.status === "truncated") {
+    return `Truncated at the ${(view.retainedBytes / 1024).toFixed(0)} KiB preview cap; the full body is ${view.byteCount} bytes. Preview published unverified.`;
+  }
+  if (view.status === "ready" && view.integrity === "verified") {
+    const durable = view.durable === "verified" ? "ledger-verified" : view.durable === "absent" ? "no accepted execution binding in the ledger" : view.durable;
+    return `Body verified (sha256 ${digestShorthand(view.verifiedDigest ?? "")}…, ${view.byteCount} bytes); ${durable}.`;
+  }
+  return view.status;
+}
+
+function s6PlanStatusLabel(status) {
+  if (status === "unrequested") return "Selected; not loaded yet.";
+  if (status === "requesting") return "Requesting plan pages…";
+  if (status === "streaming") return "Streaming plan records…";
+  if (status === "ready") return "Loaded completely.";
+  if (status === "truncated") return `Truncated at the ${S6_PLAN_RECORDS_RETAINED_CAP} record cap.`;
+  return status;
+}
+
+function s6RenderTaskPanel(derived) {
+  const panel = document.getElementById("pt-task-panel");
+  const view = derived.taskTarget;
+  if (view === null) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  document.getElementById("pt-task-title").textContent = `task ${view.taskId} revision ${view.revision}`;
+  document.getElementById("pt-task-status").textContent = s6TaskStatusText(view);
+  const metaParts = [];
+  if (view.manifestSha256 !== null) {
+    metaParts.push(`manifest sha256 ${digestShorthand(view.manifestSha256)}…`);
+  }
+  if (view.bodySha256 !== null) {
+    metaParts.push(`body sha256 ${digestShorthand(view.bodySha256)}…`);
+  }
+  if (view.durable !== null) {
+    metaParts.push(`durable evidence: ${view.durable}`);
+  }
+  document.getElementById("pt-task-meta").textContent = metaParts.join(" · ");
+  const text = document.getElementById("pt-task-body");
+  if (view.text === null) {
+    text.hidden = true;
+    text.textContent = "";
+  } else {
+    text.hidden = false;
+    text.textContent = view.text;
+  }
+  document.getElementById("pt-task-load-more").hidden = view.status !== "streaming";
+  document.getElementById("pt-task-retry").hidden = view.failure === null;
+}
+
+function s6RenderPlanPanel(derived) {
+  const panel = document.getElementById("pt-plan-panel");
+  const view = derived.planTarget;
+  if (view === null) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  document.getElementById("pt-plan-title").textContent = `plan revision ${view.revision}`;
+  const statusLines = [s6PlanStatusLabel(view.status)];
+  if (view.failure !== null) {
+    statusLines.push(`Failed (${view.failure.layer}: ${view.failure.reason}). Use Retry plan.`);
+  } else if (view.pointerStatus === "verified") {
+    statusLines.push("Every task pointer matches the pinned ledger.");
+  } else if (view.pointerStatus === "failed") {
+    statusLines.push("contract: pointer verification failed — a selected task pointer does not match the pinned ledger.");
+  }
+  document.getElementById("pt-plan-status").textContent = statusLines.join(" ");
+  const metaParts = [];
+  if (view.manifestSha256 !== null) {
+    metaParts.push(`manifest sha256 ${digestShorthand(view.manifestSha256)}…`);
+  }
+  if (view.originExecution !== null) {
+    metaParts.push(`origin execution ${view.originExecution}`);
+  }
+  document.getElementById("pt-plan-meta").textContent = metaParts.join(" · ");
+  const body = document.getElementById("pt-plan-content");
+  body.replaceChildren();
+  for (const record of view.records) {
+    const tr = document.createElement("tr");
+    const kindCell = document.createElement("td");
+    const positionCell = document.createElement("td");
+    const refCell = document.createElement("td");
+    if (record.record === "stage") {
+      kindCell.textContent = "stage";
+      positionCell.textContent = String(record.stagePosition);
+      refCell.textContent = `${record.id} (template ${record.template})`;
+    } else if (record.record === "task") {
+      kindCell.textContent = "task";
+      positionCell.textContent = `${record.stagePosition}.${record.taskPosition}`;
+      refCell.textContent = `${record.id} r${record.revision}`;
+    } else {
+      kindCell.textContent = "task_dependency";
+      positionCell.textContent = `${record.stagePosition}.${record.taskPosition}.${record.dependencyPosition}`;
+      refCell.textContent = record.taskId;
+    }
+    tr.appendChild(kindCell);
+    tr.appendChild(positionCell);
+    tr.appendChild(refCell);
+    body.appendChild(tr);
+  }
+  document.getElementById("pt-plan-load-more").hidden = view.status !== "streaming";
+  document.getElementById("pt-plan-retry").hidden = view.failure === null;
+}
+
+function renderPlanTasks(state) {
+  const section = document.getElementById("plan-tasks-section");
+  if (section === null || section.hidden) {
+    return;
+  }
+  const meta = document.getElementById("pt-identity-meta");
+  const status = document.getElementById("pt-status");
+  const loadMore = document.getElementById("pt-identity-load-more");
+  document.getElementById("pt-reload").hidden = false;
+  if (state === null) {
+    return;
+  }
+  if (state.staleCleared || state.error !== null) {
+    meta.textContent = `Ledger stream: ${state.staleCleared ? "cleared after a stale snapshot or a failed load" : "failed"} · revision ${String(state.pin)}`;
+    status.textContent = state.error === null
+      ? "The ledger data was cleared; it reloads with the next inspect refresh, or press Reload."
+      : `The ledger could not be loaded (${state.error.layer}: ${state.error.reason}). Reload or wait for the next inspect refresh.`;
+    loadMore.hidden = true;
+    document.getElementById("pt-task-ledger").replaceChildren();
+    document.getElementById("pt-plan-ledger").replaceChildren();
+    document.getElementById("pt-task-panel").hidden = true;
+    document.getElementById("pt-plan-panel").hidden = true;
+    return;
+  }
+  const identity = state.identity;
+  meta.textContent = `Ledger stream: ${identity.loaded ? `loaded to ${identity.cursor}${identity.nextAfter === null ? " (complete)" : " (more available)"}` : "not loaded"} · revision ${identity.loaded ? String(state.pin) : "–"}`;
+  status.textContent = identity.loaded ? "" : "The pinned ledger is loading…";
+  loadMore.hidden = identity.nextAfter === null || !identity.loaded;
+  const derived = derivePlanTasksView(state);
+  const taskBody = document.getElementById("pt-task-ledger");
+  const planBody = document.getElementById("pt-plan-ledger");
+  if (!derived.complete) {
+    taskBody.replaceChildren();
+    planBody.replaceChildren();
+    const taskNote = document.createElement("p");
+    taskNote.className = "lh-partial";
+    taskNote.textContent = "The pinned ledger is not complete yet; selections open once it is.";
+    taskBody.appendChild(taskNote);
+    s6RenderTaskPanel(derived);
+    s6RenderPlanPanel(derived);
+    return;
+  }
+  const taskRows = derived.taskLedger.map((record) => ({
+    taskId: record.taskId,
+    revision: record.revision,
+    cells: [record.taskId, `r${record.revision}`, digestShorthand(record.sha256)],
+    buttonId: `pt-task-open-${record.taskId}-${record.revision}`,
+  }));
+  s6RenderLedgerRows(taskBody, taskRows, (row) => row.buttonId);
+  for (const row of taskRows) {
+    document.getElementById(row.buttonId).addEventListener("click", () => {
+      try {
+        planTasksViewer.selectTask(row.taskId, row.revision);
+      } catch (error) {
+        if (error instanceof UiContractError) {
+          status.textContent = `contract: ${error.reason}`;
+          return;
+        }
+        throw error;
+      }
+      renderPlanTasks(planTasksViewer.currentState());
+    });
+  }
+  const planRows = derived.planLedger.map((record) => ({
+    revision: record.revision,
+    cells: [`r${record.revision}`, digestShorthand(record.sha256)],
+    buttonId: `pt-plan-open-${record.revision}`,
+  }));
+  s6RenderLedgerRows(planBody, planRows, (row) => row.buttonId);
+  for (const row of planRows) {
+    document.getElementById(row.buttonId).addEventListener("click", () => {
+      try {
+        planTasksViewer.selectPlan(row.revision);
+      } catch (error) {
+        if (error instanceof UiContractError) {
+          status.textContent = `contract: ${error.reason}`;
+          return;
+        }
+        throw error;
+      }
+      renderPlanTasks(planTasksViewer.currentState());
+    });
+  }
+  s6RenderTaskPanel(derived);
+  s6RenderPlanPanel(derived);
+}
+
+function resetPlanTasksDom() {
+  document.getElementById("pt-identity-meta").textContent = "";
+  document.getElementById("pt-status").textContent = "";
+  document.getElementById("pt-task-ledger").replaceChildren();
+  document.getElementById("pt-plan-ledger").replaceChildren();
+  document.getElementById("pt-task-panel").hidden = true;
+  document.getElementById("pt-plan-panel").hidden = true;
+  document.getElementById("pt-task-body").hidden = true;
+  document.getElementById("pt-task-body").textContent = "";
+  document.getElementById("pt-identity-load-more").hidden = true;
+  document.getElementById("pt-reload").hidden = true;
+  document.getElementById("pt-task-load-more").hidden = true;
+  document.getElementById("pt-task-retry").hidden = true;
+  document.getElementById("pt-plan-load-more").hidden = true;
+  document.getElementById("pt-plan-retry").hidden = true;
+}
+
+/** The section of the selected run: the viewer lives for the whole page
+ * and resets its streams on every run or applied-revision change;
+ * `inspectApplied` (called from the applied inspect flow) issues the
+ * initial pinned GET; task/plan bodies open only on the explicit
+ * ledger selection. */
+function ensurePlanTasksFor(runId) {
+  const runChanged = planTasksRunId !== runId;
+  if (planTasksViewer === null) {
+    planTasksViewer = createPlanTasksViewer({
+      identityTransport: ptIdentityTransport,
+      taskTransport: ptTaskTransport,
+      planTransport: ptPlanTransport,
+      onState: (state) => renderPlanTasks(state),
+    });
+  }
+  if (runChanged) {
+    planTasksViewer.reset();
+    planTasksRunId = runId;
+    resetPlanTasksDom();
+  }
+  document.getElementById("plan-tasks-section").hidden = false;
 }
 
 function digestShorthand(digest) {
@@ -9804,6 +11506,47 @@ function boot() {
     if (lifecycleHistoryViewer !== null) {
       lifecycleHistoryViewer.reload();
     }
+  });
+  document.getElementById("pt-identity-load-more").addEventListener("click", () => {
+    clearMessages();
+    if (planTasksViewer !== null) {
+      planTasksViewer.loadMoreIdentity();
+    }
+  });
+  document.getElementById("pt-reload").addEventListener("click", () => {
+    clearMessages();
+    if (planTasksViewer !== null) {
+      planTasksViewer.reload();
+    }
+    renderPlanTasks(planTasksViewer === null ? null : planTasksViewer.currentState());
+  });
+  document.getElementById("pt-task-load-more").addEventListener("click", () => {
+    clearMessages();
+    if (planTasksViewer !== null) {
+      planTasksViewer.loadMoreTaskBody();
+    }
+    renderPlanTasks(planTasksViewer === null ? null : planTasksViewer.currentState());
+  });
+  document.getElementById("pt-task-retry").addEventListener("click", () => {
+    clearMessages();
+    if (planTasksViewer !== null) {
+      planTasksViewer.retryTaskBody();
+    }
+    renderPlanTasks(planTasksViewer === null ? null : planTasksViewer.currentState());
+  });
+  document.getElementById("pt-plan-load-more").addEventListener("click", () => {
+    clearMessages();
+    if (planTasksViewer !== null) {
+      planTasksViewer.loadMorePlanPage();
+    }
+    renderPlanTasks(planTasksViewer === null ? null : planTasksViewer.currentState());
+  });
+  document.getElementById("pt-plan-retry").addEventListener("click", () => {
+    clearMessages();
+    if (planTasksViewer !== null) {
+      planTasksViewer.retryPlanContent();
+    }
+    renderPlanTasks(planTasksViewer === null ? null : planTasksViewer.currentState());
   });
   document.getElementById("lh-compare-apply").addEventListener("click", () => {
     const valueA = document.getElementById("lh-compare-a").value;

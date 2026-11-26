@@ -222,6 +222,23 @@ export interface UiHarness {
   applyConfirmationVisible(): boolean;
   /** The hidden/disabled state of one apply action button. */
   applyButtonState(id: string): { hidden: boolean; disabled: boolean };
+  planTasksStatus(): string;
+  planTasksMeta(): string;
+  planTasksTaskTitle(): string;
+  planTasksTaskStatusText(): string;
+  planTasksTaskMeta(): string;
+  planTasksTaskBodyText(): string;
+  planTasksPlanTitle(): string;
+  planTasksPlanStatusText(): string;
+  planTasksPlanMeta(): string;
+  planTasksTaskPanelHidden(): boolean;
+  planTasksPlanPanelHidden(): boolean;
+  planTasksTaskRows(): string[];
+  planTasksPlanRows(): string[];
+  planTasksPlanRecordRows(): string[];
+  planTasksButtonState(id: string): { hidden: boolean; disabled: boolean };
+  planTasksOpenTaskRow(index: number): void;
+  planTasksOpenPlanRow(index: number): void;
   readonly clock: UiHarnessClock | null;
   /** Clicks the Inspect button of the run row at `index` in the runs table. */
   clickRunInspect(index: number): void;
@@ -326,6 +343,31 @@ const UI_ELEMENT_IDS = [
   "lh-compare-b",
   "lh-compare-apply",
   "lh-historical",
+  "plan-tasks-section",
+  "pt-status",
+  "pt-identity-meta",
+  "pt-identity-load-more",
+  "pt-reload",
+  "pt-task-ledger",
+  "pt-task-ledger-table",
+  "pt-plan-ledger",
+  "pt-plan-ledger-table",
+  "pt-plan-records-table",
+  "pt-heading",
+  "pt-task-panel",
+  "pt-task-title",
+  "pt-task-status",
+  "pt-task-meta",
+  "pt-task-body",
+  "pt-task-load-more",
+  "pt-task-retry",
+  "pt-plan-panel",
+  "pt-plan-title",
+  "pt-plan-status",
+  "pt-plan-meta",
+  "pt-plan-content",
+  "pt-plan-load-more",
+  "pt-plan-retry",
 ] as const;
 
 export interface UiHarnessOptions {
@@ -358,7 +400,11 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
   let visibilityHandler: (() => void) | null = null;
   const documentShim = {
     createElement: (tag: string) => element(tag),
-    getElementById: (id: string) => byId.get(id) ?? null,
+    getElementById: (id: string) =>
+      // production modules may create nodes dynamically and then look
+      // them up by id (the S6 ledger row buttons); the harness resolves
+      // those through the full created-node registry
+      byId.get(id) ?? all.find((node) => node.id === id) ?? null,
     addEventListener: (_type: string, handler: (event?: unknown) => void) => {
       // the module registers exactly one visibilitychange listener at boot
       visibilityHandler = handler;
@@ -530,6 +576,68 @@ export async function createUiHarness(options: UiHarnessOptions): Promise<UiHarn
     applyButtonState: (id) => {
       const button = harness.element(id);
       return { hidden: button.hidden, disabled: button.disabled };
+    },
+    /** The `Task|Rev|Digest|Open` rows of the task ledger table (the
+     * action cell projects its button text like the real DOM; a
+     * non-row partial note projects its full text). */
+    planTasksTaskRows: () =>
+      harness.element("pt-task-ledger").children.map((row) =>
+        row.tagName !== "TR"
+          ? row.textContent
+          : row.children.map((cell) => (cell.children.length === 1 ? cell.children[0]!.textContent : cell.textContent)).join("|"),
+      ),
+    /** The `Rev|Digest|Open` rows of the plan ledger table (the
+     * action cell projects its button text like the real DOM; a
+     * non-row partial note projects its full text). */
+    planTasksPlanRows: () =>
+      harness.element("pt-plan-ledger").children.map((row) =>
+        row.tagName !== "TR"
+          ? row.textContent
+          : row.children.map((cell) => (cell.children.length === 1 ? cell.children[0]!.textContent : cell.textContent)).join("|"),
+      ),
+    /** The `Kind|Position|Reference` rows of the plan records table. */
+    planTasksPlanRecordRows: () =>
+      harness.element("pt-plan-content").children.map((row) =>
+        row.children.map((cell) => cell.textContent).join("|"),
+      ),
+    planTasksStatus: () => harness.element("pt-status").textContent,
+    planTasksMeta: () => harness.element("pt-identity-meta").textContent,
+    planTasksTaskTitle: () => harness.element("pt-task-title").textContent,
+    planTasksTaskStatusText: () => harness.element("pt-task-status").textContent,
+    planTasksTaskMeta: () => harness.element("pt-task-meta").textContent,
+    planTasksTaskBodyText: () => harness.element("pt-task-body").textContent,
+    planTasksPlanTitle: () => harness.element("pt-plan-title").textContent,
+    planTasksPlanStatusText: () => harness.element("pt-plan-status").textContent,
+    planTasksPlanMeta: () => harness.element("pt-plan-meta").textContent,
+    planTasksTaskPanelHidden: () => harness.element("pt-task-panel").hidden,
+    planTasksPlanPanelHidden: () => harness.element("pt-plan-panel").hidden,
+    planTasksButtonState: (id) => {
+      const button = harness.element(id);
+      return { hidden: button.hidden, disabled: button.disabled };
+    },
+    /** Clicks the `Open` button of the task ledger row at `index`. */
+    planTasksOpenTaskRow: (index: number): void => {
+      const row = harness.element("pt-task-ledger").children[index];
+      if (row === undefined) {
+        throw new Error(`harness task ledger row missing: ${index}`);
+      }
+      const button = row.querySelectorAll("button").find((node) => node.textContent === "Open");
+      if (button === undefined) {
+        throw new Error("harness task open button missing");
+      }
+      button.click();
+    },
+    /** Clicks the `Open` button of the plan ledger row at `index`. */
+    planTasksOpenPlanRow: (index: number): void => {
+      const row = harness.element("pt-plan-ledger").children[index];
+      if (row === undefined) {
+        throw new Error(`harness plan ledger row missing: ${index}`);
+      }
+      const button = row.querySelectorAll("button").find((node) => node.textContent === "Open");
+      if (button === undefined) {
+        throw new Error("harness plan open button missing");
+      }
+      button.click();
     },
     clock,
     dispose: () => {

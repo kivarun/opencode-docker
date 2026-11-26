@@ -1215,3 +1215,164 @@ export declare function createLifecycleHistoryViewer(io: {
   readonly bindingsTransport: UiLifecycleHistoryTransport;
   readonly onState: (state: UiLifecycleHistoryState | null) => void;
 }): UiLifecycleHistoryViewer;
+
+/* Plan and tasks (S6): the pinned identity-ledger stream consumer plus
+   the two bounded P-1 content surfaces (the byte-exact task-body chunk
+   stream and the paged semantic plan projection). */
+
+export interface UiPlanTasksTaskChunkShape {
+  readonly kind: "task_revision";
+  readonly runId: string;
+  readonly taskId: string;
+  readonly revision: number;
+  readonly manifestSha256: string;
+  readonly previousSha256: string | null;
+  readonly origin: string;
+  readonly body: {
+    readonly byteCount: number;
+    readonly bodySha256: string;
+    readonly offset: number;
+    readonly limit: number;
+    readonly returnedByteCount: number | null;
+    readonly nextOffset: number | null;
+    readonly data: Uint8Array;
+  };
+}
+export interface UiPlanTasksPlanPageShape {
+  readonly kind: "plan_revision";
+  readonly runId: string;
+  readonly revision: number;
+  readonly manifestSha256: string;
+  readonly previousSha256: string | null;
+  readonly originExecution: number;
+  readonly nextAfter: number | null;
+  readonly records: readonly Record<string, unknown>[];
+}
+export declare function parseTaskContentDocument(
+  document: unknown,
+  expected: unknown,
+): UiPlanTasksTaskChunkShape;
+export declare function parsePlanContentDocument(
+  document: unknown,
+  expected: unknown,
+): UiPlanTasksPlanPageShape;
+export declare function parseTaskContentEndpointDocument(
+  document: unknown,
+  expected: unknown,
+): unknown;
+export declare function parsePlanContentEndpointDocument(
+  document: unknown,
+  expected: unknown,
+): unknown;
+export declare function taskContentRequestPath(runId: string, taskId: string, revision: number, offset: number, limit: number): string;
+export declare function planContentRequestPath(runId: string, revision: number, after: number, limit: number): string;
+export declare function requestTaskContentJson(
+  fetchImpl: unknown,
+  path: string,
+  init: { signal?: AbortSignal } | undefined,
+  expected: unknown,
+): Promise<unknown>;
+export declare function requestPlanContentJson(
+  fetchImpl: unknown,
+  path: string,
+  init: { signal?: AbortSignal } | undefined,
+  expected: unknown,
+): Promise<unknown>;
+export declare const S6_BODY_RETAINED_BYTES_CAP: number;
+export declare const S6_PLAN_RECORDS_RETAINED_CAP: number;
+export interface UiPlanTasksSectionState extends Record<string, unknown> {
+  readonly runId: string;
+  readonly pin: number;
+  readonly identity: {
+    readonly records: readonly Record<string, unknown>[];
+    readonly cursor: number;
+    readonly nextAfter: number | null;
+    readonly loaded: boolean;
+  };
+  readonly error: null | Record<string, unknown>;
+  readonly staleCleared: boolean;
+  readonly taskTarget: null | Record<string, unknown>;
+  readonly planTarget: null | Record<string, unknown>;
+}
+export interface UiPlanTasksDerivedView {
+  readonly complete: boolean;
+  readonly error: null | Record<string, unknown>;
+  readonly staleCleared: boolean;
+  readonly taskLedger: readonly Record<string, unknown>[];
+  readonly planLedger: readonly Record<string, unknown>[];
+  readonly taskTarget: null | {
+    readonly taskId: string;
+    readonly revision: number;
+    readonly status: string | null;
+    readonly failure: null | { readonly layer: string; readonly reason: string };
+    readonly byteCount: number | null;
+    readonly retainedBytes: number;
+    readonly truncated: boolean;
+    readonly integrity: string | null;
+    readonly durable: string | null;
+    readonly verifiedDigest: string | null;
+    readonly manifestSha256: string | null;
+    readonly bodySha256: string | null;
+    readonly text: string | null;
+  };
+  readonly planTarget: null | {
+    readonly revision: number;
+    readonly status: string | null;
+    readonly failure: null | { readonly layer: string; readonly reason: string };
+    readonly manifestSha256: string | null;
+    readonly originExecution: number | null;
+    readonly records: readonly Record<string, unknown>[];
+    readonly pointerStatus: string;
+  };
+}
+export declare function createPlanTasksState(runId: string, pin: number): UiPlanTasksSectionState;
+export declare function applyPlanTasksIdentityPage(
+  state: UiPlanTasksSectionState | null,
+  page: unknown,
+  requestedAfter: number,
+): UiPlanTasksSectionState | null;
+export declare function applyTaskChunk(
+  state: UiPlanTasksSectionState | null,
+  model: unknown,
+  requestedOffset: number,
+  requestedLimit: number,
+  requestReaderId: number,
+): UiPlanTasksSectionState | null;
+export declare function applyPlanPage(
+  state: UiPlanTasksSectionState | null,
+  model: unknown,
+  requestedAfter: number,
+  requestedLimit: number,
+  requestReaderId: number,
+): UiPlanTasksSectionState | null;
+export declare interface UiPlanTasksContentTransport {
+  request(desire: {
+    readonly runId: string;
+    readonly kind: string;
+    readonly path: string;
+    readonly binding?: unknown;
+    readonly onApplied: (result: unknown) => void;
+  }): Promise<unknown>;
+  invalidate(): unknown | null;
+  dispose(): void;
+}
+export declare function createTaskContentTransport(io: unknown): UiPlanTasksContentTransport;
+export declare function createPlanContentTransport(io: unknown): UiPlanTasksContentTransport;
+export declare function derivePlanTasksView(state: unknown): UiPlanTasksDerivedView;
+export declare function verifyTaskBodyDigest(bytes: Uint8Array, expectedDigest: string): Promise<string | null>;
+export interface UiPlanTasksViewer {
+  inspectApplied(model: unknown): void;
+  selectTask(taskId: string, revision: number): void;
+  selectPlan(revision: number): void;
+  loadMoreIdentity(): void;
+  loadMoreTaskBody(): void;
+  retryTaskBody(): void;
+  loadMorePlanPage(): void;
+  retryPlanContent(): void;
+  reload(): void;
+  refreshBindings(): void;
+  reset(): void;
+  currentState(): UiPlanTasksSectionState | null;
+  dispose(): void;
+}
+export declare function createPlanTasksViewer(io: unknown): UiPlanTasksViewer;

@@ -205,7 +205,12 @@ describe("ui lifecycle-history wiring: the real module under the fake DOM", () =
     harness.clickRunInspect(0);
     await Bun.sleep(5);
     const pins = pinnedGets(probe);
-    expect(pins.identity).toEqual([`/v1/runs/${RUN}/identity?after=0&revision=24&limit=100`]);
+    // since S6 the plan/tasks slice is the second pinned identity
+    // consumer: both viewers issue their own identical initial GET
+    expect(pins.identity).toEqual([
+      `/v1/runs/${RUN}/identity?after=0&revision=24&limit=100`,
+      `/v1/runs/${RUN}/identity?after=0&revision=24&limit=100`,
+    ]);
     expect(pins.bindings).toEqual([`/v1/runs/${RUN}/execution-bindings?after=0&revision=24&limit=100`]);
     expect(harness.element("lifecycle-history-section").hidden).toBe(false);
     expect(lhStatus(harness)).toBe("Waiting for more stream pages.");
@@ -220,7 +225,9 @@ describe("ui lifecycle-history wiring: the real module under the fake DOM", () =
     probe.queue.identity = [identityPageFinal(24)];
     harness.element("lh-identity-load-more").click();
     await Bun.sleep(5);
-    expect(pinnedGets(probe).identity[1]).toBe(`/v1/runs/${RUN}/identity?after=${IDENTITY_RECORDS_A.length}&revision=24&limit=100`);
+    // identity[0]/[1] are the two pinned initials (lifecycle history and
+    // the S6 plan/tasks consumer); the load-more continuation follows
+    expect(pinnedGets(probe).identity[2]).toBe(`/v1/runs/${RUN}/identity?after=${IDENTITY_RECORDS_A.length}&revision=24&limit=100`);
     expect(lhStatus(harness)).toBe("Streams complete.");
     const lines = lhSectionText(harness);
     expect(lines.some((line) => line.includes("Generation 1 — stage stage-1 (position 1, template development)"))).toBe(true);
@@ -256,9 +263,10 @@ describe("ui lifecycle-history wiring: the real module under the fake DOM", () =
     const harness = await harnessOf(probe);
     harness.clickRunInspect(0);
     await Bun.sleep(5);
-    const pins = pinnedGets(probe);
-    expect(pins.identity).toHaveLength(1);
-    expect(pins.bindings).toHaveLength(1);
+    // the pinned terminal inspect issues the pinned identity GET per
+    // consumer (the history stream and the S6 plan/tasks ledger)
+    expect(probe.gets.filter((path) => path.endsWith("/identity?after=0&revision=24&limit=100"))).toHaveLength(2);
+    expect(probe.gets.filter((path) => path.includes("/execution-bindings?after=0"))).toHaveLength(1);
     const lines = lhSectionText(harness);
     expect(lines.some((line) => line.includes("Wait 1 at transition 2 — stage_iteration_limit_exhausted"))).toBe(true);
     expect(lines.some((line) => line.includes("continue_stage → dev_entry"))).toBe(true);
@@ -280,9 +288,12 @@ describe("ui lifecycle-history wiring: the real module under the fake DOM", () =
     await Bun.sleep(5);
     harness.click("inspect-selected");
     await Bun.sleep(5);
-    const pins = pinnedGets(probe);
-    expect(pins.identity[1]).toBe(`/v1/runs/${RUN}/identity?after=0&revision=25&limit=100`);
-    expect(pins.bindings[1]).toBe(`/v1/runs/${RUN}/execution-bindings?after=0&revision=25&limit=100`);
+    // both identity consumers restart under the new pin; the single
+    // bindings stream restarts into the same entry (order across the
+    // two transports is not pinned by the fixture)
+    const pinnedRestarts = probe.gets.filter((path) => path.endsWith("/identity?after=0&revision=25&limit=100"));
+    expect(pinnedRestarts).toHaveLength(2);
+    expect(probe.gets.filter((path) => path.endsWith("/execution-bindings?after=0&revision=25&limit=100"))).toHaveLength(1);
     expect(probe.posts).toEqual([]);
   });
 

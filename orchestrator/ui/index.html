@@ -182,6 +182,61 @@
       <h4 class="lh-subheading">Historical interventions</h4>
       <div id="lh-historical" class="lh-cards"></div>
     </div>
+    <div id="plan-tasks-section" hidden>
+      <h3 id="pt-heading">Plan and tasks</h3>
+      <p id="pt-status" aria-live="polite" class="lh-status"></p>
+      <div class="lh-streams">
+        <p id="pt-identity-meta" class="lh-meta"></p>
+        <div class="events-actions">
+          <button type="button" id="pt-identity-load-more" hidden>Load more ledger</button>
+          <button type="button" id="pt-reload" hidden>Reload section</button>
+        </div>
+      </div>
+      <h4 class="lh-subheading">Accepted task revisions</h4>
+      <table id="pt-task-ledger-table">
+        <caption>Task revisions accepted in this run</caption>
+        <thead>
+          <tr><th scope="col">Task id</th><th scope="col">Revision</th><th scope="col">Digest</th></tr>
+        </thead>
+        <tbody id="pt-task-ledger"></tbody>
+      </table>
+      <h4 class="lh-subheading">Accepted plan revisions</h4>
+      <table id="pt-plan-ledger-table">
+        <caption>Plan revisions accepted in this run</caption>
+        <thead>
+          <tr><th scope="col">Revision</th><th scope="col">Digest</th></tr>
+        </thead>
+        <tbody id="pt-plan-ledger"></tbody>
+      </table>
+      <div id="pt-task-panel" hidden>
+        <h4 class="lh-subheading">Selected task</h4>
+        <p id="pt-task-title" class="lh-meta"></p>
+        <p id="pt-task-status" class="lh-status"></p>
+        <p id="pt-task-meta" class="lh-meta"></p>
+        <pre id="pt-task-body"></pre>
+        <div class="events-actions">
+          <button type="button" id="pt-task-load-more" hidden>Load more body</button>
+          <button type="button" id="pt-task-retry" hidden>Retry body</button>
+        </div>
+      </div>
+      <div id="pt-plan-panel" hidden>
+        <h4 class="lh-subheading">Selected plan</h4>
+        <p id="pt-plan-title" class="lh-meta"></p>
+        <p id="pt-plan-status" class="lh-status"></p>
+        <p id="pt-plan-meta" class="lh-meta"></p>
+        <table id="pt-plan-records-table">
+          <caption>Projected plan records of the selected revision</caption>
+          <thead>
+            <tr><th scope="col">Kind</th><th scope="col">Position</th><th scope="col">Reference</th></tr>
+          </thead>
+          <tbody id="pt-plan-content"></tbody>
+        </table>
+        <div class="events-actions">
+          <button type="button" id="pt-plan-load-more" hidden>Load more records</button>
+          <button type="button" id="pt-plan-retry" hidden>Retry plan</button>
+        </div>
+      </div>
+    </div>
   </section>
   <section id="new-run-section" aria-labelledby="new-run-heading">
     <h2 id="new-run-heading">New run</h2>

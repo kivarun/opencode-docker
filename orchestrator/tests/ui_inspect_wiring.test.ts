@@ -574,7 +574,11 @@ describe("ui inspect wiring: the single-flight stress battery on the real module
       harness.dispose();
     }
     expect(maxActiveAcrossAll).toBe(1);
-  });
+  }, 15000);
+  // S6 wiring overlay: the module bodies grew (the S6 plan/tasks slice
+  // rides in the same file), so the per-sequence harness reimport cost
+  // grew past the default 5 s budget while the machine contract below
+  // stayed identical.
 });
 
 /* ------------------------------------------------------------------ */
