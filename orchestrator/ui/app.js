@@ -7564,7 +7564,14 @@ export function applyTaskChunk(state, model, requestedOffset, requestedLimit, re
   }
   let decodedText = target["decodedText"];
   try {
-    decodedText += decoder.decode(chunk, { stream: !(terminal || capTruncated) });
+    // the cap boundary may split a multi-byte UTF-8 sequence: the chunk
+    // ending exactly at the retained cap still carries an incomplete
+    // trailing sequence whose continuation lies beyond the cap. That
+    // suffix belongs to the unretained bytes and is never an error —
+    // decode non-fatally per chunk (stream:true), then discard the
+    // decoder WITHOUT a flush (the pending suffix is dropped with it).
+    // Only the real wire-terminal chunk flushes the decoder.
+    decodedText += decoder.decode(chunk, { stream: !terminal });
   } catch {
     throw new UiContractError("decode_failed");
   }
@@ -7588,7 +7595,11 @@ export function applyTaskChunk(state, model, requestedOffset, requestedLimit, re
     retained,
     retainedBytes,
     decodedText,
-    decoder,
+    // at the cap boundary the decoder is destroyed without a flush:
+    // its pending (split-sequence) suffix belongs to the unretained
+    // bytes and is discarded with it, so no later merge can ever
+    // decode into the truncated target
+    decoder: capTruncated ? null : decoder,
     terminal,
     truncated: capTruncated || (target["truncatedPending"] && terminal),
     truncatedPending: capTruncated ? true : target["truncatedPending"],

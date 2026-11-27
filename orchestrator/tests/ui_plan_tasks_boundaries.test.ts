@@ -41,6 +41,7 @@ interface ViewerLike {
 
 interface TaskTargetLike {
   status: string;
+  failure: { readonly layer: string; readonly reason: string } | null;
   truncated: boolean;
   terminal: boolean;
   retainedBytes: number;
@@ -199,6 +200,41 @@ describe("plan/tasks S6 corrective: the body-retention cap through the real view
       // wire terminal
       expect(issued.paths).toHaveLength(4);
       expect(issued.paths.every((path) => new URL(`https://ui.invalid${path}`).searchParams.get("limit") === String(CHUNK))).toBe(true);
+    } finally {
+      viewer.dispose();
+    }
+  });
+
+  test("a UTF-8 sequence split exactly at the cap boundary truncates without a decode failure", async () => {
+    const over = new Uint8Array(S6_BODY_RETAINED_BYTES_CAP + 1);
+    // bytes 0..CAP-2 are ASCII; byte CAP-1 begins a two-byte sequence
+    // whose continuation byte (offset CAP, beyond the retained cap)
+    // belongs to the unretained suffix of the body
+    over.fill(97);
+    over[S6_BODY_RETAINED_BYTES_CAP - 1] = 0xc2;
+    over[S6_BODY_RETAINED_BYTES_CAP] = 0x80;
+    const issued = { paths: [] as string[] };
+    const viewer = viewerFor(stageTaskBodyDigest(over), chunkFetcher(over, issued));
+    try {
+      await streamToEnd(viewer);
+      const target = taskTargetOf(viewer);
+      expect(target.status).toBe("truncated");
+      expect(target.failure).toBeNull();
+      expect(target.integrity).toBe("unverified_truncated");
+      expect(target.durable).toBe("not_verified");
+      expect(target.byteCount).toBe(S6_BODY_RETAINED_BYTES_CAP + 1);
+      expect(target.retainedBytes).toBe(S6_BODY_RETAINED_BYTES_CAP);
+      // the rendered text is only the fully decoded prefix: the split
+      // character's first byte is held by the decoder (discarded with
+      // it), never rendered and never a U+FFFD error
+      expect(target.text !== null && target.text.length === S6_BODY_RETAINED_BYTES_CAP - 1).toBe(true);
+      expect(target.text?.includes("\uFFFD")).toBe(false);
+      // the cap-boundary chunk stays the last issued GET
+      expect(issued.paths).toHaveLength(4);
+      const before = issued.paths.length;
+      viewer.loadMoreTaskBody();
+      await flush();
+      expect(issued.paths).toHaveLength(before);
     } finally {
       viewer.dispose();
     }
