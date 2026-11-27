@@ -587,10 +587,15 @@ evidence bundle (`increment-6-s6-evidence.tar.gz`,
 Verification at `f107e02`: targeted S6 suites plus the shared suites —
 boundary suite 7/0, combined S6 band 110/0; `tsc --noEmit` 0 errors;
 `git diff --check` clean; no `src/` change across the chain; official
-isolated gate (`bun run test`): candidates A and B both 4618 pass / 130
-fail with byte-identical fail-name sets, equal to the recorded clean-base
-(`f4f4918`, 4510 pass / 130 fail) set — all 130 the Apply environmental
-set (117 + 10 + 3; `security.selinux` xattr refusal). No further UI
+isolated gate (`bun run test`): candidate B is the clean authoritative
+run — 4618 pass / 130 fail; candidate A reports the identical totals and
+a byte-identical 130-name fail set PLUS one runner bookkeeping line
+`2 errors` in its summary block (recorded exactly as: same fail set,
+two additional runner errors — the a2/a3 `waitFor timeout` diagnostics of
+`control_plane_ui_project_apply.test.ts:114`, whose verbatim blocks exist
+in both candidates' full logs). Both fail-name sets are equal to the
+recorded clean-base (`f4f4918`, 4510 pass / 130 fail) set — all 130 the
+Apply environmental set (117 + 10 + 3; `security.selinux` xattr refusal). No further UI
 changed; S7–S8 untouched and not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
