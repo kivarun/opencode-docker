@@ -593,9 +593,26 @@ a byte-identical 130-name fail set PLUS one runner bookkeeping line
 `2 errors` in its summary block (recorded exactly as: same fail set,
 two additional runner errors — the a2/a3 `waitFor timeout` diagnostics of
 `control_plane_ui_project_apply.test.ts:114`, whose verbatim blocks exist
-in both candidates' full logs). Both fail-name sets are equal to the
-recorded clean-base (`f4f4918`, 4510 pass / 130 fail) set — all 130 the
-Apply environmental set (117 + 10 + 3; `security.selinux` xattr refusal). No further UI
+in both candidates' full logs).
+
+Base-run correction (evidence round 5; discovered while correcting the
+test-tree wording): the previously recorded "clean-base" run labelled
+`f4f4918` (4510 pass / 130 fail across 163 files) was
+in fact executed on the `1185cae` worktree — the S5-P0 docs commit, one
+commit BEFORE the S5 lifecycle-history landing; its 163 runner files
+cohere with `1185cae`'s 163-file `.test.ts` inventory. The comparison's
+substance is unaffected — the candidate runs and that base run share a
+byte-identical 130-name fail set — but the label was wrong. A fresh
+official run at the TRUE base `f4f4918` (this round) yields 4554 pass /
+131 fail / 4685 tests across 167 files; its fail-name set is exactly the
+candidates' 130-name set PLUS one further name — the v1 `smoke.test.ts`
+signal-timing test "7. signal during updateState(worker_running)", whose
+file is untouched by the entire S6 chain and which PASSED in both
+candidate runs and in the recorded `1185cae` base run (3 passes / 1
+failure across the four full gate runs) — a run-to-run flake of the local
+environmental gate, not an S6 regression. The 130-name fail set common to
+both candidates remains the Apply environmental battery (117 + 10 + 3;
+`security.selinux` xattr refusal). No further UI
 changed; S7–S8 untouched and not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
