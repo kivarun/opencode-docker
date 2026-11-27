@@ -95,7 +95,7 @@ General task scheduling and arbitrary stage DAG execution are later work.
 | 3 | Hard read-only reviewer | Complete (9863be3 + a37fe9f + 1fb634c; CI 42621186802; live UAT 2026-11-09) |
 | 4 | Separate development pipeline bundle | Complete (3c7caa1; CI 42831456815 — build evidence; bundle contract proven by the permanent suite, no live UAT required) |
 | 5 | Real dogfood UAT with revision and Apply | Incomplete with attempts |
-| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183), P-1 (abf95e5; CI 43903686912) and P-2 (9b08980 + corrective 00422ee; CI 44103077865 / 44113220025) landed and Complete; UI slices S1–S3 Complete (see their records below) and S4 Complete (7f79b43 → 451e63b → 47adeb50; CI 45370189214 / 45376514804 / 45397965027); the S5 prerequisite S5-P0 is landed and Complete (d0a9e4c + b0d1abe; CI 45603562120 / 45638353441 — see its record below); UI slices S5–S8 not started |
+| 6 | UI model and implementation based on UAT evidence | In progress — IA accepted; prerequisites P-3 (afe57ca; CI 43466470183), P-1 (abf95e5; CI 43903686912) and P-2 (9b08980 + corrective 00422ee; CI 44103077865 / 44113220025) landed and Complete; UI slices S1–S3 Complete (see their records below) and S4 Complete (7f79b43 → 451e63b → 47adeb50; CI 45370189214 / 45376514804 / 45397965027); the S5 prerequisite S5-P0 is landed and Complete (d0a9e4c + b0d1abe; CI 45603562120 / 45638353441 — see its record below); UI slice S5 is landed at f4f4918 (CI 45665448794) pending its completion record; UI slice S6 — the read-only plan-and-tasks slice — is landed and Complete (9760b14 → 03bf57b → f107e02; CI 45874583269 / 45970265843 / 45986117926 — see its record below); UI slices S7–S8 not started |
 
 Drift-control record (2026-11-12): the plan contains no formal Complete-gate
 for an increment's successor. Per explicit operator decision, Increment 6 is
@@ -537,7 +537,61 @@ content)** and **P-2 (accepted reviewer-output content)** are landed and
 not started. The S5 prerequisite
 **S5-P0 (the execution→generation/iteration binding and the
 `execution-bindings` projection)** is likewise landed and **Complete**
-(see its record below); UI slice S5 itself remains not started.
+(see its record below); UI slice S5 itself is landed at `f4f4918`
+(CI 45665448794 — the identity + execution-bindings pinned streams,
+waiting-anchor section, placement, compare and historical battery) and
+awaited its first accepted review together with S6, whose completion
+record below records the accepted chain from that base. UI slices S7–S8
+remain not started.
+
+### S6 Complete: read-only plan-and-tasks slice (2026-11-27)
+
+The S6 slice is landed and **Complete** after a three-round review chain
+whose production verdict is PASS at `f107e02aeff0c86da127f94d61ad5909a24bb079`.
+
+Landing chain and CI (each run success on the exact SHA):
+
+- `f4f4918` — landing base: the S5 lifecycle-history section (its own
+  completion record is tracked separately).
+- `9760b14` (CI 45874583269) — the S6 slice: the `Plan and tasks` read-only
+  section as the second consumer of the versioned identity engine
+  (`GET /v1/runs/:runId/identity`), the bounded task-body chunk stream
+  (`GET /v1/runs/:runId/tasks/:taskId/revisions/:revision` — request
+  default 65536 bytes, one-request wire cap 193536 bytes, retained-buffer
+  cap 262144 bytes) and the paged plan projection (over the same identity
+  engine's plan/task ledgers).
+- `03bf57b` (CI 45970265843) — corrective 1: the retained-cap boundary is
+  reachable and honest (truncation declared exactly at the 262144-byte
+  boundary, load-more thereafter a closed no-op), and durable task evidence
+  is fail-closed over EVERY `stage_task` binding (all-bindings agreement —
+  never `.some()`).
+- `f107e02` (CI 45986117926) — corrective 2: the cap boundary no longer
+  flushes the decoder (a `stream:!terminal` decode; the decoder is
+  destroyed without a flush at the cap; only the real wire-terminal chunk
+  flushes), so a valid multi-byte UTF-8 sequence split exactly at the
+  cap-boundary truncates cleanly — proven red-before at `03bf57b` with the
+  permanent viewer pin.
+
+Review rounds recorded by the reviewer: r1 REJECTED (four blockers: the
+cap's boundedness, the `.some()` durable binding, evidence-set arithmetic,
+the non-green focused gate); r2 REJECTED (the single remaining production
+defect: UTF-8 at the cap boundary); r3 (this round) PRODUCTION PASS with
+the evidence bundle rebuilt per the three docs corrections (empty tail
+artifact replaced by the real end-of-run blocks, the 130-failure
+classification corrected to the verified 117 + 10 + 3 split, and the base
+inventory note replaced by the exact nine-name delta). The self-verifiable
+evidence bundle (`increment-6-s6-evidence.tar.gz`,
+`d1a8f3cc…b6ab884`, 25/25 manifest OK) plus the r4 preflight report
+(`7c691cdf…`) are retained by the operator.
+
+Verification at `f107e02`: targeted S6 suites plus the shared suites —
+boundary suite 7/0, combined S6 band 110/0; `tsc --noEmit` 0 errors;
+`git diff --check` clean; no `src/` change across the chain; official
+isolated gate (`bun run test`): candidates A and B both 4618 pass / 130
+fail with byte-identical fail-name sets, equal to the recorded clean-base
+(`f4f4918`, 4510 pass / 130 fail) set — all 130 the Apply environmental
+set (117 + 10 + 3; `security.selinux` xattr refusal). No further UI
+changed; S7–S8 untouched and not started.
 
 ### Prerequisite P-3 landed: durable-identity projection (2026-11-13)
 
