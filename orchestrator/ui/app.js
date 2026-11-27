@@ -7545,6 +7545,15 @@ export function applyTaskChunk(state, model, requestedOffset, requestedLimit, re
   if (!terminal && target["truncatedPending"]) {
     throw new UiContractError("retention_cap");
   }
+  const retainedBytes = target["retainedBytes"] + body["returnedByteCount"];
+  const retained = Object.freeze([...target["retained"], chunk]);
+  // the retention cap is reachable through the stream itself: a chunk
+  // that ends exactly at the cap while the body continues (the wire
+  // still carries a next offset) is the last retained chunk — the cap
+  // declares the truncation, the decoder flushes the retained prefix,
+  // and load-more is a closed no-op from here on (no chunk can ever
+  // cross the cap: the request limit is bounded by the remaining room)
+  const capTruncated = !terminal && retainedBytes === S6_BODY_RETAINED_BYTES_CAP;
   let decoder = target["decoder"];
   if (decoder === null) {
     try {
@@ -7555,12 +7564,10 @@ export function applyTaskChunk(state, model, requestedOffset, requestedLimit, re
   }
   let decodedText = target["decodedText"];
   try {
-    decodedText += decoder.decode(chunk, { stream: !terminal });
+    decodedText += decoder.decode(chunk, { stream: !(terminal || capTruncated) });
   } catch {
     throw new UiContractError("decode_failed");
   }
-  const retained = Object.freeze([...target["retained"], chunk]);
-  const retainedBytes = target["retainedBytes"] + body["returnedByteCount"];
   const envelope =
     target["envelope"] === null
       ? Object.freeze({
@@ -7573,9 +7580,9 @@ export function applyTaskChunk(state, model, requestedOffset, requestedLimit, re
       : target["envelope"];
   const nextTarget = Object.freeze({
     ...target,
-    status: terminal ? (target["truncatedPending"] ? "truncated" : "verifying") : "streaming",
+    status: capTruncated ? "truncated" : terminal ? (target["truncatedPending"] ? "truncated" : "verifying") : "streaming",
     envelope,
-    cursor: terminal ? target["cursor"] + body["returnedByteCount"] : body["nextOffset"],
+    cursor: capTruncated ? retainedBytes : terminal ? target["cursor"] + body["returnedByteCount"] : body["nextOffset"],
     readerId: target["readerId"] + 1,
     chunkCount: target["chunkCount"] + 1,
     retained,
@@ -7583,7 +7590,8 @@ export function applyTaskChunk(state, model, requestedOffset, requestedLimit, re
     decodedText,
     decoder,
     terminal,
-    truncated: target["truncatedPending"] && terminal,
+    truncated: capTruncated || (target["truncatedPending"] && terminal),
+    truncatedPending: capTruncated ? true : target["truncatedPending"],
   });
   return s6WithTaskTarget(state, nextTarget);
 }
@@ -7713,10 +7721,22 @@ export function derivePlanTasksView(state) {
     } else if (integrity !== "verified" || target["envelope"] === null) {
       durable = "not_verified";
     } else {
-      const matchingManifest = matching.filter((stageTask) => stageTask["taskManifestSha256"] === target["envelope"]["manifestSha256"]);
-      if (matching.length === 0 || matchingManifest.length === 0) {
+      // the durable task evidence is fail-closed over EVERY binding of
+      // the selected ledger pair: all of them must agree with the
+      // verified envelope on both the manifest digest and the body
+      // digest. One agreeing binding never hides a conflicting one, a
+      // fully foreign manifest is conflict evidence (failed), and only
+      // zero bindings for the pair is the absence statement.
+      const allAgree =
+        matching.length > 0 &&
+        matching.every(
+          (stageTask) =>
+            stageTask["taskManifestSha256"] === target["envelope"]["manifestSha256"] &&
+            stageTask["bodySha256"] === target["verifiedDigest"],
+        );
+      if (matching.length === 0) {
         durable = "absent";
-      } else if (matchingManifest.some((stageTask) => stageTask["bodySha256"] === target["verifiedDigest"])) {
+      } else if (allAgree) {
         durable = "verified";
       } else {
         durable = "failed";

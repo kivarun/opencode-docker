@@ -598,10 +598,12 @@ describe("plan/tasks S6: the plan page merge", () => {
 
 describe("plan/tasks S6: the frozen derivation", () => {
   /** The identity stream fixture shared by the cross-target checks:
-   * task-alpha@1 accepted with two stage executions binding the same
-   * manifest digest but two DIFFERENT body digests, plan r2 selecting
-   * the pointered revision, and one execution without the stage-task
-   * binding. */
+   * task-alpha@1 accepted with two stage executions both AGREEING with
+   * the body under test (the durable evidence is fail-closed over
+   * every binding since the corrective boundary suite: the conflict
+   * batteries live in `ui_plan_tasks_boundaries.test.ts`), plan r2
+   * selecting the pointered revision, and one execution without the
+   * stage-task binding. */
   function fixtureState(overrides: {
     planRevision?: number;
     taskBodySha?: string;
@@ -633,7 +635,7 @@ describe("plan/tasks S6: the frozen derivation", () => {
           taskId: "task-alpha",
           taskRevision: 1,
           taskManifestSha256: sha("1"),
-          bodySha256: sha("a"),
+          bodySha256: taskBodySha,
         },
       },
       { record: "agent_output", executionIndex: 1, id: "report", digest: sha("a") },
